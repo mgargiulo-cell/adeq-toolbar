@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ADEQ Toolbar</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+
+<!-- ====================================================
+     LOGIN SCREEN
+     ==================================================== -->
+<div id="login-screen" class="login-screen">
+  <div class="login-card">
+    <div class="login-logo">
+      <span class="logo-text">ADEQ</span>
+      <span class="logo-sub">TOOLBAR</span>
+    </div>
+    <p class="login-subtitle">Acceso exclusivo ADEQ Media</p>
+    <input id="login-email"    class="form-input" type="email"    placeholder="usuario@adeqmedia.com" autocomplete="email" />
+    <input id="login-password" class="form-input" type="password" placeholder="Contraseña" autocomplete="current-password" style="margin-top:8px" />
+    <div id="login-error" class="login-error"></div>
+    <button id="btn-login" class="btn btn-primary btn-full" style="margin-top:14px">Ingresar</button>
+  </div>
+</div>
+
+<!-- HEADER -->
+<header class="header">
+  <div class="logo">
+    <span class="logo-text">ADEQ</span>
+    <span class="logo-sub">TOOLBAR</span>
+  </div>
+  <div class="header-right">
+    <div id="site-url" class="site-url">cargando...</div>
+    <button id="btn-autopilot" class="autopilot-btn" title="Activar/desactivar autoprospección">
+      <span class="autopilot-dot"></span>
+      <span class="autopilot-label">AUTO</span>
+    </button>
+    <button id="btn-refresh" class="icon-btn" title="Analizar pestaña actual">↻</button>
+    <button id="btn-settings" class="icon-btn" title="Configuración">⚙</button>
+  </div>
+</header>
+
+<!-- TABS -->
+<nav class="tabs">
+  <button class="tab-btn active" data-tab="core">🔍 Análisis</button>
+  <button class="tab-btn" data-tab="cascade">🌊 Cascada</button>
+  <button class="tab-btn" data-tab="history">🕐 Historial</button>
+  <button class="tab-btn" data-tab="import">📥 Import</button>
+</nav>
+
+<!-- ====================================================
+     TAB: ANÁLISIS
+     ==================================================== -->
+<div id="tab-core" class="tab-content active">
+
+  <!-- BANNER FOLLOW-UP (condicional) -->
+  <div id="fu-banner" class="fu-banner" style="display:none">
+    <div id="fu-banner-text" class="fu-banner-text"></div>
+    <button id="btn-generate-fu" class="btn btn-sm btn-primary">✨ Generar FU</button>
+  </div>
+
+  <!-- RECUADRO 1: TRÁFICO -->
+  <section class="card">
+    <div class="card-title"><span class="icon">📊</span> Tráfico Mensual</div>
+    <div class="traffic-row">
+      <div id="traffic-result" class="metric loading">--</div>
+      <div id="traffic-unit" class="traffic-unit">págs/mes</div>
+    </div>
+    <div id="traffic-breakdown" class="traffic-meta"></div>
+    <div id="traffic-countries" class="traffic-countries"></div>
+    <div id="traffic-category" class="traffic-meta"></div>
+    <div id="traffic-filter" class="filter-tag"></div>
+  </section>
+
+  <!-- RECUADRO 2: MONDAY -->
+  <section class="card">
+    <div class="card-title"><span class="icon">📋</span> Monday.com</div>
+    <div id="duplicate-result" class="status-badge loading">Consultando...</div>
+    <div id="score-badge" class="score-badge" style="display:none"></div>
+    <div class="monday-form">
+      <div class="form-grid">
+
+        <label class="form-label">Ejecutivo</label>
+        <select id="form-ejecutivo" class="form-select">
+          <option value="Agus">Agus</option>
+          <option value="Diego">Diego</option>
+          <option value="Max">Max</option>
+        </select>
+
+        <label class="form-label">Estado</label>
+        <select id="form-estado" class="form-select">
+          <option value="9">Masivo - Agus</option>
+          <option value="6">Masivo - Diego</option>
+          <option value="10">Masivo - Max</option>
+          <option value="8">Mail No Enviado</option>
+          <option value="0">LIVE</option>
+          <option value="1">En Negociación</option>
+          <option value="2">Descartado</option>
+          <option value="3">Propuesta Vigente</option>
+          <option value="4">Rebotado</option>
+          <option value="5">Ciclo Finalizado</option>
+          <option value="7">Avanzado</option>
+        </select>
+
+        <label class="form-label">Idioma</label>
+        <select id="form-idioma" class="form-select">
+          <option value="">— seleccionar —</option>
+          <option value="0">Ingles</option>
+          <option value="1">Espanol</option>
+          <option value="2">Italiano</option>
+          <option value="3">Portugues</option>
+          <option value="4">Frances</option>
+          <option value="5">Aleman</option>
+          <option value="6">Arabe</option>
+        </select>
+
+        <label class="form-label">GEO</label>
+        <select id="form-geo" class="form-select">
+          <option value="">— seleccionar —</option>
+          <option>Estados Unidos</option><option>Reino Unido</option><option>Argentina</option>
+          <option>México</option><option>Colombia</option><option>Chile</option>
+          <option>España</option><option>Brasil</option><option>Francia</option>
+          <option>Alemania</option><option>Italia</option><option>Portugal</option>
+          <option>Países Bajos</option><option>Bélgica</option><option>Suiza</option>
+          <option>Austria</option><option>Polonia</option><option>Hungría</option>
+          <option>República Checa</option><option>Rumania</option><option>Grecia</option>
+          <option>Turquía</option><option>Israel</option><option>Emiratos Árabes</option>
+          <option>Arabia Saudita</option><option>Marruecos</option><option>Egipto</option>
+          <option>India</option><option>Japón</option><option>Corea del Sur</option>
+          <option>Australia</option><option>Canadá</option><option>Suecia</option>
+          <option>Noruega</option><option>Dinamarca</option><option>Finlandia</option>
+          <option>Vietnam</option><option>Tailandia</option><option>Indonesia</option>
+          <option>Filipinas</option><option>China</option><option>Singapur</option>
+          <option>Sudáfrica</option><option>Nigeria</option><option>Perú</option>
+          <option>Ecuador</option><option>Venezuela</option><option>Bolivia</option>
+          <option>Paraguay</option><option>Uruguay</option><option>Rusia</option>
+          <option>Ucrania</option>
+        </select>
+
+        <label class="form-label">Tráfico</label>
+        <div id="form-pv-display" class="form-pv-display">--</div>
+
+        <label class="form-label">Email</label>
+        <input id="form-email" class="form-input" type="text" placeholder="email@sitio.com" />
+
+        <label class="form-label">Fecha</label>
+        <div class="fecha-row">
+          <input id="form-fecha" class="form-input" type="text" placeholder="DD/MM/YYYY" maxlength="10" />
+          <button id="btn-fecha-hoy" class="btn-hoy" title="Actualizar a hoy">Hoy</button>
+        </div>
+
+      </div>
+      <button id="btn-push-monday" class="btn btn-success btn-full" style="margin-top:9px">🚀 Enviar a Monday</button>
+      <div id="push-result" class="push-result"></div>
+    </div>
+  </section>
+
+  <!-- RECUADRO 3: VENTAS -->
+  <section class="card">
+    <div class="card-title"><span class="icon">💼</span> Ventas</div>
+
+    <!-- Email Decisor -->
+    <div class="sub-section">
+      <div class="sub-title">✉️ Email Decisor</div>
+      <div id="email-result" class="email-value loading">Buscando...</div>
+      <div id="email-list" style="display:none"></div>
+      <span id="email-verify-badge" class="verify-badge" style="display:none"></span>
+      <div id="linkedin-row" class="linkedin-row" style="display:none">
+        <a id="linkedin-link" href="#" target="_blank" class="linkedin-link">🔗 Ver LinkedIn</a>
+      </div>
+      <div class="email-actions">
+        <button id="btn-apollo" class="btn btn-secondary btn-sm">👤 Apollo</button>
+        <button id="btn-gemini-email" class="btn btn-secondary btn-sm">🤖 Gemini</button>
+        <button id="btn-verify-email" class="btn btn-secondary btn-sm" style="display:none">✔ Verificar</button>
+      </div>
+      <div id="apollo-result" class="apollo-result"></div>
+    </div>
+
+    <!-- Banner Detector -->
+    <div class="sub-section">
+      <div class="sub-title-row">
+        <span class="sub-title">🖼️ Formatos de Publicidad</span>
+        <button id="btn-detect-banners" class="btn btn-secondary btn-sm">↻ Actualizar</button>
+      </div>
+      <div id="banner-result" class="banner-result">No analizado</div>
+      <div id="adtech-result" class="adtech-result" style="display:none"></div>
+    </div>
+
+    <!-- Partners -->
+    <div class="sub-section">
+      <div class="sub-title">🤝 Partners Detectados</div>
+      <div id="partners-result" class="partners-result loading">Analizando...</div>
+    </div>
+
+    <!-- Pitch -->
+    <div class="sub-section">
+      <div class="sub-title-row">
+        <span class="sub-title">🤖 Pitch con Gemini</span>
+        <select id="pitch-language" class="category-select" title="Idioma del email" style="font-size:11px;padding:2px 4px;">
+          <option value="en">Ingles</option>
+          <option value="es">Espanol</option>
+          <option value="it">Italiano</option>
+          <option value="pt">Portugues</option>
+          <option value="fr">Frances</option>
+          <option value="de">Aleman</option>
+          <option value="ar">Arabe</option>
+        </select>
+        <select id="pitch-category" class="category-select" title="Categoría del sitio" style="font-size:11px;padding:2px 4px;">
+          <option value="">Categoría auto</option>
+          <option value="sports">Sports</option>
+          <option value="news">News & Media</option>
+          <option value="finance">Finance</option>
+          <option value="technology">Technology</option>
+          <option value="entertainment">Entertainment</option>
+          <option value="health">Health</option>
+          <option value="travel">Travel</option>
+          <option value="gambling">Gambling</option>
+          <option value="automotive">Automotive</option>
+          <option value="food">Food & Drink</option>
+          <option value="realestate">Real Estate</option>
+          <option value="business">Business / B2B</option>
+        </select>
+      </div>
+
+      <!-- Controles de estilo del pitch -->
+      <div class="pitch-controls">
+        <div class="pitch-ctrl-row">
+          <span class="pitch-ctrl-label">Tono</span>
+          <div class="pitch-pills" data-group="tone">
+            <button class="pitch-pill active" data-val="informal">Informal</button>
+            <button class="pitch-pill" data-val="formal">Formal</button>
+          </div>
+        </div>
+        <div class="pitch-ctrl-row">
+          <span class="pitch-ctrl-label">Largo</span>
+          <div class="pitch-pills" data-group="length">
+            <button class="pitch-pill active" data-val="short">Corto</button>
+            <button class="pitch-pill" data-val="long">Largo</button>
+          </div>
+        </div>
+        <div class="pitch-ctrl-row">
+          <span class="pitch-ctrl-label">Enfoque</span>
+          <div class="pitch-pills" data-group="focus">
+            <button class="pitch-pill active" data-val="analysis">Con análisis</button>
+            <button class="pitch-pill" data-val="nodataanalysis">Sin análisis</button>
+          </div>
+        </div>
+        <div class="pitch-ctrl-row">
+          <span class="pitch-ctrl-label">Apertura</span>
+          <div class="pitch-pills" data-group="opening">
+            <button class="pitch-pill active" data-val="direct">Directo</button>
+            <button class="pitch-pill" data-val="problem">Problema</button>
+            <button class="pitch-pill" data-val="praise">Elogio</button>
+          </div>
+        </div>
+      </div>
+
+      <textarea id="pitch-text" class="pitch-textarea" placeholder="Presioná generar para crear el pitch..."></textarea>
+      <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
+      <div class="pitch-actions">
+        <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generar Pitch</button>
+        <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Guardar como ejemplo de estilo">👍</button>
+        <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Marcar como malo — Gemini lo evitará">👎</button>
+        <span id="pitch-like-status" class="pitch-like-status"></span>
+      </div>
+    </div>
+
+    <!-- Auto-push banner (condicional) -->
+    <div id="autopush-banner" class="autopush-banner" style="display:none">
+      <div class="autopush-title">⚡ Prospecto listo</div>
+      <div class="autopush-conditions">Tráfico ✅ &nbsp;·&nbsp; No duplicado ✅ &nbsp;·&nbsp; Email encontrado ✅</div>
+      <div id="autopush-steps" class="autopush-steps"></div>
+      <button id="btn-autopush-prepare" class="btn btn-success btn-full" style="margin-top:8px">⚡ Preparar todo</button>
+    </div>
+
+    <!-- Gmail -->
+    <div class="sub-section" style="padding-bottom:4px">
+      <div id="gmail-from" class="gmail-from"></div>
+      <input id="form-subject" class="form-input" type="text" placeholder="Asunto del email..." style="margin-bottom:6px" />
+      <button id="btn-send-gmail" class="btn btn-gmail btn-full">📧 Enviar por Gmail</button>
+      <div id="gmail-result" class="push-result"></div>
+    </div>
+  </section>
+
+</div>
+
+<!-- ====================================================
+     TAB: CASCADA
+     ==================================================== -->
+<div id="tab-cascade" class="tab-content">
+
+  <section class="card">
+    <div class="card-title"><span class="icon">🌱</span> Dominio Semilla</div>
+    <div class="seed-row">
+      <input id="cascade-seed" type="text" class="seed-input" placeholder="ej: nytimes.com" />
+      <button id="btn-cascade-start" class="btn btn-primary btn-sm">Buscar</button>
+    </div>
+    <div id="cascade-status" class="cascade-status"></div>
+  </section>
+
+  <!-- Keywords -->
+  <section class="card card-tight">
+    <div class="card-title"><span class="icon">🔑</span> Keywords Semilla</div>
+    <div class="kw-filters">
+      <select id="kw-language" class="filter-select">
+        <option value="">Todos los idiomas</option>
+        <option value="en">Inglés</option>
+        <option value="es">Español</option>
+        <option value="pt">Portugués</option>
+        <option value="it">Italiano</option>
+        <option value="fr">Francés</option>
+        <option value="ar">Árabe</option>
+      </select>
+      <input id="kw-search" type="text" class="seed-input kw-search-input" placeholder="Buscar keyword..." />
+    </div>
+    <div id="keywords-list" class="keywords-list"></div>
+    <div class="kw-footer">
+      <span id="kw-rotation-timer" class="kw-timer"></span>
+    </div>
+  </section>
+
+  <!-- Buscador de Similares -->
+  <section class="card card-tight">
+    <div class="card-title"><span class="icon">🔍</span> Buscador de Similares</div>
+  </section>
+
+  <!-- Filtros -->
+  <section class="card card-tight">
+    <div class="filter-grid">
+
+      <label class="filter-label">Tráfico mín.</label>
+      <select id="cascade-min-traffic" class="filter-select">
+        <option value="500000">500K+</option>
+        <option value="750000">750K+</option>
+        <option value="1000000">1M+</option>
+        <option value="1500000">1.5M+</option>
+        <option value="2000000">2M+</option>
+        <option value="3000000">3M+</option>
+        <option value="4000000">4M+</option>
+        <option value="5000000">5M+</option>
+        <option value="7000000">7M+</option>
+        <option value="10000000">10M+</option>
+        <option value="10000001">+10M</option>
+        <option value="0">Sin filtro</option>
+      </select>
+
+      <label class="filter-label">Global Rank</label>
+      <select id="cascade-max-rank" class="filter-select">
+        <option value="50000">&lt;50K</option>
+        <option value="100000">&lt;100K</option>
+        <option value="150000">&lt;150K</option>
+        <option value="200000">&lt;200K</option>
+        <option value="300000">&lt;300K</option>
+        <option value="400000">&lt;400K</option>
+        <option value="500000">&lt;500K</option>
+        <option value="750000">&lt;750K</option>
+        <option value="1000000">&lt;1M</option>
+        <option value="2000000">&lt;2M</option>
+        <option value="5000000">&lt;5M</option>
+        <option value="0">Sin filtro</option>
+      </select>
+
+      <label class="filter-label">País</label>
+      <select id="cascade-language" class="filter-select">
+        <option value="">Todos</option>
+        <optgroup label="Latinoamérica">
+          <option value="AR">Argentina</option>
+          <option value="MX">México</option>
+          <option value="CO">Colombia</option>
+          <option value="CL">Chile</option>
+          <option value="BR">Brasil</option>
+          <option value="PE">Perú</option>
+          <option value="EC">Ecuador</option>
+          <option value="VE">Venezuela</option>
+          <option value="UY">Uruguay</option>
+          <option value="PY">Paraguay</option>
+          <option value="BO">Bolivia</option>
+          <option value="CR">Costa Rica</option>
+          <option value="PA">Panamá</option>
+          <option value="DO">Rep. Dominicana</option>
+          <option value="GT">Guatemala</option>
+          <option value="HN">Honduras</option>
+          <option value="SV">El Salvador</option>
+          <option value="CU">Cuba</option>
+          <option value="PR">Puerto Rico</option>
+        </optgroup>
+        <optgroup label="Norteamérica">
+          <option value="US">Estados Unidos</option>
+          <option value="CA">Canadá</option>
+        </optgroup>
+        <optgroup label="Europa Occidental">
+          <option value="GB">Reino Unido</option>
+          <option value="ES">España</option>
+          <option value="PT">Portugal</option>
+          <option value="FR">Francia</option>
+          <option value="DE">Alemania</option>
+          <option value="IT">Italia</option>
+          <option value="NL">Países Bajos</option>
+          <option value="BE">Bélgica</option>
+          <option value="CH">Suiza</option>
+          <option value="AT">Austria</option>
+          <option value="SE">Suecia</option>
+          <option value="NO">Noruega</option>
+          <option value="DK">Dinamarca</option>
+          <option value="FI">Finlandia</option>
+          <option value="IE">Irlanda</option>
+        </optgroup>
+        <optgroup label="Europa del Este">
+          <option value="PL">Polonia</option>
+          <option value="RO">Rumania</option>
+          <option value="HU">Hungría</option>
+          <option value="CZ">Rep. Checa</option>
+          <option value="SK">Eslovaquia</option>
+          <option value="BG">Bulgaria</option>
+          <option value="HR">Croacia</option>
+          <option value="RS">Serbia</option>
+          <option value="GR">Grecia</option>
+          <option value="UA">Ucrania</option>
+          <option value="RU">Rusia</option>
+        </optgroup>
+        <optgroup label="Medio Oriente y África">
+          <option value="TR">Turquía</option>
+          <option value="IL">Israel</option>
+          <option value="AE">Emiratos Árabes</option>
+          <option value="SA">Arabia Saudita</option>
+          <option value="EG">Egipto</option>
+          <option value="MA">Marruecos</option>
+          <option value="NG">Nigeria</option>
+          <option value="ZA">Sudáfrica</option>
+          <option value="KE">Kenia</option>
+          <option value="GH">Ghana</option>
+          <option value="ET">Etiopía</option>
+          <option value="TZ">Tanzania</option>
+        </optgroup>
+        <optgroup label="Asia y Oceanía">
+          <option value="IN">India</option>
+          <option value="JP">Japón</option>
+          <option value="KR">Corea del Sur</option>
+          <option value="CN">China</option>
+          <option value="TW">Taiwán</option>
+          <option value="HK">Hong Kong</option>
+          <option value="SG">Singapur</option>
+          <option value="MY">Malasia</option>
+          <option value="ID">Indonesia</option>
+          <option value="PH">Filipinas</option>
+          <option value="TH">Tailandia</option>
+          <option value="VN">Vietnam</option>
+          <option value="PK">Pakistán</option>
+          <option value="BD">Bangladesh</option>
+          <option value="AU">Australia</option>
+          <option value="NZ">Nueva Zelanda</option>
+        </optgroup>
+      </select>
+
+      <label class="filter-label">Nivel</label>
+      <select id="cascade-depth" class="filter-select">
+        <option value="1">1 — Directo (~10 sitios, 1 crédito)</option>
+        <option value="2" selected>2 — Expandido (~100 sitios, ~11 créditos)</option>
+      </select>
+
+    </div>
+  </section>
+
+  <!-- Resultados -->
+  <section id="cascade-results" class="cascade-results">
+    <div class="cascade-empty">Ingresá un dominio semilla o seleccioná una keyword.</div>
+  </section>
+
+  <!-- Acciones masivas -->
+  <section id="cascade-actions" class="actions" style="display:none">
+    <div class="cascade-summary" id="cascade-summary"></div>
+    <button id="btn-push-all" class="btn btn-primary btn-full">🌐 Abrir seleccionados</button>
+    <div id="cascade-push-result" class="push-result"></div>
+  </section>
+
+</div>
+
+<!-- ====================================================
+     TAB: HISTORIAL
+     ==================================================== -->
+<div id="tab-history" class="tab-content">
+  <section class="card card-tight">
+    <div class="history-header">
+      <div class="card-title" style="margin:0"><span class="icon">🕐</span> Historial</div>
+      <button id="btn-clear-history" class="btn-link-sm">Limpiar</button>
+    </div>
+    <div id="history-stats" class="history-stats"></div>
+  </section>
+  <div id="history-list" class="history-list">
+    <div class="cascade-empty">No hay sitios analizados todavía.</div>
+  </div>
+</div>
+
+<!-- ====================================================
+     TAB: IMPORT
+     ==================================================== -->
+<div id="tab-import" class="tab-content">
+  <section class="card">
+    <div class="card-title">📥 Importar URLs desde Monday</div>
+    <p class="import-desc">Traé 15 URLs del board filtrando por Geo, Idioma y Tráfico. Se abren en tabs nuevas y quedan bloqueadas 60 días para que otro usuario no las reimporte.</p>
+
+    <div class="import-filters">
+      <div class="import-filter-row">
+        <span class="form-label">Geo</span>
+        <select id="import-geo" class="form-select">
+          <option value="">Todos</option>
+          <option>Argentina</option><option>México</option><option>Colombia</option>
+          <option>Chile</option><option>España</option><option>Brasil</option>
+          <option>Perú</option><option>Ecuador</option><option>Venezuela</option>
+          <option>Bolivia</option><option>Paraguay</option><option>Uruguay</option>
+          <option>Estados Unidos</option><option>Canadá</option>
+          <option>Reino Unido</option><option>Francia</option><option>Alemania</option>
+          <option>Italia</option><option>Portugal</option><option>Países Bajos</option>
+          <option>Bélgica</option><option>Suiza</option><option>Austria</option>
+          <option>Suecia</option><option>Noruega</option><option>Dinamarca</option>
+          <option>Finlandia</option><option>Polonia</option><option>Hungría</option>
+          <option>República Checa</option><option>Rumania</option><option>Grecia</option>
+          <option>Turquía</option><option>Israel</option><option>Emiratos Árabes</option>
+          <option>Arabia Saudita</option><option>Marruecos</option><option>Egipto</option>
+          <option>Nigeria</option><option>Sudáfrica</option>
+          <option>India</option><option>Japón</option><option>Corea del Sur</option>
+          <option>China</option><option>Singapur</option><option>Indonesia</option>
+          <option>Filipinas</option><option>Tailandia</option><option>Vietnam</option>
+          <option>Australia</option><option>Rusia</option><option>Ucrania</option>
+        </select>
+      </div>
+      <div class="import-filter-row">
+        <span class="form-label">Idioma</span>
+        <select id="import-idioma" class="form-select">
+          <option value="">Todos</option>
+          <option value="Ingles">Ingles</option>
+          <option value="Espanol">Espanol</option>
+          <option value="Italiano">Italiano</option>
+          <option value="Portugues">Portugues</option>
+          <option value="Frances">Frances</option>
+          <option value="Aleman">Aleman</option>
+          <option value="Arabe">Arabe</option>
+        </select>
+      </div>
+      <div class="import-filter-row">
+        <span class="form-label">Tráfico</span>
+        <select id="import-traffic" class="form-select">
+          <option value="0">Sin filtro</option>
+          <option value="500000">+500K</option>
+          <option value="1000000">+1M</option>
+          <option value="5000000">+5M</option>
+          <option value="10000000">+10M</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="btn-import-go" class="btn btn-primary btn-full" style="margin-top:12px">🚀 Importar 15 URLs</button>
+    <div id="import-result" class="push-result" style="margin-top:8px;min-height:16px"></div>
+  </section>
+
+  <div id="import-list" class="import-list"></div>
+</div>
+
+<!-- ====================================================
+     SETTINGS MODAL
+     ==================================================== -->
+<div id="settings-modal" class="modal" style="display:none">
+  <div class="modal-overlay" id="modal-overlay"></div>
+  <div class="modal-content">
+    <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>⚙️ Configuración</span>
+      <button id="btn-logout" class="btn-logout">Cerrar sesión</button>
+    </div>
+    <div id="settings-user" class="settings-user"></div>
+
+    <div class="settings-gmail-row">
+      <div class="settings-gmail-label">Gmail asociado</div>
+      <div class="settings-gmail-value">
+        <span id="settings-gmail-assoc" class="settings-gmail-email">—</span>
+        <button id="btn-dissoc-gmail" class="btn-dissoc" style="display:none" title="Desasociar esta cuenta de Gmail">Desasociar</button>
+      </div>
+      <div class="settings-gmail-hint">El primer envío asocia tu cuenta automáticamente. Solo esa cuenta puede enviar emails desde esta sesión.</div>
+    </div>
+
+    <div class="modal-actions">
+      <button id="btn-close-settings" class="btn btn-secondary">Cerrar</button>
+    </div>
+    <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">BASE DE KEYWORDS</div>
+      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">Importá un CSV con frases (una por línea). Se guardan en Supabase y rotan automáticamente en Cascada.</div>
+      <div style="display:flex; gap:6px; margin-bottom:6px; align-items:center">
+        <label class="btn btn-secondary btn-sm" style="cursor:pointer; margin:0">
+          📥 Importar CSV
+          <input id="settings-csv-input" type="file" accept=".csv,.txt" style="display:none" />
+        </label>
+        <button id="btn-kw-delete-all" class="btn btn-secondary btn-sm">🗑 Limpiar todo</button>
+        <span id="kw-db-count" style="font-size:11px; color:var(--text-muted)"></span>
+      </div>
+      <div id="kw-import-result" style="font-size:11px; color:#16a34a; min-height:14px;"></div>
+    </div>
+
+    <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">DIAGNÓSTICO DE APIs</div>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <input id="diag-domain" class="form-input" type="text" placeholder="dominio a testear (ej: bbc.com)" style="flex:1" />
+        <button id="btn-run-diag" class="btn btn-secondary btn-sm">▶ Testear</button>
+      </div>
+      <div id="diag-result" class="diag-result"></div>
+    </div>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<footer class="footer">
+  <span>ADEQ Media © 2025</span>
+  <span id="req-counter" class="cost-hint"></span>
+</footer>
+
+<script src="popup.js" type="module"></script>
+</body>
+</html>

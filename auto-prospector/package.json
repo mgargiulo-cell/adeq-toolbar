@@ -1,0 +1,17 @@
+{
+  "name": "adeq-auto-prospector",
+  "version": "1.0.0",
+  "description": "Servicio de autoprospección automática para ADEQ Media",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
