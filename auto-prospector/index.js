@@ -259,16 +259,33 @@ async function runSession(token, cfg, sessionStart) {
 async function main() {
   log("ADEQ Auto-Prospector iniciado.");
 
-  let token = await supabaseLogin();
-  let tokenExpiry = Date.now() + 55 * 60 * 1000; // renovar cada 55 min
+  // Reintentar login indefinidamente en lugar de crashear
+  let token = null;
+  let tokenExpiry = 0;
+  while (!token) {
+    try {
+      token = await supabaseLogin();
+      tokenExpiry = Date.now() + 55 * 60 * 1000;
+      log("Login exitoso.");
+    } catch (err) {
+      log(`⚠️ Login fallido: ${err.message} — reintentando en 60s...`);
+      await sleep(60_000);
+    }
+  }
 
   while (true) {
     try {
       // Renovar token si está por vencer
       if (Date.now() > tokenExpiry) {
-        token = await supabaseLogin();
-        tokenExpiry = Date.now() + 55 * 60 * 1000;
-        log("Token renovado.");
+        try {
+          token = await supabaseLogin();
+          tokenExpiry = Date.now() + 55 * 60 * 1000;
+          log("Token renovado.");
+        } catch (err) {
+          log(`⚠️ Error renovando token: ${err.message} — reintentando en 60s...`);
+          await sleep(60_000);
+          continue;
+        }
       }
 
       const cfg = await getConfig(token);
@@ -307,6 +324,7 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error("Error fatal:", err);
-  process.exit(1);
+  console.error("Error fatal inesperado:", err);
+  // No hacer process.exit — dejar que Railway decida
+  setTimeout(() => main(), 30_000);
 });
