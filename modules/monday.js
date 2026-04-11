@@ -23,7 +23,7 @@ async function mondayRequest(query) {
 }
 
 export async function checkDuplicate(domain) {
-  const domainClean = cleanDomain(domain);
+  const domainClean = cleanDomain(domain).replace(/"/g, "").replace(/\\/g, "");
   const query = `{
     boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
       items_page(limit: 500, query_params: {
@@ -65,17 +65,18 @@ export async function checkDuplicate(domain) {
 }
 
 export async function pushToMonday(data) {
-  const { domain, traffic, email, geo, pitch, estado, fecha, idioma } = data;
+  const { domain, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo } = data;
   const comentario = pitch ? `PITCH IA:\n${pitch}` : "";
 
   const safe     = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
   const itemName = domain.startsWith("www.") ? domain : `www.${domain}`;
 
   const columnValues = {
-    [CONFIG.MONDAY_COLUMNS.trafico]:     safe(String(traffic || "")),
-    [CONFIG.MONDAY_COLUMNS.email]:       safe(email || ""),
-    [CONFIG.MONDAY_COLUMNS.geo]:         safe(geo || ""),
-    [CONFIG.MONDAY_COLUMNS.comentarios]: safe(comentario),
+    [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
+    [CONFIG.MONDAY_COLUMNS.email]:         safe(email || ""),
+    [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
+    [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
+    ...(ejecutivo                                                         ? { [CONFIG.MONDAY_COLUMNS.ejecutivo_txt]: safe(ejecutivo) } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
     ...(idioma !== "" && idioma !== undefined ? { [CONFIG.MONDAY_COLUMNS.idioma]:        { index: parseInt(idioma) } } : {}),
@@ -93,16 +94,17 @@ export async function pushToMonday(data) {
   return result?.create_item;
 }
 
-export async function updateMonday({ itemId, traffic, email, geo, pitch, estado, fecha, idioma }) {
+export async function updateMonday({ itemId, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo }) {
   const comentario = pitch ? `PITCH IA:\n${pitch}` : "";
 
   const safe = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 
   const columnValues = {
-    [CONFIG.MONDAY_COLUMNS.trafico]:     safe(String(traffic || "")),
-    [CONFIG.MONDAY_COLUMNS.email]:       safe(email || ""),
-    [CONFIG.MONDAY_COLUMNS.geo]:         safe(geo || ""),
-    [CONFIG.MONDAY_COLUMNS.comentarios]: safe(comentario),
+    [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
+    [CONFIG.MONDAY_COLUMNS.email]:         safe(email || ""),
+    [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
+    [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
+    ...(ejecutivo                                                         ? { [CONFIG.MONDAY_COLUMNS.ejecutivo_txt]: safe(ejecutivo) } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
     ...(idioma !== "" && idioma !== undefined ? { [CONFIG.MONDAY_COLUMNS.idioma]:        { index: parseInt(idioma) } } : {}),

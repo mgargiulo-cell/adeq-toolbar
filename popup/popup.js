@@ -43,10 +43,10 @@ const state = {
   accessToken: "",
 };
 
-// Condiciones para auto-push
+// Auto-push conditions
 const autoPushReady = { traffic: false, notDup: false, email: false };
 
-// ── Sanitización HTML — previene XSS en innerHTML ─────────────
+// ── HTML sanitizer — prevents XSS in innerHTML ────────────────
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -55,6 +55,44 @@ function esc(s) {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#x27;");
 }
+
+// ── Input validation helpers ──────────────────────────────────
+function isValidEmail(email) {
+  return typeof email === "string" &&
+    /^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,}$/.test(email.trim());
+}
+
+function sanitizeDomain(domain) {
+  return (domain || "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/.*$/, "")
+    .replace(/[^a-z0-9.\-]/g, "")  // strip chars that can't be in a domain
+    .slice(0, 253);
+}
+
+// ── Client-side rate limiter ──────────────────────────────────
+// Prevents accidental API flooding. Soft limit: 60 calls / minute.
+const _rateLimiter = (() => {
+  const MAX = 60;
+  const WINDOW_MS = 60_000;
+  let timestamps = [];
+  return {
+    check() {
+      const now = Date.now();
+      timestamps = timestamps.filter(t => now - t < WINDOW_MS);
+      if (timestamps.length >= MAX) return false;
+      timestamps.push(now);
+      return true;
+    },
+    remaining() {
+      const now = Date.now();
+      timestamps = timestamps.filter(t => now - t < WINDOW_MS);
+      return Math.max(0, MAX - timestamps.length);
+    },
+  };
+})();
 
 // ── Caché de sesión (mismo dominio, distinta URL dentro del sitio) ──
 // Usa chrome.storage.session: persiste mientras el browser esté abierto.
@@ -111,7 +149,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // ── Cargar API keys desde Supabase (requiere JWT válido) ──
   const apiKeys = await fetchApiKeys(auth.accessToken);
   if (!apiKeys) {
-    showError("No se pudieron cargar las configuraciones. Verificá tu conexión o volvé a ingresar.");
+    showError("Could not load API configuration. Check your connection or sign in again.");
     return;
   }
   CONFIG.MONDAY_API_KEY = apiKeys.monday_api_key  || "";
@@ -127,7 +165,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
   if (!tab?.url || tab.url.startsWith("chrome://") || tab.url.startsWith("about:")) {
-    showError("Navega a un sitio web para usar la toolbar.");
+    showError("Navigate to a website to use the toolbar.");
     return;
   }
 
@@ -138,9 +176,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("site-url").textContent = state.domain;
   document.getElementById("cascade-seed").value   = state.domain;
 
-  const { mediaBuyer } = await chrome.storage.local.get("mediaBuyer");
-  state.mediaBuyer = mediaBuyer || state.mediaBuyer;
-
+  // mediaBuyer is derived from auth login — do NOT override from legacy storage key
   prefillMondayForm();
   initTabs();
   bindButtons();
@@ -148,11 +184,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   initAutopilot();
   // loadHistoryTab() ya NO carga aquí — se hace lazy al clickear el tab
 
-  // Gmail profile
-  getGmailProfile().then(profile => {
-    const fromEl = document.getElementById("gmail-from");
-    if (fromEl && profile?.email) fromEl.textContent = `Desde: ${profile.email}`;
-  });
+  // Show the toolbar login email as the Gmail "from" account
+  const fromEl = document.getElementById("gmail-from");
+  if (fromEl && state.loginEmail) fromEl.textContent = `From: ${state.loginEmail}`;
 
   // Follow-up check
   getSendInfo(state.domain).then(info => {
@@ -213,24 +247,25 @@ document.addEventListener("DOMContentLoaded", async () => {
 // ============================================================
 // Códigos de país de SimilarWeb → texto del select #form-geo
 const GEO_LABEL = {
-  US:"Estados Unidos",GB:"Reino Unido",AR:"Argentina",MX:"México",CO:"Colombia",
-  CL:"Chile",ES:"España",BR:"Brasil",FR:"Francia",DE:"Alemania",IT:"Italia",
-  PT:"Portugal",NL:"Países Bajos",BE:"Bélgica",CH:"Suiza",AT:"Austria",
-  PL:"Polonia",HU:"Hungría",CZ:"República Checa",RO:"Rumania",GR:"Grecia",
-  TR:"Turquía",IL:"Israel",AE:"Emiratos Árabes",SA:"Arabia Saudita",
-  MA:"Marruecos",EG:"Egipto",IN:"India",JP:"Japón",KR:"Corea del Sur",
-  AU:"Australia",CA:"Canadá",SE:"Suecia",NO:"Noruega",DK:"Dinamarca",
-  FI:"Finlandia",VN:"Vietnam",TH:"Tailandia",ID:"Indonesia",PH:"Filipinas",
-  CN:"China",SG:"Singapur",ZA:"Sudáfrica",NG:"Nigeria",PE:"Perú",
+  US:"United States",GB:"United Kingdom",AR:"Argentina",MX:"Mexico",CO:"Colombia",
+  CL:"Chile",ES:"Spain",BR:"Brazil",FR:"France",DE:"Germany",IT:"Italy",
+  PT:"Portugal",NL:"Netherlands",BE:"Belgium",CH:"Switzerland",AT:"Austria",
+  PL:"Poland",HU:"Hungary",CZ:"Czech Republic",RO:"Romania",GR:"Greece",
+  TR:"Turkey",IL:"Israel",AE:"UAE",SA:"Saudi Arabia",
+  MA:"Morocco",EG:"Egypt",IN:"India",JP:"Japan",KR:"South Korea",
+  AU:"Australia",CA:"Canada",SE:"Sweden",NO:"Norway",DK:"Denmark",
+  FI:"Finland",VN:"Vietnam",TH:"Thailand",ID:"Indonesia",PH:"Philippines",
+  CN:"China",SG:"Singapore",ZA:"South Africa",NG:"Nigeria",PE:"Peru",
   EC:"Ecuador",VE:"Venezuela",BO:"Bolivia",PY:"Paraguay",UY:"Uruguay",
-  RU:"Rusia",UA:"Ucrania",
+  RU:"Russia",UA:"Ukraine",
 };
 
-// Código de idioma (2 letras) → value del select #form-idioma
-const LANG_TO_IDIOMA = { en:"0", es:"1", it:"2", pt:"3", fr:"4", de:"5", ar:"6" };
-// TLD del dominio como fallback de idioma
+// 2-letter language code → #form-idioma value (matches Monday column indexes)
+// Supported: English(0), Spanish(1), Italian(2), Portuguese(3), Arabic(6)
+const LANG_TO_IDIOMA = { en:"0", es:"1", it:"2", pt:"3", ar:"6" };
+// Domain TLD fallback for language detection
 const TLD_TO_LANG = { es:"es",mx:"es",ar:"es",co:"es",cl:"es",pe:"es",uy:"es",py:"es",bo:"es",
-  br:"pt",pt:"pt",fr:"fr",de:"de",at:"de",it:"it",ar2:"ar" };
+  br:"pt",pt:"pt",it:"it" };
 
 function detectLangFromDomain(domain) {
   const tld = (domain || "").split(".").pop()?.toLowerCase();
@@ -316,14 +351,12 @@ function fillMondayFormFromDuplicate(dup) {
   if (dup.idioma) {
     const sel = document.getElementById("form-idioma");
     const raw = dup.idioma.trim().toLowerCase();
-    // Monday puede devolver el label en español o inglés — cubrir ambos
+    // Map Monday label (Spanish or English) → select value (index)
     const MONDAY_IDIOMA = {
       "ingles": "0", "inglés": "0", "english": "0",
       "espanol": "1", "español": "1", "spanish": "1",
       "italiano": "2", "italian": "2",
       "portugues": "3", "portugués": "3", "portuguese": "3",
-      "frances": "4", "francés": "4", "french": "4",
-      "aleman": "5", "alemán": "5", "german": "5",
       "arabe": "6", "árabe": "6", "arabic": "6",
     };
     const mapped = MONDAY_IDIOMA[raw];
@@ -362,11 +395,11 @@ function initTabs() {
         loadedTabs.add(tabId);
         if (tabId === "history") {
           const listEl = document.getElementById("history-list");
-          if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Cargando historial...</div>';
+          if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading history...</div>';
           await loadHistoryTab().catch(e => {
             console.error("[History]", e);
             const listEl = document.getElementById("history-list");
-            if (listEl) listEl.innerHTML = '<div class="cascade-empty">Error al cargar historial.</div>';
+            if (listEl) listEl.innerHTML = '<div class="cascade-empty">Error loading history.</div>';
           });
         }
       }
@@ -397,7 +430,7 @@ async function runDuplicateCheck() {
       el.className   = "status-badge duplicate";
       state.mondayItemId = result.itemId;
       fillMondayFormFromDuplicate(result);
-      document.getElementById("btn-push-monday").textContent = "🔄 Actualizar en Monday";
+      document.getElementById("btn-push-monday").textContent = "🔄 Update in Monday";
     } else {
       el.textContent = "✅ Nuevo prospecto";
       el.className   = "status-badge new";
@@ -407,7 +440,7 @@ async function runDuplicateCheck() {
     // Detectar idioma siempre (nuevo y duplicado) para el pitch
     autoDetectPageLanguage();
   } catch {
-    el.textContent = "⚠️ Error Monday API";
+    el.textContent = "⚠️ Monday API error";
     el.className   = "status-badge";
   }
 }
@@ -473,8 +506,8 @@ async function autoDetectPageLanguage() {
   const pitchLangSel = document.getElementById("pitch-language");
   if (pitchLangSel) pitchLangSel.value = lang;
 
-  // Autoseleccionar en el selector de Monday
-  const MAP = { en:"0", es:"1", it:"2", pt:"3", fr:"4", de:"5", ar:"6" };
+  // Auto-select in Monday language selector (supported langs only)
+  const MAP = { en:"0", es:"1", it:"2", pt:"3", ar:"6" };
   const index = MAP[lang];
   if (index !== undefined) {
     const sel = document.getElementById("form-idioma");
@@ -499,8 +532,8 @@ async function runTrafficCheck() {
       data = await getTraffic(state.domain);
     }
     if (!data) {
-      metricEl.textContent = "Sin datos"; metricEl.className = "metric";
-      filterEl.textContent = "Configura tu RapidAPI key"; filterEl.className = "filter-tag fail";
+      metricEl.textContent = "No data"; metricEl.className = "metric";
+      filterEl.textContent = "Configure your RapidAPI key"; filterEl.className = "filter-tag fail";
       return;
     }
 
@@ -519,14 +552,14 @@ async function runTrafficCheck() {
 
     if (data.noPageViewData) {
       metricEl.textContent = formatTraffic(state.visits);
-      if (unitEl) unitEl.textContent = "visitas/mes";
-      const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Caché · hace ${data.cachedDaysAgo}d</span>` : "";
-      breakdownEl.innerHTML = `<span class="no-pageview-note">Sin dato de páginas vistas</span>${cacheStr}`;
+      if (unitEl) unitEl.textContent = "visits/mo";
+      const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
+      breakdownEl.innerHTML = `<span class="no-pageview-note">No page-view data</span>${cacheStr}`;
     } else {
       metricEl.textContent = formatTraffic(state.traffic);
-      if (unitEl) unitEl.textContent = "págs/mes";
-      const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Caché · hace ${data.cachedDaysAgo}d</span>` : "";
-      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visitas × ${data.pagesPerVisit} p/v${cacheStr}`;
+      if (unitEl) unitEl.textContent = "pages/mo";
+      const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
+      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ${data.pagesPerVisit} p/v${cacheStr}`;
     }
     metricEl.className = "metric";
 
@@ -606,7 +639,7 @@ async function runBannerDetection() {
       el.textContent = `Error: ${result.error}`;
       el.className   = "banner-result";
     } else if (!result.total) {
-      el.textContent = "No se detectaron formatos publicitarios";
+      el.textContent = "No ad formats detected";
       el.className   = "banner-result";
     } else {
       el.className = "banner-result";
@@ -625,7 +658,7 @@ async function runBannerDetection() {
       }
     }
   } catch {
-    el.textContent = "Error en detección"; el.className = "banner-result";
+    el.textContent = "Detection error"; el.className = "banner-result";
   }
   if (btn) { btn.disabled = false; btn.textContent = "↻ Actualizar"; }
 }
@@ -774,7 +807,7 @@ function checkFUStatus(sendInfo) {
 
   if (fuNumber) {
     const days = Math.floor((Date.now() - new Date(sendInfo.sendDate)) / 86_400_000);
-    textEl.textContent         = `⏰ FU${fuNumber} pendiente — enviaste el pitch hace ${days} días`;
+    textEl.textContent         = `⏰ FU${fuNumber} pending — you sent the pitch ${days} days ago`;
     banner.dataset.fuNumber    = fuNumber;
     banner.style.display       = "flex";
   }
@@ -800,7 +833,7 @@ function renderEmailList(emails) {
 
   if (!mondayEmail && suggested.length === 0) {
     resultEl.style.display = "block";
-    resultEl.textContent   = "No encontrado — usá Apollo o Gemini";
+    resultEl.textContent   = "Not found — try Apollo or Gemini";
     resultEl.className     = "email-value";
     listEl.style.display   = "none";
     return;
@@ -867,19 +900,19 @@ async function verifyCurrentEmail() {
 
   if (!result.valid || tags.includes("typo") || tags.includes("descartable") ||
       tags.includes("sin-dns") || tags.includes("sin-mx")) {
-    badge.textContent = "✖ Inválido";
+    badge.textContent = "✖ Invalid";
     badge.className   = "verify-badge fail";
     badge.title       = result.reason + (result.suggestion ? ` → ${result.suggestion}` : "");
   } else if (tags.includes("rol")) {
-    badge.textContent = "⚠ Válido General";
+    badge.textContent = "⚠ Role Address";
     badge.className   = "verify-badge unknown";
     badge.title       = result.reason;
   } else if (result.valid) {
-    badge.textContent = "✔ Válido";
+    badge.textContent = "✔ Valid";
     badge.className   = "verify-badge ok";
     badge.title       = result.reason;
   } else {
-    badge.textContent = "✖ Inválido";
+    badge.textContent = "✖ Invalid";
     badge.className   = "verify-badge fail";
     badge.title       = result.reason;
   }
@@ -928,18 +961,18 @@ function bindButtons() {
     const btn      = document.getElementById("btn-gemini-email");
     const resultEl = document.getElementById("apollo-result");
     btn.disabled   = true; btn.textContent = "⏳...";
-    resultEl.textContent = "Consultando Gemini...";
+    resultEl.textContent = "Querying Gemini...";
     const result = await searchEmailsWithGemini(state.domain);
     if (result.emails?.length > 0) {
       state.emails = [...new Set([...result.emails, ...state.emails])];
       setEmail(result.emails[0]);
-      resultEl.textContent = result.owner ? `Dueño: ${result.owner}` : "";
+      resultEl.textContent = result.owner ? `Owner: ${result.owner}` : "";
       if (result.linkedin) showLinkedIn(result.linkedin);
       autoPushReady.email = true;
       checkAutoPush();
       updateScore();
     } else {
-      resultEl.textContent = result.note || "No se encontraron emails públicos para este sitio";
+      resultEl.textContent = result.note || "No public emails found for this site";
     }
     btn.disabled = false; btn.textContent = "🤖 Gemini";
   });
@@ -1036,7 +1069,7 @@ function bindButtons() {
     const dislikeBtn = document.getElementById("btn-pitch-dislike");
     const likeStatus = document.getElementById("pitch-like-status");
     const ta         = document.getElementById("pitch-text");
-    btn.disabled = true; btn.textContent = "⏳ Generando..."; ta.value = "";
+    btn.disabled = true; btn.textContent = "⏳ Generating..."; ta.value = "";
     likeBtn.style.display = "none"; dislikeBtn.style.display = "none";
     likeStatus.textContent = "";
     const chipsEl = document.getElementById("pitch-subjects");
@@ -1137,7 +1170,7 @@ function bindButtons() {
         <div class="autopush-step">✅ Asunto pre-completado</div>
         <div class="autopush-step">→ Revisá el form y enviá con los botones de abajo</div>
       `;
-      btn.textContent = "✅ Listo — revisá y enviá";
+      btn.textContent = "✅ Ready — review and send";
     } catch (err) {
       btn.disabled = false; btn.textContent = "⚡ Preparar todo";
     }
@@ -1171,12 +1204,13 @@ function bindButtons() {
   function getMondayFormValues() {
     const fechaDisplay = document.getElementById("form-fecha").value.trim();
     return {
-      email:  document.getElementById("form-email").value.trim(),
-      geo:    document.getElementById("form-geo").value,
-      idioma: document.getElementById("form-idioma").value,
-      estado: document.getElementById("form-estado").value,
-      fecha:  toIsoDate(fechaDisplay), // Monday espera YYYY-MM-DD
-      pitch:  document.getElementById("pitch-text").value.trim(),
+      email:     document.getElementById("form-email").value.trim(),
+      geo:       document.getElementById("form-geo").value,
+      idioma:    document.getElementById("form-idioma").value,
+      estado:    document.getElementById("form-estado").value,
+      ejecutivo: document.getElementById("form-ejecutivo").value,
+      fecha:     toIsoDate(fechaDisplay),
+      pitch:     document.getElementById("pitch-text").value.trim(),
     };
   }
 
@@ -1188,11 +1222,11 @@ function bindButtons() {
     const changed = Object.keys(snap).some(k => cur[k] !== snap[k]);
     if (changed) {
       btn.disabled    = false;
-      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en Monday" : "🚀 Enviar a Monday";
+      btn.textContent = state.duplicate?.found ? "🔄 Update in Monday" : "🚀 Send to Monday";
       btn.classList.remove("btn-sent");
     } else {
       btn.disabled    = true;
-      btn.textContent = "✅ Ya en Monday";
+      btn.textContent = "✅ Already in Monday";
       btn.classList.add("btn-sent");
     }
   }
@@ -1207,26 +1241,35 @@ function bindButtons() {
   document.getElementById("btn-push-monday").addEventListener("click", async () => {
     const btn    = document.getElementById("btn-push-monday");
     const res    = document.getElementById("push-result");
-    const { email, geo, idioma, estado, fecha, pitch } = getMondayFormValues();
+    const { email, geo, idioma, estado, fecha, pitch, ejecutivo } = getMondayFormValues();
 
-    btn.disabled = true; btn.textContent = "⏳ Enviando..."; res.textContent = "";
+    // Rate limit check
+    if (!_rateLimiter.check()) {
+      res.textContent = "⚠️ Too many requests — please wait a moment"; res.className = "push-result error"; return;
+    }
+    // Validate email if provided
+    if (email && !isValidEmail(email)) {
+      res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return;
+    }
+
+    btn.disabled = true; btn.textContent = "⏳ Sending..."; res.textContent = "";
 
     try {
       if (state.duplicate?.found && state.mondayItemId) {
         await updateMonday({
           itemId: state.mondayItemId,
           traffic: formatTraffic(state.traffic),
-          email, geo, idioma, pitch, estado, fecha,
+          email, geo, idioma, pitch, estado, fecha, ejecutivo,
         });
-        res.textContent = "✅ Actualizado en Monday"; res.className = "push-result ok";
+        res.textContent = "✅ Updated in Monday"; res.className = "push-result ok";
       } else {
         const item = await pushToMonday({
           domain: state.domain,
           traffic: formatTraffic(state.traffic),
-          email, geo, idioma, pitch, estado, fecha,
+          email, geo, idioma, pitch, estado, fecha, ejecutivo,
         });
         state.mondayItemId = item?.id;
-        res.textContent = `✅ Creado: ${item?.name || state.domain}`; res.className = "push-result ok";
+        res.textContent = `✅ Created: ${item?.name || state.domain}`; res.className = "push-result ok";
 
         // Actualizar caché de sesión: ahora sí es duplicado para futuras subpáginas
         state.duplicate = { found: true, itemId: item?.id, status: "", ejecutivo: state.mediaBuyer, email, geo };
@@ -1267,7 +1310,7 @@ function bindButtons() {
     } catch (err) {
       res.textContent = `❌ ${err.message}`; res.className = "push-result error";
       btn.disabled    = false;
-      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en Monday" : "🚀 Enviar a Monday";
+      btn.textContent = state.duplicate?.found ? "🔄 Update in Monday" : "🚀 Send to Monday";
     }
   });
 
@@ -1281,76 +1324,53 @@ function bindButtons() {
     const subject = document.getElementById("form-subject").value.trim() ||
                     `Partnership opportunity — ${state.domain}`;
 
-    if (!email || !email.includes("@")) {
-      res.textContent = "❌ Ingresá un email primero"; res.className = "push-result error"; return;
+    if (!isValidEmail(email)) {
+      res.textContent = "❌ Enter a valid email first"; res.className = "push-result error"; return;
     }
     if (!pitch) {
-      res.textContent = "❌ Generá el pitch primero"; res.className = "push-result error"; return;
+      res.textContent = "❌ Generate the pitch first"; res.className = "push-result error"; return;
+    }
+    if (!_rateLimiter.check()) {
+      res.textContent = "⚠️ Too many requests — please wait a moment"; res.className = "push-result error"; return;
     }
 
-    btn.disabled = true; btn.textContent = "⏳ Verificando cuenta...";
+    btn.disabled = true; btn.textContent = "⏳ Authenticating...";
 
-    // ── Verificación / asociación Gmail (interactive = true para disparar OAuth si es necesario) ─
-    const gmailProfile = await getGmailProfile(true);
-    const activeGmail  = gmailProfile?.email || null;
+    // ── Fetch Gmail signature (will trigger OAuth window if no cached token) ──
+    btn.textContent = "⏳ Preparing...";
+    const gmailSig = await getGmailSignature(state.loginEmail);
 
-    if (!activeGmail) {
-      const oauthErr = await new Promise(r => chrome.identity.getAuthToken({ interactive: true }, (t) => r(chrome.runtime.lastError?.message || null)));
-      res.textContent = `❌ Gmail OAuth: ${oauthErr || "token nulo sin error registrado"}`;
-      res.className = "push-result error"; btn.disabled = false; btn.textContent = "📧 Enviar por Gmail"; return;
-    }
+    let bodyToSend = pitch.replace(/\n*Best,[\s\S]*$/i, "").trimEnd();
+    bodyToSend = gmailSig ? bodyToSend + "\n\n" + gmailSig : bodyToSend;
 
-    const stored = await getGmailAssociation(state.loginEmail);
-
-    if (!stored) {
-      // Primera vez — guardar la asociación automáticamente
-      await saveGmailAssociation(state.loginEmail, activeGmail);
-      state.gmailEmail = activeGmail;
-      const fromEl = document.getElementById("gmail-from");
-      if (fromEl) fromEl.textContent = `Desde: ${activeGmail}`;
-      const assocEl = document.getElementById("settings-gmail-assoc");
-      if (assocEl) assocEl.textContent = activeGmail;
-    } else if (stored !== activeGmail) {
-      // Cuenta activa no coincide con la asociada
-      res.textContent = `❌ Tu Gmail activo (${activeGmail}) no coincide con la cuenta registrada (${stored}). Cambiá la cuenta de Chrome o desasociá desde Configuración.`;
-      res.className = "push-result error"; btn.disabled = false; btn.textContent = "📧 Enviar por Gmail"; return;
-    }
-
-    // ── Firma Gmail: reutiliza el token ya obtenido para evitar doble OAuth ─
-    btn.textContent = "⏳ Preparando...";
-    const gmailToken = await getGmailToken(true);
-    const gmailSig   = gmailToken ? await getGmailSignature(gmailToken) : "";
-    let bodyToSend   = pitch.replace(/\n*Best,[\s\S]*$/i, "").trimEnd();
-    bodyToSend = gmailSig
-      ? bodyToSend + "\n\n" + gmailSig
-      : bodyToSend;
-
-    btn.textContent = "⏳ Enviando...";
-    const result = await sendEmail({ to: email, subject, body: bodyToSend });
+    btn.textContent = "⏳ Sending...";
+    const result = await sendEmail({ to: email, subject, body: bodyToSend, loginEmail: state.loginEmail });
 
     if (result.ok) {
-      const today              = new Date().toISOString().split("T")[0];
+      const today = new Date().toISOString().split("T")[0];
       const { fu1Date, fu2Date } = await saveSendDate(state.domain, {
         sendDate: today,
-        pitch:    pitch,
+        pitch,
         email,
       });
-      // Actualizar fechas FU en Monday si tenemos item ID
-      if (state.mondayItemId) {
-        setFollowUpDates(state.mondayItemId, fu1Date, fu2Date);
-      }
-      // Detectar si es FU y marcar como enviado
+      if (state.mondayItemId) setFollowUpDates(state.mondayItemId, fu1Date, fu2Date);
       const fuNumber = parseInt(document.getElementById("fu-banner")?.dataset?.fuNumber || "0");
       if (fuNumber) {
         markFUSent(state.domain, fuNumber);
         document.getElementById("fu-banner").style.display = "none";
       }
-      res.textContent = `✅ Email enviado · FU1: ${fu1Date} · FU2: ${fu2Date}`;
+      // Update "From" label with the actual Gmail account used
+      const fromEl = document.getElementById("gmail-from");
+      if (fromEl) fromEl.textContent = `From: ${state.loginEmail}`;
+      const assocEl = document.getElementById("settings-gmail-assoc");
+      if (assocEl) assocEl.textContent = state.loginEmail;
+
+      res.textContent = `✅ Email sent · FU1: ${fu1Date} · FU2: ${fu2Date}`;
       res.className   = "push-result ok";
-      btn.textContent = "✅ Enviado";
+      btn.textContent = "✅ Sent";
     } else {
       res.textContent = `❌ ${result.error}`; res.className = "push-result error";
-      btn.disabled    = false; btn.textContent = "📧 Enviar por Gmail";
+      btn.disabled    = false; btn.textContent = "📧 Send via Gmail";
     }
   });
 
@@ -1380,7 +1400,7 @@ function bindButtons() {
     const idioma     = document.getElementById("import-idioma").value;
     const minTraffic = parseInt(document.getElementById("import-traffic").value) || 0;
 
-    btn.disabled = true; btn.textContent = "⏳ Consultando Monday...";
+    btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
     resultEl.textContent = ""; resultEl.className = "push-result";
     listEl.innerHTML = "";
 
@@ -1395,8 +1415,8 @@ function bindButtons() {
 
       if (selected.length === 0) {
         resultEl.textContent = candidates.length === 0
-          ? "No se encontraron URLs con esos filtros en Monday."
-          : `Todas las URLs disponibles (${candidates.length}) ya fueron importadas. Disponibles de nuevo en los próximos días.`;
+          ? "No URLs found with those filters in Monday."
+          : `All available URLs (${candidates.length}) have already been imported. They will be available again in the coming days.`;
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "🚀 Importar 15 URLs";
         return;
@@ -1421,7 +1441,7 @@ function bindButtons() {
         setTimeout(() => chrome.tabs.create({ url: item.url, active: false }), i * 400);
       });
 
-      resultEl.textContent = `✅ ${selected.length} tabs abiertas · bloqueadas 60 días · ${candidates.length - selected.length} restantes con estos filtros`;
+      resultEl.textContent = `✅ ${selected.length} tabs opened · blocked 60 days · ${candidates.length - selected.length} remaining with these filters`;
 
     } catch (err) {
       resultEl.textContent = `❌ Error: ${err.message}`;
@@ -1543,7 +1563,7 @@ async function initKeywords() {
       filterKeywords(); // sin búsqueda → rotación normal
       return;
     }
-    document.getElementById("keywords-list").innerHTML = '<span class="kw-empty">Buscando...</span>';
+    document.getElementById("keywords-list").innerHTML = '<span class="kw-empty">Searching...</span>';
     kwSearchTimer = setTimeout(runKeywordSearch, 350);
   });
   startKwRotation();
@@ -1683,12 +1703,12 @@ async function loadHistoryTab() {
 
   statsEl.innerHTML = `
     <div class="stat-summary-row">
-      <span class="stat-summary-total">Total histórico: <strong>${hs.total}</strong></span>
-      <span class="stat-summary-month">${monthTotal} analizados · ${mesLabel}</span>
+      <span class="stat-summary-total">All-time total: <strong>${hs.total}</strong></span>
+      <span class="stat-summary-month">${monthTotal} analyzed · ${mesLabel}</span>
     </div>
 
     <div class="stat-category-block">
-      <div class="stat-cat-header stat-cat-new">📗 Nuevos <span class="stat-cat-count">${monthNew}</span></div>
+      <div class="stat-cat-header stat-cat-new">📗 New <span class="stat-cat-count">${monthNew}</span></div>
       <div class="stat-grid">
         <div class="stat-card stat-card--qual">
           <span class="sc-num">${monthNewQual}</span>
@@ -1709,7 +1729,7 @@ async function loadHistoryTab() {
     </div>
 
     <div class="stat-category-block">
-      <div class="stat-cat-header stat-cat-dup">🔵 Repetidos <span class="stat-cat-count">${monthDups}</span></div>
+      <div class="stat-cat-header stat-cat-dup">🔵 Duplicates <span class="stat-cat-count">${monthDups}</span></div>
       <div class="stat-grid">
         <div class="stat-card stat-card--qual">
           <span class="sc-num">${monthDupQual}</span>
@@ -1730,7 +1750,7 @@ async function loadHistoryTab() {
     </div>
 
     <div class="stat-category-block">
-      <div class="stat-cat-header stat-cat-below">🔻 &lt;400K total <span class="stat-cat-count">${monthBelow}</span></div>
+      <div class="stat-cat-header stat-cat-below">🔻 Below 400K <span class="stat-cat-count">${monthBelow}</span></div>
       <div class="stat-grid">
         <div class="stat-card ${monthMondayBelow > 0 ? "stat-card--warn" : "stat-card--neutral"}">
           <span class="sc-num">${monthMondayBelow}</span>
@@ -1778,7 +1798,7 @@ async function loadHistoryTab() {
     if (end < history.length) {
       const moreBtn = document.createElement("button");
       moreBtn.className   = "btn-history-more";
-      moreBtn.textContent = `Ver más (${history.length - end} restantes)`;
+      moreBtn.textContent = `Show more (${history.length - end} remaining)`;
       moreBtn.addEventListener("click", () => { historyPage++; renderHistoryPage(); });
       listEl.appendChild(moreBtn);
     }
@@ -1852,7 +1872,7 @@ async function startCascade() {
   const CASCADE_LIMIT = 15;
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días)
-  statusEl.textContent = "Consultando Monday...";
+  statusEl.textContent = "Querying Monday...";
   const boardIndex = await getMondayBoardIndex();
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - 45);
@@ -1900,7 +1920,7 @@ async function startCascade() {
 
   try {
     if (depth === 1) {
-      statusEl.textContent = "Buscando sitios similares...";
+      statusEl.textContent = "Searching similar sites...";
       const sites = await getSimilarSites(seed);
       for (const s of sites.filter(passesFilters)) {
         if (!addResult(s)) break;
@@ -1910,7 +1930,7 @@ async function startCascade() {
     }
 
     if (cascadeResults.length === 0) {
-      resultsEl.innerHTML = '<div class="cascade-empty">No se encontraron prospectos con esos filtros.</div>';
+      resultsEl.innerHTML = '<div class="cascade-empty">No prospects found with those filters.</div>';
     } else {
       const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (límite ${CASCADE_LIMIT})` : "";
       statusEl.textContent = `✅ ${cascadeResults.length} prospectos${limitMsg}${filteredCount ? ` · ${filteredCount} filtrados` : ""}`;
@@ -1970,11 +1990,11 @@ function openCascadeSelected() {
   const toOpen = cascadeResults.filter(s => cascadeSelected.has(s.domain));
 
   if (toOpen.length === 0) {
-    result.textContent = "Seleccioná al menos un sitio"; result.className = "push-result error"; return;
+    result.textContent = "Select at least one site"; result.className = "push-result error"; return;
   }
 
   toOpen.forEach(site => chrome.tabs.create({ url: `https://${site.domain}`, active: false }));
-  result.textContent = `✅ ${toOpen.length} sitios abiertos en nuevas pestañas`;
+  result.textContent = `✅ ${toOpen.length} sites opened in new tabs`;
   result.className   = "push-result ok";
 }
 
@@ -1986,7 +2006,10 @@ async function clearSupabaseHistory() {
 }
 
 function extractDomain(url) {
-  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return url; }
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, "");
+    return sanitizeDomain(hostname);
+  } catch { return sanitizeDomain(url); }
 }
 
 function countryFlag(code) {
@@ -2067,8 +2090,8 @@ async function runDiagnostic() {
 
   btn.disabled = true; btn.textContent = "⏳";
   resEl.innerHTML = `
-    <div class="diag-row"><span class="diag-label">SimilarWeb</span><span class="diag-loading">Consultando...</span></div>
-    <div class="diag-row"><span class="diag-label">Apollo</span><span class="diag-loading">Consultando...</span></div>
+    <div class="diag-row"><span class="diag-label">SimilarWeb</span><span class="diag-loading">Testing...</span></div>
+    <div class="diag-row"><span class="diag-label">Apollo</span><span class="diag-loading">Testing...</span></div>
   `;
 
   // ── Test SimilarWeb ────────────────────────────────────────
@@ -2086,8 +2109,8 @@ async function runDiagnostic() {
       const quota     = remaining != null ? ` · ${remaining}/${limit} restantes` : "";
       if (!r.ok) return { ok: false, msg: `HTTP ${r.status}${quota}` };
       const d = await r.json();
-      if (d.error || !d.Visits) return { ok: false, msg: `Sin datos para ${domain}${quota}` };
-      return { ok: true, msg: `${Math.round(d.Visits / 1000)}K visitas/mes${quota}` };
+      if (d.error || !d.Visits) return { ok: false, msg: `No data for ${domain}${quota}` };
+      return { ok: true, msg: `${Math.round(d.Visits / 1000)}K visits/mo${quota}` };
     } catch (e) {
       return { ok: false, msg: e.message };
     }
@@ -2181,21 +2204,20 @@ function initLoginScreen() {
     };
 
     if (!AUTHORIZED[email]) {
-      errorEl.textContent = "Email no autorizado";
+      errorEl.textContent = "Unauthorized email";
       return;
     }
     if (!password) {
-      errorEl.textContent = "Ingresá tu contraseña";
+      errorEl.textContent = "Enter your password";
       return;
     }
 
-    btn.disabled = true; btn.textContent = "⏳ Verificando...";
+    btn.disabled = true; btn.textContent = "⏳ Signing in...";
 
-    // Verificación real contra Supabase Auth (server-side)
     const result = await supabaseSignIn(email, password);
     if (result.error) {
       errorEl.textContent = result.error;
-      btn.disabled = false; btn.textContent = "Ingresar";
+      btn.disabled = false; btn.textContent = "Sign In";
       return;
     }
 

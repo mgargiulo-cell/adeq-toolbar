@@ -22,17 +22,18 @@ export const CONFIG = {
   // ── Monday columns (estructura, no secretos) ──────────────────
   MONDAY_BOARDS: { prospectos: "1420268379" },
   MONDAY_COLUMNS: {
-    nombre:         "name",
-    estado:         "deal_stage",
-    ejecutivo:      "deal_owner",
-    fecha_contacto: "deal_close_date",
-    fecha_fu1:      "fecha2",
-    fecha_fu2:      "fecha_1",
-    geo:            "texto6",
-    trafico:        "texto7",
-    idioma:         "estado_12",
-    comentarios:    "texto",
-    email:          "text_mkrwahsz",
+    nombre:          "name",
+    estado:          "deal_stage",
+    ejecutivo:       "deal_owner",
+    ejecutivo_txt:   "text_mksnnqxj",   // plain-text owner column (writable)
+    fecha_contacto:  "deal_close_date",
+    fecha_fu1:       "fecha2",
+    fecha_fu2:       "fecha_1",
+    geo:             "texto6",
+    trafico:         "texto7",
+    idioma:          "estado_12",
+    comentarios:     "texto",
+    email:           "text_mkrwahsz",
   },
 
   // ── General ────────────────────────────────────────────────────

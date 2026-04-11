@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -17,11 +17,11 @@
       <span class="logo-text">ADEQ</span>
       <span class="logo-sub">TOOLBAR</span>
     </div>
-    <p class="login-subtitle">Acceso exclusivo ADEQ Media</p>
-    <input id="login-email"    class="form-input" type="email"    placeholder="usuario@adeqmedia.com" autocomplete="email" />
-    <input id="login-password" class="form-input" type="password" placeholder="Contraseña" autocomplete="current-password" style="margin-top:8px" />
+    <p class="login-subtitle">ADEQ Media — Authorized Access Only</p>
+    <input id="login-email"    class="form-input" type="email"    placeholder="user@adeqmedia.com" autocomplete="email" />
+    <input id="login-password" class="form-input" type="password" placeholder="Password" autocomplete="current-password" style="margin-top:8px" />
     <div id="login-error" class="login-error"></div>
-    <button id="btn-login" class="btn btn-primary btn-full" style="margin-top:14px">Ingresar</button>
+    <button id="btn-login" class="btn btn-primary btn-full" style="margin-top:14px">Sign In</button>
   </div>
 </div>
 
@@ -32,41 +32,41 @@
     <span class="logo-sub">TOOLBAR</span>
   </div>
   <div class="header-right">
-    <div id="site-url" class="site-url">cargando...</div>
-    <button id="btn-autopilot" class="autopilot-btn" title="Activar/desactivar autoprospección">
+    <div id="site-url" class="site-url">loading...</div>
+    <button id="btn-autopilot" class="autopilot-btn" title="Enable/disable auto-prospecting">
       <span class="autopilot-dot"></span>
       <span class="autopilot-label">AUTO</span>
     </button>
-    <button id="btn-refresh" class="icon-btn" title="Analizar pestaña actual">↻</button>
-    <button id="btn-settings" class="icon-btn" title="Configuración">⚙</button>
+    <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab">↻</button>
+    <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
   </div>
 </header>
 
 <!-- TABS -->
 <nav class="tabs">
-  <button class="tab-btn active" data-tab="core">🔍 Análisis</button>
-  <button class="tab-btn" data-tab="cascade">🌊 Cascada</button>
-  <button class="tab-btn" data-tab="history">🕐 Historial</button>
+  <button class="tab-btn active" data-tab="core">🔍 Analysis</button>
+  <button class="tab-btn" data-tab="cascade">🌊 Cascade</button>
+  <button class="tab-btn" data-tab="history">🕐 History</button>
   <button class="tab-btn" data-tab="import">📥 Import</button>
 </nav>
 
 <!-- ====================================================
-     TAB: ANÁLISIS
+     TAB: ANALYSIS
      ==================================================== -->
 <div id="tab-core" class="tab-content active">
 
-  <!-- BANNER FOLLOW-UP (condicional) -->
+  <!-- FOLLOW-UP BANNER (conditional) -->
   <div id="fu-banner" class="fu-banner" style="display:none">
     <div id="fu-banner-text" class="fu-banner-text"></div>
-    <button id="btn-generate-fu" class="btn btn-sm btn-primary">✨ Generar FU</button>
+    <button id="btn-generate-fu" class="btn btn-sm btn-primary">✨ Generate FU</button>
   </div>
 
-  <!-- RECUADRO 1: TRÁFICO -->
+  <!-- CARD 1: TRAFFIC -->
   <section class="card">
-    <div class="card-title"><span class="icon">📊</span> Tráfico Mensual</div>
+    <div class="card-title"><span class="icon">📊</span> Monthly Traffic</div>
     <div class="traffic-row">
       <div id="traffic-result" class="metric loading">--</div>
-      <div id="traffic-unit" class="traffic-unit">págs/mes</div>
+      <div id="traffic-unit" class="traffic-unit">pages/mo</div>
     </div>
     <div id="traffic-breakdown" class="traffic-meta"></div>
     <div id="traffic-countries" class="traffic-countries"></div>
@@ -74,106 +74,104 @@
     <div id="traffic-filter" class="filter-tag"></div>
   </section>
 
-  <!-- RECUADRO 2: MONDAY -->
+  <!-- CARD 2: MONDAY -->
   <section class="card">
     <div class="card-title"><span class="icon">📋</span> Monday.com</div>
-    <div id="duplicate-result" class="status-badge loading">Consultando...</div>
+    <div id="duplicate-result" class="status-badge loading">Checking...</div>
     <div id="score-badge" class="score-badge" style="display:none"></div>
     <div class="monday-form">
       <div class="form-grid">
 
-        <label class="form-label">Ejecutivo</label>
+        <label class="form-label">Owner</label>
         <select id="form-ejecutivo" class="form-select">
           <option value="Agus">Agus</option>
           <option value="Diego">Diego</option>
           <option value="Max">Max</option>
         </select>
 
-        <label class="form-label">Estado</label>
+        <label class="form-label">Status</label>
         <select id="form-estado" class="form-select">
-          <option value="9">Masivo - Agus</option>
-          <option value="6">Masivo - Diego</option>
-          <option value="10">Masivo - Max</option>
-          <option value="8">Mail No Enviado</option>
+          <option value="9">Bulk - Agus</option>
+          <option value="6">Bulk - Diego</option>
+          <option value="10">Bulk - Max</option>
+          <option value="8">Email Not Sent</option>
           <option value="0">LIVE</option>
-          <option value="1">En Negociación</option>
-          <option value="2">Descartado</option>
-          <option value="3">Propuesta Vigente</option>
-          <option value="4">Rebotado</option>
-          <option value="5">Ciclo Finalizado</option>
-          <option value="7">Avanzado</option>
+          <option value="1">In Negotiation</option>
+          <option value="2">Discarded</option>
+          <option value="3">Active Proposal</option>
+          <option value="4">Bounced</option>
+          <option value="5">Cycle Ended</option>
+          <option value="7">Advanced</option>
         </select>
 
-        <label class="form-label">Idioma</label>
+        <label class="form-label">Language</label>
         <select id="form-idioma" class="form-select">
-          <option value="">— seleccionar —</option>
-          <option value="0">Ingles</option>
-          <option value="1">Espanol</option>
-          <option value="2">Italiano</option>
-          <option value="3">Portugues</option>
-          <option value="4">Frances</option>
-          <option value="5">Aleman</option>
-          <option value="6">Arabe</option>
+          <option value="">— select —</option>
+          <option value="0">English</option>
+          <option value="1">Spanish</option>
+          <option value="2">Italian</option>
+          <option value="3">Portuguese</option>
+          <option value="6">Arabic</option>
         </select>
 
         <label class="form-label">GEO</label>
         <select id="form-geo" class="form-select">
-          <option value="">— seleccionar —</option>
-          <option>Estados Unidos</option><option>Reino Unido</option><option>Argentina</option>
-          <option>México</option><option>Colombia</option><option>Chile</option>
-          <option>España</option><option>Brasil</option><option>Francia</option>
-          <option>Alemania</option><option>Italia</option><option>Portugal</option>
-          <option>Países Bajos</option><option>Bélgica</option><option>Suiza</option>
-          <option>Austria</option><option>Polonia</option><option>Hungría</option>
-          <option>República Checa</option><option>Rumania</option><option>Grecia</option>
-          <option>Turquía</option><option>Israel</option><option>Emiratos Árabes</option>
-          <option>Arabia Saudita</option><option>Marruecos</option><option>Egipto</option>
-          <option>India</option><option>Japón</option><option>Corea del Sur</option>
-          <option>Australia</option><option>Canadá</option><option>Suecia</option>
-          <option>Noruega</option><option>Dinamarca</option><option>Finlandia</option>
-          <option>Vietnam</option><option>Tailandia</option><option>Indonesia</option>
-          <option>Filipinas</option><option>China</option><option>Singapur</option>
-          <option>Sudáfrica</option><option>Nigeria</option><option>Perú</option>
+          <option value="">— select —</option>
+          <option>United States</option><option>United Kingdom</option><option>Argentina</option>
+          <option>Mexico</option><option>Colombia</option><option>Chile</option>
+          <option>Spain</option><option>Brazil</option><option>France</option>
+          <option>Germany</option><option>Italy</option><option>Portugal</option>
+          <option>Netherlands</option><option>Belgium</option><option>Switzerland</option>
+          <option>Austria</option><option>Poland</option><option>Hungary</option>
+          <option>Czech Republic</option><option>Romania</option><option>Greece</option>
+          <option>Turkey</option><option>Israel</option><option>UAE</option>
+          <option>Saudi Arabia</option><option>Morocco</option><option>Egypt</option>
+          <option>India</option><option>Japan</option><option>South Korea</option>
+          <option>Australia</option><option>Canada</option><option>Sweden</option>
+          <option>Norway</option><option>Denmark</option><option>Finland</option>
+          <option>Vietnam</option><option>Thailand</option><option>Indonesia</option>
+          <option>Philippines</option><option>China</option><option>Singapore</option>
+          <option>South Africa</option><option>Nigeria</option><option>Peru</option>
           <option>Ecuador</option><option>Venezuela</option><option>Bolivia</option>
-          <option>Paraguay</option><option>Uruguay</option><option>Rusia</option>
-          <option>Ucrania</option>
+          <option>Paraguay</option><option>Uruguay</option><option>Russia</option>
+          <option>Ukraine</option>
         </select>
 
-        <label class="form-label">Tráfico</label>
+        <label class="form-label">Traffic</label>
         <div id="form-pv-display" class="form-pv-display">--</div>
 
         <label class="form-label">Email</label>
-        <input id="form-email" class="form-input" type="text" placeholder="email@sitio.com" />
+        <input id="form-email" class="form-input" type="text" placeholder="email@site.com" />
 
-        <label class="form-label">Fecha</label>
+        <label class="form-label">Date</label>
         <div class="fecha-row">
           <input id="form-fecha" class="form-input" type="text" placeholder="DD/MM/YYYY" maxlength="10" />
-          <button id="btn-fecha-hoy" class="btn-hoy" title="Actualizar a hoy">Hoy</button>
+          <button id="btn-fecha-hoy" class="btn-hoy" title="Set to today">Today</button>
         </div>
 
       </div>
-      <button id="btn-push-monday" class="btn btn-success btn-full" style="margin-top:9px">🚀 Enviar a Monday</button>
+      <button id="btn-push-monday" class="btn btn-success btn-full" style="margin-top:9px">🚀 Send to Monday</button>
       <div id="push-result" class="push-result"></div>
     </div>
   </section>
 
-  <!-- RECUADRO 3: VENTAS -->
+  <!-- CARD 3: SALES -->
   <section class="card">
-    <div class="card-title"><span class="icon">💼</span> Ventas</div>
+    <div class="card-title"><span class="icon">💼</span> Sales</div>
 
-    <!-- Email Decisor -->
+    <!-- Decision-maker email -->
     <div class="sub-section">
-      <div class="sub-title">✉️ Email Decisor</div>
-      <div id="email-result" class="email-value loading">Buscando...</div>
+      <div class="sub-title">✉️ Decision-maker Email</div>
+      <div id="email-result" class="email-value loading">Searching...</div>
       <div id="email-list" style="display:none"></div>
       <span id="email-verify-badge" class="verify-badge" style="display:none"></span>
       <div id="linkedin-row" class="linkedin-row" style="display:none">
-        <a id="linkedin-link" href="#" target="_blank" class="linkedin-link">🔗 Ver LinkedIn</a>
+        <a id="linkedin-link" href="#" target="_blank" class="linkedin-link">🔗 View LinkedIn</a>
       </div>
       <div class="email-actions">
         <button id="btn-apollo" class="btn btn-secondary btn-sm">👤 Apollo</button>
         <button id="btn-gemini-email" class="btn btn-secondary btn-sm">🤖 Gemini</button>
-        <button id="btn-verify-email" class="btn btn-secondary btn-sm" style="display:none">✔ Verificar</button>
+        <button id="btn-verify-email" class="btn btn-secondary btn-sm" style="display:none">✔ Verify</button>
       </div>
       <div id="apollo-result" class="apollo-result"></div>
     </div>
@@ -181,36 +179,34 @@
     <!-- Banner Detector -->
     <div class="sub-section">
       <div class="sub-title-row">
-        <span class="sub-title">🖼️ Formatos de Publicidad</span>
-        <button id="btn-detect-banners" class="btn btn-secondary btn-sm">↻ Actualizar</button>
+        <span class="sub-title">🖼️ Ad Formats</span>
+        <button id="btn-detect-banners" class="btn btn-secondary btn-sm">↻ Refresh</button>
       </div>
-      <div id="banner-result" class="banner-result">No analizado</div>
+      <div id="banner-result" class="banner-result">Not analyzed</div>
       <div id="adtech-result" class="adtech-result" style="display:none"></div>
     </div>
 
     <!-- Partners -->
     <div class="sub-section">
-      <div class="sub-title">🤝 Partners Detectados</div>
-      <div id="partners-result" class="partners-result loading">Analizando...</div>
+      <div class="sub-title">🤝 Detected Partners</div>
+      <div id="partners-result" class="partners-result loading">Analyzing...</div>
     </div>
 
     <!-- Pitch -->
     <div class="sub-section">
       <div class="sub-title-row">
-        <span class="sub-title">🤖 Pitch con Gemini</span>
-        <select id="pitch-language" class="category-select" title="Idioma del email" style="font-size:11px;padding:2px 4px;">
-          <option value="en">Ingles</option>
-          <option value="es">Espanol</option>
-          <option value="it">Italiano</option>
-          <option value="pt">Portugues</option>
-          <option value="fr">Frances</option>
-          <option value="de">Aleman</option>
-          <option value="ar">Arabe</option>
+        <span class="sub-title">🤖 Pitch with Gemini</span>
+        <select id="pitch-language" class="category-select" title="Email language" style="font-size:11px;padding:2px 4px;">
+          <option value="en">English</option>
+          <option value="es">Spanish</option>
+          <option value="it">Italian</option>
+          <option value="pt">Portuguese</option>
+          <option value="ar">Arabic</option>
         </select>
-        <select id="pitch-category" class="category-select" title="Categoría del sitio" style="font-size:11px;padding:2px 4px;">
-          <option value="">Categoría auto</option>
+        <select id="pitch-category" class="category-select" title="Site category" style="font-size:11px;padding:2px 4px;">
+          <option value="">Auto category</option>
           <option value="sports">Sports</option>
-          <option value="news">News & Media</option>
+          <option value="news">News &amp; Media</option>
           <option value="finance">Finance</option>
           <option value="technology">Technology</option>
           <option value="entertainment">Entertainment</option>
@@ -218,68 +214,68 @@
           <option value="travel">Travel</option>
           <option value="gambling">Gambling</option>
           <option value="automotive">Automotive</option>
-          <option value="food">Food & Drink</option>
+          <option value="food">Food &amp; Drink</option>
           <option value="realestate">Real Estate</option>
           <option value="business">Business / B2B</option>
         </select>
       </div>
 
-      <!-- Controles de estilo del pitch -->
+      <!-- Pitch style controls -->
       <div class="pitch-controls">
         <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Tono</span>
+          <span class="pitch-ctrl-label">Tone</span>
           <div class="pitch-pills" data-group="tone">
             <button class="pitch-pill active" data-val="informal">Informal</button>
             <button class="pitch-pill" data-val="formal">Formal</button>
           </div>
         </div>
         <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Largo</span>
+          <span class="pitch-ctrl-label">Length</span>
           <div class="pitch-pills" data-group="length">
-            <button class="pitch-pill active" data-val="short">Corto</button>
-            <button class="pitch-pill" data-val="long">Largo</button>
+            <button class="pitch-pill active" data-val="short">Short</button>
+            <button class="pitch-pill" data-val="long">Long</button>
           </div>
         </div>
         <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Enfoque</span>
+          <span class="pitch-ctrl-label">Focus</span>
           <div class="pitch-pills" data-group="focus">
-            <button class="pitch-pill active" data-val="analysis">Con análisis</button>
-            <button class="pitch-pill" data-val="nodataanalysis">Sin análisis</button>
+            <button class="pitch-pill active" data-val="analysis">With analysis</button>
+            <button class="pitch-pill" data-val="nodataanalysis">No analysis</button>
           </div>
         </div>
         <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Apertura</span>
+          <span class="pitch-ctrl-label">Opening</span>
           <div class="pitch-pills" data-group="opening">
-            <button class="pitch-pill active" data-val="direct">Directo</button>
-            <button class="pitch-pill" data-val="problem">Problema</button>
-            <button class="pitch-pill" data-val="praise">Elogio</button>
+            <button class="pitch-pill active" data-val="direct">Direct</button>
+            <button class="pitch-pill" data-val="problem">Problem</button>
+            <button class="pitch-pill" data-val="praise">Praise</button>
           </div>
         </div>
       </div>
 
-      <textarea id="pitch-text" class="pitch-textarea" placeholder="Presioná generar para crear el pitch..."></textarea>
+      <textarea id="pitch-text" class="pitch-textarea" placeholder="Click Generate to create the pitch..."></textarea>
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
-        <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generar Pitch</button>
-        <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Guardar como ejemplo de estilo">👍</button>
-        <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Marcar como malo — Gemini lo evitará">👎</button>
+        <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
+        <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Save as style example">👍</button>
+        <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Gemini will avoid it">👎</button>
         <span id="pitch-like-status" class="pitch-like-status"></span>
       </div>
     </div>
 
-    <!-- Auto-push banner (condicional) -->
+    <!-- Auto-push banner (conditional) -->
     <div id="autopush-banner" class="autopush-banner" style="display:none">
-      <div class="autopush-title">⚡ Prospecto listo</div>
-      <div class="autopush-conditions">Tráfico ✅ &nbsp;·&nbsp; No duplicado ✅ &nbsp;·&nbsp; Email encontrado ✅</div>
+      <div class="autopush-title">⚡ Prospect ready</div>
+      <div class="autopush-conditions">Traffic ✅ &nbsp;·&nbsp; Not duplicate ✅ &nbsp;·&nbsp; Email found ✅</div>
       <div id="autopush-steps" class="autopush-steps"></div>
-      <button id="btn-autopush-prepare" class="btn btn-success btn-full" style="margin-top:8px">⚡ Preparar todo</button>
+      <button id="btn-autopush-prepare" class="btn btn-success btn-full" style="margin-top:8px">⚡ Prepare all</button>
     </div>
 
     <!-- Gmail -->
     <div class="sub-section" style="padding-bottom:4px">
       <div id="gmail-from" class="gmail-from"></div>
-      <input id="form-subject" class="form-input" type="text" placeholder="Asunto del email..." style="margin-bottom:6px" />
-      <button id="btn-send-gmail" class="btn btn-gmail btn-full">📧 Enviar por Gmail</button>
+      <input id="form-subject" class="form-input" type="text" placeholder="Email subject..." style="margin-bottom:6px" />
+      <button id="btn-send-gmail" class="btn btn-gmail btn-full">📧 Send via Gmail</button>
       <div id="gmail-result" class="push-result"></div>
     </div>
   </section>
@@ -287,33 +283,32 @@
 </div>
 
 <!-- ====================================================
-     TAB: CASCADA
+     TAB: CASCADE
      ==================================================== -->
 <div id="tab-cascade" class="tab-content">
 
   <section class="card">
-    <div class="card-title"><span class="icon">🌱</span> Dominio Semilla</div>
+    <div class="card-title"><span class="icon">🌱</span> Seed Domain</div>
     <div class="seed-row">
-      <input id="cascade-seed" type="text" class="seed-input" placeholder="ej: nytimes.com" />
-      <button id="btn-cascade-start" class="btn btn-primary btn-sm">Buscar</button>
+      <input id="cascade-seed" type="text" class="seed-input" placeholder="e.g. nytimes.com" />
+      <button id="btn-cascade-start" class="btn btn-primary btn-sm">Search</button>
     </div>
     <div id="cascade-status" class="cascade-status"></div>
   </section>
 
   <!-- Keywords -->
   <section class="card card-tight">
-    <div class="card-title"><span class="icon">🔑</span> Keywords Semilla</div>
+    <div class="card-title"><span class="icon">🔑</span> Seed Keywords</div>
     <div class="kw-filters">
       <select id="kw-language" class="filter-select">
-        <option value="">Todos los idiomas</option>
-        <option value="en">Inglés</option>
-        <option value="es">Español</option>
-        <option value="pt">Portugués</option>
-        <option value="it">Italiano</option>
-        <option value="fr">Francés</option>
-        <option value="ar">Árabe</option>
+        <option value="">All languages</option>
+        <option value="en">English</option>
+        <option value="es">Spanish</option>
+        <option value="pt">Portuguese</option>
+        <option value="it">Italian</option>
+        <option value="ar">Arabic</option>
       </select>
-      <input id="kw-search" type="text" class="seed-input kw-search-input" placeholder="Buscar keyword..." />
+      <input id="kw-search" type="text" class="seed-input kw-search-input" placeholder="Search keyword..." />
     </div>
     <div id="keywords-list" class="keywords-list"></div>
     <div class="kw-footer">
@@ -321,16 +316,16 @@
     </div>
   </section>
 
-  <!-- Buscador de Similares -->
+  <!-- Similar Sites Finder -->
   <section class="card card-tight">
-    <div class="card-title"><span class="icon">🔍</span> Buscador de Similares</div>
+    <div class="card-title"><span class="icon">🔍</span> Similar Sites Finder</div>
   </section>
 
-  <!-- Filtros -->
+  <!-- Filters -->
   <section class="card card-tight">
     <div class="filter-grid">
 
-      <label class="filter-label">Tráfico mín.</label>
+      <label class="filter-label">Min traffic</label>
       <select id="cascade-min-traffic" class="filter-select">
         <option value="500000">500K+</option>
         <option value="750000">750K+</option>
@@ -342,8 +337,8 @@
         <option value="5000000">5M+</option>
         <option value="7000000">7M+</option>
         <option value="10000000">10M+</option>
-        <option value="10000001">+10M</option>
-        <option value="0">Sin filtro</option>
+        <option value="10000001">&gt;10M</option>
+        <option value="0">No filter</option>
       </select>
 
       <label class="filter-label">Global Rank</label>
@@ -359,137 +354,137 @@
         <option value="1000000">&lt;1M</option>
         <option value="2000000">&lt;2M</option>
         <option value="5000000">&lt;5M</option>
-        <option value="0">Sin filtro</option>
+        <option value="0">No filter</option>
       </select>
 
-      <label class="filter-label">País</label>
+      <label class="filter-label">Country</label>
       <select id="cascade-language" class="filter-select">
-        <option value="">Todos</option>
-        <optgroup label="Latinoamérica">
+        <option value="">All</option>
+        <optgroup label="Latin America">
           <option value="AR">Argentina</option>
-          <option value="MX">México</option>
+          <option value="MX">Mexico</option>
           <option value="CO">Colombia</option>
           <option value="CL">Chile</option>
-          <option value="BR">Brasil</option>
-          <option value="PE">Perú</option>
+          <option value="BR">Brazil</option>
+          <option value="PE">Peru</option>
           <option value="EC">Ecuador</option>
           <option value="VE">Venezuela</option>
           <option value="UY">Uruguay</option>
           <option value="PY">Paraguay</option>
           <option value="BO">Bolivia</option>
           <option value="CR">Costa Rica</option>
-          <option value="PA">Panamá</option>
-          <option value="DO">Rep. Dominicana</option>
+          <option value="PA">Panama</option>
+          <option value="DO">Dominican Republic</option>
           <option value="GT">Guatemala</option>
           <option value="HN">Honduras</option>
           <option value="SV">El Salvador</option>
           <option value="CU">Cuba</option>
           <option value="PR">Puerto Rico</option>
         </optgroup>
-        <optgroup label="Norteamérica">
-          <option value="US">Estados Unidos</option>
-          <option value="CA">Canadá</option>
+        <optgroup label="North America">
+          <option value="US">United States</option>
+          <option value="CA">Canada</option>
         </optgroup>
-        <optgroup label="Europa Occidental">
-          <option value="GB">Reino Unido</option>
-          <option value="ES">España</option>
+        <optgroup label="Western Europe">
+          <option value="GB">United Kingdom</option>
+          <option value="ES">Spain</option>
           <option value="PT">Portugal</option>
-          <option value="FR">Francia</option>
-          <option value="DE">Alemania</option>
-          <option value="IT">Italia</option>
-          <option value="NL">Países Bajos</option>
-          <option value="BE">Bélgica</option>
-          <option value="CH">Suiza</option>
+          <option value="FR">France</option>
+          <option value="DE">Germany</option>
+          <option value="IT">Italy</option>
+          <option value="NL">Netherlands</option>
+          <option value="BE">Belgium</option>
+          <option value="CH">Switzerland</option>
           <option value="AT">Austria</option>
-          <option value="SE">Suecia</option>
-          <option value="NO">Noruega</option>
-          <option value="DK">Dinamarca</option>
-          <option value="FI">Finlandia</option>
-          <option value="IE">Irlanda</option>
+          <option value="SE">Sweden</option>
+          <option value="NO">Norway</option>
+          <option value="DK">Denmark</option>
+          <option value="FI">Finland</option>
+          <option value="IE">Ireland</option>
         </optgroup>
-        <optgroup label="Europa del Este">
-          <option value="PL">Polonia</option>
-          <option value="RO">Rumania</option>
-          <option value="HU">Hungría</option>
-          <option value="CZ">Rep. Checa</option>
-          <option value="SK">Eslovaquia</option>
+        <optgroup label="Eastern Europe">
+          <option value="PL">Poland</option>
+          <option value="RO">Romania</option>
+          <option value="HU">Hungary</option>
+          <option value="CZ">Czech Republic</option>
+          <option value="SK">Slovakia</option>
           <option value="BG">Bulgaria</option>
-          <option value="HR">Croacia</option>
+          <option value="HR">Croatia</option>
           <option value="RS">Serbia</option>
-          <option value="GR">Grecia</option>
-          <option value="UA">Ucrania</option>
-          <option value="RU">Rusia</option>
+          <option value="GR">Greece</option>
+          <option value="UA">Ukraine</option>
+          <option value="RU">Russia</option>
         </optgroup>
-        <optgroup label="Medio Oriente y África">
-          <option value="TR">Turquía</option>
+        <optgroup label="Middle East &amp; Africa">
+          <option value="TR">Turkey</option>
           <option value="IL">Israel</option>
-          <option value="AE">Emiratos Árabes</option>
-          <option value="SA">Arabia Saudita</option>
-          <option value="EG">Egipto</option>
-          <option value="MA">Marruecos</option>
+          <option value="AE">UAE</option>
+          <option value="SA">Saudi Arabia</option>
+          <option value="EG">Egypt</option>
+          <option value="MA">Morocco</option>
           <option value="NG">Nigeria</option>
-          <option value="ZA">Sudáfrica</option>
-          <option value="KE">Kenia</option>
+          <option value="ZA">South Africa</option>
+          <option value="KE">Kenya</option>
           <option value="GH">Ghana</option>
-          <option value="ET">Etiopía</option>
+          <option value="ET">Ethiopia</option>
           <option value="TZ">Tanzania</option>
         </optgroup>
-        <optgroup label="Asia y Oceanía">
+        <optgroup label="Asia &amp; Oceania">
           <option value="IN">India</option>
-          <option value="JP">Japón</option>
-          <option value="KR">Corea del Sur</option>
+          <option value="JP">Japan</option>
+          <option value="KR">South Korea</option>
           <option value="CN">China</option>
-          <option value="TW">Taiwán</option>
+          <option value="TW">Taiwan</option>
           <option value="HK">Hong Kong</option>
-          <option value="SG">Singapur</option>
-          <option value="MY">Malasia</option>
+          <option value="SG">Singapore</option>
+          <option value="MY">Malaysia</option>
           <option value="ID">Indonesia</option>
-          <option value="PH">Filipinas</option>
-          <option value="TH">Tailandia</option>
+          <option value="PH">Philippines</option>
+          <option value="TH">Thailand</option>
           <option value="VN">Vietnam</option>
-          <option value="PK">Pakistán</option>
+          <option value="PK">Pakistan</option>
           <option value="BD">Bangladesh</option>
           <option value="AU">Australia</option>
-          <option value="NZ">Nueva Zelanda</option>
+          <option value="NZ">New Zealand</option>
         </optgroup>
       </select>
 
-      <label class="filter-label">Nivel</label>
+      <label class="filter-label">Depth</label>
       <select id="cascade-depth" class="filter-select">
-        <option value="1">1 — Directo (~10 sitios, 1 crédito)</option>
-        <option value="2" selected>2 — Expandido (~100 sitios, ~11 créditos)</option>
+        <option value="1">1 — Direct (~10 sites, 1 credit)</option>
+        <option value="2" selected>2 — Expanded (~100 sites, ~11 credits)</option>
       </select>
 
     </div>
   </section>
 
-  <!-- Resultados -->
+  <!-- Results -->
   <section id="cascade-results" class="cascade-results">
-    <div class="cascade-empty">Ingresá un dominio semilla o seleccioná una keyword.</div>
+    <div class="cascade-empty">Enter a seed domain or select a keyword.</div>
   </section>
 
-  <!-- Acciones masivas -->
+  <!-- Bulk actions -->
   <section id="cascade-actions" class="actions" style="display:none">
     <div class="cascade-summary" id="cascade-summary"></div>
-    <button id="btn-push-all" class="btn btn-primary btn-full">🌐 Abrir seleccionados</button>
+    <button id="btn-push-all" class="btn btn-primary btn-full">🌐 Open selected</button>
     <div id="cascade-push-result" class="push-result"></div>
   </section>
 
 </div>
 
 <!-- ====================================================
-     TAB: HISTORIAL
+     TAB: HISTORY
      ==================================================== -->
 <div id="tab-history" class="tab-content">
   <section class="card card-tight">
     <div class="history-header">
-      <div class="card-title" style="margin:0"><span class="icon">🕐</span> Historial</div>
-      <button id="btn-clear-history" class="btn-link-sm">Limpiar</button>
+      <div class="card-title" style="margin:0"><span class="icon">🕐</span> History</div>
+      <button id="btn-clear-history" class="btn-link-sm">Clear</button>
     </div>
     <div id="history-stats" class="history-stats"></div>
   </section>
   <div id="history-list" class="history-list">
-    <div class="cascade-empty">No hay sitios analizados todavía.</div>
+    <div class="cascade-empty">No sites analyzed yet.</div>
   </div>
 </div>
 
@@ -498,51 +493,49 @@
      ==================================================== -->
 <div id="tab-import" class="tab-content">
   <section class="card">
-    <div class="card-title">📥 Importar URLs desde Monday</div>
-    <p class="import-desc">Traé 15 URLs del board filtrando por Geo, Idioma y Tráfico. Se abren en tabs nuevas y quedan bloqueadas 60 días para que otro usuario no las reimporte.</p>
+    <div class="card-title">📥 Import URLs from Monday</div>
+    <p class="import-desc">Fetch 15 URLs from the board filtered by Geo, Language and Traffic. They open in new tabs and are blocked for 60 days so other users don't re-import them.</p>
 
     <div class="import-filters">
       <div class="import-filter-row">
         <span class="form-label">Geo</span>
         <select id="import-geo" class="form-select">
-          <option value="">Todos</option>
-          <option>Argentina</option><option>México</option><option>Colombia</option>
-          <option>Chile</option><option>España</option><option>Brasil</option>
-          <option>Perú</option><option>Ecuador</option><option>Venezuela</option>
+          <option value="">All</option>
+          <option>Argentina</option><option>Mexico</option><option>Colombia</option>
+          <option>Chile</option><option>Spain</option><option>Brazil</option>
+          <option>Peru</option><option>Ecuador</option><option>Venezuela</option>
           <option>Bolivia</option><option>Paraguay</option><option>Uruguay</option>
-          <option>Estados Unidos</option><option>Canadá</option>
-          <option>Reino Unido</option><option>Francia</option><option>Alemania</option>
-          <option>Italia</option><option>Portugal</option><option>Países Bajos</option>
-          <option>Bélgica</option><option>Suiza</option><option>Austria</option>
-          <option>Suecia</option><option>Noruega</option><option>Dinamarca</option>
-          <option>Finlandia</option><option>Polonia</option><option>Hungría</option>
-          <option>República Checa</option><option>Rumania</option><option>Grecia</option>
-          <option>Turquía</option><option>Israel</option><option>Emiratos Árabes</option>
-          <option>Arabia Saudita</option><option>Marruecos</option><option>Egipto</option>
-          <option>Nigeria</option><option>Sudáfrica</option>
-          <option>India</option><option>Japón</option><option>Corea del Sur</option>
-          <option>China</option><option>Singapur</option><option>Indonesia</option>
-          <option>Filipinas</option><option>Tailandia</option><option>Vietnam</option>
-          <option>Australia</option><option>Rusia</option><option>Ucrania</option>
+          <option>United States</option><option>Canada</option>
+          <option>United Kingdom</option><option>France</option><option>Germany</option>
+          <option>Italy</option><option>Portugal</option><option>Netherlands</option>
+          <option>Belgium</option><option>Switzerland</option><option>Austria</option>
+          <option>Sweden</option><option>Norway</option><option>Denmark</option>
+          <option>Finland</option><option>Poland</option><option>Hungary</option>
+          <option>Czech Republic</option><option>Romania</option><option>Greece</option>
+          <option>Turkey</option><option>Israel</option><option>UAE</option>
+          <option>Saudi Arabia</option><option>Morocco</option><option>Egypt</option>
+          <option>Nigeria</option><option>South Africa</option>
+          <option>India</option><option>Japan</option><option>South Korea</option>
+          <option>China</option><option>Singapore</option><option>Indonesia</option>
+          <option>Philippines</option><option>Thailand</option><option>Vietnam</option>
+          <option>Australia</option><option>Russia</option><option>Ukraine</option>
         </select>
       </div>
       <div class="import-filter-row">
-        <span class="form-label">Idioma</span>
+        <span class="form-label">Language</span>
         <select id="import-idioma" class="form-select">
-          <option value="">Todos</option>
-          <option value="Ingles">Ingles</option>
-          <option value="Espanol">Espanol</option>
-          <option value="Italiano">Italiano</option>
-          <option value="Portugues">Portugues</option>
-          <option value="Frances">Frances</option>
-          <option value="Aleman">Aleman</option>
-          <option value="Arabe">Arabe</option>
+          <option value="">All</option>
+          <option value="Ingles">English</option>
+          <option value="Espanol">Spanish</option>
+          <option value="Italiano">Italian</option>
+          <option value="Portugues">Portuguese</option>
+          <option value="Arabe">Arabic</option>
         </select>
       </div>
       <div class="import-filter-row">
-        <span class="form-label">Tráfico</span>
+        <span class="form-label">Traffic</span>
         <select id="import-traffic" class="form-select">
-          <option value="0">Sin filtro</option>
+          <option value="0">No filter</option>
           <option value="500000">+500K</option>
           <option value="1000000">+1M</option>
           <option value="5000000">+5M</option>
@@ -551,7 +544,7 @@
       </div>
     </div>
 
-    <button id="btn-import-go" class="btn btn-primary btn-full" style="margin-top:12px">🚀 Importar 15 URLs</button>
+    <button id="btn-import-go" class="btn btn-primary btn-full" style="margin-top:12px">🚀 Import 15 URLs</button>
     <div id="import-result" class="push-result" style="margin-top:8px;min-height:16px"></div>
   </section>
 
@@ -565,42 +558,42 @@
   <div class="modal-overlay" id="modal-overlay"></div>
   <div class="modal-content">
     <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center">
-      <span>⚙️ Configuración</span>
-      <button id="btn-logout" class="btn-logout">Cerrar sesión</button>
+      <span>⚙️ Settings</span>
+      <button id="btn-logout" class="btn-logout">Sign out</button>
     </div>
     <div id="settings-user" class="settings-user"></div>
 
     <div class="settings-gmail-row">
-      <div class="settings-gmail-label">Gmail asociado</div>
+      <div class="settings-gmail-label">Linked Gmail</div>
       <div class="settings-gmail-value">
         <span id="settings-gmail-assoc" class="settings-gmail-email">—</span>
-        <button id="btn-dissoc-gmail" class="btn-dissoc" style="display:none" title="Desasociar esta cuenta de Gmail">Desasociar</button>
+        <button id="btn-dissoc-gmail" class="btn-dissoc" style="display:none" title="Unlink this Gmail account">Unlink</button>
       </div>
-      <div class="settings-gmail-hint">El primer envío asocia tu cuenta automáticamente. Solo esa cuenta puede enviar emails desde esta sesión.</div>
+      <div class="settings-gmail-hint">The first send links your account automatically. Only that account can send emails from this session.</div>
     </div>
 
     <div class="modal-actions">
-      <button id="btn-close-settings" class="btn btn-secondary">Cerrar</button>
+      <button id="btn-close-settings" class="btn btn-secondary">Close</button>
     </div>
     <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
-      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">BASE DE KEYWORDS</div>
-      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">Importá un CSV con frases (una por línea). Se guardan en Supabase y rotan automáticamente en Cascada.</div>
+      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">KEYWORD DATABASE</div>
+      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">Import a CSV with phrases (one per line). Stored in Supabase and rotated automatically in Cascade.</div>
       <div style="display:flex; gap:6px; margin-bottom:6px; align-items:center">
         <label class="btn btn-secondary btn-sm" style="cursor:pointer; margin:0">
-          📥 Importar CSV
+          📥 Import CSV
           <input id="settings-csv-input" type="file" accept=".csv,.txt" style="display:none" />
         </label>
-        <button id="btn-kw-delete-all" class="btn btn-secondary btn-sm">🗑 Limpiar todo</button>
+        <button id="btn-kw-delete-all" class="btn btn-secondary btn-sm">🗑 Clear all</button>
         <span id="kw-db-count" style="font-size:11px; color:var(--text-muted)"></span>
       </div>
       <div id="kw-import-result" style="font-size:11px; color:#16a34a; min-height:14px;"></div>
     </div>
 
     <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
-      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">DIAGNÓSTICO DE APIs</div>
+      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">API DIAGNOSTICS</div>
       <div style="display:flex; gap:6px; margin-bottom:8px;">
-        <input id="diag-domain" class="form-input" type="text" placeholder="dominio a testear (ej: bbc.com)" style="flex:1" />
-        <button id="btn-run-diag" class="btn btn-secondary btn-sm">▶ Testear</button>
+        <input id="diag-domain" class="form-input" type="text" placeholder="domain to test (e.g. bbc.com)" style="flex:1" />
+        <button id="btn-run-diag" class="btn btn-secondary btn-sm">▶ Test</button>
       </div>
       <div id="diag-result" class="diag-result"></div>
     </div>
