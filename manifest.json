@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ADEQ Toolbar",
-  "version": "3.0.0",
-  "description": "Sistema de prospección automatizada para ADEQ Media",
+  "version": "3.1.0",
+  "description": "Automated B2B prospecting tool for ADEQ Media — analyze websites, qualify leads, and push to Monday.com in one click.",
   "action": {
     "default_title": "ADEQ Toolbar",
     "default_icon": {
