@@ -321,6 +321,7 @@ async function runSession(token, cfg, sessionStart) {
     if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
       log("⏱ 45 minutos — auto-apagando.");
       await setConfigValue(token, "auto_prospecting_enabled", "false");
+      await setConfigValue(token, "auto_session_start", "");
       break;
     }
 
@@ -430,6 +431,7 @@ async function main() {
       if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
         log("⏱ Sesión expirada (45 min) — auto-apagando.");
         await setConfigValue(token, "auto_prospecting_enabled", "false");
+        await setConfigValue(token, "auto_session_start", "");
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
