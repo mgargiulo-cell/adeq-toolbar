@@ -1,13 +1,9 @@
 // ============================================================
-// ADEQ AUTO-PROSPECTOR — v2
-// Cambios:
-//   - Escribe a toolbar_review_queue (en lugar de toolbar_historial)
-//   - Filtro mínimo 400K visitas — dominios con menos son descartados
-//   - Detecta país principal de tráfico (geo)
-//   - Detecta idioma y categoría del sitio vía Gemini
-//   - Recolecta múltiples emails vía Apollo
-//   - Genera pitch completo con Gemini (subject + body)
-//   - Shuffle de candidatos para rotación de países por sesión
+// ADEQ AUTO-PROSPECTOR — v3
+// Cambios v3:
+//   - Fuente de dominios: Majestic Million (1M sitios rankeados del mundo)
+//   - Los dominios de Monday se usan como EXCLUSIÓN (ya son clientes)
+//   - Pool de dominios se descarga una vez al iniciar Railway (en memoria)
 // Deploy: Railway
 // ============================================================
 
@@ -23,6 +19,28 @@ const POLL_INTERVAL_MS = 20 * 1000;
 const DOMAIN_DELAY_MS  = 2500;
 const MIN_TRAFFIC      = 400_000;
 
+// Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
+const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
+
+// Dominios genéricos/tech que no son publishers relevantes (excluir siempre)
+const EXCLUDE_DOMAINS = new Set([
+  "google.com","google.co.uk","google.com.br","google.es","google.de",
+  "youtube.com","facebook.com","instagram.com","twitter.com","x.com",
+  "tiktok.com","snapchat.com","pinterest.com","linkedin.com","whatsapp.com",
+  "amazon.com","amazon.co.uk","amazon.de","amazon.es","amazon.com.br",
+  "wikipedia.org","wikimedia.org","reddit.com","tumblr.com",
+  "netflix.com","spotify.com","twitch.tv","discord.com","telegram.org",
+  "apple.com","microsoft.com","windows.com","office.com","live.com",
+  "yahoo.com","bing.com","duckduckgo.com","baidu.com","yandex.ru","naver.com",
+  "paypal.com","stripe.com","shopify.com","ebay.com","aliexpress.com","alibaba.com",
+  "zoom.us","slack.com","dropbox.com","drive.google.com","github.com","gitlab.com",
+  "cloudflare.com","amazonaws.com","wp.com","wordpress.com","blogspot.com",
+  "wix.com","squarespace.com","weebly.com","medium.com","substack.com",
+]);
+
+// Pool global — se carga una vez al iniciar el proceso
+let domainPool = null;
+
 const COUNTRY_CODES = {
   US:"United States", MX:"Mexico", AR:"Argentina", CO:"Colombia", BR:"Brazil",
   CL:"Chile", ES:"Spain", PE:"Peru", EC:"Ecuador", VE:"Venezuela", UY:"Uruguay",
@@ -36,6 +54,36 @@ const COUNTRY_CODES = {
   MY:"Malaysia", GR:"Greece", HU:"Hungary", CZ:"Czech Republic", RO:"Romania",
   TW:"Taiwan", HK:"Hong Kong", PK:"Pakistan",
 };
+
+// ── Domain pool (Majestic Million) ───────────────────────────
+
+async function loadDomainPool() {
+  if (domainPool !== null) return domainPool;
+
+  log("Descargando Majestic Million (puede tardar ~20s)...");
+  try {
+    const res = await fetch(MAJESTIC_URL, { signal: AbortSignal.timeout(90_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+
+    const lines = text.split("\n").slice(1); // saltar header
+    const domains = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const cols = line.split(",");
+      const domain = cols[2]?.trim().toLowerCase().replace(/^www\./, "");
+      if (domain && domain.includes(".") && !EXCLUDE_DOMAINS.has(domain)) {
+        domains.push(domain);
+      }
+    }
+    domainPool = domains;
+    log(`Pool cargado: ${domains.length.toLocaleString()} dominios disponibles.`);
+  } catch (err) {
+    log(`⚠️ Error descargando pool: ${err.message} — se reintentará en la próxima sesión.`);
+    domainPool = []; // evitar retry inmediato; se reseteará al reiniciar
+  }
+  return domainPool;
+}
 
 // ── Supabase helpers ──────────────────────────────────────────
 
@@ -305,15 +353,32 @@ function shuffleArray(arr) {
 async function runSession(token, cfg, sessionStart) {
   const { monday_api_key, rapidapi_key, gemini_api_key } = cfg;
 
-  log("Sesión iniciada. Cargando dominios de Monday...");
-  const allDomains = await fetchMondayDomains(monday_api_key);
-  const processed  = await getProcessedDomains(token);
-  const candidates = allDomains.filter(d => !processed.has(d));
+  log("Sesión iniciada. Cargando fuentes...");
 
-  // Shuffle para rotación de países — cada sesión procesa en orden distinto
+  // Cargar pool global + exclusiones en paralelo
+  const [pool, mondayDomains, processed] = await Promise.all([
+    loadDomainPool(),
+    fetchMondayDomains(monday_api_key),  // usados como exclusión (ya son clientes)
+    getProcessedDomains(token),
+  ]);
+
+  const mondaySet = new Set(mondayDomains);
+  const candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
+
+  // Shuffle para rotación — cada sesión procesa en orden distinto
   shuffleArray(candidates);
 
-  log(`${allDomains.length} en Monday — ${candidates.length} sin procesar.`);
+  log(`Pool: ${pool.length.toLocaleString()} | Monday (excluidos): ${mondayDomains.length} | Ya procesados: ${processed.size} | Candidatos: ${candidates.length.toLocaleString()}`);
+
+  if (candidates.length === 0) {
+    if (pool.length === 0) {
+      log("Pool vacío (error de descarga) — forzando re-descarga en próxima sesión.");
+      domainPool = null;
+    } else {
+      log("Sin candidatos nuevos — todos los dominios del pool ya fueron procesados.");
+    }
+    return;
+  }
 
   let count = 0; let added = 0; let skipped = 0;
 
