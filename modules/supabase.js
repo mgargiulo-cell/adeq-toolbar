@@ -163,9 +163,11 @@ export async function setAutopilotTarget(geo, category, minTraffic, accessToken)
 export async function fetchReviewQueue(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
+  // Excluir columna pitch (texto largo) — se carga on-demand al generar
+  const cols = "id,domain,traffic,geo,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at";
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&order=score.desc,created_at.desc&limit=200`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&order=score.desc,created_at.desc&limit=100&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];

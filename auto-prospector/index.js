@@ -14,8 +14,9 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_EMAIL    = process.env.SUPABASE_EMAIL;
 const SUPABASE_PASSWORD = process.env.SUPABASE_PASSWORD;
 
-const SESSION_LIMIT_MS = 45 * 60 * 1000;
-const POLL_INTERVAL_MS = 20 * 1000;
+const SESSION_LIMIT_MS  = 45 * 60 * 1000;
+const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
+const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const DOMAIN_DELAY_MS  = 2500;
 const MIN_TRAFFIC      = 400_000;
 
@@ -164,6 +165,18 @@ async function getConfig(token) {
   const cfg = {};
   rows.forEach(r => { cfg[r.key] = r.value; });
   return cfg;
+}
+
+// Lectura liviana — solo el flag de encendido, para el poll idle
+async function isAutopilotEnabled(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.auto_prospecting_enabled&select=value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    );
+    const rows = await res.json();
+    return rows?.[0]?.value === "true";
+  } catch { return false; }
 }
 
 async function setConfigValue(token, key, value) {
@@ -964,12 +977,15 @@ async function main() {
         }
       }
 
-      const cfg = await getConfig(token);
-
-      if (cfg.auto_prospecting_enabled !== "true" && cfg.auto_prospecting_enabled !== true) {
-        await sleep(POLL_INTERVAL_MS);
+      // Poll liviano — solo lee 1 fila hasta que se encienda
+      const enabled = await isAutopilotEnabled(token);
+      if (!enabled) {
+        await sleep(IDLE_INTERVAL_MS);
         continue;
       }
+
+      // Encendido — leer config completo una sola vez por sesión
+      const cfg = await getConfig(token);
 
       let sessionStart;
       if (cfg.auto_session_start) {
