@@ -226,7 +226,7 @@ async function runSession(token, cfg, sessionStart) {
     // Verificar si fue apagado manualmente (cada 10 dominios)
     if (count % 10 === 0) {
       const freshCfg = await getConfig(token);
-      if (freshCfg.auto_prospecting_enabled !== "true") {
+      if (freshCfg.auto_prospecting_enabled !== "true" && freshCfg.auto_prospecting_enabled !== true) {
         log("Autopilot apagado manualmente — deteniendo sesión.");
         break;
       }
@@ -297,7 +297,7 @@ async function main() {
       const cfg = await getConfig(token);
       log(`Debug cfg — auto_prospecting_enabled: "${cfg.auto_prospecting_enabled}" | keys: ${Object.keys(cfg).join(",")}`);
 
-      if (cfg.auto_prospecting_enabled !== "true") {
+      if (cfg.auto_prospecting_enabled !== "true" && cfg.auto_prospecting_enabled !== true) {
         // Esperar y volver a chequear
         await sleep(POLL_INTERVAL_MS);
         continue;
