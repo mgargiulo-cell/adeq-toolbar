@@ -199,34 +199,10 @@ export function validateEmailFormat(email) {
 // ============================================================
 // 5. Decisor — Gemini (nombre) + Apollo oficial (email)
 // Paso 1: Gemini con Google Search → first_name, last_name, title
-// Paso 2a: Apollo /people/match con nombre + dominio → email verificado
-// Paso 2b: Fallback Apollo /mixed_people/search por dominio + títulos
+// Paso 2: Apollo /mixed_people/search por dominio + títulos ejecutivos
 // ============================================================
 
 const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
-
-async function apolloPeopleMatch(domain, firstName, lastName, apiKey) {
-  try {
-    const res = await fetch("https://api.apollo.io/v1/people/match", {
-      method: "POST",
-      headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ first_name: firstName, last_name: lastName, domain, reveal_personal_emails: false }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return null;
-    const data   = await res.json();
-    const person = data?.person;
-    if (!person?.email) return null;
-    if (!APOLLO_GOOD_STATUSES.has(person.email_status)) return null;
-    return {
-      email:    person.email,
-      name:     `${person.first_name || firstName} ${person.last_name || lastName}`.trim(),
-      title:    person.title         || "",
-      linkedin: person.linkedin_url  || "",
-      status:   person.email_status  || "",
-    };
-  } catch { return null; }
-}
 
 async function apolloDomainSearch(domain, apiKey) {
   try {
@@ -305,13 +281,7 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
       : { error: "No Apollo key configured" };
   }
 
-  // ── Paso 2a: Apollo people/match (nombre + dominio) ──────────
-  if (firstName) {
-    const match = await apolloPeopleMatch(cleanDomain, firstName, lastName, apolloKey);
-    if (match) return match;
-  }
-
-  // ── Paso 2b: Fallback — Apollo domain search por títulos ─────
+  // ── Paso 2: Apollo mixed_people/search por dominio + títulos ──
   const results = await apolloDomainSearch(cleanDomain, apolloKey);
   if (results.length > 0) return results[0];
 

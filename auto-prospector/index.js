@@ -967,6 +967,10 @@ async function main() {
       }
 
       await runSession(token, cfg, sessionStart);
+      // Auto-disable after each session — user must re-enable manually
+      await setConfigValue(token, "auto_prospecting_enabled", "false");
+      await setConfigValue(token, "auto_session_start", "");
+      log("✅ Sesión completada — autopilot apagado. Activalo manualmente para la próxima sesión.");
       await sleep(POLL_INTERVAL_MS);
 
     } catch (err) {
