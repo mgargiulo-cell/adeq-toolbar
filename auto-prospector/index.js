@@ -472,26 +472,24 @@ async function fetchPageContent(domain) {
       html.match(/<meta[^>]+content=["']([^"']{1,300})["'][^>]+property=["']og:description["']/i) ||
       [])[1]?.trim() || "";
 
-    // Ad networks detected in page source
+    // Ad networks detected in page source — ADEQ partner networks only
     const adNetworks = [];
-    if (/googletag\b|adsbygoogle|googletagservices\.com/i.test(html))  adNetworks.push("Google GAM");
-    if (/prebid\.js|pbjs\.\w/i.test(html))                             adNetworks.push("Prebid");
-    if (/taboola/i.test(html))                                          adNetworks.push("Taboola");
-    if (/outbrain/i.test(html))                                         adNetworks.push("Outbrain");
-    if (/mgid\.com/i.test(html))                                        adNetworks.push("MGID");
-    if (/criteo/i.test(html))                                           adNetworks.push("Criteo");
-    if (/amazon-adsystem|apstag\.js/i.test(html))                       adNetworks.push("Amazon APS");
-    if (/media\.net\/dmedianet/i.test(html))                            adNetworks.push("Media.net");
-    if (/pubmatic\.com/i.test(html))                                    adNetworks.push("PubMatic");
-    if (/rubiconproject\.com|magnite\.com/i.test(html))                 adNetworks.push("Magnite");
-    if (/indexexchange\.com/i.test(html))                               adNetworks.push("Index Exchange");
-    if (/smartadserver|equativ\.com/i.test(html))                       adNetworks.push("Equativ");
-    if (/appnexus\.com|xandr\.com/i.test(html))                        adNetworks.push("Xandr");
-    if (/openx\.net/i.test(html))                                       adNetworks.push("OpenX");
-    if (/33across\.com/i.test(html))                                    adNetworks.push("33Across");
-    if (/sovrn\.com|lijit\.com/i.test(html))                           adNetworks.push("Sovrn");
-    if (/sharethrough\.com/i.test(html))                                adNetworks.push("Sharethrough");
-    if (/triplelift\.com/i.test(html))                                  adNetworks.push("TripleLift");
+    if (/sparteo\.com/i.test(html))                                        adNetworks.push("Sparteo");
+    if (/seedtag\.com/i.test(html))                                        adNetworks.push("Seedtag");
+    if (/taboola/i.test(html))                                             adNetworks.push("Taboola");
+    if (/missena\.com/i.test(html))                                        adNetworks.push("Missena");
+    if (/viads\.com|viads\.io/i.test(html))                               adNetworks.push("Viads");
+    if (/mgid\.com/i.test(html))                                           adNetworks.push("MGID");
+    if (/clever-advertising\.com|cleveradvertising\.com/i.test(html))     adNetworks.push("Clever Advertising");
+    if (/vidoomy\.com/i.test(html))                                        adNetworks.push("Vidoomy");
+    if (/vidverto\.com/i.test(html))                                       adNetworks.push("Vidverto");
+    if (/ezoic\.com|ezojs\.com|ez\.ai/i.test(html))                      adNetworks.push("Ezoic");
+    if (/clickio\.com|clickio\.net/i.test(html))                          adNetworks.push("Clickio");
+    if (/360playvid\.com/i.test(html))                                     adNetworks.push("360Playvid");
+    if (/truvid\.com/i.test(html))                                         adNetworks.push("Truvid");
+    if (/optad360\.com/i.test(html))                                       adNetworks.push("Optad360");
+    if (/embimedia\.com|embi\.media/i.test(html))                         adNetworks.push("Embi Media");
+    if (/snigel\.com/i.test(html))                                         adNetworks.push("Snigel");
 
     return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks };
   } catch { return null; }
@@ -773,11 +771,10 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ⚠️ Límite Apollo alcanzado (${apolloUsage.limit}/día) — sin búsqueda de email`);
     }
 
-    const [emails, pitchResult, similarSites] = await Promise.all([
+    const [emails, similarSites] = await Promise.all([
       canUseApollo
         ? findAllEmails(domain, meta?.firstName || "", meta?.lastName || "", apollo_api_key).then(r => { apolloCallsThisSession += 2; return r; })
         : Promise.resolve([]),
-      generatePitchForDomain(domain, visits, topCountry, language, category, contactName, contactTitle, pageContent, adNetworks, gemini_api_key),
       findSimilarSites(domain, rapidapi_key),
     ]);
 
@@ -806,9 +803,9 @@ async function runSession(token, cfg, sessionStart) {
       category,
       contactName,
       emails,
-      pitch:         pitchResult?.body     || "",
-      pitchSubject:  pitchResult?.subject  || "",
-      pitchSubjects: pitchResult?.subjects || [],
+      pitch:         "",
+      pitchSubject:  "",
+      pitchSubjects: [],
       score:         scoreWithEmails,
       adNetworks,
       pageTitle,

@@ -2507,11 +2507,17 @@ function renderProspectCard(r) {
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
       <!-- Pitch -->
-      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 4px;text-transform:uppercase;letter-spacing:.5px">Email prepared by AI</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 4px">
+        <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">Email</div>
+        <button class="btn btn-sm pcard-generate-btn" style="font-size:10px;padding:2px 8px;background:var(--primary);color:#fff;border:none;border-radius:4px;cursor:pointer">
+          ${r.pitch ? "✨ Regenerate" : "✨ Generate pitch"}
+        </button>
+      </div>
       ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-bottom:5px">📡 Ad networks detected: ${esc(adNetworks.join(", "))}</div>` : ""}
-      ${subjectChips}
+      <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
       <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
       <textarea class="form-input pcard-pitch" rows="5" style="font-size:11px;padding:6px 7px;resize:vertical;min-height:80px">${esc(r.pitch || "")}</textarea>
+      <div class="pcard-generate-result" style="font-size:10px;color:#e53e3e;margin-top:3px"></div>
 
       <!-- Monday fields -->
       <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Monday data</div>
@@ -2569,6 +2575,78 @@ function initProspectCard(card, data) {
       const subjectInput = card.querySelector(".pcard-subject");
       if (subjectInput) subjectInput.value = chip.dataset.subject;
     });
+  });
+
+  // Generate pitch button
+  card.querySelector(".pcard-generate-btn")?.addEventListener("click", async () => {
+    const btn       = card.querySelector(".pcard-generate-btn");
+    const ta        = card.querySelector(".pcard-pitch");
+    const subjInput = card.querySelector(".pcard-subject");
+    const chipsArea = card.querySelector(".pcard-chips-area");
+    const errEl     = card.querySelector(".pcard-generate-result");
+
+    btn.disabled    = true;
+    btn.textContent = "⏳ Generating...";
+    errEl.textContent = "";
+
+    try {
+      const cfg         = getPitchConfig();
+      const favExamples = await loadFavPitches(cfg);
+      const result      = await generatePitch({
+        domain:            data.domain,
+        traffic:           data.traffic,
+        techStack:         Array.isArray(data.ad_networks) ? data.ad_networks : [],
+        adsTxt:            null,
+        revenueGap:        null,
+        banners:           "",
+        category:          data.category     || "",
+        siteLanguage:      data.language     || "en",
+        pageTitle:         data.page_title   || "",
+        pageDescription:   "",
+        decisionMakerName: data.contact_name || "",
+        previousPitches:   [],
+        dislikes:          [],
+        favExamples,
+        ...cfg,
+      });
+
+      // Update textarea + subject
+      ta.value        = result.body || "";
+      if (result.subjects?.[0]) subjInput.value = result.subjects[0];
+
+      // Rebuild subject chips
+      if (chipsArea && result.subjects?.length > 0) {
+        chipsArea.innerHTML = `<div class="pcard-subject-chips" style="display:flex;flex-direction:column;gap:3px;margin-bottom:6px">
+          ${result.subjects.map((s, i) => `
+            <button class="pcard-subject-chip" data-subject="${esc(s)}"
+              style="text-align:left;font-size:10px;padding:3px 7px;border-radius:4px;border:1px solid var(--border);cursor:pointer;background:${i===0?"var(--primary)":"transparent"};color:${i===0?"#fff":"var(--text)"};line-height:1.3">
+              ${esc(s)}
+            </button>`).join("")}
+        </div>`;
+        chipsArea.querySelectorAll(".pcard-subject-chip").forEach(chip => {
+          chip.addEventListener("click", () => {
+            chipsArea.querySelectorAll(".pcard-subject-chip").forEach(c => {
+              c.style.background = "transparent"; c.style.color = "var(--text)";
+            });
+            chip.style.background = "var(--primary)"; chip.style.color = "#fff";
+            subjInput.value = chip.dataset.subject;
+          });
+        });
+      }
+
+      // Save back to Supabase
+      await updateReviewItem(state.accessToken, data.id, {
+        pitch:          result.body          || "",
+        pitch_subject:  result.subjects?.[0] || "",
+        pitch_subjects: result.subjects      || [],
+      });
+
+      btn.textContent = "✨ Regenerate";
+    } catch (err) {
+      errEl.textContent = `Error: ${err.message}`;
+      btn.textContent   = "✨ Generate pitch";
+    }
+    btn.disabled = false;
   });
 
   // Edit button → expand + focus pitch
