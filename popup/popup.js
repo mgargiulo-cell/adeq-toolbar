@@ -15,7 +15,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, fetchApiKeys,
          getImportedDomains, markDomainsImported,
-         getAutopilotEnabled, setAutopilotEnabled,
+         getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
          getDailyValidationCount }                                                           from "../modules/supabase.js";
@@ -2305,6 +2305,9 @@ async function clearGmailAssociation(loginEmail) {
 }
 
 // ── Autopilot toggle + target ─────────────────────────────────
+const AUTOPILOT_DURATION_MS = 15 * 60 * 1000; // 15 minutos
+let _autopilotTimer = null;
+
 async function initAutopilot() {
   const btn         = document.getElementById("btn-autopilot");
   const targetBtn   = document.getElementById("btn-autopilot-target");
@@ -2317,21 +2320,43 @@ async function initAutopilot() {
   const currentLbl  = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
-  const [enabled, target] = await Promise.all([
-    getAutopilotEnabled(state.accessToken),
+  const [{ enabled, sessionStart }, target] = await Promise.all([
+    getAutopilotState(state.accessToken),
     getAutopilotTarget(state.accessToken),
   ]);
-  setAutopilotUI(btn, enabled);
+
+  // Calcular tiempo restante de una sesión activa
+  const elapsed  = sessionStart ? (Date.now() - sessionStart.getTime()) : Infinity;
+  const remaining = AUTOPILOT_DURATION_MS - elapsed;
+
+  if (enabled && remaining > 0) {
+    // Sesión activa con tiempo restante — reanudar countdown
+    setAutopilotUI(btn, true);
+    startAutopilotCountdown(btn, remaining);
+  } else {
+    // Apagado o sesión expirada — siempre forzar OFF
+    setAutopilotUI(btn, false);
+    if (enabled) await setAutopilotEnabled(false, state.accessToken);
+  }
+
   updateTargetLabel(target, targetBtn, currentLbl);
   if (geoSel)     geoSel.value     = target.geo        || "";
   if (catSel)     catSel.value     = target.category   || "";
   if (trafficSel) trafficSel.value = target.minTraffic || "400000";
 
   btn.addEventListener("click", async () => {
-    const current = btn.classList.contains("active");
-    const next    = !current;
-    setAutopilotUI(btn, next);
-    await setAutopilotEnabled(next, state.accessToken);
+    const isOn = btn.classList.contains("active");
+    if (isOn) {
+      // Apagar
+      clearAutopilotTimer();
+      setAutopilotUI(btn, false);
+      await setAutopilotEnabled(false, state.accessToken);
+    } else {
+      // Encender por 15 min
+      setAutopilotUI(btn, true);
+      await setAutopilotEnabled(true, state.accessToken);
+      startAutopilotCountdown(btn, AUTOPILOT_DURATION_MS);
+    }
   });
 
   targetBtn?.addEventListener("click", () => {
@@ -2353,6 +2378,31 @@ async function initAutopilot() {
   });
 }
 
+function startAutopilotCountdown(btn, durationMs) {
+  clearAutopilotTimer();
+  const endsAt = Date.now() + durationMs;
+
+  const tick = () => {
+    const left = endsAt - Date.now();
+    if (left <= 0) {
+      clearAutopilotTimer();
+      setAutopilotUI(btn, false);
+      setAutopilotEnabled(false, state.accessToken);
+      return;
+    }
+    const mins = Math.ceil(left / 60000);
+    const labelEl = btn.querySelector(".autopilot-label");
+    if (labelEl) labelEl.textContent = `AUTO ON ${mins}m`;
+  };
+
+  tick();
+  _autopilotTimer = setInterval(tick, 30000); // actualiza cada 30s
+}
+
+function clearAutopilotTimer() {
+  if (_autopilotTimer) { clearInterval(_autopilotTimer); _autopilotTimer = null; }
+}
+
 function updateTargetLabel(target, targetBtn, currentLbl) {
   const trafficNum = parseInt(target.minTraffic || "400000");
   const trafficLbl = trafficNum >= 10000001 ? "+10M+" : trafficNum >= 1000000 ? `+${trafficNum/1000000}M` : `+${trafficNum/1000}K`;
@@ -2365,9 +2415,11 @@ function updateTargetLabel(target, targetBtn, currentLbl) {
 
 function setAutopilotUI(btn, enabled) {
   btn.classList.toggle("active", enabled);
+  const labelEl = btn.querySelector(".autopilot-label");
+  if (labelEl) labelEl.textContent = enabled ? "AUTO ON" : "AUTO OFF";
   btn.title = enabled
-    ? "Autopilot ACTIVO — el servicio está prospectando automáticamente"
-    : "Autopilot OFF — click para activar";
+    ? "Autopilot ON — corre 15 min y se apaga solo. Click para apagar ahora."
+    : "Autopilot OFF — click para activar (15 min)";
 }
 
 async function logout() {

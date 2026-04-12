@@ -82,15 +82,26 @@ export async function fetchApiKeys(accessToken) {
 
 // ── Autopilot toggle ──────────────────────────────────────────
 export async function getAutopilotEnabled(accessToken) {
+  const { enabled } = await getAutopilotState(accessToken);
+  return enabled;
+}
+
+// Returns { enabled: bool, sessionStart: Date|null }
+export async function getAutopilotState(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
-    const res = await fetch(`${url}/rest/v1/toolbar_config?key=eq.auto_prospecting_enabled&select=value`, {
-      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
-    });
+    const res  = await fetch(
+      `${url}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,auto_session_start)&select=key,value`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
     const rows = await res.json();
-    return rows?.[0]?.value === "true";
-  } catch { return false; }
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+    const enabled      = map.auto_prospecting_enabled === "true";
+    const sessionStart = map.auto_session_start ? new Date(map.auto_session_start) : null;
+    return { enabled, sessionStart };
+  } catch { return { enabled: false, sessionStart: null }; }
 }
 
 export async function setAutopilotEnabled(enabled, accessToken) {
