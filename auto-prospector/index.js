@@ -437,6 +437,7 @@ async function main() {
       }
 
       await runSession(token, cfg, sessionStart);
+      await sleep(POLL_INTERVAL_MS);
 
     } catch (err) {
       log(`❌ Error: ${err.message}`);
