@@ -295,6 +295,7 @@ async function main() {
       }
 
       const cfg = await getConfig(token);
+      log(`Debug cfg — auto_prospecting_enabled: "${cfg.auto_prospecting_enabled}" | keys: ${Object.keys(cfg).join(",")}`);
 
       if (cfg.auto_prospecting_enabled !== "true") {
         // Esperar y volver a chequear
