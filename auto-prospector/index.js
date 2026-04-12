@@ -224,6 +224,49 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
   });
 }
 
+async function getApolloUsageToday(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_daily_limit)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+
+    const today   = new Date().toISOString().slice(0, 10);
+    const storedDate  = map.apollo_calls_date  || "";
+    const storedCount = parseInt(map.apollo_calls_today || "0", 10);
+    const limit       = parseInt(map.apollo_daily_limit || "50",  10);
+
+    // Si cambió el día, el contador empieza de cero
+    const usedToday = storedDate === today ? storedCount : 0;
+    return { usedToday, limit, today };
+  } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10) }; }
+}
+
+async function saveApolloUsage(token, callsThisSession, today) {
+  if (callsThisSession === 0) return;
+  try {
+    // Leer valor actual primero (otra sesión pudo haber corrido en paralelo)
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+
+    const storedDate  = map.apollo_calls_date || "";
+    const storedCount = storedDate === today ? parseInt(map.apollo_calls_today || "0", 10) : 0;
+    const newCount    = storedCount + callsThisSession;
+
+    await setConfigValue(token, "apollo_calls_today", String(newCount));
+    await setConfigValue(token, "apollo_calls_date",  today);
+    log(`Apollo usage guardado: ${newCount} calls hoy (sumé ${callsThisSession} en esta sesión)`);
+  } catch {}
+}
+
 async function getRejectionPatterns(token) {
   try {
     const res = await fetch(
@@ -613,13 +656,18 @@ async function runSession(token, cfg, sessionStart) {
   const targetInfo = [targetGeo, targetCategory].filter(Boolean).join(" + ") || "sin filtros";
   log(`Sesión iniciada. Target: ${targetInfo} | Min score: ${minScore}`);
 
-  // Carga en paralelo: pool global, dominios Monday (exclusión), dominios procesados, patrones de rechazo
-  const [pool, mondayDomains, processed, rejectionPatterns] = await Promise.all([
+  // Carga en paralelo: pool global, Monday, procesados, rechazos, uso Apollo
+  const [pool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
     loadDomainPool(),
     fetchMondayDomains(monday_api_key),
     getProcessedDomains(token),
     getRejectionPatterns(token),
+    getApolloUsageToday(token),
   ]);
+
+  let apolloCallsThisSession = 0;
+  const apolloRemaining = apolloUsage.limit - apolloUsage.usedToday;
+  log(`Apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} usados hoy — ${apolloRemaining} disponibles`);
 
   if (rejectionPatterns.categories && Object.keys(rejectionPatterns.categories).length > 0) {
     const topRejected = Object.entries(rejectionPatterns.categories)
@@ -719,8 +767,16 @@ async function runSession(token, cfg, sessionStart) {
     }
 
     // Paso 2: emails + pitch + sitios similares en paralelo
+    // Apollo solo si quedan créditos disponibles hoy
+    const canUseApollo = apollo_api_key && (apolloUsage.usedToday + apolloCallsThisSession) < apolloUsage.limit;
+    if (!canUseApollo && apollo_api_key) {
+      log(`  ⚠️ Límite Apollo alcanzado (${apolloUsage.limit}/día) — sin búsqueda de email`);
+    }
+
     const [emails, pitchResult, similarSites] = await Promise.all([
-      findAllEmails(domain, meta?.firstName || "", meta?.lastName || "", apollo_api_key),
+      canUseApollo
+        ? findAllEmails(domain, meta?.firstName || "", meta?.lastName || "", apollo_api_key).then(r => { apolloCallsThisSession += 2; return r; })
+        : Promise.resolve([]),
       generatePitchForDomain(domain, visits, topCountry, language, category, contactName, contactTitle, pageContent, adNetworks, gemini_api_key),
       findSimilarSites(domain, rapidapi_key),
     ]);
@@ -765,6 +821,7 @@ async function runSession(token, cfg, sessionStart) {
   }
 
   log(`Sesión completada — ${count} procesados | ${added} guardados | ${skipped} bajo tráfico | ${lowScore} bajo score | ${discovered} descubiertos vía similares`);
+  await saveApolloUsage(token, apolloCallsThisSession, apolloUsage.today);
 }
 
 // ── Loop principal ────────────────────────────────────────────
