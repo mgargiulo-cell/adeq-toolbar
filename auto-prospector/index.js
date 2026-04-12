@@ -305,30 +305,44 @@ async function fetchMondayDomains(apiKey) {
 }
 
 async function getTrafficData(domain, rapidApiKey) {
+  const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "similarweb-insights.p.rapidapi.com" };
   try {
     const res = await fetch(
       `https://similarweb-insights.p.rapidapi.com/traffic?domain=${encodeURIComponent(domain)}`,
-      {
-        headers: {
-          "x-rapidapi-key":  rapidApiKey,
-          "x-rapidapi-host": "similarweb-insights.p.rapidapi.com",
-        },
-        signal: AbortSignal.timeout(8000),
-      }
+      { headers, signal: AbortSignal.timeout(8000) }
     );
     if (!res.ok) return { visits: null, topCountry: null };
     const data = await res.json();
-    const visits = data?.visits || data?.Visits || data?.pageViews || null;
+    const visits = data?.Visits || data?.visits || data?.pageViews || null;
 
-    // Extract top country from various possible field names
-    const shares = data?.topCountryShares || data?.CountryShares || data?.countries || data?.topCountries || [];
-    let countryCode = null;
-    if (Array.isArray(shares) && shares.length) {
-      countryCode = shares[0]?.country || shares[0]?.countryCode || shares[0]?.Country || null;
+    // Extract top country — try inline data first, then separate /countries endpoint
+    let topCountry = null;
+    const inlineList = data?.TopCountries || data?.Countries || data?.countries
+                    || data?.topCountryShares || data?.CountryShares || [];
+    if (Array.isArray(inlineList) && inlineList.length) {
+      const c    = inlineList[0];
+      const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
+      if (code) topCountry = COUNTRY_CODES[code] || code;
     }
-    const topCountry = countryCode
-      ? (COUNTRY_CODES[String(countryCode).toUpperCase()] || countryCode)
-      : null;
+
+    // Fallback: dedicated /countries endpoint (used by extension too)
+    if (!topCountry) {
+      try {
+        const r2 = await fetch(
+          `https://similarweb-insights.p.rapidapi.com/countries?domain=${encodeURIComponent(domain)}`,
+          { headers, signal: AbortSignal.timeout(6000) }
+        );
+        if (r2.ok) {
+          const d2   = await r2.json();
+          const list = Array.isArray(d2) ? d2 : (d2?.TopCountries || d2?.Countries || d2?.countries || []);
+          if (list.length) {
+            const c    = list[0];
+            const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
+            if (code) topCountry = COUNTRY_CODES[code] || code;
+          }
+        }
+      } catch {}
+    }
 
     return { visits, topCountry };
   } catch { return { visits: null, topCountry: null }; }
@@ -450,6 +464,54 @@ async function findAllEmails(domain, firstName, lastName, apolloApiKey) {
   } catch {}
 
   return [...new Set(emails)];
+}
+
+// ── Email scraping fallback (server-side HTTP) ────────────────
+
+const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}(?=\s|$|[^a-zA-Z])/g;
+const IGNORE_EMAIL = ["example.com","domain.com","sentry.io","google.com","w3.org","schema.org","cloudflare.com"];
+
+function extractEmailsFromHtml(html) {
+  const clean = html
+    .replace(/&#64;|&#x40;/gi, "@").replace(/&#46;|&#x2e;/gi, ".")
+    .replace(/\[\s*at\s*\]/gi, "@").replace(/\(\s*at\s*\)/gi, "@")
+    .replace(/\barroba\b/gi,   "@").replace(/\bpunto\b/gi,    ".");
+  const found = [...new Set((clean.match(EMAIL_REGEX) || []).map(e => e.toLowerCase()))];
+  return found.filter(e => {
+    const lower = e.toLowerCase();
+    if (IGNORE_EMAIL.some(p => lower.includes(p))) return false;
+    const parts = e.split("@");
+    if (parts.length !== 2) return false;
+    const tld = parts[1].split(".").pop();
+    return tld && tld.length >= 2 && tld.length <= 6;
+  });
+}
+
+async function scrapeEmailsForDomain(domain) {
+  const emails = new Set();
+  const base   = `https://${domain}`;
+
+  // 1. website.informer.com
+  try {
+    const r = await fetch(`https://website.informer.com/${domain}`, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (r.ok) extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
+  } catch {}
+
+  if (emails.size > 0) return [...emails];
+
+  // 2. Contact pages
+  for (const path of ["/contact", "/contact-us", "/about", "/advertise", "/advertising"]) {
+    try {
+      const r = await fetch(new URL(path, base).href, { signal: AbortSignal.timeout(4000) });
+      if (r.ok) extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
+      if (emails.size > 0) break;
+    } catch {}
+  }
+
+  return [...emails];
 }
 
 // ── Page intelligence ─────────────────────────────────────────
@@ -748,6 +810,19 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
 
+    // Filtro duro de GEO — si topCountry está disponible y no pertenece a la región objetivo, descartar
+    if (targetGeo && topCountry) {
+      const region = GEO_REGIONS[targetGeo];
+      const inRegion = region ? region.includes(topCountry) : (targetGeo === topCountry);
+      if (!inRegion) {
+        log(`  ✗ GEO ${topCountry} ∉ ${targetGeo} — descartado`);
+        await markProcessed(token, [domain]);
+        count++; skipped++;
+        await sleep(DOMAIN_DELAY_MS);
+        continue;
+      }
+    }
+
     // Scoring: tráfico + categoría + contacto + geo target + contenido accesible
     const rawScore = scoreCandidate({ visits, category, topCountry, contactName, emails: [], pageContent, targetGeo });
 
@@ -771,12 +846,14 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ⚠️ Límite Apollo alcanzado (${apolloUsage.limit}/día) — sin búsqueda de email`);
     }
 
-    const [emails, similarSites] = await Promise.all([
+    const [apolloEmails, scraperEmails, similarSites] = await Promise.all([
       canUseApollo
         ? findAllEmails(domain, meta?.firstName || "", meta?.lastName || "", apollo_api_key).then(r => { apolloCallsThisSession += 2; return r; })
         : Promise.resolve([]),
+      scrapeEmailsForDomain(domain),
       findSimilarSites(domain, rapidapi_key),
     ]);
+    const emails = [...new Set([...apolloEmails, ...scraperEmails])];
 
     // Score final con emails encontrados
     const scoreWithEmails = finalScore + (emails.length > 0 ? 10 : 0);

@@ -2493,7 +2493,6 @@ function renderProspectCard(r) {
       <div style="display:flex;gap:3px;flex-shrink:0">
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="See email &amp; data" style="padding:3px 7px">▼</button>
         <button class="btn btn-success btn-sm pcard-validate-btn" title="Push to Monday + Send Email" style="padding:3px 7px">✅</button>
-        <button class="btn btn-secondary btn-sm pcard-mondayonly-btn" title="Push to Monday only (no email)" style="padding:3px 7px">📋</button>
         <button class="btn btn-sm pcard-reject-btn" title="Reject permanently" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
@@ -2537,7 +2536,6 @@ function renderProspectCard(r) {
       <!-- Action buttons in panel -->
       <div style="display:flex;gap:6px;margin-top:10px">
         <button class="btn btn-success btn-sm pcard-validate-expanded" style="flex:1">✅ Push + Send Email</button>
-        <button class="btn btn-secondary btn-sm pcard-mondayonly-expanded" style="flex:1">📋 Monday only</button>
       </div>
       <div class="pcard-result" style="min-height:14px;font-size:11px;margin-top:5px;color:#16a34a"></div>
     </div>
