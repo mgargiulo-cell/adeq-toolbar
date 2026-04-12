@@ -1412,9 +1412,12 @@ function bindButtons() {
     const resultEl = document.getElementById("import-result");
     const listEl   = document.getElementById("import-list");
 
-    const geo        = document.getElementById("import-geo").value;
-    const idioma     = document.getElementById("import-idioma").value;
-    const minTraffic = parseInt(document.getElementById("import-traffic").value) || 0;
+    const geo          = document.getElementById("import-geo").value;
+    const idioma       = document.getElementById("import-idioma").value;
+    const trafficVal   = document.getElementById("import-traffic").value;
+    const [tMinRaw, tMaxRaw] = trafficVal.split(":").map(v => v === "" ? 0 : Number(v));
+    const minTraffic   = tMinRaw || 0;
+    const maxTraffic   = tMaxRaw || 0;
 
     btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
     resultEl.textContent = ""; resultEl.className = "push-result";
@@ -1422,7 +1425,7 @@ function bindButtons() {
 
     try {
       const [candidates, importedSet] = await Promise.all([
-        fetchImportCandidates({ geo, idioma, minTraffic }),
+        fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic }),
         getImportedDomains(state.accessToken),
       ]);
 

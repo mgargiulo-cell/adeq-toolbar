@@ -214,44 +214,60 @@ function parseTrafficText(str) {
 
 // ── fetchImportCandidates — para el tab Import ────────────────
 // Trae ítems del board filtrados por geo/idioma, filtra tráfico client-side
-export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0 } = {}) {
+export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0, maxTraffic = 0 } = {}) {
   const rules = [];
-  // Excluir siempre "En Negociacion" (index 1) — ya están siendo trabajados
-  rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.estado}", compare_value: ["1"], operator: not_any_of }`);
   // idioma value is the numeric index of the status column (e.g. "0"=English, "1"=Spanish)
   if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: ["${idioma}"], operator: any_of }`);
   // geo value must match the English text stored in Monday
   if (geo)           rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.geo}", compare_value: ["${geo}"], operator: contains_text }`);
 
-  const queryParams = `, query_params: { rules: [${rules.join(",")}] }`;
+  const queryParams = rules.length
+    ? `, query_params: { rules: [${rules.join(",")}] }`
+    : "";
 
-  const query = `{
-    boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
-      items_page(limit: 150${queryParams}) {
-        items {
-          name
-          column_values(ids: [
-            "${CONFIG.MONDAY_COLUMNS.trafico}",
-            "${CONFIG.MONDAY_COLUMNS.geo}",
-            "${CONFIG.MONDAY_COLUMNS.idioma}"
-          ]) { id text }
-        }
-      }
-    }
-  }`;
+  // Collect all items using cursor pagination (Monday max 500/page)
+  let cursor   = null;
+  let allItems = [];
 
   try {
-    const data  = await mondayRequest(query);
-    const items = data?.boards?.[0]?.items_page?.items || [];
+    do {
+      const cursorArg = cursor ? `, cursor: "${cursor}"` : "";
+      const query = `{
+        boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
+          items_page(limit: 500${queryParams}${cursorArg}) {
+            cursor
+            items {
+              name
+              column_values(ids: [
+                "${CONFIG.MONDAY_COLUMNS.trafico}",
+                "${CONFIG.MONDAY_COLUMNS.geo}",
+                "${CONFIG.MONDAY_COLUMNS.idioma}",
+                "${CONFIG.MONDAY_COLUMNS.estado}"
+              ]) { id text }
+            }
+          }
+        }
+      }`;
 
-    return items
+      const data = await mondayRequest(query);
+      const page = data?.boards?.[0]?.items_page;
+      allItems   = [...allItems, ...(page?.items || [])];
+      cursor     = page?.cursor || null;
+    } while (cursor);
+
+    return allItems
       .map(item => {
         const col     = (id) => item.column_values.find(c => c.id === id)?.text || "";
         const traffic = parseTrafficText(col(CONFIG.MONDAY_COLUMNS.trafico));
         const domain  = cleanDomain(item.name);
-        return { domain, url: `https://www.${domain}`, traffic, geo: col(CONFIG.MONDAY_COLUMNS.geo), idioma: col(CONFIG.MONDAY_COLUMNS.idioma) };
+        const estado  = col(CONFIG.MONDAY_COLUMNS.estado);
+        return { domain, url: `https://www.${domain}`, traffic, geo: col(CONFIG.MONDAY_COLUMNS.geo), idioma: col(CONFIG.MONDAY_COLUMNS.idioma), estado };
       })
-      .filter(item => item.domain && (!minTraffic || item.traffic >= minTraffic));
+      // Excluir "En Negociacion" client-side (más confiable que depender del operador not_any_of de Monday)
+      .filter(item => item.domain && item.estado !== "En Negociacion")
+      .filter(item => !minTraffic || item.traffic >= minTraffic)
+      .filter(item => !maxTraffic || item.traffic <= maxTraffic);
+
   } catch (e) {
     console.error("[Import] fetchImportCandidates error:", e.message);
     return [];
