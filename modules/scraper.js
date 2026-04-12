@@ -146,7 +146,26 @@ export async function scrapeInformer(domain) {
 }
 
 // ============================================================
-// 3. Páginas de contacto del propio sitio
+// 3. who.is — WHOIS registrant email
+// ============================================================
+export async function scrapeWhoIs(domain) {
+  const cleanDomain = domain.replace(/^www\./, "");
+  try {
+    const response = await fetch(`https://who.is/whois/${cleanDomain}`, {
+      method: "GET",
+      signal: AbortSignal.timeout(7000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
+    });
+    if (!response.ok) return [];
+    const html   = await response.text();
+    return filterEmails(extractEmailsFromText(html));
+  } catch {
+    return [];
+  }
+}
+
+// ============================================================
+// 4. Páginas de contacto del propio sitio
 // ============================================================
 export async function scrapeContactPages(baseUrl) {
   const paths = ["/contact", "/contact-us", "/contacto", "/about", "/about-us", "/legal", "/privacy", "/advertise", "/advertising"];

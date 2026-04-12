@@ -41,7 +41,7 @@
     ]
   },
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://www.google.com data:; connect-src 'self' https://api.monday.com https://*.rapidapi.com https://generativelanguage.googleapis.com https://api.apollo.io https://www.googleapis.com https://accounts.google.com https://*.supabase.co https://website.informer.com https://downloads.majesticseo.com https://dns.google;"
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://www.google.com data:; connect-src 'self' https://api.monday.com https://*.rapidapi.com https://generativelanguage.googleapis.com https://api.apollo.io https://www.googleapis.com https://accounts.google.com https://*.supabase.co https://website.informer.com https://downloads.majesticseo.com https://dns.google https://who.is;"
   },
   "host_permissions": [
     "https://api.monday.com/*",

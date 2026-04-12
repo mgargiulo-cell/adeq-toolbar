@@ -4,7 +4,7 @@
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, getMonthlyApiCalls, getApiLimits } from "../modules/traffic.js";
-import { scrapeEmailsFromPage, scrapeInformer, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
+import { scrapeEmailsFromPage, scrapeInformer, scrapeWhoIs, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
 import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
@@ -694,12 +694,13 @@ async function runEmailScraper() {
     // Si ya tenemos emails en caché de sesión (misma visita al dominio), usarlos
     // Igualmente re-scrapeamos la página actual para no perdernos emails de subpáginas
     const sess = await getSessionCache(state.domain);
-    const [pageEmails, informerData] = await Promise.all([
+    const [pageEmails, informerData, whoIsEmails] = await Promise.all([
       scrapeEmailsFromPage(state.tabId),
       sess?.emails?.length ? Promise.resolve({ emails: [] }) : scrapeInformer(state.domain),
+      sess?.emails?.length ? Promise.resolve([]) : scrapeWhoIs(state.domain),
     ]);
     const sessionEmails = sess?.emails || [];
-    const allEmails = [...new Set([...sessionEmails, ...pageEmails, ...(informerData.emails || [])])]
+    const allEmails = [...new Set([...sessionEmails, ...pageEmails, ...(informerData.emails || []), ...whoIsEmails])]
       .filter(quickValidateEmail);
     state.emails = allEmails;
 

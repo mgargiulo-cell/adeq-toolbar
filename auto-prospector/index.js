@@ -502,7 +502,19 @@ async function scrapeEmailsForDomain(domain) {
 
   if (emails.size > 0) return [...emails];
 
-  // 2. Contact pages
+  // 2. who.is WHOIS (registrant email)
+  try {
+    const cleanDomain = domain.replace(/^www\./, "");
+    const r = await fetch(`https://who.is/whois/${cleanDomain}`, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (r.ok) extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
+  } catch {}
+
+  if (emails.size > 0) return [...emails];
+
+  // 3. Contact pages
   for (const path of ["/contact", "/contact-us", "/about", "/advertise", "/advertising"]) {
     try {
       const r = await fetch(new URL(path, base).href, { signal: AbortSignal.timeout(4000) });
