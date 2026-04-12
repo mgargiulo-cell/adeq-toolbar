@@ -15,7 +15,8 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, fetchApiKeys,
          getImportedDomains, markDomainsImported,
-         getAutopilotEnabled, setAutopilotEnabled }                                            from "../modules/supabase.js";
+         getAutopilotEnabled, setAutopilotEnabled,
+         fetchAutoProspects, deleteHistorialRecords, permanentlyBlockDomains }               from "../modules/supabase.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken }                        from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -182,6 +183,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindButtons();
   initKeywords();
   initAutopilot();
+  initProspectsTab();
   // loadHistoryTab() ya NO carga aquí — se hace lazy al clickear el tab
 
   // Show the toolbar login email as the Gmail "from" account
@@ -401,6 +403,9 @@ function initTabs() {
             const listEl = document.getElementById("history-list");
             if (listEl) listEl.innerHTML = '<div class="cascade-empty">Error loading history.</div>';
           });
+        }
+        if (tabId === "prospects") {
+          await loadProspectsTab();
         }
       }
     });
@@ -2306,6 +2311,183 @@ function setAutopilotUI(btn, enabled) {
 async function logout() {
   await chrome.storage.local.remove("auth");
   window.location.reload();
+}
+
+// ============================================================
+// PROSPECTS TAB — Candidatos del auto-prospector
+// ============================================================
+async function loadProspectsTab() {
+  const listEl   = document.getElementById("prospects-list");
+  const countEl  = document.getElementById("prospects-count");
+  if (!listEl) return;
+
+  listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
+
+  const rows = await fetchAutoProspects(state.accessToken);
+
+  if (!rows.length) {
+    listEl.innerHTML = '<div class="cascade-empty">No auto-prospected candidates yet.</div>';
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+
+  if (countEl) countEl.textContent = `${rows.length} candidates`;
+
+  listEl.innerHTML = rows.map(r => {
+    const trafficFmt = r.page_views ? formatTraffic(r.page_views) : "N/A";
+    const contact    = r.ejecutivo  || "—";
+    const email      = r.email      || "—";
+    const hasEmail   = r.email && r.email.includes("@");
+    return `
+      <div class="import-item prospect-row" data-id="${r.id}" data-domain="${esc(r.domain)}" data-email="${esc(r.email || "")}" data-contact="${esc(r.ejecutivo || "")}">
+        <input type="checkbox" class="prospect-chk" style="margin-right:6px;cursor:pointer" />
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.domain)}</div>
+          <div style="font-size:10px;color:var(--text-muted)">
+            📊 ${trafficFmt}
+            ${contact !== "—" ? ` · 👤 ${esc(contact)}` : ""}
+            ${hasEmail ? ` · ✉️ <span style="color:#3b82f6">${esc(email)}</span>` : ""}
+          </div>
+        </div>
+        <button class="btn btn-secondary btn-sm prospect-discard" title="Discard permanently" style="flex-shrink:0;margin-left:6px">🗑</button>
+      </div>`;
+  }).join("");
+
+  // Checkbox listeners
+  listEl.querySelectorAll(".prospect-chk").forEach(chk => {
+    chk.addEventListener("change", updateProspectSelectAll);
+  });
+
+  // Discard per-row
+  listEl.querySelectorAll(".prospect-discard").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const row    = btn.closest(".prospect-row");
+      const id     = parseInt(row.dataset.id);
+      const domain = row.dataset.domain;
+      btn.disabled = true; btn.textContent = "⏳";
+      await Promise.all([
+        deleteHistorialRecords(state.accessToken, [id]),
+        permanentlyBlockDomains(state.accessToken, [domain]),
+      ]);
+      row.remove();
+      const remaining = listEl.querySelectorAll(".prospect-row").length;
+      if (countEl) countEl.textContent = `${remaining} candidates`;
+      if (!remaining) listEl.innerHTML = '<div class="cascade-empty">No candidates left.</div>';
+      updateProspectSelectAll();
+    });
+  });
+
+  // Select-all toggle
+  const selectAllChk = document.getElementById("prospects-select-all");
+  if (selectAllChk) {
+    selectAllChk.onchange = () => {
+      listEl.querySelectorAll(".prospect-chk").forEach(c => { c.checked = selectAllChk.checked; });
+    };
+  }
+}
+
+function updateProspectSelectAll() {
+  const selectAllChk = document.getElementById("prospects-select-all");
+  if (!selectAllChk) return;
+  const all     = document.querySelectorAll(".prospect-chk");
+  const checked = document.querySelectorAll(".prospect-chk:checked");
+  selectAllChk.checked       = all.length > 0 && checked.length === all.length;
+  selectAllChk.indeterminate = checked.length > 0 && checked.length < all.length;
+}
+
+function initProspectsTab() {
+  document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
+    const listEl = document.getElementById("prospects-list");
+    if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
+    await loadProspectsTab();
+  });
+
+  // Push to Monday (no email)
+  document.getElementById("btn-prospects-push")?.addEventListener("click", async () => {
+    await processSelectedProspects({ sendEmail: false });
+  });
+
+  // Push + generate pitch + send email
+  document.getElementById("btn-prospects-push-email")?.addEventListener("click", async () => {
+    await processSelectedProspects({ sendEmail: true });
+  });
+}
+
+async function processSelectedProspects({ sendEmail: doSendEmail }) {
+  const resultEl   = document.getElementById("prospects-action-result");
+  const ejecutivo  = document.getElementById("prospects-ejecutivo").value;
+  const estado     = document.getElementById("prospects-estado").value;
+  const listEl     = document.getElementById("prospects-list");
+
+  const selected = [...listEl.querySelectorAll(".prospect-row")]
+    .filter(row => row.querySelector(".prospect-chk")?.checked);
+
+  if (!selected.length) {
+    resultEl.textContent = "No items selected.";
+    resultEl.className   = "push-result error";
+    return;
+  }
+
+  resultEl.textContent = `⏳ Processing 0 / ${selected.length}...`;
+  resultEl.className   = "push-result";
+
+  let done = 0; let errors = 0;
+  const processedIds     = [];
+  const processedDomains = [];
+
+  for (const row of selected) {
+    const domain  = row.dataset.domain;
+    const id      = parseInt(row.dataset.id);
+    const email   = row.dataset.email;
+    const contact = row.dataset.contact;
+
+    try {
+      // Push to Monday
+      await pushToMonday({ domain, traffic: "", email, geo: "", pitch: "", estado, ejecutivo });
+
+      // Generate pitch + send email
+      if (doSendEmail && email && email.includes("@")) {
+        const pitchResult = await generatePitch({
+          domain, traffic: 0, techStack: [], adsTxt: null, revenueGap: null,
+          banners: "", category: "", siteLanguage: "", pageTitle: "",
+          pageDescription: "", decisionMakerName: contact,
+          tone: "informal", length: "short", focus: "nodataanalysis", opening: "direct",
+          lang: "en", favExamples: [], dislikes: [],
+        });
+        const body = pitchResult?.body || "";
+        if (body) {
+          const signature = await getGmailSignature();
+          await sendEmail({
+            to:      email,
+            subject: pitchResult?.subjects?.[0] || `Partnership opportunity — ${domain}`,
+            body:    body + (signature ? "\n\n" + signature : ""),
+          });
+        }
+      }
+
+      processedIds.push(id);
+      processedDomains.push(domain);
+      row.style.opacity = "0.4";
+      done++;
+      resultEl.textContent = `⏳ Processing ${done} / ${selected.length}...`;
+
+    } catch (err) {
+      console.error("[Prospects]", domain, err.message);
+      errors++;
+    }
+  }
+
+  // Remove processed rows and reload
+  if (processedIds.length) {
+    await deleteHistorialRecords(state.accessToken, processedIds);
+    await loadProspectsTab();
+  }
+
+  resultEl.textContent = errors
+    ? `✅ ${done} pushed · ❌ ${errors} errors`
+    : `✅ ${done} prospects pushed to Monday${doSendEmail ? " + emails sent" : ""}`;
+  resultEl.className = "push-result ok";
 }
 
 async function updateApiFooter() {

@@ -117,6 +117,51 @@ export async function setAutopilotEnabled(enabled, accessToken) {
   } catch {}
 }
 
+// ── Auto-Prospects — candidatos generados por el auto-prospector ─────
+export async function fetchAutoProspects(accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_historial?source=eq.auto&media_buyer=eq.AUTO&order=created_at.desc&limit=200&select=id,domain,page_views,ejecutivo,email,date`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return [];
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows : [];
+  } catch { return []; }
+}
+
+export async function deleteHistorialRecords(accessToken, ids) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!ids || !ids.length) return;
+  const idList = ids.join(",");
+  try {
+    await fetch(`${url}/rest/v1/toolbar_historial?id=in.(${idList})`, {
+      method:  "DELETE",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+    });
+  } catch {}
+}
+
+export async function permanentlyBlockDomains(accessToken, domains) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!domains || !domains.length) return;
+  const expiresAt = new Date(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000).toISOString(); // 10 años
+  try {
+    await fetch(`${url}/rest/v1/toolbar_import_queue`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
+      },
+      body: JSON.stringify(domains.map(d => ({ domain: d, imported_by: "DISCARDED", expires_at: expiresAt }))),
+    });
+  } catch {}
+}
+
 // ── Import Queue — evitar que dos usuarios importen las mismas URLs ──
 export async function getImportedDomains(accessToken) {
   const url = CONFIG.SUPABASE_URL;

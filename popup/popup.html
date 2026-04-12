@@ -47,6 +47,7 @@
   <button class="tab-btn active" data-tab="core">🔍 Analysis</button>
   <button class="tab-btn" data-tab="cascade">🌊 Cascade</button>
   <button class="tab-btn" data-tab="history">🕐 History</button>
+  <button class="tab-btn" data-tab="prospects">🤖 Prospects</button>
   <button class="tab-btn" data-tab="import">📥 Import</button>
 </nav>
 
@@ -485,6 +486,54 @@
   </section>
   <div id="history-list" class="history-list">
     <div class="cascade-empty">No sites analyzed yet.</div>
+  </div>
+</div>
+
+<!-- ====================================================
+     TAB: PROSPECTS (Auto-prospector candidates)
+     ==================================================== -->
+<div id="tab-prospects" class="tab-content">
+  <section class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div class="card-title" style="margin:0">🤖 Auto-Prospector Candidates</div>
+      <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
+    </div>
+    <p class="import-desc">Prospects found by the auto-pilot. Select the ones to push to Monday. Discard the rest permanently.</p>
+
+    <!-- Push settings -->
+    <div class="form-grid" style="margin-bottom:10px">
+      <label class="form-label">Owner</label>
+      <select id="prospects-ejecutivo" class="form-select">
+        <option value="Agus">Agus</option>
+        <option value="Diego">Diego</option>
+        <option value="Max">Max</option>
+      </select>
+      <label class="form-label">Status</label>
+      <select id="prospects-estado" class="form-select">
+        <option value="8">Email Not Sent</option>
+        <option value="9">Bulk - Agus</option>
+        <option value="6">Bulk - Diego</option>
+        <option value="10">Bulk - Max</option>
+      </select>
+    </div>
+
+    <!-- Action buttons -->
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <button id="btn-prospects-push" class="btn btn-success btn-sm" style="flex:1">🚀 Push to Monday</button>
+      <button id="btn-prospects-push-email" class="btn btn-primary btn-sm" style="flex:1">📧 Push + Send Email</button>
+    </div>
+    <div id="prospects-action-result" class="push-result" style="min-height:14px;margin-bottom:6px"></div>
+
+    <!-- Select all -->
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:11px;color:var(--text-muted)">
+      <input type="checkbox" id="prospects-select-all" style="cursor:pointer" />
+      <label for="prospects-select-all" style="cursor:pointer">Select all</label>
+      <span id="prospects-count" style="margin-left:auto"></span>
+    </div>
+  </section>
+
+  <div id="prospects-list" class="import-list">
+    <div class="cascade-empty">⏳ Loading...</div>
   </div>
 </div>
 
