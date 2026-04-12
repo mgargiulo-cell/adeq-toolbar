@@ -80,7 +80,17 @@ export async function getTraffic(domain) {
 
   // Caché primero (60 días)
   const cached = await getTrafficCache(cleanDomain);
-  if (cached) return cached;
+  if (cached) {
+    // Si el caché no tiene geo, intentar el endpoint /countries una vez y rellenar
+    if (!cached.topCountries?.length) {
+      const fresh = await fetchTopCountries(cleanDomain);
+      if (fresh.length) {
+        cached.topCountries = fresh;
+        await saveTrafficCache(cleanDomain, cached);
+      }
+    }
+    return cached;
+  }
 
   try {
     // ── Primario: /traffic — tiene Visits + PagePerVisit (engagement metrics) ──
