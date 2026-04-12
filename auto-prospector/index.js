@@ -21,12 +21,6 @@ const DOMAIN_DELAY_MS   = 2000;            // pausa entre dominios (rate limit)
 
 // ── Supabase helpers ──────────────────────────────────────────
 async function supabaseLogin() {
-  // Debug: log first/last 6 chars of key to verify it's loading correctly
-  const keyPreview = SUPABASE_ANON_KEY
-    ? `${SUPABASE_ANON_KEY.slice(0, 6)}...${SUPABASE_ANON_KEY.slice(-6)} (len:${SUPABASE_ANON_KEY.length})`
-    : "UNDEFINED";
-  log(`Debug — URL: ${SUPABASE_URL} | KEY: ${keyPreview} | EMAIL: ${SUPABASE_EMAIL}`);
-
   const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
     method: "POST",
     headers: { "apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json" },
@@ -295,7 +289,6 @@ async function main() {
       }
 
       const cfg = await getConfig(token);
-      log(`Debug cfg — auto_prospecting_enabled: "${cfg.auto_prospecting_enabled}" | keys: ${Object.keys(cfg).join(",")}`);
 
       if (cfg.auto_prospecting_enabled !== "true" && cfg.auto_prospecting_enabled !== true) {
         // Esperar y volver a chequear
