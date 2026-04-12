@@ -216,12 +216,14 @@ function parseTrafficText(str) {
 // Trae ítems del board filtrados por geo/idioma, filtra tráfico client-side
 export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0 } = {}) {
   const rules = [];
+  // Excluir siempre "En Negociacion" (index 1) — ya están siendo trabajados
+  rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.estado}", compare_value: ["1"], operator: not_any_of }`);
   // idioma value is the numeric index of the status column (e.g. "0"=English, "1"=Spanish)
   if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: ["${idioma}"], operator: any_of }`);
-  // geo value must match the Spanish text stored in Monday (e.g. "México", "Estados Unidos")
+  // geo value must match the English text stored in Monday
   if (geo)           rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.geo}", compare_value: ["${geo}"], operator: contains_text }`);
 
-  const queryParams = rules.length ? `, query_params: { rules: [${rules.join(",")}] }` : "";
+  const queryParams = `, query_params: { rules: [${rules.join(",")}] }`;
 
   const query = `{
     boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
