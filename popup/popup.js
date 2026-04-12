@@ -1857,8 +1857,10 @@ async function startCascade() {
   const resultsEl = document.getElementById("cascade-results");
   const actionsEl = document.getElementById("cascade-actions");
 
-  const minTraffic = parseInt(document.getElementById("cascade-min-traffic").value);
-  const maxRank    = parseInt(document.getElementById("cascade-max-rank").value);
+  const trafficVal   = document.getElementById("cascade-min-traffic").value;
+  const [tMin, tMax] = trafficVal.split(":").map(v => v === "" ? Infinity : Number(v));
+  const rankVal      = document.getElementById("cascade-max-rank").value;
+  const [rMin, rMax] = rankVal.split(":").map(v => v === "" ? Infinity : Number(v));
   const langFilter = document.getElementById("cascade-language").value;
   const depth      = parseInt(document.getElementById("cascade-depth").value);
 
@@ -1899,8 +1901,10 @@ async function startCascade() {
 
   const passesFilters = (site) => {
     if (CASCADE_BLOCKLIST.has(site.domain.replace(/^www\./, ""))) return false;
-    if (site.visits < minTraffic) return false;
-    if (maxRank > 0 && site.globalRank && site.globalRank > maxRank) return false;
+    if (tMin > 0 && site.visits < tMin) return false;
+    if (tMax !== Infinity && site.visits > tMax) return false;
+    if (rMin > 0 && site.globalRank && site.globalRank < rMin) return false;
+    if (rMax !== Infinity && site.globalRank && site.globalRank > rMax) return false;
     if (langFilter && site.countryCode !== langFilter) return false;
     if (isBlockedByExec(site.domain)) { filteredCount++; return false; }
     return true;
