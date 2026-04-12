@@ -2082,7 +2082,11 @@ function mapCategory(category) {
 }
 
 function showError(msg) {
-  document.body.innerHTML = `<div style="padding:20px;color:#fc8181;font-family:sans-serif;font-size:13px;">${msg}</div>`;
+  const div = document.createElement("div");
+  div.style.cssText = "padding:20px;color:#fc8181;font-family:sans-serif;font-size:13px;";
+  div.textContent = msg;
+  document.body.innerHTML = "";
+  document.body.appendChild(div);
 }
 
 // ============================================================

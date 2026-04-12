@@ -289,19 +289,12 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
   // ── Paso 2a: Apollo people/match (nombre + dominio) ──────────
   if (firstName) {
     const match = await apolloPeopleMatch(cleanDomain, firstName, lastName, apolloKey);
-    if (match) {
-      console.log(`[Apollo] ✓ people/match: ${match.email} (${match.status})`);
-      return match;
-    }
+    if (match) return match;
   }
 
   // ── Paso 2b: Fallback — Apollo domain search por títulos ─────
-  console.log("[Apollo] Fallback → domain search para:", cleanDomain);
   const results = await apolloDomainSearch(cleanDomain, apolloKey);
-  if (results.length > 0) {
-    console.log(`[Apollo] ✓ domain search: ${results[0].email} (${results[0].status})`);
-    return results[0];
-  }
+  if (results.length > 0) return results[0];
 
   return {
     name:  firstName ? `${firstName} ${lastName}`.trim() : "",
