@@ -1,0 +1,4 @@
+node_modules/
+auto-prospector/node_modules/
+.DS_Store
+*.zip
