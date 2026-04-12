@@ -1338,13 +1338,13 @@ function bindButtons() {
 
     // ── Fetch Gmail signature (will trigger OAuth window if no cached token) ──
     btn.textContent = "⏳ Preparing...";
-    const gmailSig = await getGmailSignature(state.loginEmail);
+    const gmailSig = await getGmailSignature();
 
     let bodyToSend = pitch.replace(/\n*Best,[\s\S]*$/i, "").trimEnd();
     bodyToSend = gmailSig ? bodyToSend + "\n\n" + gmailSig : bodyToSend;
 
     btn.textContent = "⏳ Sending...";
-    const result = await sendEmail({ to: email, subject, body: bodyToSend, loginEmail: state.loginEmail });
+    const result = await sendEmail({ to: email, subject, body: bodyToSend });
 
     if (result.ok) {
       const today = new Date().toISOString().split("T")[0];

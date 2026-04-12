@@ -1,158 +1,81 @@
 // ============================================================
-// ADEQ TOOLBAR — Gmail OAuth + Send  v2
+// ADEQ TOOLBAR — Gmail OAuth + Send  v3
 //
-// Uses chrome.identity.launchWebAuthFlow (implicit flow) so that
-// ANY Google account (Agus, Diego, Max) can authenticate on any
-// machine, regardless of the extension's unpacked ID.
+// Uses chrome.identity.getAuthToken — the native Chrome Extension
+// OAuth API. Works correctly for Internal Google Workspace apps
+// (all @adeqmedia.com accounts authorized automatically).
 //
-// Token is cached in chrome.storage.local per toolbar login email
-// to avoid asking for OAuth on every send.
+// Token is cached by Chrome automatically. On 401, the cached
+// token is removed and a fresh one is requested.
 // ============================================================
 
 const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/gmail.settings.basic",
-].join(" ");
+];
 
-// ── Token cache helpers ───────────────────────────────────────
-// Key: "gmail_token_<loginEmail>"  →  { token, expiresAt }
+// ── Core token fetch ──────────────────────────────────────────
 
-async function getCachedToken(loginEmail) {
-  try {
-    const key = `gmail_token_${loginEmail || "shared"}`;
-    const { [key]: cached } = await chrome.storage.local.get(key);
-    if (!cached) return null;
-    if (Date.now() > cached.expiresAt - 120_000) return null; // expire 2 min early
-    return cached.token;
-  } catch { return null; }
-}
-
-async function setCachedToken(loginEmail, token, expiresInSec) {
-  try {
-    const key = `gmail_token_${loginEmail || "shared"}`;
-    await chrome.storage.local.set({
-      [key]: { token, expiresAt: Date.now() + expiresInSec * 1000 },
-    });
-  } catch {}
-}
-
-async function clearCachedToken(loginEmail) {
-  try {
-    const key = `gmail_token_${loginEmail || "shared"}`;
-    await chrome.storage.local.remove(key);
-  } catch {}
-}
-
-// ── Core OAuth via launchWebAuthFlow ─────────────────────────
-//
-// Works for any Google account on any machine.
-// Google treats *.chromiumapp.org redirects as trusted for
-// Chrome-App–type OAuth clients, so no exact extension-ID
-// registration is needed.
-//
-// If the OAuth app is in "Testing" mode in Google Cloud Console,
-// Agus and Diego must be added as test users by the admin (Max).
-
-async function fetchTokenInteractive(loginEmail) {
-  const clientId   = "1006462691161-6uicvg6urcco0a50534c46l4jiclfm70.apps.googleusercontent.com";
-  const redirectUri = `https://${chrome.runtime.id}.chromiumapp.org/`;
-
-  const authUrl = new URL("https://accounts.google.com/o/oauth2/auth");
-  authUrl.searchParams.set("client_id",     clientId);
-  authUrl.searchParams.set("response_type", "token");
-  authUrl.searchParams.set("redirect_uri",  redirectUri);
-  authUrl.searchParams.set("scope",         GMAIL_SCOPES);
-  authUrl.searchParams.set("prompt",        "select_account");
-  // Pre-fill the login hint so users don't have to pick the wrong account
-  if (loginEmail) authUrl.searchParams.set("login_hint", loginEmail);
-
+function fetchToken(interactive) {
   return new Promise((resolve) => {
-    chrome.identity.launchWebAuthFlow(
-      { url: authUrl.toString(), interactive: true },
-      async (redirectUrl) => {
-        if (chrome.runtime.lastError || !redirectUrl) {
-          const msg = chrome.runtime.lastError?.message || "OAuth window closed";
-          console.error("[Gmail] launchWebAuthFlow error:", msg);
-          resolve(null);
-          return;
-        }
-        try {
-          const hash   = new URL(redirectUrl).hash.slice(1);
-          const params = new URLSearchParams(hash);
-          const token  = params.get("access_token");
-          const expiresIn = parseInt(params.get("expires_in") || "3600");
-          if (token) {
-            await setCachedToken(loginEmail, token, expiresIn);
-          }
-          resolve(token || null);
-        } catch {
-          resolve(null);
-        }
+    chrome.identity.getAuthToken({ interactive, scopes: GMAIL_SCOPES }, (token) => {
+      if (chrome.runtime.lastError || !token) {
+        console.warn("[Gmail] getAuthToken:", chrome.runtime.lastError?.message);
+        resolve(null);
+      } else {
+        resolve(token);
       }
-    );
+    });
+  });
+}
+
+function removeCachedToken(token) {
+  return new Promise((resolve) => {
+    chrome.identity.removeCachedAuthToken({ token }, resolve);
   });
 }
 
 // ── Public API ────────────────────────────────────────────────
 
 /**
- * Returns a valid Gmail access token for the given toolbar loginEmail.
- * Uses the cache first; falls back to interactive OAuth.
- *
- * @param {boolean} interactive  - true = show OAuth window if needed
- * @param {string}  [loginEmail] - toolbar login email (used as cache key + login_hint)
+ * Returns a valid Gmail access token.
+ * @param {boolean} interactive - show OAuth window if needed
  * @returns {string|null}
  */
-export async function getGmailToken(interactive = true, loginEmail = "") {
-  const cached = await getCachedToken(loginEmail);
-  if (cached) return cached;
-  if (!interactive) return null;
-  return fetchTokenInteractive(loginEmail);
+export async function getGmailToken(interactive = true) {
+  return fetchToken(interactive);
 }
 
 /**
- * Returns the Gmail profile (email address) for the currently active token.
- * Non-interactive: returns null if no cached token exists.
- *
- * @param {boolean} [interactive]
- * @param {string}  [loginEmail]
+ * Returns the Gmail profile of the authenticated user.
+ * @param {boolean} interactive
  * @returns {{ email: string } | null}
  */
-export async function getGmailProfile(interactive = false, loginEmail = "") {
-  const token = await getGmailToken(interactive, loginEmail);
+export async function getGmailProfile(interactive = false) {
+  const token = await fetchToken(interactive);
   if (!token) return null;
-
-  try {
-    const res = await fetch(
-      "https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=" + encodeURIComponent(token)
-    );
-    if (!res.ok) return { email: loginEmail || "authenticated" };
-    const data = await res.json();
-    return { email: data.email || loginEmail || "authenticated" };
-  } catch {
-    return { email: loginEmail || "authenticated" };
-  }
+  return { email: "authenticated" };
 }
 
 /**
- * Returns the Gmail signature (plain text) for the logged-in account.
- *
- * @param {string} [loginEmail]
+ * Returns the Gmail signature (plain text) of the authenticated user.
  * @returns {string}
  */
-export async function getGmailSignature(loginEmail = "") {
+export async function getGmailSignature() {
   try {
-    const token = await getGmailToken(true, loginEmail);
+    const token = await fetchToken(true);
     if (!token) return "";
 
     const res = await fetch(
       "https://www.googleapis.com/gmail/v1/users/me/settings/sendAs",
       { headers: { "Authorization": `Bearer ${token}` } }
     );
+
     if (!res.ok) {
-      if (res.status === 401) await clearCachedToken(loginEmail); // invalidate
+      if (res.status === 401) await removeCachedToken(token);
       return "";
     }
+
     const data    = await res.json();
     const primary = data.sendAs?.find(s => s.isDefault) || data.sendAs?.[0];
     const html    = primary?.signature || "";
@@ -177,22 +100,18 @@ export async function getGmailSignature(loginEmail = "") {
 
 /**
  * Sends an email via Gmail API.
- *
  * @param {{ to: string, subject: string, body: string, loginEmail?: string }} params
  * @returns {{ ok: boolean, error?: string }}
  */
-export async function sendEmail({ to, subject, body, loginEmail = "" }) {
+export async function sendEmail({ to, subject, body }) {
   try {
-    let token = await getGmailToken(false, loginEmail);
-
-    // If no cached token, ask interactively
-    if (!token) token = await getGmailToken(true, loginEmail);
-    if (!token) throw new Error("Could not obtain Gmail token. Make sure your Google account is authorized.");
+    let token = await fetchToken(true);
+    if (!token) throw new Error("Could not obtain Gmail token. Make sure Chrome is signed in with your @adeqmedia.com account.");
 
     const raw = buildRaw({ to, subject, body });
 
-    const res = await fetch("https://www.googleapis.com/gmail/v1/users/me/messages/send", {
-      method: "POST",
+    let res = await fetch("https://www.googleapis.com/gmail/v1/users/me/messages/send", {
+      method:  "POST",
       headers: {
         "Authorization": `Bearer ${token}`,
         "Content-Type":  "application/json",
@@ -200,12 +119,24 @@ export async function sendEmail({ to, subject, body, loginEmail = "" }) {
       body: JSON.stringify({ raw }),
     });
 
+    // Token expired — remove and retry once with a fresh token
+    if (res.status === 401) {
+      await removeCachedToken(token);
+      token = await fetchToken(true);
+      if (!token) throw new Error("Authentication expired. Please try again.");
+
+      res = await fetch("https://www.googleapis.com/gmail/v1/users/me/messages/send", {
+        method:  "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type":  "application/json",
+        },
+        body: JSON.stringify({ raw }),
+      });
+    }
+
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      if (res.status === 401) {
-        await clearCachedToken(loginEmail); // force re-auth next time
-        throw new Error("Gmail token expired — please try again to re-authenticate.");
-      }
       throw new Error(err?.error?.message || `Gmail error ${res.status}`);
     }
 
