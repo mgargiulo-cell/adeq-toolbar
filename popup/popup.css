@@ -397,7 +397,8 @@ body {
 .rank-ok   { color: #10b981 !important; }
 .rank-warn { color: #f59e0b !important; }
 .rank-bad  { color: #ef4444 !important; }
-.cascade-summary { font-size: 13px; color: var(--text-muted); margin-bottom: 7px; text-align: center; }
+.cascade-actions-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; }
+.cascade-summary { font-size: 13px; color: var(--text-muted); }
 
 /* ---- HISTORIAL ---- */
 .history-header { display: flex; justify-content: space-between; align-items: center; }

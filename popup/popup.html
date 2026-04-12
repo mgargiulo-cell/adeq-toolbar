@@ -590,12 +590,6 @@
         </optgroup>
       </select>
 
-      <label class="filter-label">Depth</label>
-      <select id="cascade-depth" class="filter-select">
-        <option value="1">1 — Direct (~10 sites, 1 credit)</option>
-        <option value="2" selected>2 — Expanded (~100 sites, ~11 credits)</option>
-      </select>
-
     </div>
   </section>
 
@@ -606,7 +600,10 @@
 
   <!-- Bulk actions -->
   <section id="cascade-actions" class="actions" style="display:none">
-    <div class="cascade-summary" id="cascade-summary"></div>
+    <div class="cascade-actions-row">
+      <div class="cascade-summary" id="cascade-summary"></div>
+      <button id="btn-check-all" class="btn btn-secondary btn-sm">Check all</button>
+    </div>
     <button id="btn-push-all" class="btn btn-primary btn-full">🌐 Open selected</button>
     <div id="cascade-push-result" class="push-result"></div>
   </section>

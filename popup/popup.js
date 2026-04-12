@@ -1388,6 +1388,14 @@ function bindButtons() {
     if (e.key === "Enter") startCascade();
   });
   document.getElementById("btn-push-all").addEventListener("click", openCascadeSelected);
+  document.getElementById("btn-check-all").addEventListener("click", () => {
+    const resultsEl = document.getElementById("cascade-results");
+    resultsEl.querySelectorAll("input[type=checkbox]").forEach(cb => {
+      cb.checked = true;
+      cascadeSelected.add(cb.closest(".cascade-item")?.dataset.domain);
+    });
+    updateCascadeSummary();
+  });
 
   // Historial — limpiar solo la lista del usuario actual, los stats persisten
   document.getElementById("btn-clear-history").addEventListener("click", async () => {
@@ -1862,7 +1870,6 @@ async function startCascade() {
   const rankVal      = document.getElementById("cascade-max-rank").value;
   const [rMin, rMax] = rankVal.split(":").map(v => v === "" ? Infinity : Number(v));
   const langFilter = document.getElementById("cascade-language").value;
-  const depth      = parseInt(document.getElementById("cascade-depth").value);
 
   btn.disabled = true; btn.textContent = "⏳";
   cascadeResults = []; cascadeSelected = new Set();
@@ -1879,7 +1886,7 @@ async function startCascade() {
     "stackoverflow.com","github.com","gitlab.com","canva.com","figma.com",
   ]);
 
-  const CASCADE_LIMIT = 15;
+  const CASCADE_LIMIT = 30;
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días)
   statusEl.textContent = "Querying Monday...";
@@ -1931,15 +1938,7 @@ async function startCascade() {
   };
 
   try {
-    if (depth === 1) {
-      statusEl.textContent = "Searching similar sites...";
-      const sites = await getSimilarSites(seed);
-      for (const s of sites.filter(passesFilters)) {
-        if (!addResult(s)) break;
-      }
-    } else {
-      await runCascade(seed, onProgress);
-    }
+    await runCascade(seed, onProgress);
 
     if (cascadeResults.length === 0) {
       resultsEl.innerHTML = '<div class="cascade-empty">No prospects found with those filters.</div>';
@@ -1969,7 +1968,7 @@ function appendCascadeItem(site, container) {
   const grade = `<span class="score-grade-sm" style="background:${s.color}" title="${s.label}">${s.grade}</span>`;
 
   item.innerHTML = `
-    <input type="checkbox" checked />
+    <input type="checkbox" />
     <img class="cascade-favicon" src="https://www.google.com/s2/favicons?domain=${esc(site.domain)}&sz=16" onerror="this.style.display='none'" />
     <span class="cascade-domain" title="${esc(site.domain)}">${esc(site.domain)}</span>
     <span class="cascade-visits">${esc(formatTraffic(site.visits))}</span>
@@ -1979,7 +1978,7 @@ function appendCascadeItem(site, container) {
   `;
 
   const cb = item.querySelector("input");
-  cascadeSelected.add(site.domain);
+  // unchecked by default — user picks what to open
   cb.addEventListener("change", () => {
     if (cb.checked) cascadeSelected.add(site.domain);
     else            cascadeSelected.delete(site.domain);
