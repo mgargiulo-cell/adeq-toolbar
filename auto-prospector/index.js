@@ -359,30 +359,53 @@ Rules:
   } catch { return null; }
 }
 
-async function findAllEmails(domain, firstName, lastName, rapidApiKey) {
+const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
+
+async function findAllEmails(domain, firstName, lastName, apolloApiKey) {
+  if (!apolloApiKey) return [];
   const emails = [];
-  try {
-    const params = new URLSearchParams({ domain, first_name: firstName, last_name: lastName });
-    const res = await fetch(
-      `https://apollo-io-enrichment-data-scraper.p.rapidapi.com/email-finder.php?${params}`,
-      {
-        headers: {
-          "x-rapidapi-key":  rapidApiKey,
-          "x-rapidapi-host": "apollo-io-enrichment-data-scraper.p.rapidapi.com",
-        },
+
+  // ── Paso 1: people/match si tenemos nombre ────────────────────
+  if (firstName) {
+    try {
+      const res = await fetch("https://api.apollo.io/v1/people/match", {
+        method: "POST",
+        headers: { "X-Api-Key": apolloApiKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ first_name: firstName, last_name: lastName || "", domain, reveal_personal_emails: false }),
         signal: AbortSignal.timeout(10000),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const p    = data?.person;
+        if (p?.email && APOLLO_GOOD_STATUSES.has(p.email_status)) {
+          emails.push(p.email);
+        }
       }
-    );
+    } catch {}
+  }
+
+  // ── Paso 2: domain search (siempre — puede traer más contactos) ─
+  try {
+    const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+      method: "POST",
+      headers: { "X-Api-Key": apolloApiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q_organization_domains_list: [domain],
+        person_titles: ["CEO","founder","co-founder","owner","publisher","editor in chief","managing editor","director","head of digital","VP"],
+        per_page: 5,
+        page: 1,
+      }),
+      signal: AbortSignal.timeout(12000),
+    });
     if (res.ok) {
-      const data = await res.json();
-      const found = [
-        data?.email,
-        data?.data?.email,
-        ...(Array.isArray(data?.emails) ? data.emails : []),
-      ].filter(e => e && typeof e === "string" && e.includes("@") && e.includes("."));
-      emails.push(...found);
+      const data   = await res.json();
+      const people = Array.isArray(data?.people) ? data.people : [];
+      for (const p of people) {
+        if (p.email && APOLLO_GOOD_STATUSES.has(p.email_status)) emails.push(p.email);
+      }
     }
   } catch {}
+
   return [...new Set(emails)];
 }
 
@@ -580,7 +603,7 @@ function shuffleArray(arr) {
 // ── Sesión de prospección ─────────────────────────────────────
 
 async function runSession(token, cfg, sessionStart) {
-  const { monday_api_key, rapidapi_key, gemini_api_key } = cfg;
+  const { monday_api_key, rapidapi_key, gemini_api_key, apollo_api_key } = cfg;
 
   // Targets de esta sesión (desde toolbar_config)
   const targetGeo      = cfg.target_geo      || "";   // ej: "LATAM", "Europe", "MENA", "Asia"
@@ -697,9 +720,7 @@ async function runSession(token, cfg, sessionStart) {
 
     // Paso 2: emails + pitch + sitios similares en paralelo
     const [emails, pitchResult, similarSites] = await Promise.all([
-      meta?.firstName
-        ? findAllEmails(domain, meta.firstName, meta.lastName, rapidapi_key)
-        : Promise.resolve([]),
+      findAllEmails(domain, meta?.firstName || "", meta?.lastName || "", apollo_api_key),
       generatePitchForDomain(domain, visits, topCountry, language, category, contactName, contactTitle, pageContent, adNetworks, gemini_api_key),
       findSimilarSites(domain, rapidapi_key),
     ]);

@@ -178,18 +178,73 @@ export function validateEmailFormat(email) {
 }
 
 // ============================================================
-// 5. Decisor — Apollo free (nombre) + RapidAPI enrichment (email)
-// Paso 1: Apollo people search → first_name, last_name, title
-// Paso 2: apollo-io-enrichment-data-scraper → email real
+// 5. Decisor — Gemini (nombre) + Apollo oficial (email)
+// Paso 1: Gemini con Google Search → first_name, last_name, title
+// Paso 2a: Apollo /people/match con nombre + dominio → email verificado
+// Paso 2b: Fallback Apollo /mixed_people/search por dominio + títulos
 // ============================================================
+
+const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
+
+async function apolloPeopleMatch(domain, firstName, lastName, apiKey) {
+  try {
+    const res = await fetch("https://api.apollo.io/v1/people/match", {
+      method: "POST",
+      headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ first_name: firstName, last_name: lastName, domain, reveal_personal_emails: false }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data   = await res.json();
+    const person = data?.person;
+    if (!person?.email) return null;
+    if (!APOLLO_GOOD_STATUSES.has(person.email_status)) return null;
+    return {
+      email:    person.email,
+      name:     `${person.first_name || firstName} ${person.last_name || lastName}`.trim(),
+      title:    person.title         || "",
+      linkedin: person.linkedin_url  || "",
+      status:   person.email_status  || "",
+    };
+  } catch { return null; }
+}
+
+async function apolloDomainSearch(domain, apiKey) {
+  try {
+    const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+      method: "POST",
+      headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q_organization_domains_list: [domain],
+        person_titles: ["CEO","founder","co-founder","owner","publisher","editor in chief","managing editor","director","head of digital","VP"],
+        per_page: 5,
+        page: 1,
+      }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) return [];
+    const data   = await res.json();
+    const people = Array.isArray(data?.people) ? data.people : [];
+    return people
+      .filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status))
+      .map(p => ({
+        email:    p.email,
+        name:     `${p.first_name || ""} ${p.last_name || ""}`.trim(),
+        title:    p.title        || "",
+        linkedin: p.linkedin_url || "",
+        status:   p.email_status || "",
+      }));
+  } catch { return []; }
+}
+
 export async function findDecisionMakerViaApollo(domain) {
   const cleanDomain = domain.replace(/^www\./, "");
+  const apolloKey   = CONFIG.APOLLO_API_KEY;
 
   // ── Paso 1: Gemini con Google Search → nombre del decisor ────
   let firstName = "", lastName = "", title = "", linkedin = "";
 
   if (CONFIG.GEMINI_API_KEY) {
-    console.log("[Apollo] Paso 1 vacío — intentando Gemini como fallback para:", cleanDomain);
     try {
       const prompt = `Find the CEO, founder, or main decision maker of the website "${cleanDomain}".
 Return ONLY a JSON object with no extra text:
@@ -215,60 +270,44 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
         const match = text.match(/\{[\s\S]*\}/);
         if (match) {
           const p = JSON.parse(match[0]);
-          if (p.first_name && p.last_name) {
-            firstName = p.first_name; lastName = p.last_name;
-            title     = p.title     || title;
-            linkedin  = p.linkedin  || linkedin;
-            console.log("[Apollo] Gemini encontró:", firstName, lastName, title);
+          if (p.first_name) {
+            firstName = p.first_name; lastName = p.last_name || "";
+            title     = p.title     || "";
+            linkedin  = p.linkedin  || "";
           }
         }
       }
-    } catch (e) {
-      console.warn("[Apollo] Gemini error:", e.message);
+    } catch {}
+  }
+
+  if (!apolloKey) {
+    return firstName
+      ? { name: `${firstName} ${lastName}`.trim(), email: null, title, linkedin, error: "No Apollo key" }
+      : { error: "No Apollo key configured" };
+  }
+
+  // ── Paso 2a: Apollo people/match (nombre + dominio) ──────────
+  if (firstName) {
+    const match = await apolloPeopleMatch(cleanDomain, firstName, lastName, apolloKey);
+    if (match) {
+      console.log(`[Apollo] ✓ people/match: ${match.email} (${match.status})`);
+      return match;
     }
   }
 
-  if (!firstName || !lastName) {
-    console.log("[Apollo] Sin nombre disponible para:", cleanDomain);
-    return { error: "No se encontró decisor para " + cleanDomain };
+  // ── Paso 2b: Fallback — Apollo domain search por títulos ─────
+  console.log("[Apollo] Fallback → domain search para:", cleanDomain);
+  const results = await apolloDomainSearch(cleanDomain, apolloKey);
+  if (results.length > 0) {
+    console.log(`[Apollo] ✓ domain search: ${results[0].email} (${results[0].status})`);
+    return results[0];
   }
 
-  console.log("[Apollo] Paso 1 OK →", firstName, lastName, title);
-  console.log("[Apollo] Paso 2: llamando RapidAPI enrichment para", cleanDomain);
-
-  try {
-    const params = new URLSearchParams({ domain: cleanDomain, first_name: firstName, last_name: lastName });
-    const res = await fetch(
-      `https://apollo-io-enrichment-data-scraper.p.rapidapi.com/email-finder.php?${params}`,
-      {
-        method: "GET",
-        headers: {
-          "x-rapidapi-key":  CONFIG.RAPIDAPI_KEY,
-          "x-rapidapi-host": "apollo-io-enrichment-data-scraper.p.rapidapi.com",
-          "Content-Type":    "application/json",
-        },
-        signal: AbortSignal.timeout(10000),
-      }
-    );
-
-    if (!res.ok) {
-      return { name: `${firstName} ${lastName}`.trim(), email: null, title, linkedin, error: `Enrichment ${res.status}` };
-    }
-
-    const data  = await res.json();
-    // La API puede devolver email en distintos campos según la respuesta
-    const email = data?.email || data?.data?.email || data?.emails?.[0] || null;
-
-    return {
-      name:    `${firstName} ${lastName}`.trim(),
-      email,
-      title:   data?.title   || data?.data?.title   || title,
-      linkedin: data?.linkedin_url || data?.data?.linkedin_url || linkedin,
-    };
-
-  } catch (err) {
-    return { name: `${firstName} ${lastName}`.trim(), email: null, title, linkedin, error: err.message };
-  }
+  return {
+    name:  firstName ? `${firstName} ${lastName}`.trim() : "",
+    email: null, title, linkedin,
+    error: "No email found via Apollo",
+  };
 }
 
 // ============================================================

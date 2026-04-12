@@ -2123,34 +2123,33 @@ async function runDiagnostic() {
     }
   })();
 
-  // ── Test Apollo (vía RapidAPI) ─────────────────────────────
+  // ── Test Apollo (API oficial) ──────────────────────────────
   const apolloPromise = (async () => {
+    const apolloKey = CONFIG.APOLLO_API_KEY;
+    if (!apolloKey) return { ok: false, msg: "apollo_api_key no configurada en Supabase" };
     try {
-      const r = await fetch(
-        `https://apollo-io-enrichment-data-scraper.p.rapidapi.com/people-search.php?domain=${encodeURIComponent(domain)}`,
-        {
-          method: "GET",
-          headers: {
-            "x-rapidapi-key":  CONFIG_DIAG.RAPIDAPI_KEY,
-            "x-rapidapi-host": "apollo-io-enrichment-data-scraper.p.rapidapi.com",
-          },
-          signal: AbortSignal.timeout(10000),
-        }
-      );
+      const r = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+        method: "POST",
+        headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          q_organization_domains_list: [domain],
+          person_titles: ["CEO","founder","owner","publisher","editor"],
+          per_page: 3, page: 1,
+        }),
+        signal: AbortSignal.timeout(12000),
+      });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
-        return { ok: false, msg: `HTTP ${r.status}: ${err?.message || err?.error || JSON.stringify(err).substring(0, 80)}` };
+        return { ok: false, msg: `HTTP ${r.status}: ${err?.message || JSON.stringify(err).substring(0, 80)}` };
       }
-      const d = await r.json();
-      const people = Array.isArray(d) ? d
-        : Array.isArray(d?.people)  ? d.people
-        : Array.isArray(d?.results) ? d.results
-        : d?.data ? (Array.isArray(d.data) ? d.data : [d.data]) : [];
-      if (people.length === 0) return { ok: false, msg: `Sin resultados — respuesta: ${JSON.stringify(d).substring(0, 100)}` };
-      const names = people.slice(0, 2).map(p =>
-        `${p.first_name || p.firstName || ""} ${p.last_name || p.lastName || ""} (${p.title || p.job_title || "sin título"})`
-      ).join(", ");
-      return { ok: true, msg: `${people.length} persona(s): ${names}` };
+      const d      = await r.json();
+      const people = Array.isArray(d?.people) ? d.people : [];
+      if (people.length === 0) return { ok: false, msg: "Sin resultados para este dominio" };
+      const found = people
+        .filter(p => p.email)
+        .map(p => `${p.first_name || ""} ${p.last_name || ""} — ${p.email} (${p.email_status || "?"})`.trim())
+        .slice(0, 2).join(" · ");
+      return { ok: true, msg: found || `${people.length} persona(s) encontradas` };
     } catch (e) {
       return { ok: false, msg: e.message };
     }
