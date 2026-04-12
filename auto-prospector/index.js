@@ -22,21 +22,81 @@ const MIN_TRAFFIC      = 400_000;
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
 
-// Dominios genéricos/tech que no son publishers relevantes (excluir siempre)
+// Dominios de tech/redes sociales/marcas globales — no son publishers
 const EXCLUDE_DOMAINS = new Set([
-  "google.com","google.co.uk","google.com.br","google.es","google.de",
-  "youtube.com","facebook.com","instagram.com","twitter.com","x.com",
+  // Search & tech
+  "google.com","google.co.uk","google.com.br","google.es","google.de","google.com.mx",
+  "google.co.jp","google.fr","google.it","google.com.ar",
+  "youtube.com","gmail.com","googletagmanager.com","googleapis.com",
+  "bing.com","duckduckgo.com","baidu.com","yandex.ru","yandex.com","naver.com","yahoo.com",
+  "msn.com","bing.com","ask.com","aol.com",
+  // Social
+  "facebook.com","instagram.com","twitter.com","x.com","threads.net",
   "tiktok.com","snapchat.com","pinterest.com","linkedin.com","whatsapp.com",
-  "amazon.com","amazon.co.uk","amazon.de","amazon.es","amazon.com.br",
-  "wikipedia.org","wikimedia.org","reddit.com","tumblr.com",
-  "netflix.com","spotify.com","twitch.tv","discord.com","telegram.org",
-  "apple.com","microsoft.com","windows.com","office.com","live.com",
-  "yahoo.com","bing.com","duckduckgo.com","baidu.com","yandex.ru","naver.com",
-  "paypal.com","stripe.com","shopify.com","ebay.com","aliexpress.com","alibaba.com",
-  "zoom.us","slack.com","dropbox.com","drive.google.com","github.com","gitlab.com",
-  "cloudflare.com","amazonaws.com","wp.com","wordpress.com","blogspot.com",
-  "wix.com","squarespace.com","weebly.com","medium.com","substack.com",
+  "reddit.com","tumblr.com","quora.com","vk.com","ok.ru",
+  "discord.com","telegram.org","signal.org","wechat.com","line.me",
+  // Video/streaming
+  "netflix.com","spotify.com","twitch.tv","vimeo.com","dailymotion.com",
+  "hulu.com","disneyplus.com","primevideo.com","peacocktv.com","hbomax.com",
+  // E-commerce/retail
+  "amazon.com","amazon.co.uk","amazon.de","amazon.es","amazon.com.br","amazon.fr",
+  "ebay.com","ebay.co.uk","ebay.de","aliexpress.com","alibaba.com","taobao.com",
+  "mercadolibre.com","shopify.com","etsy.com","wish.com","rakuten.com",
+  "walmart.com","target.com","costco.com","bestbuy.com","homedepot.com",
+  // Finance
+  "paypal.com","stripe.com","payoneer.com","wise.com","revolut.com",
+  "chase.com","bankofamerica.com","wellsfargo.com","citibank.com","hsbc.com",
+  "visa.com","mastercard.com","americanexpress.com",
+  // Tech/software
+  "apple.com","microsoft.com","windows.com","office.com","live.com","outlook.com",
+  "zoom.us","slack.com","dropbox.com","github.com","gitlab.com","stackoverflow.com",
+  "cloudflare.com","amazonaws.com","azure.microsoft.com","cloud.google.com",
+  "oracle.com","sap.com","salesforce.com","hubspot.com","zendesk.com",
+  "adobe.com","canva.com","figma.com","notion.so","atlassian.com","jira.com",
+  // CMS/blogging (plataformas, no publishers)
+  "wp.com","wordpress.com","blogspot.com","wix.com","squarespace.com",
+  "weebly.com","medium.com","substack.com","ghost.io","blogger.com",
+  "webflow.com","jimdo.com","strikingly.com",
+  // Knowledge/encyclopedia
+  "wikipedia.org","wikimedia.org","wikihow.com","wikidata.org",
+  // Travel booking (no content puro)
+  "booking.com","airbnb.com","expedia.com","tripadvisor.com","hotels.com",
+  "kayak.com","skyscanner.net","agoda.com","hostelworld.com",
+  // Food delivery
+  "ubereats.com","doordash.com","grubhub.com","deliveroo.com","justeat.com","rappi.com",
+  // Ride/transport
+  "uber.com","lyft.com","bolt.eu","cabify.com","grab.com",
+  // Misc global brands
+  "ikea.com","zara.com","hm.com","uniqlo.com","nike.com","adidas.com",
+  "mcdonalds.com","starbucks.com","cocacola.com","pepsi.com",
+  "samsung.com","lg.com","sony.com","panasonic.com","philips.com",
+  "toyota.com","honda.com","bmw.com","mercedes-benz.com","volkswagen.com",
 ]);
+
+// Detecta dominios de universidades e institutos académicos
+function isUniversityDomain(domain) {
+  // TLDs académicos
+  if (domain.endsWith(".edu")) return true;
+  if (domain.endsWith(".ac.uk"))  return true;
+  if (domain.endsWith(".edu.au")) return true;
+  if (domain.endsWith(".edu.br")) return true;
+  if (domain.endsWith(".edu.mx")) return true;
+  if (domain.endsWith(".ac.jp"))  return true;
+  if (domain.endsWith(".edu.ar")) return true;
+  if (domain.endsWith(".edu.co")) return true;
+  if (domain.endsWith(".ac.nz"))  return true;
+  if (domain.endsWith(".ac.za"))  return true;
+  // Palabras clave en el dominio
+  const kw = /\b(university|universidad|universidade|universit[aey]|uni[-.]|college|instituto[-.]tecnol|polytechnic|akademi|hochschule|facultad)\b/i;
+  return kw.test(domain);
+}
+
+function isDomainAllowed(domain) {
+  if (!domain || !domain.includes(".")) return false;
+  if (EXCLUDE_DOMAINS.has(domain)) return false;
+  if (isUniversityDomain(domain)) return false;
+  return true;
+}
 
 // Pool global — se carga una vez al iniciar el proceso
 let domainPool = null;
@@ -72,9 +132,7 @@ async function loadDomainPool() {
       if (!line.trim()) continue;
       const cols = line.split(",");
       const domain = cols[2]?.trim().toLowerCase().replace(/^www\./, "");
-      if (domain && domain.includes(".") && !EXCLUDE_DOMAINS.has(domain)) {
-        domains.push(domain);
-      }
+      if (isDomainAllowed(domain)) domains.push(domain);
     }
     domainPool = domains;
     log(`Pool cargado: ${domains.length.toLocaleString()} dominios disponibles.`);
@@ -210,6 +268,30 @@ async function getTrafficData(domain, rapidApiKey) {
 
     return { visits, topCountry };
   } catch { return { visits: null, topCountry: null }; }
+}
+
+async function findSimilarSites(domain, rapidApiKey) {
+  try {
+    const res = await fetch(
+      `https://similarweb-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
+      {
+        headers: {
+          "x-rapidapi-key":  rapidApiKey,
+          "x-rapidapi-host": "similarweb-insights.p.rapidapi.com",
+        },
+        signal: AbortSignal.timeout(8000),
+      }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    // Handle various response shapes
+    const raw = data?.similar_sites || data?.similarSites || data?.sites
+              || data?.related_sites || data?.data?.similar_sites || data?.data || [];
+    const sites = Array.isArray(raw) ? raw : [];
+    return sites
+      .map(s => cleanDomain(s?.domain || s?.url || s?.name || (typeof s === "string" ? s : "")))
+      .filter(d => isDomainAllowed(d));
+  } catch { return []; }
 }
 
 async function findContactAndMeta(domain, geminiKey) {
@@ -380,9 +462,12 @@ async function runSession(token, cfg, sessionStart) {
     return;
   }
 
-  let count = 0; let added = 0; let skipped = 0;
+  // Cola dinámica: permite inyectar sitios similares descubiertos durante la sesión
+  const toProcess = [...candidates];
+  const seenInSession = new Set(toProcess);
+  let count = 0; let added = 0; let skipped = 0; let discovered = 0;
 
-  for (const domain of candidates) {
+  while (toProcess.length > 0) {
     if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
       log("⏱ 45 minutos — auto-apagando.");
       await setConfigValue(token, "auto_prospecting_enabled", "false");
@@ -398,7 +483,8 @@ async function runSession(token, cfg, sessionStart) {
       }
     }
 
-    log(`→ [${count + 1}/${candidates.length}] ${domain}`);
+    const domain = toProcess.shift();
+    log(`→ [${count + 1} proc | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
 
     // Paso 1: tráfico + meta en paralelo
     const [trafficData, meta] = await Promise.all([
@@ -421,13 +507,28 @@ async function runSession(token, cfg, sessionStart) {
     const category    = meta?.category  || "other";
     const contactName = meta?.firstName ? `${meta.firstName} ${meta.lastName}`.trim() : "";
 
-    // Paso 2: emails + pitch en paralelo
-    const [emails, pitchResult] = await Promise.all([
+    // Paso 2: emails + pitch + sitios similares en paralelo
+    const [emails, pitchResult, similarSites] = await Promise.all([
       meta?.firstName
         ? findAllEmails(domain, meta.firstName, meta.lastName, rapidapi_key)
         : Promise.resolve([]),
       generatePitchForDomain(domain, visits, topCountry, language, category, contactName, gemini_api_key),
+      findSimilarSites(domain, rapidapi_key),
     ]);
+
+    // Inyectar sitios similares en la cola (si no están ya vistos ni procesados)
+    let newFromSimilar = 0;
+    for (const sim of similarSites) {
+      if (!seenInSession.has(sim) && !processed.has(sim) && !mondaySet.has(sim)) {
+        seenInSession.add(sim);
+        toProcess.push(sim);
+        newFromSimilar++;
+        discovered++;
+      }
+    }
+    if (newFromSimilar > 0) {
+      log(`  🔗 ${newFromSimilar} sitios similares añadidos a la cola`);
+    }
 
     await saveToReviewQueue(token, {
       domain, traffic: visits, geo: topCountry, language, category,
@@ -442,13 +543,13 @@ async function runSession(token, cfg, sessionStart) {
     await sleep(DOMAIN_DELAY_MS);
   }
 
-  log(`Sesión completada — ${count} procesados, ${added} en cola de revisión, ${skipped} saltados (<400K).`);
+  log(`Sesión completada — ${count} procesados, ${added} en cola de revisión, ${skipped} saltados (<400K), ${discovered} descubiertos vía similares.`);
 }
 
 // ── Loop principal ────────────────────────────────────────────
 
 async function main() {
-  log("ADEQ Auto-Prospector v2 iniciado.");
+  log("ADEQ Auto-Prospector v3 iniciado.");
 
   let token = null;
   let tokenExpiry = 0;
