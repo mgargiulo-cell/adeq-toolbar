@@ -2367,10 +2367,8 @@ function defaultOwnerForLang(lang) {
   return "Diego";
 }
 
-function defaultStatusForOwner(owner) {
-  if (owner === "Agus")  return "9";
-  if (owner === "Diego") return "6";
-  return "10";
+function defaultStatusForOwner(_owner) {
+  return "1"; // En Negociacion — default for all new prospects
 }
 
 async function loadProspectsTab() {
@@ -2438,7 +2436,7 @@ function renderProspectCard(r) {
     `<option value="${o}" ${o === owner ? "selected" : ""}>${o}</option>`).join("");
 
   const statusOptions = [
-    ["9","Bulk - Agus"],["6","Bulk - Diego"],["10","Bulk - Max"],["8","Email Not Sent"]
+    ["1","En Negociacion"],["9","Bulk - Agus"],["6","Bulk - Diego"],["10","Bulk - Max"],["8","Email Not Sent"]
   ].map(([v,l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`).join("");
 
   const langOptions = [
