@@ -28,7 +28,7 @@ import { CONFIG }                                                               
 const state = {
   domain: "", url: "", tabId: null,
   traffic: 0, visits: 0, pagesPerVisit: null, trafficData: null,
-  emails: [], techStack: [], partners: [], banners: null,
+  emails: [], emailSources: new Map(), techStack: [], partners: [], banners: null,
   adsTxt: null, revenueGap: null,
   pitch: "", duplicate: null,
   mediaBuyer: "Agus",
@@ -699,10 +699,12 @@ async function runEmailScraper() {
       sess?.emails?.length ? Promise.resolve({ emails: [] }) : scrapeInformer(state.domain),
       sess?.emails?.length ? Promise.resolve([]) : scrapeWhoIs(state.domain),
     ]);
-    const sessionEmails = sess?.emails || [];
-    const allEmails = [...new Set([...sessionEmails, ...pageEmails, ...(informerData.emails || []), ...whoIsEmails])]
-      .filter(quickValidateEmail);
-    state.emails = allEmails;
+    state.emails = []; state.emailSources = new Map();
+    addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail),        "Cache");
+    addEmailsWithSource(pageEmails.filter(quickValidateEmail),                  "Page");
+    addEmailsWithSource((informerData.emails || []).filter(quickValidateEmail), "Informer");
+    addEmailsWithSource(whoIsEmails.filter(quickValidateEmail),                 "WhoIs");
+    const allEmails = state.emails;
 
     if (allEmails.length > 0 || state.duplicate?.email) {
       renderEmailList(allEmails);
@@ -824,6 +826,14 @@ function checkFUStatus(sendInfo) {
 // ============================================================
 // EMAIL
 // ============================================================
+function addEmailsWithSource(emails, source) {
+  for (const e of emails) {
+    if (!e) continue;
+    if (!state.emailSources.has(e)) state.emailSources.set(e, source);
+    if (!state.emails.includes(e)) state.emails.push(e);
+  }
+}
+
 function renderEmailList(emails) {
   const resultEl = document.getElementById("email-result");
   const listEl   = document.getElementById("email-list");
@@ -863,7 +873,9 @@ function renderEmailList(emails) {
   if (suggested.length > 0) {
     html += `<div class="email-group-label">${mondayEmail ? "💡 Sugeridas" : "📧 Encontradas"}</div>`;
     suggested.forEach(email => {
-      html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}</div>`;
+      const src = state.emailSources.get(email) || "";
+      const badge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
+      html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}${badge}</div>`;
     });
   }
 
@@ -888,9 +900,7 @@ function renderEmailList(emails) {
 }
 
 function setEmail(email) {
-  if (email && !state.emails.includes(email)) {
-    state.emails = [email, ...state.emails];
-  }
+  if (email && !state.emails.includes(email)) state.emails.unshift(email);
   renderEmailList(state.emails);
 }
 
@@ -953,7 +963,7 @@ function bindButtons() {
       resultEl.textContent = `${result.name} · ${result.title}`;
       if (result.name) state.decisionMakerName = result.name.split(" ")[0]; // primer nombre
       if (result.email && !result.email.includes("No disponible")) {
-        state.emails = [result.email, ...state.emails];
+        addEmailsWithSource([result.email], "Apollo");
         setEmail(result.email);
         autoPushReady.email = true;
         checkAutoPush();
@@ -972,7 +982,7 @@ function bindButtons() {
     resultEl.textContent = "Querying Gemini...";
     const result = await searchEmailsWithGemini(state.domain);
     if (result.emails?.length > 0) {
-      state.emails = [...new Set([...result.emails, ...state.emails])];
+      addEmailsWithSource(result.emails, "Gemini");
       setEmail(result.emails[0]);
       resultEl.textContent = result.owner ? `Owner: ${result.owner}` : "";
       if (result.linkedin) showLinkedIn(result.linkedin);
