@@ -461,26 +461,7 @@ async function findAllEmails(domain, firstName, lastName, apolloApiKey) {
   if (!apolloApiKey) return [];
   const emails = [];
 
-  // ── Paso 1: people/match si tenemos nombre ────────────────────
-  if (firstName) {
-    try {
-      const res = await fetch("https://api.apollo.io/v1/people/match", {
-        method: "POST",
-        headers: { "X-Api-Key": apolloApiKey, "Content-Type": "application/json" },
-        body: JSON.stringify({ first_name: firstName, last_name: lastName || "", domain, reveal_personal_emails: false }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const p    = data?.person;
-        if (p?.email && APOLLO_GOOD_STATUSES.has(p.email_status)) {
-          emails.push(p.email);
-        }
-      }
-    } catch {}
-  }
-
-  // ── Paso 2: domain search (siempre — puede traer más contactos) ─
+  // /v1/people/match is deprecated (HTTP 422) — use only mixed_people/search
   try {
     const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
       method: "POST",
