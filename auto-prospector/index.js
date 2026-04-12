@@ -349,27 +349,66 @@ async function getTrafficData(domain, rapidApiKey) {
 }
 
 async function findSimilarSites(domain, rapidApiKey) {
-  try {
-    const res = await fetch(
-      `https://similarweb-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
-      {
-        headers: {
-          "x-rapidapi-key":  rapidApiKey,
-          "x-rapidapi-host": "similarweb-insights.p.rapidapi.com",
-        },
-        signal: AbortSignal.timeout(8000),
-      }
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-    // Handle various response shapes
-    const raw = data?.similar_sites || data?.similarSites || data?.sites
-              || data?.related_sites || data?.data?.similar_sites || data?.data || [];
-    const sites = Array.isArray(raw) ? raw : [];
-    return sites
-      .map(s => cleanDomain(s?.domain || s?.url || s?.name || (typeof s === "string" ? s : "")))
-      .filter(d => isDomainAllowed(d));
-  } catch { return []; }
+  const [swSites, ssSites] = await Promise.all([
+    (async () => {
+      try {
+        const res = await fetch(
+          `https://similarweb-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
+          {
+            headers: {
+              "x-rapidapi-key":  rapidApiKey,
+              "x-rapidapi-host": "similarweb-insights.p.rapidapi.com",
+            },
+            signal: AbortSignal.timeout(8000),
+          }
+        );
+        if (!res.ok) return [];
+        const data = await res.json();
+        const raw = data?.similar_sites || data?.similarSites || data?.sites
+                  || data?.related_sites || data?.data?.similar_sites || data?.data || [];
+        const sites = Array.isArray(raw) ? raw : [];
+        return sites
+          .map(s => cleanDomain(s?.domain || s?.url || s?.name || (typeof s === "string" ? s : "")))
+          .filter(d => isDomainAllowed(d));
+      } catch { return []; }
+    })(),
+    (async () => {
+      try {
+        const clean = domain.replace(/^www\./, "").toLowerCase();
+        const res = await fetch(`https://www.similarsites.com/site/${encodeURIComponent(clean)}`, {
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
+          signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return [];
+        const html = await res.text();
+        const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+        if (!match) return [];
+        const json = JSON.parse(match[1]);
+        const domains = [];
+        function search(obj) {
+          if (!obj || typeof obj !== "object") return;
+          if (Array.isArray(obj)) {
+            for (const item of obj) {
+              if (item && typeof item === "object") {
+                const d = item.domain || item.Domain || item.url || item.site || item.hostname;
+                if (d && typeof d === "string" && d.includes(".") && !d.includes("/")) {
+                  const cd = d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
+                  if (cd && cd !== clean) domains.push(cd);
+                }
+                search(item);
+              }
+            }
+          } else {
+            for (const val of Object.values(obj)) search(val);
+          }
+        }
+        search(json);
+        return [...new Set(domains)].slice(0, 20).filter(d => isDomainAllowed(d));
+      } catch { return []; }
+    })(),
+  ]);
+
+  return [...new Set([...swSites, ...ssSites])];
 }
 
 async function findContactAndMeta(domain, geminiKey) {
