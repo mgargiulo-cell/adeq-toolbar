@@ -122,30 +122,29 @@ export async function getAutopilotTarget(accessToken) {
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_config?key=in.(target_geo,target_category)&select=key,value`,
+      `${url}/rest/v1/toolbar_config?key=in.(target_geo,target_category,min_traffic)&select=key,value`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     const rows = await res.json();
     const map  = {};
     if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value || ""; });
-    return { geo: map.target_geo || "", category: map.target_category || "" };
-  } catch { return { geo: "", category: "" }; }
+    return { geo: map.target_geo || "", category: map.target_category || "", minTraffic: map.min_traffic || "400000" };
+  } catch { return { geo: "", category: "", minTraffic: "400000" }; }
 }
 
-export async function setAutopilotTarget(geo, category, accessToken) {
+export async function setAutopilotTarget(geo, category, minTraffic, accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const headers = { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
-  const upsert = async (cfgKey, val) => {
-    const chk = await fetch(`${url}/rest/v1/toolbar_config?key=eq.${cfgKey}&select=key`, { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } });
-    const exists = (await chk.json())?.length > 0;
-    await fetch(`${url}/rest/v1/toolbar_config${exists ? `?key=eq.${cfgKey}` : ""}`, {
-      method: exists ? "PATCH" : "POST", headers,
-      body: JSON.stringify(exists ? { value: val } : { key: cfgKey, value: val }),
-    });
-  };
+  const headers = { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates" };
   try {
-    await Promise.all([upsert("target_geo", geo), upsert("target_category", category)]);
+    await fetch(`${url}/rest/v1/toolbar_config`, {
+      method: "POST", headers,
+      body: JSON.stringify([
+        { key: "target_geo",      value: geo },
+        { key: "target_category", value: category },
+        { key: "min_traffic",     value: String(minTraffic || "400000") },
+      ]),
+    });
   } catch {}
 }
 

@@ -46,22 +46,78 @@
 <!-- AUTOPILOT TARGET PANEL -->
 <div id="autopilot-target-panel" style="display:none;background:var(--card-bg);border-bottom:1px solid var(--border);padding:10px 12px">
   <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">🎯 Autopilot Target</div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px">
     <div>
-      <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">GEO Region</div>
+      <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">GEO</div>
       <select id="autopilot-target-geo" class="form-select" style="font-size:11px">
-        <option value="">All regions</option>
-        <option value="LATAM">🌎 LATAM</option>
-        <option value="Europe">🇪🇺 Europe</option>
-        <option value="MENA">🌙 MENA</option>
-        <option value="Asia">🌏 Asia</option>
-        <option value="United States">🇺🇸 United States</option>
+        <option value="">All</option>
+        <optgroup label="── Regions ──">
+          <option value="LATAM">🌎 LATAM</option>
+          <option value="Europe">🇪🇺 Europe</option>
+          <option value="MENA">🌙 MENA</option>
+          <option value="Asia">🌏 Asia</option>
+        </optgroup>
+        <optgroup label="── Countries ──">
+          <option value="United States">🇺🇸 United States</option>
+          <option value="United Kingdom">🇬🇧 United Kingdom</option>
+          <option value="Mexico">🇲🇽 Mexico</option>
+          <option value="Argentina">🇦🇷 Argentina</option>
+          <option value="Colombia">🇨🇴 Colombia</option>
+          <option value="Chile">🇨🇱 Chile</option>
+          <option value="Spain">🇪🇸 Spain</option>
+          <option value="Brazil">🇧🇷 Brazil</option>
+          <option value="Peru">🇵🇪 Peru</option>
+          <option value="Ecuador">🇪🇨 Ecuador</option>
+          <option value="Venezuela">🇻🇪 Venezuela</option>
+          <option value="Uruguay">🇺🇾 Uruguay</option>
+          <option value="Paraguay">🇵🇾 Paraguay</option>
+          <option value="Bolivia">🇧🇴 Bolivia</option>
+          <option value="France">🇫🇷 France</option>
+          <option value="Germany">🇩🇪 Germany</option>
+          <option value="Italy">🇮🇹 Italy</option>
+          <option value="Portugal">🇵🇹 Portugal</option>
+          <option value="Netherlands">🇳🇱 Netherlands</option>
+          <option value="Belgium">🇧🇪 Belgium</option>
+          <option value="Switzerland">🇨🇭 Switzerland</option>
+          <option value="Austria">🇦🇹 Austria</option>
+          <option value="Sweden">🇸🇪 Sweden</option>
+          <option value="Norway">🇳🇴 Norway</option>
+          <option value="Denmark">🇩🇰 Denmark</option>
+          <option value="Finland">🇫🇮 Finland</option>
+          <option value="Poland">🇵🇱 Poland</option>
+          <option value="Greece">🇬🇷 Greece</option>
+          <option value="Romania">🇷🇴 Romania</option>
+          <option value="Czech Republic">🇨🇿 Czech Republic</option>
+          <option value="Hungary">🇭🇺 Hungary</option>
+          <option value="Ukraine">🇺🇦 Ukraine</option>
+          <option value="Russia">🇷🇺 Russia</option>
+          <option value="Turkey">🇹🇷 Turkey</option>
+          <option value="Israel">🇮🇱 Israel</option>
+          <option value="UAE">🇦🇪 UAE</option>
+          <option value="Saudi Arabia">🇸🇦 Saudi Arabia</option>
+          <option value="Egypt">🇪🇬 Egypt</option>
+          <option value="Morocco">🇲🇦 Morocco</option>
+          <option value="India">🇮🇳 India</option>
+          <option value="Japan">🇯🇵 Japan</option>
+          <option value="South Korea">🇰🇷 South Korea</option>
+          <option value="China">🇨🇳 China</option>
+          <option value="Singapore">🇸🇬 Singapore</option>
+          <option value="Malaysia">🇲🇾 Malaysia</option>
+          <option value="Indonesia">🇮🇩 Indonesia</option>
+          <option value="Philippines">🇵🇭 Philippines</option>
+          <option value="Thailand">🇹🇭 Thailand</option>
+          <option value="Vietnam">🇻🇳 Vietnam</option>
+          <option value="Canada">🇨🇦 Canada</option>
+          <option value="Australia">🇦🇺 Australia</option>
+          <option value="South Africa">🇿🇦 South Africa</option>
+          <option value="Nigeria">🇳🇬 Nigeria</option>
+        </optgroup>
       </select>
     </div>
     <div>
       <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">Category</div>
       <select id="autopilot-target-category" class="form-select" style="font-size:11px">
-        <option value="">All categories</option>
+        <option value="">All</option>
         <option value="sports">⚽ Sports</option>
         <option value="news">📰 News</option>
         <option value="finance">💰 Finance</option>
@@ -73,6 +129,33 @@
         <option value="automotive">🚗 Automotive</option>
         <option value="food">🍔 Food</option>
         <option value="business">💼 Business</option>
+      </select>
+    </div>
+    <div>
+      <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">Min Traffic</div>
+      <select id="autopilot-target-traffic" class="form-select" style="font-size:11px">
+        <option value="400000">Any (+400K)</option>
+        <option value="500000">+500K</option>
+        <option value="1000000">+1M</option>
+        <option value="1500000">+1.5M</option>
+        <option value="2000000">+2M</option>
+        <option value="2500000">+2.5M</option>
+        <option value="3000000">+3M</option>
+        <option value="3500000">+3.5M</option>
+        <option value="4000000">+4M</option>
+        <option value="4500000">+4.5M</option>
+        <option value="5000000">+5M</option>
+        <option value="5500000">+5.5M</option>
+        <option value="6000000">+6M</option>
+        <option value="6500000">+6.5M</option>
+        <option value="7000000">+7M</option>
+        <option value="7500000">+7.5M</option>
+        <option value="8000000">+8M</option>
+        <option value="8500000">+8.5M</option>
+        <option value="9000000">+9M</option>
+        <option value="9500000">+9.5M</option>
+        <option value="10000000">+10M</option>
+        <option value="10000001">+10M+</option>
       </select>
     </div>
   </div>

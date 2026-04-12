@@ -721,12 +721,13 @@ async function runSession(token, cfg, sessionStart) {
   const { monday_api_key, rapidapi_key, gemini_api_key, apollo_api_key } = cfg;
 
   // Targets de esta sesión (desde toolbar_config)
-  const targetGeo      = cfg.target_geo      || "";   // ej: "LATAM", "Europe", "MENA", "Asia"
-  const targetCategory = cfg.target_category || "";   // ej: "sports", "news", "finance"
-  const minScore       = Number(cfg.min_score) || 20;
+  const targetGeo      = cfg.target_geo      || "";
+  const targetCategory = cfg.target_category || "";
+  const minScore       = Number(cfg.min_score)    || 20;
+  const sessionMinTraffic = Number(cfg.min_traffic) || MIN_TRAFFIC;
 
   const targetInfo = [targetGeo, targetCategory].filter(Boolean).join(" + ") || "sin filtros";
-  log(`Sesión iniciada. Target: ${targetInfo} | Min score: ${minScore}`);
+  log(`Sesión iniciada. Target: ${targetInfo} | Min score: ${minScore} | Min traffic: ${(sessionMinTraffic/1000).toFixed(0)}K`);
 
   // Carga en paralelo: pool global, Monday, procesados, rechazos, uso Apollo
   const [pool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
@@ -798,7 +799,7 @@ async function runSession(token, cfg, sessionStart) {
     const { visits, topCountry } = trafficData;
 
     // Filtro primario: tráfico mínimo
-    if (!visits || visits < MIN_TRAFFIC) {
+    if (!visits || visits < sessionMinTraffic) {
       log(`  ✗ Tráfico (${visits ? Math.round(visits/1000)+"K" : "N/A"}) — descartado`);
       await markProcessed(token, [domain]);
       count++; skipped++;

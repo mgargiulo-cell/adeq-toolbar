@@ -2290,14 +2290,15 @@ async function clearGmailAssociation(loginEmail) {
 
 // ── Autopilot toggle + target ─────────────────────────────────
 async function initAutopilot() {
-  const btn        = document.getElementById("btn-autopilot");
-  const targetBtn  = document.getElementById("btn-autopilot-target");
-  const panel      = document.getElementById("autopilot-target-panel");
-  const geoSel     = document.getElementById("autopilot-target-geo");
-  const catSel     = document.getElementById("autopilot-target-category");
-  const saveBtn    = document.getElementById("btn-autopilot-target-save");
-  const closeBtn   = document.getElementById("btn-autopilot-target-close");
-  const currentLbl = document.getElementById("autopilot-target-current");
+  const btn         = document.getElementById("btn-autopilot");
+  const targetBtn   = document.getElementById("btn-autopilot-target");
+  const panel       = document.getElementById("autopilot-target-panel");
+  const geoSel      = document.getElementById("autopilot-target-geo");
+  const catSel      = document.getElementById("autopilot-target-category");
+  const trafficSel  = document.getElementById("autopilot-target-traffic");
+  const saveBtn     = document.getElementById("btn-autopilot-target-save");
+  const closeBtn    = document.getElementById("btn-autopilot-target-close");
+  const currentLbl  = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
   const [enabled, target] = await Promise.all([
@@ -2306,8 +2307,9 @@ async function initAutopilot() {
   ]);
   setAutopilotUI(btn, enabled);
   updateTargetLabel(target, targetBtn, currentLbl);
-  if (geoSel) geoSel.value = target.geo || "";
-  if (catSel) catSel.value = target.category || "";
+  if (geoSel)     geoSel.value     = target.geo        || "";
+  if (catSel)     catSel.value     = target.category   || "";
+  if (trafficSel) trafficSel.value = target.minTraffic || "400000";
 
   btn.addEventListener("click", async () => {
     const current = btn.classList.contains("active");
@@ -2322,10 +2324,11 @@ async function initAutopilot() {
   });
 
   saveBtn?.addEventListener("click", async () => {
-    const geo = geoSel?.value || "";
-    const cat = catSel?.value || "";
-    await setAutopilotTarget(geo, cat, state.accessToken);
-    updateTargetLabel({ geo, category: cat }, targetBtn, currentLbl);
+    const geo        = geoSel?.value     || "";
+    const cat        = catSel?.value     || "";
+    const minTraffic = trafficSel?.value || "400000";
+    await setAutopilotTarget(geo, cat, minTraffic, state.accessToken);
+    updateTargetLabel({ geo, category: cat, minTraffic }, targetBtn, currentLbl);
     if (panel) panel.style.display = "none";
   });
 
@@ -2335,12 +2338,13 @@ async function initAutopilot() {
 }
 
 function updateTargetLabel(target, targetBtn, currentLbl) {
-  const parts = [target.geo, target.category].filter(Boolean);
+  const trafficNum = parseInt(target.minTraffic || "400000");
+  const trafficLbl = trafficNum >= 10000001 ? "+10M+" : trafficNum >= 1000000 ? `+${trafficNum/1000000}M` : `+${trafficNum/1000}K`;
+  const parts = [target.geo, target.category, trafficLbl !== "+400K" ? trafficLbl : ""].filter(Boolean);
   const label = parts.length ? parts.join(" · ") : "All";
   if (targetBtn) targetBtn.title = `Target: ${label}`;
   if (currentLbl) currentLbl.textContent = `Active target: ${label}`;
-  // Highlight button if target is set
-  if (targetBtn) targetBtn.style.color = parts.length ? "var(--primary)" : "";
+  if (targetBtn) targetBtn.style.color = (target.geo || target.category) ? "var(--primary)" : "";
 }
 
 function setAutopilotUI(btn, enabled) {
