@@ -16,7 +16,8 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, fetchApiKeys,
          getImportedDomains, markDomainsImported,
          getAutopilotEnabled, setAutopilotEnabled,
-         fetchAutoProspects, deleteHistorialRecords, permanentlyBlockDomains }               from "../modules/supabase.js";
+         fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
+         getDailyValidationCount }                                                           from "../modules/supabase.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken }                        from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -2314,180 +2315,309 @@ async function logout() {
 }
 
 // ============================================================
-// PROSPECTS TAB — Candidatos del auto-prospector
+// PROSPECTS TAB — Review queue del auto-prospector
 // ============================================================
+
+const LANG_TO_IDX    = { en: "0", es: "1", it: "2", pt: "3", ar: "6" };
+const LANG_NAMES_PRO = { en: "English", es: "Spanish", it: "Italian", pt: "Portuguese", ar: "Arabic", fr: "French", de: "German" };
+
+function defaultOwnerForLang(lang) {
+  if (lang === "es" || lang === "pt") return "Agus";
+  if (lang === "en")                  return "Max";
+  return "Diego";
+}
+
+function defaultStatusForOwner(owner) {
+  if (owner === "Agus")  return "9";
+  if (owner === "Diego") return "6";
+  return "10";
+}
+
 async function loadProspectsTab() {
-  const listEl   = document.getElementById("prospects-list");
-  const countEl  = document.getElementById("prospects-count");
+  const listEl  = document.getElementById("prospects-list");
+  const statsEl = document.getElementById("prospects-stats");
   if (!listEl) return;
 
   listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
 
-  const rows = await fetchAutoProspects(state.accessToken);
+  const [rows, dailyCount] = await Promise.all([
+    fetchReviewQueue(state.accessToken),
+    getDailyValidationCount(state.accessToken, state.loginEmail),
+  ]);
+
+  updateProspectsDailyBar(dailyCount);
+  if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidates` : "No pending candidates";
 
   if (!rows.length) {
-    listEl.innerHTML = '<div class="cascade-empty">No auto-prospected candidates yet.</div>';
-    if (countEl) countEl.textContent = "";
+    listEl.innerHTML = '<div class="cascade-empty">No pending prospects. The auto-pilot will add candidates here.</div>';
     return;
   }
 
-  if (countEl) countEl.textContent = `${rows.length} candidates`;
+  listEl.innerHTML = rows.map(r => renderProspectCard(r)).join("");
 
-  listEl.innerHTML = rows.map(r => {
-    const trafficFmt = r.page_views ? formatTraffic(r.page_views) : "N/A";
-    const contact    = r.ejecutivo  || "—";
-    const email      = r.email      || "—";
-    const hasEmail   = r.email && r.email.includes("@");
-    return `
-      <div class="import-item prospect-row" data-id="${r.id}" data-domain="${esc(r.domain)}" data-email="${esc(r.email || "")}" data-contact="${esc(r.ejecutivo || "")}">
-        <input type="checkbox" class="prospect-chk" style="margin-right:6px;cursor:pointer" />
-        <div style="flex:1;min-width:0">
-          <div style="font-weight:600;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.domain)}</div>
-          <div style="font-size:10px;color:var(--text-muted)">
-            📊 ${trafficFmt}
-            ${contact !== "—" ? ` · 👤 ${esc(contact)}` : ""}
-            ${hasEmail ? ` · ✉️ <span style="color:#3b82f6">${esc(email)}</span>` : ""}
-          </div>
+  listEl.querySelectorAll(".pcard").forEach(card => {
+    const id   = parseInt(card.dataset.id);
+    const data = rows.find(r => r.id === id);
+    if (data) initProspectCard(card, data);
+  });
+}
+
+function updateProspectsDailyBar(count) {
+  const countEl = document.getElementById("prospects-daily-count");
+  const fillEl  = document.getElementById("prospects-daily-fill");
+  if (countEl) countEl.textContent = count;
+  if (fillEl)  fillEl.style.width  = Math.min(100, (count / 50) * 100) + "%";
+  if (fillEl)  fillEl.style.background = count >= 50 ? "#e53e3e" : count >= 40 ? "#d97706" : "#3b82f6";
+}
+
+function renderProspectCard(r) {
+  const trafficFmt  = r.traffic ? formatTraffic(r.traffic) : "N/A";
+  const emails      = Array.isArray(r.emails) ? r.emails : [];
+  const hasEmail    = emails.length > 0;
+  const owner       = defaultOwnerForLang(r.language);
+  const status      = defaultStatusForOwner(owner);
+  const langIdx     = LANG_TO_IDX[r.language] || "0";
+  const langName    = LANG_NAMES_PRO[r.language] || r.language || "—";
+
+  const emailOptions = emails.map((e, i) => `
+    <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
+      <input type="radio" name="email_${r.id}" value="${esc(e)}" ${i === 0 ? "checked" : ""} class="pcard-email-radio" />
+      ${esc(e)}
+    </label>`).join("");
+
+  const ownerOptions = ["Agus", "Diego", "Max"].map(o =>
+    `<option value="${o}" ${o === owner ? "selected" : ""}>${o}</option>`).join("");
+
+  const statusOptions = [
+    ["9","Bulk - Agus"],["6","Bulk - Diego"],["10","Bulk - Max"],["8","Email Not Sent"]
+  ].map(([v,l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`).join("");
+
+  const langOptions = [
+    ["0","English"],["1","Spanish"],["2","Italian"],["3","Portuguese"],["6","Arabic"]
+  ].map(([v,l]) => `<option value="${v}" ${v === langIdx ? "selected" : ""}>${l}</option>`).join("");
+
+  return `
+  <div class="pcard" data-id="${r.id}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;margin:0 8px 8px;overflow:hidden">
+
+    <!-- Summary row -->
+    <div style="display:flex;align-items:center;gap:6px;padding:8px 10px">
+      <div style="flex:1;min-width:0">
+        <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
+           style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+          ${esc(r.domain)} ↗
+        </a>
+        <div style="font-size:10px;color:var(--text-muted);margin-top:2px;display:flex;flex-wrap:wrap;gap:4px">
+          <span>📊 ${trafficFmt}</span>
+          ${r.geo      ? `<span>🌎 ${esc(r.geo)}</span>`      : ""}
+          ${r.language ? `<span>🗣 ${esc(langName)}</span>`    : ""}
+          ${r.category ? `<span>📁 ${esc(r.category)}</span>` : ""}
+          ${r.contact_name ? `<span>👤 ${esc(r.contact_name)}</span>` : ""}
+          ${hasEmail ? `<span style="color:#3b82f6">✉️ ${emails.length} email${emails.length > 1 ? "s" : ""}</span>` : '<span style="color:#e53e3e">✉️ no email</span>'}
         </div>
-        <button class="btn btn-secondary btn-sm prospect-discard" title="Discard permanently" style="flex-shrink:0;margin-left:6px">🗑</button>
-      </div>`;
-  }).join("");
+      </div>
+      <div style="display:flex;gap:3px;flex-shrink:0">
+        <button class="btn btn-secondary btn-sm pcard-expand-btn" title="See email &amp; data" style="padding:3px 7px">▼</button>
+        <button class="btn btn-success btn-sm pcard-validate-btn" title="Push to Monday + Send Email" style="padding:3px 7px">✅</button>
+        <button class="btn btn-secondary btn-sm pcard-mondayonly-btn" title="Push to Monday only (no email)" style="padding:3px 7px">📋</button>
+        <button class="btn btn-sm pcard-reject-btn" title="Reject permanently" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
+      </div>
+    </div>
 
-  // Checkbox listeners
-  listEl.querySelectorAll(".prospect-chk").forEach(chk => {
-    chk.addEventListener("change", updateProspectSelectAll);
+    <!-- Expandable detail panel -->
+    <div class="pcard-detail" style="display:none;border-top:1px solid var(--border);padding:10px">
+
+      <!-- Email selection -->
+      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px">Select email to send</div>
+      ${hasEmail ? emailOptions : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails found by auto-prospector.</div>'}
+      <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
+
+      <!-- Pitch -->
+      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 4px;text-transform:uppercase;letter-spacing:.5px">Email prepared by AI</div>
+      <input type="text" class="form-input pcard-subject" value="${esc(r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
+      <textarea class="form-input pcard-pitch" rows="5" style="font-size:11px;padding:6px 7px;resize:vertical;min-height:80px">${esc(r.pitch || "")}</textarea>
+
+      <!-- Monday fields -->
+      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Monday data</div>
+      <div class="form-grid">
+        <label class="form-label">Owner</label>
+        <select class="form-select pcard-owner">${ownerOptions}</select>
+        <label class="form-label">Status</label>
+        <select class="form-select pcard-status">${statusOptions}</select>
+        <label class="form-label">Language</label>
+        <select class="form-select pcard-lang">${langOptions}</select>
+        <label class="form-label">GEO</label>
+        <input type="text" class="form-input pcard-geo" value="${esc(r.geo || "")}" placeholder="e.g. Mexico" style="font-size:11px;padding:4px 7px" />
+        <label class="form-label">Traffic</label>
+        <div style="font-size:12px;font-weight:600;padding:4px 0">${trafficFmt}</div>
+      </div>
+
+      <!-- Action buttons in panel -->
+      <div style="display:flex;gap:6px;margin-top:10px">
+        <button class="btn btn-success btn-sm pcard-validate-expanded" style="flex:1">✅ Push + Send Email</button>
+        <button class="btn btn-secondary btn-sm pcard-mondayonly-expanded" style="flex:1">📋 Monday only</button>
+      </div>
+      <div class="pcard-result" style="min-height:14px;font-size:11px;margin-top:5px;color:#16a34a"></div>
+    </div>
+
+  </div>`;
+}
+
+function initProspectCard(card, data) {
+  const id = data.id;
+
+  // Domain link → open tab
+  card.querySelector(".pcard-domain-link")?.addEventListener("click", e => {
+    e.preventDefault();
+    chrome.tabs.create({ url: e.currentTarget.dataset.url, active: false });
   });
 
-  // Discard per-row
-  listEl.querySelectorAll(".prospect-discard").forEach(btn => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const row    = btn.closest(".prospect-row");
-      const id     = parseInt(row.dataset.id);
-      const domain = row.dataset.domain;
-      btn.disabled = true; btn.textContent = "⏳";
-      await Promise.all([
-        deleteHistorialRecords(state.accessToken, [id]),
-        permanentlyBlockDomains(state.accessToken, [domain]),
-      ]);
-      row.remove();
-      const remaining = listEl.querySelectorAll(".prospect-row").length;
-      if (countEl) countEl.textContent = `${remaining} candidates`;
-      if (!remaining) listEl.innerHTML = '<div class="cascade-empty">No candidates left.</div>';
-      updateProspectSelectAll();
+  // Expand toggle
+  card.querySelector(".pcard-expand-btn")?.addEventListener("click", () => {
+    const panel = card.querySelector(".pcard-detail");
+    const btn   = card.querySelector(".pcard-expand-btn");
+    const open  = panel.style.display === "none";
+    panel.style.display = open ? "block" : "none";
+    btn.textContent     = open ? "▲" : "▼";
+  });
+
+  // Edit button → expand + focus pitch
+  card.querySelector(".pcard-edit-btn")?.addEventListener("click", () => {
+    const panel = card.querySelector(".pcard-detail");
+    if (panel.style.display === "none") {
+      panel.style.display = "block";
+      card.querySelector(".pcard-expand-btn").textContent = "▲";
+    }
+    card.querySelector(".pcard-pitch")?.focus();
+  });
+
+  // Reject
+  card.querySelector(".pcard-reject-btn")?.addEventListener("click", async () => {
+    if (!confirm(`Reject and permanently block "${data.domain}"?`)) return;
+    card.style.opacity = "0.4";
+    await rejectReviewItem(state.accessToken, id, data.domain);
+    card.remove();
+    refreshProspectsStats();
+  });
+
+  // Validate (compact) → uses data defaults
+  card.querySelector(".pcard-validate-btn")?.addEventListener("click", async () => {
+    await validateProspect(card, data, true);
+  });
+
+  // Monday only (compact)
+  card.querySelector(".pcard-mondayonly-btn")?.addEventListener("click", async () => {
+    await validateProspect(card, data, false);
+  });
+
+  // Validate (expanded)
+  card.querySelector(".pcard-validate-expanded")?.addEventListener("click", async () => {
+    await validateProspect(card, data, true);
+  });
+
+  // Monday only (expanded)
+  card.querySelector(".pcard-mondayonly-expanded")?.addEventListener("click", async () => {
+    await validateProspect(card, data, false);
+  });
+}
+
+function getSelectedEmail(card) {
+  const manual = card.querySelector(".pcard-email-manual")?.value?.trim();
+  if (manual && manual.includes("@")) return manual;
+  const checked = card.querySelector(".pcard-email-radio:checked");
+  return checked?.value || "";
+}
+
+async function validateProspect(card, data, doSendEmail) {
+  const resultEl = card.querySelector(".pcard-result");
+  const setResult = (msg, ok = true) => {
+    if (resultEl) { resultEl.textContent = msg; resultEl.style.color = ok ? "#16a34a" : "#e53e3e"; }
+  };
+
+  // Daily limit check
+  const dailyCount = await getDailyValidationCount(state.accessToken, state.loginEmail);
+  if (dailyCount >= 50) {
+    setResult("Daily limit reached (50/day).", false);
+    return;
+  }
+
+  const email     = getSelectedEmail(card);
+  const pitch     = card.querySelector(".pcard-pitch")?.value?.trim()     || data.pitch || "";
+  const subject   = card.querySelector(".pcard-subject")?.value?.trim()   || data.pitch_subject || `Partnership — ${data.domain}`;
+  const ejecutivo = card.querySelector(".pcard-owner")?.value             || defaultOwnerForLang(data.language);
+  const estado    = card.querySelector(".pcard-status")?.value            || defaultStatusForOwner(ejecutivo);
+  const idioma    = card.querySelector(".pcard-lang")?.value              || LANG_TO_IDX[data.language] || "0";
+  const geo       = card.querySelector(".pcard-geo")?.value?.trim()       || data.geo || "";
+  const traffic   = data.traffic ? formatTraffic(data.traffic) : "";
+
+  // Disable buttons during processing
+  card.querySelectorAll("button").forEach(b => { b.disabled = true; });
+  setResult("⏳ Processing...", true);
+
+  try {
+    // 1. Push to Monday
+    await pushToMonday({
+      domain:    data.domain,
+      traffic,
+      email:     doSendEmail ? email : "",
+      geo,
+      pitch,
+      estado,
+      ejecutivo,
+      idioma,
+      fecha:     new Date().toISOString().split("T")[0],
     });
-  });
 
-  // Select-all toggle
-  const selectAllChk = document.getElementById("prospects-select-all");
-  if (selectAllChk) {
-    selectAllChk.onchange = () => {
-      listEl.querySelectorAll(".prospect-chk").forEach(c => { c.checked = selectAllChk.checked; });
-    };
+    // 2. Send email (if requested and email available)
+    if (doSendEmail && email) {
+      const signature = await getGmailSignature();
+      const fullBody  = pitch + (signature ? "\n\n" + signature : "");
+      const result    = await sendEmail({ to: email, subject, body: fullBody });
+      if (!result.ok) throw new Error(result.error || "Gmail error");
+    }
+
+    // 3. Save to historial
+    await saveHistory({
+      domain:     data.domain,
+      mediaBuyer: ejecutivo,
+      pageViews:  data.traffic || 0,
+      rawVisits:  data.traffic || 0,
+      isNew:      true,
+      ejecutivo,
+      email:      email || "",
+      geo,
+      date:       new Date().toISOString().split("T")[0],
+      source:     "auto-validated",
+    });
+
+    // 4. Mark validated in review queue
+    await validateReviewItem(state.accessToken, data.id, state.loginEmail);
+
+    // 5. Update UI
+    card.style.opacity = "0.3";
+    setResult(doSendEmail && email ? "✅ Monday + Email sent!" : "✅ Pushed to Monday");
+    setTimeout(() => { card.remove(); refreshProspectsStats(); }, 1200);
+
+  } catch (err) {
+    console.error("[Prospects validate]", err.message);
+    setResult("❌ " + err.message, false);
+    card.querySelectorAll("button").forEach(b => { b.disabled = false; });
   }
 }
 
-function updateProspectSelectAll() {
-  const selectAllChk = document.getElementById("prospects-select-all");
-  if (!selectAllChk) return;
-  const all     = document.querySelectorAll(".prospect-chk");
-  const checked = document.querySelectorAll(".prospect-chk:checked");
-  selectAllChk.checked       = all.length > 0 && checked.length === all.length;
-  selectAllChk.indeterminate = checked.length > 0 && checked.length < all.length;
+async function refreshProspectsStats() {
+  const listEl  = document.getElementById("prospects-list");
+  const statsEl = document.getElementById("prospects-stats");
+  const remaining = listEl?.querySelectorAll(".pcard").length || 0;
+  if (statsEl) statsEl.textContent = remaining ? `${remaining} pending candidates` : "No pending candidates";
+  if (!remaining && listEl) listEl.innerHTML = '<div class="cascade-empty">Queue empty — great work! 🎉</div>';
+  const count = await getDailyValidationCount(state.accessToken, state.loginEmail);
+  updateProspectsDailyBar(count);
 }
 
 function initProspectsTab() {
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
-    const listEl = document.getElementById("prospects-list");
-    if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
     await loadProspectsTab();
   });
-
-  // Push to Monday (no email)
-  document.getElementById("btn-prospects-push")?.addEventListener("click", async () => {
-    await processSelectedProspects({ sendEmail: false });
-  });
-
-  // Push + generate pitch + send email
-  document.getElementById("btn-prospects-push-email")?.addEventListener("click", async () => {
-    await processSelectedProspects({ sendEmail: true });
-  });
-}
-
-async function processSelectedProspects({ sendEmail: doSendEmail }) {
-  const resultEl   = document.getElementById("prospects-action-result");
-  const ejecutivo  = document.getElementById("prospects-ejecutivo").value;
-  const estado     = document.getElementById("prospects-estado").value;
-  const listEl     = document.getElementById("prospects-list");
-
-  const selected = [...listEl.querySelectorAll(".prospect-row")]
-    .filter(row => row.querySelector(".prospect-chk")?.checked);
-
-  if (!selected.length) {
-    resultEl.textContent = "No items selected.";
-    resultEl.className   = "push-result error";
-    return;
-  }
-
-  resultEl.textContent = `⏳ Processing 0 / ${selected.length}...`;
-  resultEl.className   = "push-result";
-
-  let done = 0; let errors = 0;
-  const processedIds     = [];
-  const processedDomains = [];
-
-  for (const row of selected) {
-    const domain  = row.dataset.domain;
-    const id      = parseInt(row.dataset.id);
-    const email   = row.dataset.email;
-    const contact = row.dataset.contact;
-
-    try {
-      // Push to Monday
-      await pushToMonday({ domain, traffic: "", email, geo: "", pitch: "", estado, ejecutivo });
-
-      // Generate pitch + send email
-      if (doSendEmail && email && email.includes("@")) {
-        const pitchResult = await generatePitch({
-          domain, traffic: 0, techStack: [], adsTxt: null, revenueGap: null,
-          banners: "", category: "", siteLanguage: "", pageTitle: "",
-          pageDescription: "", decisionMakerName: contact,
-          tone: "informal", length: "short", focus: "nodataanalysis", opening: "direct",
-          lang: "en", favExamples: [], dislikes: [],
-        });
-        const body = pitchResult?.body || "";
-        if (body) {
-          const signature = await getGmailSignature();
-          await sendEmail({
-            to:      email,
-            subject: pitchResult?.subjects?.[0] || `Partnership opportunity — ${domain}`,
-            body:    body + (signature ? "\n\n" + signature : ""),
-          });
-        }
-      }
-
-      processedIds.push(id);
-      processedDomains.push(domain);
-      row.style.opacity = "0.4";
-      done++;
-      resultEl.textContent = `⏳ Processing ${done} / ${selected.length}...`;
-
-    } catch (err) {
-      console.error("[Prospects]", domain, err.message);
-      errors++;
-    }
-  }
-
-  // Remove processed rows and reload
-  if (processedIds.length) {
-    await deleteHistorialRecords(state.accessToken, processedIds);
-    await loadProspectsTab();
-  }
-
-  resultEl.textContent = errors
-    ? `✅ ${done} pushed · ❌ ${errors} errors`
-    : `✅ ${done} prospects pushed to Monday${doSendEmail ? " + emails sent" : ""}`;
-  resultEl.className = "push-result ok";
 }
 
 async function updateApiFooter() {

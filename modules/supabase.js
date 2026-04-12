@@ -117,13 +117,13 @@ export async function setAutopilotEnabled(enabled, accessToken) {
   } catch {}
 }
 
-// ── Auto-Prospects — candidatos generados por el auto-prospector ─────
-export async function fetchAutoProspects(accessToken) {
+// ── Review Queue — candidatos del auto-prospector para validación ─────
+export async function fetchReviewQueue(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_historial?source=eq.auto&media_buyer=eq.AUTO&order=created_at.desc&limit=200&select=id,domain,page_views,ejecutivo,email,date`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&order=created_at.desc&limit=200`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -132,34 +132,63 @@ export async function fetchAutoProspects(accessToken) {
   } catch { return []; }
 }
 
-export async function deleteHistorialRecords(accessToken, ids) {
+export async function validateReviewItem(accessToken, id, validatedBy) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  if (!ids || !ids.length) return;
-  const idList = ids.join(",");
   try {
-    await fetch(`${url}/rest/v1/toolbar_historial?id=in.(${idList})`, {
-      method:  "DELETE",
-      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+    await fetch(`${url}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "validated", validated_by: validatedBy, validated_at: new Date().toISOString() }),
     });
   } catch {}
 }
 
-export async function permanentlyBlockDomains(accessToken, domains) {
+export async function rejectReviewItem(accessToken, id, domain) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  if (!domains || !domains.length) return;
-  const expiresAt = new Date(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000).toISOString(); // 10 años
+  const expiresAt = new Date(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000).toISOString();
   try {
+    await fetch(`${url}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "rejected" }),
+    });
     await fetch(`${url}/rest/v1/toolbar_import_queue`, {
       method: "POST",
       headers: {
         "apikey": key, "Authorization": `Bearer ${accessToken}`,
         "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
       },
-      body: JSON.stringify(domains.map(d => ({ domain: d, imported_by: "DISCARDED", expires_at: expiresAt }))),
+      body: JSON.stringify([{ domain, imported_by: "REJECTED", expires_at: expiresAt }]),
     });
   } catch {}
+}
+
+export async function updateReviewItem(accessToken, id, data) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    await fetch(`${url}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+  } catch {}
+}
+
+export async function getDailyValidationCount(accessToken, userEmail) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_review_queue?validated_by=eq.${encodeURIComponent(userEmail)}&validated_at=gte.${today}T00:00:00Z&select=id`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("Content-Range") || "";
+    return parseInt(range.split("/")[1]) || 0;
+  } catch { return 0; }
 }
 
 // ── Import Queue — evitar que dos usuarios importen las mismas URLs ──

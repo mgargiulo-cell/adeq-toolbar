@@ -490,49 +490,27 @@
 </div>
 
 <!-- ====================================================
-     TAB: PROSPECTS (Auto-prospector candidates)
+     TAB: PROSPECTS (Auto-prospector review queue)
      ==================================================== -->
 <div id="tab-prospects" class="tab-content">
-  <section class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-      <div class="card-title" style="margin:0">🤖 Auto-Prospector Candidates</div>
+  <section class="card" style="padding-bottom:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div class="card-title" style="margin:0">🤖 Review Prospects</div>
       <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
     </div>
-    <p class="import-desc">Prospects found by the auto-pilot. Select the ones to push to Monday. Discard the rest permanently.</p>
-
-    <!-- Push settings -->
-    <div class="form-grid" style="margin-bottom:10px">
-      <label class="form-label">Owner</label>
-      <select id="prospects-ejecutivo" class="form-select">
-        <option value="Agus">Agus</option>
-        <option value="Diego">Diego</option>
-        <option value="Max">Max</option>
-      </select>
-      <label class="form-label">Status</label>
-      <select id="prospects-estado" class="form-select">
-        <option value="8">Email Not Sent</option>
-        <option value="9">Bulk - Agus</option>
-        <option value="6">Bulk - Diego</option>
-        <option value="10">Bulk - Max</option>
-      </select>
-    </div>
-
-    <!-- Action buttons -->
-    <div style="display:flex;gap:6px;margin-bottom:8px">
-      <button id="btn-prospects-push" class="btn btn-success btn-sm" style="flex:1">🚀 Push to Monday</button>
-      <button id="btn-prospects-push-email" class="btn btn-primary btn-sm" style="flex:1">📧 Push + Send Email</button>
-    </div>
-    <div id="prospects-action-result" class="push-result" style="min-height:14px;margin-bottom:6px"></div>
-
-    <!-- Select all -->
-    <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;font-size:11px;color:var(--text-muted)">
-      <input type="checkbox" id="prospects-select-all" style="cursor:pointer" />
-      <label for="prospects-select-all" style="cursor:pointer">Select all</label>
-      <span id="prospects-count" style="margin-left:auto"></span>
+    <div id="prospects-stats" style="font-size:11px;color:var(--text-muted);margin-bottom:6px"></div>
+    <div>
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:3px">
+        <span>Daily validated</span>
+        <span><b id="prospects-daily-count">0</b> / 50</span>
+      </div>
+      <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden">
+        <div id="prospects-daily-fill" style="height:100%;background:#3b82f6;border-radius:2px;width:0%;transition:width 0.3s"></div>
+      </div>
     </div>
   </section>
 
-  <div id="prospects-list" class="import-list">
+  <div id="prospects-list">
     <div class="cascade-empty">⏳ Loading...</div>
   </div>
 </div>
