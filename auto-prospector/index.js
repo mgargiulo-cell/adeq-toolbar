@@ -198,7 +198,7 @@ async function markProcessed(token, domains) {
   });
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle }) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
     headers: {
@@ -207,17 +207,38 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
     },
     body: JSON.stringify({
       domain,
-      traffic:       traffic ? Math.round(traffic) : 0,
-      geo:           geo           || "",
-      language:      language      || "",
-      category:      category      || "",
-      contact_name:  contactName   || "",
-      emails:        emails        || [],
-      pitch:         pitch         || "",
-      pitch_subject: pitchSubject  || "",
-      status:        "pending",
+      traffic:        traffic ? Math.round(traffic) : 0,
+      geo:            geo            || "",
+      language:       language       || "",
+      category:       category       || "",
+      contact_name:   contactName    || "",
+      emails:         emails         || [],
+      pitch:          pitch          || "",
+      pitch_subject:  pitchSubject   || "",
+      pitch_subjects: pitchSubjects  || [],
+      score:          score          || 0,
+      ad_networks:    adNetworks     || [],
+      page_title:     pageTitle      || "",
+      status:         "pending",
     }),
   });
+}
+
+async function getRejectionPatterns(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=category,geo&status=eq.rejected&order=created_at.desc&limit=150`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    );
+    const rows = await res.json();
+    if (!Array.isArray(rows)) return { categories: {}, geos: {} };
+    const categories = {}, geos = {};
+    for (const r of rows) {
+      if (r.category) categories[r.category] = (categories[r.category] || 0) + 1;
+      if (r.geo)      geos[r.geo]             = (geos[r.geo]             || 0) + 1;
+    }
+    return { categories, geos };
+  } catch { return { categories: {}, geos: {} }; }
 }
 
 // ── APIs externas ─────────────────────────────────────────────
@@ -365,27 +386,149 @@ async function findAllEmails(domain, firstName, lastName, rapidApiKey) {
   return [...new Set(emails)];
 }
 
-async function generatePitchForDomain(domain, visits, geo, language, category, contactName, geminiKey) {
+// ── Page intelligence ─────────────────────────────────────────
+
+async function fetchPageContent(domain) {
+  try {
+    const res = await fetch(`https://${domain}`, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
+      signal: AbortSignal.timeout(9000),
+      redirect: "follow",
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    const title = (html.match(/<title[^>]*>([^<]{1,120})<\/title>/i) || [])[1]?.trim() || "";
+    const desc  = (
+      html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']{1,300})["']/i) ||
+      html.match(/<meta[^>]+content=["']([^"']{1,300})["'][^>]+name=["']description["']/i) ||
+      html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']{1,300})["']/i) ||
+      html.match(/<meta[^>]+content=["']([^"']{1,300})["'][^>]+property=["']og:description["']/i) ||
+      [])[1]?.trim() || "";
+
+    // Ad networks detected in page source
+    const adNetworks = [];
+    if (/googletag\b|adsbygoogle|googletagservices\.com/i.test(html))  adNetworks.push("Google GAM");
+    if (/prebid\.js|pbjs\.\w/i.test(html))                             adNetworks.push("Prebid");
+    if (/taboola/i.test(html))                                          adNetworks.push("Taboola");
+    if (/outbrain/i.test(html))                                         adNetworks.push("Outbrain");
+    if (/mgid\.com/i.test(html))                                        adNetworks.push("MGID");
+    if (/criteo/i.test(html))                                           adNetworks.push("Criteo");
+    if (/amazon-adsystem|apstag\.js/i.test(html))                       adNetworks.push("Amazon APS");
+    if (/media\.net\/dmedianet/i.test(html))                            adNetworks.push("Media.net");
+    if (/pubmatic\.com/i.test(html))                                    adNetworks.push("PubMatic");
+    if (/rubiconproject\.com|magnite\.com/i.test(html))                 adNetworks.push("Magnite");
+    if (/indexexchange\.com/i.test(html))                               adNetworks.push("Index Exchange");
+    if (/smartadserver|equativ\.com/i.test(html))                       adNetworks.push("Equativ");
+    if (/appnexus\.com|xandr\.com/i.test(html))                        adNetworks.push("Xandr");
+    if (/openx\.net/i.test(html))                                       adNetworks.push("OpenX");
+    if (/33across\.com/i.test(html))                                    adNetworks.push("33Across");
+    if (/sovrn\.com|lijit\.com/i.test(html))                           adNetworks.push("Sovrn");
+    if (/sharethrough\.com/i.test(html))                                adNetworks.push("Sharethrough");
+    if (/triplelift\.com/i.test(html))                                  adNetworks.push("TripleLift");
+
+    return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks };
+  } catch { return null; }
+}
+
+// ── Scoring ───────────────────────────────────────────────────
+
+const GEO_REGIONS = {
+  LATAM:  ["Mexico","Argentina","Colombia","Chile","Brazil","Peru","Ecuador","Venezuela","Uruguay","Paraguay","Bolivia","Spain"],
+  Europe: ["United Kingdom","France","Germany","Italy","Portugal","Netherlands","Belgium","Switzerland","Austria","Poland","Sweden","Norway","Denmark","Finland","Greece","Hungary","Czech Republic","Romania","Ukraine","Russia"],
+  MENA:   ["UAE","Saudi Arabia","Egypt","Morocco","Turkey","Israel","Kuwait","Qatar","Algeria","Tunisia"],
+  Asia:   ["India","Japan","South Korea","China","Taiwan","Hong Kong","Singapore","Malaysia","Indonesia","Philippines","Thailand","Vietnam","Pakistan"],
+};
+
+const HIGH_VALUE_CATS = new Set(["sports","news","entertainment","gambling","finance"]);
+const MED_VALUE_CATS  = new Set(["health","travel","automotive","technology","food","business"]);
+
+function scoreCandidate({ visits, category, topCountry, contactName, emails, pageContent, targetGeo }) {
+  let score = 0;
+
+  // Traffic tier (0–40)
+  if      (visits >= 20_000_000) score += 40;
+  else if (visits >=  5_000_000) score += 32;
+  else if (visits >=  1_000_000) score += 22;
+  else if (visits >=    500_000) score += 14;
+  else                           score +=  6;
+
+  // Category ad-value (0–25)
+  if      (HIGH_VALUE_CATS.has(category)) score += 25;
+  else if (MED_VALUE_CATS.has(category))  score += 15;
+  else                                     score +=  5;
+
+  // Contact & email signals (0–20)
+  if (contactName)      score += 10;
+  if (emails.length > 0) score += 10;
+
+  // Page accessible (0–5)
+  if (pageContent) score += 5;
+
+  // Target geo bonus/penalty (±15)
+  if (targetGeo && topCountry) {
+    const region = GEO_REGIONS[targetGeo];
+    if (region) {
+      if (region.includes(topCountry)) score += 15;
+      else                              score -= 10;
+    } else if (targetGeo === topCountry) {
+      score += 15;
+    }
+  }
+
+  return Math.max(0, score);
+}
+
+// ── Pitch generation ──────────────────────────────────────────
+
+async function generatePitchForDomain(domain, visits, geo, language, category, contactName, contactTitle, pageContent, adNetworks, geminiKey) {
   const langNames = { en:"English", es:"Spanish", pt:"Portuguese", it:"Italian", ar:"Arabic", fr:"French", de:"German" };
   const langName  = langNames[language] || "English";
-  const trafficStr = visits ? `${Math.round(visits / 1000)}K monthly visits` : "significant traffic";
   const greeting  = contactName ? `Dear ${contactName}` : "Dear Publisher";
 
-  const prompt = `Write a short outreach email for ADEQ Media (digital advertising network) to the publisher "${domain}".
+  // Traffic tier copy
+  let trafficLine;
+  if      (visits >= 20_000_000) trafficLine = `${Math.round(visits/1_000_000)}M monthly visits (major publisher)`;
+  else if (visits >=  5_000_000) trafficLine = `${Math.round(visits/1_000_000)}M monthly visits (large publisher)`;
+  else if (visits >=  1_000_000) trafficLine = `${Math.round(visits/1_000_000)}M monthly visits (mid-size publisher)`;
+  else                           trafficLine = `${Math.round(visits/1000)}K monthly visits (growing publisher)`;
 
-Site: ${trafficStr} · ${geo || "international"} · ${category || "general content"}
-Greeting: ${greeting}
+  // Page context block
+  const pageBlock = pageContent?.title || pageContent?.description
+    ? `Site content intel:\n- Title: "${pageContent.title}"\n${pageContent.description ? `- Description: "${pageContent.description}"` : ""}`
+    : "";
 
-Rules:
-- Language: ${langName}
-- Tone: professional and direct
-- Length: 3-4 short sentences
-- Topic: monetization partnership opportunity
-- No specific revenue numbers or percentages
-- Sign as "ADEQ Media Team"
-- Subject: concise, specific to the site
+  // Monetization context
+  const adBlock = adNetworks?.length
+    ? `Current ad partners detected on site: ${adNetworks.join(", ")} — angle: complement or improve existing setup`
+    : "No major ad network detected on site — angle: introduce programmatic monetization opportunity";
 
-Return ONLY valid JSON: {"subject":"...","body":"..."}`;
+  const prompt = `You are writing a cold outreach email on behalf of ADEQ Media, a digital advertising network.
+
+TARGET PUBLISHER INTELLIGENCE:
+- Domain: ${domain}
+- Traffic: ${trafficLine}
+- Primary market: ${geo || "international"}
+- Content category: ${category || "general"}
+- Contact: ${contactName ? `${contactName}${contactTitle ? `, ${contactTitle}` : ""}` : "unknown"}
+${pageBlock}
+- ${adBlock}
+
+YOUR TASK:
+Write a 3–4 sentence outreach email in ${langName}.
+- Greeting: ${greeting}
+- Reference something SPECIFIC about this publisher (their category, market, or what makes them relevant)
+- Be concrete about the partnership value, not generic
+- ${adNetworks?.length ? "Acknowledge they already monetize — position ADEQ as a premium complement" : "Show them what they're leaving on the table without programmatic"}
+- Sign: "ADEQ Media Team"
+- Do NOT mention specific revenue numbers or percentages
+
+Return ONLY valid JSON with exactly this shape:
+{
+  "subject": "best subject line",
+  "subjects": ["subject option A — direct statement", "subject option B — question format", "subject option C — data/insight hook"],
+  "body": "full email body"
+}`;
 
   try {
     const res = await fetch(
@@ -395,7 +538,7 @@ Return ONLY valid JSON: {"subject":"...","body":"..."}`;
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.4, maxOutputTokens: 500 },
+          generationConfig: { temperature: 0.4, maxOutputTokens: 600 },
         }),
         signal: AbortSignal.timeout(15000),
       }
@@ -406,7 +549,11 @@ Return ONLY valid JSON: {"subject":"...","body":"..."}`;
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
     const p = JSON.parse(match[0]);
-    return { subject: p.subject || "", body: p.body || "" };
+    return {
+      subject:  p.subject  || "",
+      subjects: Array.isArray(p.subjects) ? p.subjects.slice(0, 3) : [],
+      body:     p.body     || "",
+    };
   } catch { return null; }
 }
 
@@ -435,22 +582,34 @@ function shuffleArray(arr) {
 async function runSession(token, cfg, sessionStart) {
   const { monday_api_key, rapidapi_key, gemini_api_key } = cfg;
 
-  log("Sesión iniciada. Cargando fuentes...");
+  // Targets de esta sesión (desde toolbar_config)
+  const targetGeo      = cfg.target_geo      || "";   // ej: "LATAM", "Europe", "MENA", "Asia"
+  const targetCategory = cfg.target_category || "";   // ej: "sports", "news", "finance"
+  const minScore       = Number(cfg.min_score) || 20;
 
-  // Cargar pool global + exclusiones en paralelo
-  const [pool, mondayDomains, processed] = await Promise.all([
+  const targetInfo = [targetGeo, targetCategory].filter(Boolean).join(" + ") || "sin filtros";
+  log(`Sesión iniciada. Target: ${targetInfo} | Min score: ${minScore}`);
+
+  // Carga en paralelo: pool global, dominios Monday (exclusión), dominios procesados, patrones de rechazo
+  const [pool, mondayDomains, processed, rejectionPatterns] = await Promise.all([
     loadDomainPool(),
-    fetchMondayDomains(monday_api_key),  // usados como exclusión (ya son clientes)
+    fetchMondayDomains(monday_api_key),
     getProcessedDomains(token),
+    getRejectionPatterns(token),
   ]);
 
-  const mondaySet = new Set(mondayDomains);
-  const candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
+  if (rejectionPatterns.categories && Object.keys(rejectionPatterns.categories).length > 0) {
+    const topRejected = Object.entries(rejectionPatterns.categories)
+      .sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([c, n]) => `${c}(×${n})`).join(", ");
+    log(`Patrones de rechazo aprendidos — categorías: ${topRejected}`);
+  }
 
-  // Shuffle para rotación — cada sesión procesa en orden distinto
+  const mondaySet  = new Set(mondayDomains);
+  const candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
   shuffleArray(candidates);
 
-  log(`Pool: ${pool.length.toLocaleString()} | Monday (excluidos): ${mondayDomains.length} | Ya procesados: ${processed.size} | Candidatos: ${candidates.length.toLocaleString()}`);
+  log(`Pool: ${pool.length.toLocaleString()} | Excluidos (Monday): ${mondayDomains.length} | Ya procesados: ${processed.size} | Candidatos: ${candidates.length.toLocaleString()}`);
 
   if (candidates.length === 0) {
     if (pool.length === 0) {
@@ -462,10 +621,10 @@ async function runSession(token, cfg, sessionStart) {
     return;
   }
 
-  // Cola dinámica: permite inyectar sitios similares descubiertos durante la sesión
-  const toProcess = [...candidates];
+  // Cola dinámica: permite inyectar sitios similares durante la sesión
+  const toProcess     = [...candidates];
   const seenInSession = new Set(toProcess);
-  let count = 0; let added = 0; let skipped = 0; let discovered = 0;
+  let count = 0, added = 0, skipped = 0, lowScore = 0, discovered = 0;
 
   while (toProcess.length > 0) {
     if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
@@ -484,39 +643,71 @@ async function runSession(token, cfg, sessionStart) {
     }
 
     const domain = toProcess.shift();
-    log(`→ [${count + 1} proc | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
+    log(`→ [${count + 1} | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
 
-    // Paso 1: tráfico + meta en paralelo
-    const [trafficData, meta] = await Promise.all([
+    // Paso 1: tráfico + meta + contenido de página en paralelo
+    const [trafficData, meta, pageContent] = await Promise.all([
       getTrafficData(domain, rapidapi_key),
       findContactAndMeta(domain, gemini_api_key),
+      fetchPageContent(domain),
     ]);
 
     const { visits, topCountry } = trafficData;
 
-    // Filtro: descartar si < 400K
+    // Filtro primario: tráfico mínimo
     if (!visits || visits < MIN_TRAFFIC) {
-      log(`  ✗ Tráfico insuficiente (${visits ? Math.round(visits / 1000) + "K" : "N/A"}) — saltando`);
+      log(`  ✗ Tráfico (${visits ? Math.round(visits/1000)+"K" : "N/A"}) — descartado`);
       await markProcessed(token, [domain]);
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
 
-    const language    = meta?.language  || "en";
-    const category    = meta?.category  || "other";
-    const contactName = meta?.firstName ? `${meta.firstName} ${meta.lastName}`.trim() : "";
+    const language     = meta?.language  || "en";
+    const category     = meta?.category  || "other";
+    const contactName  = meta?.firstName ? `${meta.firstName} ${meta.lastName}`.trim() : "";
+    const contactTitle = meta?.title     || "";
+    const adNetworks   = pageContent?.adNetworks || [];
+    const pageTitle    = pageContent?.title       || "";
+
+    // Filtro por categoría objetivo (si está configurado)
+    if (targetCategory && category !== targetCategory) {
+      log(`  ✗ Categoría ${category} ≠ objetivo ${targetCategory} — descartado`);
+      await markProcessed(token, [domain]);
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
+
+    // Scoring: tráfico + categoría + contacto + geo target + contenido accesible
+    const rawScore = scoreCandidate({ visits, category, topCountry, contactName, emails: [], pageContent, targetGeo });
+
+    // Penalización por patrones de rechazo aprendidos
+    const catPenalty = Math.min(20, (rejectionPatterns.categories[category] || 0) * 4);
+    const geoPenalty = Math.min(10, (rejectionPatterns.geos[topCountry]     || 0) * 2);
+    const finalScore = rawScore - catPenalty - geoPenalty;
+
+    if (finalScore < minScore) {
+      log(`  ✗ Score ${finalScore} (raw ${rawScore}, penalización cat:${catPenalty} geo:${geoPenalty}) — descartado`);
+      await markProcessed(token, [domain]);
+      count++; lowScore++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
 
     // Paso 2: emails + pitch + sitios similares en paralelo
     const [emails, pitchResult, similarSites] = await Promise.all([
       meta?.firstName
         ? findAllEmails(domain, meta.firstName, meta.lastName, rapidapi_key)
         : Promise.resolve([]),
-      generatePitchForDomain(domain, visits, topCountry, language, category, contactName, gemini_api_key),
+      generatePitchForDomain(domain, visits, topCountry, language, category, contactName, contactTitle, pageContent, adNetworks, gemini_api_key),
       findSimilarSites(domain, rapidapi_key),
     ]);
 
-    // Inyectar sitios similares en la cola (si no están ya vistos ni procesados)
+    // Score final con emails encontrados
+    const scoreWithEmails = finalScore + (emails.length > 0 ? 10 : 0);
+
+    // Inyectar sitios similares en la cola
     let newFromSimilar = 0;
     for (const sim of similarSites) {
       if (!seenInSession.has(sim) && !processed.has(sim) && !mondaySet.has(sim)) {
@@ -526,24 +717,33 @@ async function runSession(token, cfg, sessionStart) {
         discovered++;
       }
     }
-    if (newFromSimilar > 0) {
-      log(`  🔗 ${newFromSimilar} sitios similares añadidos a la cola`);
-    }
+    if (newFromSimilar > 0) log(`  🔗 +${newFromSimilar} sitios similares`);
+
+    if (adNetworks.length > 0) log(`  📡 Ad networks: ${adNetworks.join(", ")}`);
 
     await saveToReviewQueue(token, {
-      domain, traffic: visits, geo: topCountry, language, category,
-      contactName, emails,
-      pitch:        pitchResult?.body    || "",
-      pitchSubject: pitchResult?.subject || "",
+      domain,
+      traffic:       visits,
+      geo:           topCountry,
+      language,
+      category,
+      contactName,
+      emails,
+      pitch:         pitchResult?.body     || "",
+      pitchSubject:  pitchResult?.subject  || "",
+      pitchSubjects: pitchResult?.subjects || [],
+      score:         scoreWithEmails,
+      adNetworks,
+      pageTitle,
     });
     await markProcessed(token, [domain]);
     count++; added++;
 
-    log(`  ✓ ${Math.round(visits / 1000)}K | ${topCountry || "N/A"} | ${language} | ${category} | ${contactName || "N/A"} | ${emails.length} email(s)`);
+    log(`  ✓ score:${scoreWithEmails} | ${Math.round(visits/1000)}K | ${topCountry||"N/A"} | ${language} | ${category} | ${contactName||"—"} | ${emails.length} email(s)`);
     await sleep(DOMAIN_DELAY_MS);
   }
 
-  log(`Sesión completada — ${count} procesados, ${added} en cola de revisión, ${skipped} saltados (<400K), ${discovered} descubiertos vía similares.`);
+  log(`Sesión completada — ${count} procesados | ${added} guardados | ${skipped} bajo tráfico | ${lowScore} bajo score | ${discovered} descubiertos vía similares`);
 }
 
 // ── Loop principal ────────────────────────────────────────────

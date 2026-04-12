@@ -16,6 +16,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, fetchApiKeys,
          getImportedDomains, markDomainsImported,
          getAutopilotEnabled, setAutopilotEnabled,
+         getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
          getDailyValidationCount }                                                           from "../modules/supabase.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken }                        from "../modules/gmail.js";
@@ -2283,23 +2284,59 @@ async function clearGmailAssociation(loginEmail) {
   await chrome.storage.local.remove(key);
 }
 
-// ── Autopilot toggle ──────────────────────────────────────────
+// ── Autopilot toggle + target ─────────────────────────────────
 async function initAutopilot() {
-  const btn = document.getElementById("btn-autopilot");
+  const btn        = document.getElementById("btn-autopilot");
+  const targetBtn  = document.getElementById("btn-autopilot-target");
+  const panel      = document.getElementById("autopilot-target-panel");
+  const geoSel     = document.getElementById("autopilot-target-geo");
+  const catSel     = document.getElementById("autopilot-target-category");
+  const saveBtn    = document.getElementById("btn-autopilot-target-save");
+  const closeBtn   = document.getElementById("btn-autopilot-target-close");
+  const currentLbl = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
-  const enabled = await getAutopilotEnabled(state.accessToken);
+  const [enabled, target] = await Promise.all([
+    getAutopilotEnabled(state.accessToken),
+    getAutopilotTarget(state.accessToken),
+  ]);
   setAutopilotUI(btn, enabled);
+  updateTargetLabel(target, targetBtn, currentLbl);
+  if (geoSel) geoSel.value = target.geo || "";
+  if (catSel) catSel.value = target.category || "";
 
   btn.addEventListener("click", async () => {
     const current = btn.classList.contains("active");
     const next    = !current;
     setAutopilotUI(btn, next);
     await setAutopilotEnabled(next, state.accessToken);
-    btn.title = next
-      ? "Autopilot ACTIVO — el servicio está prospectando automáticamente"
-      : "Autopilot OFF — click para activar";
   });
+
+  targetBtn?.addEventListener("click", () => {
+    if (!panel) return;
+    panel.style.display = panel.style.display === "none" ? "block" : "none";
+  });
+
+  saveBtn?.addEventListener("click", async () => {
+    const geo = geoSel?.value || "";
+    const cat = catSel?.value || "";
+    await setAutopilotTarget(geo, cat, state.accessToken);
+    updateTargetLabel({ geo, category: cat }, targetBtn, currentLbl);
+    if (panel) panel.style.display = "none";
+  });
+
+  closeBtn?.addEventListener("click", () => {
+    if (panel) panel.style.display = "none";
+  });
+}
+
+function updateTargetLabel(target, targetBtn, currentLbl) {
+  const parts = [target.geo, target.category].filter(Boolean);
+  const label = parts.length ? parts.join(" · ") : "All";
+  if (targetBtn) targetBtn.title = `Target: ${label}`;
+  if (currentLbl) currentLbl.textContent = `Active target: ${label}`;
+  // Highlight button if target is set
+  if (targetBtn) targetBtn.style.color = parts.length ? "var(--primary)" : "";
 }
 
 function setAutopilotUI(btn, enabled) {
@@ -2378,6 +2415,15 @@ function renderProspectCard(r) {
   const status      = defaultStatusForOwner(owner);
   const langIdx     = LANG_TO_IDX[r.language] || "0";
   const langName    = LANG_NAMES_PRO[r.language] || r.language || "—";
+  const adNetworks  = Array.isArray(r.ad_networks) ? r.ad_networks : [];
+  const subjects    = Array.isArray(r.pitch_subjects) ? r.pitch_subjects : [];
+
+  // Score badge color
+  const score = r.score || 0;
+  const scoreBg = score >= 60 ? "#16a34a" : score >= 35 ? "#d97706" : "#6b7280";
+  const scoreBadge = score > 0
+    ? `<span style="font-size:10px;font-weight:700;color:#fff;background:${scoreBg};border-radius:4px;padding:1px 5px;flex-shrink:0">${score}</span>`
+    : "";
 
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
@@ -2396,23 +2442,49 @@ function renderProspectCard(r) {
     ["0","English"],["1","Spanish"],["2","Italian"],["3","Portuguese"],["6","Arabic"]
   ].map(([v,l]) => `<option value="${v}" ${v === langIdx ? "selected" : ""}>${l}</option>`).join("");
 
+  // Subject chips (3 variants from Gemini)
+  const subjectChips = subjects.length > 0
+    ? `<div class="pcard-subject-chips" style="display:flex;flex-direction:column;gap:3px;margin-bottom:6px">
+        ${subjects.map((s, i) => `
+          <button class="pcard-subject-chip" data-subject="${esc(s)}"
+            style="text-align:left;font-size:10px;padding:3px 7px;border-radius:4px;border:1px solid var(--border);cursor:pointer;background:${i===0?"var(--primary)":"transparent"};color:${i===0?"#fff":"var(--text)"};line-height:1.3">
+            ${esc(s)}
+          </button>`).join("")}
+       </div>`
+    : "";
+
+  // Ad networks row
+  const adNetRow = adNetworks.length > 0
+    ? `<span style="font-size:10px;color:#7c3aed">📡 ${esc(adNetworks.slice(0,3).join(", "))}</span>`
+    : "";
+
+  // Page title as subtitle
+  const titleRow = r.page_title
+    ? `<div style="font-size:10px;color:var(--text-muted);font-style:italic;margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.page_title)}">${esc(r.page_title)}</div>`
+    : "";
+
   return `
   <div class="pcard" data-id="${r.id}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;margin:0 8px 8px;overflow:hidden">
 
     <!-- Summary row -->
     <div style="display:flex;align-items:center;gap:6px;padding:8px 10px">
       <div style="flex:1;min-width:0">
-        <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
-           style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          ${esc(r.domain)} ↗
-        </a>
-        <div style="font-size:10px;color:var(--text-muted);margin-top:2px;display:flex;flex-wrap:wrap;gap:4px">
+        <div style="display:flex;align-items:center;gap:5px">
+          <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
+             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+            ${esc(r.domain)} ↗
+          </a>
+          ${scoreBadge}
+        </div>
+        ${titleRow}
+        <div style="font-size:10px;color:var(--text-muted);margin-top:3px;display:flex;flex-wrap:wrap;gap:4px">
           <span>📊 ${trafficFmt}</span>
           ${r.geo      ? `<span>🌎 ${esc(r.geo)}</span>`      : ""}
           ${r.language ? `<span>🗣 ${esc(langName)}</span>`    : ""}
           ${r.category ? `<span>📁 ${esc(r.category)}</span>` : ""}
           ${r.contact_name ? `<span>👤 ${esc(r.contact_name)}</span>` : ""}
-          ${hasEmail ? `<span style="color:#3b82f6">✉️ ${emails.length} email${emails.length > 1 ? "s" : ""}</span>` : '<span style="color:#e53e3e">✉️ no email</span>'}
+          ${hasEmail ? `<span style="color:#3b82f6">✉️ ${emails.length}</span>` : '<span style="color:#e53e3e">✉️ —</span>'}
+          ${adNetRow}
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
@@ -2428,12 +2500,14 @@ function renderProspectCard(r) {
 
       <!-- Email selection -->
       <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px">Select email to send</div>
-      ${hasEmail ? emailOptions : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails found by auto-prospector.</div>'}
+      ${hasEmail ? emailOptions : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails found — enter manually.</div>'}
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
       <!-- Pitch -->
       <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 4px;text-transform:uppercase;letter-spacing:.5px">Email prepared by AI</div>
-      <input type="text" class="form-input pcard-subject" value="${esc(r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
+      ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-bottom:5px">📡 Ad networks detected: ${esc(adNetworks.join(", "))}</div>` : ""}
+      ${subjectChips}
+      <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
       <textarea class="form-input pcard-pitch" rows="5" style="font-size:11px;padding:6px 7px;resize:vertical;min-height:80px">${esc(r.pitch || "")}</textarea>
 
       <!-- Monday fields -->
@@ -2478,6 +2552,20 @@ function initProspectCard(card, data) {
     const open  = panel.style.display === "none";
     panel.style.display = open ? "block" : "none";
     btn.textContent     = open ? "▲" : "▼";
+  });
+
+  // Subject chips — click selects subject into input
+  card.querySelectorAll(".pcard-subject-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      card.querySelectorAll(".pcard-subject-chip").forEach(c => {
+        c.style.background = "transparent";
+        c.style.color      = "var(--text)";
+      });
+      chip.style.background = "var(--primary)";
+      chip.style.color      = "#fff";
+      const subjectInput = card.querySelector(".pcard-subject");
+      if (subjectInput) subjectInput.value = chip.dataset.subject;
+    });
   });
 
   // Edit button → expand + focus pitch

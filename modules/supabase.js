@@ -117,13 +117,45 @@ export async function setAutopilotEnabled(enabled, accessToken) {
   } catch {}
 }
 
+export async function getAutopilotTarget(accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_config?key=in.(target_geo,target_category)&select=key,value`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value || ""; });
+    return { geo: map.target_geo || "", category: map.target_category || "" };
+  } catch { return { geo: "", category: "" }; }
+}
+
+export async function setAutopilotTarget(geo, category, accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const headers = { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" };
+  const upsert = async (cfgKey, val) => {
+    const chk = await fetch(`${url}/rest/v1/toolbar_config?key=eq.${cfgKey}&select=key`, { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } });
+    const exists = (await chk.json())?.length > 0;
+    await fetch(`${url}/rest/v1/toolbar_config${exists ? `?key=eq.${cfgKey}` : ""}`, {
+      method: exists ? "PATCH" : "POST", headers,
+      body: JSON.stringify(exists ? { value: val } : { key: cfgKey, value: val }),
+    });
+  };
+  try {
+    await Promise.all([upsert("target_geo", geo), upsert("target_category", category)]);
+  } catch {}
+}
+
 // ── Review Queue — candidatos del auto-prospector para validación ─────
 export async function fetchReviewQueue(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&order=created_at.desc&limit=200`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&order=score.desc,created_at.desc&limit=200`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
