@@ -424,53 +424,9 @@ async function findSimilarSites(domain, rapidApiKey) {
   return [...new Set([...swSites, ...ssSites])];
 }
 
-async function findContactAndMeta(domain, geminiKey) {
-  try {
-    const prompt = `Analyze the website "${domain}" and return ONLY this JSON (no extra text):
-{
-  "first_name": "",
-  "last_name": "",
-  "title": "",
-  "language": "en",
-  "category": "other"
-}
-Rules:
-- first_name / last_name: CEO, founder, or main decision maker (empty string if not found)
-- language: 2-letter ISO code of the site's main content language (en/es/pt/it/ar/fr/de)
-- category: one of sports / news / finance / technology / entertainment / health / travel / gambling / automotive / food / business / other`;
-
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          tools: [{ google_search: {} }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
-        }),
-        signal: AbortSignal.timeout(15000),
-      }
-    );
-    if (!res.ok) return null;
-    const data  = await res.json();
-    const text  = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const match = text.match(/\{[\s\S]*?\}/);
-    if (!match) return null;
-    const p = JSON.parse(match[0]);
-    return {
-      firstName: p.first_name || "",
-      lastName:  p.last_name  || "",
-      title:     p.title      || "",
-      language:  p.language   || "en",
-      category:  p.category   || "other",
-    };
-  } catch { return null; }
-}
-
 const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
 
-async function findAllEmails(domain, firstName, lastName, apolloApiKey) {
+async function findAllEmails(domain, apolloApiKey) {
   if (!apolloApiKey) return [];
   const emails = [];
 
@@ -650,84 +606,6 @@ function scoreCandidate({ visits, category, topCountry, contactName, emails, pag
   return Math.max(0, score);
 }
 
-// ── Pitch generation ──────────────────────────────────────────
-
-async function generatePitchForDomain(domain, visits, geo, language, category, contactName, contactTitle, pageContent, adNetworks, geminiKey) {
-  const langNames = { en:"English", es:"Spanish", pt:"Portuguese", it:"Italian", ar:"Arabic", fr:"French", de:"German" };
-  const langName  = langNames[language] || "English";
-  const greeting  = contactName ? `Dear ${contactName}` : "Dear Publisher";
-
-  // Traffic tier copy
-  let trafficLine;
-  if      (visits >= 20_000_000) trafficLine = `${Math.round(visits/1_000_000)}M monthly visits (major publisher)`;
-  else if (visits >=  5_000_000) trafficLine = `${Math.round(visits/1_000_000)}M monthly visits (large publisher)`;
-  else if (visits >=  1_000_000) trafficLine = `${Math.round(visits/1_000_000)}M monthly visits (mid-size publisher)`;
-  else                           trafficLine = `${Math.round(visits/1000)}K monthly visits (growing publisher)`;
-
-  // Page context block
-  const pageBlock = pageContent?.title || pageContent?.description
-    ? `Site content intel:\n- Title: "${pageContent.title}"\n${pageContent.description ? `- Description: "${pageContent.description}"` : ""}`
-    : "";
-
-  // Monetization context
-  const adBlock = adNetworks?.length
-    ? `Current ad partners detected on site: ${adNetworks.join(", ")} — angle: complement or improve existing setup`
-    : "No major ad network detected on site — angle: introduce programmatic monetization opportunity";
-
-  const prompt = `You are writing a cold outreach email on behalf of ADEQ Media, a digital advertising network.
-
-TARGET PUBLISHER INTELLIGENCE:
-- Domain: ${domain}
-- Traffic: ${trafficLine}
-- Primary market: ${geo || "international"}
-- Content category: ${category || "general"}
-- Contact: ${contactName ? `${contactName}${contactTitle ? `, ${contactTitle}` : ""}` : "unknown"}
-${pageBlock}
-- ${adBlock}
-
-YOUR TASK:
-Write a 3–4 sentence outreach email in ${langName}.
-- Greeting: ${greeting}
-- Reference something SPECIFIC about this publisher (their category, market, or what makes them relevant)
-- Be concrete about the partnership value, not generic
-- ${adNetworks?.length ? "Acknowledge they already monetize — position ADEQ as a premium complement" : "Show them what they're leaving on the table without programmatic"}
-- Sign: "ADEQ Media Team"
-- Do NOT mention specific revenue numbers or percentages
-
-Return ONLY valid JSON with exactly this shape:
-{
-  "subject": "best subject line",
-  "subjects": ["subject option A — direct statement", "subject option B — question format", "subject option C — data/insight hook"],
-  "body": "full email body"
-}`;
-
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.4, maxOutputTokens: 600 },
-        }),
-        signal: AbortSignal.timeout(15000),
-      }
-    );
-    if (!res.ok) return null;
-    const data  = await res.json();
-    const text  = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const match = text.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    const p = JSON.parse(match[0]);
-    return {
-      subject:  p.subject  || "",
-      subjects: Array.isArray(p.subjects) ? p.subjects.slice(0, 3) : [],
-      body:     p.body     || "",
-    };
-  } catch { return null; }
-}
-
 // ── Helpers ───────────────────────────────────────────────────
 
 function cleanDomain(str) {
@@ -751,7 +629,7 @@ function shuffleArray(arr) {
 // ── Sesión de prospección ─────────────────────────────────────
 
 async function runSession(token, cfg, sessionStart) {
-  const { monday_api_key, rapidapi_key, gemini_api_key, apollo_api_key } = cfg;
+  const { monday_api_key, rapidapi_key, apollo_api_key } = cfg;
 
   // Targets de esta sesión (desde toolbar_config)
   const targetGeo      = cfg.target_geo      || "";
@@ -822,10 +700,9 @@ async function runSession(token, cfg, sessionStart) {
     const domain = toProcess.shift();
     log(`→ [${count + 1} | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
 
-    // Paso 1: tráfico + meta + contenido de página en paralelo
-    const [trafficData, meta, pageContent] = await Promise.all([
+    // Paso 1: tráfico + contenido de página en paralelo (sin Gemini)
+    const [trafficData, pageContent] = await Promise.all([
       getTrafficData(domain, rapidapi_key),
-      findContactAndMeta(domain, gemini_api_key),
       fetchPageContent(domain),
     ]);
 
@@ -840,12 +717,11 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
 
-    const language     = meta?.language  || "en";
-    const category     = meta?.category  || "other";
-    const contactName  = meta?.firstName ? `${meta.firstName} ${meta.lastName}`.trim() : "";
-    const contactTitle = meta?.title     || "";
-    const adNetworks   = pageContent?.adNetworks || [];
-    const pageTitle    = pageContent?.title       || "";
+    const language    = "";
+    const category    = pageContent?.category || "";
+    const contactName = "";
+    const adNetworks  = pageContent?.adNetworks || [];
+    const pageTitle   = pageContent?.title       || "";
 
     // Filtro por categoría objetivo (si está configurado)
     if (targetCategory && category !== targetCategory) {
@@ -894,7 +770,7 @@ async function runSession(token, cfg, sessionStart) {
 
     const [apolloEmails, scraperEmails, similarSites] = await Promise.all([
       canUseApollo
-        ? findAllEmails(domain, meta?.firstName || "", meta?.lastName || "", apollo_api_key).then(r => { apolloCallsThisSession += 2; return r; })
+        ? findAllEmails(domain, apollo_api_key).then(r => { apolloCallsThisSession += 2; return r; })
         : Promise.resolve([]),
       scrapeEmailsForDomain(domain),
       findSimilarSites(domain, rapidapi_key),
