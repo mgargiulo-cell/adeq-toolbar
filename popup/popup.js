@@ -1285,6 +1285,7 @@ function bindButtons() {
           itemId: state.mondayItemId,
           traffic: formatTraffic(state.traffic),
           email, geo, idioma, pitch, estado, fecha, ejecutivo,
+          loginEmail: state.loginEmail,
         });
         res.textContent = "✅ Updated in Monday"; res.className = "push-result ok";
       } else {
@@ -1292,6 +1293,7 @@ function bindButtons() {
           domain: state.domain,
           traffic: formatTraffic(state.traffic),
           email, geo, idioma, pitch, estado, fecha, ejecutivo,
+          loginEmail: state.loginEmail,
         });
         state.mondayItemId = item?.id;
         res.textContent = `✅ Created: ${item?.name || state.domain}`; res.className = "push-result ok";
@@ -2901,6 +2903,7 @@ async function validateProspect(card, data, doSendEmail) {
       ejecutivo,
       idioma,
       fecha:     new Date().toISOString().split("T")[0],
+      loginEmail: state.loginEmail,
     });
 
     // 2. Send email (if requested and email available)
