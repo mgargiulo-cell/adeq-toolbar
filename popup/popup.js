@@ -372,11 +372,8 @@ function fillMondayFormFromDuplicate(dup) {
       if (opt) sel.value = opt.value;
     }
   }
-  if (dup.ejecutivo) {
-    const sel = document.getElementById("form-ejecutivo");
-    const opt = [...sel.options].find(o => o.value === dup.ejecutivo);
-    if (opt) sel.value = dup.ejecutivo;
-  }
+  // NOTA: No sobrescribimos form-ejecutivo con dup.ejecutivo (dueño original).
+  // Cada actualización debe quedar registrada bajo el usuario logueado.
 }
 
 // ============================================================
@@ -2295,8 +2292,15 @@ function applyUserFromAuth(auth) {
     "dhorovitz@adeqmedia.com": "Diego",
   };
 
-  const email = auth?.user || "";
-  const name  = AUTHORIZED[email] || auth?.name || "Max";
+  const email = (auth?.user || "").toLowerCase().trim();
+  const name  = AUTHORIZED[email] || auth?.name || "";
+
+  if (!name) {
+    console.error("[auth] No se pudo determinar el usuario logueado. Email:", email);
+    // Forzar re-login: borra auth y recarga
+    chrome.storage.local.remove("auth").then(() => window.location.reload());
+    return;
+  }
 
   state.mediaBuyer   = name;
   state.loginEmail   = email;
