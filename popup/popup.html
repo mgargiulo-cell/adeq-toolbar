@@ -767,6 +767,38 @@
   </section>
 
   <div id="import-list" class="import-list"></div>
+
+  <!-- CSV Bulk Upload — envía dominios a la cola del auto-prospector -->
+  <section class="card" style="margin-top:16px">
+    <div class="card-title">📤 CSV Bulk Queue (Auto-prospector)</div>
+    <p class="import-desc">Subí un CSV (1 dominio por línea). El auto-prospector de Railway los procesa automáticamente: analiza tráfico, emails, y pushea a Monday. Apollo solo para +1M visits.</p>
+
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+      <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
+      <button id="btn-csv-upload" class="btn btn-primary btn-sm">Upload</button>
+    </div>
+    <div id="csv-upload-result" class="push-result" style="min-height:16px;font-size:11px"></div>
+
+    <div style="margin-top:10px;padding:10px;background:var(--bg);border-radius:6px;font-size:11px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <strong>Queue status</strong>
+        <button id="btn-csv-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px">↻ Refresh</button>
+      </div>
+      <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
+    </div>
+
+    <div style="display:flex;gap:6px;margin-top:10px;align-items:center;flex-wrap:wrap">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">
+        <input id="csv-queue-enabled" type="checkbox" />
+        <span>Auto-procesar cola (Railway)</span>
+      </label>
+    </div>
+
+    <div style="display:flex;gap:6px;margin-top:8px">
+      <button id="btn-csv-clear-processed" class="btn btn-secondary btn-sm" style="font-size:10px">Clear processed</button>
+      <button id="btn-csv-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e">Clear ALL</button>
+    </div>
+  </section>
 </div>
 
 <!-- ====================================================

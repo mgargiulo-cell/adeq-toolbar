@@ -167,16 +167,23 @@ async function getConfig(token) {
   return cfg;
 }
 
-// Lectura liviana — solo el flag de encendido, para el poll idle
-async function isAutopilotEnabled(token) {
+// Lectura liviana — flags de encendido, para el poll idle
+async function getActiveFlags(token) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.auto_prospecting_enabled&select=value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,csv_queue_enabled)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
     );
     const rows = await res.json();
-    return rows?.[0]?.value === "true";
-  } catch { return false; }
+    const map = {};
+    rows.forEach(r => { map[r.key] = r.value === "true"; });
+    return { autopilot: !!map.auto_prospecting_enabled, csvQueue: !!map.csv_queue_enabled };
+  } catch { return { autopilot: false, csvQueue: false }; }
+}
+
+async function isAutopilotEnabled(token) {
+  const f = await getActiveFlags(token);
+  return f.autopilot;
 }
 
 async function setConfigValue(token, key, value) {
@@ -626,6 +633,174 @@ function shuffleArray(arr) {
   }
 }
 
+// ── CSV Queue — bulk refresh de Monday ────────────────────────
+
+async function getNextCsvItem(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&order=uploaded_at.asc&limit=1&select=id,domain`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    );
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const item = rows[0];
+
+    // Marcar como processing (claim atómico)
+    const claim = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${item.id}&status=eq.pending`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json", "Prefer": "return=representation",
+        },
+        body: JSON.stringify({ status: "processing" }),
+      }
+    );
+    const claimed = await claim.json().catch(() => []);
+    return claimed?.[0] ? item : null; // si otro proceso lo tomó, claimed será []
+  } catch { return null; }
+}
+
+async function markCsvItem(token, id, status, fields = {}) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${id}`, {
+      method: "PATCH",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ status, processed_at: new Date().toISOString(), ...fields }),
+    });
+  } catch {}
+}
+
+// Busca un item en Monday por nombre de dominio (name column contains domain)
+async function findMondayItem(domain, mondayApiKey) {
+  const clean = cleanDomain(domain);
+  const query = `{
+    boards(ids: [1420268379]) {
+      items_page(limit: 5, query_params: { rules: [
+        { column_id: "name", compare_value: "${clean}", operator: contains_text }
+      ]}) {
+        items { id name }
+      }
+    }
+  }`;
+  try {
+    const res = await fetch("https://api.monday.com/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": mondayApiKey, "API-Version": "2024-01" },
+      body: JSON.stringify({ query }),
+    });
+    const data  = await res.json();
+    const items = data?.data?.boards?.[0]?.items_page?.items || [];
+    const match = items.find(it => cleanDomain(it.name) === clean);
+    return match ? match.id : null;
+  } catch { return null; }
+}
+
+async function updateMondayItem(itemId, columnValues, mondayApiKey) {
+  const safe = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  const mutation = `mutation {
+    change_multiple_column_values(
+      item_id: ${itemId},
+      board_id: 1420268379,
+      column_values: "${safe(JSON.stringify(columnValues))}"
+    ) { id }
+  }`;
+  const res = await fetch("https://api.monday.com/v2", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": mondayApiKey, "API-Version": "2024-01" },
+    body: JSON.stringify({ query: mutation }),
+  });
+  const data = await res.json();
+  if (data?.errors) throw new Error(JSON.stringify(data.errors).substring(0, 200));
+  return data?.data?.change_multiple_column_values;
+}
+
+async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSessionRef) {
+  const { monday_api_key, rapidapi_key, apollo_api_key } = cfg;
+  const domain = item.domain;
+
+  // 1. Buscar item en Monday
+  const itemId = await findMondayItem(domain, monday_api_key);
+  if (!itemId) {
+    await markCsvItem(token, item.id, "skipped", { error_message: "not in Monday" });
+    log(`  ⏭ ${domain} — no está en Monday`);
+    return;
+  }
+
+  // 2. Traffic + page content en paralelo (sin Gemini)
+  const [trafficData, pageContent] = await Promise.all([
+    getTrafficData(domain, rapidapi_key),
+    fetchPageContent(domain),
+  ]);
+  const { visits, topCountry } = trafficData;
+
+  // 3. Emails — Apollo si visits >= 500K, scraping siempre como fallback
+  const canUseApollo = apollo_api_key
+    && visits >= 500_000
+    && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit;
+
+  const [apolloEmails, scraperEmails] = await Promise.all([
+    canUseApollo
+      ? findAllEmails(domain, apollo_api_key).then(r => { apolloCallsThisSessionRef.count += 2; return r; })
+      : Promise.resolve([]),
+    scrapeEmailsForDomain(domain),
+  ]);
+  const emails = [...new Set([...apolloEmails, ...scraperEmails])];
+  const primaryEmail = emails[0] || "";
+
+  // 4. Update Monday — solo campos con data (no sobreescribe con vacío)
+  const columnValues = {};
+  if (visits)      columnValues["texto7"] = String(visits);                         // Paginas Vistas
+  if (topCountry)  columnValues["texto6"] = topCountry;                             // Top Geo
+  if (primaryEmail) columnValues["email_mm2edcd3"] = { email: primaryEmail, text: primaryEmail };
+
+  try {
+    if (Object.keys(columnValues).length > 0) {
+      await updateMondayItem(itemId, columnValues, monday_api_key);
+      await markCsvItem(token, item.id, "done", { monday_item_id: itemId });
+      log(`  ✅ ${domain} — visits:${visits || 0} geo:${topCountry || "-"} email:${primaryEmail ? "yes" : "no"} apollo:${canUseApollo ? "yes" : "no"}`);
+    } else {
+      await markCsvItem(token, item.id, "done", { monday_item_id: itemId, error_message: "no new data" });
+      log(`  ○ ${domain} — sin data nueva`);
+    }
+  } catch (e) {
+    await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500) });
+    log(`  ❌ ${domain} — ${e.message}`);
+  }
+}
+
+async function runCsvQueue(token, cfg, maxItems = 100) {
+  const apolloUsage = await getApolloUsage(token, cfg);
+  const callsRef    = { count: 0 };
+  let processed     = 0;
+
+  log(`▶ CSV queue start (apollo usados hoy: ${apolloUsage.usedToday}/${apolloUsage.limit})`);
+
+  while (processed < maxItems) {
+    const item = await getNextCsvItem(token);
+    if (!item) { log("  (cola vacía)"); break; }
+
+    processed++;
+    log(`→ [${processed}/${maxItems}] ${item.domain}`);
+
+    try {
+      await processCsvItem(token, item, cfg, apolloUsage, callsRef);
+    } catch (e) {
+      await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500) });
+      log(`  ❌ ${item.domain} — uncaught: ${e.message}`);
+    }
+
+    await sleep(DOMAIN_DELAY_MS);
+  }
+
+  await saveApolloUsage(token, callsRef.count, new Date().toISOString().split("T")[0]);
+  log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}`);
+}
+
 // ── Sesión de prospección ─────────────────────────────────────
 
 async function runSession(token, cfg, sessionStart) {
@@ -853,10 +1028,18 @@ async function main() {
         }
       }
 
-      // Poll liviano — solo lee 1 fila hasta que se encienda
-      const enabled = await isAutopilotEnabled(token);
-      if (!enabled) {
+      // Poll liviano — lee autopilot + csv_queue flags
+      const flags = await getActiveFlags(token);
+      if (!flags.autopilot && !flags.csvQueue) {
         await sleep(IDLE_INTERVAL_MS);
+        continue;
+      }
+
+      // CSV queue tiene prioridad sobre autopilot normal
+      if (flags.csvQueue) {
+        const cfg = await getConfig(token);
+        await runCsvQueue(token, cfg, 100); // procesa hasta 100 por tanda
+        await sleep(POLL_INTERVAL_MS);
         continue;
       }
 

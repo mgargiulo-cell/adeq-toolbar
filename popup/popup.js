@@ -14,6 +14,7 @@ import { detectBanners }                                                        
 import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
+         uploadCsvDomains, getCsvQueueStats, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
          getImportedDomains, markDomainsImported,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
          getAutopilotTarget, setAutopilotTarget,
@@ -1488,6 +1489,9 @@ function bindButtons() {
     btn.disabled = false; btn.textContent = "🚀 Importar 15 URLs";
   });
 
+  // CSV Bulk Queue — Auto-prospector refresh de dominios en Monday
+  await initCsvQueue();
+
   // Settings
   document.getElementById("btn-settings").addEventListener("click", openSettings);
   document.getElementById("btn-close-settings").addEventListener("click", closeSettings);
@@ -2402,6 +2406,88 @@ async function saveGmailAssociation(loginEmail, gmailEmail) {
 async function clearGmailAssociation(loginEmail) {
   const key = `gmail_assoc_${loginEmail}`;
   await chrome.storage.local.remove(key);
+}
+
+// ── CSV Bulk Queue ────────────────────────────────────────────
+async function initCsvQueue() {
+  const fileInput   = document.getElementById("csv-file-input");
+  const uploadBtn   = document.getElementById("btn-csv-upload");
+  const uploadRes   = document.getElementById("csv-upload-result");
+  const statsEl     = document.getElementById("csv-queue-stats");
+  const refreshBtn  = document.getElementById("btn-csv-refresh");
+  const enabledCbx  = document.getElementById("csv-queue-enabled");
+  const clearProc   = document.getElementById("btn-csv-clear-processed");
+  const clearAll    = document.getElementById("btn-csv-clear-all");
+  if (!uploadBtn) return;
+
+  const refreshStats = async () => {
+    statsEl.textContent = "Loading...";
+    const stats = await getCsvQueueStats(state.accessToken);
+    statsEl.innerHTML = `
+      Total: <strong>${stats.total}</strong><br>
+      ⏳ Pending: <strong>${stats.pending}</strong> · 🔄 Processing: <strong>${stats.processing}</strong><br>
+      ✅ Done: <strong>${stats.done}</strong> · ❌ Error: <strong>${stats.error}</strong> · ⏭ Skipped: <strong>${stats.skipped}</strong>
+    `;
+  };
+
+  // Estado inicial del toggle
+  enabledCbx.checked = await getCsvQueueEnabled(state.accessToken);
+  enabledCbx.addEventListener("change", async () => {
+    await setCsvQueueEnabled(enabledCbx.checked, state.accessToken);
+  });
+
+  refreshBtn.addEventListener("click", refreshStats);
+  await refreshStats();
+
+  // Upload CSV
+  uploadBtn.addEventListener("click", async () => {
+    const file = fileInput.files?.[0];
+    if (!file) { uploadRes.textContent = "Seleccioná un archivo CSV primero"; uploadRes.className = "push-result error"; return; }
+
+    uploadBtn.disabled = true; uploadBtn.textContent = "⏳...";
+    uploadRes.textContent = "Leyendo archivo..."; uploadRes.className = "push-result";
+
+    try {
+      const text    = await file.text();
+      const domains = text.split(/[\r\n]+/)
+        .map(l => l.trim())
+        .filter(Boolean)
+        // Tomar la primera columna si hay comas (formato CSV)
+        .map(l => l.split(",")[0].trim())
+        // Limpiar dominio
+        .map(d => d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "").toLowerCase())
+        .filter(d => d.includes(".") && !d.includes(" "));
+
+      if (domains.length === 0) { uploadRes.textContent = "No se encontraron dominios válidos"; uploadRes.className = "push-result error"; return; }
+
+      // Dedupe
+      const unique = [...new Set(domains)];
+      uploadRes.textContent = `Subiendo ${unique.length} dominios...`;
+
+      const result = await uploadCsvDomains(unique, state.loginEmail, state.accessToken);
+      uploadRes.textContent = `✅ ${result.inserted} agregados (${result.attempted - result.inserted} duplicados ignorados)`;
+      uploadRes.className = "push-result ok";
+      fileInput.value = "";
+      await refreshStats();
+    } catch (err) {
+      uploadRes.textContent = `❌ ${err.message}`;
+      uploadRes.className = "push-result error";
+    } finally {
+      uploadBtn.disabled = false; uploadBtn.textContent = "Upload";
+    }
+  });
+
+  clearProc.addEventListener("click", async () => {
+    if (!confirm("¿Borrar todas las entradas procesadas (done/error/skipped) de la cola?")) return;
+    await clearCsvQueue(state.accessToken, true);
+    await refreshStats();
+  });
+
+  clearAll.addEventListener("click", async () => {
+    if (!confirm("⚠️ Borrar TODAS las entradas de la cola CSV (incluidas las pendientes)?")) return;
+    await clearCsvQueue(state.accessToken, false);
+    await refreshStats();
+  });
 }
 
 // ── Autopilot toggle + target ─────────────────────────────────

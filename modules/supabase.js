@@ -701,3 +701,102 @@ export async function markFUSent(domain, fuNumber) {
     console.warn("markFUSent failed:", err.message);
   }
 }
+
+// ── CSV Queue — batch de dominios a procesar por el auto-prospector ───
+export async function uploadCsvDomains(domains, userEmail, accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!Array.isArray(domains) || domains.length === 0) return { inserted: 0 };
+
+  // Batch de 500 (límite seguro de Supabase REST)
+  const BATCH = 500;
+  let inserted = 0;
+  for (let i = 0; i < domains.length; i += BATCH) {
+    const slice = domains.slice(i, i + BATCH).map(d => ({
+      domain: d, status: "pending", uploaded_by: userEmail,
+    }));
+    try {
+      const res = await fetch(`${url}/rest/v1/toolbar_csv_queue`, {
+        method: "POST",
+        headers: {
+          "apikey": key, "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "Prefer": "resolution=ignore-duplicates,return=representation",
+        },
+        body: JSON.stringify(slice),
+      });
+      if (res.ok) {
+        const rows = await res.json().catch(() => []);
+        inserted += Array.isArray(rows) ? rows.length : 0;
+      }
+    } catch (e) {
+      console.warn("uploadCsvDomains batch failed:", e.message);
+    }
+  }
+  return { inserted, attempted: domains.length };
+}
+
+export async function getCsvQueueStats(accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const stats = { total: 0, pending: 0, processing: 0, done: 0, error: 0, skipped: 0 };
+  try {
+    // Usamos HEAD + Prefer: count=exact para obtener totales por status
+    const statuses = Object.keys(stats).filter(k => k !== "total");
+    const results = await Promise.all(statuses.map(async (s) => {
+      const res = await fetch(
+        `${url}/rest/v1/toolbar_csv_queue?status=eq.${s}&select=id`,
+        { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
+      );
+      const contentRange = res.headers.get("content-range") || "";
+      const match = contentRange.match(/\/(\d+)$/);
+      return { status: s, count: match ? parseInt(match[1]) : 0 };
+    }));
+    results.forEach(r => { stats[r.status] = r.count; stats.total += r.count; });
+  } catch (e) {
+    console.warn("getCsvQueueStats failed:", e.message);
+  }
+  return stats;
+}
+
+export async function clearCsvQueue(accessToken, onlyProcessed = false) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const filter = onlyProcessed ? "?status=in.(done,error,skipped)" : "?id=gte.0";
+  try {
+    await fetch(`${url}/rest/v1/toolbar_csv_queue${filter}`, {
+      method: "DELETE",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+export async function getCsvQueueEnabled(accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_config?key=eq.csv_queue_enabled&select=value`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    const rows = await res.json();
+    return rows?.[0]?.value === "true";
+  } catch { return false; }
+}
+
+export async function setCsvQueueEnabled(enabled, accessToken) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    await fetch(`${url}/rest/v1/toolbar_config?key=eq.csv_queue_enabled`, {
+      method: "PATCH",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ value: enabled ? "true" : "false" }),
+    });
+  } catch (e) {
+    console.warn("setCsvQueueEnabled failed:", e.message);
+  }
+}
