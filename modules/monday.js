@@ -64,12 +64,32 @@ export async function checkDuplicate(domain) {
   };
 }
 
+// Resuelve el user ID de Monday a partir del login email o el nombre corto
+function resolveMondayPerson(ejecutivo, loginEmail) {
+  if (loginEmail) {
+    const id = CONFIG.MONDAY_USER_IDS?.[loginEmail.toLowerCase()];
+    if (id) return id;
+  }
+  const shortToEmail = {
+    "Max":   "mgargiulo@adeqmedia.com",
+    "Agus":  "sales@adeqmedia.com",
+    "Diego": "dhorovitz@adeqmedia.com",
+  };
+  if (ejecutivo && shortToEmail[ejecutivo]) {
+    const id = CONFIG.MONDAY_USER_IDS?.[shortToEmail[ejecutivo]];
+    if (id) return id;
+  }
+  return null;
+}
+
 export async function pushToMonday(data) {
-  const { domain, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo } = data;
+  const { domain, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo, loginEmail } = data;
   const comentario = pitch ? `PITCH IA:\n${pitch}` : "";
 
   const safe     = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
   const itemName = domain.startsWith("www.") ? domain : `www.${domain}`;
+
+  const personId = resolveMondayPerson(ejecutivo, loginEmail);
 
   const columnValues = {
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
@@ -77,6 +97,7 @@ export async function pushToMonday(data) {
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
     ...(ejecutivo                                                         ? { [CONFIG.MONDAY_COLUMNS.ejecutivo_txt]: safe(ejecutivo) } : {}),
+    ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
     ...(idioma !== "" && idioma !== undefined ? { [CONFIG.MONDAY_COLUMNS.idioma]:        { index: parseInt(idioma) } } : {}),
@@ -94,10 +115,12 @@ export async function pushToMonday(data) {
   return result?.create_item;
 }
 
-export async function updateMonday({ itemId, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo }) {
+export async function updateMonday({ itemId, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo, loginEmail }) {
   const comentario = pitch ? `PITCH IA:\n${pitch}` : "";
 
   const safe = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+
+  const personId = resolveMondayPerson(ejecutivo, loginEmail);
 
   const columnValues = {
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
@@ -105,6 +128,7 @@ export async function updateMonday({ itemId, traffic, email, geo, pitch, estado,
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
     ...(ejecutivo                                                         ? { [CONFIG.MONDAY_COLUMNS.ejecutivo_txt]: safe(ejecutivo) } : {}),
+    ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
     ...(idioma !== "" && idioma !== undefined ? { [CONFIG.MONDAY_COLUMNS.idioma]:        { index: parseInt(idioma) } } : {}),

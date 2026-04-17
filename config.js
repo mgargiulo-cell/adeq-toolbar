@@ -21,6 +21,12 @@ export const CONFIG = {
 
   // ── Monday columns (estructura, no secretos) ──────────────────
   MONDAY_BOARDS: { prospectos: "1420268379" },
+  // Mapping: login email → Monday user ID (para columna Persona deal_owner)
+  MONDAY_USER_IDS: {
+    "mgargiulo@adeqmedia.com": 56851451, // Maximiliano
+    "sales@adeqmedia.com":     60940538, // Agustina
+    "dhorovitz@adeqmedia.com": 56938560, // Diego
+  },
   MONDAY_COLUMNS: {
     nombre:          "name",
     estado:          "deal_stage",

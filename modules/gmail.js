@@ -55,13 +55,12 @@ export async function getGmailProfile(interactive = false) {
   const token = await fetchToken(interactive);
   if (!token) return null;
   try {
-    const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-      headers: { "Authorization": `Bearer ${token}` },
-    });
-    if (res.status === 401) { await removeCachedToken(token); return null; }
+    // tokeninfo funciona con cualquier token sin necesidad de scopes extra
+    const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+    if (res.status === 401 || res.status === 400) { await removeCachedToken(token); return null; }
     if (!res.ok) return null;
     const data = await res.json();
-    return { email: (data?.emailAddress || "").toLowerCase() };
+    return { email: (data?.email || "").toLowerCase() };
   } catch { return null; }
 }
 
@@ -117,18 +116,34 @@ export async function sendEmail({ to, subject, body, expectedFrom }) {
     let token = await fetchToken(true);
     if (!token) throw new Error("Could not obtain Gmail token. Make sure Chrome is signed in with your @adeqmedia.com account.");
 
-    // Validar que el Gmail de Chrome coincida con el login de la toolbar
+    // Validación estricta: si no podemos verificar la identidad del Gmail, NO enviamos.
     if (expectedFrom) {
-      const profileRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-        headers: { "Authorization": `Bearer ${token}` },
-      });
-      if (profileRes.ok) {
-        const profile = await profileRes.json();
-        const gmailEmail = (profile?.emailAddress || "").toLowerCase();
-        const expected   = expectedFrom.toLowerCase();
-        if (gmailEmail && gmailEmail !== expected) {
-          throw new Error(`El Gmail de Chrome (${gmailEmail}) no coincide con el login (${expected}). Cambiá de cuenta en Chrome o logueate con ese email en la toolbar.`);
-        }
+      const expected = expectedFrom.toLowerCase().trim();
+
+      let profileRes;
+      try {
+        // tokeninfo devuelve el email asociado al token sin requerir scopes extra
+        profileRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
+      } catch (e) {
+        throw new Error(`No se pudo verificar la identidad del Gmail (${e.message}). No se envió el email.`);
+      }
+
+      if (profileRes.status === 401 || profileRes.status === 400) {
+        await removeCachedToken(token);
+        throw new Error("Token de Gmail expirado. Probá de nuevo.");
+      }
+      if (!profileRes.ok) {
+        throw new Error(`No se pudo verificar la identidad del Gmail (HTTP ${profileRes.status}). No se envió el email.`);
+      }
+
+      const profile    = await profileRes.json().catch(() => ({}));
+      const gmailEmail = (profile?.email || "").toLowerCase().trim();
+
+      if (!gmailEmail) {
+        throw new Error("No se pudo obtener el email de la cuenta de Chrome. No se envió el email.");
+      }
+      if (gmailEmail !== expected) {
+        throw new Error(`⚠️ El Gmail de Chrome (${gmailEmail}) no coincide con el login (${expected}). El email NO se envió. Cambiá de cuenta en Chrome (Settings → Gmail Account → Sign out) y volvé a conectar con ${expected}.`);
       }
     }
 
