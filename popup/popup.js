@@ -1194,11 +1194,18 @@ function bindButtons() {
   // Generar Follow-Up
   document.getElementById("btn-generate-fu").addEventListener("click", async () => {
     const btn      = document.getElementById("btn-generate-fu");
-    const fuNumber = parseInt(document.getElementById("fu-banner").dataset.fuNumber || "1");
+    const fuNumber = parseInt(document.getElementById("fu-banner")?.dataset?.fuNumber || "1");
+    const pitchEl  = document.getElementById("pitch-text");
+
+    if (!state.sendInfo?.sendDate) {
+      pitchEl.value = "No se encontró la fecha del envío original. Enviá el pitch primero antes de generar un follow-up.";
+      return;
+    }
+
     btn.disabled   = true; btn.textContent = "⏳...";
 
     try {
-      const days = Math.floor((Date.now() - new Date(state.sendInfo?.sendDate || Date.now())) / 86_400_000);
+      const days = Math.floor((Date.now() - new Date(state.sendInfo.sendDate)) / 86_400_000);
       const text = await generateFollowUp({
         domain:        state.domain,
         originalPitch: state.sendInfo?.pitch || "",
@@ -1269,6 +1276,9 @@ function bindButtons() {
 
     btn.disabled = true; btn.textContent = "⏳ Sending..."; res.textContent = "";
 
+    // Snapshot antes de que el push mute state.duplicate — necesario para el contador
+    const wasNewPush = !state.duplicate?.found;
+
     try {
       if (state.duplicate?.found && state.mondayItemId) {
         await updateMonday({
@@ -1315,10 +1325,9 @@ function bindButtons() {
           monthNewQual: 0, monthDupQual: 0, monthMondayNewQual: 0, monthMondayDupQual: 0, monthMondayBelow: 0 });
       }
       const isQual = state.traffic >= CONFIG.MIN_TRAFFIC;
-      const isNew2 = !state.duplicate?.found;
       hs.monthMonday = (hs.monthMonday || 0) + 1;
       if (!isQual)        hs.monthMondayBelow    = (hs.monthMondayBelow    || 0) + 1;
-      else if (isNew2)    hs.monthMondayNewQual  = (hs.monthMondayNewQual  || 0) + 1;
+      else if (wasNewPush) hs.monthMondayNewQual  = (hs.monthMondayNewQual  || 0) + 1;
       else                hs.monthMondayDupQual  = (hs.monthMondayDupQual  || 0) + 1;
       await chrome.storage.local.set({ [statsKey]: hs });
       loadHistoryTab();
