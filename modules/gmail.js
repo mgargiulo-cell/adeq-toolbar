@@ -47,14 +47,22 @@ export async function getGmailToken(interactive = true) {
 }
 
 /**
- * Returns the Gmail profile of the authenticated user.
+ * Returns the Gmail profile (real email address) of the authenticated Chrome user.
  * @param {boolean} interactive
  * @returns {{ email: string } | null}
  */
 export async function getGmailProfile(interactive = false) {
   const token = await fetchToken(interactive);
   if (!token) return null;
-  return { email: "authenticated" };
+  try {
+    const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+      headers: { "Authorization": `Bearer ${token}` },
+    });
+    if (res.status === 401) { await removeCachedToken(token); return null; }
+    if (!res.ok) return null;
+    const data = await res.json();
+    return { email: (data?.emailAddress || "").toLowerCase() };
+  } catch { return null; }
 }
 
 /**
@@ -99,14 +107,30 @@ export async function getGmailSignature() {
 }
 
 /**
- * Sends an email via Gmail API.
- * @param {{ to: string, subject: string, body: string, loginEmail?: string }} params
+ * Sends an email via Gmail API. If `expectedFrom` is provided,
+ * verifies that Chrome's Google account matches before sending.
+ * @param {{ to: string, subject: string, body: string, expectedFrom?: string }} params
  * @returns {{ ok: boolean, error?: string }}
  */
-export async function sendEmail({ to, subject, body }) {
+export async function sendEmail({ to, subject, body, expectedFrom }) {
   try {
     let token = await fetchToken(true);
     if (!token) throw new Error("Could not obtain Gmail token. Make sure Chrome is signed in with your @adeqmedia.com account.");
+
+    // Validar que el Gmail de Chrome coincida con el login de la toolbar
+    if (expectedFrom) {
+      const profileRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+        headers: { "Authorization": `Bearer ${token}` },
+      });
+      if (profileRes.ok) {
+        const profile = await profileRes.json();
+        const gmailEmail = (profile?.emailAddress || "").toLowerCase();
+        const expected   = expectedFrom.toLowerCase();
+        if (gmailEmail && gmailEmail !== expected) {
+          throw new Error(`El Gmail de Chrome (${gmailEmail}) no coincide con el login (${expected}). Cambiá de cuenta en Chrome o logueate con ese email en la toolbar.`);
+        }
+      }
+    }
 
     const raw = buildRaw({ to, subject, body });
 

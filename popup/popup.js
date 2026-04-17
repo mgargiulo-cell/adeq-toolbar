@@ -1359,7 +1359,7 @@ function bindButtons() {
     bodyToSend = gmailSig ? bodyToSend + "\n\n" + gmailSig : bodyToSend;
 
     btn.textContent = "⏳ Sending...";
-    const result = await sendEmail({ to: email, subject, body: bodyToSend });
+    const result = await sendEmail({ to: email, subject, body: bodyToSend, expectedFrom: state.loginEmail });
 
     if (result.ok) {
       const today = new Date().toISOString().split("T")[0];
@@ -2839,7 +2839,7 @@ async function validateProspect(card, data, doSendEmail) {
     if (doSendEmail && email) {
       const signature = await getGmailSignature();
       const fullBody  = pitch + (signature ? "\n\n" + signature : "");
-      const result    = await sendEmail({ to: email, subject, body: fullBody });
+      const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
       if (!result.ok) throw new Error(result.error || "Gmail error");
     }
 
