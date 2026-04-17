@@ -17,6 +17,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 
 // Escucha mensajes del popup o content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) return;
   if (message.type === "PING") {
     sendResponse({ status: "ok", version: "2.0.0" });
   }

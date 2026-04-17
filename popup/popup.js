@@ -13,7 +13,7 @@ import { runCascade, getSimilarSites }                                          
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
 import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
-         searchKeywordsInDB, supabaseSignIn, supabaseRefresh, fetchApiKeys,
+         searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
          getImportedDomains, markDomainsImported,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
          getAutopilotTarget, setAutopilotTarget,
@@ -2181,13 +2181,13 @@ async function runDiagnostic() {
   resEl.innerHTML = `
     <div class="diag-row">
       <span class="diag-label">SimilarWeb</span>
-      <span class="${sw.ok ? "diag-ok" : "diag-error"}">${sw.ok ? "✅" : "❌"} ${sw.msg}</span>
+      <span class="${sw.ok ? "diag-ok" : "diag-error"}">${sw.ok ? "✅" : "❌"} ${esc(sw.msg)}</span>
     </div>
     <div class="diag-row">
       <span class="diag-label">Apollo</span>
-      <span class="${apollo.ok ? "diag-ok" : "diag-error"}">${apollo.ok ? "✅" : "❌"} ${apollo.msg}</span>
+      <span class="${apollo.ok ? "diag-ok" : "diag-error"}">${apollo.ok ? "✅" : "❌"} ${esc(apollo.msg)}</span>
     </div>
-    <div class="diag-detail" style="margin-top:4px">Testeado con: ${domain}</div>
+    <div class="diag-detail" style="margin-top:4px">Testeado con: ${esc(domain)}</div>
   `;
 
   btn.disabled = false; btn.textContent = "▶ Testear";
@@ -2203,9 +2203,11 @@ const CONFIG_DIAG = {
 // LOGIN / AUTH
 // ============================================================
 function initLoginScreen() {
-  const screen  = document.getElementById("login-screen");
-  const btn     = document.getElementById("btn-login");
-  const errorEl = document.getElementById("login-error");
+  const screen    = document.getElementById("login-screen");
+  const btn       = document.getElementById("btn-login");
+  const forgotBtn = document.getElementById("btn-forgot-password");
+  const errorEl   = document.getElementById("login-error");
+  const infoEl    = document.getElementById("login-info");
 
   screen.style.display = "flex";
 
@@ -2217,6 +2219,30 @@ function initLoginScreen() {
   });
 
   btn.addEventListener("click", attemptLogin);
+
+  forgotBtn?.addEventListener("click", async () => {
+    const email = document.getElementById("login-email").value.trim().toLowerCase();
+    errorEl.textContent = ""; infoEl.textContent = "";
+
+    const AUTHORIZED_RESET = new Set([
+      "mgargiulo@adeqmedia.com",
+      "sales@adeqmedia.com",
+      "dhorovitz@adeqmedia.com",
+    ]);
+
+    if (!email) { errorEl.textContent = "Ingresá tu email primero"; return; }
+    if (!AUTHORIZED_RESET.has(email)) { errorEl.textContent = "Email no autorizado"; return; }
+
+    forgotBtn.disabled = true; forgotBtn.textContent = "Enviando...";
+    const result = await supabaseResetPassword(email);
+    forgotBtn.disabled = false; forgotBtn.textContent = "Forgot password?";
+
+    if (result.error) {
+      errorEl.textContent = result.error;
+    } else {
+      infoEl.textContent = "✓ Te enviamos un email con el link para resetear la contraseña.";
+    }
+  });
 
   async function attemptLogin() {
     const email    = document.getElementById("login-email").value.trim().toLowerCase();

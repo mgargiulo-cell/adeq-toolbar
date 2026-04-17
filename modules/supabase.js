@@ -39,6 +39,26 @@ export async function supabaseSignIn(email, password) {
   }
 }
 
+// Envía email de recovery. Supabase dispara el correo con el link de reset.
+export async function supabaseResetPassword(email) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(`${url}/auth/v1/recover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "apikey": key },
+      body: JSON.stringify({ email }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return { error: data?.error_description || data?.msg || "No se pudo enviar el email" };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { error: "Error de conexión: " + e.message };
+  }
+}
+
 export async function supabaseRefresh(refreshToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;

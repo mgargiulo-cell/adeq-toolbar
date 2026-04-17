@@ -8,6 +8,7 @@
 
 // Responde a solicitudes del popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) return;
   if (message.type === "GET_PAGE_DATA") {
     sendResponse({
       title:    document.title,
