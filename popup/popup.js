@@ -1480,6 +1480,31 @@ function bindButtons() {
   // Settings
   document.getElementById("btn-settings").addEventListener("click", openSettings);
   document.getElementById("btn-close-settings").addEventListener("click", closeSettings);
+
+  // Gmail sign-in (trigger interactive OAuth)
+  document.getElementById("btn-gmail-connect")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-gmail-connect");
+    btn.disabled = true; btn.textContent = "⏳...";
+    await getGmailToken(true); // interactive — fuerza el prompt
+    btn.disabled = false; btn.textContent = "Sign in to Gmail";
+    await refreshGmailStatus();
+  });
+
+  // Gmail sign-out (revoca el token y limpia caché)
+  document.getElementById("btn-gmail-signout")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-gmail-signout");
+    btn.disabled = true; btn.textContent = "⏳...";
+    try {
+      const token = await getGmailToken(false);
+      if (token) {
+        await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" });
+        await new Promise(resolve => chrome.identity.removeCachedAuthToken({ token }, resolve));
+      }
+    } catch {}
+    btn.disabled = false; btn.textContent = "Sign out Gmail";
+    await refreshGmailStatus();
+  });
+
   document.getElementById("btn-dissoc-gmail")?.addEventListener("click", async () => {
     await clearGmailAssociation(state.loginEmail);
     state.gmailEmail = "";
@@ -1551,12 +1576,46 @@ async function openSettings() {
   const count = dbKeywords.length || await countKeywordsDB();
   document.getElementById("kw-db-count").textContent = count ? `${count} frases` : "";
 
-  // Mostrar cuenta Gmail asociada
-  const assoc    = await getGmailAssociation(state.loginEmail);
-  const assocEl  = document.getElementById("settings-gmail-assoc");
-  const dissocEl = document.getElementById("btn-dissoc-gmail");
-  if (assocEl)  assocEl.textContent  = assoc || "Sin asociar";
-  if (dissocEl) dissocEl.style.display = assoc ? "inline-block" : "none";
+  await refreshGmailStatus();
+}
+
+// Lee el estado real de la cuenta Gmail de Chrome y lo muestra
+async function refreshGmailStatus() {
+  const emailEl    = document.getElementById("settings-gmail-assoc");
+  const badgeEl    = document.getElementById("gmail-status-badge");
+  const warnEl     = document.getElementById("gmail-mismatch-warn");
+  const connectBtn = document.getElementById("btn-gmail-connect");
+  const signoutBtn = document.getElementById("btn-gmail-signout");
+  if (!emailEl || !badgeEl) return;
+
+  const profile  = await getGmailProfile(false); // no interactive
+  const expected = (state.loginEmail || "").toLowerCase();
+
+  warnEl.style.display = "none";
+  warnEl.textContent   = "";
+
+  if (!profile?.email) {
+    emailEl.textContent   = "No conectado";
+    badgeEl.textContent   = "OFF";
+    badgeEl.className     = "gmail-status-badge off";
+    connectBtn.style.display = "inline-block";
+    signoutBtn.style.display = "none";
+    return;
+  }
+
+  emailEl.textContent      = profile.email;
+  connectBtn.style.display = "none";
+  signoutBtn.style.display = "inline-block";
+
+  if (expected && profile.email !== expected) {
+    badgeEl.textContent = "MISMATCH";
+    badgeEl.className   = "gmail-status-badge mismatch";
+    warnEl.textContent  = `⚠ Chrome está logueado como ${profile.email}, pero entraste a la toolbar como ${expected}. Sign out y volvé a conectar con la cuenta correcta.`;
+    warnEl.style.display = "block";
+  } else {
+    badgeEl.textContent = "ON";
+    badgeEl.className   = "gmail-status-badge on";
+  }
 }
 
 function closeSettings() {

@@ -782,12 +782,19 @@
     <div id="settings-user" class="settings-user"></div>
 
     <div class="settings-gmail-row">
-      <div class="settings-gmail-label">Linked Gmail</div>
+      <div class="settings-gmail-label">
+        Gmail Account
+        <span id="gmail-status-badge" class="gmail-status-badge off">OFF</span>
+      </div>
       <div class="settings-gmail-value">
         <span id="settings-gmail-assoc" class="settings-gmail-email">—</span>
-        <button id="btn-dissoc-gmail" class="btn-dissoc" style="display:none" title="Unlink this Gmail account">Unlink</button>
       </div>
-      <div class="settings-gmail-hint">The first send links your account automatically. Only that account can send emails from this session.</div>
+      <div id="gmail-mismatch-warn" class="gmail-mismatch" style="display:none"></div>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button id="btn-gmail-connect" class="btn btn-secondary btn-sm" style="font-size:11px">Sign in to Gmail</button>
+        <button id="btn-gmail-signout" class="btn btn-secondary btn-sm" style="font-size:11px;display:none">Sign out Gmail</button>
+      </div>
+      <div class="settings-gmail-hint">Los emails se envían desde esta cuenta. Debe coincidir con tu login de la toolbar.</div>
     </div>
 
     <div class="modal-actions">

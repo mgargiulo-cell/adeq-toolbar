@@ -89,7 +89,12 @@ body {
 .btn-logout:hover { background: #fee2e2; }
 .settings-user        { font-size: 12px; color: var(--text-muted); margin-bottom: 10px; }
 .settings-gmail-row   { background: var(--bg); border-radius: 8px; padding: 9px 10px; margin-bottom: 10px; }
-.settings-gmail-label { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
+.settings-gmail-label { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; display:flex; align-items:center; gap:6px; }
+.gmail-status-badge { font-size: 9px; font-weight: 800; padding: 1px 6px; border-radius: 4px; letter-spacing: 0.5px; }
+.gmail-status-badge.on       { background: #d1fae5; color: #065f46; }
+.gmail-status-badge.mismatch { background: #fef3c7; color: #92400e; }
+.gmail-status-badge.off      { background: #fee2e2; color: #991b1b; }
+.gmail-mismatch { font-size: 11px; color: #b45309; background: #fffbeb; border: 1px solid #fcd34d; padding: 6px 8px; border-radius: 6px; margin-top: 4px; line-height: 1.4; }
 .settings-gmail-value { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .settings-gmail-email { font-size: 12px; font-weight: 600; color: var(--text); }
 .settings-gmail-hint  { font-size: 10px; color: var(--text-muted); line-height: 1.4; }
