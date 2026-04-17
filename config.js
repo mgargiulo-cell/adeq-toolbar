@@ -30,8 +30,7 @@ export const CONFIG = {
   MONDAY_COLUMNS: {
     nombre:          "name",
     estado:          "deal_stage",
-    ejecutivo:       "deal_owner",
-    ejecutivo_txt:   "text_mksnnqxj",   // plain-text owner column (writable)
+    ejecutivo:       "deal_owner",       // person column
     fecha_contacto:  "deal_close_date",
     fecha_fu1:       "fecha2",
     fecha_fu2:       "fecha_1",
@@ -39,7 +38,8 @@ export const CONFIG = {
     trafico:         "texto7",
     idioma:          "estado_12",
     comentarios:     "texto",
-    email:           "text_mkrwahsz",
+    email:           "email_mm2edcd3",   // email column (was text_mkrwahsz)
+    telefono:        "tel_fono_1",
   },
 
   // ── General ────────────────────────────────────────────────────

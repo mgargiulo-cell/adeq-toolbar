@@ -93,10 +93,9 @@ export async function pushToMonday(data) {
 
   const columnValues = {
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
-    [CONFIG.MONDAY_COLUMNS.email]:         safe(email || ""),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
-    ...(ejecutivo                                                         ? { [CONFIG.MONDAY_COLUMNS.ejecutivo_txt]: safe(ejecutivo) } : {}),
+    ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
     ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
@@ -124,10 +123,9 @@ export async function updateMonday({ itemId, traffic, email, geo, pitch, estado,
 
   const columnValues = {
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
-    [CONFIG.MONDAY_COLUMNS.email]:         safe(email || ""),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
-    ...(ejecutivo                                                         ? { [CONFIG.MONDAY_COLUMNS.ejecutivo_txt]: safe(ejecutivo) } : {}),
+    ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
     ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
