@@ -944,7 +944,7 @@ function showLinkedIn(url) {
 // ============================================================
 // BOTONES
 // ============================================================
-function bindButtons() {
+async function bindButtons() {
 
   // Verificar email
   document.getElementById("btn-verify-email").addEventListener("click", verifyCurrentEmail);
