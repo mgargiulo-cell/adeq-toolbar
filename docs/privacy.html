@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ADEQ Toolbar — Privacy Policy</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f8fafc;
+      color: #1e293b;
+      line-height: 1.6;
+      padding: 40px 20px;
+    }
+    main {
+      max-width: 780px;
+      margin: 0 auto;
+      background: white;
+      padding: 40px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+    }
+    h1 { color: #0f172a; margin: 0 0 8px; font-size: 28px; }
+    h2 { color: #334155; margin: 32px 0 12px; font-size: 18px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; }
+    h3 { color: #475569; margin: 18px 0 8px; font-size: 15px; }
+    p, li { font-size: 14px; color: #334155; }
+    ul { padding-left: 22px; }
+    .meta { color: #64748b; font-size: 12px; margin-bottom: 20px; }
+    code { background: #f1f5f9; padding: 2px 5px; border-radius: 3px; font-size: 13px; }
+    a { color: #0369a1; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ADEQ Toolbar — Privacy Policy</h1>
+    <p class="meta">Last updated: April 20, 2026 · Contact: mgargiulo@adeqmedia.com</p>
+
+    <h2>1. Who this applies to</h2>
+    <p>
+      ADEQ Toolbar is a private Chrome extension used <strong>exclusively</strong> by
+      authorized employees of ADEQ Media for internal B2B prospecting.
+      Access is restricted by email whitelist to:
+    </p>
+    <ul>
+      <li><code>mgargiulo@adeqmedia.com</code></li>
+      <li><code>sales@adeqmedia.com</code></li>
+      <li><code>dhorovitz@adeqmedia.com</code></li>
+    </ul>
+    <p>
+      The extension is not intended for, nor accessible to, users outside ADEQ Media.
+    </p>
+
+    <h2>2. Data the extension handles</h2>
+
+    <h3>From the employee (you)</h3>
+    <ul>
+      <li><strong>Authentication:</strong> your Supabase email/password login, Google OAuth access token used only to send Gmail on your behalf.</li>
+      <li><strong>Local preferences:</strong> session cache, recent analyses, keyword lists stored in <code>chrome.storage.local</code>.</li>
+    </ul>
+
+    <h3>From the websites you analyze</h3>
+    <ul>
+      <li>URL, page title, meta description, visible ad network scripts, banner sizes.</li>
+      <li>Public WHOIS records and contact-page emails of the analyzed domain.</li>
+      <li>Aggregated traffic metrics from SimilarWeb (via RapidAPI).</li>
+      <li>Decision-maker names and business emails from Apollo.io (when available under the account's plan).</li>
+    </ul>
+
+    <h2>3. Where data goes</h2>
+    <ul>
+      <li><strong>Monday.com</strong> — prospect records are pushed to ADEQ Media's private CRM board.</li>
+      <li><strong>Supabase</strong> — authentication, shared config, activity logs, audit trail.</li>
+      <li><strong>Gmail (via Google OAuth)</strong> — sending prepared sales emails from the authenticated employee's account.</li>
+      <li><strong>Third-party APIs</strong> called to fetch public information about websites: SimilarWeb (RapidAPI), Apollo.io, Gemini (Google), public WHOIS (who.is), website.informer.com, DNS-over-HTTPS (dns.google).</li>
+    </ul>
+
+    <h2>4. What we do NOT do</h2>
+    <ul>
+      <li>We do not sell or transfer user data to third parties.</li>
+      <li>We do not use data for advertising, profiling, credit scoring or loan decisions.</li>
+      <li>We do not collect browsing history outside the websites actively opened by the employee while using the toolbar.</li>
+      <li>We do not run any remote JavaScript. All code is packaged within the extension.</li>
+    </ul>
+
+    <h2>5. Permissions explained</h2>
+    <ul>
+      <li><code>activeTab</code>, <code>tabs</code>, <code>scripting</code> — read the URL, title, and meta of the website being analyzed; open selected prospect URLs in background tabs.</li>
+      <li><code>storage</code> — local cache of session token and recent lookups.</li>
+      <li><code>identity</code> — Gmail OAuth to send emails from the employee's account.</li>
+      <li><code>sidePanel</code> — display the toolbar UI as a side panel.</li>
+      <li><code>&lt;all_urls&gt;</code> host permission — the team analyzes any publisher site, domain cannot be predicted in advance.</li>
+    </ul>
+
+    <h2>6. Data retention</h2>
+    <ul>
+      <li>Supabase records are kept for the lifetime of the ADEQ Media account.</li>
+      <li>Local caches expire between 24 hours and 60 days depending on type.</li>
+      <li>On uninstall, local data is removed automatically by Chrome.</li>
+    </ul>
+
+    <h2>7. Security</h2>
+    <ul>
+      <li>All API calls use HTTPS.</li>
+      <li>Supabase tables use Row-Level Security (RLS) restricted to authenticated ADEQ Media accounts.</li>
+      <li>Gmail identity is verified against the logged-in Supabase email before any email is sent.</li>
+    </ul>
+
+    <h2>8. Questions</h2>
+    <p>
+      For any question regarding this policy or the handling of data, contact:
+      <a href="mailto:mgargiulo@adeqmedia.com">mgargiulo@adeqmedia.com</a>.
+    </p>
+  </main>
+</body>
+</html>
