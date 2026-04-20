@@ -238,9 +238,9 @@ function parseTrafficText(str) {
 // Trae ítems del board filtrados por geo/idioma, filtra tráfico client-side
 export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0, maxTraffic = 0 } = {}) {
   const rules = [];
-  // idioma value is the numeric index of the status column — any_of expects array
-  if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: ["${idioma}"], operator: any_of }`);
-  // geo uses contains_text — Monday expects a STRING, not array, for this operator
+  // idioma: status column con ID numérico — Monday requiere número, no string
+  if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: [${parseInt(idioma)}], operator: any_of }`);
+  // geo: text column, contains_text espera un string (no array)
   if (geo)           rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.geo}", compare_value: "${geo}", operator: contains_text }`);
 
   const queryParams = rules.length
