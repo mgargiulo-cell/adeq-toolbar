@@ -341,8 +341,8 @@ function toIsoDate(display) {
 function prefillMondayForm() {
   document.getElementById("form-fecha").value     = toDisplayDate(new Date().toISOString().split("T")[0]);
   document.getElementById("form-ejecutivo").value = state.mediaBuyer;
-  const defaultStatus = { Agus: "9", Diego: "6", Max: "10" };
-  document.getElementById("form-estado").value    = defaultStatus[state.mediaBuyer] || "9";
+  // Default estado: "Propuesta Vigente" (id 3) para envíos/updates desde la toolbar
+  document.getElementById("form-estado").value    = "3";
 }
 
 function fillMondayFormFromDuplicate(dup) {
@@ -2659,7 +2659,7 @@ function defaultOwnerForLang(lang) {
 }
 
 function defaultStatusForOwner(_owner) {
-  return "1"; // En Negociacion — default for all new prospects
+  return "3"; // Propuesta Vigente — default para envíos/updates desde la toolbar
 }
 
 async function loadProspectsTab() {
