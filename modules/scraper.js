@@ -202,34 +202,80 @@ export function validateEmailFormat(email) {
 // Paso 2: Apollo /mixed_people/search por dominio + títulos ejecutivos
 // ============================================================
 
-const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
+const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed", "unverified"]);
+
+function isUnlockedEmail(email) {
+  if (!email) return false;
+  const lower = email.toLowerCase();
+  // Apollo devuelve placeholders cuando el email está bloqueado por plan
+  if (lower.includes("email_not_unlocked")) return false;
+  if (lower.includes("not_unlocked_")) return false;
+  if (!lower.includes("@") || !lower.includes(".")) return false;
+  return true;
+}
+
+async function apolloSearch(domain, apiKey, withTitleFilter) {
+  const body = {
+    q_organization_domains_list: [domain],
+    per_page: 10,
+    page: 1,
+  };
+  if (withTitleFilter) {
+    body.person_titles = ["CEO","founder","co-founder","owner","publisher","editor","director","head","VP","manager","sales","marketing","business development"];
+  }
+
+  const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+    method: "POST",
+    headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    console.warn(`[Apollo] HTTP ${res.status}:`, errBody.substring(0, 300));
+    return null;
+  }
+  return res.json();
+}
 
 async function apolloDomainSearch(domain, apiKey) {
   try {
-    const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
-      method: "POST",
-      headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        q_organization_domains_list: [domain],
-        person_titles: ["CEO","founder","co-founder","owner","publisher","editor in chief","managing editor","director","head of digital","VP"],
-        per_page: 5,
-        page: 1,
-      }),
-      signal: AbortSignal.timeout(12000),
-    });
-    if (!res.ok) return [];
-    const data   = await res.json();
-    const people = Array.isArray(data?.people) ? data.people : [];
-    return people
-      .filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status))
+    // Intento 1: con filtro de títulos (más preciso para decisores)
+    let data = await apolloSearch(domain, apiKey, true);
+    let people = Array.isArray(data?.people) ? data.people : [];
+    console.log(`[Apollo] ${domain}: ${people.length} con filtro de títulos`);
+
+    let valid = people
+      .filter(p => isUnlockedEmail(p.email) && APOLLO_GOOD_STATUSES.has(p.email_status))
       .map(p => ({
-        email:    p.email,
-        name:     `${p.first_name || ""} ${p.last_name || ""}`.trim(),
-        title:    p.title        || "",
-        linkedin: p.linkedin_url || "",
-        status:   p.email_status || "",
+        email: p.email, name: `${p.first_name || ""} ${p.last_name || ""}`.trim(),
+        title: p.title || "", linkedin: p.linkedin_url || "", status: p.email_status || "",
       }));
-  } catch { return []; }
+
+    // Intento 2 (fallback): sin filtro de títulos, trae cualquier persona del dominio
+    if (valid.length === 0) {
+      data = await apolloSearch(domain, apiKey, false);
+      people = Array.isArray(data?.people) ? data.people : [];
+      console.log(`[Apollo] ${domain}: ${people.length} sin filtro de títulos (fallback)`);
+
+      valid = people
+        .filter(p => isUnlockedEmail(p.email) && APOLLO_GOOD_STATUSES.has(p.email_status))
+        .map(p => ({
+          email: p.email, name: `${p.first_name || ""} ${p.last_name || ""}`.trim(),
+          title: p.title || "", linkedin: p.linkedin_url || "", status: p.email_status || "",
+        }));
+
+      if (people.length > 0 && valid.length === 0) {
+        const statuses = people.slice(0, 5).map(p => `${p.first_name || "?"}: ${p.email_status || "null"} (${p.email || "no-email"})`).join(" | ");
+        console.warn(`[Apollo] ${domain}: todos los emails bloqueados por plan → ${statuses}`);
+      }
+    }
+    return valid;
+  } catch (e) {
+    console.warn(`[Apollo] error:`, e.message);
+    return [];
+  }
 }
 
 export async function findDecisionMakerViaApollo(domain) {
