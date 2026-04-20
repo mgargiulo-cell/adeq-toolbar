@@ -128,30 +128,39 @@ export async function sendEmail({ to, subject, body, expectedFrom }) {
     if (expectedFrom) {
       const expected = expectedFrom.toLowerCase().trim();
 
-      let profileRes;
-      try {
-        // tokeninfo devuelve el email asociado al token sin requerir scopes extra
-        profileRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(token)}`);
-      } catch (e) {
-        throw new Error(`No se pudo verificar la identidad del Gmail (${e.message}). No se envió el email.`);
-      }
+      const getEmailFromToken = async (tkn) => {
+        try {
+          const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(tkn)}`);
+          if (!res.ok) return { ok: false, status: res.status, email: "" };
+          const data = await res.json().catch(() => ({}));
+          return { ok: true, status: res.status, email: (data?.email || "").toLowerCase().trim() };
+        } catch (e) {
+          return { ok: false, status: 0, email: "", error: e.message };
+        }
+      };
 
-      if (profileRes.status === 401 || profileRes.status === 400) {
+      let result = await getEmailFromToken(token);
+
+      // Si el token viejo no tiene scope email → limpiar caché y forzar re-auth
+      if (result.ok && !result.email) {
         await removeCachedToken(token);
-        throw new Error("Token de Gmail expirado. Probá de nuevo.");
-      }
-      if (!profileRes.ok) {
-        throw new Error(`No se pudo verificar la identidad del Gmail (HTTP ${profileRes.status}). No se envió el email.`);
+        token = await fetchToken(true);
+        if (!token) throw new Error("No se pudo renovar el token de Gmail. Probá de nuevo.");
+        result = await getEmailFromToken(token);
       }
 
-      const profile    = await profileRes.json().catch(() => ({}));
-      const gmailEmail = (profile?.email || "").toLowerCase().trim();
-
-      if (!gmailEmail) {
-        throw new Error("No se pudo obtener el email de la cuenta de Chrome. No se envió el email.");
+      if (!result.ok && (result.status === 401 || result.status === 400)) {
+        await removeCachedToken(token);
+        throw new Error("Token de Gmail expirado. En Settings → Sign out Gmail → Sign in to Gmail.");
       }
-      if (gmailEmail !== expected) {
-        throw new Error(`⚠️ El Gmail de Chrome (${gmailEmail}) no coincide con el login (${expected}). El email NO se envió. Cambiá de cuenta en Chrome (Settings → Gmail Account → Sign out) y volvé a conectar con ${expected}.`);
+      if (!result.ok) {
+        throw new Error(`No se pudo verificar la identidad del Gmail (${result.error || "HTTP " + result.status}). No se envió el email.`);
+      }
+      if (!result.email) {
+        throw new Error("El token no tiene permiso para leer el email. En Settings → Sign out Gmail → Sign in to Gmail y aceptá los permisos nuevos.");
+      }
+      if (result.email !== expected) {
+        throw new Error(`⚠️ El Gmail de Chrome (${result.email}) no coincide con el login (${expected}). El email NO se envió. En Settings → Sign out Gmail → Sign in to Gmail con ${expected}.`);
       }
     }
 
