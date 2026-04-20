@@ -1496,13 +1496,45 @@ async function bindButtons() {
   document.getElementById("btn-settings").addEventListener("click", openSettings);
   document.getElementById("btn-close-settings").addEventListener("click", closeSettings);
 
-  // Gmail sign-in (trigger interactive OAuth)
+  // Gmail sign-in (trigger interactive OAuth) — rechaza si Chrome Gmail no coincide
   document.getElementById("btn-gmail-connect")?.addEventListener("click", async () => {
-    const btn = document.getElementById("btn-gmail-connect");
+    const btn   = document.getElementById("btn-gmail-connect");
+    const warn  = document.getElementById("gmail-mismatch-warn");
+    const expected = (state.loginEmail || "").toLowerCase().trim();
+
     btn.disabled = true; btn.textContent = "⏳...";
-    await getGmailToken(true); // interactive — fuerza el prompt
-    btn.disabled = false; btn.textContent = "Sign in to Gmail";
-    await refreshGmailStatus();
+    if (warn) { warn.style.display = "none"; warn.textContent = ""; }
+
+    try {
+      const token = await getGmailToken(true); // interactive — fuerza el prompt
+      if (!token) {
+        if (warn) { warn.textContent = "⚠ No se pudo obtener el token de Google. Revisá que permitas el acceso en el prompt."; warn.style.display = "block"; }
+        return;
+      }
+
+      // Verificar que el email del token coincida con el login
+      const profile = await getGmailProfile(false);
+      if (!profile?.email) {
+        if (warn) { warn.textContent = "⚠ No se pudo leer el email de la cuenta de Google."; warn.style.display = "block"; }
+        // Revocar el token para que no quede cacheado
+        try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" }); } catch {}
+        await new Promise(r => chrome.identity.removeCachedAuthToken({ token }, r));
+        return;
+      }
+
+      if (profile.email !== expected) {
+        // MISMATCH — revocar y mostrar error claro
+        try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" }); } catch {}
+        await new Promise(r => chrome.identity.removeCachedAuthToken({ token }, r));
+        if (warn) {
+          warn.textContent = `⚠ Elegiste ${profile.email} pero tenés que firmar con ${expected}. Cambiá de cuenta en Chrome o elegí la cuenta correcta en el prompt.`;
+          warn.style.display = "block";
+        }
+      }
+    } finally {
+      btn.disabled = false; btn.textContent = "Sign in to Gmail";
+      await refreshGmailStatus();
+    }
   });
 
   // Gmail sign-out (revoca el token y limpia caché)
@@ -2618,7 +2650,7 @@ async function logout() {
 // ============================================================
 
 const LANG_TO_IDX    = { en: "0", es: "1", it: "2", pt: "3", ar: "6" };
-const LANG_NAMES_PRO = { en: "English", es: "Spanish", it: "Italian", pt: "Portuguese", ar: "Arabic", fr: "French", de: "German" };
+const LANG_NAMES_PRO = { en: "Ingles", es: "Español", it: "Italiano", pt: "Portugues", ar: "Arabe", fr: "Frances", de: "Aleman" };
 
 function defaultOwnerForLang(lang) {
   if (lang === "es" || lang === "pt") return "Agus";
@@ -2695,7 +2727,8 @@ function renderProspectCard(r) {
     `<option value="${o}" ${o === owner ? "selected" : ""}>${o}</option>`).join("");
 
   const statusOptions = [
-    ["1","En Negociacion"],["9","Bulk - Agus"],["6","Bulk - Diego"],["10","Bulk - Max"],["8","Email Not Sent"]
+    ["1","En Negociacion"],["9","Masivo - Agus"],["6","Masivo - Diego"],["10","Masivo - Max"],
+    ["8","Mail No Enviado"],["3","Propuesta Vigente"],["5","Ciclo Finalizado"]
   ].map(([v,l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`).join("");
 
   const langOptions = [
