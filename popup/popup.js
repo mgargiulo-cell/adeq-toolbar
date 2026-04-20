@@ -20,7 +20,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
          getDailyValidationCount }                                                           from "../modules/supabase.js";
-import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken }                        from "../modules/gmail.js";
+import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens }   from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
@@ -156,7 +156,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     showError("Could not load API configuration. Check your connection or sign in again.");
     return;
   }
-  CONFIG.MONDAY_API_KEY = apiKeys.monday_api_key  || "";
+  // Monday API key por usuario (cae en la default si no hay específica)
+  const loginEmail   = (auth?.user || "").toLowerCase().trim();
+  const userMondayKey = apiKeys[`monday_api_key_${loginEmail}`];
+  CONFIG.MONDAY_API_KEY = userMondayKey || apiKeys.monday_api_key || "";
   CONFIG.RAPIDAPI_KEY   = apiKeys.rapidapi_key    || "";
   CONFIG.GEMINI_API_KEY = apiKeys.gemini_api_key  || "";
   CONFIG.APOLLO_API_KEY = apiKeys.apollo_api_key  || "";
@@ -1506,6 +1509,8 @@ async function bindButtons() {
     if (warn) { warn.style.display = "none"; warn.textContent = ""; }
 
     try {
+      // Limpiar cualquier token cacheado para forzar el OAuth con scopes nuevos
+      await clearAllCachedTokens();
       const token = await getGmailToken(true); // interactive — fuerza el prompt
       if (!token) {
         if (warn) { warn.textContent = "⚠ No se pudo obtener el token de Google. Revisá que permitas el acceso en el prompt."; warn.style.display = "block"; }

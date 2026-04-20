@@ -35,6 +35,14 @@ function removeCachedToken(token) {
   });
 }
 
+// Limpia TODOS los tokens cacheados de Chrome para esta extensión.
+// Se usa cuando los scopes cambian y necesitamos forzar un re-consent.
+export async function clearAllCachedTokens() {
+  return new Promise((resolve) => {
+    chrome.identity.clearAllCachedAuthTokens(() => resolve());
+  });
+}
+
 // ── Public API ────────────────────────────────────────────────
 
 /**
