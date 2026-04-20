@@ -2728,7 +2728,7 @@ function renderProspectCard(r) {
 
   const statusOptions = [
     ["1","En Negociacion"],["9","Masivo - Agus"],["6","Masivo - Diego"],["10","Masivo - Max"],
-    ["8","Mail No Enviado"],["3","Propuesta Vigente"],["5","Ciclo Finalizado"]
+    ["8","Mail No Enviado"],["3","Propuesta Vigente"],["4","Propuesta Vigente (T)"],["5","Ciclo Finalizado"]
   ].map(([v,l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`).join("");
 
   const langOptions = [
