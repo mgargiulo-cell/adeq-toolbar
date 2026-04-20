@@ -253,10 +253,17 @@ export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic 
 
   try {
     do {
-      const cursorArg = cursor ? `, cursor: "${cursor}"` : "";
+      // Monday rule: query_params SOLO en la primera request; subsequent usan solo cursor
+      let pageArgs;
+      if (cursor) {
+        pageArgs = `cursor: "${cursor}", limit: 500`;
+      } else {
+        pageArgs = `limit: 500${queryParams}`;
+      }
+
       const query = `{
         boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
-          items_page(limit: 500${queryParams}${cursorArg}) {
+          items_page(${pageArgs}) {
             cursor
             items {
               name
