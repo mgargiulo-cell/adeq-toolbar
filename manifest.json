@@ -38,7 +38,8 @@
     "client_id": "1006462691161-6uicvg6urcco0a50534c46l4jiclfm70.apps.googleusercontent.com",
     "scopes": [
       "https://www.googleapis.com/auth/gmail.send",
-      "https://www.googleapis.com/auth/gmail.settings.basic"
+      "https://www.googleapis.com/auth/gmail.settings.basic",
+      "https://www.googleapis.com/auth/userinfo.email"
     ]
   },
   "content_security_policy": {
