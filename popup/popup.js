@@ -576,7 +576,7 @@ async function runTrafficCheck() {
       // Estimación por categoría — mostrar pero claramente etiquetado como ~
       metricEl.textContent = `~${formatTraffic(state.traffic)}`;
       if (unitEl) unitEl.textContent = "pages/mo (est.)";
-      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ~${data.pagesPerVisit} p/v <span class="pv-estimated">(estimado por categoría)</span>${cacheStr}`;
+      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ~${data.pagesPerVisit} p/v <span class="pv-estimated">(estimated by category)</span>${cacheStr}`;
     } else {
       metricEl.textContent = formatTraffic(state.traffic);
       if (unitEl) unitEl.textContent = "pages/mo";
@@ -2608,7 +2608,7 @@ async function initCsvQueue() {
     historyEl.textContent = "Loading...";
     const rows = await getCsvQueueHistory(state.accessToken, 30, currentHistorySource);
     if (rows.length === 0) {
-      historyEl.innerHTML = `<div style="color:var(--text-muted);font-style:italic">Aún no hay dominios procesados en "${currentHistorySource === "csv" ? "CSV externo" : "Monday"}"</div>`;
+      historyEl.innerHTML = `<div style="color:var(--text-muted);font-style:italic">No domains processed yet in "${currentHistorySource === "csv" ? "External CSV" : "Monday"}"</div>`;
       return;
     }
     const statusIcon = { done: "✅", error: "❌", skipped: "⏭" };
@@ -3169,8 +3169,8 @@ function renderProspectCard(r) {
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="See email &amp; data" style="padding:3px 7px">▼</button>
-        <button class="btn btn-sm pcard-like-btn" title="Me sirve este tipo de sitio — entrenar al autopilot" style="padding:3px 6px;color:#16a34a;background:transparent;border:1px solid var(--border)">👍</button>
-        <button class="btn btn-sm pcard-dislike-btn" title="No me sirve — el autopilot aprende a evitar estos" style="padding:3px 6px;background:transparent;border:1px solid var(--border)">👎</button>
+        <button class="btn btn-sm pcard-like-btn" title="I want more like this — train the autopilot" aria-label="Like" style="padding:3px 6px;color:#16a34a;background:transparent;border:1px solid var(--border)">👍</button>
+        <button class="btn btn-sm pcard-dislike-btn" title="Not useful — autopilot will avoid these" aria-label="Dislike" style="padding:3px 6px;background:transparent;border:1px solid var(--border)">👎</button>
         <button class="btn btn-success btn-sm pcard-validate-btn" title="Push to Monday + Send Email" style="padding:3px 7px">✅</button>
         <button class="btn btn-sm pcard-reject-btn" title="Reject permanently" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -3376,7 +3376,7 @@ function initProspectCard(card, data) {
       category: data.category, geo: data.geo, ad_networks: data.ad_networks,
     });
     btn.textContent = "👍"; btn.style.background = "#d1fae5"; btn.style.borderColor = "#34d399";
-    btn.title = "✓ Like guardado — el autopilot va a priorizar estos patrones";
+    btn.title = "✓ Like saved — autopilot will prioritize similar patterns";
   });
 
   // 👎 Dislike — el autopilot aprende a evitar categoría/geo/dominio
@@ -3389,7 +3389,7 @@ function initProspectCard(card, data) {
       category: data.category, geo: data.geo, ad_networks: data.ad_networks,
     });
     btn.textContent = "👎"; btn.style.background = "#fee2e2"; btn.style.borderColor = "#fca5a5";
-    btn.title = "✓ Dislike guardado — el autopilot no va a traer más de este tipo";
+    btn.title = "✓ Dislike saved — autopilot will avoid this type";
   });
 
   // Reject

@@ -225,14 +225,14 @@
           <option value="5">Ciclo Finalizado</option>
         </select>
 
-        <label class="form-label">Idioma</label>
+        <label class="form-label">Language</label>
         <select id="form-idioma" class="form-select">
           <option value="">— select —</option>
           <option value="0">English</option>
           <option value="1">Spanish</option>
           <option value="2">Italian</option>
           <option value="3">Portuguese</option>
-          <option value="5">¿Idioma?</option>
+          <option value="5">Language?</option>
           <option value="6">Arabic</option>
         </select>
 
@@ -419,13 +419,13 @@
     <!-- Import CSV (colapsable, oculto por default) -->
     <div id="kw-import-panel" style="display:none; margin-bottom:10px; padding:8px; background:var(--bg); border-radius:6px">
       <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px; line-height:1.4">
-        Upload a CSV con frases (una por línea). Se guardan en Supabase y rotan automáticamente acá.
+        Upload a CSV with phrases (one per line). They're stored in Supabase and rotate automatically below.
       </div>
       <input id="kw-csv-input" type="file" accept=".csv,.txt" style="font-size:11px; width:100%; margin-bottom:6px" />
       <div id="kw-import-result" style="font-size:10px; color:var(--text-muted)"></div>
       <div style="display:flex; gap:6px; margin-top:6px">
         <span id="kw-db-count-inline" style="font-size:10px; color:var(--text-muted); flex:1; align-self:center"></span>
-        <button id="btn-kw-delete-all-inline" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e">Borrar todo</button>
+        <button id="btn-kw-delete-all-inline" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e">Delete all</button>
       </div>
     </div>
 
@@ -801,14 +801,14 @@
 
   <div id="import-list" class="import-list"></div>
 
-  <!-- MONDAY CSV AUTO PROSPECTOR — subí CSV para refrescar datos existentes -->
+  <!-- MONDAY CSV AUTO PROSPECTOR — upload a CSV to refresh existing data -->
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-       SECCIÓN 2/3 — External CSV (URLs que NO están en Monday)
+       SECTION 2/3 — External CSV (URLs not in Monday)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <div class="import-section-label" style="margin-top:20px">②  EXTERNAL URLS AUTO PROSPECTOR (CSV)</div>
   <section class="card">
     <div class="card-title">📤 External URLs Auto Prospector</div>
-    <p class="import-desc">Upload a CSV (1 dominio por línea) con URLs <strong>externas</strong>. El auto-prospector las procesa en background: analiza tráfico, emails, y las pushea a Monday como prospectos nuevos.</p>
+    <p class="import-desc">Upload a CSV (1 domain per line) with <strong>external</strong> URLs. The auto-prospector processes them in the background — analyzes traffic, emails, and pushes them to Monday as new prospects.</p>
     <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
@@ -817,7 +817,7 @@
     </div>
     <div id="csv-upload-result" class="push-result" style="min-height:16px;font-size:11px"></div>
 
-    <!-- Historial External CSV (queda más abajo, compartido con sección 3) -->
+    <!-- External CSV history (displayed below, shared with section 3) -->
   </section>
 
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -884,7 +884,7 @@
       <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
     </div>
 
-    <!-- AUTO ON — crítico para que Railway procese -->
+    <!-- AUTO ON — required for Railway to process the queue -->
     <div style="margin-bottom:10px;padding:10px;background:#fff7ed;border:2px solid #fb923c;border-radius:6px">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;font-weight:600">
         <input id="csv-queue-enabled" type="checkbox" style="width:16px;height:16px" />
