@@ -284,9 +284,11 @@ export async function fetchMondayForRefresh({ geo = "", idioma = "", limit = 75 
 }
 
 // ── fetchImportCandidates — para el tab Import ────────────────
-// Trae ítems del board filtrados por geo/idioma, filtra tráfico client-side
+// Trae ítems del board con estado "Ciclo Finalizado" filtrados por geo/idioma
 export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0, maxTraffic = 0 } = {}) {
   const rules = [];
+  // Estado "Ciclo Finalizado" (id 5) — SIEMPRE se filtra por este estado
+  rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.estado}", compare_value: [5], operator: any_of }`);
   // idioma: status column con ID numérico — Monday requiere número, no string
   if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: [${parseInt(idioma)}], operator: any_of }`);
   // geo: text column, contains_text espera un string (no array)
@@ -341,8 +343,7 @@ export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic 
         const estado  = col(CONFIG.MONDAY_COLUMNS.estado);
         return { domain, url: `https://www.${domain}`, traffic, geo: col(CONFIG.MONDAY_COLUMNS.geo), idioma: col(CONFIG.MONDAY_COLUMNS.idioma), estado };
       })
-      // Excluir "En Negociacion" client-side (más confiable que depender del operador not_any_of de Monday)
-      .filter(item => item.domain && item.estado !== "En Negociacion")
+      .filter(item => item.domain)
       .filter(item => !minTraffic || item.traffic >= minTraffic)
       .filter(item => !maxTraffic || item.traffic <= maxTraffic);
 

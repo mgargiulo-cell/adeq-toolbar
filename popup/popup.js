@@ -15,7 +15,6 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
-         getImportedDomains, markDomainsImported,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
@@ -1457,24 +1456,19 @@ async function bindButtons() {
     listEl.innerHTML = "";
 
     try {
-      const [candidates, importedSet] = await Promise.all([
-        fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic }),
-        getImportedDomains(state.accessToken),
-      ]);
+      const candidates = await fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic });
 
-      const available = candidates.filter(c => !importedSet.has(c.domain));
-      const selected  = available.slice(0, 15);
-
-      if (selected.length === 0) {
-        resultEl.textContent = candidates.length === 0
-          ? "No URLs found with those filters in Monday."
-          : `All available URLs (${candidates.length}) have already been imported. They will be available again in the coming days.`;
+      if (candidates.length === 0) {
+        resultEl.textContent = "No URLs found with those filters in Monday.";
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "🚀 Importar 15 URLs";
         return;
       }
 
-      // Mostrar lista
+      // Mezclar aleatoriamente y tomar 15 (para que no siempre salgan los mismos)
+      const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+      const selected = shuffled.slice(0, 15);
+
       listEl.innerHTML = selected.map((item, i) => `
         <div class="import-item">
           <span class="import-num">${i + 1}</span>
@@ -1482,18 +1476,15 @@ async function bindButtons() {
           <span class="import-meta">${item.traffic ? esc(formatTraffic(item.traffic)) + " vis" : ""}</span>
         </div>`).join("");
 
-      resultEl.textContent = `${selected.length} URLs listas — abriendo tabs...`;
+      resultEl.textContent = `${selected.length} URLs — abriendo tabs...`;
       resultEl.className = "push-result ok";
-
-      // Marcar como importadas en Supabase
-      await markDomainsImported(selected.map(s => s.domain), state.loginEmail, state.accessToken);
 
       // Abrir tabs con delay para que Chrome no las bloquee
       selected.forEach((item, i) => {
         setTimeout(() => chrome.tabs.create({ url: item.url, active: false }), i * 400);
       });
 
-      resultEl.textContent = `✅ ${selected.length} tabs opened · blocked 60 days · ${candidates.length - selected.length} remaining with these filters`;
+      resultEl.textContent = `✅ ${selected.length} tabs abiertas (${candidates.length - selected.length} más con estos filtros)`;
 
     } catch (err) {
       resultEl.textContent = `❌ Error: ${err.message}`;
@@ -1522,24 +1513,18 @@ async function bindButtons() {
     listEl.innerHTML = "";
 
     try {
-      const [candidates, importedSet] = await Promise.all([
-        fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic }),
-        getImportedDomains(state.accessToken),
-      ]);
+      const candidates = await fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic });
 
-      const available = candidates.filter(c => !importedSet.has(c.domain));
-      const selected  = available.slice(0, 15);
-
-      if (selected.length === 0) {
-        resultEl.textContent = candidates.length === 0
-          ? "No URLs found with those filters in Monday."
-          : `All available URLs (${candidates.length}) have already been imported.`;
+      if (candidates.length === 0) {
+        resultEl.textContent = "No URLs found with those filters in Monday.";
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "📤 Send to Queue";
         return;
       }
 
-      // Mostrar lista visual igual que Import tabs
+      const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+      const selected = shuffled.slice(0, 15);
+
       listEl.innerHTML = selected.map((item, i) => `
         <div class="import-item">
           <span class="import-num">${i + 1}</span>
@@ -1549,13 +1534,9 @@ async function bindButtons() {
 
       resultEl.textContent = `Subiendo ${selected.length} dominios a la cola...`;
 
-      // Marcar como "importadas" en Supabase (bloqueo 60 días — igual que abrir tabs)
-      await markDomainsImported(selected.map(s => s.domain), state.loginEmail, state.accessToken);
-
-      // Encolar para procesamiento por Railway
       const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken);
 
-      resultEl.textContent = `✅ ${upload.inserted} agregadas a la cola (${selected.length - upload.inserted} ya estaban). Railway procesará automáticamente si el toggle está ON.`;
+      resultEl.textContent = `✅ ${upload.inserted} agregadas a la cola (${selected.length - upload.inserted} ya estaban). Railway procesará si el toggle está ON.`;
       resultEl.className = "push-result ok";
 
     } catch (err) {
