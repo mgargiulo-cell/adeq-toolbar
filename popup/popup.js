@@ -2,7 +2,7 @@
 // ADEQ TOOLBAR — Popup v4
 // ============================================================
 
-import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates } from "../modules/monday.js";
+import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, getMonthlyApiCalls, getApiLimits } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeInformer, scrapeWhoIs, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -2685,10 +2685,41 @@ async function initCsvQueue() {
     }
   });
 
+  // Refresh desde Monday (sin CSV) — busca Ciclo Finalizado + filtros
+  document.getElementById("btn-refresh-from-monday")?.addEventListener("click", async () => {
+    const btn      = document.getElementById("btn-refresh-from-monday");
+    const resultEl = document.getElementById("refresh-from-monday-result");
+    const geo      = document.getElementById("refresh-geo").value;
+    const idioma   = document.getElementById("refresh-idioma").value;
+    const limit    = parseInt(document.getElementById("refresh-limit").value) || 75;
+
+    btn.disabled = true; btn.textContent = "⏳ Buscando en Monday...";
+    resultEl.textContent = ""; resultEl.className = "push-result";
+
+    try {
+      const domains = await fetchMondayForRefresh({ geo, idioma, limit });
+      if (domains.length === 0) {
+        resultEl.textContent = "No se encontraron dominios con estado Ciclo Finalizado + esos filtros";
+        resultEl.className = "push-result error";
+        return;
+      }
+      resultEl.textContent = `Encontrados ${domains.length}, subiendo a la cola...`;
+      const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken);
+      resultEl.textContent = `✅ ${up.inserted} agregados (${domains.length - up.inserted} ya estaban). Railway procesa 75/día/user.`;
+      resultEl.className = "push-result ok";
+      await refreshAll();
+    } catch (err) {
+      resultEl.textContent = `❌ ${err.message}`;
+      resultEl.className = "push-result error";
+    } finally {
+      btn.disabled = false; btn.textContent = "🔄 Buscar y encolar desde Monday";
+    }
+  });
+
   clearProc.addEventListener("click", async () => {
     if (!confirm("¿Borrar todas las entradas procesadas (done/error/skipped) de la cola?")) return;
     await clearCsvQueue(state.accessToken, true);
-    await refreshStats();
+    await refreshAll();
   });
 
   clearAll.addEventListener("click", async () => {

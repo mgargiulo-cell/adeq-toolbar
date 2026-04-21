@@ -234,6 +234,55 @@ function parseTrafficText(str) {
   return parseInt(s.replace(/[^0-9]/g, "")) || 0;
 }
 
+// ── fetchMondayForRefresh — para MONDAY CSV AUTO PROSPECTOR ─────
+// Trae dominios ya en Monday con estado "Ciclo Finalizado" filtrado por geo/idioma,
+// para re-prospectarlos en batch sin necesidad de CSV
+export async function fetchMondayForRefresh({ geo = "", idioma = "", limit = 75 } = {}) {
+  const rules = [];
+  // Estado "Ciclo Finalizado" = index 5 (obligatorio)
+  rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.estado}", compare_value: [5], operator: any_of }`);
+  if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: [${parseInt(idioma)}], operator: any_of }`);
+  if (geo)           rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.geo}", compare_value: "${geo}", operator: contains_text }`);
+
+  const queryParams = `, query_params: { rules: [${rules.join(",")}] }`;
+
+  let cursor   = null;
+  let allItems = [];
+
+  try {
+    do {
+      const pageArgs = cursor
+        ? `cursor: "${cursor}", limit: 500`
+        : `limit: 500${queryParams}`;
+
+      const query = `{
+        boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
+          items_page(${pageArgs}) {
+            cursor
+            items { name }
+          }
+        }
+      }`;
+
+      const data = await mondayRequest(query);
+      const page = data?.boards?.[0]?.items_page;
+      allItems   = [...allItems, ...(page?.items || [])];
+      cursor     = page?.cursor || null;
+
+      // Corte temprano si ya tenemos >= limit (no necesitamos más)
+      if (allItems.length >= limit * 2) break;
+    } while (cursor);
+
+    return allItems
+      .map(it => cleanDomain(it.name))
+      .filter(Boolean)
+      .slice(0, limit);
+  } catch (e) {
+    console.error("[Refresh] fetchMondayForRefresh error:", e.message);
+    return [];
+  }
+}
+
 // ── fetchImportCandidates — para el tab Import ────────────────
 // Trae ítems del board filtrados por geo/idioma, filtra tráfico client-side
 export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0, maxTraffic = 0 } = {}) {

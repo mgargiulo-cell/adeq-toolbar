@@ -773,6 +773,55 @@
     </div>
     <div id="csv-upload-result" class="push-result" style="min-height:16px;font-size:11px"></div>
 
+    <!-- Alternativa: buscar dominios directo en Monday (sin CSV) -->
+    <div style="margin-top:14px; padding:10px; background:var(--bg); border-radius:6px; border:1px dashed var(--border)">
+      <div style="font-size:11px; font-weight:700; margin-bottom:6px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.4px">
+        📋 O buscar directo en Monday (sin CSV)
+      </div>
+      <div style="font-size:10px; color:var(--text-muted); margin-bottom:8px; line-height:1.4">
+        Encuentra dominios en Monday con estado <strong>Ciclo Finalizado</strong> según filtros y los agrega a la cola automáticamente.
+      </div>
+      <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
+        <select id="refresh-geo" class="form-select" style="font-size:11px">
+          <option value="">Geo: All</option>
+          <option value="Argentina">Argentina</option>
+          <option value="Mexico">Mexico</option>
+          <option value="Colombia">Colombia</option>
+          <option value="Chile">Chile</option>
+          <option value="Spain">Spain</option>
+          <option value="Brazil">Brazil</option>
+          <option value="Peru">Peru</option>
+          <option value="Ecuador">Ecuador</option>
+          <option value="Venezuela">Venezuela</option>
+          <option value="Uruguay">Uruguay</option>
+          <option value="United States">United States</option>
+          <option value="United Kingdom">United Kingdom</option>
+          <option value="France">France</option>
+          <option value="Germany">Germany</option>
+          <option value="Italy">Italy</option>
+          <option value="Portugal">Portugal</option>
+          <option value="UAE">UAE</option>
+          <option value="Saudi Arabia">Saudi Arabia</option>
+          <option value="India">India</option>
+          <option value="Japan">Japan</option>
+          <option value="Philippines">Philippines</option>
+          <option value="Indonesia">Indonesia</option>
+          <option value="Australia">Australia</option>
+        </select>
+        <select id="refresh-idioma" class="form-select" style="font-size:11px">
+          <option value="">Idioma: All</option>
+          <option value="0">Ingles</option>
+          <option value="1">Español</option>
+          <option value="2">Italiano</option>
+          <option value="3">Portugues</option>
+          <option value="6">Arabe</option>
+        </select>
+        <input id="refresh-limit" type="number" class="form-input" min="1" max="200" value="75" style="font-size:11px; padding:6px" title="Cantidad máxima (recordá: 75/día/user)" />
+      </div>
+      <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Buscar y encolar desde Monday</button>
+      <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
+    </div>
+
     <div style="margin-top:10px;padding:10px;background:var(--bg);border-radius:6px;font-size:11px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
         <strong>Queue status</strong>
