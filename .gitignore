@@ -3,3 +3,7 @@ auto-prospector/node_modules/
 .DS_Store
 *.zip
 *.pem
+supabase/.temp/
+supabase/.branches/
+.env
+.env.local
