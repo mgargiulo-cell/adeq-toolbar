@@ -725,10 +725,32 @@ function shuffleArray(arr) {
 
 // ── CSV Queue — bulk refresh de Monday ────────────────────────
 
-async function getNextCsvItem(token) {
+const CSV_DAILY_LIMIT_PER_USER = 75;
+
+// Cuenta cuántos items terminó (done) un usuario específico hoy
+async function getUserCsvDoneToday(token, userEmail) {
   try {
+    const todayISO = new Date().toISOString().split("T")[0];
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&order=uploaded_at.asc&limit=1&select=id,domain`,
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_by=eq.${encodeURIComponent(userEmail)}&processed_at=gte.${todayISO}T00:00:00Z&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
+    );
+    const contentRange = res.headers.get("content-range") || "";
+    const match = contentRange.match(/\/(\d+)$/);
+    return match ? parseInt(match[1]) : 0;
+  } catch { return 0; }
+}
+
+async function getNextCsvItem(token, blockedUsers = new Set()) {
+  try {
+    let filter = "";
+    if (blockedUsers.size > 0) {
+      // Supabase REST "not.in" syntax: uploaded_by=not.in.(a,b,c)
+      const list = [...blockedUsers].map(u => `"${u}"`).join(",");
+      filter = `&uploaded_by=not.in.(${list})`;
+    }
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}&order=uploaded_at.asc&limit=1&select=id,domain,uploaded_by`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
     );
     const rows = await res.json();
@@ -752,6 +774,44 @@ async function getNextCsvItem(token) {
   } catch { return null; }
 }
 
+// Revierte un item claimed a pending (para cuando el usuario alcanzó su quota diaria)
+async function revertCsvItemToPending(token, id) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ status: "pending" }),
+    });
+  } catch {}
+}
+
+// Map login email → Monday user ID para la columna Persona deal_owner
+const MONDAY_USER_IDS = {
+  "mgargiulo@adeqmedia.com": 56851451, // Maximiliano
+  "sales@adeqmedia.com":     60940538, // Agustina
+  "dhorovitz@adeqmedia.com": 56938560, // Diego
+};
+
+// Elige la Monday API key del usuario que subió el CSV (fallback al default)
+function getMondayKeyForUser(cfg, userEmail) {
+  if (!userEmail) return cfg.monday_api_key || "";
+  const perUser = cfg[`monday_api_key_${userEmail.toLowerCase().trim()}`];
+  return perUser || cfg.monday_api_key || "";
+}
+
+// Formatea visitas al formato Monday:
+//   <1M  → redondea al múltiplo de 50K más cercano → "150K" / "450K" / "950K"
+//   >=1M → redondea a 1 decimal → "1.3M" / "5.2M"
+function formatVisitsForMonday(visits) {
+  if (!visits || visits < 1000) return String(visits || 0);
+  if (visits >= 1_000_000) {
+    const m = Math.round(visits / 100_000) / 10; // 1 decimal
+    return `${m}M`;
+  }
+  const k = Math.round(visits / 50_000) * 50; // múltiplos de 50
+  return `${k}K`;
+}
+
 async function markCsvItem(token, id, status, fields = {}) {
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${id}`, {
@@ -765,7 +825,7 @@ async function markCsvItem(token, id, status, fields = {}) {
   } catch {}
 }
 
-// Busca un item en Monday por nombre de dominio (name column contains domain)
+// Busca un item en Monday por nombre de dominio y devuelve id + estado actual
 async function findMondayItem(domain, mondayApiKey) {
   const clean = cleanDomain(domain);
   const query = `{
@@ -773,7 +833,10 @@ async function findMondayItem(domain, mondayApiKey) {
       items_page(limit: 5, query_params: { rules: [
         { column_id: "name", compare_value: "${clean}", operator: contains_text }
       ]}) {
-        items { id name }
+        items {
+          id name
+          column_values(ids: ["deal_stage"]) { id text }
+        }
       }
     }
   }`;
@@ -786,7 +849,9 @@ async function findMondayItem(domain, mondayApiKey) {
     const data  = await res.json();
     const items = data?.data?.boards?.[0]?.items_page?.items || [];
     const match = items.find(it => cleanDomain(it.name) === clean);
-    return match ? match.id : null;
+    if (!match) return null;
+    const estado = match.column_values?.find(c => c.id === "deal_stage")?.text || "";
+    return { id: match.id, estado };
   } catch { return null; }
 }
 
@@ -810,18 +875,33 @@ async function updateMondayItem(itemId, columnValues, mondayApiKey) {
 }
 
 async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSessionRef) {
-  const { monday_api_key, rapidapi_key, apollo_api_key } = cfg;
+  const { rapidapi_key, apollo_api_key } = cfg;
   const domain = item.domain;
 
-  // 1. Buscar item en Monday
-  const itemId = await findMondayItem(domain, monday_api_key);
-  if (!itemId) {
+  // Usar la Monday API key del usuario que subió el CSV (sus acciones se registran como él)
+  const mondayApiKey = getMondayKeyForUser(cfg, item.uploaded_by);
+  if (!mondayApiKey) {
+    await markCsvItem(token, item.id, "error", { error_message: "No Monday API key for user " + (item.uploaded_by || "unknown") });
+    log(`  ❌ ${domain} — sin API key para ${item.uploaded_by}`);
+    return;
+  }
+
+  // 1. Buscar item en Monday y validar estado
+  const match = await findMondayItem(domain, mondayApiKey);
+  if (!match) {
     await markCsvItem(token, item.id, "skipped", { error_message: "not in Monday" });
     log(`  ⏭ ${domain} — no está en Monday`);
     return;
   }
 
-  // 2. Traffic + page content en paralelo (sin Gemini)
+  // Solo procesar items cuyo Estado actual es "Ciclo Finalizado"
+  if (match.estado !== "Ciclo Finalizado") {
+    await markCsvItem(token, item.id, "skipped", { error_message: `estado=${match.estado || "?"} (solo Ciclo Finalizado)`, monday_item_id: match.id });
+    log(`  ⏭ ${domain} — estado "${match.estado}" (no es Ciclo Finalizado)`);
+    return;
+  }
+
+  // 2. Traffic + page content en paralelo
   const [trafficData, pageContent] = await Promise.all([
     getTrafficData(domain, rapidapi_key),
     fetchPageContent(domain),
@@ -842,40 +922,63 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const emails = [...new Set([...apolloEmails, ...scraperEmails])];
   const primaryEmail = emails[0] || "";
 
-  // 4. Update Monday — solo campos con data (no sobreescribe con vacío)
+  // 4. Update Monday: traffic + geo + email + fecha + ejecutivo + estado
   const columnValues = {};
-  if (visits)      columnValues["texto7"] = String(visits);                         // Paginas Vistas
-  if (topCountry)  columnValues["texto6"] = topCountry;                             // Top Geo
+  if (visits)       columnValues["texto7"] = formatVisitsForMonday(visits);              // Paginas Vistas formateado (K/M)
+  if (topCountry)   columnValues["texto6"] = topCountry;                                  // Top Geo
   if (primaryEmail) columnValues["email_mm2edcd3"] = { email: primaryEmail, text: primaryEmail };
 
+  // Fecha Contacto = hoy
+  columnValues["deal_close_date"] = { date: new Date().toISOString().split("T")[0] };
+
+  // Ejecutivo = usuario que subió el CSV (persona column con user ID)
+  const userId = MONDAY_USER_IDS[item.uploaded_by?.toLowerCase()];
+  if (userId) columnValues["deal_owner"] = { personsAndTeams: [{ id: userId, kind: "person" }] };
+
+  // Estado = "Propuesta Vigente (T)" (index 4)
+  columnValues["deal_stage"] = { index: 4 };
+
   try {
-    if (Object.keys(columnValues).length > 0) {
-      await updateMondayItem(itemId, columnValues, monday_api_key);
-      await markCsvItem(token, item.id, "done", { monday_item_id: itemId });
-      log(`  ✅ ${domain} — visits:${visits || 0} geo:${topCountry || "-"} email:${primaryEmail ? "yes" : "no"} apollo:${canUseApollo ? "yes" : "no"}`);
-    } else {
-      await markCsvItem(token, item.id, "done", { monday_item_id: itemId, error_message: "no new data" });
-      log(`  ○ ${domain} — sin data nueva`);
-    }
+    await updateMondayItem(match.id, columnValues, mondayApiKey);
+    await markCsvItem(token, item.id, "done", { monday_item_id: match.id });
+    const vstr = visits ? formatVisitsForMonday(visits) : "-";
+    log(`  ✅ ${domain} — visits:${vstr} geo:${topCountry || "-"} email:${primaryEmail ? "yes" : "no"} apollo:${canUseApollo ? "yes" : "no"} → Propuesta Vigente (T)`);
   } catch (e) {
-    await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500) });
+    await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500), monday_item_id: match.id });
     log(`  ❌ ${domain} — ${e.message}`);
   }
 }
 
 async function runCsvQueue(token, cfg, maxItems = 100) {
-  const apolloUsage = await getApolloUsage(token, cfg);
-  const callsRef    = { count: 0 };
-  let processed     = 0;
+  const apolloUsage   = await getApolloUsage(token, cfg);
+  const callsRef      = { count: 0 };
+  const blockedUsers  = new Set(); // usuarios que alcanzaron el límite diario
+  const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
+  let processed       = 0;
 
-  log(`▶ CSV queue start (apollo usados hoy: ${apolloUsage.usedToday}/${apolloUsage.limit})`);
+  log(`▶ CSV queue start (apollo usados hoy: ${apolloUsage.usedToday}/${apolloUsage.limit}, límite diario por user: ${CSV_DAILY_LIMIT_PER_USER})`);
 
   while (processed < maxItems) {
-    const item = await getNextCsvItem(token);
-    if (!item) { log("  (cola vacía)"); break; }
+    const item = await getNextCsvItem(token, blockedUsers);
+    if (!item) { log("  (cola vacía o todos los users alcanzaron su límite diario)"); break; }
+
+    const userEmail = item.uploaded_by?.toLowerCase() || "";
+
+    // Check quota diaria del usuario: suma los ya hechos en DB + los ya procesados en esta tanda
+    const alreadyDone = await getUserCsvDoneToday(token, userEmail);
+    const inBatch     = userCounts.get(userEmail) || 0;
+    const userTotal   = alreadyDone + inBatch;
+
+    if (userTotal >= CSV_DAILY_LIMIT_PER_USER) {
+      log(`  ⏸ ${userEmail} alcanzó ${userTotal}/${CSV_DAILY_LIMIT_PER_USER} hoy — se reanuda mañana`);
+      blockedUsers.add(userEmail);
+      await revertCsvItemToPending(token, item.id); // deja el item para mañana
+      continue;
+    }
 
     processed++;
-    log(`→ [${processed}/${maxItems}] ${item.domain}`);
+    userCounts.set(userEmail, inBatch + 1);
+    log(`→ [${processed}/${maxItems}] ${item.domain} (${userEmail}: ${userTotal + 1}/${CSV_DAILY_LIMIT_PER_USER})`);
 
     try {
       await processCsvItem(token, item, cfg, apolloUsage, callsRef);
