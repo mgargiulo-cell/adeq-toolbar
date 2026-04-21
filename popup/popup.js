@@ -4,7 +4,7 @@
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, getMonthlyApiCalls, getApiLimits } from "../modules/traffic.js";
-import { scrapeEmailsFromPage, scrapeInformer, scrapeWhoIs, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
+import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
 import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
@@ -3517,7 +3517,8 @@ async function validateProspect(card, data, doSendEmail) {
     });
 
     // 4. Mark validated in review queue
-    await validateReviewItem(state.accessToken, data.id, state.loginEmail);
+    const mark = await validateReviewItem(state.accessToken, data.id, state.loginEmail);
+    if (!mark.ok) throw new Error(`Could not mark validated: ${mark.error}`);
 
     // 5. Update UI
     card.style.opacity = "0.3";

@@ -19,13 +19,6 @@
     "service_worker": "background/service-worker.js",
     "type": "module"
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content/content-script.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "permissions": [
     "activeTab",
     "storage",
@@ -43,7 +36,7 @@
     ]
   },
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://www.google.com https://*.gstatic.com data:; connect-src 'self' https://api.monday.com https://*.rapidapi.com https://generativelanguage.googleapis.com https://api.apollo.io https://www.googleapis.com https://accounts.google.com https://oauth2.googleapis.com https://*.supabase.co https://website.informer.com https://downloads.majesticseo.com https://dns.google https://who.is https://www.similarsites.com;"
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://www.google.com https://*.gstatic.com data:; connect-src 'self' https://api.monday.com https://*.rapidapi.com https://generativelanguage.googleapis.com https://api.apollo.io https://www.googleapis.com https://accounts.google.com https://oauth2.googleapis.com https://*.supabase.co https://dns.google https://www.similarsites.com;"
   },
   "host_permissions": [
     "https://api.monday.com/*",
@@ -54,10 +47,7 @@
     "https://oauth2.googleapis.com/*",
     "https://accounts.google.com/*",
     "https://*.supabase.co/*",
-    "https://website.informer.com/*",
-    "https://who.is/*",
     "https://dns.google/*",
-    "https://www.similarsites.com/*",
-    "<all_urls>"
+    "https://www.similarsites.com/*"
   ]
 }

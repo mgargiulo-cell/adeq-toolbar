@@ -228,12 +228,14 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
-    await fetch(`${url}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
+    const res = await fetch(`${url}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
       method: "PATCH",
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ status: "validated", validated_by: validatedBy, validated_at: new Date().toISOString() }),
     });
-  } catch {}
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 export async function rejectReviewItem(accessToken, id, domain) {
