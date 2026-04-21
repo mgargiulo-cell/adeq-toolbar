@@ -28,7 +28,7 @@ import { CONFIG }                                                               
 const state = {
   domain: "", url: "", tabId: null,
   traffic: 0, visits: 0, pagesPerVisit: null, trafficData: null,
-  emails: [], emailSources: new Map(), techStack: [], partners: [], banners: null,
+  emails: [], emailSources: new Map(), emailSentInSession: false, techStack: [], partners: [], banners: null,
   adsTxt: null, revenueGap: null,
   pitch: "", duplicate: null,
   mediaBuyer: "Agus",
@@ -1283,6 +1283,15 @@ async function bindButtons() {
     if (email && !isValidEmail(email)) {
       res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return;
     }
+    // Guard: no dejar pushear a Monday si todavía no se mandó el email
+    // (si es duplicado que ya existía, sí permitimos update sin mail nuevo)
+    if (!state.emailSentInSession && !state.duplicate?.found) {
+      const msg = "❌ You need to send the email first via Gmail. Click 'Send Gmail' before pushing to Monday.";
+      res.textContent = msg; res.className = "push-result error";
+      // Scroll al botón Gmail para guiar al usuario
+      document.getElementById("btn-send-gmail")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
 
     btn.disabled = true; btn.textContent = "⏳ Sending..."; res.textContent = "";
 
@@ -1357,12 +1366,19 @@ async function bindButtons() {
     const email   = document.getElementById("form-email").value.trim() ||
                     document.getElementById("email-result").textContent.trim();
     const pitch   = document.getElementById("pitch-text").value || state.pitch;
-    const subject = document.getElementById("form-subject").value.trim() ||
-                    `Partnership opportunity — ${state.domain}`;
+    const subjectRaw = document.getElementById("form-subject").value.trim();
 
     if (!isValidEmail(email)) {
       res.textContent = "❌ Enter a valid email first"; res.className = "push-result error"; return;
     }
+    // Subject obligatorio — no dejamos enviar si está vacío
+    if (!subjectRaw) {
+      res.textContent = "❌ El asunto (Subject) es obligatorio. Completalo antes de enviar el email.";
+      res.className   = "push-result error";
+      document.getElementById("form-subject")?.focus();
+      return;
+    }
+    const subject = subjectRaw;
     if (!pitch) {
       res.textContent = "❌ Generate the pitch first"; res.className = "push-result error"; return;
     }
@@ -1386,6 +1402,7 @@ async function bindButtons() {
     const result = await sendEmail({ to: email, subject, body: bodyToSend, expectedFrom: state.loginEmail });
 
     if (result.ok) {
+      state.emailSentInSession = true; // unlock el push a Monday
       const today = new Date().toISOString().split("T")[0];
       const { fu1Date, fu2Date } = await saveSendDate(state.domain, {
         sendDate: today,
@@ -2598,12 +2615,14 @@ async function initCsvQueue() {
     `;
   };
 
+  let currentHistorySource = "csv"; // "csv" | "monday"
+
   const refreshHistory = async () => {
     if (!historyEl) return;
     historyEl.textContent = "Cargando...";
-    const rows = await getCsvQueueHistory(state.accessToken, 30);
+    const rows = await getCsvQueueHistory(state.accessToken, 30, currentHistorySource);
     if (rows.length === 0) {
-      historyEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic">Aún no hay dominios procesados</div>';
+      historyEl.innerHTML = `<div style="color:var(--text-muted);font-style:italic">Aún no hay dominios procesados en "${currentHistorySource === "csv" ? "CSV externo" : "Monday"}"</div>`;
       return;
     }
     const statusIcon = { done: "✅", error: "❌", skipped: "⏭" };
@@ -2615,6 +2634,23 @@ async function initCsvQueue() {
       return `<div style="padding:3px 0;border-bottom:1px solid var(--border)"><span>${icon}</span> <strong>${esc(r.domain)}</strong> <span style="color:var(--text-muted)">${when}</span>${err}${skip}</div>`;
     }).join("");
   };
+
+  // Tab switcher del historial
+  const tabCsv    = document.getElementById("tab-history-csv");
+  const tabMonday = document.getElementById("tab-history-monday");
+  const setTab = (which) => {
+    currentHistorySource = which;
+    [tabCsv, tabMonday].forEach(t => {
+      if (!t) return;
+      t.classList.remove("history-tab-active");
+      t.style.borderBottomColor = "transparent";
+    });
+    const active = which === "csv" ? tabCsv : tabMonday;
+    if (active) { active.classList.add("history-tab-active"); active.style.borderBottomColor = "var(--primary)"; }
+    refreshHistory();
+  };
+  tabCsv?.addEventListener("click", () => setTab("csv"));
+  tabMonday?.addEventListener("click", () => setTab("monday"));
 
   const refreshAll = async () => { await Promise.all([refreshStats(), refreshHistory()]); };
 
@@ -2651,10 +2687,18 @@ async function initCsvQueue() {
 
       // Dedupe
       const unique = [...new Set(domains)];
+
+      // Aviso si pasa el límite diario de 75 — solo se procesarán los primeros 75 hoy
+      if (unique.length > 75) {
+        const ok = confirm(`⚠️ Subiste ${unique.length} dominios pero el límite es 75/día por usuario.\n\nLos primeros 75 se procesarán hoy y el resto los siguientes días automáticamente.\n\n¿Continuar?`);
+        if (!ok) { uploadRes.textContent = "Upload cancelado."; uploadRes.className = "push-result"; return; }
+      }
+
       uploadRes.textContent = `Subiendo ${unique.length} dominios...`;
 
       const result = await uploadCsvDomains(unique, state.loginEmail, state.accessToken);
-      uploadRes.textContent = `✅ ${result.inserted} agregados (${result.attempted - result.inserted} duplicados ignorados)`;
+      const note = unique.length > 75 ? ` Se procesarán 75/día.` : "";
+      uploadRes.textContent = `✅ ${result.inserted} agregados (${result.attempted - result.inserted} duplicados ignorados).${note}`;
       uploadRes.className = "push-result ok";
       fileInput.value = "";
       await refreshAll();
@@ -2685,7 +2729,7 @@ async function initCsvQueue() {
         return;
       }
       resultEl.textContent = `Encontrados ${domains.length}, subiendo a la cola...`;
-      const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken);
+      const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken, "monday");
       resultEl.textContent = `✅ ${up.inserted} agregados (${domains.length - up.inserted} ya estaban). Railway procesa 75/día/user.`;
       resultEl.className = "push-result ok";
       await refreshAll();
@@ -2711,7 +2755,7 @@ async function initCsvQueue() {
 }
 
 // ── Autopilot toggle + target ─────────────────────────────────
-const AUTOPILOT_DURATION_MS = 15 * 60 * 1000; // 15 minutos
+const AUTOPILOT_DURATION_MS = 60 * 60 * 1000; // 1 hora max de sesión autopilot
 let _autopilotTimer = null;
 
 async function initAutopilot() {

@@ -703,7 +703,8 @@ export async function markFUSent(domain, fuNumber) {
 }
 
 // ── CSV Queue — batch de dominios a procesar por el auto-prospector ───
-export async function uploadCsvDomains(domains, userEmail, accessToken) {
+// source: "csv" (External URLs) o "monday" (Monday URL Auto Prospector)
+export async function uploadCsvDomains(domains, userEmail, accessToken, source = "csv") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!Array.isArray(domains) || domains.length === 0) return { inserted: 0 };
@@ -713,7 +714,7 @@ export async function uploadCsvDomains(domains, userEmail, accessToken) {
   let inserted = 0;
   for (let i = 0; i < domains.length; i += BATCH) {
     const slice = domains.slice(i, i + BATCH).map(d => ({
-      domain: d, status: "pending", uploaded_by: userEmail,
+      domain: d, status: "pending", uploaded_by: userEmail, source,
     }));
     try {
       const res = await fetch(`${url}/rest/v1/toolbar_csv_queue`, {
@@ -737,12 +738,14 @@ export async function uploadCsvDomains(domains, userEmail, accessToken) {
 }
 
 // Últimos N dominios procesados (done/error/skipped) ordenados por fecha
-export async function getCsvQueueHistory(accessToken, limit = 30) {
+// sourceFilter: "csv" | "monday" | null (todos)
+export async function getCsvQueueHistory(accessToken, limit = 30, sourceFilter = null) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
+  const sourceQuery = sourceFilter ? `&source=eq.${sourceFilter}` : "";
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_csv_queue?status=in.(done,error,skipped)&order=processed_at.desc.nullslast&limit=${limit}&select=domain,status,processed_at,error_message,monday_item_id`,
+      `${url}/rest/v1/toolbar_csv_queue?status=in.(done,error,skipped)${sourceQuery}&order=processed_at.desc.nullslast&limit=${limit}&select=domain,status,processed_at,error_message,monday_item_id,source`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];

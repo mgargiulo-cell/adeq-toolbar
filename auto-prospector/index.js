@@ -14,7 +14,7 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_EMAIL    = process.env.SUPABASE_EMAIL;
 const SUPABASE_PASSWORD = process.env.SUPABASE_PASSWORD;
 
-const SESSION_LIMIT_MS  = 45 * 60 * 1000;
+const SESSION_LIMIT_MS  = 60 * 60 * 1000; // 1 hora max por sesión de autopilot
 const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const DOMAIN_DELAY_MS  = 2500;
@@ -1051,7 +1051,7 @@ async function runSession(token, cfg, sessionStart) {
 
   while (toProcess.length > 0) {
     if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
-      log("⏱ 45 minutos — auto-apagando.");
+      log("⏱ 60 minutos — auto-apagando.");
       await setConfigValue(token, "auto_prospecting_enabled", "false");
       await setConfigValue(token, "auto_session_start", "");
       break;
@@ -1265,7 +1265,7 @@ async function main() {
       }
 
       if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
-        log("⏱ Sesión expirada (45 min) — auto-apagando.");
+        log("⏱ Sesión expirada (60 min) — auto-apagando.");
         await setConfigValue(token, "auto_prospecting_enabled", "false");
         await setConfigValue(token, "auto_session_start", "");
         await sleep(POLL_INTERVAL_MS);

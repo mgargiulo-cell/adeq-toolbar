@@ -646,12 +646,17 @@
 </div>
 
 <!-- ====================================================
-     TAB: IMPORT
+     TAB: IMPORT — 3 secciones independientes
      ==================================================== -->
 <div id="tab-import" class="tab-content">
+
+  <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       SECCIÓN 1/3 — IMPORT MANUAL (abrir tabs / encolar)
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div class="import-section-label">①  IMPORT URLS DESDE MONDAY</div>
   <section class="card">
     <div class="card-title">📥 Import URLs from Monday</div>
-    <p class="import-desc">Trae 15 URLs con estado <strong>Ciclo Finalizado</strong> del board filtradas por Geo, Idioma y Tráfico. Se abren en nuevas tabs para revisar manualmente.</p>
+    <p class="import-desc">Trae 15 URLs con estado <strong>Ciclo Finalizado</strong> del board filtradas por Geo, Idioma y Tráfico. Se abren en nuevas tabs para revisar manualmente, o se pueden encolar para el auto-prospector.</p>
 
     <div class="import-filters">
       <div class="import-filter-row">
@@ -763,9 +768,14 @@
   <div id="import-list" class="import-list"></div>
 
   <!-- MONDAY CSV AUTO PROSPECTOR — subí CSV para refrescar datos existentes -->
-  <section class="card" style="margin-top:16px">
-    <div class="card-title">📤 MONDAY CSV AUTO PROSPECTOR</div>
-    <p class="import-desc">Subí un CSV (1 dominio por línea). El auto-prospector de Railway los procesa automáticamente: analiza tráfico, emails, y actualiza el item existente en Monday. Apollo solo para +1M visits.</p>
+  <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       SECCIÓN 2/3 — CSV externo (URLs que NO están en Monday)
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div class="import-section-label" style="margin-top:20px">②  EXTERNAL URLS AUTO PROSPECTOR (CSV)</div>
+  <section class="card">
+    <div class="card-title">📤 External URLs Auto Prospector</div>
+    <p class="import-desc">Subí un CSV (1 dominio por línea) con URLs <strong>externas</strong>. El auto-prospector las procesa en background: analiza tráfico, emails, y las pushea a Monday como prospectos nuevos.</p>
+    <p class="import-warn">⚠️ <strong>AUTO ON</strong> debe estar activado abajo para que se procesen. Límite: <strong>75/día/usuario</strong>.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
@@ -773,56 +783,66 @@
     </div>
     <div id="csv-upload-result" class="push-result" style="min-height:16px;font-size:11px"></div>
 
-    <!-- Alternativa: buscar dominios directo en Monday (sin CSV) -->
-    <div style="margin-top:14px; padding:10px; background:var(--bg); border-radius:6px; border:1px dashed var(--border)">
-      <div style="font-size:11px; font-weight:700; margin-bottom:6px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.4px">
-        📋 O buscar directo en Monday (sin CSV)
-      </div>
-      <div style="font-size:10px; color:var(--text-muted); margin-bottom:8px; line-height:1.4">
-        Encuentra dominios en Monday con estado <strong>Ciclo Finalizado</strong> según filtros y los agrega a la cola automáticamente.
-      </div>
-      <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
-        <select id="refresh-geo" class="form-select" style="font-size:11px">
-          <option value="">Geo: All</option>
-          <option value="Argentina">Argentina</option>
-          <option value="Mexico">Mexico</option>
-          <option value="Colombia">Colombia</option>
-          <option value="Chile">Chile</option>
-          <option value="Spain">Spain</option>
-          <option value="Brazil">Brazil</option>
-          <option value="Peru">Peru</option>
-          <option value="Ecuador">Ecuador</option>
-          <option value="Venezuela">Venezuela</option>
-          <option value="Uruguay">Uruguay</option>
-          <option value="United States">United States</option>
-          <option value="United Kingdom">United Kingdom</option>
-          <option value="France">France</option>
-          <option value="Germany">Germany</option>
-          <option value="Italy">Italy</option>
-          <option value="Portugal">Portugal</option>
-          <option value="UAE">UAE</option>
-          <option value="Saudi Arabia">Saudi Arabia</option>
-          <option value="India">India</option>
-          <option value="Japan">Japan</option>
-          <option value="Philippines">Philippines</option>
-          <option value="Indonesia">Indonesia</option>
-          <option value="Australia">Australia</option>
-        </select>
-        <select id="refresh-idioma" class="form-select" style="font-size:11px">
-          <option value="">Idioma: All</option>
-          <option value="0">Ingles</option>
-          <option value="1">Español</option>
-          <option value="2">Italiano</option>
-          <option value="3">Portugues</option>
-          <option value="6">Arabe</option>
-        </select>
-        <input id="refresh-limit" type="number" class="form-input" min="1" max="200" value="75" style="font-size:11px; padding:6px" title="Cantidad máxima (recordá: 75/día/user)" />
-      </div>
-      <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Buscar y encolar desde Monday</button>
-      <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
-    </div>
+    <!-- Historial CSV externo (queda más abajo, compartido con sección 3) -->
+  </section>
 
-    <div style="margin-top:10px;padding:10px;background:var(--bg);border-radius:6px;font-size:11px">
+  <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       SECCIÓN 3/3 — Monday URL Auto Prospector
+       (busca en Monday items ya existentes en Ciclo Finalizado)
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div class="import-section-label" style="margin-top:20px">③  MONDAY URL AUTO PROSPECTOR</div>
+  <section class="card">
+    <div class="card-title">🔄 Monday URL Auto Prospector</div>
+    <p class="import-desc">Busca dominios que <strong>ya están en Monday</strong> con estado <strong>Ciclo Finalizado</strong> (filtrados por Geo e Idioma) y los re-prospecta en background. Refresca email, tráfico, geo, y los deja en <strong>Propuesta Vigente (T)</strong>.</p>
+    <p class="import-warn">⚠️ <strong>AUTO ON</strong> debe estar activado abajo para que se procesen. Límite: <strong>75/día/usuario</strong>.</p>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
+      <select id="refresh-geo" class="form-select" style="font-size:11px">
+        <option value="">Geo: All</option>
+        <option value="Argentina">Argentina</option>
+        <option value="Mexico">Mexico</option>
+        <option value="Colombia">Colombia</option>
+        <option value="Chile">Chile</option>
+        <option value="Spain">Spain</option>
+        <option value="Brazil">Brazil</option>
+        <option value="Peru">Peru</option>
+        <option value="Ecuador">Ecuador</option>
+        <option value="Venezuela">Venezuela</option>
+        <option value="Uruguay">Uruguay</option>
+        <option value="United States">United States</option>
+        <option value="United Kingdom">United Kingdom</option>
+        <option value="France">France</option>
+        <option value="Germany">Germany</option>
+        <option value="Italy">Italy</option>
+        <option value="Portugal">Portugal</option>
+        <option value="UAE">UAE</option>
+        <option value="Saudi Arabia">Saudi Arabia</option>
+        <option value="India">India</option>
+        <option value="Japan">Japan</option>
+        <option value="Philippines">Philippines</option>
+        <option value="Indonesia">Indonesia</option>
+        <option value="Australia">Australia</option>
+      </select>
+      <select id="refresh-idioma" class="form-select" style="font-size:11px">
+        <option value="">Idioma: All</option>
+        <option value="0">Ingles</option>
+        <option value="1">Español</option>
+        <option value="2">Italiano</option>
+        <option value="3">Portugues</option>
+        <option value="6">Arabe</option>
+      </select>
+      <input id="refresh-limit" type="number" class="form-input" min="1" max="75" value="75" style="font-size:11px; padding:6px" title="Cantidad máxima (75/día/user)" />
+    </div>
+    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Buscar y encolar desde Monday</button>
+    <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       COLA + HISTORIAL COMPARTIDO (para secciones 2 y 3)
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div class="import-section-label" style="margin-top:20px">🚦  ESTADO DE LA COLA (secciones 2 y 3)</div>
+  <section class="card">
+    <div style="margin-bottom:10px;padding:10px;background:var(--bg);border-radius:6px;font-size:11px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
         <strong>Queue status</strong>
         <button id="btn-csv-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px">↻ Refresh</button>
@@ -830,18 +850,21 @@
       <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
     </div>
 
-    <div style="display:flex;gap:6px;margin-top:10px;align-items:center;flex-wrap:wrap">
-      <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">
-        <input id="csv-queue-enabled" type="checkbox" />
-        <span>Auto-procesar cola (Railway)</span>
+    <!-- AUTO ON — crítico para que Railway procese -->
+    <div style="margin-bottom:10px;padding:10px;background:#fff7ed;border:2px solid #fb923c;border-radius:6px">
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;font-weight:600">
+        <input id="csv-queue-enabled" type="checkbox" style="width:16px;height:16px" />
+        <span>🟢 AUTO ON — Railway procesa automáticamente</span>
       </label>
+      <div style="font-size:10px; color:var(--text-muted); margin-top:4px; margin-left:24px">Si está OFF, las URLs se encolan pero no se procesan.</div>
     </div>
 
-    <!-- HISTORIAL de dominios procesados -->
-    <div style="margin-top:10px;padding:10px;background:var(--bg);border-radius:6px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <strong style="font-size:11px">📜 HISTORIAL de procesados</strong>
-        <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px">↻</button>
+    <!-- HISTORIAL tabs: CSV externo / Monday -->
+    <div style="margin-top:10px">
+      <div style="display:flex;gap:8px;margin-bottom:8px;border-bottom:1px solid var(--border)">
+        <button id="tab-history-csv" class="history-tab-btn history-tab-active" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid var(--primary);cursor:pointer">CSV externo</button>
+        <button id="tab-history-monday" class="history-tab-btn" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid transparent;cursor:pointer">Monday</button>
+        <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px;margin-left:auto">↻</button>
       </div>
       <div id="csv-history-list" style="font-size:10px; max-height:220px; overflow-y:auto">Cargando...</div>
     </div>
