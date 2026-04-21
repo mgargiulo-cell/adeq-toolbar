@@ -249,7 +249,8 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
 async function getUserAutopilotCountToday(token, userEmail) {
   if (!userEmail) return 0;
   try {
-    const todayISO = new Date().toISOString().split("T")[0];
+    // Argentina local day — quotas reset at 00:00 AR, not 00:00 UTC
+    const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}&created_at=gte.${todayISO}T00:00:00Z&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
@@ -812,7 +813,8 @@ const CSV_DAILY_LIMIT_PER_USER = 75;
 // Cuenta cuántos items terminó (done) un usuario específico hoy
 async function getUserCsvDoneToday(token, userEmail) {
   try {
-    const todayISO = new Date().toISOString().split("T")[0];
+    // Argentina local day — quotas reset at 00:00 AR, not 00:00 UTC
+    const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_by=eq.${encodeURIComponent(userEmail)}&processed_at=gte.${todayISO}T00:00:00Z&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
@@ -1385,6 +1387,9 @@ async function main() {
           continue;
         }
       }
+
+      // Heartbeat — cliente lee esto para mostrar si Railway está vivo
+      try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
 
       // Poll liviano — lee autopilot + csv_queue flags
       const flags = await getActiveFlags(token);

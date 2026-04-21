@@ -158,6 +158,28 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
   setProxyAuth(auth.accessToken);
 
+  // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
+  const scheduleRefresh = () => {
+    const msUntil = (auth.expiresAt || 0) - Date.now() - 2 * 60 * 1000;
+    if (msUntil <= 0) return;
+    setTimeout(async () => {
+      try {
+        const r = await supabaseRefresh(auth.refreshToken);
+        if (!r.error && r.access_token) {
+          auth.accessToken  = r.access_token;
+          auth.refreshToken = r.refresh_token;
+          auth.expiresAt    = Date.now() + (r.expires_in * 1000);
+          state.accessToken = r.access_token;
+          await chrome.storage.local.set({ auth });
+          setSupabaseAuth(r.access_token);
+          setProxyAuth(r.access_token);
+          scheduleRefresh();
+        }
+      } catch (e) { console.warn("[AuthRefresh]", e.message); }
+    }, msUntil);
+  };
+  scheduleRefresh();
+
   // ── Cargar API keys desde Supabase (requiere JWT válido) ──
   const apiKeys = await fetchApiKeys(auth.accessToken);
   if (!apiKeys) {
@@ -2903,6 +2925,24 @@ function initPitchDrafts() {
   });
 }
 
+function renderRailwayHeartbeat(heartbeatAt) {
+  const el = document.getElementById("railway-heartbeat");
+  if (!el) return;
+  if (!heartbeatAt) {
+    el.textContent = "Railway: never seen";
+    el.style.color = "#f87171";
+    return;
+  }
+  const ageSec = Math.round((Date.now() - heartbeatAt.getTime()) / 1000);
+  let label, color;
+  if (ageSec < 30)       { label = "🟢 Railway alive"; color = "#86efac"; }
+  else if (ageSec < 180) { label = `🟡 Railway last seen ${ageSec}s ago`; color = "#fde047"; }
+  else if (ageSec < 3600){ label = `🔴 Railway stale (${Math.round(ageSec/60)}m)`; color = "#f87171"; }
+  else                   { label = `⚫ Railway down (${Math.round(ageSec/3600)}h)`; color = "#f87171"; }
+  el.textContent = label;
+  el.style.color = color;
+}
+
 async function initAutopilot() {
   const btn         = document.getElementById("btn-autopilot");
   const targetBtn   = document.getElementById("btn-autopilot-target");
@@ -2915,10 +2955,20 @@ async function initAutopilot() {
   const currentLbl  = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
-  const [{ enabled, sessionStart }, target] = await Promise.all([
+  const [{ enabled, sessionStart, heartbeatAt }, target] = await Promise.all([
     getAutopilotState(state.accessToken),
     getAutopilotTarget(state.accessToken),
   ]);
+
+  renderRailwayHeartbeat(heartbeatAt);
+  // Refresca heartbeat cada 15s mientras el tab Prospects esté visible
+  setInterval(async () => {
+    if (document.visibilityState === "hidden") return;
+    const tab = document.getElementById("tab-prospects");
+    if (!tab?.classList.contains("active")) return;
+    const st = await getAutopilotState(state.accessToken);
+    renderRailwayHeartbeat(st.heartbeatAt);
+  }, 15_000);
 
   // Calcular tiempo restante de una sesión activa
   const elapsed  = sessionStart ? (Date.now() - sessionStart.getTime()) : Infinity;

@@ -117,7 +117,7 @@ export async function getAutopilotState(accessToken) {
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
     const res  = await fetch(
-      `${url}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,auto_session_start)&select=key,value`,
+      `${url}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,auto_session_start,auto_heartbeat_at)&select=key,value`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     const rows = await res.json();
@@ -125,8 +125,9 @@ export async function getAutopilotState(accessToken) {
     if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
     const enabled      = map.auto_prospecting_enabled === "true";
     const sessionStart = map.auto_session_start ? new Date(map.auto_session_start) : null;
-    return { enabled, sessionStart };
-  } catch { return { enabled: false, sessionStart: null }; }
+    const heartbeatAt  = map.auto_heartbeat_at  ? new Date(map.auto_heartbeat_at)  : null;
+    return { enabled, sessionStart, heartbeatAt };
+  } catch { return { enabled: false, sessionStart: null, heartbeatAt: null }; }
 }
 
 async function upsertConfig(url, key, headers, configKey, value) {
@@ -275,7 +276,8 @@ export async function getDailyValidationCount(accessToken, userEmail) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
-    const today = new Date().toISOString().split("T")[0];
+    // Local day (browser timezone) — matches what the user thinks of as "today"
+    const today = new Date().toLocaleDateString("en-CA");
     const res = await fetch(
       `${url}/rest/v1/toolbar_review_queue?validated_by=eq.${encodeURIComponent(userEmail)}&validated_at=gte.${today}T00:00:00Z&select=id`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
