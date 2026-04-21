@@ -6,7 +6,8 @@
 // 3. Apollo.io API (decisor CEO/Owner)
 // ============================================================
 
-import { CONFIG } from "../config.js";
+import { CONFIG }    from "../config.js";
+import { callProxy } from "./apiProxy.js";
 
 const IGNORE_DOMAINS = [
   "example.com","domain.com","yoursite.com","sentry.io",
@@ -234,19 +235,12 @@ async function apolloSearchPage(domain, apiKey, withTitleFilter, page = 1) {
     body.person_titles = ["CEO","founder","co-founder","owner","publisher","editor","director","head","VP","manager","sales","marketing","business development"];
   }
 
-  const res = await fetch("https://api.apollo.io/v1/mixed_people/api_search", {
-    method: "POST",
-    headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(12000),
-  });
-
+  const res = await callProxy("apollo", "/v1/mixed_people/api_search", { method: "POST", body });
   if (!res.ok) {
-    const errBody = await res.text().catch(() => "");
-    console.warn(`[Apollo] HTTP ${res.status}:`, errBody.substring(0, 300));
+    console.warn(`[Apollo] HTTP ${res.status}:`, (res.text || "").substring(0, 300));
     return null;
   }
-  return res.json();
+  return res.data;
 }
 
 // Pagina hasta 3 páginas (30 personas max) parando si partial_results o no hay más páginas
@@ -330,33 +324,27 @@ async function apolloDomainSearch(domain, apiKey) {
 
 export async function findDecisionMakerViaApollo(domain) {
   const cleanDomain = domain.replace(/^www\./, "");
-  const apolloKey   = CONFIG.APOLLO_API_KEY;
 
   // ── Paso 1: Gemini con Google Search → nombre del decisor ────
   let firstName = "", lastName = "", title = "", linkedin = "";
 
-  if (CONFIG.GEMINI_API_KEY) {
+  {
     try {
       const prompt = `Find the CEO, founder, or main decision maker of the website "${cleanDomain}".
 Return ONLY a JSON object with no extra text:
 {"first_name":"John","last_name":"Smith","title":"CEO","linkedin":"https://linkedin.com/in/..."}
 If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`;
 
-      const gRes = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${CONFIG.GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            tools: [{ google_search: {} }],
-            generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
-          }),
-          signal: AbortSignal.timeout(12000),
-        }
-      );
+      const gRes = await callProxy("gemini", "/v1beta/models/gemini-2.5-flash:generateContent", {
+        method: "POST",
+        body: {
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          tools: [{ google_search: {} }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
+        },
+      });
       if (gRes.ok) {
-        const gData = await gRes.json();
+        const gData = gRes.data || {};
         const text  = gData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
         const match = text.match(/\{[\s\S]*\}/);
         if (match) {
@@ -371,14 +359,8 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
     } catch {}
   }
 
-  if (!apolloKey) {
-    return firstName
-      ? { name: `${firstName} ${lastName}`.trim(), email: null, title, linkedin, error: "No Apollo key" }
-      : { error: "No Apollo key configured" };
-  }
-
   // ── Paso 2: Apollo mixed_people/search por dominio + títulos ──
-  const diag = await apolloDomainSearch(cleanDomain, apolloKey);
+  const diag = await apolloDomainSearch(cleanDomain, null);
   if (diag.valid.length > 0) return diag.valid[0];
 
   // Construir mensaje de diagnóstico específico

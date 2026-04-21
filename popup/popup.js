@@ -24,6 +24,7 @@ import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllC
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
+import { callProxy, setProxyAuth }                                                              from "../modules/apiProxy.js";
 
 // ---- Estado global ----
 const state = {
@@ -154,6 +155,8 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Seed the shared Supabase auth token so every supabase.js request uses the user JWT (not anon)
   setSupabaseAuth(auth.accessToken);
+  // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
+  setProxyAuth(auth.accessToken);
 
   // ── Cargar API keys desde Supabase (requiere JWT válido) ──
   const apiKeys = await fetchApiKeys(auth.accessToken);
@@ -2398,21 +2401,13 @@ async function runDiagnostic() {
     <div class="diag-row"><span class="diag-label">Apollo</span><span class="diag-loading">Testing...</span></div>
   `;
 
-  // ── Test SimilarWeb ────────────────────────────────────────
+  // ── Test SimilarWeb (via proxy) ────────────────────────────
   const swPromise = (async () => {
     try {
-      const r = await fetch(
-        `https://similarweb-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
-        { method: "GET", headers: {
-            "x-rapidapi-key":  CONFIG_DIAG.RAPIDAPI_KEY,
-            "x-rapidapi-host": CONFIG_DIAG.RAPIDAPI_HOST,
-          }, signal: AbortSignal.timeout(8000) }
-      );
-      const remaining = r.headers.get("X-RateLimit-Requests-Remaining");
-      const limit     = r.headers.get("X-RateLimit-Requests-Limit");
-      const quota     = remaining != null ? ` · ${remaining}/${limit} restantes` : "";
+      const r = await callProxy("rapidapi", `/similar-sites?domain=${encodeURIComponent(domain)}`, { method: "GET" });
+      const quota = r.quota?.providerRemaining != null ? ` · ${r.quota.providerRemaining} quota left` : "";
       if (!r.ok) return { ok: false, msg: `HTTP ${r.status}${quota}` };
-      const d = await r.json();
+      const d = r.data || {};
       if (d.error || !d.Visits) return { ok: false, msg: `No data for ${domain}${quota}` };
       return { ok: true, msg: `${Math.round(d.Visits / 1000)}K visits/mo${quota}` };
     } catch (e) {
@@ -2420,26 +2415,22 @@ async function runDiagnostic() {
     }
   })();
 
-  // ── Test Apollo (API oficial) ──────────────────────────────
+  // ── Test Apollo (via proxy) ─────────────────────────────────
   const apolloPromise = (async () => {
-    const apolloKey = CONFIG.APOLLO_API_KEY;
-    if (!apolloKey) return { ok: false, msg: "apollo_api_key no configurada en Supabase" };
     try {
-      const r = await fetch("https://api.apollo.io/v1/mixed_people/api_search", {
+      const r = await callProxy("apollo", "/v1/mixed_people/api_search", {
         method: "POST",
-        headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           q_organization_domains_list: [domain],
           person_titles: ["CEO","founder","owner","publisher","editor"],
           per_page: 3, page: 1,
-        }),
-        signal: AbortSignal.timeout(12000),
+        },
       });
       if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        return { ok: false, msg: `HTTP ${r.status}: ${err?.message || JSON.stringify(err).substring(0, 80)}` };
+        const err = r.data || {};
+        return { ok: false, msg: `HTTP ${r.status}: ${err?.message || r.text?.substring(0, 80) || ""}` };
       }
-      const d      = await r.json();
+      const d      = r.data || {};
       const people = Array.isArray(d?.people) ? d.people : [];
       if (people.length === 0) return { ok: false, msg: "Sin resultados para este dominio" };
       const found = people

@@ -5,7 +5,8 @@
 // analyzeRevenueGap
 // ============================================================
 
-import { CONFIG } from "../config.js";
+import { CONFIG }    from "../config.js";
+import { callProxy } from "./apiProxy.js";
 
 const GEMINI_FLASH = "gemini-2.5-flash";
 const GEMINI_PRO   = "gemini-2.5-pro";
@@ -315,19 +316,14 @@ async function callGemini(systemPrompt, userMessage, generationConfig = {}, mode
   }
 
   const tryModel = async (m) => {
-    const url = `${GEMINI_BASE}/${m}:generateContent`;
-    const response = await fetch(`${url}?key=${CONFIG.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const path = `/v1beta/models/${m}:generateContent`;
+    const response = await callProxy("gemini", path, { method: "POST", body });
     if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
       const status = response.status;
-      const msg    = err?.error?.message || "sin detalle";
+      const msg    = response.data?.error?.message || response.text || "sin detalle";
       throw Object.assign(new Error(`Gemini error ${status}: ${msg}`), { status });
     }
-    const data = await response.json();
+    const data = response.data || {};
     const candidate = data?.candidates?.[0];
     const text = candidate?.content?.parts?.[0]?.text;
     if (!text) {

@@ -5,8 +5,7 @@
 
 import { CONFIG }                              from "../config.js";
 import { getSimilarCache, saveSimilarCache }   from "./supabase.js";
-
-const RAPIDAPI_BASE = "https://similarweb-insights.p.rapidapi.com";
+import { callProxy }                           from "./apiProxy.js";
 
 /**
  * Obtiene sitios similares a un dominio.
@@ -20,18 +19,9 @@ export async function getSimilarSites(domain) {
   if (cached) return cached;
 
   try {
-    const response = await fetch(`${RAPIDAPI_BASE}/similar-sites?domain=${encodeURIComponent(clean)}`, {
-      method: "GET",
-      headers: {
-        "Content-Type":    "application/json",
-        "x-rapidapi-key":  CONFIG.RAPIDAPI_KEY,
-        "x-rapidapi-host": CONFIG.RAPIDAPI_TRAFFIC_HOST,
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-
+    const response = await callProxy("rapidapi", `/similar-sites?domain=${encodeURIComponent(clean)}`, { method: "GET" });
     if (!response.ok) return [];
-    const data = await response.json();
+    const data = response.data || {};
     if (data.error || !data.SimilarSites) return [];
 
     const sites = data.SimilarSites

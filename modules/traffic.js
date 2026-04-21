@@ -5,14 +5,13 @@
 
 import { CONFIG }                            from "../config.js";
 import { getTrafficCache, saveTrafficCache } from "./supabase.js";
+import { callProxy }                         from "./apiProxy.js";
 
-const RAPIDAPI_BASE = "https://similarweb-insights.p.rapidapi.com";
-// Headers como función para leer CONFIG en tiempo de ejecución (ya cargado desde Supabase)
-const getHeaders = () => ({
-  "Content-Type":    "application/json",
-  "x-rapidapi-key":  CONFIG.RAPIDAPI_KEY,
-  "x-rapidapi-host": CONFIG.RAPIDAPI_TRAFFIC_HOST,
-});
+// Every RapidAPI call now goes through the Edge Function proxy (keys stay server-side)
+async function rapidFetch(path) {
+  const res = await callProxy("rapidapi", path, { method: "GET" });
+  return { ok: res.ok, status: res.status, data: res.data };
+}
 
 // ── Contador mensual de requests reales a RapidAPI ────────────
 async function incrementApiCounter() {
@@ -29,15 +28,6 @@ export async function getMonthlyApiCalls() {
   return stored[key] || 0;
 }
 
-// Guarda los límites reales del plan tal como los informa RapidAPI
-async function saveApiLimits(remaining, limit) {
-  if (remaining == null || limit == null) return;
-  await chrome.storage.local.set({
-    sw_limit:     parseInt(limit),
-    sw_remaining: parseInt(remaining),
-  });
-}
-
 export async function getApiLimits() {
   const stored = await chrome.storage.local.get(["sw_limit", "sw_remaining"]);
   return {
@@ -49,12 +39,9 @@ export async function getApiLimits() {
 // ── fetchTopCountries — endpoint separado ─────────────────────
 async function fetchTopCountries(domain) {
   try {
-    const res = await fetch(
-      `${RAPIDAPI_BASE}/countries?domain=${encodeURIComponent(domain)}`,
-      { method: "GET", headers: getHeaders(), signal: AbortSignal.timeout(5000) }
-    );
+    const res = await rapidFetch(`/countries?domain=${encodeURIComponent(domain)}`);
     if (!res.ok) return [];
-    const data = await res.json();
+    const data = res.data;
 
     // Normalizar distintos formatos posibles de la API
     const list = Array.isArray(data)
@@ -75,12 +62,9 @@ async function fetchTopCountries(domain) {
 // Muchas cuentas tienen engagement metrics en /engagement aunque no en /traffic
 async function fetchEngagement(domain) {
   try {
-    const res = await fetch(
-      `${RAPIDAPI_BASE}/engagement?domain=${encodeURIComponent(domain)}`,
-      { method: "GET", headers: getHeaders(), signal: AbortSignal.timeout(5000) }
-    );
+    const res = await rapidFetch(`/engagement?domain=${encodeURIComponent(domain)}`);
     if (!res.ok) return null;
-    const data = await res.json();
+    const data = res.data || {};
     const ppv = data.PagePerVisit || data.PagesPerVisit || data.pagesPerVisit || data.pages_per_visit || null;
     if (!ppv) return null;
     return parseFloat(ppv);
@@ -135,19 +119,11 @@ export async function getTraffic(domain) {
 
   try {
     // ── Primario: /traffic — tiene Visits + PagePerVisit (engagement metrics) ──
-    const response = await fetch(
-      `${RAPIDAPI_BASE}/traffic?domain=${encodeURIComponent(cleanDomain)}`,
-      { method: "GET", headers: getHeaders(), signal: AbortSignal.timeout(8000) }
-    );
-
-    saveApiLimits(
-      response.headers.get("X-RateLimit-Requests-Remaining"),
-      response.headers.get("X-RateLimit-Requests-Limit")
-    );
+    const response = await rapidFetch(`/traffic?domain=${encodeURIComponent(cleanDomain)}`);
     incrementApiCounter();
 
     if (response.ok) {
-      const data = await response.json();
+      const data = response.data || {};
       if (!data.error && data.Visits) {
         const visits    = Math.round(data.Visits || 0);
         let pagesPerVisit  = data.PagePerVisit || data.PagesPerVisit || null;
@@ -202,18 +178,9 @@ export async function getTraffic(domain) {
     }
 
     // ── Fallback: /similar-sites ──────────────────────────────
-    const fallback = await fetch(
-      `${RAPIDAPI_BASE}/similar-sites?domain=${encodeURIComponent(cleanDomain)}`,
-      { method: "GET", headers: getHeaders(), signal: AbortSignal.timeout(8000) }
-    );
+    const fallback = await rapidFetch(`/similar-sites?domain=${encodeURIComponent(cleanDomain)}`);
     if (!fallback.ok) return null;
-
-    saveApiLimits(
-      fallback.headers.get("X-RateLimit-Requests-Remaining"),
-      fallback.headers.get("X-RateLimit-Requests-Limit")
-    );
-
-    const fData         = await fallback.json();
+    const fData = fallback.data || {};
     const visits        = Math.round(fData.Visits || 0);
     let pagesPerVisit   = fData.PagePerVisit || fData.PagesPerVisit || null;
     let ppvSource       = pagesPerVisit ? "similar-sites" : null;

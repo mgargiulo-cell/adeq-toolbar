@@ -3,10 +3,11 @@
 // Usa grounding para buscar en la web real en lugar de memoria entrenada.
 // ============================================================
 
-import { CONFIG } from "../config.js";
+import { CONFIG }    from "../config.js";
+import { callProxy } from "./apiProxy.js";
 
-// Usa Flash con Google Search grounding — busca en la web real
-const GEMINI_GROUNDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+// Gemini 2.5 Flash con Google Search grounding — busca en la web real (via Edge Function proxy)
+const GEMINI_GROUNDING_PATH = "/v1beta/models/gemini-2.5-flash:generateContent";
 
 /**
  * Busca emails/contactos de un sitio usando Gemini + Google Search grounding.
@@ -36,19 +37,13 @@ Return ONLY a raw JSON object (no markdown, no code fence, no prose):
 
   const attempt = async (retryNum = 0) => {
     try {
-      const response = await fetch(`${GEMINI_GROUNDING_URL}?key=${CONFIG.GEMINI_API_KEY}`, {
+      const response = await callProxy("gemini", GEMINI_GROUNDING_PATH, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        body: {
           contents: [{ role: "user", parts: [{ text: prompt }] }],
           tools: [{ google_search: {} }],
-          generationConfig: {
-            temperature:     0.1,
-            maxOutputTokens: 800,
-            // NOTE: responseMimeType JSON no es compatible con google_search tool.
-            // Parseamos el JSON manualmente del texto (ya hay lógica de extracción).
-          },
-        }),
+          generationConfig: { temperature: 0.1, maxOutputTokens: 800 },
+        },
       });
 
       if (response.status === 429 && retryNum < 2) {
@@ -58,13 +53,12 @@ Return ONLY a raw JSON object (no markdown, no code fence, no prose):
       }
 
       if (!response.ok) {
-        const errBody = await response.json().catch(() => ({}));
-        const msg = errBody?.error?.message || `HTTP ${response.status}`;
+        const msg = response.data?.error?.message || `HTTP ${response.status}`;
         console.warn(`[Gemini] ${domain}: request failed — ${msg}`);
         return { emails: [], owner: "", linkedin: "", note: `Error: ${msg}` };
       }
 
-      const data = await response.json();
+      const data = response.data || {};
       const candidate = data?.candidates?.[0];
       const text = candidate?.content?.parts?.[0]?.text || "";
 
@@ -144,17 +138,16 @@ Responde SOLO con un JSON array:
 Si no tienes email confiable para un sitio, pon "email": null.`;
 
   try {
-    const response = await fetch(`${GEMINI_GROUNDING_URL}?key=${CONFIG.GEMINI_API_KEY}`, {
+    const response = await callProxy("gemini", GEMINI_GROUNDING_PATH, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: {
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         tools: [{ google_search: {} }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 1000 },
-      }),
+      },
     });
 
-    const data = await response.json();
+    const data = response.data || {};
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     const jsonMatch = text.match(/\[[\s\S]*\]/);
