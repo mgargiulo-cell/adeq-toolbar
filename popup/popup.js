@@ -18,7 +18,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getPitchDrafts, savePitchDraft, deletePitchDraft,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          getAutopilotTarget, setAutopilotTarget,
-         fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
+         fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
          getDailyValidationCount }                                                           from "../modules/supabase.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
@@ -3435,12 +3435,32 @@ async function validateProspect(card, data, doSendEmail) {
 
   const email     = getSelectedEmail(card);
   const pitch     = card.querySelector(".pcard-pitch")?.value?.trim()     || data.pitch || "";
-  const subject   = card.querySelector(".pcard-subject")?.value?.trim()   || data.pitch_subject || `Partnership — ${data.domain}`;
+  const subject   = card.querySelector(".pcard-subject")?.value?.trim()   || data.pitch_subject || "";
   const ejecutivo = card.querySelector(".pcard-owner")?.value             || defaultOwnerForLang(data.language);
   const estado    = card.querySelector(".pcard-status")?.value            || defaultStatusForOwner(ejecutivo);
   const idioma    = card.querySelector(".pcard-lang")?.value              || LANG_TO_IDX[data.language] || "0";
   const geo       = card.querySelector(".pcard-geo")?.value?.trim()       || data.geo || "";
   const traffic   = data.traffic ? formatTraffic(data.traffic) : "";
+
+  // Validations (block before sending)
+  if (doSendEmail) {
+    if (!email || !isValidEmail(email)) {
+      setResult("❌ Valid email required. Pick one from the list or enter manually.", false);
+      return;
+    }
+    if (!subject) {
+      setResult("❌ Subject required. Fill it in before sending.", false);
+      return;
+    }
+    if (!pitch) {
+      setResult("❌ Pitch body required.", false);
+      return;
+    }
+  }
+  if (!geo) {
+    setResult("⚠️ GEO is empty — confirm in the form before pushing.", false);
+    // no return — just warn
+  }
 
   // Disable buttons during processing
   card.querySelectorAll("button").forEach(b => { b.disabled = true; });
@@ -3517,6 +3537,11 @@ async function refreshProspectsStats() {
 
 function initProspectsTab() {
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
+    await loadProspectsTab();
+  });
+  document.getElementById("btn-prospects-clear")?.addEventListener("click", async () => {
+    if (!confirm("Clear all pending prospects from YOUR queue?\n(Only items you created — other users' prospects are not affected.)")) return;
+    await clearPendingProspects(state.accessToken, state.loginEmail);
     await loadProspectsTab();
   });
 }

@@ -656,9 +656,12 @@
   </section>
 
   <section class="card" style="padding-bottom:10px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px">
       <div class="card-title" style="margin:0">📋 Review Prospects</div>
-      <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
+      <div style="display:flex;gap:6px">
+        <button id="btn-prospects-clear" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e" title="Clear all pending prospects">🗑 Clear all</button>
+        <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
+      </div>
     </div>
     <div id="prospects-stats" style="font-size:11px;color:var(--text-muted);margin-bottom:6px"></div>
     <div>

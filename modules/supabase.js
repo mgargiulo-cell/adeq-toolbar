@@ -760,6 +760,20 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   return { inserted, attempted: domains.length };
 }
 
+// Clear all pending prospects (del user actual o todos)
+export async function clearPendingProspects(accessToken, userEmail = null) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const userFilter = userEmail ? `&created_by=eq.${encodeURIComponent(userEmail)}` : "";
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_review_queue?status=eq.pending${userFilter}`, {
+      method: "DELETE",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+    });
+    return { ok: res.ok };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 // ── Pitch Drafts — borradores guardados por usuario y idioma ──
 export async function getPitchDrafts(accessToken, userEmail, language = null) {
   const url = CONFIG.SUPABASE_URL;
