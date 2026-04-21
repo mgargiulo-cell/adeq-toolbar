@@ -1505,36 +1505,34 @@ async function bindButtons() {
     const warn  = document.getElementById("gmail-mismatch-warn");
     const expected = (state.loginEmail || "").toLowerCase().trim();
 
-    btn.disabled = true; btn.textContent = "⏳...";
-    if (warn) { warn.style.display = "none"; warn.textContent = ""; }
+    btn.disabled = true; btn.textContent = "⏳ Autorizando...";
+    if (warn) { warn.style.display = "none"; warn.textContent = ""; warn.className = "gmail-mismatch"; }
 
     try {
-      // Limpiar cualquier token cacheado para forzar el OAuth con scopes nuevos
+      // Limpiar token cacheado para forzar re-auth con scopes actualizados
       await clearAllCachedTokens();
       const token = await getGmailToken(true); // interactive — fuerza el prompt
+
       if (!token) {
-        if (warn) { warn.textContent = "⚠ No se pudo obtener el token de Google. Revisá que permitas el acceso en el prompt."; warn.style.display = "block"; }
+        showGmailFeedback("error", "No se pudo obtener la autorización. Revisá que hayas aceptado los permisos en el prompt de Google.");
         return;
       }
 
-      // Verificar que el email del token coincida con el login
       const profile = await getGmailProfile(false);
       if (!profile?.email) {
-        if (warn) { warn.textContent = "⚠ No se pudo leer el email de la cuenta de Google."; warn.style.display = "block"; }
-        // Revocar el token para que no quede cacheado
+        showGmailFeedback("error", "No se pudo leer el email de la cuenta Google. Intentá de nuevo o verificá los permisos.");
         try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" }); } catch {}
         await new Promise(r => chrome.identity.removeCachedAuthToken({ token }, r));
         return;
       }
 
       if (profile.email !== expected) {
-        // MISMATCH — revocar y mostrar error claro
+        // MISMATCH
         try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" }); } catch {}
         await new Promise(r => chrome.identity.removeCachedAuthToken({ token }, r));
-        if (warn) {
-          warn.textContent = `⚠ Elegiste ${profile.email} pero tenés que firmar con ${expected}. Cambiá de cuenta en Chrome o elegí la cuenta correcta en el prompt.`;
-          warn.style.display = "block";
-        }
+        showGmailFeedback("warn", `Elegiste ${profile.email} pero tenés que firmar con ${expected}. Volvé a intentar y elegí la cuenta correcta.`);
+      } else {
+        showGmailFeedback("ok", `✓ Gmail conectado: ${profile.email}`);
       }
     } finally {
       btn.disabled = false; btn.textContent = "Sign in to Gmail";
@@ -1545,14 +1543,18 @@ async function bindButtons() {
   // Gmail sign-out (revoca el token y limpia caché)
   document.getElementById("btn-gmail-signout")?.addEventListener("click", async () => {
     const btn = document.getElementById("btn-gmail-signout");
-    btn.disabled = true; btn.textContent = "⏳...";
+    btn.disabled = true; btn.textContent = "⏳ Cerrando...";
     try {
       const token = await getGmailToken(false);
       if (token) {
         await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" });
         await new Promise(resolve => chrome.identity.removeCachedAuthToken({ token }, resolve));
       }
-    } catch {}
+      await clearAllCachedTokens();
+      showGmailFeedback("ok", "✓ Sesión de Gmail cerrada. Hacé Sign in to Gmail para volver a conectar.");
+    } catch (e) {
+      showGmailFeedback("error", `Error cerrando sesión: ${e.message}`);
+    }
     btn.disabled = false; btn.textContent = "Sign out Gmail";
     await refreshGmailStatus();
   });
@@ -1629,6 +1631,20 @@ async function openSettings() {
   document.getElementById("kw-db-count").textContent = count ? `${count} frases` : "";
 
   await refreshGmailStatus();
+}
+
+// Feedback visible en el panel de Gmail (ok / warn / error)
+function showGmailFeedback(kind, text) {
+  const warn = document.getElementById("gmail-mismatch-warn");
+  if (!warn) return;
+  warn.className     = `gmail-mismatch gmail-feedback-${kind}`;
+  warn.textContent   = text;
+  warn.style.display = "block";
+  // Auto-ocultar mensajes de OK después de 6s para no ser molesto
+  if (kind === "ok") {
+    clearTimeout(warn._hideTimer);
+    warn._hideTimer = setTimeout(() => { warn.style.display = "none"; }, 6000);
+  }
 }
 
 // Lee el estado real de la cuenta Gmail de Chrome y lo muestra

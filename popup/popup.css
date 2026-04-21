@@ -95,6 +95,9 @@ body {
 .gmail-status-badge.mismatch { background: #fef3c7; color: #92400e; }
 .gmail-status-badge.off      { background: #fee2e2; color: #991b1b; }
 .gmail-mismatch { font-size: 11px; color: #b45309; background: #fffbeb; border: 1px solid #fcd34d; padding: 6px 8px; border-radius: 6px; margin-top: 4px; line-height: 1.4; }
+.gmail-feedback-ok    { color: #065f46; background: #d1fae5; border-color: #86efac; }
+.gmail-feedback-warn  { color: #92400e; background: #fef3c7; border-color: #fbbf24; }
+.gmail-feedback-error { color: #991b1b; background: #fee2e2; border-color: #fca5a5; }
 .settings-gmail-value { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .settings-gmail-email { font-size: 12px; font-weight: 600; color: var(--text); }
 .settings-gmail-hint  { font-size: 10px; color: var(--text-muted); line-height: 1.4; }
