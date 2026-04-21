@@ -35,11 +35,6 @@
   </div>
   <div class="header-right">
     <div id="site-url" class="site-url">loading...</div>
-    <button id="btn-autopilot" class="autopilot-btn" title="Enable/disable auto-prospecting">
-      <span class="autopilot-dot"></span>
-      <span class="autopilot-label">AUTO</span>
-    </button>
-    <button id="btn-autopilot-target" class="icon-btn" title="Set autopilot target (GEO + Category)" style="font-size:11px">🎯</button>
     <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab">↻</button>
     <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
   </div>
@@ -642,9 +637,27 @@
      TAB: PROSPECTS (Auto-prospector review queue)
      ==================================================== -->
 <div id="tab-prospects" class="tab-content">
+
+  <!-- HERO: Autopilot control (movido desde el header) -->
+  <section class="card" style="padding:12px; background:linear-gradient(135deg,#0f172a,#1e293b); border:1px solid #334155; color:#fff">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+      <div style="flex:1;min-width:200px">
+        <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 Autopilot — Descubrimiento automático</div>
+        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Corre 1h, encuentra sitios nuevos en internet y los agrega acá para revisar. Límite 75/día por usuario.</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button id="btn-autopilot-target" class="icon-btn" title="Target (GEO + Categoría)" style="font-size:13px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:#fff">🎯</button>
+        <button id="btn-autopilot" class="autopilot-btn" title="Prender / apagar">
+          <span class="autopilot-dot"></span>
+          <span class="autopilot-label">AUTO OFF</span>
+        </button>
+      </div>
+    </div>
+  </section>
+
   <section class="card" style="padding-bottom:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-      <div class="card-title" style="margin:0">🤖 Review Prospects</div>
+      <div class="card-title" style="margin:0">📋 Review Prospects</div>
       <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
     </div>
     <div id="prospects-stats" style="font-size:11px;color:var(--text-muted);margin-bottom:6px"></div>
