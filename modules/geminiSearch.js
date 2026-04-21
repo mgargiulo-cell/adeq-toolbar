@@ -45,7 +45,8 @@ Return ONLY a raw JSON object (no markdown, no code fence, no prose):
           generationConfig: {
             temperature:     0.1,
             maxOutputTokens: 800,
-            responseMimeType: "application/json", // fuerza JSON válido
+            // NOTE: responseMimeType JSON no es compatible con google_search tool.
+            // Parseamos el JSON manualmente del texto (ya hay lógica de extracción).
           },
         }),
       });

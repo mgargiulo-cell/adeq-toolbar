@@ -655,10 +655,20 @@ const BLOCKED_TLDS     = [".edu", ".gov", ".mil", ".ac.uk", ".edu.", ".gov.", ".
 const ADULT_TLDS       = [".xxx", ".adult", ".porn", ".sex"];
 const ADULT_KEYWORDS   = ["porn", "xxx", "xvideos", "sexcam", "camgirl", "fuck", "nsfw", "hentai", "escort"];
 
+// ── GEO BLACKLIST — países que NUNCA queremos prospectar (aunque no haya targetGeo) ──
+const GEO_BLACKLIST_COUNTRIES = new Set([
+  "United States","Canada","Russia","Australia","New Zealand",
+]);
+// TLDs que corresponden a países blacklisteados — se skipean ANTES de SimilarWeb
+const BLACKLIST_TLDS = [".us",".ca",".ru",".au",".nz",".ua"]; // Ukraine también fuera (zona conflicto)
+
 // TLDs por región — usado para pre-filtrar por GEO antes de fetchar SimilarWeb
+// Priorizamos LATAM > Europa > MENA > Africa > Asia
 const TLD_BY_REGION = {
   LATAM:  [".ar",".mx",".co",".cl",".br",".pe",".ec",".ve",".uy",".py",".bo",".es",".com.ar",".com.mx",".com.co",".com.br",".com.pe"],
-  Europe: [".uk",".co.uk",".fr",".de",".it",".pt",".nl",".be",".ch",".at",".pl",".se",".no",".dk",".fi",".gr",".hu",".cz",".ro",".ua",".ru"],
+  CentralAmerica: [".mx",".cr",".pa",".gt",".hn",".ni",".sv",".cu",".pr",".do"],
+  Europe: [".uk",".co.uk",".fr",".de",".it",".pt",".nl",".be",".ch",".at",".pl",".se",".no",".dk",".fi",".gr",".hu",".cz",".ro",".ie",".lu",".rs",".sk",".bg",".hr",".si",".lt",".lv",".ee"],
+  Africa: [".za",".ng",".ke",".gh",".ma",".tn",".dz",".eg",".et",".tz"],
   MENA:   [".ae",".sa",".eg",".ma",".tr",".il",".kw",".qa",".dz",".tn"],
   Asia:   [".in",".jp",".kr",".cn",".tw",".hk",".sg",".my",".id",".ph",".th",".vn",".pk",".bd"],
 };
@@ -669,6 +679,37 @@ function isDomainBlocked(domain) {
   if (BLOCKED_TLDS.some(t => d.endsWith(t) || d.includes(t))) return "government/education";
   if (ADULT_TLDS.some(t => d.endsWith(t))) return "adult-tld";
   if (ADULT_KEYWORDS.some(k => d.includes(k))) return "adult-keyword";
+  // Blacklist geográfica: descarta dominios de USA/CA/RU/AU/NZ/UA por TLD
+  if (BLACKLIST_TLDS.some(t => d.endsWith(t))) return "geo-blacklist-tld";
+  return null;
+}
+
+// Infiere país desde el TLD — fallback cuando SimilarWeb no devuelve topCountry
+const TLD_TO_COUNTRY = {
+  ".ar": "Argentina", ".mx": "Mexico", ".co": "Colombia", ".cl": "Chile", ".br": "Brazil",
+  ".pe": "Peru", ".ec": "Ecuador", ".ve": "Venezuela", ".uy": "Uruguay", ".py": "Paraguay",
+  ".bo": "Bolivia", ".es": "Spain",
+  ".cr": "Costa Rica", ".pa": "Panama", ".gt": "Guatemala", ".hn": "Honduras",
+  ".ni": "Nicaragua", ".sv": "El Salvador", ".cu": "Cuba", ".pr": "Puerto Rico", ".do": "Dominican Republic",
+  ".uk": "United Kingdom", ".co.uk": "United Kingdom", ".fr": "France", ".de": "Germany",
+  ".it": "Italy", ".pt": "Portugal", ".nl": "Netherlands", ".be": "Belgium",
+  ".ch": "Switzerland", ".at": "Austria", ".pl": "Poland", ".se": "Sweden",
+  ".no": "Norway", ".dk": "Denmark", ".fi": "Finland", ".gr": "Greece",
+  ".hu": "Hungary", ".cz": "Czech Republic", ".ro": "Romania", ".ie": "Ireland",
+  ".za": "South Africa", ".ng": "Nigeria", ".ke": "Kenya", ".gh": "Ghana", ".ma": "Morocco",
+  ".tn": "Tunisia", ".dz": "Algeria", ".eg": "Egypt",
+  ".ae": "UAE", ".sa": "Saudi Arabia", ".tr": "Turkey", ".il": "Israel",
+  ".in": "India", ".jp": "Japan", ".kr": "South Korea", ".tw": "Taiwan", ".hk": "Hong Kong",
+  ".sg": "Singapore", ".my": "Malaysia", ".id": "Indonesia", ".ph": "Philippines",
+  ".th": "Thailand", ".vn": "Vietnam", ".pk": "Pakistan",
+};
+
+function inferCountryFromTLD(domain) {
+  const d = domain.toLowerCase();
+  // Probar TLDs compuestos primero (.co.uk, .com.ar, etc.)
+  for (const [tld, country] of Object.entries(TLD_TO_COUNTRY)) {
+    if (d.endsWith(tld)) return country;
+  }
   return null;
 }
 
@@ -696,10 +737,12 @@ function matchesTargetGeoByTLD(domain, targetGeo) {
 // ── Scoring ───────────────────────────────────────────────────
 
 const GEO_REGIONS = {
-  LATAM:  ["Mexico","Argentina","Colombia","Chile","Brazil","Peru","Ecuador","Venezuela","Uruguay","Paraguay","Bolivia","Spain"],
-  Europe: ["United Kingdom","France","Germany","Italy","Portugal","Netherlands","Belgium","Switzerland","Austria","Poland","Sweden","Norway","Denmark","Finland","Greece","Hungary","Czech Republic","Romania","Ukraine","Russia"],
-  MENA:   ["UAE","Saudi Arabia","Egypt","Morocco","Turkey","Israel","Kuwait","Qatar","Algeria","Tunisia"],
-  Asia:   ["India","Japan","South Korea","China","Taiwan","Hong Kong","Singapore","Malaysia","Indonesia","Philippines","Thailand","Vietnam","Pakistan"],
+  LATAM:          ["Mexico","Argentina","Colombia","Chile","Brazil","Peru","Ecuador","Venezuela","Uruguay","Paraguay","Bolivia","Spain"],
+  CentralAmerica: ["Mexico","Costa Rica","Panama","Guatemala","Honduras","Nicaragua","El Salvador","Dominican Republic","Cuba","Puerto Rico"],
+  Europe:         ["United Kingdom","France","Germany","Italy","Portugal","Netherlands","Belgium","Switzerland","Austria","Poland","Sweden","Norway","Denmark","Finland","Greece","Hungary","Czech Republic","Romania","Ireland","Luxembourg","Serbia","Slovakia","Bulgaria","Croatia","Slovenia","Lithuania","Latvia","Estonia"],
+  Africa:         ["South Africa","Nigeria","Kenya","Ghana","Morocco","Tunisia","Algeria","Egypt","Ethiopia","Tanzania"],
+  MENA:           ["UAE","Saudi Arabia","Egypt","Morocco","Turkey","Israel","Kuwait","Qatar","Algeria","Tunisia"],
+  Asia:           ["India","Japan","South Korea","China","Taiwan","Hong Kong","Singapore","Malaysia","Indonesia","Philippines","Thailand","Vietnam","Pakistan"],
 };
 
 const HIGH_VALUE_CATS = new Set(["sports","news","entertainment","gambling","finance"]);
@@ -944,7 +987,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     getTrafficData(domain, rapidapi_key),
     fetchPageContent(domain),
   ]);
-  const { visits, topCountry } = trafficData;
+  let { visits, topCountry } = trafficData;
+
+  // Fallback GEO: si SimilarWeb no trajo topCountry, inferir desde TLD
+  if (!topCountry) {
+    const inferred = inferCountryFromTLD(domain);
+    if (inferred) topCountry = inferred;
+  }
 
   // 3. Emails — Apollo si visits >= 500K, scraping siempre como fallback
   const canUseApollo = apollo_api_key
@@ -1030,6 +1079,7 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
 
   await saveApolloUsage(token, callsRef.count, new Date().toISOString().split("T")[0]);
   log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}`);
+  return processed;
 }
 
 // ── Sesión de prospección ─────────────────────────────────────
@@ -1162,7 +1212,25 @@ async function runSession(token, cfg, sessionStart) {
       fetchPageContent(domain),
     ]);
 
-    const { visits, topCountry } = trafficData;
+    let { visits, topCountry } = trafficData;
+
+    // Fallback GEO: si SimilarWeb no trajo topCountry, inferir desde TLD
+    if (!topCountry) {
+      const inferred = inferCountryFromTLD(domain);
+      if (inferred) {
+        topCountry = inferred;
+        log(`  ℹ ${domain} — GEO inferido por TLD: ${topCountry}`);
+      }
+    }
+
+    // Blacklist geográfica post-traffic — si topCountry está en blacklist, skip
+    if (topCountry && GEO_BLACKLIST_COUNTRIES.has(topCountry)) {
+      log(`  ⊘ ${domain} — topCountry ${topCountry} blacklisteado, skip`);
+      await markProcessed(token, [domain]);
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
 
     // Filtro primario: tráfico mínimo
     if (!visits || visits < sessionMinTraffic) {
@@ -1324,10 +1392,22 @@ async function main() {
         continue;
       }
 
-      // CSV queue tiene prioridad sobre autopilot normal
+      // CSV queue — procesar primero si está activa y hay items
+      // (NO es mutuamente exclusivo con el autopilot; si CSV no tiene items, sigue a autopilot)
+      let csvProcessed = 0;
       if (flags.csvQueue) {
-        const cfg = await getConfig(token);
-        await runCsvQueue(token, cfg, 100); // procesa hasta 100 por tanda
+        const cfgCsv = await getConfig(token);
+        csvProcessed = await runCsvQueue(token, cfgCsv, 50); // batch chico para poder alternar con autopilot
+        if (csvProcessed > 0) {
+          // Hubo trabajo — volver al loop rápido (próxima iteración sigue con CSV o pasa a autopilot)
+          await sleep(POLL_INTERVAL_MS);
+          continue;
+        }
+        // No había items pending → cae a autopilot si está prendido
+      }
+
+      // Autopilot (sólo si está prendido)
+      if (!flags.autopilot) {
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
