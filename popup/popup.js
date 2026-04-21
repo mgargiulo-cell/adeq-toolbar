@@ -116,7 +116,8 @@ async function setSessionCache(domain, data) {
   } catch {}
 }
 
-let cascadeResults  = [];
+let cascadeResults    = [];
+let cascadeRawResults = []; // todos los sites recibidos antes de filtrar — para Apply filters
 let cascadeSelected = new Set();
 
 // ============================================================
@@ -1419,6 +1420,7 @@ async function bindButtons() {
     if (e.key === "Enter") startCascade();
   });
   document.getElementById("btn-push-all").addEventListener("click", openCascadeSelected);
+  document.getElementById("btn-cascade-apply-filters")?.addEventListener("click", applyCascadeFilters);
   document.getElementById("btn-check-all").addEventListener("click", () => {
     const resultsEl = document.getElementById("cascade-results");
     resultsEl.querySelectorAll("input[type=checkbox]").forEach(cb => {
@@ -2081,7 +2083,7 @@ async function startCascade() {
   const langFilter = document.getElementById("cascade-language").value;
 
   btn.disabled = true; btn.textContent = "⏳";
-  cascadeResults = []; cascadeSelected = new Set();
+  cascadeResults = []; cascadeRawResults = []; cascadeSelected = new Set();
   resultsEl.innerHTML = ""; actionsEl.style.display = "none";
 
   // Dominios genéricos/irrelevantes que SimilarWeb suele devolver por tráfico
@@ -2095,7 +2097,7 @@ async function startCascade() {
     "stackoverflow.com","github.com","gitlab.com","canva.com","figma.com",
   ]);
 
-  const CASCADE_LIMIT = 30;
+  const CASCADE_LIMIT = 50;
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días)
   statusEl.textContent = "Querying Monday...";
@@ -2141,8 +2143,9 @@ async function startCascade() {
   const onProgress = ({ status, domain: d, site, level }) => {
     if (status === "searching") {
       statusEl.textContent = `Nivel ${level}: buscando similares de ${d}...`;
-    } else if (status === "found" && passesFilters(site)) {
-      addResult(site);
+    } else if (status === "found") {
+      cascadeRawResults.push(site);
+      if (passesFilters(site)) addResult(site);
     }
   };
 
@@ -2203,6 +2206,63 @@ function appendCascadeItem(site, container) {
 function updateCascadeSummary() {
   const el = document.getElementById("cascade-summary");
   if (el) el.textContent = `${cascadeSelected.size} seleccionados de ${cascadeResults.length}`;
+}
+
+// Re-aplica los filtros actuales a los raw results (sin re-consultar la API)
+function applyCascadeFilters() {
+  const resultsEl = document.getElementById("cascade-results");
+  const statusEl  = document.getElementById("cascade-status");
+  const actionsEl = document.getElementById("cascade-actions");
+  if (!cascadeRawResults.length) {
+    if (statusEl) statusEl.textContent = "No hay resultados para filtrar. Hacé primero una búsqueda.";
+    return;
+  }
+
+  const trafficVal   = document.getElementById("cascade-min-traffic").value;
+  const [tMin, tMax] = trafficVal.split(":").map(v => v === "" ? Infinity : Number(v));
+  const rankVal      = document.getElementById("cascade-max-rank").value;
+  const [rMin, rMax] = rankVal.split(":").map(v => v === "" ? Infinity : Number(v));
+  const langFilter   = document.getElementById("cascade-language").value;
+
+  const BLOCKLIST = new Set([
+    "google.com","youtube.com","facebook.com","instagram.com","twitter.com","x.com",
+    "tiktok.com","linkedin.com","reddit.com","wikipedia.org","amazon.com","ebay.com",
+    "chatgpt.com","openai.com","chat.openai.com","bing.com","yahoo.com","msn.com",
+    "microsoft.com","apple.com","netflix.com","twitch.tv","pinterest.com","snapchat.com",
+    "whatsapp.com","telegram.org","discord.com","zoom.us","dropbox.com","shopify.com",
+    "wordpress.com","blogger.com","tumblr.com","medium.com","substack.com","quora.com",
+    "stackoverflow.com","github.com","gitlab.com","canva.com","figma.com",
+  ]);
+  const LIMIT = 50;
+
+  const filtered = cascadeRawResults.filter(site => {
+    if (BLOCKLIST.has(site.domain.replace(/^www\./, ""))) return false;
+    if (tMin > 0 && site.visits < tMin) return false;
+    if (tMax !== Infinity && site.visits > tMax) return false;
+    if (rMin > 0 && site.globalRank && site.globalRank < rMin) return false;
+    if (rMax !== Infinity && site.globalRank && site.globalRank > rMax) return false;
+    if (langFilter && site.countryCode !== langFilter) return false;
+    return true;
+  }).slice(0, LIMIT);
+
+  // Re-renderizar desde cero
+  cascadeResults  = [];
+  cascadeSelected = new Set();
+  resultsEl.innerHTML = "";
+  for (const site of filtered) {
+    cascadeResults.push(site);
+    appendCascadeItem(site, resultsEl);
+  }
+
+  if (cascadeResults.length === 0) {
+    resultsEl.innerHTML = '<div class="cascade-empty">Ningún resultado pasa los filtros actuales.</div>';
+    actionsEl.style.display = "none";
+  } else {
+    actionsEl.style.display = "block";
+    updateCascadeSummary();
+  }
+
+  if (statusEl) statusEl.textContent = `✅ ${cascadeResults.length} resultados con los filtros aplicados (de ${cascadeRawResults.length} totales)`;
 }
 
 function openCascadeSelected() {

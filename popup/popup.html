@@ -415,7 +415,7 @@
 <div id="tab-cascade" class="tab-content">
 
   <section class="card">
-    <div class="card-title"><span class="icon">🌱</span> Seed Domain</div>
+    <div class="card-title"><span class="icon">🔍</span> Buscar similar websites</div>
     <div class="seed-row">
       <input id="cascade-seed" type="text" class="seed-input" placeholder="e.g. nytimes.com" />
       <button id="btn-cascade-start" class="btn btn-primary btn-sm">Search</button>
@@ -425,7 +425,7 @@
 
   <!-- Keywords -->
   <section class="card card-tight">
-    <div class="card-title"><span class="icon">🔑</span> Seed Keywords</div>
+    <div class="card-title"><span class="icon">🔑</span> Google Keywords</div>
     <div class="kw-filters">
       <select id="kw-language" class="filter-select">
         <option value="">All languages</option>
@@ -443,13 +443,9 @@
     </div>
   </section>
 
-  <!-- Similar Sites Finder -->
-  <section class="card card-tight">
-    <div class="card-title"><span class="icon">🔍</span> Similar Sites Finder</div>
-  </section>
-
   <!-- Filters -->
   <section class="card card-tight">
+    <div class="card-title"><span class="icon">🎚️</span> Filtros</div>
     <div class="filter-grid">
 
       <label class="filter-label">Traffic range</label>
@@ -480,22 +476,18 @@
       <label class="filter-label">Global Rank range</label>
       <select id="cascade-max-rank" class="filter-select">
         <option value="0:">No filter</option>
-        <option value="0:50000">1 – 50K</option>
-        <option value="50000:100000">50K – 100K</option>
-        <option value="100000:150000">100K – 150K</option>
-        <option value="150000:200000">150K – 200K</option>
-        <option value="200000:250000">200K – 250K</option>
-        <option value="250000:300000">250K – 300K</option>
-        <option value="300000:350000">300K – 350K</option>
-        <option value="350000:400000">350K – 400K</option>
-        <option value="400000:450000">400K – 450K</option>
-        <option value="450000:500000">450K – 500K</option>
-        <option value="500000:600000">500K – 600K</option>
-        <option value="600000:700000">600K – 700K</option>
-        <option value="700000:800000">700K – 800K</option>
-        <option value="800000:900000">800K – 900K</option>
-        <option value="900000:1000000">900K – 1M</option>
-        <option value="1000000:">+1M</option>
+        <option value="0:500000">0 – 500K</option>
+        <option value="500000:1000000">500K – 1M</option>
+        <option value="1000000:2000000">1M – 2M</option>
+        <option value="2000000:3000000">2M – 3M</option>
+        <option value="3000000:4000000">3M – 4M</option>
+        <option value="4000000:5000000">4M – 5M</option>
+        <option value="5000000:6000000">5M – 6M</option>
+        <option value="6000000:7000000">6M – 7M</option>
+        <option value="7000000:8000000">7M – 8M</option>
+        <option value="8000000:9000000">8M – 9M</option>
+        <option value="9000000:10000000">9M – 10M</option>
+        <option value="10000000:">+10M</option>
       </select>
 
       <label class="filter-label">Country</label>
@@ -591,6 +583,7 @@
       </select>
 
     </div>
+    <button id="btn-cascade-apply-filters" class="btn btn-secondary btn-full" style="margin-top:10px">🎯 Aplicar filtros</button>
   </section>
 
   <!-- Results -->
