@@ -3,7 +3,7 @@
 // ============================================================
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh } from "../modules/monday.js";
-import { getTraffic, formatTraffic, passesTrafficFilter, getMonthlyApiCalls, getApiLimits } from "../modules/traffic.js";
+import { getTraffic, formatTraffic, passesTrafficFilter } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
@@ -19,7 +19,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
-         getDailyValidationCount }                                                           from "../modules/supabase.js";
+         getDailyValidationCount, getApiUsageToday }                                         from "../modules/supabase.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -3606,11 +3606,11 @@ function initProspectsTab() {
 async function updateApiFooter() {
   const el = document.getElementById("req-counter");
   if (!el) return;
-  const [calls, limits] = await Promise.all([getMonthlyApiCalls(), getApiLimits()]);
-  if (limits.limit != null) {
-    el.textContent = `SW: ${limits.remaining} restantes de ${limits.limit} · ${calls} este mes`;
-    el.style.color = limits.remaining < 50 ? "#e53e3e" : limits.remaining < 200 ? "#d97706" : "#a0aec0";
-  } else {
-    el.textContent = `SW API: ${calls} calls este mes`;
-  }
+  const usage = await getApiUsageToday(state.accessToken, state.loginEmail);
+  const bp = usage.byProvider || {};
+  const g  = bp.gemini   || 0;
+  const a  = bp.apollo   || 0;
+  const r  = bp.rapidapi || 0;
+  el.textContent = `API today: ${usage.total} (G:${g}/A:${a}/R:${r})`;
+  el.style.color = usage.total > 400 ? "#e53e3e" : usage.total > 250 ? "#d97706" : "#a0aec0";
 }

@@ -3,7 +3,6 @@
 // Usa grounding para buscar en la web real en lugar de memoria entrenada.
 // ============================================================
 
-import { CONFIG }    from "../config.js";
 import { callProxy } from "./apiProxy.js";
 
 // Gemini 2.5 Flash con Google Search grounding — busca en la web real (via Edge Function proxy)

@@ -13,29 +13,6 @@ async function rapidFetch(path) {
   return { ok: res.ok, status: res.status, data: res.data };
 }
 
-// ── Contador mensual de requests reales a RapidAPI ────────────
-async function incrementApiCounter() {
-  const key    = `sw_calls_${new Date().toISOString().substring(0, 7)}`;
-  const stored = await chrome.storage.local.get(key);
-  const count  = (stored[key] || 0) + 1;
-  await chrome.storage.local.set({ [key]: count });
-  return count;
-}
-
-export async function getMonthlyApiCalls() {
-  const key    = `sw_calls_${new Date().toISOString().substring(0, 7)}`;
-  const stored = await chrome.storage.local.get(key);
-  return stored[key] || 0;
-}
-
-export async function getApiLimits() {
-  const stored = await chrome.storage.local.get(["sw_limit", "sw_remaining"]);
-  return {
-    limit:     stored.sw_limit     ?? null,
-    remaining: stored.sw_remaining ?? null,
-  };
-}
-
 // ── fetchTopCountries — endpoint separado ─────────────────────
 async function fetchTopCountries(domain) {
   try {
@@ -120,7 +97,6 @@ export async function getTraffic(domain) {
   try {
     // ── Primario: /traffic — tiene Visits + PagePerVisit (engagement metrics) ──
     const response = await rapidFetch(`/traffic?domain=${encodeURIComponent(cleanDomain)}`);
-    incrementApiCounter();
 
     if (response.ok) {
       const data = response.data || {};

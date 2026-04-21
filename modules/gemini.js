@@ -5,7 +5,6 @@
 // analyzeRevenueGap
 // ============================================================
 
-import { CONFIG }    from "../config.js";
 import { callProxy } from "./apiProxy.js";
 
 const GEMINI_FLASH = "gemini-2.5-flash";

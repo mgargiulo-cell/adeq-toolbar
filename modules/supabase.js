@@ -16,6 +16,24 @@ async function getConfig() {
   };
 }
 
+// Today's API usage (total + by_provider) for the current user
+export async function getApiUsageToday(accessToken, userEmail) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !userEmail) return { total: 0, byProvider: {} };
+  try {
+    const today = new Date().toLocaleDateString("en-CA");
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(userEmail)}&day=eq.${today}&select=total,by_provider`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return { total: 0, byProvider: {} };
+    const rows = await res.json();
+    const r = Array.isArray(rows) && rows[0];
+    return r ? { total: r.total || 0, byProvider: r.by_provider || {} } : { total: 0, byProvider: {} };
+  } catch { return { total: 0, byProvider: {} }; }
+}
+
 // ── Auth token cache — set once after login; used as Bearer by every request ──
 let _sbAuthToken = null;
 export function setSupabaseAuth(accessToken) { _sbAuthToken = accessToken || null; }

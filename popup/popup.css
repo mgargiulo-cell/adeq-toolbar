@@ -290,11 +290,6 @@ body {
 .banner-chip.video    { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
 .banner-chip.display  { background: #faf5ff; border-color: #e9d5ff; color: #7e22ce; }
 .banner-notes { width: 100%; font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-.adtech-result       { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 3px; }
-.adtech-label        { width: 100%; font-size: 10px; font-weight: 700; text-transform: uppercase; color: #94a3b8; margin-bottom: 1px; letter-spacing: 0.5px; }
-.adtech-chip         { padding: 2px 7px; background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 11px; color: #475569; }
-.adtech-chip.ssp     { background: #fefce8; border-color: #fde68a; color: #92400e; }
-.adtech-chip.server  { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
 .adtech-chip.native  { background: #fff7ed; border-color: #fed7aa; color: #c2410c; }
 .adtech-chip.video   { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
 .adtech-chip.hb      { background: #fdf4ff; border-color: #e9d5ff; color: #7e22ce; }
