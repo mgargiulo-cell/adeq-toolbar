@@ -160,13 +160,29 @@ export async function verifyEmail(email) {
     } catch {}
   }
 
+  // ── Catch-all detection ──────────────────────────────────
+  // Un dominio "catch-all" acepta emails con cualquier local-part.
+  // Verificamos que el MX provider sea "business-grade" y no un providers tipo catch-all genérico.
+  // Heurística: si el MX apunta a proveedores que se sabe son catch-all (mailgun, sendgrid, etc.)
+  // marcamos el email como unverifiable aunque tenga MX.
+  const catchAllProviders = [
+    "mailgun.org","mailgun.net","sendgrid.net","sendgrid.com",
+    "postmarkapp.com","mandrill","mailjet.com","sparkpost.com",
+    "amazonses.com","aws.amazon.com",
+    "mxroute","improvmx.com","forwardemail.net",
+  ];
+  const mxLower = mxRecords.map(m => m.toLowerCase()).join(" ");
+  const catchAllSuspected = catchAllProviders.some(p => mxLower.includes(p));
+  if (catchAllSuspected) tags.push("catch-all-provider");
+
   // ── Score ──────────────────────────────────────────────────
   let score = 0;
   if (mxFound)             score += 60;
   else if (aFound)         score += 20;
   if (!isRole)             score += 20;
   if (!tags.includes("tld-sospechoso")) score += 10;
-  if (mxFound && !isRole)  score += 10;
+  if (mxFound && !isRole && !catchAllSuspected)  score += 10;
+  if (catchAllSuspected)   score -= 30;           // baja mucho el score — catch-all no verificable
 
   // ── Resultado ──────────────────────────────────────────────
   if (!mxFound && !aFound) {
@@ -192,9 +208,20 @@ export async function verifyEmail(email) {
   // MX encontrado
   const isGenericMX = mxRecords.some(r =>
     r.includes("google") || r.includes("outlook") || r.includes("microsoft") ||
-    r.includes("protonmail") || r.includes("zoho") || r.includes("mailgun")
+    r.includes("protonmail") || r.includes("zoho")
   );
   if (isGenericMX) tags.push("mx-conocido");
+
+  // Catch-all detectado → no marcamos como valid (sería decir que cualquier email existe)
+  if (catchAllSuspected) {
+    return {
+      valid:   false,
+      score,
+      reason:  `Dominio usa MX catch-all (${mxRecords[0]?.split(" ")[1] || "?"}) — cualquier email resuelve, no verificable de forma confiable`,
+      mxFound: true,
+      tags,
+    };
+  }
 
   if (isRole) {
     return {

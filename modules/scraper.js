@@ -202,24 +202,32 @@ export function validateEmailFormat(email) {
 // Paso 2: Apollo /mixed_people/search por dominio + títulos ejecutivos
 // ============================================================
 
-const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed", "unverified"]);
+// Valores que Apollo devuelve en email_status — incluimos likely_to_engage (mismatch anterior)
+const APOLLO_GOOD_STATUSES = new Set([
+  "verified",
+  "likely",
+  "likely_to_engage",
+  "guessed",
+  "unverified",
+]);
 
-function isUnlockedEmail(email) {
+function isUnlockedEmail(email, emailLocked) {
+  if (emailLocked === true) return false;         // metadata explícita de Apollo
   if (!email) return false;
   const lower = email.toLowerCase();
-  // Apollo devuelve placeholders cuando el email está bloqueado por plan
   if (lower.includes("email_not_unlocked")) return false;
   if (lower.includes("not_unlocked_")) return false;
   if (!lower.includes("@") || !lower.includes(".")) return false;
   return true;
 }
 
-async function apolloSearch(domain, apiKey, withTitleFilter) {
+// Una página de la búsqueda Apollo (max 10 personas por page según el endpoint)
+async function apolloSearchPage(domain, apiKey, withTitleFilter, page = 1) {
   const body = {
     q_organization_domains_list: [domain],
     per_page: 10,
-    page: 1,
-    reveal_personal_emails: true,       // usa créditos del plan para desbloquear emails
+    page,
+    reveal_personal_emails: true,
     contact_email_status: ["verified", "likely_to_engage", "guessed"],
   };
   if (withTitleFilter) {
@@ -239,6 +247,23 @@ async function apolloSearch(domain, apiKey, withTitleFilter) {
     return null;
   }
   return res.json();
+}
+
+// Pagina hasta 3 páginas (30 personas max) parando si partial_results o no hay más páginas
+async function apolloSearch(domain, apiKey, withTitleFilter) {
+  const allPeople = [];
+  let lastPagination = null;
+  for (let page = 1; page <= 3; page++) {
+    const data = await apolloSearchPage(domain, apiKey, withTitleFilter, page);
+    if (!data) break;
+    lastPagination = data.pagination || null;
+    const people = Array.isArray(data.people) ? data.people : [];
+    allPeople.push(...people);
+    if (people.length < 10) break;                           // última página
+    if (data.partial_results_only === true) break;           // Apollo cortó resultados
+    if (lastPagination && lastPagination.has_next_page === false) break;
+  }
+  return { people: allPeople, pagination: lastPagination };
 }
 
 function mapApolloPerson(p) {
@@ -262,7 +287,7 @@ async function apolloDomainSearch(domain, apiKey) {
 
     // Intento 2: si no trajo nada útil, retry sin títulos
     let triedFallback = false;
-    if (people.length === 0 || !people.some(p => isUnlockedEmail(p.email) && APOLLO_GOOD_STATUSES.has(p.email_status))) {
+    if (people.length === 0 || !people.some(p => isUnlockedEmail(p.email, p.email_locked) && APOLLO_GOOD_STATUSES.has(p.email_status))) {
       const data2 = await apolloSearch(domain, apiKey, false);
       const people2 = Array.isArray(data2?.people) ? data2.people : [];
       if (people2.length > people.length) people = people2;
@@ -273,7 +298,7 @@ async function apolloDomainSearch(domain, apiKey) {
 
     for (const p of people) {
       const hasEmail    = !!p.email;
-      const unlocked    = isUnlockedEmail(p.email);
+      const unlocked    = isUnlockedEmail(p.email, p.email_locked);
       const goodStatus  = APOLLO_GOOD_STATUSES.has(p.email_status);
 
       if (!hasEmail)                     diag.noEmailCount++;

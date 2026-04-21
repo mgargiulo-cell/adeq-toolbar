@@ -15,73 +15,112 @@ const GEMINI_GROUNDING_URL = "https://generativelanguage.googleapis.com/v1beta/m
  * @returns {{ emails: string[], owner: string, linkedin: string, note: string }}
  */
 export async function searchEmailsWithGemini(domain) {
-  const prompt = `Busca el email de contacto o del CEO/owner/editor del sitio web "${domain}".
+  // Prompt reforzado: fuerza el uso del web search, obliga JSON limpio
+  const prompt = `You are an email researcher. You MUST use Google Search to look up real information on the web — DO NOT rely on training data.
 
-Buscá en:
-- La página de contacto del sitio (${domain}/contact, ${domain}/contacto, ${domain}/about)
-- LinkedIn de la empresa o su CEO
-- Registros WHOIS públicos
-- Artículos de prensa o entrevistas donde aparezca el email
+Target website: "${domain}"
 
-Devolvé SOLO un JSON con este formato exacto:
-{
-  "emails": ["email@dominio.com"],
-  "owner": "Nombre del CEO/owner si lo encontrás",
-  "linkedin": "URL de LinkedIn si existe",
-  "note": "fuente o nota breve"
-}
+Search the web for the official CEO, founder, owner, or publisher's BUSINESS email of this domain. Check:
+1. The site's own "Contact", "About", "Staff", "Team", or "Advertise" pages (try ${domain}/contact, ${domain}/about, ${domain}/team, ${domain}/advertise)
+2. Press releases or news articles mentioning the CEO/founder and any email
+3. LinkedIn profiles of executives linked to ${domain}
+4. Public WHOIS records (only if not privacy-protected)
 
-Si no encontrás emails reales, devolvé emails como array vacío []. No inventes.`;
+RULES:
+- Never fabricate an email. If you cannot verify it from a web source, return an empty emails array.
+- Prefer personal emails (ceo@, founder@, firstname@) over role-based (info@, contact@).
+- Do NOT return email_not_unlocked@*, noreply@*, do-not-reply@*, press-release@*, or privacy-proxy emails (markmonitor, whoisguard, domainsbyproxy, contactprivacy).
 
-  try {
-    const response = await fetch(`${GEMINI_GROUNDING_URL}?key=${CONFIG.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        tools: [{ google_search: {} }],
-        generationConfig: {
-          temperature:     0.1,
-          maxOutputTokens: 600,
-        },
-      }),
-    });
+Return ONLY a raw JSON object (no markdown, no code fence, no prose):
+{"emails":["<email1>","<email2>"],"owner":"<name>","linkedin":"<url>","note":"<source or reason>"}`;
 
-    if (!response.ok) {
-      const errBody = await response.json().catch(() => ({}));
-      throw new Error(`Gemini error ${response.status}: ${errBody?.error?.message || "sin detalle"}`);
-    }
+  const attempt = async (retryNum = 0) => {
+    try {
+      const response = await fetch(`${GEMINI_GROUNDING_URL}?key=${CONFIG.GEMINI_API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          tools: [{ google_search: {} }],
+          generationConfig: {
+            temperature:     0.1,
+            maxOutputTokens: 800,
+            responseMimeType: "application/json", // fuerza JSON válido
+          },
+        }),
+      });
 
-    const data = await response.json();
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      if (response.status === 429 && retryNum < 2) {
+        console.warn(`[Gemini] ${domain}: rate limit, retry in ${(retryNum + 1) * 2}s`);
+        await new Promise(r => setTimeout(r, (retryNum + 1) * 2000));
+        return attempt(retryNum + 1);
+      }
 
-    // Extraer JSON de la respuesta (puede venir con texto alrededor)
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        const msg = errBody?.error?.message || `HTTP ${response.status}`;
+        console.warn(`[Gemini] ${domain}: request failed — ${msg}`);
+        return { emails: [], owner: "", linkedin: "", note: `Error: ${msg}` };
+      }
+
+      const data = await response.json();
+      const candidate = data?.candidates?.[0];
+      const text = candidate?.content?.parts?.[0]?.text || "";
+
+      // Log grounding metadata para debug
+      const groundingMetadata = candidate?.groundingMetadata;
+      const searchesDone = groundingMetadata?.webSearchQueries?.length || 0;
+      const sourcesFound = groundingMetadata?.groundingChunks?.length || 0;
+      console.log(`[Gemini] ${domain}: searches=${searchesDone}, sources=${sourcesFound}, text_length=${text.length}`);
+
+      if (!text) {
+        const blockReason = data?.promptFeedback?.blockReason || candidate?.finishReason || "empty";
+        console.warn(`[Gemini] ${domain}: empty response, reason=${blockReason}`);
+        return { emails: [], owner: "", linkedin: "", note: `Respuesta vacía (${blockReason})` };
+      }
+
+      // Primero intentar parsear todo el texto como JSON (responseMimeType lo fuerza)
+      let parsed = null;
       try {
-        const parsed = JSON.parse(jsonMatch[0]);
+        parsed = JSON.parse(text);
+      } catch {
+        // Si falla, buscar el primer {...} embebido
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try { parsed = JSON.parse(jsonMatch[0]); } catch {}
+        }
+      }
+
+      if (parsed) {
+        const emails = Array.isArray(parsed.emails)
+          ? parsed.emails.filter(e => e && typeof e === "string" && e.includes("@") && !/email_not_unlocked|noreply|no-reply|markmonitor|whoisguard/i.test(e))
+          : [];
         return {
-          emails:   Array.isArray(parsed.emails) ? parsed.emails.filter(e => e && e.includes("@")) : [],
+          emails,
           owner:    parsed.owner    || "",
           linkedin: parsed.linkedin || "",
-          note:     parsed.note     || "",
+          note:     emails.length ? (parsed.note || `Gemini encontró ${emails.length} email(s)`) : (parsed.note || "Gemini no encontró emails"),
         };
-      } catch { /* caer al regex */ }
+      }
+
+      // Fallback: regex sobre texto libre (si parsing falló)
+      const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}/g;
+      const found = [...new Set((text.match(emailRegex) || []).map(e => e.toLowerCase()))]
+        .filter(e => !/email_not_unlocked|noreply|no-reply|markmonitor|whoisguard/i.test(e));
+      return {
+        emails:   found,
+        owner:    "",
+        linkedin: "",
+        note:     found.length ? "Parseado via regex del texto" : "JSON inválido y sin emails en texto libre",
+      };
+
+    } catch (err) {
+      console.warn(`[Gemini] ${domain}: exception — ${err.message}`);
+      return { emails: [], owner: "", linkedin: "", note: `Error: ${err.message}` };
     }
+  };
 
-    // Fallback: buscar emails en el texto libre
-    const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}/g;
-    const found = [...new Set((text.match(emailRegex) || []).map(e => e.toLowerCase()))];
-    return {
-      emails:   found,
-      owner:    "",
-      linkedin: "",
-      note:     found.length ? "Extraído del texto de Gemini" : "No se encontraron emails públicos",
-    };
-
-  } catch (err) {
-    return { emails: [], owner: "", linkedin: "", note: `Error: ${err.message}` };
-  }
+  return attempt();
 }
 
 /**
