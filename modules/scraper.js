@@ -239,42 +239,65 @@ async function apolloSearch(domain, apiKey, withTitleFilter) {
   return res.json();
 }
 
+function mapApolloPerson(p) {
+  return {
+    email:    p.email, name: `${p.first_name || ""} ${p.last_name || ""}`.trim(),
+    title:    p.title || "", linkedin: p.linkedin_url || "", status: p.email_status || "",
+  };
+}
+
+/**
+ * Busca en Apollo y devuelve diagnóstico detallado.
+ * Return shape: { valid: [...], rawCount, lockedCount, noEmailCount, badStatusCount, sample, httpError }
+ */
 async function apolloDomainSearch(domain, apiKey) {
+  const diag = { valid: [], rawCount: 0, lockedCount: 0, noEmailCount: 0, badStatusCount: 0, sample: [], httpError: null };
+
   try {
-    // Intento 1: con filtro de títulos (más preciso para decisores)
+    // Intento 1: con filtro de títulos
     let data = await apolloSearch(domain, apiKey, true);
     let people = Array.isArray(data?.people) ? data.people : [];
-    console.log(`[Apollo] ${domain}: ${people.length} con filtro de títulos`);
 
-    let valid = people
-      .filter(p => isUnlockedEmail(p.email) && APOLLO_GOOD_STATUSES.has(p.email_status))
-      .map(p => ({
-        email: p.email, name: `${p.first_name || ""} ${p.last_name || ""}`.trim(),
-        title: p.title || "", linkedin: p.linkedin_url || "", status: p.email_status || "",
-      }));
-
-    // Intento 2 (fallback): sin filtro de títulos, trae cualquier persona del dominio
-    if (valid.length === 0) {
-      data = await apolloSearch(domain, apiKey, false);
-      people = Array.isArray(data?.people) ? data.people : [];
-      console.log(`[Apollo] ${domain}: ${people.length} sin filtro de títulos (fallback)`);
-
-      valid = people
-        .filter(p => isUnlockedEmail(p.email) && APOLLO_GOOD_STATUSES.has(p.email_status))
-        .map(p => ({
-          email: p.email, name: `${p.first_name || ""} ${p.last_name || ""}`.trim(),
-          title: p.title || "", linkedin: p.linkedin_url || "", status: p.email_status || "",
-        }));
-
-      if (people.length > 0 && valid.length === 0) {
-        const statuses = people.slice(0, 5).map(p => `${p.first_name || "?"}: ${p.email_status || "null"} (${p.email || "no-email"})`).join(" | ");
-        console.warn(`[Apollo] ${domain}: todos los emails bloqueados por plan → ${statuses}`);
-      }
+    // Intento 2: si no trajo nada útil, retry sin títulos
+    let triedFallback = false;
+    if (people.length === 0 || !people.some(p => isUnlockedEmail(p.email) && APOLLO_GOOD_STATUSES.has(p.email_status))) {
+      const data2 = await apolloSearch(domain, apiKey, false);
+      const people2 = Array.isArray(data2?.people) ? data2.people : [];
+      if (people2.length > people.length) people = people2;
+      triedFallback = true;
     }
-    return valid;
+
+    diag.rawCount = people.length;
+
+    for (const p of people) {
+      const hasEmail    = !!p.email;
+      const unlocked    = isUnlockedEmail(p.email);
+      const goodStatus  = APOLLO_GOOD_STATUSES.has(p.email_status);
+
+      if (!hasEmail)                     diag.noEmailCount++;
+      else if (!unlocked)                diag.lockedCount++;
+      else if (!goodStatus)              diag.badStatusCount++;
+      else                               diag.valid.push(mapApolloPerson(p));
+    }
+
+    // Sample para debugging: primeros 5 con el motivo por el que se filtró (o pasó)
+    diag.sample = people.slice(0, 5).map(p => ({
+      name:   `${p.first_name || "?"} ${p.last_name || ""}`.trim(),
+      title:  p.title || "",
+      email:  p.email || null,
+      status: p.email_status || null,
+    }));
+
+    const fallbackNote = triedFallback ? " (con fallback)" : "";
+    console.log(`[Apollo] ${domain}${fallbackNote}: ${diag.rawCount} personas · ${diag.valid.length} válidas · ${diag.lockedCount} bloqueados · ${diag.noEmailCount} sin email · ${diag.badStatusCount} status inválido`);
+    if (diag.rawCount > 0 && diag.valid.length === 0) {
+      console.warn(`[Apollo] sample:`, diag.sample);
+    }
+    return diag;
   } catch (e) {
+    diag.httpError = e.message;
     console.warn(`[Apollo] error:`, e.message);
-    return [];
+    return diag;
   }
 }
 
@@ -328,13 +351,22 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
   }
 
   // ── Paso 2: Apollo mixed_people/search por dominio + títulos ──
-  const results = await apolloDomainSearch(cleanDomain, apolloKey);
-  if (results.length > 0) return results[0];
+  const diag = await apolloDomainSearch(cleanDomain, apolloKey);
+  if (diag.valid.length > 0) return diag.valid[0];
+
+  // Construir mensaje de diagnóstico específico
+  let reason;
+  if (diag.httpError)           reason = `Apollo API error: ${diag.httpError}`;
+  else if (diag.rawCount === 0) reason = `Apollo no tiene personas indexadas para ${cleanDomain}`;
+  else if (diag.lockedCount === diag.rawCount) reason = `Apollo encontró ${diag.rawCount} personas pero TODOS los emails están bloqueados por plan. Desbloqueá los contactos en Apollo.app o upgradeá el plan.`;
+  else if (diag.noEmailCount === diag.rawCount) reason = `Apollo encontró ${diag.rawCount} personas pero ninguna tiene email registrado`;
+  else reason = `Apollo encontró ${diag.rawCount} personas: ${diag.lockedCount} bloqueados · ${diag.noEmailCount} sin email · ${diag.badStatusCount} con status inválido`;
 
   return {
     name:  firstName ? `${firstName} ${lastName}`.trim() : "",
     email: null, title, linkedin,
-    error: "No email found via Apollo",
+    error: reason,
+    _apolloDiag: diag, // expuesto para debug en UI
   };
 }
 
