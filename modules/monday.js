@@ -143,14 +143,6 @@ export async function updateMonday({ itemId, traffic, email, geo, pitch, estado,
   return mondayRequest(mutation);
 }
 
-export async function recycleProspect({ itemId, traffic, email, techDetected, pitch, newStatusIndex }) {
-  return updateMonday({
-    itemId, traffic, email, techDetected,
-    pitch:  `♻️ Reciclado: ${new Date().toLocaleDateString("es-AR")}\n${pitch || ""}`,
-    estado: newStatusIndex,
-  });
-}
-
 export const MONDAY_STATES = {
   LIVE:              { index: "0",  label: "LIVE" },
   EN_NEGOCIACION:    { index: "1",  label: "En Negociacion" },

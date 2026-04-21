@@ -117,56 +117,7 @@ function extractEmailsFromDOM() {
 }
 
 // ============================================================
-// 2. website.informer.com — teléfono + email
-// ============================================================
-export async function scrapeInformer(domain) {
-  const cleanDomain = domain.replace(/^www\./, "");
-  const url = `https://website.informer.com/${cleanDomain}`;
-
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      signal: AbortSignal.timeout(7000),
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
-    });
-
-    if (!response.ok) return { emails: [], phone: null };
-
-    const html   = await response.text();
-    const emails = filterEmails(extractEmailsFromText(html));
-
-    // Extrae teléfono (formatos: +1 555..., (555)..., internacional)
-    const phoneMatch = html.match(/(?:\+\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}/);
-    const phone      = phoneMatch?.[0]?.trim() || null;
-
-    return { emails, phone, source: "website.informer.com" };
-
-  } catch {
-    return { emails: [], phone: null };
-  }
-}
-
-// ============================================================
-// 3. who.is — WHOIS registrant email
-// ============================================================
-export async function scrapeWhoIs(domain) {
-  const cleanDomain = domain.replace(/^www\./, "");
-  try {
-    const response = await fetch(`https://who.is/whois/${cleanDomain}`, {
-      method: "GET",
-      signal: AbortSignal.timeout(7000),
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
-    });
-    if (!response.ok) return [];
-    const html   = await response.text();
-    return filterEmails(extractEmailsFromText(html));
-  } catch {
-    return [];
-  }
-}
-
-// ============================================================
-// 4. Páginas de contacto del propio sitio
+// 2. Páginas de contacto del propio sitio
 // ============================================================
 export async function scrapeContactPages(baseUrl) {
   const paths = ["/contact", "/contact-us", "/contacto", "/about", "/about-us", "/legal", "/privacy", "/advertise", "/advertising"];
