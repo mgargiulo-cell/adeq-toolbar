@@ -203,6 +203,36 @@ export async function sendEmail({ to, subject, body, expectedFrom }) {
   }
 }
 
+// ── Closing helper ────────────────────────────────────────────
+
+const CLOSINGS = {
+  en: "Best regards,",
+  es: "Saludos,",
+  pt: "Cumprimentos,",
+  it: "Cordiali saluti,",
+  fr: "Cordialement,",
+  de: "Mit freundlichen Grüßen,",
+  ar: "مع خالص التحيات,",
+};
+
+// Detecta si el body ya termina con un cierre (en cualquier idioma común).
+const CLOSING_PATTERN = /\n\s*(best\s*regards|best|regards|saludos|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen|cheers|thanks|thank\s*you|sincerely|kind\s*regards)[.,!\s]*\s*$/i;
+
+/**
+ * Si el body no termina con un cierre de email, agrega el apropiado para
+ * el idioma. Si ya termina con uno, lo deja tal cual.
+ * @param {string} body
+ * @param {string} lang - código de idioma (en/es/pt/it/fr/de/ar)
+ * @returns {string} body con cierre garantizado
+ */
+export function appendClosingIfMissing(body, lang = "es") {
+  const trimmed = (body || "").trimEnd();
+  if (!trimmed) return trimmed;
+  if (CLOSING_PATTERN.test(trimmed)) return trimmed; // ya tiene cierre
+  const closing = CLOSINGS[lang] || CLOSINGS.es;
+  return `${trimmed}\n\n${closing}`;
+}
+
 // ── Internal helpers ──────────────────────────────────────────
 
 function buildRaw({ to, subject, body }) {

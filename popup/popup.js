@@ -20,7 +20,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
          getDailyValidationCount }                                                           from "../modules/supabase.js";
-import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens }   from "../modules/gmail.js";
+import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
@@ -1369,8 +1369,11 @@ async function bindButtons() {
     // ── Fetch Gmail signature (will trigger OAuth window if no cached token) ──
     btn.textContent = "⏳ Preparing...";
     const gmailSig = await getGmailSignature();
+    const lang     = state.siteLanguage || state.monday?.idioma || "es";
 
+    // Stripping viejo cierre Best,... luego garantizamos cierre localizado antes de la firma
     let bodyToSend = pitch.replace(/\n*Best,[\s\S]*$/i, "").trimEnd();
+    bodyToSend = appendClosingIfMissing(bodyToSend, lang);
     bodyToSend = gmailSig ? bodyToSend + "\n\n" + gmailSig : bodyToSend;
 
     btn.textContent = "⏳ Sending...";
@@ -3112,7 +3115,9 @@ async function validateProspect(card, data, doSendEmail) {
     // 2. Send email (if requested and email available)
     if (doSendEmail && email) {
       const signature = await getGmailSignature();
-      const fullBody  = pitch + (signature ? "\n\n" + signature : "");
+      const lang      = data?.language || "es";
+      const bodyWithClosing = appendClosingIfMissing(pitch, lang);
+      const fullBody  = bodyWithClosing + (signature ? "\n\n" + signature : "");
       const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
       if (!result.ok) throw new Error(result.error || "Gmail error");
     }
