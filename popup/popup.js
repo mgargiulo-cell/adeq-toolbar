@@ -1492,6 +1492,69 @@ async function bindButtons() {
     btn.disabled = false; btn.textContent = "🚀 Importar 15 URLs";
   });
 
+  // ── Import → Auto-prospector Queue ─────────────────────────────
+  // En vez de abrir tabs, encola los 15 dominios para que Railway los procese en background
+  document.getElementById("btn-import-queue").addEventListener("click", async () => {
+    const btn      = document.getElementById("btn-import-queue");
+    const resultEl = document.getElementById("import-result");
+    const listEl   = document.getElementById("import-list");
+
+    const geo          = document.getElementById("import-geo").value;
+    const idioma       = document.getElementById("import-idioma").value;
+    const trafficVal   = document.getElementById("import-traffic").value;
+    const [tMinRaw, tMaxRaw] = trafficVal.split(":").map(v => v === "" ? 0 : Number(v));
+    const minTraffic   = tMinRaw || 0;
+    const maxTraffic   = tMaxRaw || 0;
+
+    btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
+    resultEl.textContent = ""; resultEl.className = "push-result";
+    listEl.innerHTML = "";
+
+    try {
+      const [candidates, importedSet] = await Promise.all([
+        fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic }),
+        getImportedDomains(state.accessToken),
+      ]);
+
+      const available = candidates.filter(c => !importedSet.has(c.domain));
+      const selected  = available.slice(0, 15);
+
+      if (selected.length === 0) {
+        resultEl.textContent = candidates.length === 0
+          ? "No URLs found with those filters in Monday."
+          : `All available URLs (${candidates.length}) have already been imported.`;
+        resultEl.className = "push-result error";
+        btn.disabled = false; btn.textContent = "📤 Send to Queue";
+        return;
+      }
+
+      // Mostrar lista visual igual que Import tabs
+      listEl.innerHTML = selected.map((item, i) => `
+        <div class="import-item">
+          <span class="import-num">${i + 1}</span>
+          <span class="import-domain">${esc(item.domain)}</span>
+          <span class="import-meta">${item.traffic ? esc(formatTraffic(item.traffic)) + " vis" : ""}</span>
+        </div>`).join("");
+
+      resultEl.textContent = `Subiendo ${selected.length} dominios a la cola...`;
+
+      // Marcar como "importadas" en Supabase (bloqueo 60 días — igual que abrir tabs)
+      await markDomainsImported(selected.map(s => s.domain), state.loginEmail, state.accessToken);
+
+      // Encolar para procesamiento por Railway
+      const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken);
+
+      resultEl.textContent = `✅ ${upload.inserted} agregadas a la cola (${selected.length - upload.inserted} ya estaban). Railway procesará automáticamente si el toggle está ON.`;
+      resultEl.className = "push-result ok";
+
+    } catch (err) {
+      resultEl.textContent = `❌ Error: ${err.message}`;
+      resultEl.className = "push-result error";
+    }
+
+    btn.disabled = false; btn.textContent = "📤 Send to Queue";
+  });
+
   // CSV Bulk Queue — Auto-prospector refresh de dominios en Monday
   await initCsvQueue();
 

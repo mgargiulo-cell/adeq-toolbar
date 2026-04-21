@@ -561,7 +561,22 @@ async function fetchPageContent(domain) {
     if (/embimedia\.com|embi\.media/i.test(html))                         adNetworks.push("Embi Media");
     if (/snigel\.com/i.test(html))                                         adNetworks.push("Snigel");
 
-    return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks };
+    // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
+    const textForCategory = `${title} ${desc} ${domain}`.toLowerCase();
+    let category = "other";
+    if      (/sport|futbol|futebol|soccer|football|nba|basket|tennis|béisbol|beisbol|liga|mlb|f1|motor|boxeo|boxing/.test(textForCategory)) category = "sports";
+    else if (/noticia|news|diario|periódico|periodico|press|journalism|último|ultimo momento|actualidad/.test(textForCategory))            category = "news";
+    else if (/finanz|banco|econom|invest|crypto|bolsa|stock|finance|mercad/.test(textForCategory))                                          category = "finance";
+    else if (/cine|película|pelicula|movie|film|music|música|música|juego|game|entertain|espectácul|espectacul|farándula|farandula/.test(textForCategory)) category = "entertainment";
+    else if (/tech|tecnolog|software|digital|code|program|gadget|computador|hardware/.test(textForCategory))                                category = "technology";
+    else if (/salud|health|medic|bienestar|wellness|fitness|diet/.test(textForCategory))                                                    category = "health";
+    else if (/viaj|travel|tour|hotel|vacacion|destino|vuel/.test(textForCategory))                                                          category = "travel";
+    else if (/casin|apuesta|betting|gambl|poker|bingo|lotería|loteria/.test(textForCategory))                                              category = "gambling";
+    else if (/auto|car |coche|vehícul|vehicul|moto|truck|camión|camion/.test(textForCategory))                                             category = "automotive";
+    else if (/receta|cocina|comida|food|cook|gastronom/.test(textForCategory))                                                              category = "food";
+    else if (/negocio|business|emprend|startup|marketing|seo|empresa/.test(textForCategory))                                                category = "business";
+
+    return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks, category };
   } catch { return null; }
 }
 
