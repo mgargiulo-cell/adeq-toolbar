@@ -13,7 +13,7 @@ import { runCascade, getSimilarSites }                                          
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
 import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
-         searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
+         searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys, setSupabaseAuth,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
          getPitchDrafts, savePitchDraft, deletePitchDraft,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
@@ -151,6 +151,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     initLoginScreen();
     return;
   }
+
+  // Seed the shared Supabase auth token so every supabase.js request uses the user JWT (not anon)
+  setSupabaseAuth(auth.accessToken);
 
   // ── Cargar API keys desde Supabase (requiere JWT válido) ──
   const apiKeys = await fetchApiKeys(auth.accessToken);

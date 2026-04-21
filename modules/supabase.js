@@ -16,6 +16,11 @@ async function getConfig() {
   };
 }
 
+// ── Auth token cache — set once after login; used as Bearer by every request ──
+let _sbAuthToken = null;
+export function setSupabaseAuth(accessToken) { _sbAuthToken = accessToken || null; }
+function bearer(key) { return `Bearer ${_sbAuthToken || key}`; }
+
 // ── Autenticación Supabase ────────────────────────────────────
 
 export async function supabaseSignIn(email, password) {
@@ -339,7 +344,7 @@ export async function saveHistory(entry) {
       headers: {
         "Content-Type":  "application/json",
         "apikey":        key,
-        "Authorization": `Bearer ${key}`,
+        "Authorization": bearer(key),
         "Prefer":        "return=minimal",
       },
       body: JSON.stringify({
@@ -367,7 +372,7 @@ export async function loadHistory() {
     try {
       const res = await fetch(
         `${url}/rest/v1/toolbar_historial?order=created_at.desc&limit=50`,
-        { headers: { "apikey": key, "Authorization": `Bearer ${key}` } }
+        { headers: { "apikey": key, "Authorization": bearer(key) } }
       );
       if (res.ok) {
         const rows = await res.json();
@@ -401,7 +406,7 @@ export async function loadKeywordsFromDB() {
   try {
     const res = await fetch(
       `${url}/rest/v1/toolbar_keywords?select=phrase,lang&order=id.asc&limit=5000`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${key}` } }
+      { headers: { "apikey": key, "Authorization": bearer(key) } }
     );
     if (!res.ok) return [];
     return await res.json(); // [{ phrase, lang }]
@@ -417,7 +422,7 @@ export async function searchKeywordsInDB(term, preferLang = "") {
   try {
     const res = await fetch(
       `${url}/rest/v1/toolbar_keywords?select=phrase,lang&phrase=ilike.*${encodeURIComponent(term)}*&order=phrase.asc&limit=200`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${key}` } }
+      { headers: { "apikey": key, "Authorization": bearer(key) } }
     );
     if (!res.ok) {
       const errBody = await res.json().catch(() => ({}));
@@ -454,7 +459,7 @@ export async function importKeywordsToDB(phrases, source = "import") {
         headers: {
           "Content-Type":  "application/json",
           "apikey":        key,
-          "Authorization": `Bearer ${key}`,
+          "Authorization": bearer(key),
           "Prefer":        "resolution=ignore-duplicates,return=minimal",
         },
         body: JSON.stringify(batch),
@@ -482,7 +487,7 @@ export async function countKeywordsDB() {
   try {
     const res = await fetch(
       `${url}/rest/v1/toolbar_keywords?select=id`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${key}`, "Prefer": "count=exact", "Range": "0-0" } }
+      { headers: { "apikey": key, "Authorization": bearer(key), "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("Content-Range") || "";
     return parseInt(range.split("/")[1]) || 0;
@@ -529,7 +534,7 @@ export async function getSimilarCache(domain) {
     cutoff.setDate(cutoff.getDate() - 60);
     const res = await fetch(
       `${url}/rest/v1/toolbar_similar_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${key}` } }
+      { headers: { "apikey": key, "Authorization": bearer(key) } }
     );
     if (!res.ok) return null;
     const rows = await res.json();
@@ -546,7 +551,7 @@ export async function saveSimilarCache(domain, sites) {
       headers: {
         "Content-Type":  "application/json",
         "apikey":        key,
-        "Authorization": `Bearer ${key}`,
+        "Authorization": bearer(key),
         "Prefer":        "resolution=merge-duplicates,return=minimal",
       },
       body: JSON.stringify({ domain, sites, fetched_at: new Date().toISOString() }),
@@ -569,7 +574,7 @@ export async function getTrafficCache(domain) {
 
     const res = await fetch(
       `${url}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${key}` } }
+      { headers: { "apikey": key, "Authorization": bearer(key) } }
     );
     if (!res.ok) return null;
     const rows = await res.json();
@@ -596,7 +601,7 @@ export async function saveTrafficCache(domain, data) {
       headers: {
         "Content-Type":  "application/json",
         "apikey":        key,
-        "Authorization": `Bearer ${key}`,
+        "Authorization": bearer(key),
         "Prefer":        "resolution=merge-duplicates,return=minimal",
       },
       body: JSON.stringify({ domain, data: clean, fetched_at: new Date().toISOString() }),
@@ -635,7 +640,7 @@ export async function saveSendDate(domain, { sendDate, pitch, email }) {
         headers: {
           "Content-Type":  "application/json",
           "apikey":        key,
-          "Authorization": `Bearer ${key}`,
+          "Authorization": bearer(key),
           "Prefer":        "resolution=merge-duplicates,return=minimal",
         },
         body: JSON.stringify({
@@ -664,7 +669,7 @@ export async function getSendInfo(domain) {
     try {
       const res = await fetch(
         `${url}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&limit=1`,
-        { headers: { "apikey": key, "Authorization": `Bearer ${key}` } }
+        { headers: { "apikey": key, "Authorization": bearer(key) } }
       );
       if (res.ok) {
         const rows = await res.json();
@@ -716,7 +721,7 @@ export async function markFUSent(domain, fuNumber) {
         headers: {
           "Content-Type":  "application/json",
           "apikey":        key,
-          "Authorization": `Bearer ${key}`,
+          "Authorization": bearer(key),
           "Prefer":        "return=minimal",
         },
         body: JSON.stringify({ [`fu${fuNumber}_sent`]: true }),
