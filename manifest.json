@@ -57,6 +57,7 @@
     "https://website.informer.com/*",
     "https://who.is/*",
     "https://dns.google/*",
-    "https://www.similarsites.com/*"
+    "https://www.similarsites.com/*",
+    "<all_urls>"
   ]
 }
