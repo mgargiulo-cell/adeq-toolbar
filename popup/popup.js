@@ -3059,10 +3059,17 @@ async function loadProspectsTab() {
 
   listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
 
-  const [rows, dailyCount] = await Promise.all([
-    fetchReviewQueue(state.accessToken),
-    getDailyValidationCount(state.accessToken, state.loginEmail),
-  ]);
+  let rows = [];
+  let dailyCount = 0;
+  try {
+    [rows, dailyCount] = await Promise.all([
+      fetchReviewQueue(state.accessToken),
+      getDailyValidationCount(state.accessToken, state.loginEmail),
+    ]);
+  } catch (err) {
+    listEl.innerHTML = `<div class="cascade-empty" style="color:#e53e3e">❌ Error cargando prospectos: ${esc(err.message || String(err))}</div>`;
+    return;
+  }
 
   updateProspectsDailyBar(dailyCount);
   if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidates` : "No pending candidates";

@@ -257,7 +257,7 @@ async function getApolloUsageToday(token) {
     const today   = new Date().toISOString().slice(0, 10);
     const storedDate  = map.apollo_calls_date  || "";
     const storedCount = parseInt(map.apollo_calls_today || "0", 10);
-    const limit       = parseInt(map.apollo_daily_limit || "50",  10);
+    const limit       = parseInt(map.apollo_daily_limit || "150", 10);
 
     // Si cambió el día, el contador empieza de cero
     const usedToday = storedDate === today ? storedCount : 0;
