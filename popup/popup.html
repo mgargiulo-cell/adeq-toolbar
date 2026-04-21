@@ -762,10 +762,10 @@
 
   <div id="import-list" class="import-list"></div>
 
-  <!-- CSV Bulk Upload — envía dominios a la cola del auto-prospector -->
+  <!-- MONDAY CSV AUTO PROSPECTOR — subí CSV para refrescar datos existentes -->
   <section class="card" style="margin-top:16px">
-    <div class="card-title">📤 CSV Bulk Queue (Auto-prospector)</div>
-    <p class="import-desc">Subí un CSV (1 dominio por línea). El auto-prospector de Railway los procesa automáticamente: analiza tráfico, emails, y pushea a Monday. Apollo solo para +1M visits.</p>
+    <div class="card-title">📤 MONDAY CSV AUTO PROSPECTOR</div>
+    <p class="import-desc">Subí un CSV (1 dominio por línea). El auto-prospector de Railway los procesa automáticamente: analiza tráfico, emails, y actualiza el item existente en Monday. Apollo solo para +1M visits.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
@@ -786,6 +786,15 @@
         <input id="csv-queue-enabled" type="checkbox" />
         <span>Auto-procesar cola (Railway)</span>
       </label>
+    </div>
+
+    <!-- HISTORIAL de dominios procesados -->
+    <div style="margin-top:10px;padding:10px;background:var(--bg);border-radius:6px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <strong style="font-size:11px">📜 HISTORIAL de procesados</strong>
+        <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px">↻</button>
+      </div>
+      <div id="csv-history-list" style="font-size:10px; max-height:220px; overflow-y:auto">Cargando...</div>
     </div>
 
     <div style="display:flex;gap:6px;margin-top:8px">

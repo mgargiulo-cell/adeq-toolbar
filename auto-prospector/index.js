@@ -580,6 +580,81 @@ async function fetchPageContent(domain) {
   } catch { return null; }
 }
 
+// ── Blocklist para autopilot — evita dominios que no son targets válidos ───
+
+// Dominios exactos que no queremos prospectar (grandes marcas, tech giants, social media)
+const CORPORATE_BLOCKLIST = new Set([
+  // Search engines
+  "google.com","bing.com","yahoo.com","baidu.com","yandex.ru","duckduckgo.com","ask.com",
+  // Social networks
+  "facebook.com","twitter.com","x.com","instagram.com","tiktok.com","linkedin.com",
+  "reddit.com","pinterest.com","snapchat.com","whatsapp.com","telegram.org","discord.com",
+  "tumblr.com","weibo.com","vk.com","quora.com",
+  // Tech giants & big brands
+  "apple.com","microsoft.com","amazon.com","google.com","alphabet.com","meta.com",
+  "netflix.com","spotify.com","adobe.com","ibm.com","oracle.com","sap.com","salesforce.com",
+  "hubspot.com","shopify.com","stripe.com","square.com","paypal.com","visa.com","mastercard.com",
+  "samsung.com","sony.com","intel.com","amd.com","nvidia.com","dell.com","hp.com","lenovo.com",
+  "tesla.com","uber.com","lyft.com","airbnb.com","booking.com","expedia.com","tripadvisor.com",
+  // Dev / SaaS
+  "github.com","gitlab.com","bitbucket.org","atlassian.com","slack.com","notion.so","figma.com",
+  "canva.com","zoom.us","dropbox.com","box.com","wetransfer.com","docusign.com",
+  // Content platforms (no publishers independientes)
+  "youtube.com","vimeo.com","twitch.tv","medium.com","substack.com","wordpress.com","blogger.com",
+  "wikipedia.org","stackoverflow.com","stackexchange.com",
+  // Adult (explícito)
+  "pornhub.com","xvideos.com","xhamster.com","redtube.com","youporn.com","xnxx.com","brazzers.com",
+  "chaturbate.com","onlyfans.com","livejasmin.com","stripchat.com","bongacams.com",
+  // E-commerce gigantes
+  "ebay.com","alibaba.com","aliexpress.com","mercadolibre.com","mercadolibre.com.ar","mercadolivre.com.br",
+  "walmart.com","target.com","bestbuy.com","homedepot.com","costco.com",
+  // ChatGPT / AI giants
+  "chatgpt.com","openai.com","chat.openai.com","claude.ai","anthropic.com","perplexity.ai","gemini.google.com",
+]);
+
+// TLDs o subcadenas que SIEMPRE indican sitios no-prospectables
+const BLOCKED_TLDS     = [".edu", ".gov", ".mil", ".ac.uk", ".edu.", ".gov.", ".mil."];
+const ADULT_TLDS       = [".xxx", ".adult", ".porn", ".sex"];
+const ADULT_KEYWORDS   = ["porn", "xxx", "xvideos", "sexcam", "camgirl", "fuck", "nsfw", "hentai", "escort"];
+
+// TLDs por región — usado para pre-filtrar por GEO antes de fetchar SimilarWeb
+const TLD_BY_REGION = {
+  LATAM:  [".ar",".mx",".co",".cl",".br",".pe",".ec",".ve",".uy",".py",".bo",".es",".com.ar",".com.mx",".com.co",".com.br",".com.pe"],
+  Europe: [".uk",".co.uk",".fr",".de",".it",".pt",".nl",".be",".ch",".at",".pl",".se",".no",".dk",".fi",".gr",".hu",".cz",".ro",".ua",".ru"],
+  MENA:   [".ae",".sa",".eg",".ma",".tr",".il",".kw",".qa",".dz",".tn"],
+  Asia:   [".in",".jp",".kr",".cn",".tw",".hk",".sg",".my",".id",".ph",".th",".vn",".pk",".bd"],
+};
+
+function isDomainBlocked(domain) {
+  const d = domain.toLowerCase();
+  if (CORPORATE_BLOCKLIST.has(d)) return "corporate/brand";
+  if (BLOCKED_TLDS.some(t => d.endsWith(t) || d.includes(t))) return "government/education";
+  if (ADULT_TLDS.some(t => d.endsWith(t))) return "adult-tld";
+  if (ADULT_KEYWORDS.some(k => d.includes(k))) return "adult-keyword";
+  return null;
+}
+
+// Si hay targetGeo seteado, chequea que el TLD matchee con algún país de la región
+// Para .com / .net / .org etc (genéricos) devuelve true (no podemos decidir sin SimilarWeb)
+function matchesTargetGeoByTLD(domain, targetGeo) {
+  if (!targetGeo) return true;
+  const tldList = TLD_BY_REGION[targetGeo];
+  if (!tldList) return true; // target es un país específico, no podemos pre-filtrar
+  const d = domain.toLowerCase();
+  const genericTLDs = [".com", ".net", ".org", ".info", ".biz", ".co", ".io", ".app", ".dev", ".xyz"];
+  // Si tiene TLD regional → chequear si pertenece a la región target
+  const hasRegionalTLD = tldList.some(t => d.endsWith(t));
+  if (hasRegionalTLD) return true;
+  // Si tiene TLD de OTRA región → descartar
+  for (const [region, tlds] of Object.entries(TLD_BY_REGION)) {
+    if (region === targetGeo) continue;
+    if (tlds.some(t => d.endsWith(t))) return false;
+  }
+  // Es genérico (.com etc) — aceptamos y dejamos que SimilarWeb decida con topCountry
+  if (genericTLDs.some(t => d.endsWith(t))) return true;
+  return true;
+}
+
 // ── Scoring ───────────────────────────────────────────────────
 
 const GEO_REGIONS = {
@@ -889,6 +964,23 @@ async function runSession(token, cfg, sessionStart) {
 
     const domain = toProcess.shift();
     log(`→ [${count + 1} | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
+
+    // Pre-filtro GRATUITO (antes de gastar créditos SimilarWeb / Apollo):
+    // 1) Blocklist corporativa / universidades / adultos / tech giants
+    const blockReason = isDomainBlocked(domain);
+    if (blockReason) {
+      log(`  ⊘ ${domain} — ${blockReason}, saltado sin consumir API`);
+      await markProcessed(token, [domain]);
+      count++; skipped++;
+      continue; // sin sleep — no consumió nada
+    }
+    // 2) GEO pre-filter por TLD si hay targetGeo
+    if (targetGeo && !matchesTargetGeoByTLD(domain, targetGeo)) {
+      log(`  ⊘ ${domain} — TLD no coincide con región ${targetGeo}`);
+      await markProcessed(token, [domain]);
+      count++; skipped++;
+      continue; // sin sleep
+    }
 
     // Paso 1: tráfico + contenido de página en paralelo (sin Gemini)
     const [trafficData, pageContent] = await Promise.all([

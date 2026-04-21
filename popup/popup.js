@@ -14,7 +14,7 @@ import { detectBanners }                                                        
 import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
-         uploadCsvDomains, getCsvQueueStats, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
+         uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
          getImportedDomains, markDomainsImported,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
          getAutopilotTarget, setAutopilotTarget,
@@ -2595,14 +2595,16 @@ async function clearGmailAssociation(loginEmail) {
 
 // ── CSV Bulk Queue ────────────────────────────────────────────
 async function initCsvQueue() {
-  const fileInput   = document.getElementById("csv-file-input");
-  const uploadBtn   = document.getElementById("btn-csv-upload");
-  const uploadRes   = document.getElementById("csv-upload-result");
-  const statsEl     = document.getElementById("csv-queue-stats");
-  const refreshBtn  = document.getElementById("btn-csv-refresh");
-  const enabledCbx  = document.getElementById("csv-queue-enabled");
-  const clearProc   = document.getElementById("btn-csv-clear-processed");
-  const clearAll    = document.getElementById("btn-csv-clear-all");
+  const fileInput      = document.getElementById("csv-file-input");
+  const uploadBtn      = document.getElementById("btn-csv-upload");
+  const uploadRes      = document.getElementById("csv-upload-result");
+  const statsEl        = document.getElementById("csv-queue-stats");
+  const refreshBtn     = document.getElementById("btn-csv-refresh");
+  const enabledCbx     = document.getElementById("csv-queue-enabled");
+  const clearProc      = document.getElementById("btn-csv-clear-processed");
+  const clearAll       = document.getElementById("btn-csv-clear-all");
+  const historyEl      = document.getElementById("csv-history-list");
+  const historyRefresh = document.getElementById("btn-csv-history-refresh");
   if (!uploadBtn) return;
 
   const refreshStats = async () => {
@@ -2615,6 +2617,26 @@ async function initCsvQueue() {
     `;
   };
 
+  const refreshHistory = async () => {
+    if (!historyEl) return;
+    historyEl.textContent = "Cargando...";
+    const rows = await getCsvQueueHistory(state.accessToken, 30);
+    if (rows.length === 0) {
+      historyEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic">Aún no hay dominios procesados</div>';
+      return;
+    }
+    const statusIcon = { done: "✅", error: "❌", skipped: "⏭" };
+    historyEl.innerHTML = rows.map(r => {
+      const icon = statusIcon[r.status] || "•";
+      const when = r.processed_at ? new Date(r.processed_at).toLocaleString("es-AR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "";
+      const err  = r.status === "error" && r.error_message ? ` <span style="color:#e53e3e">— ${esc(r.error_message.substring(0, 80))}</span>` : "";
+      const skip = r.status === "skipped" && r.error_message ? ` <span style="color:var(--text-muted)">— ${esc(r.error_message)}</span>` : "";
+      return `<div style="padding:3px 0;border-bottom:1px solid var(--border)"><span>${icon}</span> <strong>${esc(r.domain)}</strong> <span style="color:var(--text-muted)">${when}</span>${err}${skip}</div>`;
+    }).join("");
+  };
+
+  const refreshAll = async () => { await Promise.all([refreshStats(), refreshHistory()]); };
+
   // Estado inicial del toggle
   enabledCbx.checked = await getCsvQueueEnabled(state.accessToken);
   enabledCbx.addEventListener("change", async () => {
@@ -2622,7 +2644,8 @@ async function initCsvQueue() {
   });
 
   refreshBtn.addEventListener("click", refreshStats);
-  await refreshStats();
+  historyRefresh?.addEventListener("click", refreshHistory);
+  await refreshAll();
 
   // Upload CSV
   uploadBtn.addEventListener("click", async () => {
@@ -2653,7 +2676,7 @@ async function initCsvQueue() {
       uploadRes.textContent = `✅ ${result.inserted} agregados (${result.attempted - result.inserted} duplicados ignorados)`;
       uploadRes.className = "push-result ok";
       fileInput.value = "";
-      await refreshStats();
+      await refreshAll();
     } catch (err) {
       uploadRes.textContent = `❌ ${err.message}`;
       uploadRes.className = "push-result error";

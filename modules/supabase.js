@@ -736,6 +736,24 @@ export async function uploadCsvDomains(domains, userEmail, accessToken) {
   return { inserted, attempted: domains.length };
 }
 
+// Últimos N dominios procesados (done/error/skipped) ordenados por fecha
+export async function getCsvQueueHistory(accessToken, limit = 30) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_csv_queue?status=in.(done,error,skipped)&order=processed_at.desc.nullslast&limit=${limit}&select=domain,status,processed_at,error_message,monday_item_id`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return [];
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    console.warn("getCsvQueueHistory failed:", e.message);
+    return [];
+  }
+}
+
 export async function getCsvQueueStats(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
