@@ -558,16 +558,22 @@ async function runTrafficCheck() {
       if (catSel && mapped) catSel.value = mapped;
     }
 
+    const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
+
     if (data.noPageViewData) {
       metricEl.textContent = formatTraffic(state.visits);
       if (unitEl) unitEl.textContent = "visits/mo";
-      const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
       breakdownEl.innerHTML = `<span class="no-pageview-note">No page-view data</span>${cacheStr}`;
+    } else if (data.estimatedPages) {
+      // Estimación por categoría — mostrar pero claramente etiquetado como ~
+      metricEl.textContent = `~${formatTraffic(state.traffic)}`;
+      if (unitEl) unitEl.textContent = "pages/mo (est.)";
+      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ~${data.pagesPerVisit} p/v <span class="pv-estimated">(estimado por categoría)</span>${cacheStr}`;
     } else {
       metricEl.textContent = formatTraffic(state.traffic);
       if (unitEl) unitEl.textContent = "pages/mo";
-      const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
-      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ${data.pagesPerVisit} p/v${cacheStr}`;
+      const srcLabel = data.ppvSource === "engagement" ? ` <span class="pv-source">via /engagement</span>` : "";
+      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ${data.pagesPerVisit} p/v${srcLabel}${cacheStr}`;
     }
     metricEl.className = "metric";
 

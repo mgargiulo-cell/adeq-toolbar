@@ -71,6 +71,47 @@ async function fetchTopCountries(domain) {
   }
 }
 
+// ── fetchEngagement — endpoint secundario para PagePerVisit ───
+// Muchas cuentas tienen engagement metrics en /engagement aunque no en /traffic
+async function fetchEngagement(domain) {
+  try {
+    const res = await fetch(
+      `${RAPIDAPI_BASE}/engagement?domain=${encodeURIComponent(domain)}`,
+      { method: "GET", headers: getHeaders(), signal: AbortSignal.timeout(5000) }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const ppv = data.PagePerVisit || data.PagesPerVisit || data.pagesPerVisit || data.pages_per_visit || null;
+    if (!ppv) return null;
+    return parseFloat(ppv);
+  } catch { return null; }
+}
+
+// Estimación de PagePerVisit según categoría del sitio — último recurso
+// Basado en industry benchmarks públicos (SimilarWeb, Statista, ComScore)
+const CATEGORY_PAGES_PER_VISIT = {
+  news:          4.5,
+  sports:        5.0,
+  entertainment: 5.5,
+  gambling:      6.0,
+  finance:       2.8,
+  technology:    2.5,
+  business:      2.5,
+  health:        3.0,
+  travel:        4.0,
+  automotive:    3.5,
+  food:          3.8,
+  other:         3.0,
+};
+
+function estimatePagesPerVisit(category) {
+  const c = (category || "").toLowerCase();
+  for (const [key, ppv] of Object.entries(CATEGORY_PAGES_PER_VISIT)) {
+    if (c.includes(key)) return ppv;
+  }
+  return CATEGORY_PAGES_PER_VISIT.other;
+}
+
 // ── getTraffic ────────────────────────────────────────────────
 export async function getTraffic(domain) {
   const cleanDomain = domain
@@ -108,9 +149,15 @@ export async function getTraffic(domain) {
     if (response.ok) {
       const data = await response.json();
       if (!data.error && data.Visits) {
-        const visits        = Math.round(data.Visits || 0);
-        const pagesPerVisit = data.PagePerVisit || data.PagesPerVisit || null;
-        const pageViews     = pagesPerVisit ? Math.round(visits * pagesPerVisit) : null;
+        const visits    = Math.round(data.Visits || 0);
+        let pagesPerVisit  = data.PagePerVisit || data.PagesPerVisit || null;
+        let ppvSource      = pagesPerVisit ? "traffic" : null;
+
+        // Fallback 1: endpoint /engagement (suele tener metrics que /traffic omite)
+        if (!pagesPerVisit) {
+          const engagementPPV = await fetchEngagement(cleanDomain);
+          if (engagementPPV) { pagesPerVisit = engagementPPV; ppvSource = "engagement"; }
+        }
 
         // Top countries — desde respuesta principal o endpoint separado
         let topCountries = [];
@@ -125,6 +172,15 @@ export async function getTraffic(domain) {
           topCountries = await fetchTopCountries(cleanDomain);
         }
 
+        const category = data.Category || "";
+        // Fallback 2: estimar por categoría si ningún endpoint nos dió metrics
+        if (!pagesPerVisit && category) {
+          pagesPerVisit = estimatePagesPerVisit(category);
+          ppvSource     = "estimated";
+        }
+
+        const pageViews = pagesPerVisit ? Math.round(visits * pagesPerVisit) : null;
+
         const result = {
           visits,
           pagesPerVisit:  pagesPerVisit ? Math.round(pagesPerVisit * 10) / 10 : null,
@@ -132,12 +188,13 @@ export async function getTraffic(domain) {
           monthly:        pageViews || visits,
           rawVisits:      visits,
           noPageViewData: !pagesPerVisit,
-          category:       data.Category     || "",
+          ppvSource,                         // "traffic" | "engagement" | "estimated" | null
+          estimatedPages: ppvSource === "estimated",
+          category,
           categoryRank:   data.CategoryRank || null,
           globalRank:     data.GlobalRank   || null,
           topCountries,
           tags:           data.Tags         || [],
-          estimatedPages: false,
         };
         await saveTrafficCache(cleanDomain, result);
         return result;
@@ -158,9 +215,21 @@ export async function getTraffic(domain) {
 
     const fData         = await fallback.json();
     const visits        = Math.round(fData.Visits || 0);
-    const pagesPerVisit = fData.PagePerVisit || fData.PagesPerVisit || null;
-    const pageViews     = pagesPerVisit ? Math.round(visits * pagesPerVisit) : null;
-    const topCountries  = await fetchTopCountries(cleanDomain);
+    let pagesPerVisit   = fData.PagePerVisit || fData.PagesPerVisit || null;
+    let ppvSource       = pagesPerVisit ? "similar-sites" : null;
+
+    if (!pagesPerVisit) {
+      const engagementPPV = await fetchEngagement(cleanDomain);
+      if (engagementPPV) { pagesPerVisit = engagementPPV; ppvSource = "engagement"; }
+    }
+    const category = fData.Category || "";
+    if (!pagesPerVisit && category) {
+      pagesPerVisit = estimatePagesPerVisit(category);
+      ppvSource     = "estimated";
+    }
+
+    const pageViews    = pagesPerVisit ? Math.round(visits * pagesPerVisit) : null;
+    const topCountries = await fetchTopCountries(cleanDomain);
     const result = {
       visits,
       pagesPerVisit:  pagesPerVisit ? Math.round(pagesPerVisit * 10) / 10 : null,
@@ -168,10 +237,12 @@ export async function getTraffic(domain) {
       monthly:        pageViews || visits,
       rawVisits:      visits,
       noPageViewData: !pagesPerVisit,
-      category:       fData.Category    || "",
+      ppvSource,
+      estimatedPages: ppvSource === "estimated",
+      category,
       categoryRank:   fData.CategoryRank || null,
       globalRank:     fData.GlobalRank   || null,
-      tags: [], estimatedPages: false, topCountries,
+      tags: [], topCountries,
     };
     await saveTrafficCache(cleanDomain, result);
     return result;

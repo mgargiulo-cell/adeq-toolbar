@@ -191,6 +191,8 @@ body {
 .filter-tag.fail { color: var(--danger); }
 .estimated-badge { font-size: 12px; color: var(--warning); font-style: italic; }
 .no-pageview-note { font-size: 12px; color: var(--warning); margin-top: 2px; }
+.pv-estimated     { font-size: 11px; color: var(--warning); font-style: italic; }
+.pv-source        { font-size: 11px; color: var(--text-muted); font-style: italic; }
 .traffic-countries { display: flex; gap: 5px; margin-top: 4px; flex-wrap: wrap; }
 .country-flag-chip { font-size: 13px; background: #f0f4ff; border-radius: 10px; padding: 1px 7px; color: #444; }
 
