@@ -66,6 +66,23 @@ const DISPOSABLE = new Set([
 // ── 4. FORMATO regex ──────────────────────────────────────────
 const EMAIL_REGEX = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
 
+// Proxies de WhoIs / buzones de registrars — nunca son contactos reales,
+// aunque SMTP responda. Hay que marcarlos como inválidos explícitamente.
+const WHOIS_PROXY_DOMAINS = new Set([
+  "markmonitor.com","whoisguard.com","whoisprivacy.com","whoisprivacyservice.org",
+  "domainsbyproxy.com","contactprivacy.com","privacyprotect.org","privacy-protect.org",
+  "proxy.dreamhost.com","namebright.com","namesilo.com","registerdomainsafe.com",
+  "registrarsafe.com","anonymize.com","onamae.com","withheldforprivacy.com",
+  "withheldforprivacy.email","perfectprivacy.com","protecteddomainservices.com",
+  "whoisproxy.com","proxydomain.com","csc-global.com","redacted-gandi.net",
+]);
+
+const WHOIS_PROXY_LOCALS = new Set([
+  "whoisrequest","whoisprivacy","whoisguard","domainabuse","domain-abuse",
+  "abusereport","dns-admin","hostmaster","registrar","registrarcontact",
+  "legal-notices","takedown","dmca",
+]);
+
 export async function verifyEmail(email) {
   if (!email || !email.includes("@")) {
     return { valid: false, score: 0, reason: "Formato inválido", tags: ["formato"] };
@@ -77,6 +94,14 @@ export async function verifyEmail(email) {
   // ── Formato ────────────────────────────────────────────────
   if (!EMAIL_REGEX.test(email)) {
     return { valid: false, score: 0, reason: "Formato inválido", tags: ["formato"] };
+  }
+
+  // ── Proxy de WhoIs (markmonitor etc.) — nunca es contacto real ─
+  if (WHOIS_PROXY_DOMAINS.has(domain) || [...WHOIS_PROXY_DOMAINS].some(d => domain.endsWith("." + d))) {
+    return { valid: false, score: 0, reason: `Proxy de WhoIs (${domain}) — no es un contacto real`, tags: ["proxy-whois"] };
+  }
+  if (WHOIS_PROXY_LOCALS.has(local) || [...WHOIS_PROXY_LOCALS].some(l => local.startsWith(l + "-") || local.startsWith(l + "_"))) {
+    return { valid: false, score: 0, reason: `Buzón de registrar (${local}@) — no es un contacto real`, tags: ["proxy-whois"] };
   }
 
   // ── Typo en dominio ────────────────────────────────────────

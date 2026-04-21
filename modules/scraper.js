@@ -219,6 +219,8 @@ async function apolloSearch(domain, apiKey, withTitleFilter) {
     q_organization_domains_list: [domain],
     per_page: 10,
     page: 1,
+    reveal_personal_emails: true,       // usa créditos del plan para desbloquear emails
+    contact_email_status: ["verified", "likely_to_engage", "guessed"],
   };
   if (withTitleFilter) {
     body.person_titles = ["CEO","founder","co-founder","owner","publisher","editor","director","head","VP","manager","sales","marketing","business development"];
@@ -403,6 +405,33 @@ function extractEmailsFromText(text) {
   return [...new Set((clean.match(regex) || []).map(e => e.toLowerCase()))];
 }
 
+// Dominios de proxies/privacidad de WhoIs — nunca son contactos reales
+const WHOIS_PROXY_DOMAINS = [
+  "markmonitor.com", "whoisguard.com", "whoisprivacy.com", "whoisprivacyservice.org",
+  "domainsbyproxy.com", "contactprivacy.com", "privacyprotect.org", "privacy-protect.org",
+  "proxy.dreamhost.com", "namebright.com", "namecheap.com", "namesilo.com",
+  "registerdomainsafe.com", "registrarsafe.com", "anonymize.com", "onamae.com",
+  "withheldforprivacy.com", "withheldforprivacy.email", "perfectprivacy.com",
+  "protecteddomainservices.com", "whoisproxy.com", "proxydomain.com",
+  "cloudflare.com", "csc-global.com", "redacted-gandi.net",
+];
+
+// Local-parts típicos de buzones genéricos de registrars / legal (no contactos)
+const WHOIS_PROXY_LOCALS = [
+  "whoisrequest", "whoisprivacy", "whoisguard", "domainabuse", "domain-abuse",
+  "abusereport", "dns-admin", "hostmaster", "registrar", "registrarcontact",
+  "legal-notices", "takedown", "dmca",
+];
+
+function isWhoIsProxyEmail(email) {
+  const lower = email.toLowerCase();
+  const [local, domain] = lower.split("@");
+  if (!domain) return false;
+  if (WHOIS_PROXY_DOMAINS.some(d => domain === d || domain.endsWith("." + d))) return true;
+  if (WHOIS_PROXY_LOCALS.some(l => local === l || local.startsWith(l + "-") || local.startsWith(l + "_"))) return true;
+  return false;
+}
+
 // Validación rápida sincrónica antes de mostrar (sin DNS)
 export function quickValidateEmail(email) {
   if (!email || typeof email !== "string") return false;
@@ -429,6 +458,9 @@ export function quickValidateEmail(email) {
 
   // El dominio no puede ser solo un TLD (ej: "@com")
   if (domainParts.length === 1) return false;
+
+  // Bloquear proxies de WhoIs — no son contactos reales
+  if (isWhoIsProxyEmail(email)) return false;
 
   // Formato general válido
   const emailRegex = /^[a-zA-Z0-9._%+\-]{1,64}@[a-zA-Z0-9.\-]{1,253}\.[a-zA-Z]{2,6}$/;
