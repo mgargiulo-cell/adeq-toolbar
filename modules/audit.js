@@ -106,12 +106,28 @@ export async function runAudit(baseUrl, monthlyTraffic = 0) {
 }
 
 async function checkAdsTxt(baseUrl) {
+  // Ahora usamos activeTab + chrome.scripting.executeScript para fetchear ads.txt
+  // desde el context de la página (esquiva la CSP del extension page).
   try {
-    const url      = new URL("/ads.txt", baseUrl).href;
-    const response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5000) });
-    if (!response.ok) return { exists: false, entries: 0, hasGoogle: false };
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) return { exists: false, entries: 0, hasGoogle: false };
 
-    const text  = await response.text();
+    const url = new URL("/ads.txt", baseUrl).href;
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async (adsUrl) => {
+        try {
+          const res = await fetch(adsUrl, { method: "GET" });
+          if (!res.ok) return null;
+          return await res.text();
+        } catch { return null; }
+      },
+      args: [url],
+    });
+
+    const text = result?.result;
+    if (!text) return { exists: false, entries: 0, hasGoogle: false };
+
     const lines = text.split("\n").filter(l => l.trim() && !l.startsWith("#"));
     return {
       exists:    true,

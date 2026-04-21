@@ -234,7 +234,7 @@ async function apolloSearchPage(domain, apiKey, withTitleFilter, page = 1) {
     body.person_titles = ["CEO","founder","co-founder","owner","publisher","editor","director","head","VP","manager","sales","marketing","business development"];
   }
 
-  const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+  const res = await fetch("https://api.apollo.io/v1/mixed_people/api_search", {
     method: "POST",
     headers: { "X-Api-Key": apiKey, "Content-Type": "application/json" },
     body: JSON.stringify(body),

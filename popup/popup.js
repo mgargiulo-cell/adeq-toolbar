@@ -1394,8 +1394,12 @@ async function bindButtons() {
     const gmailSig = await getGmailSignature();
     const lang     = state.siteLanguage || state.monday?.idioma || "es";
 
-    // Stripping viejo cierre Best,... luego garantizamos cierre localizado antes de la firma
-    let bodyToSend = pitch.replace(/\n*Best,[\s\S]*$/i, "").trimEnd();
+    // Stripping de cualquier cierre viejo en CUALQUIER idioma (Gemini puede meter "Best regards,"
+    // aunque el pitch sea en español). Luego agregamos el cierre localizado correcto.
+    let bodyToSend = pitch.replace(
+      /\n+\s*(best\s*regards|kind\s*regards|regards|sincerely|cheers|thanks|thank\s*you|best|saludos(?:\s*cordiales)?|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|abracos|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen)[.,!\s]*[\s\S]*$/i,
+      ""
+    ).trimEnd();
     bodyToSend = appendClosingIfMissing(bodyToSend, lang);
     bodyToSend = gmailSig ? bodyToSend + "\n\n" + gmailSig : bodyToSend;
 
@@ -2419,7 +2423,7 @@ async function runDiagnostic() {
     const apolloKey = CONFIG.APOLLO_API_KEY;
     if (!apolloKey) return { ok: false, msg: "apollo_api_key no configurada en Supabase" };
     try {
-      const r = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+      const r = await fetch("https://api.apollo.io/v1/mixed_people/api_search", {
         method: "POST",
         headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3461,7 +3465,12 @@ async function validateProspect(card, data, doSendEmail) {
     if (doSendEmail && email) {
       const signature = await getGmailSignature();
       const lang      = data?.language || "es";
-      const bodyWithClosing = appendClosingIfMissing(pitch, lang);
+      // Sacar cierres viejos en cualquier idioma, luego agregar el correcto
+      const stripped = (pitch || "").replace(
+        /\n+\s*(best\s*regards|kind\s*regards|regards|sincerely|cheers|thanks|thank\s*you|best|saludos(?:\s*cordiales)?|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|abracos|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen)[.,!\s]*[\s\S]*$/i,
+        ""
+      ).trimEnd();
+      const bodyWithClosing = appendClosingIfMissing(stripped, lang);
       const fullBody  = bodyWithClosing + (signature ? "\n\n" + signature : "");
       const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
       if (!result.ok) throw new Error(result.error || "Gmail error");

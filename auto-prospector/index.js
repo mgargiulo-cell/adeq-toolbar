@@ -475,9 +475,10 @@ async function findAllEmails(domain, apolloApiKey) {
   if (!apolloApiKey) return [];
   const emails = [];
 
-  // /v1/people/match is deprecated (HTTP 422) — use only mixed_people/search
+  // /v1/people/match was deprecated — now /v1/mixed_people/search is ALSO deprecated.
+  // Current endpoint: /v1/mixed_people/api_search (per Apollo docs 2026-04)
   try {
-    const res = await fetch("https://api.apollo.io/v1/mixed_people/search", {
+    const res = await fetch("https://api.apollo.io/v1/mixed_people/api_search", {
       method: "POST",
       headers: { "X-Api-Key": apolloApiKey, "Content-Type": "application/json" },
       body: JSON.stringify({
