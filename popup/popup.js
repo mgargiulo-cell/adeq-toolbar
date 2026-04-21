@@ -726,7 +726,7 @@ async function runEmailScraper() {
       renderEmailList([]);
     }
   } catch {
-    el.textContent = "Error en scraping"; el.className = "email-value";
+    el.textContent = "Scraping error"; el.className = "email-value";
   }
 
   updateScore();
@@ -1125,10 +1125,10 @@ async function bindButtons() {
       // Guardar en historial de pitches de esta sesión (para anti-repetición)
       state.generatedPitches.push(result.body);
       if (state.generatedPitches.length > 5) state.generatedPitches.shift();
-      // Asuntos sugeridos
+      // Asuntos sugeridos — siempre overwrite con el primero del idioma correcto
       showSubjectChips(result.subjects);
       const subjectEl = document.getElementById("form-subject");
-      if (subjectEl && !subjectEl.value && result.subjects?.[0]) {
+      if (subjectEl && result.subjects?.[0]) {
         subjectEl.value = result.subjects[0];
       }
       btn.textContent = "✨ Regenerar";
@@ -1188,8 +1188,8 @@ async function bindButtons() {
       showSubjectChips(result.subjects);
 
       const subjectEl = document.getElementById("form-subject");
-      if (subjectEl && !subjectEl.value && result.subjects?.[0]) subjectEl.value = result.subjects[0];
-      else if (subjectEl && !subjectEl.value) subjectEl.value = `Partnership opportunity — ${state.domain}`;
+      if (subjectEl && result.subjects?.[0]) subjectEl.value = result.subjects[0];
+      // NO fallback en inglés — si Gemini no devolvió subjects, dejar vacío para que el user lo complete
 
       stepsEl.innerHTML = `
         <div class="autopush-step">✅ Pitch generado</div>
@@ -1498,7 +1498,7 @@ async function bindButtons() {
           <span class="import-meta">${item.traffic ? esc(formatTraffic(item.traffic)) + " vis" : ""}</span>
         </div>`).join("");
 
-      resultEl.textContent = `${selected.length} URLs — abriendo tabs...`;
+      resultEl.textContent = `${selected.length} URLs — opening tabs...`;
       resultEl.className = "push-result ok";
 
       // Abrir tabs con delay para que Chrome no las bloquee
@@ -1506,7 +1506,7 @@ async function bindButtons() {
         setTimeout(() => chrome.tabs.create({ url: item.url, active: false }), i * 400);
       });
 
-      resultEl.textContent = `✅ ${selected.length} tabs abiertas (${candidates.length - selected.length} más con estos filtros)`;
+      resultEl.textContent = `✅ ${selected.length} tabs opened (${candidates.length - selected.length} more with these filters)`;
 
     } catch (err) {
       resultEl.textContent = `❌ Error: ${err.message}`;
@@ -1554,11 +1554,11 @@ async function bindButtons() {
           <span class="import-meta">${item.traffic ? esc(formatTraffic(item.traffic)) + " vis" : ""}</span>
         </div>`).join("");
 
-      resultEl.textContent = `Subiendo ${selected.length} dominios a la cola...`;
+      resultEl.textContent = `Uploading ${selected.length} domains to queue...`;
 
       const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken);
 
-      resultEl.textContent = `✅ ${upload.inserted} agregadas a la cola (${selected.length - upload.inserted} ya estaban). Railway procesará si el toggle está ON.`;
+      resultEl.textContent = `✅ ${upload.inserted} added to queue (${selected.length - upload.inserted} already queued). Railway will process if toggle is ON.`;
       resultEl.className = "push-result ok";
 
     } catch (err) {
@@ -1585,7 +1585,7 @@ async function bindButtons() {
     const warn  = document.getElementById("gmail-mismatch-warn");
     const expected = (state.loginEmail || "").toLowerCase().trim();
 
-    btn.disabled = true; btn.textContent = "⏳ Autorizando...";
+    btn.disabled = true; btn.textContent = "⏳ Authorizing...";
     if (warn) { warn.style.display = "none"; warn.textContent = ""; warn.className = "gmail-mismatch"; }
 
     try {
@@ -1594,13 +1594,13 @@ async function bindButtons() {
       const token = await getGmailToken(true); // interactive — fuerza el prompt
 
       if (!token) {
-        showGmailFeedback("error", "No se pudo obtener la autorización. Revisá que hayas aceptado los permisos en el prompt de Google.");
+        showGmailFeedback("error", "Could not get authorization. Please accept permissions on the Google prompt.");
         return;
       }
 
       const profile = await getGmailProfile(false);
       if (!profile?.email) {
-        showGmailFeedback("error", "No se pudo leer el email de la cuenta Google. Intentá de nuevo o verificá los permisos.");
+        showGmailFeedback("error", "Could not read Google account email. Try again or check permissions.");
         try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" }); } catch {}
         await new Promise(r => chrome.identity.removeCachedAuthToken({ token }, r));
         return;
@@ -1610,9 +1610,9 @@ async function bindButtons() {
         // MISMATCH
         try { await fetch(`https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`, { method: "POST" }); } catch {}
         await new Promise(r => chrome.identity.removeCachedAuthToken({ token }, r));
-        showGmailFeedback("warn", `Elegiste ${profile.email} pero tenés que firmar con ${expected}. Volvé a intentar y elegí la cuenta correcta.`);
+        showGmailFeedback("warn", `You picked ${profile.email} but must sign in with ${expected}. Try again and select the correct account.`);
       } else {
-        showGmailFeedback("ok", `✓ Gmail conectado: ${profile.email}`);
+        showGmailFeedback("ok", `✓ Gmail connected: ${profile.email}`);
       }
     } finally {
       btn.disabled = false; btn.textContent = "Sign in to Gmail";
@@ -1623,7 +1623,7 @@ async function bindButtons() {
   // Gmail sign-out (revoca el token y limpia caché)
   document.getElementById("btn-gmail-signout")?.addEventListener("click", async () => {
     const btn = document.getElementById("btn-gmail-signout");
-    btn.disabled = true; btn.textContent = "⏳ Cerrando...";
+    btn.disabled = true; btn.textContent = "⏳ Closing...";
     try {
       const token = await getGmailToken(false);
       if (token) {
@@ -1631,9 +1631,9 @@ async function bindButtons() {
         await new Promise(resolve => chrome.identity.removeCachedAuthToken({ token }, resolve));
       }
       await clearAllCachedTokens();
-      showGmailFeedback("ok", "✓ Sesión de Gmail cerrada. Hacé Sign in to Gmail para volver a conectar.");
+      showGmailFeedback("ok", "✓ Gmail signed out. Click Sign in to Gmail to reconnect.");
     } catch (e) {
-      showGmailFeedback("error", `Error cerrando sesión: ${e.message}`);
+      showGmailFeedback("error", `Sign-out error: ${e.message}`);
     }
     btn.disabled = false; btn.textContent = "Sign out Gmail";
     await refreshGmailStatus();
@@ -1644,10 +1644,10 @@ async function bindButtons() {
     state.gmailEmail = "";
     const assocEl  = document.getElementById("settings-gmail-assoc");
     const dissocEl = document.getElementById("btn-dissoc-gmail");
-    if (assocEl)  assocEl.textContent     = "Sin asociar";
+    if (assocEl)  assocEl.textContent     = "Not linked";
     if (dissocEl) dissocEl.style.display  = "none";
     const fromEl = document.getElementById("gmail-from");
-    if (fromEl)   fromEl.textContent      = "Desde: sin asociar";
+    if (fromEl)   fromEl.textContent      = "From: not linked";
   });
   document.getElementById("modal-overlay").addEventListener("click", closeSettings);
   document.getElementById("btn-run-diag").addEventListener("click", runDiagnostic);
@@ -1661,7 +1661,7 @@ async function bindButtons() {
     // Al mostrar, refrescar el count
     if (panel.style.display !== "none") {
       const countEl = document.getElementById("kw-db-count-inline");
-      if (countEl) countEl.textContent = `${dbKeywords.length} frases importadas`;
+      if (countEl) countEl.textContent = `${dbKeywords.length} phrases imported`;
     }
   });
 
@@ -1670,7 +1670,7 @@ async function bindButtons() {
     const file = e.target.files[0];
     if (!file) return;
     const resultEl = document.getElementById("kw-import-result");
-    resultEl.textContent = "Procesando...";
+    resultEl.textContent = "Processing...";
     const reader = new FileReader();
     reader.onload = async (ev) => {
       const text = ev.target.result;
@@ -1685,7 +1685,7 @@ async function bindButtons() {
       dbKeywords = [...dbKeywords, ...rows.map(r => ({ kw: r.phrase, lang: r.lang, db: true }))];
       resultEl.textContent = `✅ ${count} frases importadas (total: ${dbKeywords.length})`;
       const countEl = document.getElementById("kw-db-count-inline");
-      if (countEl) countEl.textContent = `${dbKeywords.length} frases importadas`;
+      if (countEl) countEl.textContent = `${dbKeywords.length} phrases imported`;
       e.target.value = "";
       filterKeywords();
     };
@@ -1693,14 +1693,14 @@ async function bindButtons() {
   });
 
   document.getElementById("btn-kw-delete-all-inline")?.addEventListener("click", async () => {
-    if (!confirm("¿Borrar TODAS las frases de la base de keywords?")) return;
+    if (!confirm("Delete ALL phrases from the keyword database?")) return;
     const resultEl = document.getElementById("kw-import-result");
-    resultEl.textContent = "Limpiando...";
+    resultEl.textContent = "Clearing...";
     await clearKeywordsDB();
     dbKeywords = [];
     const countEl = document.getElementById("kw-db-count-inline");
     if (countEl) countEl.textContent = "0 frases";
-    resultEl.textContent = "✅ Base de keywords limpiada";
+    resultEl.textContent = "✅ Keyword database cleared";
     filterKeywords();
   });
 }
@@ -1755,7 +1755,7 @@ async function refreshGmailStatus() {
   warnEl.textContent   = "";
 
   if (!profile?.email) {
-    emailEl.textContent   = "No conectado";
+    emailEl.textContent   = "Not connected";
     badgeEl.textContent   = "OFF";
     badgeEl.className     = "gmail-status-badge off";
     connectBtn.style.display = "inline-block";
@@ -1770,7 +1770,7 @@ async function refreshGmailStatus() {
   if (expected && profile.email !== expected) {
     badgeEl.textContent = "MISMATCH";
     badgeEl.className   = "gmail-status-badge mismatch";
-    warnEl.textContent  = `⚠ Chrome está logueado como ${profile.email}, pero entraste a la toolbar como ${expected}. Sign out y volvé a conectar con la cuenta correcta.`;
+    warnEl.textContent  = `⚠ Chrome is signed in as ${profile.email}, but you logged into the toolbar as ${expected}. Sign out and reconnect with the correct account.`;
     warnEl.style.display = "block";
   } else {
     badgeEl.textContent = "ON";
@@ -2223,7 +2223,7 @@ function appendCascadeItem(site, container) {
 
 function updateCascadeSummary() {
   const el = document.getElementById("cascade-summary");
-  if (el) el.textContent = `${cascadeSelected.size} seleccionados de ${cascadeResults.length}`;
+  if (el) el.textContent = `${cascadeSelected.size} selected of ${cascadeResults.length}`;
 }
 
 // Re-aplica los filtros actuales a los raw results (sin re-consultar la API)
@@ -2280,7 +2280,7 @@ function applyCascadeFilters() {
     updateCascadeSummary();
   }
 
-  if (statusEl) statusEl.textContent = `✅ ${cascadeResults.length} resultados con los filtros aplicados (de ${cascadeRawResults.length} totales)`;
+  if (statusEl) statusEl.textContent = `✅ ${cascadeResults.length} results matching filters (of ${cascadeRawResults.length} total)`;
 }
 
 function openCascadeSelected() {
@@ -2504,17 +2504,17 @@ function initLoginScreen() {
       "dhorovitz@adeqmedia.com",
     ]);
 
-    if (!email) { errorEl.textContent = "Ingresá tu email primero"; return; }
-    if (!AUTHORIZED_RESET.has(email)) { errorEl.textContent = "Email no autorizado"; return; }
+    if (!email) { errorEl.textContent = "Enter your email first"; return; }
+    if (!AUTHORIZED_RESET.has(email)) { errorEl.textContent = "Email not authorized"; return; }
 
-    forgotBtn.disabled = true; forgotBtn.textContent = "Enviando...";
+    forgotBtn.disabled = true; forgotBtn.textContent = "Sending...";
     const result = await supabaseResetPassword(email);
     forgotBtn.disabled = false; forgotBtn.textContent = "Forgot password?";
 
     if (result.error) {
       errorEl.textContent = result.error;
     } else {
-      infoEl.textContent = "✓ Te enviamos un email con el link para resetear la contraseña.";
+      infoEl.textContent = "✓ Password reset email sent.";
     }
   });
 
@@ -2639,7 +2639,7 @@ async function initCsvQueue() {
 
   const refreshHistory = async () => {
     if (!historyEl) return;
-    historyEl.textContent = "Cargando...";
+    historyEl.textContent = "Loading...";
     const rows = await getCsvQueueHistory(state.accessToken, 30, currentHistorySource);
     if (rows.length === 0) {
       historyEl.innerHTML = `<div style="color:var(--text-muted);font-style:italic">Aún no hay dominios procesados en "${currentHistorySource === "csv" ? "CSV externo" : "Monday"}"</div>`;
@@ -2674,10 +2674,21 @@ async function initCsvQueue() {
 
   const refreshAll = async () => { await Promise.all([refreshStats(), refreshHistory()]); };
 
+  // Auto-refresh cada 10s cuando AUTO ON está activo
+  let heartbeatTimer = null;
+  const startHeartbeat = () => {
+    if (heartbeatTimer) return;
+    heartbeatTimer = setInterval(() => { refreshStats(); refreshHistory(); }, 10_000);
+  };
+  const stopHeartbeat = () => { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } };
+
   // Estado inicial del toggle
   enabledCbx.checked = await getCsvQueueEnabled(state.accessToken);
+  if (enabledCbx.checked) startHeartbeat();
   enabledCbx.addEventListener("change", async () => {
     await setCsvQueueEnabled(enabledCbx.checked, state.accessToken);
+    if (enabledCbx.checked) startHeartbeat();
+    else stopHeartbeat();
   });
 
   refreshBtn.addEventListener("click", refreshStats);
@@ -2703,7 +2714,7 @@ async function initCsvQueue() {
         .map(d => d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "").toLowerCase())
         .filter(d => d.includes(".") && !d.includes(" "));
 
-      if (domains.length === 0) { uploadRes.textContent = "No se encontraron dominios válidos"; uploadRes.className = "push-result error"; return; }
+      if (domains.length === 0) { uploadRes.textContent = "No valid domains found"; uploadRes.className = "push-result error"; return; }
 
       // Dedupe
       const unique = [...new Set(domains)];
@@ -2711,14 +2722,14 @@ async function initCsvQueue() {
       // Aviso si pasa el límite diario de 75 — solo se procesarán los primeros 75 hoy
       if (unique.length > 75) {
         const ok = confirm(`⚠️ Subiste ${unique.length} dominios pero el límite es 75/día por usuario.\n\nLos primeros 75 se procesarán hoy y el resto los siguientes días automáticamente.\n\n¿Continuar?`);
-        if (!ok) { uploadRes.textContent = "Upload cancelado."; uploadRes.className = "push-result"; return; }
+        if (!ok) { uploadRes.textContent = "Upload canceled."; uploadRes.className = "push-result"; return; }
       }
 
-      uploadRes.textContent = `Subiendo ${unique.length} dominios...`;
+      uploadRes.textContent = `Uploading ${unique.length} domains...`;
 
       const result = await uploadCsvDomains(unique, state.loginEmail, state.accessToken);
-      const note = unique.length > 75 ? ` Se procesarán 75/día.` : "";
-      uploadRes.textContent = `✅ ${result.inserted} agregados (${result.attempted - result.inserted} duplicados ignorados).${note}`;
+      const note = unique.length > 75 ? ` 75/day will be processed.` : "";
+      uploadRes.textContent = `✅ ${result.inserted} added (${result.attempted - result.inserted} duplicates ignored).${note}`;
       uploadRes.className = "push-result ok";
       fileInput.value = "";
       await refreshAll();
@@ -2738,7 +2749,7 @@ async function initCsvQueue() {
     const idioma   = document.getElementById("refresh-idioma").value;
     const limit    = parseInt(document.getElementById("refresh-limit").value) || 75;
 
-    btn.disabled = true; btn.textContent = "⏳ Buscando en Monday...";
+    btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
     resultEl.textContent = ""; resultEl.className = "push-result";
 
     try {
@@ -2748,9 +2759,9 @@ async function initCsvQueue() {
         resultEl.className = "push-result error";
         return;
       }
-      resultEl.textContent = `Encontrados ${domains.length}, subiendo a la cola...`;
+      resultEl.textContent = `Found ${domains.length}, uploading to queue...`;
       const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken, "monday");
-      resultEl.textContent = `✅ ${up.inserted} agregados (${domains.length - up.inserted} ya estaban). Railway procesa 75/día/user.`;
+      resultEl.textContent = `✅ ${up.inserted} added (${domains.length - up.inserted} already queued). Railway processes 75/day/user.`;
       resultEl.className = "push-result ok";
       await refreshAll();
     } catch (err) {
@@ -2762,13 +2773,13 @@ async function initCsvQueue() {
   });
 
   clearProc.addEventListener("click", async () => {
-    if (!confirm("¿Borrar todas las entradas procesadas (done/error/skipped) de la cola?")) return;
+    if (!confirm("Delete all processed entries (done/error/skipped) from the queue?")) return;
     await clearCsvQueue(state.accessToken, true);
     await refreshAll();
   });
 
   clearAll.addEventListener("click", async () => {
-    if (!confirm("⚠️ Borrar TODAS las entradas de la cola CSV (incluidas las pendientes)?")) return;
+    if (!confirm("⚠️ Delete ALL entries from the CSV queue (including pending)?")) return;
     await clearCsvQueue(state.accessToken, false);
     await refreshStats();
   });
@@ -2889,8 +2900,8 @@ function initPitchDrafts() {
     const body    = bodyEl.value.trim();
     const language = langEl.value;
     const subject  = subjectEl.value.trim();
-    if (!name)    { resultEl.textContent = "❌ Falta el nombre"; resultEl.style.color = "#e53e3e"; return; }
-    if (!body)    { resultEl.textContent = "❌ Falta el cuerpo del email"; resultEl.style.color = "#e53e3e"; return; }
+    if (!name)    { resultEl.textContent = "❌ Name is required"; resultEl.style.color = "#e53e3e"; return; }
+    if (!body)    { resultEl.textContent = "❌ Email body is required"; resultEl.style.color = "#e53e3e"; return; }
 
     saveBtn.disabled = true; saveBtn.textContent = "⏳...";
     const result = await savePitchDraft(state.accessToken, {
@@ -2899,7 +2910,7 @@ function initPitchDrafts() {
     saveBtn.disabled = false; saveBtn.textContent = "💾 Guardar";
 
     if (result.ok) {
-      resultEl.textContent = editingId ? "✅ Actualizado" : "✅ Guardado";
+      resultEl.textContent = editingId ? "✅ Updated" : "✅ Saved";
       resultEl.style.color = "#16a34a";
       editingId = result.data?.id || null;
       modeLbl.textContent = editingId ? `Editando: ${name}` : "Nuevo borrador";
@@ -3030,8 +3041,8 @@ function setAutopilotUI(btn, enabled) {
   const labelEl = btn.querySelector(".autopilot-label");
   if (labelEl) labelEl.textContent = enabled ? "AUTO ON" : "AUTO OFF";
   btn.title = enabled
-    ? "Autopilot ON — corre 15 min y se apaga solo. Click para apagar ahora."
-    : "Autopilot OFF — click para activar (15 min)";
+    ? "Autopilot ON — runs 1h then shuts off. Click to turn off now."
+    : "Autopilot OFF — click to activate (1h)";
 }
 
 async function logout() {
@@ -3056,6 +3067,8 @@ function defaultStatusForOwner(_owner) {
   return "4"; // Propuesta Vigente (T) — default para envíos/updates desde la toolbar
 }
 
+let _cachedProspectDrafts = []; // cache de borradores para los dropdowns de las cards
+
 async function loadProspectsTab() {
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
@@ -3066,12 +3079,13 @@ async function loadProspectsTab() {
   let rows = [];
   let dailyCount = 0;
   try {
-    [rows, dailyCount] = await Promise.all([
+    [rows, dailyCount, _cachedProspectDrafts] = await Promise.all([
       fetchReviewQueue(state.accessToken),
       getDailyValidationCount(state.accessToken, state.loginEmail),
+      getPitchDrafts(state.accessToken, state.loginEmail),
     ]);
   } catch (err) {
-    listEl.innerHTML = `<div class="cascade-empty" style="color:#e53e3e">❌ Error cargando prospectos: ${esc(err.message || String(err))}</div>`;
+    listEl.innerHTML = `<div class="cascade-empty" style="color:#e53e3e">❌ Error loading prospects: ${esc(err.message || String(err))}</div>`;
     return;
   }
 
@@ -3199,11 +3213,16 @@ function renderProspectCard(r) {
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
       <!-- Pitch -->
-      <div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 4px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 4px;gap:4px">
         <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">Email</div>
-        <button class="btn btn-sm pcard-generate-btn" style="font-size:10px;padding:2px 8px;background:var(--primary);color:#fff;border:none;border-radius:4px;cursor:pointer">
-          ${r.pitch ? "✨ Regenerate" : "✨ Generate pitch"}
-        </button>
+        <div style="display:flex;gap:4px">
+          <select class="pcard-draft-select form-select" style="font-size:10px;padding:2px 6px;max-width:140px">
+            <option value="">📋 Load draft...</option>
+          </select>
+          <button class="btn btn-sm pcard-generate-btn" style="font-size:10px;padding:2px 8px;background:var(--primary);color:#fff;border:none;border-radius:4px;cursor:pointer">
+            ${r.pitch ? "✨ Regenerate" : "✨ Generate"}
+          </button>
+        </div>
       </div>
       ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-bottom:5px">📡 Ad networks detected: ${esc(adNetworks.join(", "))}</div>` : ""}
       <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
@@ -3253,6 +3272,41 @@ function initProspectCard(card, data) {
     panel.style.display = open ? "block" : "none";
     btn.textContent     = open ? "▲" : "▼";
   });
+
+  // Draft dropdown — populate + handler
+  const draftSelect = card.querySelector(".pcard-draft-select");
+  if (draftSelect && _cachedProspectDrafts.length > 0) {
+    const langGroups = { es: [], en: [], pt: [], it: [], fr: [], de: [], ar: [] };
+    for (const d of _cachedProspectDrafts) {
+      if (langGroups[d.language]) langGroups[d.language].push(d);
+    }
+    const langLabel = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", fr:"🇫🇷 FR", de:"🇩🇪 DE", ar:"🇸🇦 AR" };
+    for (const [lang, drafts] of Object.entries(langGroups)) {
+      if (drafts.length === 0) continue;
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = langLabel[lang] || lang.toUpperCase();
+      for (const d of drafts) {
+        const opt = document.createElement("option");
+        opt.value = d.id;
+        opt.textContent = d.name + (d.user_email === "_default_" ? " · default" : "");
+        optgroup.appendChild(opt);
+      }
+      draftSelect.appendChild(optgroup);
+    }
+    draftSelect.addEventListener("change", (e) => {
+      const id = e.target.value;
+      if (!id) return;
+      const draft = _cachedProspectDrafts.find(x => String(x.id) === id);
+      if (!draft) return;
+      // Replace {{domain}} placeholder and inject
+      const replaceVars = (s) => (s || "").replace(/\{\{domain\}\}/g, data.domain);
+      const pitchEl   = card.querySelector(".pcard-pitch");
+      const subjectEl = card.querySelector(".pcard-subject");
+      if (pitchEl)   pitchEl.value   = replaceVars(draft.body);
+      if (subjectEl) subjectEl.value = replaceVars(draft.subject || "");
+      draftSelect.value = ""; // reset after selection
+    });
+  }
 
   // Subject chips — click selects subject into input
   card.querySelectorAll(".pcard-subject-chip").forEach(chip => {

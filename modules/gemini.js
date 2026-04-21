@@ -202,12 +202,14 @@ RULES:
 - The email must read as a cohesive whole — not a list of disconnected facts.
 - Every email must feel freshly written — vary sentence structure, word choice, and angle.
 
+CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Do NOT include any English if the target is not English. Every word, every subject line, every sentence — in ${langName}.
+
 OUTPUT: Respond with a valid JSON object — no markdown, no extra text:
 {
-  "body": "the complete email body (no sign-off at the end)",
-  "subjects": ["Subject line 1", "Subject line 2", "Subject line 3"]
+  "body": "the complete email body in ${langName} (no sign-off at the end)",
+  "subjects": ["subject 1 in ${langName}", "subject 2 in ${langName}", "subject 3 in ${langName}"]
 }
-The 3 subject lines must be in ${langName}, compelling, 6-10 words each, and varied in angle.`;
+All 3 subject lines must be in ${langName}, compelling, 6-10 words each, and varied in angle.`;
 
   const userMessage = `Site: ${domain}
 Monthly traffic: ${trafficStr} visits

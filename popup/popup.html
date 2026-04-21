@@ -228,12 +228,12 @@
         <label class="form-label">Idioma</label>
         <select id="form-idioma" class="form-select">
           <option value="">— select —</option>
-          <option value="0">Ingles</option>
-          <option value="1">Español</option>
-          <option value="2">Italiano</option>
-          <option value="3">Portugues</option>
+          <option value="0">English</option>
+          <option value="1">Spanish</option>
+          <option value="2">Italian</option>
+          <option value="3">Portuguese</option>
           <option value="5">¿Idioma?</option>
-          <option value="6">Arabe</option>
+          <option value="6">Arabic</option>
         </select>
 
         <label class="form-label">GEO</label>
@@ -322,7 +322,7 @@
           <option value="en">English</option>
           <option value="es">Spanish</option>
           <option value="it">Italian</option>
-          <option value="pt">Portuguese</option>
+          <option value="pt">Portuguesee</option>
           <option value="ar">Arabic</option>
         </select>
         <select id="pitch-category" class="category-select" title="Site category" style="font-size:11px;padding:2px 4px;">
@@ -379,7 +379,7 @@
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
         <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
-        <button id="btn-pitch-draft" class="btn btn-secondary btn-sm" title="Seleccionar un borrador guardado">📋 Borrador</button>
+        <button id="btn-pitch-draft" class="btn btn-secondary btn-sm" title="Seleccionar un borrador guardado">📋 Draft</button>
         <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Save as style example">👍</button>
         <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Gemini will avoid it">👎</button>
         <span id="pitch-like-status" class="pitch-like-status"></span>
@@ -420,7 +420,7 @@
     <!-- Import CSV (colapsable, oculto por default) -->
     <div id="kw-import-panel" style="display:none; margin-bottom:10px; padding:8px; background:var(--bg); border-radius:6px">
       <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px; line-height:1.4">
-        Subí un CSV con frases (una por línea). Se guardan en Supabase y rotan automáticamente acá.
+        Upload a CSV con frases (una por línea). Se guardan en Supabase y rotan automáticamente acá.
       </div>
       <input id="kw-csv-input" type="file" accept=".csv,.txt" style="font-size:11px; width:100%; margin-bottom:6px" />
       <div id="kw-import-result" style="font-size:10px; color:var(--text-muted)"></div>
@@ -435,7 +435,7 @@
         <option value="">All languages</option>
         <option value="en">English</option>
         <option value="es">Spanish</option>
-        <option value="pt">Portuguese</option>
+        <option value="pt">Portuguesee</option>
         <option value="it">Italian</option>
         <option value="ar">Arabic</option>
       </select>
@@ -447,9 +447,9 @@
     </div>
   </section>
 
-  <!-- Buscar similar websites (abajo de keywords) -->
+  <!-- Find similar websites (abajo de keywords) -->
   <section class="card">
-    <div class="card-title"><span class="icon">🔍</span> Buscar similar websites</div>
+    <div class="card-title"><span class="icon">🔍</span> Find similar websites</div>
     <div class="seed-row">
       <input id="cascade-seed" type="text" class="seed-input" placeholder="e.g. nytimes.com" />
       <button id="btn-cascade-start" class="btn btn-primary btn-sm">Search</button>
@@ -459,7 +459,7 @@
 
   <!-- Filters -->
   <section class="card card-tight">
-    <div class="card-title"><span class="icon">🎚️</span> Filtros</div>
+    <div class="card-title"><span class="icon">🎚️</span> Filters</div>
     <div class="filter-grid">
 
       <label class="filter-label">Traffic range</label>
@@ -642,8 +642,8 @@
   <section class="card" style="padding:12px; background:linear-gradient(135deg,#0f172a,#1e293b); border:1px solid #334155; color:#fff">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
-        <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 Autopilot — Descubrimiento automático</div>
-        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Corre 1h, encuentra sitios nuevos en internet y los agrega acá para revisar. Límite 75/día por usuario.</div>
+        <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 Autopilot — Automatic discovery</div>
+        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Runs for 1h, finds new sites on the web and adds them here for review. Limit 75/day per user.</div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <button id="btn-autopilot-target" class="icon-btn" title="Target (GEO + Categoría)" style="font-size:13px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:#fff">🎯</button>
@@ -688,10 +688,10 @@
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
        SECCIÓN 1/3 — IMPORT MANUAL (abrir tabs / encolar)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
-  <div class="import-section-label">①  IMPORT URLS DESDE MONDAY</div>
+  <div class="import-section-label">①  IMPORT URLS FROM MONDAY</div>
   <section class="card">
     <div class="card-title">📥 Import URLs from Monday</div>
-    <p class="import-desc">Trae 15 URLs con estado <strong>Ciclo Finalizado</strong> del board filtradas por Geo, Idioma y Tráfico. Se abren en nuevas tabs para revisar manualmente, o se pueden encolar para el auto-prospector.</p>
+    <p class="import-desc">Fetches 15 URLs with <strong>Ciclo Finalizado</strong> status from the board, filtered by Geo, Language and Traffic. Opens in new tabs for manual review, or queues them for the auto-prospector.</p>
 
     <div class="import-filters">
       <div class="import-filter-row">
@@ -754,15 +754,15 @@
         </select>
       </div>
       <div class="import-filter-row">
-        <span class="form-label">Idioma</span>
+        <span class="form-label">Language</span>
         <select id="import-idioma" class="form-select">
           <option value="">Todos</option>
           <!-- Values = Monday status index for estado_12 column -->
-          <option value="0">Ingles</option>
-          <option value="1">Español</option>
-          <option value="2">Italiano</option>
-          <option value="3">Portugues</option>
-          <option value="6">Arabe</option>
+          <option value="0">English</option>
+          <option value="1">Spanish</option>
+          <option value="2">Italian</option>
+          <option value="3">Portuguese</option>
+          <option value="6">Arabic</option>
         </select>
       </div>
       <div class="import-filter-row">
@@ -804,13 +804,13 @@
 
   <!-- MONDAY CSV AUTO PROSPECTOR — subí CSV para refrescar datos existentes -->
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-       SECCIÓN 2/3 — CSV externo (URLs que NO están en Monday)
+       SECCIÓN 2/3 — External CSV (URLs que NO están en Monday)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <div class="import-section-label" style="margin-top:20px">②  EXTERNAL URLS AUTO PROSPECTOR (CSV)</div>
   <section class="card">
     <div class="card-title">📤 External URLs Auto Prospector</div>
-    <p class="import-desc">Subí un CSV (1 dominio por línea) con URLs <strong>externas</strong>. El auto-prospector las procesa en background: analiza tráfico, emails, y las pushea a Monday como prospectos nuevos.</p>
-    <p class="import-warn">⚠️ <strong>AUTO ON</strong> debe estar activado abajo para que se procesen. Límite: <strong>75/día/usuario</strong>.</p>
+    <p class="import-desc">Upload a CSV (1 dominio por línea) con URLs <strong>externas</strong>. El auto-prospector las procesa en background: analiza tráfico, emails, y las pushea a Monday como prospectos nuevos.</p>
+    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
@@ -818,7 +818,7 @@
     </div>
     <div id="csv-upload-result" class="push-result" style="min-height:16px;font-size:11px"></div>
 
-    <!-- Historial CSV externo (queda más abajo, compartido con sección 3) -->
+    <!-- Historial External CSV (queda más abajo, compartido con sección 3) -->
   </section>
 
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -828,8 +828,8 @@
   <div class="import-section-label" style="margin-top:20px">③  MONDAY URL AUTO PROSPECTOR</div>
   <section class="card">
     <div class="card-title">🔄 Monday URL Auto Prospector</div>
-    <p class="import-desc">Busca dominios que <strong>ya están en Monday</strong> con estado <strong>Ciclo Finalizado</strong> (filtrados por Geo e Idioma) y los re-prospecta en background. Refresca email, tráfico, geo, y los deja en <strong>Propuesta Vigente (T)</strong>.</p>
-    <p class="import-warn">⚠️ <strong>AUTO ON</strong> debe estar activado abajo para que se procesen. Límite: <strong>75/día/usuario</strong>.</p>
+    <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
+    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
       <select id="refresh-geo" class="form-select" style="font-size:11px">
@@ -859,23 +859,23 @@
         <option value="Australia">Australia</option>
       </select>
       <select id="refresh-idioma" class="form-select" style="font-size:11px">
-        <option value="">Idioma: All</option>
-        <option value="0">Ingles</option>
-        <option value="1">Español</option>
-        <option value="2">Italiano</option>
-        <option value="3">Portugues</option>
-        <option value="6">Arabe</option>
+        <option value="">Language: All</option>
+        <option value="0">English</option>
+        <option value="1">Spanish</option>
+        <option value="2">Italian</option>
+        <option value="3">Portuguese</option>
+        <option value="6">Arabic</option>
       </select>
-      <input id="refresh-limit" type="number" class="form-input" min="1" max="75" value="75" style="font-size:11px; padding:6px" title="Cantidad máxima (75/día/user)" />
+      <input id="refresh-limit" type="number" class="form-input" min="1" max="75" value="75" style="font-size:11px; padding:6px" title="Max quantity (75/day/user)" />
     </div>
-    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Buscar y encolar desde Monday</button>
+    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
   </section>
 
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
        COLA + HISTORIAL COMPARTIDO (para secciones 2 y 3)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
-  <div class="import-section-label" style="margin-top:20px">🚦  ESTADO DE LA COLA (secciones 2 y 3)</div>
+  <div class="import-section-label" style="margin-top:20px">🚦  QUEUE STATUS (sections 2 &amp; 3)</div>
   <section class="card">
     <div style="margin-bottom:10px;padding:10px;background:var(--bg);border-radius:6px;font-size:11px">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -889,15 +889,15 @@
     <div style="margin-bottom:10px;padding:10px;background:#fff7ed;border:2px solid #fb923c;border-radius:6px">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;font-weight:600">
         <input id="csv-queue-enabled" type="checkbox" style="width:16px;height:16px" />
-        <span>🟢 AUTO ON — Railway procesa automáticamente</span>
+        <span>🟢 AUTO ON — Railway processes automatically</span>
       </label>
-      <div style="font-size:10px; color:var(--text-muted); margin-top:4px; margin-left:24px">Si está OFF, las URLs se encolan pero no se procesan.</div>
+      <div style="font-size:10px; color:var(--text-muted); margin-top:4px; margin-left:24px">If OFF, URLs are queued but not processed.</div>
     </div>
 
-    <!-- HISTORIAL tabs: CSV externo / Monday -->
+    <!-- HISTORIAL tabs: External CSV / Monday -->
     <div style="margin-top:10px">
       <div style="display:flex;gap:8px;margin-bottom:8px;border-bottom:1px solid var(--border)">
-        <button id="tab-history-csv" class="history-tab-btn history-tab-active" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid var(--primary);cursor:pointer">CSV externo</button>
+        <button id="tab-history-csv" class="history-tab-btn history-tab-active" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid var(--primary);cursor:pointer">External CSV</button>
         <button id="tab-history-monday" class="history-tab-btn" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid transparent;cursor:pointer">Monday</button>
         <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px;margin-left:auto">↻</button>
       </div>
@@ -936,7 +936,7 @@
         <button id="btn-gmail-connect" class="btn btn-secondary btn-sm" style="font-size:11px">Sign in to Gmail</button>
         <button id="btn-gmail-signout" class="btn btn-secondary btn-sm" style="font-size:11px;display:none">Sign out Gmail</button>
       </div>
-      <div class="settings-gmail-hint">Los emails se envían desde esta cuenta. Debe coincidir con tu login de la toolbar.</div>
+      <div class="settings-gmail-hint">Emails are sent from this account. Must match your toolbar login.</div>
     </div>
 
     <div class="modal-actions">
@@ -944,7 +944,7 @@
     </div>
     <!-- KEYWORD DATABASE movido a Cascade → Google Keywords (⬆️ Import CSV) -->
     <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; font-size:11px; color:var(--text-muted)">
-      💡 Keyword DB ahora está en la pestaña <strong>Cascade → Google Keywords → ⬆️ Import CSV</strong>.
+      💡 The Keyword DB is now in the <strong>Cascade → Google Keywords → ⬆️ Import CSV</strong> tab.
     </div>
 
     <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
@@ -971,7 +971,7 @@
   <div class="modal-overlay" id="drafts-modal-overlay"></div>
   <div class="modal-content" style="max-width:480px">
     <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center">
-      <span>📋 Borradores de pitch</span>
+      <span>📋 Pitch Drafts</span>
       <button id="btn-drafts-close" class="icon-btn" style="font-size:14px">✕</button>
     </div>
 
@@ -979,26 +979,26 @@
 
     <div style="border-top:1px solid var(--border); padding-top:10px; margin-top:8px">
       <div style="font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:.4px; margin-bottom:6px">
-        <span id="drafts-form-mode">Nuevo borrador</span>
+        <span id="drafts-form-mode">New draft</span>
       </div>
-      <input id="draft-name" type="text" class="form-input" placeholder="Nombre del borrador (ej: Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
+      <input id="draft-name" type="text" class="form-input" placeholder="Draft name (e.g.: Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
       <div style="display:flex; gap:6px; margin-bottom:6px">
         <select id="draft-language" class="form-select" style="flex:1; font-size:12px">
-          <option value="es">Español</option>
+          <option value="es">Spanish</option>
           <option value="en">English</option>
           <option value="pt">Português</option>
-          <option value="it">Italiano</option>
+          <option value="it">Italian</option>
           <option value="fr">Français</option>
           <option value="de">Deutsch</option>
           <option value="ar">العربية</option>
         </select>
-        <input id="draft-subject" type="text" class="form-input" placeholder="Asunto (opcional)" style="flex:2; font-size:12px" />
+        <input id="draft-subject" type="text" class="form-input" placeholder="Subject (optional)" style="flex:2; font-size:12px" />
       </div>
-      <textarea id="draft-body" class="form-input" placeholder="Cuerpo del email... Usá {{domain}} como placeholder." style="width:100%; min-height:120px; font-size:12px; font-family:inherit"></textarea>
+      <textarea id="draft-body" class="form-input" placeholder="Email body... Use {{domain}} as placeholder." style="width:100%; min-height:120px; font-size:12px; font-family:inherit"></textarea>
 
       <div style="display:flex; gap:6px; margin-top:8px">
-        <button id="btn-draft-save" class="btn btn-primary btn-sm" style="flex:1">💾 Guardar</button>
-        <button id="btn-draft-new" class="btn btn-secondary btn-sm">➕ Nuevo</button>
+        <button id="btn-draft-save" class="btn btn-primary btn-sm" style="flex:1">💾 Save</button>
+        <button id="btn-draft-new" class="btn btn-secondary btn-sm">➕ New</button>
         <button id="btn-draft-delete" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e;display:none">🗑</button>
       </div>
       <div id="draft-save-result" style="font-size:11px; margin-top:6px; min-height:14px"></div>
