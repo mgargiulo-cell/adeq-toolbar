@@ -15,6 +15,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
+         getPitchDrafts, savePitchDraft, deletePitchDraft,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
@@ -1567,6 +1568,9 @@ async function bindButtons() {
   // CSV Bulk Queue — Auto-prospector refresh de dominios en Monday
   await initCsvQueue();
 
+  // Pitch drafts — modal para cargar/editar/guardar borradores
+  initPitchDrafts();
+
   // Settings
   document.getElementById("btn-settings").addEventListener("click", openSettings);
   document.getElementById("btn-close-settings").addEventListener("click", closeSettings);
@@ -1645,8 +1649,20 @@ async function bindButtons() {
   document.getElementById("btn-run-diag").addEventListener("click", runDiagnostic);
   document.getElementById("btn-logout").addEventListener("click", logout);
 
-  // Keywords DB — importar CSV desde settings
-  document.getElementById("settings-csv-input").addEventListener("change", async (e) => {
+  // Toggle panel de import de keywords (Cascade → Google Keywords)
+  document.getElementById("btn-kw-import-toggle")?.addEventListener("click", () => {
+    const panel = document.getElementById("kw-import-panel");
+    if (!panel) return;
+    panel.style.display = panel.style.display === "none" ? "block" : "none";
+    // Al mostrar, refrescar el count
+    if (panel.style.display !== "none") {
+      const countEl = document.getElementById("kw-db-count-inline");
+      if (countEl) countEl.textContent = `${dbKeywords.length} frases importadas`;
+    }
+  });
+
+  // Keywords DB — importar CSV (ahora desde Cascade → Google Keywords)
+  document.getElementById("kw-csv-input")?.addEventListener("change", async (e) => {
     const file = e.target.files[0];
     if (!file) return;
     const resultEl = document.getElementById("kw-import-result");
@@ -1664,19 +1680,22 @@ async function bindButtons() {
       const { count } = await importKeywordsToDB(rows);
       dbKeywords = [...dbKeywords, ...rows.map(r => ({ kw: r.phrase, lang: r.lang, db: true }))];
       resultEl.textContent = `✅ ${count} frases importadas (total: ${dbKeywords.length})`;
-      document.getElementById("kw-db-count").textContent = `${dbKeywords.length} frases`;
+      const countEl = document.getElementById("kw-db-count-inline");
+      if (countEl) countEl.textContent = `${dbKeywords.length} frases importadas`;
       e.target.value = "";
       filterKeywords();
     };
     reader.readAsText(file);
   });
 
-  document.getElementById("btn-kw-delete-all").addEventListener("click", async () => {
+  document.getElementById("btn-kw-delete-all-inline")?.addEventListener("click", async () => {
+    if (!confirm("¿Borrar TODAS las frases de la base de keywords?")) return;
     const resultEl = document.getElementById("kw-import-result");
     resultEl.textContent = "Limpiando...";
     await clearKeywordsDB();
     dbKeywords = [];
-    document.getElementById("kw-db-count").textContent = "0 frases";
+    const countEl = document.getElementById("kw-db-count-inline");
+    if (countEl) countEl.textContent = "0 frases";
     resultEl.textContent = "✅ Base de keywords limpiada";
     filterKeywords();
   });
@@ -1699,9 +1718,6 @@ function detectPhraseLang(phrase) {
 
 async function openSettings() {
   document.getElementById("settings-modal").style.display = "flex";
-  const count = dbKeywords.length || await countKeywordsDB();
-  document.getElementById("kw-db-count").textContent = count ? `${count} frases` : "";
-
   await refreshGmailStatus();
 }
 
@@ -2757,6 +2773,148 @@ async function initCsvQueue() {
 // ── Autopilot toggle + target ─────────────────────────────────
 const AUTOPILOT_DURATION_MS = 60 * 60 * 1000; // 1 hora max de sesión autopilot
 let _autopilotTimer = null;
+
+// ── Pitch Drafts modal ────────────────────────────────────────
+function initPitchDrafts() {
+  const openBtn    = document.getElementById("btn-pitch-draft");
+  const modal      = document.getElementById("drafts-modal");
+  const overlay    = document.getElementById("drafts-modal-overlay");
+  const closeBtn   = document.getElementById("btn-drafts-close");
+  const listEl     = document.getElementById("drafts-list");
+  const nameEl     = document.getElementById("draft-name");
+  const langEl     = document.getElementById("draft-language");
+  const subjectEl  = document.getElementById("draft-subject");
+  const bodyEl     = document.getElementById("draft-body");
+  const saveBtn    = document.getElementById("btn-draft-save");
+  const newBtn     = document.getElementById("btn-draft-new");
+  const delBtn     = document.getElementById("btn-draft-delete");
+  const modeLbl    = document.getElementById("drafts-form-mode");
+  const resultEl   = document.getElementById("draft-save-result");
+  if (!openBtn || !modal) return;
+
+  let editingId = null; // si estamos editando un draft existente del usuario
+  let lastDrafts = [];
+
+  const clearForm = () => {
+    editingId = null;
+    nameEl.value = ""; subjectEl.value = ""; bodyEl.value = "";
+    langEl.value = state.siteLanguage || "es";
+    modeLbl.textContent = "Nuevo borrador";
+    delBtn.style.display = "none";
+    resultEl.textContent = "";
+  };
+
+  const renderList = (drafts) => {
+    lastDrafts = drafts;
+    if (drafts.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">No hay borradores. Creá uno abajo.</div>';
+      return;
+    }
+    listEl.innerHTML = drafts.map(d => {
+      const isDefault = d.user_email === "_default_";
+      const langName  = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", fr:"🇫🇷 FR", de:"🇩🇪 DE", ar:"🇸🇦 AR" }[d.language] || d.language;
+      const tagClass  = isDefault ? "color:#0369a1" : "color:var(--text-muted)";
+      return `
+        <div class="draft-item" data-id="${d.id}" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;cursor:pointer">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+            <strong style="font-size:12px">${esc(d.name)}</strong>
+            <span style="font-size:10px; ${tagClass}">${langName}${isDefault ? " · DEFAULT" : ""}</span>
+          </div>
+          ${d.subject ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${esc(d.subject)}</div>` : ""}
+          <div style="font-size:10px;color:var(--text-muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc((d.body || "").substring(0, 80))}</div>
+          <div style="display:flex;gap:4px;margin-top:6px">
+            <button class="btn btn-primary btn-sm draft-use-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px;flex:1">✅ Usar este</button>
+            ${isDefault ? "" : `<button class="btn btn-secondary btn-sm draft-edit-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px">✏️ Editar</button>`}
+          </div>
+        </div>`;
+    }).join("");
+
+    listEl.querySelectorAll(".draft-use-btn").forEach(b => b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = b.dataset.id;
+      const d  = lastDrafts.find(x => String(x.id) === id);
+      if (!d) return;
+      applyDraftToPitch(d);
+      close();
+    }));
+
+    listEl.querySelectorAll(".draft-edit-btn").forEach(b => b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = b.dataset.id;
+      const d  = lastDrafts.find(x => String(x.id) === id);
+      if (!d) return;
+      editingId = d.id;
+      nameEl.value = d.name; langEl.value = d.language; subjectEl.value = d.subject || ""; bodyEl.value = d.body;
+      modeLbl.textContent = `Editando: ${d.name}`;
+      delBtn.style.display = "inline-block";
+    }));
+  };
+
+  const applyDraftToPitch = (d) => {
+    const domain = state.domain || "example.com";
+    const subject = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
+    const body    = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
+    const pitchEl   = document.getElementById("pitch-text");
+    const subjectEl = document.getElementById("form-subject");
+    if (pitchEl)   pitchEl.value   = body;
+    if (subjectEl && subject) subjectEl.value = subject;
+    // Disparar evento para que el autopush/snapshot detecte el cambio
+    pitchEl?.dispatchEvent(new Event("input"));
+  };
+
+  const load = async () => {
+    const drafts = await getPitchDrafts(state.accessToken, state.loginEmail);
+    renderList(drafts);
+  };
+
+  const open = () => {
+    clearForm();
+    modal.style.display = "flex";
+    load();
+  };
+  const close = () => { modal.style.display = "none"; };
+
+  openBtn.addEventListener("click", open);
+  closeBtn?.addEventListener("click", close);
+  overlay?.addEventListener("click", close);
+
+  newBtn.addEventListener("click", clearForm);
+
+  saveBtn.addEventListener("click", async () => {
+    const name    = nameEl.value.trim();
+    const body    = bodyEl.value.trim();
+    const language = langEl.value;
+    const subject  = subjectEl.value.trim();
+    if (!name)    { resultEl.textContent = "❌ Falta el nombre"; resultEl.style.color = "#e53e3e"; return; }
+    if (!body)    { resultEl.textContent = "❌ Falta el cuerpo del email"; resultEl.style.color = "#e53e3e"; return; }
+
+    saveBtn.disabled = true; saveBtn.textContent = "⏳...";
+    const result = await savePitchDraft(state.accessToken, {
+      id: editingId, user_email: state.loginEmail, name, language, subject, body,
+    });
+    saveBtn.disabled = false; saveBtn.textContent = "💾 Guardar";
+
+    if (result.ok) {
+      resultEl.textContent = editingId ? "✅ Actualizado" : "✅ Guardado";
+      resultEl.style.color = "#16a34a";
+      editingId = result.data?.id || null;
+      modeLbl.textContent = editingId ? `Editando: ${name}` : "Nuevo borrador";
+      delBtn.style.display = editingId ? "inline-block" : "none";
+      await load();
+    } else {
+      resultEl.textContent = `❌ ${result.error || "Error"}`;
+      resultEl.style.color = "#e53e3e";
+    }
+  });
+
+  delBtn.addEventListener("click", async () => {
+    if (!editingId) return;
+    if (!confirm("¿Borrar este borrador?")) return;
+    await deletePitchDraft(state.accessToken, editingId);
+    clearForm();
+    await load();
+  });
+}
 
 async function initAutopilot() {
   const btn         = document.getElementById("btn-autopilot");

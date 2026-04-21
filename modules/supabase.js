@@ -737,6 +737,59 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   return { inserted, attempted: domains.length };
 }
 
+// ── Pitch Drafts — borradores guardados por usuario y idioma ──
+export async function getPitchDrafts(accessToken, userEmail, language = null) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const langFilter = language ? `&language=eq.${language}` : "";
+  // Trae borradores del user + los defaults (_default_)
+  const userFilter = `user_email=in.(${encodeURIComponent(userEmail)},_default_)`;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_pitch_drafts?${userFilter}${langFilter}&order=is_default.desc,updated_at.desc&select=id,user_email,name,language,subject,body,is_default,updated_at`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (e) { console.warn("getPitchDrafts:", e.message); return []; }
+}
+
+export async function savePitchDraft(accessToken, { id, user_email, name, language, subject, body }) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const payload = { user_email, name, language, subject: subject || "", body, updated_at: new Date().toISOString() };
+  try {
+    if (id) {
+      const res = await fetch(`${url}/rest/v1/toolbar_pitch_drafts?id=eq.${id}`, {
+        method: "PATCH",
+        headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "return=representation" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => []);
+      return { ok: res.ok, data: data?.[0] || null };
+    }
+    const res = await fetch(`${url}/rest/v1/toolbar_pitch_drafts`, {
+      method: "POST",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const data = await res.json().catch(() => []);
+    return { ok: res.ok, data: data?.[0] || null, error: res.ok ? null : (data?.message || `HTTP ${res.status}`) };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+export async function deletePitchDraft(accessToken, id) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    await fetch(`${url}/rest/v1/toolbar_pitch_drafts?id=eq.${id}`, {
+      method: "DELETE",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+    });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 // Últimos N dominios procesados (done/error/skipped) ordenados por fecha
 // sourceFilter: "csv" | "monday" | null (todos)
 export async function getCsvQueueHistory(accessToken, limit = 30, sourceFilter = null) {

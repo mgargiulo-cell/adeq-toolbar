@@ -384,6 +384,7 @@
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
         <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
+        <button id="btn-pitch-draft" class="btn btn-secondary btn-sm" title="Seleccionar un borrador guardado">📋 Borrador</button>
         <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Save as style example">👍</button>
         <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Gemini will avoid it">👎</button>
         <span id="pitch-like-status" class="pitch-like-status"></span>
@@ -414,18 +415,26 @@
      ==================================================== -->
 <div id="tab-cascade" class="tab-content">
 
-  <section class="card">
-    <div class="card-title"><span class="icon">🔍</span> Buscar similar websites</div>
-    <div class="seed-row">
-      <input id="cascade-seed" type="text" class="seed-input" placeholder="e.g. nytimes.com" />
-      <button id="btn-cascade-start" class="btn btn-primary btn-sm">Search</button>
-    </div>
-    <div id="cascade-status" class="cascade-status"></div>
-  </section>
-
-  <!-- Keywords -->
+  <!-- Google Keywords (arriba de todo) — incluye import CSV de keywords -->
   <section class="card card-tight">
-    <div class="card-title"><span class="icon">🔑</span> Google Keywords</div>
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span><span class="icon">🔑</span> Google Keywords</span>
+      <button id="btn-kw-import-toggle" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px" title="Importar frases desde CSV">⬆️ Import CSV</button>
+    </div>
+
+    <!-- Import CSV (colapsable, oculto por default) -->
+    <div id="kw-import-panel" style="display:none; margin-bottom:10px; padding:8px; background:var(--bg); border-radius:6px">
+      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px; line-height:1.4">
+        Subí un CSV con frases (una por línea). Se guardan en Supabase y rotan automáticamente acá.
+      </div>
+      <input id="kw-csv-input" type="file" accept=".csv,.txt" style="font-size:11px; width:100%; margin-bottom:6px" />
+      <div id="kw-import-result" style="font-size:10px; color:var(--text-muted)"></div>
+      <div style="display:flex; gap:6px; margin-top:6px">
+        <span id="kw-db-count-inline" style="font-size:10px; color:var(--text-muted); flex:1; align-self:center"></span>
+        <button id="btn-kw-delete-all-inline" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e">Borrar todo</button>
+      </div>
+    </div>
+
     <div class="kw-filters">
       <select id="kw-language" class="filter-select">
         <option value="">All languages</option>
@@ -441,6 +450,16 @@
     <div class="kw-footer">
       <span id="kw-rotation-timer" class="kw-timer"></span>
     </div>
+  </section>
+
+  <!-- Buscar similar websites (abajo de keywords) -->
+  <section class="card">
+    <div class="card-title"><span class="icon">🔍</span> Buscar similar websites</div>
+    <div class="seed-row">
+      <input id="cascade-seed" type="text" class="seed-input" placeholder="e.g. nytimes.com" />
+      <button id="btn-cascade-start" class="btn btn-primary btn-sm">Search</button>
+    </div>
+    <div id="cascade-status" class="cascade-status"></div>
   </section>
 
   <!-- Filters -->
@@ -907,18 +926,9 @@
     <div class="modal-actions">
       <button id="btn-close-settings" class="btn btn-secondary">Close</button>
     </div>
-    <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
-      <div style="font-size:12px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">KEYWORD DATABASE</div>
-      <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">Import a CSV with phrases (one per line). Stored in Supabase and rotated automatically in Cascade.</div>
-      <div style="display:flex; gap:6px; margin-bottom:6px; align-items:center">
-        <label class="btn btn-secondary btn-sm" style="cursor:pointer; margin:0">
-          📥 Import CSV
-          <input id="settings-csv-input" type="file" accept=".csv,.txt" style="display:none" />
-        </label>
-        <button id="btn-kw-delete-all" class="btn btn-secondary btn-sm">🗑 Clear all</button>
-        <span id="kw-db-count" style="font-size:11px; color:var(--text-muted)"></span>
-      </div>
-      <div id="kw-import-result" style="font-size:11px; color:#16a34a; min-height:14px;"></div>
+    <!-- KEYWORD DATABASE movido a Cascade → Google Keywords (⬆️ Import CSV) -->
+    <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px; font-size:11px; color:var(--text-muted)">
+      💡 Keyword DB ahora está en la pestaña <strong>Cascade → Google Keywords → ⬆️ Import CSV</strong>.
     </div>
 
     <div style="margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
@@ -937,6 +947,48 @@
   <span>ADEQ Media © 2025</span>
   <span id="req-counter" class="cost-hint"></span>
 </footer>
+
+<!-- ====================================================
+     PITCH DRAFTS MODAL
+     ==================================================== -->
+<div id="drafts-modal" class="modal" style="display:none">
+  <div class="modal-overlay" id="drafts-modal-overlay"></div>
+  <div class="modal-content" style="max-width:480px">
+    <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>📋 Borradores de pitch</span>
+      <button id="btn-drafts-close" class="icon-btn" style="font-size:14px">✕</button>
+    </div>
+
+    <div id="drafts-list" style="max-height:260px; overflow-y:auto; margin:10px 0; font-size:12px"></div>
+
+    <div style="border-top:1px solid var(--border); padding-top:10px; margin-top:8px">
+      <div style="font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:.4px; margin-bottom:6px">
+        <span id="drafts-form-mode">Nuevo borrador</span>
+      </div>
+      <input id="draft-name" type="text" class="form-input" placeholder="Nombre del borrador (ej: Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
+      <div style="display:flex; gap:6px; margin-bottom:6px">
+        <select id="draft-language" class="form-select" style="flex:1; font-size:12px">
+          <option value="es">Español</option>
+          <option value="en">English</option>
+          <option value="pt">Português</option>
+          <option value="it">Italiano</option>
+          <option value="fr">Français</option>
+          <option value="de">Deutsch</option>
+          <option value="ar">العربية</option>
+        </select>
+        <input id="draft-subject" type="text" class="form-input" placeholder="Asunto (opcional)" style="flex:2; font-size:12px" />
+      </div>
+      <textarea id="draft-body" class="form-input" placeholder="Cuerpo del email... Usá {{domain}} como placeholder." style="width:100%; min-height:120px; font-size:12px; font-family:inherit"></textarea>
+
+      <div style="display:flex; gap:6px; margin-top:8px">
+        <button id="btn-draft-save" class="btn btn-primary btn-sm" style="flex:1">💾 Guardar</button>
+        <button id="btn-draft-new" class="btn btn-secondary btn-sm">➕ Nuevo</button>
+        <button id="btn-draft-delete" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e;display:none">🗑</button>
+      </div>
+      <div id="draft-save-result" style="font-size:11px; margin-top:6px; min-height:14px"></div>
+    </div>
+  </div>
+</div>
 
 <script src="popup.js" type="module"></script>
 </body>
