@@ -465,13 +465,13 @@ export async function importKeywordsToDB(phrases, source = "import") {
   return { count: inserted };
 }
 
-export async function clearKeywordsDB() {
+export async function clearKeywordsDB(accessToken) {
   const { url, key } = await getConfig();
-  if (!url || !key) return;
+  if (!url || !key || !accessToken) return;
   try {
     await fetch(`${url}/rest/v1/toolbar_keywords?id=gte.0`, {
       method: "DELETE",
-      headers: { "apikey": key, "Authorization": `Bearer ${key}` },
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
     });
   } catch {}
 }
@@ -489,13 +489,15 @@ export async function countKeywordsDB() {
   } catch { return 0; }
 }
 
-export async function clearHistory() {
+export async function clearHistory(accessToken, userEmail) {
   const { url, key } = await getConfig();
-  if (!url || !key) return;
+  if (!url || !key || !accessToken || !userEmail) return;
   try {
-    await fetch(`${url}/rest/v1/toolbar_historial?id=gte.0`, {
+    // Only delete the caller's own rows — never wipe other users' history
+    const q = `media_buyer=eq.${encodeURIComponent(userEmail)}`;
+    await fetch(`${url}/rest/v1/toolbar_historial?${q}`, {
       method: "DELETE",
-      headers: { "apikey": key, "Authorization": `Bearer ${key}` },
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
     });
   } catch (err) {
     console.warn("clearHistory failed:", err.message);

@@ -79,7 +79,7 @@ export async function getGmailProfile(interactive = false) {
  */
 export async function getGmailSignature() {
   try {
-    const token = await fetchToken(true);
+    const token = await fetchToken(false);
     if (!token) return "";
 
     const res = await fetch(

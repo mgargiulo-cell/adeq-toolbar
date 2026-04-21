@@ -119,6 +119,7 @@ async function setSessionCache(domain, data) {
 let cascadeResults    = [];
 let cascadeRawResults = []; // todos los sites recibidos antes de filtrar — para Apply filters
 let cascadeSelected = new Set();
+let cascadeBlockedExecSet = new Set(); // domains owned by other media buyers (last 45d) — keep filtered across re-applies
 
 // ============================================================
 // INIT
@@ -205,48 +206,45 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Contador de API calls + límites del plan en footer
   updateApiFooter();
 
-  // Análisis core en paralelo — cada sección falla de forma independiente
-  await Promise.all([
+  // Análisis core en paralelo — no bloquea el render del UI
+  Promise.all([
     runDuplicateCheck() .catch(e => console.error("[DupCheck]",   e)),
     runTrafficCheck()   .catch(e => console.error("[Traffic]",    e)),
     runAuditCheck()     .catch(e => console.error("[Audit]",      e)),
     runEmailScraper()   .catch(e => console.error("[Email]",      e)),
     runBannerDetection().catch(e => console.error("[Banners]",    e)),
     runPageContext()    .catch(e => console.error("[PageCtx]",    e)),
-  ]);
-
-  // Auto-completar formulario de Monday cuando corresponde
-  runAutoFill();
-
-  // Guardar en caché de sesión los datos costosos (evita créditos en subpáginas)
-  setSessionCache(state.domain, {
-    duplicate:   state.duplicate,
-    trafficData: state.trafficData,
-    traffic:     state.traffic,
-    visits:      state.visits,
-    pagesPerVisit: state.pagesPerVisit,
-    category:    state.category,
-    emails:      state.emails,
-  });
-
-  // Contabilizar +400K separando nuevos de duplicados
-  if (state.traffic >= CONFIG.MIN_TRAFFIC) {
-    const isNewSite = !state.duplicate?.found;
-    const nowMonth  = new Date().toISOString().substring(0, 7);
-    const statsKey  = userKey("historyStats");
-    const defaults  = { total: 0, month: nowMonth, monthNew: 0, monthDups: 0, monthMonday: 0,
-                        monthNewQual: 0, monthDupQual: 0,
-                        monthMondayNewQual: 0, monthMondayDupQual: 0, monthMondayBelow: 0 };
-    const { [statsKey]: hs = defaults } = await chrome.storage.local.get(statsKey);
-    if (hs.month !== nowMonth) {
-      Object.assign(hs, { month: nowMonth, monthNew: 0, monthDups: 0, monthMonday: 0,
-        monthNewQual: 0, monthDupQual: 0, monthMondayNewQual: 0, monthMondayDupQual: 0, monthMondayBelow: 0 });
+  ]).then(async () => {
+    runAutoFill();
+    // Guardar en caché de sesión los datos costosos (evita créditos en subpáginas)
+    setSessionCache(state.domain, {
+      duplicate:   state.duplicate,
+      trafficData: state.trafficData,
+      traffic:     state.traffic,
+      visits:      state.visits,
+      pagesPerVisit: state.pagesPerVisit,
+      category:    state.category,
+      emails:      state.emails,
+    });
+    // Contabilizar +400K separando nuevos de duplicados
+    if (state.traffic >= CONFIG.MIN_TRAFFIC) {
+      const isNewSite = !state.duplicate?.found;
+      const nowMonth  = new Date().toISOString().substring(0, 7);
+      const statsKey  = userKey("historyStats");
+      const defaults  = { total: 0, month: nowMonth, monthNew: 0, monthDups: 0, monthMonday: 0,
+                          monthNewQual: 0, monthDupQual: 0,
+                          monthMondayNewQual: 0, monthMondayDupQual: 0, monthMondayBelow: 0 };
+      const { [statsKey]: hs = defaults } = await chrome.storage.local.get(statsKey);
+      if (hs.month !== nowMonth) {
+        Object.assign(hs, { month: nowMonth, monthNew: 0, monthDups: 0, monthMonday: 0,
+          monthNewQual: 0, monthDupQual: 0, monthMondayNewQual: 0, monthMondayDupQual: 0, monthMondayBelow: 0 });
+      }
+      if (isNewSite) hs.monthNewQual = (hs.monthNewQual || 0) + 1;
+      else           hs.monthDupQual = (hs.monthDupQual || 0) + 1;
+      await chrome.storage.local.set({ [statsKey]: hs });
+      loadHistoryTab().catch(() => {});
     }
-    if (isNewSite) hs.monthNewQual = (hs.monthNewQual || 0) + 1;
-    else           hs.monthDupQual = (hs.monthDupQual || 0) + 1;
-    await chrome.storage.local.set({ [statsKey]: hs });
-    loadHistoryTab().catch(() => {}); // pre-carga silenciosa en background
-  }
+  }).catch(() => {});
 });
 
 // ============================================================
@@ -1397,7 +1395,7 @@ async function bindButtons() {
     // Stripping de cualquier cierre viejo en CUALQUIER idioma (Gemini puede meter "Best regards,"
     // aunque el pitch sea en español). Luego agregamos el cierre localizado correcto.
     let bodyToSend = pitch.replace(
-      /\n+\s*(best\s*regards|kind\s*regards|regards|sincerely|cheers|thanks|thank\s*you|best|saludos(?:\s*cordiales)?|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|abracos|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen)[.,!\s]*[\s\S]*$/i,
+      /\n+\s*(best\s*regards|kind\s*regards|regards|sincerely|cheers|thanks\b|thank\s*you|saludos(?:\s*cordiales)?|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|abracos|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen)[.,!]*\s*\n[\s\S]{0,200}$/i,
       ""
     ).trimEnd();
     bodyToSend = appendClosingIfMissing(bodyToSend, lang);
@@ -1639,16 +1637,6 @@ async function bindButtons() {
     await refreshGmailStatus();
   });
 
-  document.getElementById("btn-dissoc-gmail")?.addEventListener("click", async () => {
-    await clearGmailAssociation(state.loginEmail);
-    state.gmailEmail = "";
-    const assocEl  = document.getElementById("settings-gmail-assoc");
-    const dissocEl = document.getElementById("btn-dissoc-gmail");
-    if (assocEl)  assocEl.textContent     = "Not linked";
-    if (dissocEl) dissocEl.style.display  = "none";
-    const fromEl = document.getElementById("gmail-from");
-    if (fromEl)   fromEl.textContent      = "From: not linked";
-  });
   document.getElementById("modal-overlay").addEventListener("click", closeSettings);
   document.getElementById("btn-run-diag").addEventListener("click", runDiagnostic);
   document.getElementById("btn-logout").addEventListener("click", logout);
@@ -1696,7 +1684,7 @@ async function bindButtons() {
     if (!confirm("Delete ALL phrases from the keyword database?")) return;
     const resultEl = document.getElementById("kw-import-result");
     resultEl.textContent = "Clearing...";
-    await clearKeywordsDB();
+    await clearKeywordsDB(state.accessToken);
     dbKeywords = [];
     const countEl = document.getElementById("kw-db-count-inline");
     if (countEl) countEl.textContent = "0 frases";
@@ -1817,11 +1805,16 @@ async function initKeywords() {
 function startKwRotation() {
   kwNextRotation = Date.now() + KW_ROTATION_MS;
   updateRotationTimer();
-  setInterval(() => {
+  const rotTimer  = setInterval(() => {
+    if (document.visibilityState === "hidden") return;
     kwNextRotation = Date.now() + KW_ROTATION_MS;
     filterKeywords();
   }, KW_ROTATION_MS);
-  setInterval(updateRotationTimer, 10 * 1000);
+  const tickTimer = setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    updateRotationTimer();
+  }, 10 * 1000);
+  window._kwTimers = { rotTimer, tickTimer };
 }
 
 function updateRotationTimer() {
@@ -2094,14 +2087,16 @@ async function startCascade() {
   const resultsEl = document.getElementById("cascade-results");
   const actionsEl = document.getElementById("cascade-actions");
 
-  const trafficVal   = document.getElementById("cascade-min-traffic").value;
-  const [tMin, tMax] = trafficVal.split(":").map(v => v === "" ? Infinity : Number(v));
-  const rankVal      = document.getElementById("cascade-max-rank").value;
-  const [rMin, rMax] = rankVal.split(":").map(v => v === "" ? Infinity : Number(v));
+  const parseRange = (val) => {
+    const [a, b] = val.split(":");
+    return [a === "" || a == null ? 0 : Number(a), b === "" || b == null ? Infinity : Number(b)];
+  };
+  const [tMin, tMax] = parseRange(document.getElementById("cascade-min-traffic").value);
+  const [rMin, rMax] = parseRange(document.getElementById("cascade-max-rank").value);
   const langFilter = document.getElementById("cascade-language").value;
 
   btn.disabled = true; btn.textContent = "⏳";
-  cascadeResults = []; cascadeRawResults = []; cascadeSelected = new Set();
+  cascadeResults = []; cascadeRawResults = []; cascadeSelected = new Set(); cascadeBlockedExecSet = new Set();
   resultsEl.innerHTML = ""; actionsEl.style.display = "none";
 
   // Dominios genéricos/irrelevantes que SimilarWeb suele devolver por tráfico
@@ -2142,7 +2137,7 @@ async function startCascade() {
     if (rMin > 0 && site.globalRank && site.globalRank < rMin) return false;
     if (rMax !== Infinity && site.globalRank && site.globalRank > rMax) return false;
     if (langFilter && site.countryCode !== langFilter) return false;
-    if (isBlockedByExec(site.domain)) { filteredCount++; return false; }
+    if (isBlockedByExec(site.domain)) { filteredCount++; cascadeBlockedExecSet.add(site.domain.replace(/^www\./, "").toLowerCase()); return false; }
     return true;
   };
 
@@ -2236,10 +2231,12 @@ function applyCascadeFilters() {
     return;
   }
 
-  const trafficVal   = document.getElementById("cascade-min-traffic").value;
-  const [tMin, tMax] = trafficVal.split(":").map(v => v === "" ? Infinity : Number(v));
-  const rankVal      = document.getElementById("cascade-max-rank").value;
-  const [rMin, rMax] = rankVal.split(":").map(v => v === "" ? Infinity : Number(v));
+  const parseRange = (val) => {
+    const [a, b] = val.split(":");
+    return [a === "" || a == null ? 0 : Number(a), b === "" || b == null ? Infinity : Number(b)];
+  };
+  const [tMin, tMax] = parseRange(document.getElementById("cascade-min-traffic").value);
+  const [rMin, rMax] = parseRange(document.getElementById("cascade-max-rank").value);
   const langFilter   = document.getElementById("cascade-language").value;
 
   const BLOCKLIST = new Set([
@@ -2254,7 +2251,9 @@ function applyCascadeFilters() {
   const LIMIT = 50;
 
   const filtered = cascadeRawResults.filter(site => {
-    if (BLOCKLIST.has(site.domain.replace(/^www\./, ""))) return false;
+    const clean = site.domain.replace(/^www\./, "").toLowerCase();
+    if (BLOCKLIST.has(clean)) return false;
+    if (cascadeBlockedExecSet.has(clean)) return false;
     if (tMin > 0 && site.visits < tMin) return false;
     if (tMax !== Infinity && site.visits > tMax) return false;
     if (rMin > 0 && site.globalRank && site.globalRank < rMin) return false;
@@ -2300,7 +2299,7 @@ function openCascadeSelected() {
 // HELPERS
 // ============================================================
 async function clearSupabaseHistory() {
-  try { await clearHistory(); } catch {}
+  try { await clearHistory(state.accessToken, state.loginEmail); } catch {}
 }
 
 function extractDomain(url) {
@@ -2678,7 +2677,10 @@ async function initCsvQueue() {
   let heartbeatTimer = null;
   const startHeartbeat = () => {
     if (heartbeatTimer) return;
-    heartbeatTimer = setInterval(() => { refreshStats(); refreshHistory(); }, 10_000);
+    heartbeatTimer = setInterval(() => {
+      if (document.visibilityState === "hidden") return;
+      refreshStats(); refreshHistory();
+    }, 10_000);
   };
   const stopHeartbeat = () => { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } };
 
@@ -2704,15 +2706,18 @@ async function initCsvQueue() {
     uploadRes.textContent = "Leyendo archivo..."; uploadRes.className = "push-result";
 
     try {
-      const text    = await file.text();
+      const text    = (await file.text()).replace(/^\uFEFF/, "");
       const domains = text.split(/[\r\n]+/)
         .map(l => l.trim())
         .filter(Boolean)
-        // Tomar la primera columna si hay comas (formato CSV)
-        .map(l => l.split(",")[0].trim())
+        // Tomar la primera columna — respeta comillas básicas ("acme, inc.com" → acme, inc.com)
+        .map(l => {
+          const m = l.match(/^"([^"]*)"|^([^,]*)/);
+          return ((m && (m[1] ?? m[2])) || "").trim();
+        })
         // Limpiar dominio
         .map(d => d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "").toLowerCase())
-        .filter(d => d.includes(".") && !d.includes(" "));
+        .filter(d => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(d));
 
       if (domains.length === 0) { uploadRes.textContent = "No valid domains found"; uploadRes.className = "push-result error"; return; }
 
@@ -3512,8 +3517,8 @@ async function validateProspect(card, data, doSendEmail) {
     }
   }
   if (!geo) {
-    setResult("⚠️ GEO is empty — confirm in the form before pushing.", false);
-    // no return — just warn
+    setResult("❌ GEO is required — please set it before pushing.", false);
+    return;
   }
 
   // Disable buttons during processing
@@ -3541,7 +3546,7 @@ async function validateProspect(card, data, doSendEmail) {
       const lang      = data?.language || "es";
       // Sacar cierres viejos en cualquier idioma, luego agregar el correcto
       const stripped = (pitch || "").replace(
-        /\n+\s*(best\s*regards|kind\s*regards|regards|sincerely|cheers|thanks|thank\s*you|best|saludos(?:\s*cordiales)?|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|abracos|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen)[.,!\s]*[\s\S]*$/i,
+        /\n+\s*(best\s*regards|kind\s*regards|regards|sincerely|cheers|thanks\b|thank\s*you|saludos(?:\s*cordiales)?|un\s*saludo|cordialmente|atentamente|cumprimentos|abraços|abracos|cordiali\s*saluti|cordialement|mit\s*freundlichen\s*grüßen)[.,!]*\s*\n[\s\S]{0,200}$/i,
         ""
       ).trimEnd();
       const bodyWithClosing = appendClosingIfMissing(stripped, lang);

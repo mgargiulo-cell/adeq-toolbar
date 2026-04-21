@@ -23,6 +23,20 @@
   --gmail:          #ea4335;
   --input-bg:       #f7fafc;
   --input-border:   #cbd5e0;
+  --primary:        #0693e3;
+  --card-bg:        #ffffff;
+  --bg-secondary:   #f1f5fb;
+}
+
+:focus-visible {
+  outline: 2px solid var(--adeq-blue);
+  outline-offset: 1px;
+}
+
+button:disabled, .btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  filter: grayscale(0.3);
 }
 
 html, body { height: 100%; }
