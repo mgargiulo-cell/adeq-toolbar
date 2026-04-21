@@ -195,10 +195,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   prefillMondayForm();
   initTabs();
   bindButtons();
-  initKeywords();
-  initAutopilot();
-  initProspectsTab();
-  // loadHistoryTab() ya NO carga aquí — se hace lazy al clickear el tab
+  initPitchDrafts(); // used by Prospects cards + Analysis — cheap, keep eager
+  // initKeywords, initAutopilot, initProspectsTab, initCsvQueue, loadHistoryTab → lazy on tab click
 
   // Show the toolbar login email as the Gmail "from" account
   const fromEl = document.getElementById("gmail-from");
@@ -389,7 +387,7 @@ function fillMondayFormFromDuplicate(dup) {
 // TABS
 // ============================================================
 function initTabs() {
-  const loadedTabs = new Set(["core", "cascade"]); // estos cargan on-demand por botón
+  const loadedTabs = new Set(["core"]); // core loads eagerly with the page
 
   document.querySelectorAll(".tab-btn").forEach(btn => {
     btn.addEventListener("click", async () => {
@@ -400,20 +398,25 @@ function initTabs() {
       const tabEl  = document.getElementById(`tab-${tabId}`);
       tabEl.classList.add("active");
 
-      // Lazy load: solo carga la primera vez que se abre el tab
+      // Lazy load: only initialize the tab the first time it's opened
       if (!loadedTabs.has(tabId)) {
         loadedTabs.add(tabId);
-        if (tabId === "history") {
-          const listEl = document.getElementById("history-list");
-          if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading history...</div>';
-          await loadHistoryTab().catch(e => {
-            console.error("[History]", e);
+        try {
+          if (tabId === "history") {
             const listEl = document.getElementById("history-list");
-            if (listEl) listEl.innerHTML = '<div class="cascade-empty">Error loading history.</div>';
-          });
-        }
-        if (tabId === "prospects") {
-          await loadProspectsTab();
+            if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading history...</div>';
+            await loadHistoryTab();
+          } else if (tabId === "cascade") {
+            await initKeywords();
+          } else if (tabId === "prospects") {
+            await initProspectsTab();
+            await initAutopilot();
+            await loadProspectsTab();
+          } else if (tabId === "import") {
+            await initCsvQueue();
+          }
+        } catch (e) {
+          console.error(`[Tab ${tabId}]`, e);
         }
       }
     });
@@ -1188,13 +1191,15 @@ async function bindButtons() {
       // NO fallback en inglés — si Gemini no devolvió subjects, dejar vacío para que el user lo complete
 
       stepsEl.innerHTML = `
-        <div class="autopush-step">✅ Pitch generado</div>
-        <div class="autopush-step">✅ Asunto pre-completado</div>
-        <div class="autopush-step">→ Revisá el form y enviá con los botones de abajo</div>
+        <div class="autopush-step">✅ Pitch generated</div>
+        <div class="autopush-step">✅ Subject pre-filled</div>
+        <div class="autopush-step">→ Review the form and send with the buttons below</div>
       `;
       btn.textContent = "✅ Ready — review and send";
     } catch (err) {
-      btn.disabled = false; btn.textContent = "⚡ Preparar todo";
+      console.error("[Prepare all]", err);
+      stepsEl.innerHTML = `<div class="autopush-step" style="color:var(--danger)">❌ ${esc(err.message || "Unknown error")}</div>`;
+      btn.disabled = false; btn.textContent = "⚡ Prepare all";
     }
   });
 
@@ -1205,7 +1210,7 @@ async function bindButtons() {
     const pitchEl  = document.getElementById("pitch-text");
 
     if (!state.sendInfo?.sendDate) {
-      pitchEl.value = "No se encontró la fecha del envío original. Enviá el pitch primero antes de generar un follow-up.";
+      alert("Original send date not found. Send the first pitch before generating a follow-up.");
       return;
     }
 
@@ -1222,9 +1227,11 @@ async function bindButtons() {
       document.getElementById("pitch-text").value   = text;
       document.getElementById("form-subject").value = `Re: Partnership opportunity — ${state.domain}`;
       document.querySelector('[data-tab="core"]')?.click();
-      btn.textContent = "✅ Generado";
-    } catch {
-      btn.disabled = false; btn.textContent = "✨ Generar FU";
+      btn.textContent = "✅ Generated";
+    } catch (err) {
+      console.error("[Generate FU]", err);
+      alert("Follow-up generation failed: " + (err.message || "unknown error"));
+      btn.disabled = false; btn.textContent = "✨ Generate FU";
     }
   });
 
@@ -1565,11 +1572,8 @@ async function bindButtons() {
     btn.disabled = false; btn.textContent = "📤 Send to Queue";
   });
 
-  // CSV Bulk Queue — Auto-prospector refresh de dominios en Monday
-  await initCsvQueue();
-
-  // Pitch drafts — modal para cargar/editar/guardar borradores
-  initPitchDrafts();
+  // initCsvQueue() → lazy-loaded when user clicks the Import tab (initTabs)
+  // initPitchDrafts() → loaded eagerly in DOMContentLoaded
 
   // Settings
   document.getElementById("btn-settings").addEventListener("click", openSettings);
@@ -1669,7 +1673,7 @@ async function bindButtons() {
       const rows = phrases.map(phrase => ({ phrase, lang: detectPhraseLang(phrase) }));
       const { count } = await importKeywordsToDB(rows);
       dbKeywords = [...dbKeywords, ...rows.map(r => ({ kw: r.phrase, lang: r.lang, db: true }))];
-      resultEl.textContent = `✅ ${count} frases importadas (total: ${dbKeywords.length})`;
+      resultEl.textContent = `✅ ${count} phrases imported (total: ${dbKeywords.length})`;
       const countEl = document.getElementById("kw-db-count-inline");
       if (countEl) countEl.textContent = `${dbKeywords.length} phrases imported`;
       e.target.value = "";
@@ -1685,7 +1689,7 @@ async function bindButtons() {
     await clearKeywordsDB(state.accessToken);
     dbKeywords = [];
     const countEl = document.getElementById("kw-db-count-inline");
-    if (countEl) countEl.textContent = "0 frases";
+    if (countEl) countEl.textContent = "0 phrases";
     resultEl.textContent = "✅ Keyword database cleared";
     filterKeywords();
   });
@@ -1842,7 +1846,7 @@ async function runKeywordSearch() {
     const el = document.getElementById("keywords-list");
     if (local.length > 0) {
       renderKeywords(local, term);
-      el.insertAdjacentHTML("afterbegin", `<div class="kw-api-warn">⚠ Supabase: ${esc(error)} — mostrando resultados locales</div>`);
+      el.insertAdjacentHTML("afterbegin", `<div class="kw-api-warn">⚠ Supabase: ${esc(error)} — showing local results</div>`);
     } else {
       el.innerHTML = `<span class="kw-empty">Error al buscar: ${esc(error)}</span>`;
     }
@@ -1855,7 +1859,7 @@ async function runKeywordSearch() {
 
   if (results.length === 0) {
     document.getElementById("keywords-list").innerHTML =
-      '<span class="kw-empty">Sin resultados — la keyword no está en la base de datos</span>';
+      '<span class="kw-empty">No results — the keyword isn\'t in the database</span>';
     return;
   }
 
@@ -1882,7 +1886,7 @@ function renderKeywords(kws, search = "") {
   const el    = document.getElementById("keywords-list");
   const limit = search ? Infinity : 100;
   if (kws.length === 0) {
-    el.innerHTML = '<span class="kw-empty">Sin resultados</span>'; return;
+    el.innerHTML = '<span class="kw-empty">No results</span>'; return;
   }
   const visible = kws.slice(0, limit);
   el.innerHTML = visible.map(k =>
@@ -2008,7 +2012,7 @@ async function loadHistoryTab() {
   });
 
   if (history.length === 0) {
-    listEl.innerHTML = '<div class="cascade-empty">No hay sitios en el listado.</div>';
+    listEl.innerHTML = '<div class="cascade-empty">No sites in the list.</div>';
     return;
   }
 
@@ -2022,7 +2026,7 @@ async function loadHistoryTab() {
 
     listEl.innerHTML = visible.map(h => `
       <div class="history-item" data-url="https://${esc(h.domain)}">
-        <img class="history-favicon" src="https://www.google.com/s2/favicons?domain=${esc(h.domain)}&sz=16" onerror="this.style.display='none'" />
+        <img class="history-favicon" loading="lazy" src="https://www.google.com/s2/favicons?domain=${esc(h.domain)}&sz=16" onerror="this.style.display='none'" />
         <span class="history-domain">${esc(h.domain)}</span>
         <span class="history-traffic">${esc(h.traffic || formatTraffic(h.pageViews) || "--")}</span>
         <span class="history-buyer">${esc(h.mediaBuyer || "")}</span>
@@ -2153,7 +2157,7 @@ async function startCascade() {
 
   const onProgress = ({ status, domain: d, site, level }) => {
     if (status === "searching") {
-      statusEl.textContent = `Nivel ${level}: buscando similares de ${d}...`;
+      statusEl.textContent = `Level ${level}: searching similar sites of ${d}...`;
     } else if (status === "found") {
       cascadeRawResults.push(site);
       if (passesFilters(site)) addResult(site);
@@ -2166,8 +2170,8 @@ async function startCascade() {
     if (cascadeResults.length === 0) {
       resultsEl.innerHTML = '<div class="cascade-empty">No prospects found with those filters.</div>';
     } else {
-      const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (límite ${CASCADE_LIMIT})` : "";
-      statusEl.textContent = `✅ ${cascadeResults.length} prospectos${limitMsg}${filteredCount ? ` · ${filteredCount} filtrados` : ""}`;
+      const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (limit ${CASCADE_LIMIT})` : "";
+      statusEl.textContent = `✅ ${cascadeResults.length} prospects${limitMsg}${filteredCount ? ` · ${filteredCount} filtered out` : ""}`;
       actionsEl.style.display = "block";
       updateCascadeSummary();
     }
@@ -2175,7 +2179,7 @@ async function startCascade() {
     statusEl.textContent = `Error: ${err.message}`;
   }
 
-  btn.disabled = false; btn.textContent = "Buscar";
+  btn.disabled = false; btn.textContent = "Search";
 }
 
 function appendCascadeItem(site, container) {
@@ -2192,7 +2196,7 @@ function appendCascadeItem(site, container) {
 
   item.innerHTML = `
     <input type="checkbox" />
-    <img class="cascade-favicon" src="https://www.google.com/s2/favicons?domain=${esc(site.domain)}&sz=16" onerror="this.style.display='none'" />
+    <img class="cascade-favicon" loading="lazy" src="https://www.google.com/s2/favicons?domain=${esc(site.domain)}&sz=16" onerror="this.style.display='none'" />
     <span class="cascade-domain" title="${esc(site.domain)}">${esc(site.domain)}</span>
     <span class="cascade-visits">${esc(formatTraffic(site.visits))}</span>
     <span class="cascade-rank ${rankColor}">${rankText}</span>
@@ -2225,7 +2229,7 @@ function applyCascadeFilters() {
   const statusEl  = document.getElementById("cascade-status");
   const actionsEl = document.getElementById("cascade-actions");
   if (!cascadeRawResults.length) {
-    if (statusEl) statusEl.textContent = "No hay resultados para filtrar. Hacé primero una búsqueda.";
+    if (statusEl) statusEl.textContent = "No results to filter — run a search first.";
     return;
   }
 
@@ -2270,7 +2274,7 @@ function applyCascadeFilters() {
   }
 
   if (cascadeResults.length === 0) {
-    resultsEl.innerHTML = '<div class="cascade-empty">Ningún resultado pasa los filtros actuales.</div>';
+    resultsEl.innerHTML = '<div class="cascade-empty">No results match the current filters.</div>';
     actionsEl.style.display = "none";
   } else {
     actionsEl.style.display = "block";
@@ -2296,10 +2300,6 @@ function openCascadeSelected() {
 // ============================================================
 // HELPERS
 // ============================================================
-async function clearSupabaseHistory() {
-  try { await clearHistory(state.accessToken, state.loginEmail); } catch {}
-}
-
 function extractDomain(url) {
   try {
     const hostname = new URL(url).hostname.replace(/^www\./, "");
@@ -2424,7 +2424,7 @@ async function runDiagnostic() {
       }
       const d      = r.data || {};
       const people = Array.isArray(d?.people) ? d.people : [];
-      if (people.length === 0) return { ok: false, msg: "Sin resultados para este dominio" };
+      if (people.length === 0) return { ok: false, msg: "No results for this domain" };
       const found = people
         .filter(p => p.email)
         .map(p => `${p.first_name || ""} ${p.last_name || ""} — ${p.email} (${p.email_status || "?"})`.trim())
@@ -2577,25 +2577,6 @@ function applyUserFromAuth(auth) {
   if (userEl) userEl.textContent = `${name} · ${email}`;
 }
 
-// ── Asociación Gmail ──────────────────────────────────────────
-// Vincula el email de login de la toolbar con la cuenta Gmail de Chrome.
-// Se guarda una sola vez; se puede resetear desde Settings.
-async function getGmailAssociation(loginEmail) {
-  const key = `gmail_assoc_${loginEmail}`;
-  const stored = await chrome.storage.local.get(key);
-  return stored[key] || null; // null = sin asociación todavía
-}
-
-async function saveGmailAssociation(loginEmail, gmailEmail) {
-  const key = `gmail_assoc_${loginEmail}`;
-  await chrome.storage.local.set({ [key]: gmailEmail });
-}
-
-async function clearGmailAssociation(loginEmail) {
-  const key = `gmail_assoc_${loginEmail}`;
-  await chrome.storage.local.remove(key);
-}
-
 // ── CSV Bulk Queue ────────────────────────────────────────────
 async function initCsvQueue() {
   const fileInput      = document.getElementById("csv-file-input");
@@ -2686,10 +2667,10 @@ async function initCsvQueue() {
   // Upload CSV
   uploadBtn.addEventListener("click", async () => {
     const file = fileInput.files?.[0];
-    if (!file) { uploadRes.textContent = "Seleccioná un archivo CSV primero"; uploadRes.className = "push-result error"; return; }
+    if (!file) { uploadRes.textContent = "Pick a CSV file first"; uploadRes.className = "push-result error"; return; }
 
     uploadBtn.disabled = true; uploadBtn.textContent = "⏳...";
-    uploadRes.textContent = "Leyendo archivo..."; uploadRes.className = "push-result";
+    uploadRes.textContent = "Reading file..."; uploadRes.className = "push-result";
 
     try {
       const text    = (await file.text()).replace(/^\uFEFF/, "");
@@ -2712,7 +2693,7 @@ async function initCsvQueue() {
 
       // Aviso si pasa el límite diario de 75 — solo se procesarán los primeros 75 hoy
       if (unique.length > 75) {
-        const ok = confirm(`⚠️ Subiste ${unique.length} dominios pero el límite es 75/día por usuario.\n\nLos primeros 75 se procesarán hoy y el resto los siguientes días automáticamente.\n\n¿Continuar?`);
+        const ok = confirm(`⚠️ You uploaded ${unique.length} domains but the limit is 75/day per user.\n\nThe first 75 will be processed today and the rest over following days automatically.\n\nContinue?`);
         if (!ok) { uploadRes.textContent = "Upload canceled."; uploadRes.className = "push-result"; return; }
       }
 
@@ -2746,7 +2727,7 @@ async function initCsvQueue() {
     try {
       const domains = await fetchMondayForRefresh({ geo, idioma, limit });
       if (domains.length === 0) {
-        resultEl.textContent = "No se encontraron dominios con estado Ciclo Finalizado + esos filtros";
+        resultEl.textContent = "No Ciclo Finalizado domains match those filters.";
         resultEl.className = "push-result error";
         return;
       }
@@ -2759,7 +2740,7 @@ async function initCsvQueue() {
       resultEl.textContent = `❌ ${err.message}`;
       resultEl.className = "push-result error";
     } finally {
-      btn.disabled = false; btn.textContent = "🔄 Buscar y encolar desde Monday";
+      btn.disabled = false; btn.textContent = "🔄 Fetch &amp; queue from Monday";
     }
   });
 
@@ -2805,7 +2786,7 @@ function initPitchDrafts() {
     editingId = null;
     nameEl.value = ""; subjectEl.value = ""; bodyEl.value = "";
     langEl.value = state.siteLanguage || "es";
-    modeLbl.textContent = "Nuevo borrador";
+    modeLbl.textContent = "New draft";
     delBtn.style.display = "none";
     resultEl.textContent = "";
   };
@@ -2813,7 +2794,7 @@ function initPitchDrafts() {
   const renderList = (drafts) => {
     lastDrafts = drafts;
     if (drafts.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">No hay borradores. Creá uno abajo.</div>';
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">No drafts yet. Create one below.</div>';
       return;
     }
     listEl.innerHTML = drafts.map(d => {
@@ -2898,13 +2879,13 @@ function initPitchDrafts() {
     const result = await savePitchDraft(state.accessToken, {
       id: editingId, user_email: state.loginEmail, name, language, subject, body,
     });
-    saveBtn.disabled = false; saveBtn.textContent = "💾 Guardar";
+    saveBtn.disabled = false; saveBtn.textContent = "💾 Save";
 
     if (result.ok) {
       resultEl.textContent = editingId ? "✅ Updated" : "✅ Saved";
       resultEl.style.color = "#16a34a";
       editingId = result.data?.id || null;
-      modeLbl.textContent = editingId ? `Editando: ${name}` : "Nuevo borrador";
+      modeLbl.textContent = editingId ? `Editing: ${name}` : "New draft";
       delBtn.style.display = editingId ? "inline-block" : "none";
       await load();
     } else {
@@ -2915,7 +2896,7 @@ function initPitchDrafts() {
 
   delBtn.addEventListener("click", async () => {
     if (!editingId) return;
-    if (!confirm("¿Borrar este borrador?")) return;
+    if (!confirm("Delete this draft?")) return;
     await deletePitchDraft(state.accessToken, editingId);
     clearForm();
     await load();
@@ -2966,7 +2947,7 @@ async function initAutopilot() {
       setAutopilotUI(btn, false);
       await setAutopilotEnabled(false, state.accessToken);
     } else {
-      // Encender por 15 min
+      // Turn on for up to AUTOPILOT_DURATION_MS (default 60 min)
       setAutopilotUI(btn, true);
       await setAutopilotEnabled(true, state.accessToken, state.loginEmail);
       startAutopilotCountdown(btn, AUTOPILOT_DURATION_MS);
@@ -3385,16 +3366,6 @@ function initProspectCard(card, data) {
     btn.disabled = false;
   });
 
-  // Edit button → expand + focus pitch
-  card.querySelector(".pcard-edit-btn")?.addEventListener("click", () => {
-    const panel = card.querySelector(".pcard-detail");
-    if (panel.style.display === "none") {
-      panel.style.display = "block";
-      card.querySelector(".pcard-expand-btn").textContent = "▲";
-    }
-    card.querySelector(".pcard-pitch")?.focus();
-  });
-
   // 👍 Like — entrena al autopilot para buscar más tipos similares
   card.querySelector(".pcard-like-btn")?.addEventListener("click", async (e) => {
     e.stopPropagation();
@@ -3442,19 +3413,9 @@ function initProspectCard(card, data) {
     await validateProspect(card, data, true);
   });
 
-  // Monday only (compact)
-  card.querySelector(".pcard-mondayonly-btn")?.addEventListener("click", async () => {
-    await validateProspect(card, data, false);
-  });
-
   // Validate (expanded)
   card.querySelector(".pcard-validate-expanded")?.addEventListener("click", async () => {
     await validateProspect(card, data, true);
-  });
-
-  // Monday only (expanded)
-  card.querySelector(".pcard-mondayonly-expanded")?.addEventListener("click", async () => {
-    await validateProspect(card, data, false);
   });
 }
 

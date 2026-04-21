@@ -35,8 +35,8 @@
   </div>
   <div class="header-right">
     <div id="site-url" class="site-url">loading...</div>
-    <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab">↻</button>
-    <button id="btn-settings" class="icon-btn" title="Settings">⚙</button>
+    <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab" aria-label="Re-analyze current tab">↻</button>
+    <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
   </div>
 </header>
 
@@ -305,7 +305,6 @@
         <button id="btn-detect-banners" class="btn btn-secondary btn-sm">↻ Refresh</button>
       </div>
       <div id="banner-result" class="banner-result">Not analyzed</div>
-      <div id="adtech-result" class="adtech-result" style="display:none"></div>
     </div>
 
     <!-- Partners -->
@@ -646,7 +645,7 @@
         <div style="font-size:10px;color:#94a3b8;margin-top:2px">Runs for 1h, finds new sites on the web and adds them here for review. Limit 75/day per user.</div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
-        <button id="btn-autopilot-target" class="icon-btn" title="Target (GEO + Categoría)" style="font-size:13px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:#fff">🎯</button>
+        <button id="btn-autopilot-target" class="icon-btn" title="Autopilot target (GEO + category)" aria-label="Autopilot target" style="font-size:13px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:#fff">🎯</button>
         <button id="btn-autopilot" class="autopilot-btn" title="Prender / apagar">
           <span class="autopilot-dot"></span>
           <span class="autopilot-label">AUTO OFF</span>
@@ -972,7 +971,7 @@
   <div class="modal-content" style="max-width:480px">
     <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center">
       <span>📋 Pitch Drafts</span>
-      <button id="btn-drafts-close" class="icon-btn" style="font-size:14px">✕</button>
+      <button id="btn-drafts-close" class="icon-btn" aria-label="Close drafts modal" title="Close" style="font-size:14px">✕</button>
     </div>
 
     <div id="drafts-list" style="max-height:260px; overflow-y:auto; margin:10px 0; font-size:12px"></div>
