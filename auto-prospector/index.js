@@ -218,7 +218,7 @@ async function markProcessed(token, domains) {
   });
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy }) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
     headers: {
@@ -239,9 +239,47 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
       score:          score          || 0,
       ad_networks:    adNetworks     || [],
       page_title:     pageTitle      || "",
+      created_by:     createdBy      || "",    // user que inició el autopilot
       status:         "pending",
     }),
   });
+}
+
+// Cuenta items de autopilot creados por un user hoy (para quota 75/día)
+async function getUserAutopilotCountToday(token, userEmail) {
+  if (!userEmail) return 0;
+  try {
+    const todayISO = new Date().toISOString().split("T")[0];
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}&created_at=gte.${todayISO}T00:00:00Z&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
+    );
+    const cr = res.headers.get("content-range") || "";
+    const m = cr.match(/\/(\d+)$/);
+    return m ? parseInt(m[1]) : 0;
+  } catch { return 0; }
+}
+
+// Carga feedback del user: sets con categorías/geos/dominios que marcó como disliked
+async function loadAutopilotFeedback(token, userEmail) {
+  const dislikedCategories = new Map(); // category → count
+  const dislikedGeos       = new Map();
+  const dislikedDomains    = new Set();
+  if (!userEmail) return { dislikedCategories, dislikedGeos, dislikedDomains };
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.disliked&select=domain,category,geo&limit=1000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    );
+    if (!res.ok) return { dislikedCategories, dislikedGeos, dislikedDomains };
+    const rows = await res.json();
+    for (const r of rows) {
+      if (r.domain)   dislikedDomains.add(r.domain.toLowerCase());
+      if (r.category) dislikedCategories.set(r.category, (dislikedCategories.get(r.category) || 0) + 1);
+      if (r.geo)      dislikedGeos.set(r.geo,             (dislikedGeos.get(r.geo)             || 0) + 1);
+    }
+  } catch {}
+  return { dislikedCategories, dislikedGeos, dislikedDomains };
 }
 
 async function getApolloUsageToday(token) {
@@ -1004,9 +1042,25 @@ async function runSession(token, cfg, sessionStart) {
   const targetCategory = cfg.target_category || "";
   const minScore       = Number(cfg.min_score)    || 20;
   const sessionMinTraffic = Number(cfg.min_traffic) || MIN_TRAFFIC;
+  const sessionUser    = cfg.auto_session_user || "";       // user que inició el autopilot
+  const AUTOPILOT_DAILY_LIMIT = 75;
 
   const targetInfo = [targetGeo, targetCategory].filter(Boolean).join(" + ") || "sin filtros";
-  log(`Sesión iniciada. Target: ${targetInfo} | Min score: ${minScore} | Min traffic: ${(sessionMinTraffic/1000).toFixed(0)}K`);
+  log(`Sesión iniciada. User: ${sessionUser || "(desconocido)"} | Target: ${targetInfo} | Min score: ${minScore} | Min traffic: ${(sessionMinTraffic/1000).toFixed(0)}K`);
+
+  // Quota diaria per-user para el autopilot
+  const userTodayCount = await getUserAutopilotCountToday(token, sessionUser);
+  if (sessionUser && userTodayCount >= AUTOPILOT_DAILY_LIMIT) {
+    log(`⚠️ ${sessionUser} ya alcanzó el límite diario de autopilot (${userTodayCount}/${AUTOPILOT_DAILY_LIMIT}) — sesión no arranca`);
+    return;
+  }
+  log(`Quota del día para ${sessionUser}: ${userTodayCount}/${AUTOPILOT_DAILY_LIMIT}`);
+
+  // Cargar feedback del user (learning)
+  const feedback = await loadAutopilotFeedback(token, sessionUser);
+  if (feedback.dislikedDomains.size || feedback.dislikedCategories.size || feedback.dislikedGeos.size) {
+    log(`Learning: ${feedback.dislikedDomains.size} dominios, ${feedback.dislikedCategories.size} categorías y ${feedback.dislikedGeos.size} geos bloqueados por feedback previo`);
+  }
 
   // Carga en paralelo: pool global, Monday, procesados, rechazos, uso Apollo
   const [pool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
@@ -1057,6 +1111,16 @@ async function runSession(token, cfg, sessionStart) {
       break;
     }
 
+    // Check quota diaria del user: si ya alcanzó 75, cortar
+    if (sessionUser) {
+      const userSessionTotal = userTodayCount + added;
+      if (userSessionTotal >= AUTOPILOT_DAILY_LIMIT) {
+        log(`⏸ ${sessionUser} alcanzó ${userSessionTotal}/${AUTOPILOT_DAILY_LIMIT} autopilot hoy — sesión cortada`);
+        await setConfigValue(token, "auto_prospecting_enabled", "false");
+        break;
+      }
+    }
+
     if (count % 10 === 0 && count > 0) {
       const freshCfg = await getConfig(token);
       if (freshCfg.auto_prospecting_enabled !== "true" && freshCfg.auto_prospecting_enabled !== true) {
@@ -1069,6 +1133,13 @@ async function runSession(token, cfg, sessionStart) {
     log(`→ [${count + 1} | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
 
     // Pre-filtro GRATUITO (antes de gastar créditos SimilarWeb / Apollo):
+    // 0) Learning: dominio dislikeado directamente por el user
+    if (feedback.dislikedDomains.has(domain.toLowerCase())) {
+      log(`  ⊘ ${domain} — disliked previamente por ${sessionUser}, skip`);
+      await markProcessed(token, [domain]);
+      count++; skipped++;
+      continue;
+    }
     // 1) Blocklist corporativa / universidades / adultos / tech giants
     const blockReason = isDomainBlocked(domain);
     if (blockReason) {
@@ -1133,13 +1204,20 @@ async function runSession(token, cfg, sessionStart) {
     // Scoring: tráfico + categoría + contacto + geo target + contenido accesible
     const rawScore = scoreCandidate({ visits, category, topCountry, contactName, emails: [], pageContent, targetGeo });
 
-    // Penalización por patrones de rechazo aprendidos
+    // Penalización por patrones de rechazo aprendidos (globales)
     const catPenalty = Math.min(20, (rejectionPatterns.categories[category] || 0) * 4);
     const geoPenalty = Math.min(10, (rejectionPatterns.geos[topCountry]     || 0) * 2);
-    const finalScore = rawScore - catPenalty - geoPenalty;
+
+    // Penalización POR USUARIO (feedback like/dislike explícito) — mucho más fuerte
+    const userCatDislikes = feedback.dislikedCategories.get(category) || 0;
+    const userGeoDislikes = feedback.dislikedGeos.get(topCountry)     || 0;
+    const userCatPenalty  = Math.min(40, userCatDislikes * 10);       // -10 por cada dislike, max -40
+    const userGeoPenalty  = Math.min(30, userGeoDislikes * 8);
+
+    const finalScore = rawScore - catPenalty - geoPenalty - userCatPenalty - userGeoPenalty;
 
     if (finalScore < minScore) {
-      log(`  ✗ Score ${finalScore} (raw ${rawScore}, penalización cat:${catPenalty} geo:${geoPenalty}) — descartado`);
+      log(`  ✗ Score ${finalScore} (raw ${rawScore}, global cat:${catPenalty} geo:${geoPenalty}, user cat:${userCatPenalty} geo:${userGeoPenalty}) — descartado`);
       await markProcessed(token, [domain]);
       count++; lowScore++;
       await sleep(DOMAIN_DELAY_MS);
@@ -1193,6 +1271,7 @@ async function runSession(token, cfg, sessionStart) {
       score:         scoreWithEmails,
       adNetworks,
       pageTitle,
+      createdBy:     sessionUser,
     });
     await markProcessed(token, [domain]);
     count++; added++;

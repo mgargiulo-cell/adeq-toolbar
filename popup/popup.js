@@ -16,7 +16,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
          getPitchDrafts, savePitchDraft, deletePitchDraft,
-         getAutopilotEnabled, getAutopilotState, setAutopilotEnabled,
+         getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem,
          getDailyValidationCount }                                                           from "../modules/supabase.js";
@@ -2962,7 +2962,7 @@ async function initAutopilot() {
     } else {
       // Encender por 15 min
       setAutopilotUI(btn, true);
-      await setAutopilotEnabled(true, state.accessToken);
+      await setAutopilotEnabled(true, state.accessToken, state.loginEmail);
       startAutopilotCountdown(btn, AUTOPILOT_DURATION_MS);
     }
   });
@@ -3179,6 +3179,8 @@ function renderProspectCard(r) {
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="See email &amp; data" style="padding:3px 7px">▼</button>
+        <button class="btn btn-sm pcard-like-btn" title="Me sirve este tipo de sitio — entrenar al autopilot" style="padding:3px 6px;color:#16a34a;background:transparent;border:1px solid var(--border)">👍</button>
+        <button class="btn btn-sm pcard-dislike-btn" title="No me sirve — el autopilot aprende a evitar estos" style="padding:3px 6px;background:transparent;border:1px solid var(--border)">👎</button>
         <button class="btn btn-success btn-sm pcard-validate-btn" title="Push to Monday + Send Email" style="padding:3px 7px">✅</button>
         <button class="btn btn-sm pcard-reject-btn" title="Reject permanently" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -3344,11 +3346,44 @@ function initProspectCard(card, data) {
     card.querySelector(".pcard-pitch")?.focus();
   });
 
+  // 👍 Like — entrena al autopilot para buscar más tipos similares
+  card.querySelector(".pcard-like-btn")?.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "⏳";
+    await saveAutopilotFeedback(state.accessToken, {
+      user_email: state.loginEmail, domain: data.domain, action: "liked",
+      category: data.category, geo: data.geo, ad_networks: data.ad_networks,
+    });
+    btn.textContent = "👍"; btn.style.background = "#d1fae5"; btn.style.borderColor = "#34d399";
+    btn.title = "✓ Like guardado — el autopilot va a priorizar estos patrones";
+  });
+
+  // 👎 Dislike — el autopilot aprende a evitar categoría/geo/dominio
+  card.querySelector(".pcard-dislike-btn")?.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "⏳";
+    await saveAutopilotFeedback(state.accessToken, {
+      user_email: state.loginEmail, domain: data.domain, action: "disliked",
+      category: data.category, geo: data.geo, ad_networks: data.ad_networks,
+    });
+    btn.textContent = "👎"; btn.style.background = "#fee2e2"; btn.style.borderColor = "#fca5a5";
+    btn.title = "✓ Dislike guardado — el autopilot no va a traer más de este tipo";
+  });
+
   // Reject
   card.querySelector(".pcard-reject-btn")?.addEventListener("click", async () => {
     if (!confirm(`Reject and permanently block "${data.domain}"?`)) return;
     card.style.opacity = "0.4";
-    await rejectReviewItem(state.accessToken, id, data.domain);
+    // Al rechazar, también guardar dislike para el learning
+    await Promise.all([
+      rejectReviewItem(state.accessToken, id, data.domain),
+      saveAutopilotFeedback(state.accessToken, {
+        user_email: state.loginEmail, domain: data.domain, action: "disliked",
+        category: data.category, geo: data.geo, ad_networks: data.ad_networks,
+      }),
+    ]);
     card.remove();
     refreshProspectsStats();
   });

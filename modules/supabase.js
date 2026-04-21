@@ -124,7 +124,17 @@ export async function getAutopilotState(accessToken) {
   } catch { return { enabled: false, sessionStart: null }; }
 }
 
-export async function setAutopilotEnabled(enabled, accessToken) {
+async function upsertConfig(url, key, headers, configKey, value) {
+  const check = await fetch(`${url}/rest/v1/toolbar_config?key=eq.${configKey}&select=key`, { headers });
+  const exists = (await check.json())?.length > 0;
+  await fetch(`${url}/rest/v1/toolbar_config${exists ? `?key=eq.${configKey}` : ""}`, {
+    method: exists ? "PATCH" : "POST",
+    headers,
+    body: JSON.stringify(exists ? { value } : { key: configKey, value }),
+  });
+}
+
+export async function setAutopilotEnabled(enabled, accessToken, userEmail = "") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   const headers = {
@@ -135,17 +145,30 @@ export async function setAutopilotEnabled(enabled, accessToken) {
       method: "PATCH", headers,
       body: JSON.stringify({ value: enabled ? "true" : "false" }),
     });
-    // Si se enciende, guardar timestamp de inicio de sesión
+    // Al encender: guardar timestamp + user que inició
     if (enabled) {
       const sessionStart = new Date().toISOString();
-      const check = await fetch(`${url}/rest/v1/toolbar_config?key=eq.auto_session_start&select=key`, { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } });
-      const exists = (await check.json())?.length > 0;
-      await fetch(`${url}/rest/v1/toolbar_config${exists ? "?key=eq.auto_session_start" : ""}`, {
-        method: exists ? "PATCH" : "POST", headers,
-        body: JSON.stringify(exists ? { value: sessionStart } : { key: "auto_session_start", value: sessionStart }),
-      });
+      await upsertConfig(url, key, headers, "auto_session_start", sessionStart);
+      if (userEmail) await upsertConfig(url, key, headers, "auto_session_user", userEmail);
     }
   } catch {}
+}
+
+// ── Autopilot feedback (learning from user like/dislike) ────
+export async function saveAutopilotFeedback(accessToken, { user_email, domain, action, category, geo, ad_networks }) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_autopilot_feedback`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify([{ user_email, domain, action, category: category || "", geo: geo || "", ad_networks: ad_networks || [] }]),
+    });
+    return { ok: res.ok };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 export async function getAutopilotTarget(accessToken) {
