@@ -706,26 +706,18 @@ async function runEmailScraper() {
     // Si ya tenemos emails en caché de sesión (misma visita al dominio), usarlos
     // Igualmente re-scrapeamos la página actual para no perdernos emails de subpáginas
     const sess = await getSessionCache(state.domain);
-    const [pageEmails, informerData, whoIsEmails] = await Promise.all([
-      scrapeEmailsFromPage(state.tabId),
-      sess?.emails?.length ? Promise.resolve({ emails: [] }) : scrapeInformer(state.domain),
-      sess?.emails?.length ? Promise.resolve([]) : scrapeWhoIs(state.domain),
-    ]);
+    // Only scrape the page DOM automatically (free + no external leak).
+    // Informer/WhoIs are paid third-parties that leak the visited domain — run only on-demand via Apollo/Gemini buttons.
+    const pageEmails = await scrapeEmailsFromPage(state.tabId);
     state.emails = []; state.emailSources = new Map();
-    addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail),        "Cache");
-    addEmailsWithSource(pageEmails.filter(quickValidateEmail),                  "Page");
-    addEmailsWithSource((informerData.emails || []).filter(quickValidateEmail), "Informer");
-    addEmailsWithSource(whoIsEmails.filter(quickValidateEmail),                 "WhoIs");
+    addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail), "Cache");
+    addEmailsWithSource(pageEmails.filter(quickValidateEmail),           "Page");
     const allEmails = state.emails;
 
     if (allEmails.length > 0 || state.duplicate?.email) {
       renderEmailList(allEmails);
       autoPushReady.email = true;
       checkAutoPush();
-    } else if (informerData.phone) {
-      el.style.display = "block";
-      el.textContent = `📞 ${informerData.phone}`; el.className = "email-value";
-      document.getElementById("email-list").style.display = "none";
     } else {
       renderEmailList([]);
     }
