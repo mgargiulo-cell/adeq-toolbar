@@ -789,17 +789,20 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   return { inserted, attempted: domains.length };
 }
 
-// Clear all pending prospects (del user actual o todos)
+// Clear ALL prospects of the user (any status — pending, rejected, validated, failed)
 export async function clearPendingProspects(accessToken, userEmail = null) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const userFilter = userEmail ? `&created_by=eq.${encodeURIComponent(userEmail)}` : "";
+  if (!userEmail) return { ok: false, error: "userEmail required" };
   try {
-    const res = await fetch(`${url}/rest/v1/toolbar_review_queue?status=eq.pending${userFilter}`, {
-      method: "DELETE",
-      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
-    });
-    return { ok: res.ok };
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}`,
+      {
+        method: "DELETE",
+        headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+      }
+    );
+    return { ok: res.ok, status: res.status };
   } catch (e) { return { ok: false, error: e.message }; }
 }
 

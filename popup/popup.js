@@ -3597,8 +3597,12 @@ function initProspectsTab() {
     await loadProspectsTab();
   });
   document.getElementById("btn-prospects-clear")?.addEventListener("click", async () => {
-    if (!confirm("Clear all pending prospects from YOUR queue?\n(Only items you created — other users' prospects are not affected.)")) return;
-    await clearPendingProspects(state.accessToken, state.loginEmail);
+    if (!confirm("Delete ALL your prospects (pending, rejected, validated, failed)?\n\nThis cannot be undone. Only your own items are affected.")) return;
+    const btn = document.getElementById("btn-prospects-clear");
+    btn.disabled = true; btn.textContent = "⏳ Deleting...";
+    const r = await clearPendingProspects(state.accessToken, state.loginEmail);
+    btn.disabled = false; btn.textContent = "🗑 Clear all";
+    if (!r.ok) { alert("Delete failed — status " + (r.status || "?") + " · " + (r.error || "")); return; }
     await loadProspectsTab();
   });
 }
