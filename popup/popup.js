@@ -3022,7 +3022,7 @@ async function initAutopilot() {
   const currentLbl  = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
-  const [{ enabled, sessionStart, heartbeatAt }, target] = await Promise.all([
+  const [{ enabled, heartbeatAt }, target] = await Promise.all([
     getAutopilotState(state.accessToken),
     getAutopilotTarget(state.accessToken),
   ]);
@@ -3037,18 +3037,12 @@ async function initAutopilot() {
     renderRailwayHeartbeat(st.heartbeatAt);
   }, 15_000);
 
-  // Calcular tiempo restante de una sesión activa
-  const elapsed  = sessionStart ? (Date.now() - sessionStart.getTime()) : Infinity;
-  const remaining = AUTOPILOT_DURATION_MS - elapsed;
-
-  if (enabled && remaining > 0) {
-    // Sesión activa con tiempo restante — reanudar countdown
-    setAutopilotUI(btn, true);
-    startAutopilotCountdown(btn, remaining);
-  } else {
-    // Apagado o sesión expirada — siempre forzar OFF
-    setAutopilotUI(btn, false);
-    if (enabled) await setAutopilotEnabled(false, state.accessToken);
+  // HARD RULE: autopilot must ALWAYS start OFF when the toolbar opens.
+  // If the DB has it on (stuck session or another tab), force-disable it now.
+  setAutopilotUI(btn, false);
+  if (enabled) {
+    await setAutopilotEnabled(false, state.accessToken);
+    console.log("[Autopilot] Forced OFF on panel open — user must re-enable manually");
   }
 
   updateTargetLabel(target, targetBtn, currentLbl);
