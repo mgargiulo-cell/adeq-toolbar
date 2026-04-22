@@ -14,6 +14,7 @@ const SUPABASE_ANON_KEY         = process.env.SUPABASE_ANON_KEY;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // bypass RLS (backend worker)
 const SUPABASE_EMAIL            = process.env.SUPABASE_EMAIL;
 const SUPABASE_PASSWORD         = process.env.SUPABASE_PASSWORD;
+const CLOUDFLARE_API_TOKEN      = process.env.CLOUDFLARE_API_TOKEN || null; // optional: Radar country-indexed pool
 
 // If a service-role key is set, use it as Bearer — bypasses RLS.
 // Otherwise fall back to user JWT (won't see items uploaded by other users with RLS on).
@@ -121,6 +122,11 @@ const COUNTRY_CODES = {
   TW:"Taiwan", HK:"Hong Kong", PK:"Pakistan",
 };
 
+// Reverse lookup: country name → ISO code (for Cloudflare Radar API)
+const COUNTRY_NAME_TO_CODE = Object.fromEntries(
+  Object.entries(COUNTRY_CODES).map(([code, name]) => [name, code])
+);
+
 // ── Domain pool (Majestic Million) ───────────────────────────
 
 async function loadDomainPool() {
@@ -147,6 +153,61 @@ async function loadDomainPool() {
     domainPool = []; // evitar retry inmediato; se reseteará al reiniciar
   }
   return domainPool;
+}
+
+// ── Cloudflare Radar: country-indexed domain pool ────────────
+// Returns Map<domain, Set<countryCode>> for each country in countryCodes.
+// Requires CLOUDFLARE_API_TOKEN env var. If missing → returns null (fallback to Majestic).
+async function loadRadarPoolForCountries(countryCodes) {
+  if (!CLOUDFLARE_API_TOKEN) return null;
+  if (!countryCodes?.length) return null;
+
+  const headers = { "Authorization": `Bearer ${CLOUDFLARE_API_TOKEN}` };
+  const merged = new Map(); // domain → Set<CC>
+  const LIMIT  = 1000;
+
+  for (const cc of countryCodes) {
+    try {
+      const url = `https://api.cloudflare.com/client/v4/radar/ranking/top?location=${encodeURIComponent(cc)}&limit=${LIMIT}`;
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) {
+        log(`  ⚠️ Radar ${cc}: HTTP ${res.status} — saltado`);
+        continue;
+      }
+      const data = await res.json();
+      const top  = data?.result?.top_0 || data?.result?.top || [];
+      let added = 0;
+      for (const entry of top) {
+        const domain = (entry?.domain || entry?.value || "").toLowerCase().replace(/^www\./, "");
+        if (!domain || !isDomainAllowed(domain)) continue;
+        if (BLACKLIST_TLDS.some(tld => domain.endsWith(tld))) continue;
+        if (!merged.has(domain)) merged.set(domain, new Set());
+        merged.get(domain).add(cc);
+        added++;
+      }
+      log(`  🌎 Radar ${cc}: +${added} dominios`);
+    } catch (e) {
+      log(`  ⚠️ Radar ${cc}: ${e.message}`);
+    }
+  }
+  return merged.size > 0 ? merged : null;
+}
+
+// Expand a mix of regions + countries to ISO codes Cloudflare Radar understands
+function targetGeosToCountryCodes(targetGeos) {
+  const codes = new Set();
+  for (const g of targetGeos) {
+    if (GEO_REGIONS[g]) {
+      for (const country of GEO_REGIONS[g]) {
+        const cc = COUNTRY_NAME_TO_CODE[country];
+        if (cc) codes.add(cc);
+      }
+    } else {
+      const cc = COUNTRY_NAME_TO_CODE[g];
+      if (cc) codes.add(cc);
+    }
+  }
+  return [...codes];
 }
 
 // ── Supabase helpers ──────────────────────────────────────────
@@ -1156,14 +1217,33 @@ async function runSession(token, cfg, sessionStart) {
     log(`Learning: ${feedback.dislikedDomains.size} dominios, ${feedback.dislikedCategories.size} categorías y ${feedback.dislikedGeos.size} geos bloqueados por feedback previo`);
   }
 
+  // Intentar Cloudflare Radar si hay target_geos + token configurado
+  let poolSource = "majestic";
+  let radarPool  = null;
+  if (CLOUDFLARE_API_TOKEN && hasTargetGeo) {
+    const countryCodes = targetGeosToCountryCodes(targetGeos);
+    if (countryCodes.length > 0) {
+      log(`Cloudflare Radar: consultando top domains para ${countryCodes.join(",")}...`);
+      radarPool = await loadRadarPoolForCountries(countryCodes);
+      if (radarPool) {
+        poolSource = "radar";
+        log(`Pool Radar listo: ${radarPool.size.toLocaleString()} dominios pre-filtrados por país.`);
+      } else {
+        log("Radar devolvió vacío — cayendo a Majestic Million.");
+      }
+    }
+  }
+
   // Carga en paralelo: pool global, Monday, procesados, rechazos, uso Apollo
-  const [pool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
-    loadDomainPool(),
+  const [majesticPool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
+    radarPool ? Promise.resolve([...radarPool.keys()]) : loadDomainPool(),
     fetchMondayDomains(monday_api_key),
     getProcessedDomains(token),
     getRejectionPatterns(token),
     getApolloUsageToday(token),
   ]);
+  const pool = majesticPool;
+  log(`Fuente del pool: ${poolSource} (${pool.length.toLocaleString()} dominios)`);
 
   let apolloCallsThisSession = 0;
   const apolloRemaining = apolloUsage.limit - apolloUsage.usedToday;
@@ -1278,7 +1358,14 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
 
-    // Fallback GEO: si SimilarWeb no trajo topCountry, inferir desde TLD
+    // Fallback GEO orden: SimilarWeb > Radar hint > TLD
+    if (!topCountry && radarPool?.has(domain)) {
+      const cc = [...radarPool.get(domain)][0];
+      if (cc && COUNTRY_CODES[cc]) {
+        topCountry = COUNTRY_CODES[cc];
+        log(`  ℹ ${domain} — GEO del Radar: ${topCountry}`);
+      }
+    }
     if (!topCountry) {
       const inferred = inferCountryFromTLD(domain);
       if (inferred) {
