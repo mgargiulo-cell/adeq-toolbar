@@ -211,15 +211,27 @@ async function getProcessedDomains(token) {
   return new Set(rows.map(r => r.domain));
 }
 
-async function markProcessed(token, domains) {
-  const expiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+// Reasons with PERMANENT block (never re-evaluate)
+const PERMANENT_REASONS = new Set([
+  "country_blacklist",  // US/CA/RU/AU/NZ — won't change
+  "tld_blacklist",      // .us/.ca/.ru/.au/.nz — won't change
+  "government",         // .gov/.edu — won't change
+  "blocklist",          // static exclude list (google.com, etc.) — won't change
+  "rejected_by_user",   // user clicked ❌ Reject in Prospects
+]);
+// Other reasons (traffic_low, page_unreachable, api_error) → 60-day TTL, re-evaluate eventually
+
+async function markProcessed(token, domains, reason = "processed") {
+  const isPerm = PERMANENT_REASONS.has(reason);
+  // Permanent = expire in 100 years. Temporary = 60 days.
+  const expiresAt = new Date(Date.now() + (isPerm ? 100 * 365 : 60) * 24 * 60 * 60 * 1000).toISOString();
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_import_queue`, {
     method: "POST",
     headers: {
       "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
       "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
     },
-    body: JSON.stringify(domains.map(d => ({ domain: d, imported_by: "AUTO", expires_at: expiresAt }))),
+    body: JSON.stringify(domains.map(d => ({ domain: d, imported_by: reason, expires_at: expiresAt }))),
   });
 }
 
@@ -368,15 +380,35 @@ async function fetchMondayDomains(apiKey) {
   return items.map(i => cleanDomain(i.name)).filter(Boolean);
 }
 
+// Retry helper — 3 attempts with exponential backoff for transient RapidAPI errors.
+// 5xx + network errors retry; 4xx (bad domain) fails fast. Returns null on permanent failure.
+async function rapidFetchWithRetry(url, headers, timeout = 8000) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
+      if (res.ok) return await res.json();
+      // 4xx = client error, don't retry
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) return null;
+      // 429 / 5xx = retry
+      lastErr = `HTTP ${res.status}`;
+    } catch (e) {
+      lastErr = e.message;
+    }
+    if (attempt < 2) await sleep(500 * Math.pow(2, attempt)); // 500ms, 1s
+  }
+  return { __error: lastErr }; // signal to caller: distinguish from "empty"
+}
+
 async function getTrafficData(domain, rapidApiKey) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "similarweb-insights.p.rapidapi.com" };
   try {
-    const res = await fetch(
+    const data = await rapidFetchWithRetry(
       `https://similarweb-insights.p.rapidapi.com/traffic?domain=${encodeURIComponent(domain)}`,
-      { headers, signal: AbortSignal.timeout(8000) }
+      headers
     );
-    if (!res.ok) return { visits: null, topCountry: null };
-    const data = await res.json();
+    if (!data) return { visits: null, topCountry: null, error: null };             // 4xx = domain not in SW
+    if (data.__error) return { visits: null, topCountry: null, error: data.__error }; // retries exhausted
     const visits = data?.Visits || data?.visits || data?.pageViews || null;
 
     // Extract top country — try inline data first, then separate /countries endpoint
@@ -408,8 +440,8 @@ async function getTrafficData(domain, rapidApiKey) {
       } catch {}
     }
 
-    return { visits, topCountry };
-  } catch { return { visits: null, topCountry: null }; }
+    return { visits, topCountry, error: null };
+  } catch (e) { return { visits: null, topCountry: null, error: e.message }; }
 }
 
 async function findSimilarSites(domain, rapidApiKey) {
@@ -1198,7 +1230,7 @@ async function runSession(token, cfg, sessionStart) {
     // 0) Learning: dominio dislikeado directamente por el user
     if (feedback.dislikedDomains.has(domain.toLowerCase())) {
       log(`  ⊘ ${domain} — disliked previamente por ${sessionUser}, skip`);
-      await markProcessed(token, [domain]);
+      await markProcessed(token, [domain], "rejected_by_user");
       count++; skipped++;
       continue;
     }
@@ -1206,14 +1238,25 @@ async function runSession(token, cfg, sessionStart) {
     const blockReason = isDomainBlocked(domain);
     if (blockReason) {
       log(`  ⊘ ${domain} — ${blockReason}, saltado sin consumir API`);
-      await markProcessed(token, [domain]);
+      // Permanent: these categories won't change
+      const perm = blockReason.includes("gov") || blockReason.includes("edu") || blockReason.includes("university")
+        ? "government" : "blocklist";
+      await markProcessed(token, [domain], perm);
       count++; skipped++;
-      continue; // sin sleep — no consumió nada
+      continue;
+    }
+    // 1b) TLD blacklist (permanent — a .us won't stop being .us)
+    if (BLACKLIST_TLDS.some(tld => domain.endsWith(tld))) {
+      log(`  ⊘ ${domain} — TLD blacklisteado, skip permanente`);
+      await markProcessed(token, [domain], "tld_blacklist");
+      count++; skipped++;
+      continue;
     }
     // 2) GEO pre-filter por TLD si hay targets — pasa si matchea CUALQUIERA
     if (hasTargetGeo && !targetGeos.some(g => matchesTargetGeoByTLD(domain, g))) {
       log(`  ⊘ ${domain} — TLD no coincide con ${targetGeos.join("+")}`);
-      await markProcessed(token, [domain]);
+      // Not permanent — user may change targets in next session
+      await markProcessed(token, [domain], "tld_target_mismatch");
       count++; skipped++;
       continue;
     }
@@ -1224,7 +1267,16 @@ async function runSession(token, cfg, sessionStart) {
       fetchPageContent(domain),
     ]);
 
-    let { visits, topCountry } = trafficData;
+    let { visits, topCountry, error: rapidError } = trafficData;
+
+    // Si el RapidAPI devolvió error tras 3 retries, no descartar permanentemente
+    if (rapidError) {
+      log(`  ⚠ RapidAPI error (${rapidError}) — re-evaluar después`);
+      await markProcessed(token, [domain], "api_error");
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
 
     // Fallback GEO: si SimilarWeb no trajo topCountry, inferir desde TLD
     if (!topCountry) {
@@ -1235,19 +1287,27 @@ async function runSession(token, cfg, sessionStart) {
       }
     }
 
-    // Blacklist geográfica post-traffic — si topCountry está en blacklist, skip
+    // Blacklist geográfica post-traffic — permanente, el país no va a cambiar
     if (topCountry && GEO_BLACKLIST_COUNTRIES.has(topCountry)) {
-      log(`  ⊘ ${domain} — topCountry ${topCountry} blacklisteado, skip`);
-      await markProcessed(token, [domain]);
+      log(`  ⊘ ${domain} — topCountry ${topCountry} blacklisteado, skip permanente`);
+      await markProcessed(token, [domain], "country_blacklist");
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
 
-    // Filtro primario: tráfico mínimo
-    if (!visits || visits < sessionMinTraffic) {
-      log(`  ✗ Tráfico (${visits ? Math.round(visits/1000)+"K" : "N/A"}) — descartado`);
-      await markProcessed(token, [domain]);
+    // Filtro primario: tráfico mínimo. Si visits=null, puede ser API error vs site sin tráfico.
+    // Distinguimos: null = api_error (re-evaluable), número bajo = traffic_low (re-evaluable en 60 días)
+    if (visits === null || visits === undefined) {
+      log(`  ⚠ Tráfico N/A (posible API error) — descartado temporalmente`);
+      await markProcessed(token, [domain], "api_error");
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
+    if (visits < sessionMinTraffic) {
+      log(`  ✗ Tráfico (${Math.round(visits/1000)}K) < ${(sessionMinTraffic/1000)}K — descartado`);
+      await markProcessed(token, [domain], "traffic_low");
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
@@ -1259,19 +1319,19 @@ async function runSession(token, cfg, sessionStart) {
     const adNetworks  = pageContent?.adNetworks || [];
     const pageTitle   = pageContent?.title       || "";
 
-    // Filtro por categoría objetivo (si está configurado)
+    // Filtro por categoría objetivo (si está configurado) — no permanente
     if (targetCategory && category !== targetCategory) {
       log(`  ✗ Categoría ${category} ≠ objetivo ${targetCategory} — descartado`);
-      await markProcessed(token, [domain]);
+      await markProcessed(token, [domain], "category_mismatch");
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
 
-    // Filtro duro de GEO — si hay targets, topCountry debe estar en el set permitido
+    // Filtro duro de GEO — no permanente (user puede cambiar targets)
     if (hasTargetGeo && topCountry && !allowedCountries.has(topCountry)) {
       log(`  ✗ GEO ${topCountry} ∉ {${[...allowedCountries].slice(0,5).join(",")}${allowedCountries.size>5?"...":""}} — descartado`);
-      await markProcessed(token, [domain]);
+      await markProcessed(token, [domain], "geo_target_mismatch");
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
@@ -1294,7 +1354,7 @@ async function runSession(token, cfg, sessionStart) {
 
     if (finalScore < minScore) {
       log(`  ✗ Score ${finalScore} (raw ${rawScore}, global cat:${catPenalty} geo:${geoPenalty}, user cat:${userCatPenalty} geo:${userGeoPenalty}) — descartado`);
-      await markProcessed(token, [domain]);
+      await markProcessed(token, [domain], "low_score");
       count++; lowScore++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
@@ -1349,7 +1409,7 @@ async function runSession(token, cfg, sessionStart) {
       pageTitle,
       createdBy:     sessionUser,
     });
-    await markProcessed(token, [domain]);
+    await markProcessed(token, [domain], "added_to_review");
     count++; added++;
 
     log(`  ✓ score:${scoreWithEmails} | ${Math.round(visits/1000)}K | ${topCountry||"N/A"} | ${language} | ${category} | ${contactName||"—"} | ${emails.length} email(s)`);
