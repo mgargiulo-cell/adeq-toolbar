@@ -48,6 +48,7 @@
     "https://accounts.google.com/*",
     "https://*.supabase.co/*",
     "https://dns.google/*",
-    "https://www.similarsites.com/*"
+    "https://www.similarsites.com/*",
+    "<all_urls>"
   ]
 }
