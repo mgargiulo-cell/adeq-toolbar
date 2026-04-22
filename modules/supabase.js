@@ -103,6 +103,57 @@ export async function supabaseRefresh(refreshToken) {
   }
 }
 
+// ── Pitch feedback RAG (Voyage embeddings + pgvector) ─────────
+export async function insertPitchFeedback(accessToken, userEmail, payload) {
+  // payload: { domain, category, geo, language, traffic, pitch_body, pitch_subject, context, embedding, action }
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !userEmail) return { ok: false, error: "auth required" };
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_pitch_feedback`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({ user_email: userEmail, ...payload }),
+    });
+    return { ok: res.ok, status: res.status };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// Returns top-N pitches matching the query embedding, scoped to user + action.
+// Uses the SQL function match_pitch_feedback (see sql/pitch_feedback_rag.sql).
+export async function matchPitchFeedback(accessToken, userEmail, embedding, action = "liked", count = 3) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !userEmail || !Array.isArray(embedding)) return [];
+  try {
+    const res = await fetch(`${url}/rest/v1/rpc/match_pitch_feedback`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query_embedding:  embedding,
+        match_user_email: userEmail,
+        match_action:     action,
+        match_count:      count,
+      }),
+    });
+    if (!res.ok) {
+      console.warn("[matchPitchFeedback] HTTP", res.status, (await res.text()).slice(0, 200));
+      return [];
+    }
+    const rows = await res.json();
+    return Array.isArray(rows) ? rows : [];
+  } catch (e) {
+    console.warn("[matchPitchFeedback] exception", e.message);
+    return [];
+  }
+}
+
 // ── Per-user custom Claude prompt (appended to system prompt on pitch generation) ──
 export async function getCustomPrompt(accessToken, userEmail) {
   const url = CONFIG.SUPABASE_URL;

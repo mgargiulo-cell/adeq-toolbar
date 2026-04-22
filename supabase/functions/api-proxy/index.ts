@@ -27,6 +27,7 @@ const PROVIDER_CAPS = {
   apollo:    150,
   rapidapi:  400,
   anthropic: 200,
+  voyage:    300,
 };
 
 const PROVIDERS = {
@@ -55,6 +56,12 @@ const PROVIDERS = {
     keyEnv: "ANTHROPIC_API_KEY",
     apiVersion: "2023-06-01",
     allow: /^\/v1\/messages$/,
+  },
+  voyage: {
+    base: "https://api.voyageai.com",
+    authMode: "header-bearer",        // Authorization: Bearer <KEY>
+    keyEnv: "VOYAGE_API_KEY",
+    allow: /^\/v1\/embeddings$/,
   },
 };
 
@@ -134,6 +141,8 @@ serve(async (req) => {
   } else if (cfg.authMode === "header-anthropic") {
     upstreamHeaders["x-api-key"]          = keyVal;
     upstreamHeaders["anthropic-version"]  = cfg.apiVersion || "2023-06-01";
+  } else if (cfg.authMode === "header-bearer") {
+    upstreamHeaders["Authorization"]      = `Bearer ${keyVal}`;
   }
 
   // ── Fetch upstream ──────────────────────────────────────────

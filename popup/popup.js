@@ -19,7 +19,9 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
-         getDailyValidationCount, getApiUsageToday, getCustomPrompt, setCustomPrompt }       from "../modules/supabase.js";
+         getDailyValidationCount, getApiUsageToday, getCustomPrompt, setCustomPrompt,
+         insertPitchFeedback, matchPitchFeedback }                                           from "../modules/supabase.js";
+import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -1043,6 +1045,48 @@ function renderApolloPeople(resultEl, result) {
 // ============================================================
 // BOTONES
 // ============================================================
+// ── RAG helpers (Voyage embeddings + Supabase pgvector retrieval) ──
+// Returns { likeBodies: string[], dislikeBodies: string[] }. Empty arrays on
+// any failure — caller silently falls back to heuristic favorites.
+async function ragRetrievePitchExamples({ domain, category, geo, language, traffic }) {
+  try {
+    const ctxStr = buildPitchContext({ domain, category, geo, language, traffic });
+    const embedding = await voyageEmbed(ctxStr, "query");
+    if (!embedding) return { likeBodies: [], dislikeBodies: [] };
+    const [likes, dislikes] = await Promise.all([
+      matchPitchFeedback(state.accessToken, state.loginEmail, embedding, "liked",    3),
+      matchPitchFeedback(state.accessToken, state.loginEmail, embedding, "disliked", 2),
+    ]);
+    return {
+      likeBodies:    likes.map(r => r.pitch_body).filter(Boolean),
+      dislikeBodies: dislikes.map(r => r.pitch_body).filter(Boolean),
+    };
+  } catch (e) {
+    console.warn("[RAG] retrieval failed:", e.message);
+    return { likeBodies: [], dislikeBodies: [] };
+  }
+}
+
+// Save feedback (liked/disliked) into the RAG store with embedded context.
+// Best-effort: non-blocking, never throws to caller.
+async function ragSavePitchFeedback(action, pitchBody, pitchSubject, ctxFields) {
+  try {
+    const ctxStr = buildPitchContext(ctxFields);
+    const embedding = await voyageEmbed(ctxStr, "document");
+    if (!embedding) return;
+    await insertPitchFeedback(state.accessToken, state.loginEmail, {
+      ...ctxFields,
+      pitch_body:    pitchBody,
+      pitch_subject: pitchSubject || "",
+      context:       ctxStr,
+      embedding,
+      action,
+    });
+  } catch (e) {
+    console.warn("[RAG] save failed:", e.message);
+  }
+}
+
 async function bindButtons() {
 
   // Verificar email
@@ -1162,6 +1206,8 @@ async function bindButtons() {
     await chrome.storage.local.set({ [key]: list.slice(0, 5) });
   }
 
+  // RAG helpers are defined at module scope (see ragRetrievePitchExamples / ragSavePitchFeedback below).
+
   function showSubjectChips(subjects) {
     const chipsEl   = document.getElementById("pitch-subjects");
     const subjectEl = document.getElementById("form-subject");
@@ -1195,8 +1241,14 @@ async function bindButtons() {
       const category    = document.getElementById("pitch-category")?.value || state.category;
       const siteLanguage = document.getElementById("pitch-language")?.value || state.siteLanguage || "en";
       const cfg         = getPitchConfig();
-      const favExamples = await loadFavPitches(cfg);
-      const dislikes    = await loadDislikePitches();
+      const [favLocal, dislLocal, rag] = await Promise.all([
+        loadFavPitches(cfg),
+        loadDislikePitches(),
+        ragRetrievePitchExamples({ domain: state.domain, category, geo: detectGeo?.() || "", language: siteLanguage, traffic: state.traffic }),
+      ]);
+      // Merge: RAG first (semantically relevant), then heuristic, dedupe, cap
+      const favExamples = [...new Set([...rag.likeBodies,    ...favLocal])].slice(0, 5);
+      const dislikes    = [...new Set([...rag.dislikeBodies, ...dislLocal])].slice(0, 5);
       const bannerInfo  = state.banners?.summary?.map(s =>
         s.detail ? `${s.type} (${s.detail})` : s.type
       ).join(", ") || "";
@@ -1233,21 +1285,31 @@ async function bindButtons() {
   });
 
   document.getElementById("btn-pitch-like").addEventListener("click", async () => {
-    const pitch = document.getElementById("pitch-text").value.trim();
+    const pitch   = document.getElementById("pitch-text").value.trim();
+    const subject = document.getElementById("form-subject")?.value?.trim() || "";
     if (!pitch) return;
     const cfg = getPitchConfig();
     await saveFavPitch(cfg, pitch);
+    ragSavePitchFeedback("liked", pitch, subject, {
+      domain: state.domain, category: state.category,
+      geo: detectGeo?.() || "", language: state.siteLanguage || "", traffic: state.traffic || 0,
+    });
     const likeStatus = document.getElementById("pitch-like-status");
-    likeStatus.textContent = "✓ Guardado como ejemplo";
+    likeStatus.textContent = "✓ Saved as style example (RAG)";
     setTimeout(() => { likeStatus.textContent = ""; }, 2500);
   });
 
   document.getElementById("btn-pitch-dislike").addEventListener("click", async () => {
-    const pitch = document.getElementById("pitch-text").value.trim();
+    const pitch   = document.getElementById("pitch-text").value.trim();
+    const subject = document.getElementById("form-subject")?.value?.trim() || "";
     if (!pitch) return;
     await saveDislikePitch(pitch);
+    ragSavePitchFeedback("disliked", pitch, subject, {
+      domain: state.domain, category: state.category,
+      geo: detectGeo?.() || "", language: state.siteLanguage || "", traffic: state.traffic || 0,
+    });
     const likeStatus = document.getElementById("pitch-like-status");
-    likeStatus.textContent = "✗ Marcado para evitar";
+    likeStatus.textContent = "✗ Marked to avoid (RAG)";
     setTimeout(() => { likeStatus.textContent = ""; }, 2500);
   });
 
@@ -1260,8 +1322,13 @@ async function bindButtons() {
     try {
       const category    = document.getElementById("pitch-category")?.value || state.category;
       const cfg         = getPitchConfig();
-      const favExamples = await loadFavPitches(cfg);
-      const dislikes    = await loadDislikePitches();
+      const [favLocal, dislLocal, rag] = await Promise.all([
+        loadFavPitches(cfg),
+        loadDislikePitches(),
+        ragRetrievePitchExamples({ domain: state.domain, category, geo: detectGeo?.() || "", language: state.siteLanguage, traffic: state.traffic }),
+      ]);
+      const favExamples = [...new Set([...rag.likeBodies,    ...favLocal])].slice(0, 5);
+      const dislikes    = [...new Set([...rag.dislikeBodies, ...dislLocal])].slice(0, 5);
       const result      = await generatePitch({
         domain: state.domain, traffic: state.traffic,
         techStack: state.techStack, adsTxt: state.adsTxt,
@@ -3467,7 +3534,18 @@ function initProspectCard(card, data) {
 
     try {
       const cfg         = getPitchConfig();
-      const favExamples = await loadFavPitches(cfg);
+      const [favLocal, rag] = await Promise.all([
+        loadFavPitches(cfg),
+        ragRetrievePitchExamples({
+          domain:   data.domain,
+          category: data.category || "",
+          geo:      data.geo      || "",
+          language: data.language || "en",
+          traffic:  data.traffic  || 0,
+        }),
+      ]);
+      const favExamples = [...new Set([...rag.likeBodies,    ...favLocal])].slice(0, 5);
+      const dislikes    = [...new Set([...rag.dislikeBodies])].slice(0, 5);
       const result      = await generatePitch({
         domain:            data.domain,
         traffic:           data.traffic,
@@ -3481,7 +3559,7 @@ function initProspectCard(card, data) {
         pageDescription:   "",
         decisionMakerName: data.contact_name || "",
         previousPitches:   [],
-        dislikes:          [],
+        dislikes,
         favExamples,
         customPrompt:      state.customPrompt || "",
         ...cfg,
