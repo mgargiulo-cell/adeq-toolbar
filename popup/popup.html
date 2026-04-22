@@ -45,9 +45,8 @@
   <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">🎯 Autopilot Target</div>
   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:8px">
     <div>
-      <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">GEO</div>
-      <select id="autopilot-target-geo" class="form-select" style="font-size:11px">
-        <option value="">All</option>
+      <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">GEO <span style="color:var(--text-muted);font-weight:400">(Ctrl/Cmd+click for multiple)</span></div>
+      <select id="autopilot-target-geo" class="form-select" style="font-size:11px;height:120px" multiple title="Pick one or more countries/regions. Leave empty for all (except hard blacklist).">
         <optgroup label="── Regions ──">
           <option value="LATAM">🌎 LATAM</option>
           <option value="Europe">🇪🇺 Europe</option>
@@ -656,10 +655,17 @@
   </section>
 
   <section class="card" style="padding-bottom:10px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;flex-wrap:wrap">
       <div class="card-title" style="margin:0">📋 Review Prospects</div>
-      <div style="display:flex;gap:6px">
-        <button id="btn-prospects-clear" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e" title="Clear all pending prospects">🗑 Clear all</button>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="prospects-date-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by autopilot discovery date">
+          <option value="">All dates</option>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="last7">Last 7 days</option>
+          <option value="last30">Last 30 days</option>
+        </select>
+        <button id="btn-prospects-clear" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e" title="Clear all your prospects (any status)">🗑 Clear all</button>
         <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
       </div>
     </div>

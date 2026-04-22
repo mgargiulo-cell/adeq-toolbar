@@ -755,7 +755,7 @@ const GEO_REGIONS = {
 const HIGH_VALUE_CATS = new Set(["sports","news","entertainment","gambling","finance"]);
 const MED_VALUE_CATS  = new Set(["health","travel","automotive","technology","food","business"]);
 
-function scoreCandidate({ visits, category, topCountry, contactName, emails, pageContent, targetGeo }) {
+function scoreCandidate({ visits, category, topCountry, contactName, emails, pageContent, allowedCountries }) {
   let score = 0;
 
   // Traffic tier (0–40)
@@ -777,15 +777,9 @@ function scoreCandidate({ visits, category, topCountry, contactName, emails, pag
   // Page accessible (0–5)
   if (pageContent) score += 5;
 
-  // Target geo bonus/penalty (±15)
-  if (targetGeo && topCountry) {
-    const region = GEO_REGIONS[targetGeo];
-    if (region) {
-      if (region.includes(topCountry)) score += 15;
-      else                              score -= 10;
-    } else if (targetGeo === topCountry) {
-      score += 15;
-    }
+  // Target geo bonus (+15 if inside the allowed set)
+  if (allowedCountries?.size && topCountry && allowedCountries.has(topCountry)) {
+    score += 15;
   }
 
   return Math.max(0, score);
@@ -1096,14 +1090,24 @@ async function runSession(token, cfg, sessionStart) {
   const { monday_api_key, rapidapi_key, apollo_api_key } = cfg;
 
   // Targets de esta sesión (desde toolbar_config)
-  const targetGeo      = cfg.target_geo      || "";
+  // target_geo can be a comma-separated list of regions and/or countries
+  const targetGeoRaw   = cfg.target_geo      || "";
+  const targetGeos     = targetGeoRaw.split(",").map(s => s.trim()).filter(Boolean);
   const targetCategory = cfg.target_category || "";
   const minScore       = Number(cfg.min_score)    || 20;
   const sessionMinTraffic = Number(cfg.min_traffic) || MIN_TRAFFIC;
-  const sessionUser    = cfg.auto_session_user || "";       // user que inició el autopilot
+  const sessionUser    = cfg.auto_session_user || "";
   const AUTOPILOT_DAILY_LIMIT = 75;
 
-  const targetInfo = [targetGeo, targetCategory].filter(Boolean).join(" + ") || "sin filtros";
+  // Expand regions to concrete country lists for matching
+  const allowedCountries = new Set();
+  for (const g of targetGeos) {
+    if (GEO_REGIONS[g]) GEO_REGIONS[g].forEach(c => allowedCountries.add(c));
+    else allowedCountries.add(g); // treat as single country
+  }
+  const hasTargetGeo = targetGeos.length > 0;
+
+  const targetInfo = [targetGeos.join("+"), targetCategory].filter(Boolean).join(" / ") || "sin filtros";
   log(`Sesión iniciada. User: ${sessionUser || "(desconocido)"} | Target: ${targetInfo} | Min score: ${minScore} | Min traffic: ${(sessionMinTraffic/1000).toFixed(0)}K`);
 
   // Quota diaria per-user para el autopilot
@@ -1206,12 +1210,12 @@ async function runSession(token, cfg, sessionStart) {
       count++; skipped++;
       continue; // sin sleep — no consumió nada
     }
-    // 2) GEO pre-filter por TLD si hay targetGeo
-    if (targetGeo && !matchesTargetGeoByTLD(domain, targetGeo)) {
-      log(`  ⊘ ${domain} — TLD no coincide con región ${targetGeo}`);
+    // 2) GEO pre-filter por TLD si hay targets — pasa si matchea CUALQUIERA
+    if (hasTargetGeo && !targetGeos.some(g => matchesTargetGeoByTLD(domain, g))) {
+      log(`  ⊘ ${domain} — TLD no coincide con ${targetGeos.join("+")}`);
       await markProcessed(token, [domain]);
       count++; skipped++;
-      continue; // sin sleep
+      continue;
     }
 
     // Paso 1: tráfico + contenido de página en paralelo (sin Gemini)
@@ -1264,21 +1268,17 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
 
-    // Filtro duro de GEO — si topCountry está disponible y no pertenece a la región objetivo, descartar
-    if (targetGeo && topCountry) {
-      const region = GEO_REGIONS[targetGeo];
-      const inRegion = region ? region.includes(topCountry) : (targetGeo === topCountry);
-      if (!inRegion) {
-        log(`  ✗ GEO ${topCountry} ∉ ${targetGeo} — descartado`);
-        await markProcessed(token, [domain]);
-        count++; skipped++;
-        await sleep(DOMAIN_DELAY_MS);
-        continue;
-      }
+    // Filtro duro de GEO — si hay targets, topCountry debe estar en el set permitido
+    if (hasTargetGeo && topCountry && !allowedCountries.has(topCountry)) {
+      log(`  ✗ GEO ${topCountry} ∉ {${[...allowedCountries].slice(0,5).join(",")}${allowedCountries.size>5?"...":""}} — descartado`);
+      await markProcessed(token, [domain]);
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
     }
 
     // Scoring: tráfico + categoría + contacto + geo target + contenido accesible
-    const rawScore = scoreCandidate({ visits, category, topCountry, contactName, emails: [], pageContent, targetGeo });
+    const rawScore = scoreCandidate({ visits, category, topCountry, contactName, emails: [], pageContent, allowedCountries });
 
     // Penalización por patrones de rechazo aprendidos (globales)
     const catPenalty = Math.min(20, (rejectionPatterns.categories[category] || 0) * 4);

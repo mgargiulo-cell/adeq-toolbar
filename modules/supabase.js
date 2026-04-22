@@ -227,14 +227,31 @@ export async function setAutopilotTarget(geo, category, minTraffic, accessToken)
 }
 
 // ── Review Queue — candidatos del auto-prospector para validación ─────
-export async function fetchReviewQueue(accessToken) {
+export async function fetchReviewQueue(accessToken, { dateFilter = "" } = {}) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  // Excluir columna pitch (texto largo) — se carga on-demand al generar
   const cols = "id,domain,traffic,geo,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at";
+  // Date filter: "" | "today" | "yesterday" | "last7" | "last30"
+  let dateClause = "";
+  if (dateFilter) {
+    const tzDay = (d) => d.toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
+    const now = new Date();
+    if (dateFilter === "today") {
+      dateClause = `&created_at=gte.${tzDay(now)}T00:00:00`;
+    } else if (dateFilter === "yesterday") {
+      const y = new Date(now.getTime() - 86400000);
+      dateClause = `&created_at=gte.${tzDay(y)}T00:00:00&created_at=lt.${tzDay(now)}T00:00:00`;
+    } else if (dateFilter === "last7") {
+      const d7 = new Date(now.getTime() - 7 * 86400000);
+      dateClause = `&created_at=gte.${tzDay(d7)}T00:00:00`;
+    } else if (dateFilter === "last30") {
+      const d30 = new Date(now.getTime() - 30 * 86400000);
+      dateClause = `&created_at=gte.${tzDay(d30)}T00:00:00`;
+    }
+  }
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&order=score.desc,created_at.desc&limit=100&select=${cols}`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}&order=score.desc,created_at.desc&limit=100&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -789,20 +806,38 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   return { inserted, attempted: domains.length };
 }
 
-// Clear ALL prospects of the user (any status — pending, rejected, validated, failed)
+// Clear prospects: deletes rows where (created_by=user) OR rows with NULL/empty created_by (legacy).
+// Returns { ok, deleted, status }.
 export async function clearPendingProspects(accessToken, userEmail = null) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!userEmail) return { ok: false, error: "userEmail required" };
+  const headers = {
+    "apikey": key,
+    "Authorization": `Bearer ${accessToken}`,
+    "Prefer": "return=representation",
+  };
+  let deleted = 0;
   try {
-    const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}`,
-      {
-        method: "DELETE",
-        headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
-      }
+    // 1) Rows owned by the user
+    const resOwn = await fetch(
+      `${url}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}&select=id`,
+      { method: "DELETE", headers }
     );
-    return { ok: res.ok, status: res.status };
+    if (resOwn.ok) {
+      const rows = await resOwn.json().catch(() => []);
+      deleted += Array.isArray(rows) ? rows.length : 0;
+    }
+    // 2) Legacy rows without created_by (pre-RLS). RLS may block this depending on policy; harmless if it does.
+    const resLegacy = await fetch(
+      `${url}/rest/v1/toolbar_review_queue?or=(created_by.is.null,created_by.eq.)&select=id`,
+      { method: "DELETE", headers }
+    );
+    if (resLegacy.ok) {
+      const rows = await resLegacy.json().catch(() => []);
+      deleted += Array.isArray(rows) ? rows.length : 0;
+    }
+    return { ok: true, deleted };
   } catch (e) { return { ok: false, error: e.message }; }
 }
 

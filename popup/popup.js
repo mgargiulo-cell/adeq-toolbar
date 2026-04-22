@@ -3052,7 +3052,11 @@ async function initAutopilot() {
   }
 
   updateTargetLabel(target, targetBtn, currentLbl);
-  if (geoSel)     geoSel.value     = target.geo        || "";
+  // Restore previously-selected geos (multi-select: comma-separated in config)
+  if (geoSel) {
+    const saved = new Set((target.geo || "").split(",").map(s => s.trim()).filter(Boolean));
+    Array.from(geoSel.options).forEach(o => { o.selected = saved.has(o.value); });
+  }
   if (catSel)     catSel.value     = target.category   || "";
   if (trafficSel) trafficSel.value = target.minTraffic || "400000";
 
@@ -3077,7 +3081,10 @@ async function initAutopilot() {
   });
 
   saveBtn?.addEventListener("click", async () => {
-    const geo        = geoSel?.value     || "";
+    // Multi-select geos → comma-separated string
+    const geo = geoSel
+      ? Array.from(geoSel.selectedOptions).map(o => o.value).filter(Boolean).join(",")
+      : "";
     const cat        = catSel?.value     || "";
     const minTraffic = trafficSel?.value || "400000";
     await setAutopilotTarget(geo, cat, minTraffic, state.accessToken);
@@ -3118,11 +3125,14 @@ function clearAutopilotTimer() {
 function updateTargetLabel(target, targetBtn, currentLbl) {
   const trafficNum = parseInt(target.minTraffic || "400000");
   const trafficLbl = trafficNum >= 10000001 ? "+10M+" : trafficNum >= 1000000 ? `+${trafficNum/1000000}M` : `+${trafficNum/1000}K`;
-  const parts = [target.geo, target.category, trafficLbl !== "+400K" ? trafficLbl : ""].filter(Boolean);
+  // Multi-GEO: shorten when many
+  const geos = (target.geo || "").split(",").map(s => s.trim()).filter(Boolean);
+  const geoLbl = geos.length === 0 ? "" : geos.length <= 2 ? geos.join("+") : `${geos.length} geos`;
+  const parts = [geoLbl, target.category, trafficLbl !== "+400K" ? trafficLbl : ""].filter(Boolean);
   const label = parts.length ? parts.join(" · ") : "All";
   if (targetBtn) targetBtn.title = `Target: ${label}`;
   if (currentLbl) currentLbl.textContent = `Active target: ${label}`;
-  if (targetBtn) targetBtn.style.color = (target.geo || target.category) ? "var(--primary)" : "";
+  if (targetBtn) targetBtn.style.color = (geos.length || target.category) ? "var(--primary)" : "";
 }
 
 function setAutopilotUI(btn, enabled) {
@@ -3165,11 +3175,12 @@ async function loadProspectsTab() {
 
   listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
 
+  const dateFilter = document.getElementById("prospects-date-filter")?.value || "";
   let rows = [];
   let dailyCount = 0;
   try {
     [rows, dailyCount, _cachedProspectDrafts] = await Promise.all([
-      fetchReviewQueue(state.accessToken),
+      fetchReviewQueue(state.accessToken, { dateFilter }),
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
     ]);
@@ -3663,13 +3674,19 @@ function initProspectsTab() {
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
   });
+  document.getElementById("prospects-date-filter")?.addEventListener("change", async () => {
+    await loadProspectsTab();
+  });
   document.getElementById("btn-prospects-clear")?.addEventListener("click", async () => {
     if (!confirm("Delete ALL your prospects (pending, rejected, validated, failed)?\n\nThis cannot be undone. Only your own items are affected.")) return;
     const btn = document.getElementById("btn-prospects-clear");
     btn.disabled = true; btn.textContent = "⏳ Deleting...";
     const r = await clearPendingProspects(state.accessToken, state.loginEmail);
     btn.disabled = false; btn.textContent = "🗑 Clear all";
-    if (!r.ok) { alert("Delete failed — status " + (r.status || "?") + " · " + (r.error || "")); return; }
+    if (!r.ok) { alert("Delete failed: " + (r.error || "unknown")); return; }
+    if (r.deleted === 0) {
+      alert("No rows deleted.\n\nPossible causes:\n• Rows belong to other users (RLS blocks them)\n• Rows have no 'created_by' set and RLS won't allow deletion\n\nAsk an admin to clear them via service role if needed.");
+    }
     await loadProspectsTab();
   });
 }
