@@ -178,20 +178,19 @@ export async function matchPitchFeedback(accessToken, userEmail, embedding, acti
   }
 }
 
-// ── Per-user custom Claude prompt (appended to system prompt on pitch generation) ──
+// ── Per-user custom Claude prompt (own table, simple per-user RLS) ──
 export async function getCustomPrompt(accessToken, userEmail) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!accessToken || !userEmail) return "";
-  const cfgKey = `custom_prompt_${userEmail.toLowerCase()}`;
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_config?key=eq.${encodeURIComponent(cfgKey)}&select=value`,
+      `${url}/rest/v1/toolbar_user_prompts?user_email=eq.${encodeURIComponent(userEmail.toLowerCase())}&select=prompt`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return "";
     const rows = await res.json();
-    return (Array.isArray(rows) && rows[0]?.value) || "";
+    return (Array.isArray(rows) && rows[0]?.prompt) || "";
   } catch { return ""; }
 }
 
@@ -199,17 +198,25 @@ export async function setCustomPrompt(accessToken, userEmail, value) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!accessToken || !userEmail) return { ok: false, error: "auth required" };
-  const cfgKey = `custom_prompt_${userEmail.toLowerCase()}`;
   const headers = {
     "apikey": key, "Authorization": `Bearer ${accessToken}`,
-    "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates,return=minimal",
   };
   try {
-    const res = await fetch(`${url}/rest/v1/toolbar_config`, {
+    const res = await fetch(`${url}/rest/v1/toolbar_user_prompts`, {
       method: "POST", headers,
-      body: JSON.stringify([{ key: cfgKey, value: value || "" }]),
+      body: JSON.stringify([{
+        user_email: userEmail.toLowerCase(),
+        prompt:     value || "",
+        updated_at: new Date().toISOString(),
+      }]),
     });
-    return { ok: res.ok, status: res.status };
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, status: res.status, error: txt.slice(0, 200) };
+    }
+    return { ok: true };
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
