@@ -60,8 +60,11 @@ cd /Users/maximilianogargiulo/Desktop/adeq-toolbar
 supabase secrets set \
   GEMINI_API_KEY=PEGAR_GEMINI_KEY_ACA \
   APOLLO_API_KEY=PEGAR_APOLLO_KEY_ACA \
-  RAPIDAPI_KEY=PEGAR_RAPIDAPI_KEY_ACA
+  RAPIDAPI_KEY=PEGAR_RAPIDAPI_KEY_ACA \
+  ANTHROPIC_API_KEY=sk-ant-PEGAR_ANTHROPIC_KEY_ACA
 ```
+
+> **Nota:** `ANTHROPIC_API_KEY` es obligatoria ahora que el pitch, follow-up y revenue-gap usan Claude (Sonnet 4.6 / Haiku 4.5). Sin ella, esos 3 flujos fallan con `Missing ANTHROPIC_API_KEY secret`.
 
 Tiene que responder `Finished supabase secrets set.`
 

@@ -23,9 +23,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
 const DAILY_QUOTA_PER_USER = 500;
 // Per-provider per-user daily caps
 const PROVIDER_CAPS = {
-  gemini:   300,
-  apollo:   150,
-  rapidapi: 400,
+  gemini:    300,
+  apollo:    150,
+  rapidapi:  400,
+  anthropic: 200,
 };
 
 const PROVIDERS = {
@@ -43,10 +44,17 @@ const PROVIDERS = {
   },
   rapidapi: {
     base: "https://similarweb-insights.p.rapidapi.com",
-    authMode: "header-rapidapi",      // x-rapidapi-key + x-rapidapi-host
+    authMode: "header-rapidapi",
     keyEnv: "RAPIDAPI_KEY",
     hostHeader: "similarweb-insights.p.rapidapi.com",
     allow: /^\/(traffic|engagement|countries|similar|category|description|keywords|general|website-analysis)\b/,
+  },
+  anthropic: {
+    base: "https://api.anthropic.com",
+    authMode: "header-anthropic",     // x-api-key + anthropic-version
+    keyEnv: "ANTHROPIC_API_KEY",
+    apiVersion: "2023-06-01",
+    allow: /^\/v1\/messages$/,
   },
 };
 
@@ -123,6 +131,9 @@ serve(async (req) => {
   } else if (cfg.authMode === "header-rapidapi") {
     upstreamHeaders["x-rapidapi-key"]  = keyVal;
     upstreamHeaders["x-rapidapi-host"] = cfg.hostHeader;
+  } else if (cfg.authMode === "header-anthropic") {
+    upstreamHeaders["x-api-key"]          = keyVal;
+    upstreamHeaders["anthropic-version"]  = cfg.apiVersion || "2023-06-01";
   }
 
   // ── Fetch upstream ──────────────────────────────────────────

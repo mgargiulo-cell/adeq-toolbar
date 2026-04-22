@@ -1,15 +1,14 @@
 // ============================================================
-// ADEQ TOOLBAR — Módulo Gemini IA
-// generatePitch    — pitch de ventas con contexto de categoría
-// generateFollowUp — follow-up corto referenciando el pitch original
-// analyzeRevenueGap
+// ADEQ TOOLBAR — Módulo de generación de texto IA
+// generatePitch     → Claude Sonnet 4.6 (prompt caching on stable style prefix)
+// generateFollowUp  → Claude Haiku 4.5 (short, simple)
+// analyzeRevenueGap → Claude Sonnet 4.6
+//
+// Gemini-backed flows (web search grounding) live in geminiSearch.js and
+// scraper.js; this file no longer calls Gemini directly.
 // ============================================================
 
-import { callProxy } from "./apiProxy.js";
-
-const GEMINI_FLASH = "gemini-2.5-flash";
-const GEMINI_PRO   = "gemini-2.5-pro";
-const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
+import { callClaude, CLAUDE_SONNET, CLAUDE_HAIKU } from "./claude.js";
 
 // ── Contextos de categoría ────────────────────────────────────
 const CATEGORY_CONTEXTS = {
@@ -66,6 +65,69 @@ const AVOID_OPENERS = [
 const LANG_NAMES = {
   en: "English", es: "Spanish", pt: "Portuguese",
   it: "Italian", ar: "Arabic", fr: "French", de: "German",
+};
+
+// ── Stable cacheable system prefix for generatePitch ──────────────
+// Everything that doesn't change per-call lives here so it can be cached
+// across requests. Anthropic caches prefix matches — any byte change
+// invalidates the cache, so this string MUST stay deterministic (no
+// interpolated timestamps, no user ids, no sort-order-dependent JSON).
+const PITCH_STABLE_SYSTEM = `You are a senior Ad Ops consultant at ADEQ Media writing a cold outreach email to the owner or publisher of a website.
+
+STYLE REFERENCE — real emails sent by ADEQ Media team. Study the tone, structure, and phrasing. Write in this same voice:
+
+Email 1 (Spanish, informal, two options pitch):
+"Hola, ¿cómo estás?
+Tengo dos opciones con las que estamos obteniendo muy buenos resultados. Por un lado, un slider con CPM fijo de 1 USD, y por otro gestionamos la demanda de display a través de un header bidding interno, donde ponemos a competir 8 diferentes demandas para obtener el mejor precio posible por cada anuncio.
+Hemos hablado algunas veces en el pasado, pero nunca llegamos a implementar. Me gustaría que nos puedan evaluar en base a los resultados. No tenemos cláusulas de exclusividad ni períodos mínimos de permanencia: seguimos trabajando juntos solo si generamos buenos resultados.
+¿Cómo lo ves?"
+
+Email 2 (Spanish, geo-specific traffic angle):
+"Hola, espero que estes muy bien. Te cuento que estamos buscando tráfico de nigeria porque venimos obteniendo muy buenos resultados con distintas demandas, tanto en display como en video. Viendo tu sitio creo que podemos replicar el mismo esquema y sacar un extra en la monetización. Trabajamos con un revshare 80-20 a tu favor y no tenemos ataduras comerciales. Me gustaría que nos puedan probar y sacar sus conclusiones sabiendo que estamos sumando nuevas campañas en el comienzo de Abril. ¿Qué te parece?"
+
+Email 3 (Spanish, follow-up / no response):
+"Hola, ¿cómo estás? ¿Tuviste la oportunidad de ver mi correo? Me gustaría recibir tu feedback. Te escribo nuevamente porque estamos obteniendo muy buenos resultados y me gustaría que puedan probarlo, teniendo en cuenta que no tenemos ataduras comerciales y que nuestro objetivo es generar ingresos adicionales para el sitio. Avisame si tenés alguna reserva sobre algún formato o si tenés prioridad en algunas posiciones que te gustaría reemplazar porque no están rindiendo como esperabas."
+
+Email 4 (Spanish, handling objection about other agencies):
+"Lo sé, ya he analizado tu sitio. Y lo que comentás es muy común: en la mayoría de los sitios con los que trabajamos también hay otras agencias además de Adsense. Dicho esto, también es cierto que una competencia sana entre dos agencias puede ayudarte a aprovechar de una mejor manera las ubicaciones y obtener mejores resultados. Me gustaría entender qué posiciones podríamos reemplazar, especialmente aquellas que hoy considerás que no están rindiendo bien. Al final, serán los resultados los que hablen. ¿Qué opinás?"
+
+Email 5 (Spanish, SimilarWeb traffic insight + video formats):
+"Hola Erick, sí, revisando SimilarWeb noté lo mismo; hay una gran variedad de tráfico de distintos países, pero Suecia es el principal. Contamos con campañas en la mayoría de los países europeos y, además, tenemos presencia en todos los continentes. ¿Ves viable probar con video además de los banners? Tengo opciones tanto para instream como para outstream. Con la primera, podemos aprovechar el reproductor en los momentos en que no se esté sirviendo contenido. La segunda solo se vuelve visible cuando hay una campaña para mostrar; de lo contrario, los lectores no notarán absolutamente nada. ¿Tenés preferencia por alguno de ellos?"
+
+Email 6 (English, reconnect + header bidding + video):
+"Hi Michal, how have you been? It's been a while. I'd really like us to reconnect and test the alternatives we're currently working with. The company has grown significantly, and I believe you'll notice the difference. We've implemented an internal header bidding setup that allows all our demand sources to compete for display inventory. For video, we offer both slider and instream options. How does that sound to you? Let me know what your current priorities are on your side."
+
+Email 7 (Spanish, video instream + display header bidding, format preference question):
+"Hola Fernando, ¿cómo estás? Dispongo de dos opciones que están teniendo un desempeño muy bueno. Por un lado, un video instream que, en los momentos en que no está reproduciendo publicidad, se puede configurar para mostrar avances de otras noticias de tu sitio; esto ayuda a la recirculación de contenido y aumenta el tiempo de permanencia del usuario. Por otro lado, en todo lo que respecta a display, trabajamos con un header bidding interno con el objetivo de maximizar las ganancias en cada ubicación. ¿Tenés preferencia por algún formato? Estamos cargando nuevas campañas para el mes de abril, por lo que es un buen momento para avanzar."
+
+KEY STYLE TRAITS TO REPLICATE:
+- Conversational, direct, no corporate jargon
+- Short paragraphs, one idea per paragraph
+- Always mention: no exclusivity / no minimum commitment / results-based
+- Specific technical knowledge (CPM, header bidding, instream, outstream, revshare)
+- End with a specific question, not a generic CTA
+- Use site-specific data (traffic, geo, tech stack) to show you've done research
+
+GENERAL RULES:
+- No subject line in the body. No sender name. No job title. No sign-off or farewell phrase.
+- Every sentence must be complete. Never cut off mid-thought.
+- The email must read as a cohesive whole — not a list of disconnected facts.
+- Every email must feel freshly written — vary sentence structure, word choice, and angle.
+
+OUTPUT FORMAT:
+Return a JSON object with two fields:
+- "body": the complete email body (no sign-off at the end)
+- "subjects": an array of exactly 3 compelling subject lines, 6-10 words each, varied in angle
+Subjects and body must all be in the target language specified in the per-call instructions.`;
+
+const PITCH_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    body:     { type: "string", description: "Complete email body in the target language, no sign-off." },
+    subjects: { type: "array",  items: { type: "string" } },
+  },
+  required: ["body", "subjects"],
+  additionalProperties: false,
 };
 
 // ── generatePitch ─────────────────────────────────────────────
@@ -146,9 +208,8 @@ export async function generatePitch(ctx) {
     ? `\nSTYLE TO AVOID — emails the media buyer rejected, do NOT write anything resembling these:\n${dislikes.map((d, i) => `Rejected ${i + 1}:\n"${d.substring(0, 200)}"`).join("\n\n")}\n`
     : "";
 
-  const systemPrompt = `You are a senior Ad Ops consultant at ADEQ Media writing a cold outreach email to the owner or publisher of a website.
-
-LANGUAGE: ${langInstr}
+  // Per-call instructions (volatile — changes every request, keep AFTER the cache breakpoint)
+  const perCallSystem = `LANGUAGE: ${langInstr}
 
 RECIPIENT: ${recipientInstr}
 ${categoryCtx ? `\nSITE VERTICAL CONTEXT:\n${categoryCtx}\n` : ""}
@@ -156,60 +217,14 @@ EMAIL STRUCTURE — follow this exact order:
 1. OPENING LINE: ${openingInstr}
 2. BODY: ${bodyLengthInstr} ${focusInstr}
 3. CLOSING QUESTION: One short, specific question tied to this site — not a generic "would you be open to a call?".
-4. SIGN-OFF: Do NOT add any closing phrase, farewell, or signature (no "Best,", no "Regards,", no "Saludos,", no "Cheers,"). End the email with the closing question. A signature is appended automatically.
+4. SIGN-OFF: Do NOT add any closing phrase, farewell, or signature. End the email with the closing question. A signature is appended automatically.
 
 TONE: ${toneInstr}
 ANGLE FOR THIS EMAIL: ${angle}
 ${previousSection}${favSection}${dislikeSection}
-STYLE REFERENCE — real emails sent by ADEQ Media team. Study the tone, structure, and phrasing. Write in this same voice:
+DO NOT START WITH: "${avoid}"
 
-Email 1 (Spanish, informal, two options pitch):
-"Hola, ¿cómo estás?
-Tengo dos opciones con las que estamos obteniendo muy buenos resultados. Por un lado, un slider con CPM fijo de 1 USD, y por otro gestionamos la demanda de display a través de un header bidding interno, donde ponemos a competir 8 diferentes demandas para obtener el mejor precio posible por cada anuncio.
-Hemos hablado algunas veces en el pasado, pero nunca llegamos a implementar. Me gustaría que nos puedan evaluar en base a los resultados. No tenemos cláusulas de exclusividad ni períodos mínimos de permanencia: seguimos trabajando juntos solo si generamos buenos resultados.
-¿Cómo lo ves?"
-
-Email 2 (Spanish, geo-specific traffic angle):
-"Hola, espero que estes muy bien. Te cuento que estamos buscando tráfico de nigeria porque venimos obteniendo muy buenos resultados con distintas demandas, tanto en display como en video. Viendo tu sitio creo que podemos replicar el mismo esquema y sacar un extra en la monetización. Trabajamos con un revshare 80-20 a tu favor y no tenemos ataduras comerciales. Me gustaría que nos puedan probar y sacar sus conclusiones sabiendo que estamos sumando nuevas campañas en el comienzo de Abril. ¿Qué te parece?"
-
-Email 3 (Spanish, follow-up / no response):
-"Hola, ¿cómo estás? ¿Tuviste la oportunidad de ver mi correo? Me gustaría recibir tu feedback. Te escribo nuevamente porque estamos obteniendo muy buenos resultados y me gustaría que puedan probarlo, teniendo en cuenta que no tenemos ataduras comerciales y que nuestro objetivo es generar ingresos adicionales para el sitio. Avisame si tenés alguna reserva sobre algún formato o si tenés prioridad en algunas posiciones que te gustaría reemplazar porque no están rindiendo como esperabas."
-
-Email 4 (Spanish, handling objection about other agencies):
-"Lo sé, ya he analizado tu sitio. Y lo que comentás es muy común: en la mayoría de los sitios con los que trabajamos también hay otras agencias además de Adsense. Dicho esto, también es cierto que una competencia sana entre dos agencias puede ayudarte a aprovechar de una mejor manera las ubicaciones y obtener mejores resultados. Me gustaría entender qué posiciones podríamos reemplazar, especialmente aquellas que hoy considerás que no están rindiendo bien. Al final, serán los resultados los que hablen. ¿Qué opinás?"
-
-Email 5 (Spanish, SimilarWeb traffic insight + video formats):
-"Hola Erick, sí, revisando SimilarWeb noté lo mismo; hay una gran variedad de tráfico de distintos países, pero Suecia es el principal. Contamos con campañas en la mayoría de los países europeos y, además, tenemos presencia en todos los continentes. ¿Ves viable probar con video además de los banners? Tengo opciones tanto para instream como para outstream. Con la primera, podemos aprovechar el reproductor en los momentos en que no se esté sirviendo contenido. La segunda solo se vuelve visible cuando hay una campaña para mostrar; de lo contrario, los lectores no notarán absolutamente nada. ¿Tenés preferencia por alguno de ellos?"
-
-Email 6 (English, reconnect + header bidding + video):
-"Hi Michal, how have you been? It's been a while. I'd really like us to reconnect and test the alternatives we're currently working with. The company has grown significantly, and I believe you'll notice the difference. We've implemented an internal header bidding setup that allows all our demand sources to compete for display inventory. For video, we offer both slider and instream options. How does that sound to you? Let me know what your current priorities are on your side."
-
-Email 7 (Spanish, video instream + display header bidding, format preference question):
-"Hola Fernando, ¿cómo estás? Dispongo de dos opciones que están teniendo un desempeño muy bueno. Por un lado, un video instream que, en los momentos en que no está reproduciendo publicidad, se puede configurar para mostrar avances de otras noticias de tu sitio; esto ayuda a la recirculación de contenido y aumenta el tiempo de permanencia del usuario. Por otro lado, en todo lo que respecta a display, trabajamos con un header bidding interno con el objetivo de maximizar las ganancias en cada ubicación. ¿Tenés preferencia por algún formato? Estamos cargando nuevas campañas para el mes de abril, por lo que es un buen momento para avanzar."
-
-KEY STYLE TRAITS TO REPLICATE:
-- Conversational, direct, no corporate jargon
-- Short paragraphs, one idea per paragraph
-- Always mention: no exclusivity / no minimum commitment / results-based
-- Specific technical knowledge (CPM, header bidding, instream, outstream, revshare)
-- End with a specific question, not a generic CTA
-- Use site-specific data (traffic, geo, tech stack) to show you've done research
-
-RULES:
-- Do NOT start with: "${avoid}"
-- No subject line in the body. No sender name. No job title. No sign-off or farewell phrase.
-- Every sentence must be complete. Never cut off mid-thought.
-- The email must read as a cohesive whole — not a list of disconnected facts.
-- Every email must feel freshly written — vary sentence structure, word choice, and angle.
-
-CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Do NOT include any English if the target is not English. Every word, every subject line, every sentence — in ${langName}.
-
-OUTPUT: Respond with a valid JSON object — no markdown, no extra text:
-{
-  "body": "the complete email body in ${langName} (no sign-off at the end)",
-  "subjects": ["subject 1 in ${langName}", "subject 2 in ${langName}", "subject 3 in ${langName}"]
-}
-All 3 subject lines must be in ${langName}, compelling, 6-10 words each, and varied in angle.`;
+CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Every word — in ${langName}.`;
 
   const userMessage = `Site: ${domain}
 Monthly traffic: ${trafficStr} visits
@@ -219,130 +234,103 @@ ${gapStr}
 ${bannerStr}
 ${pageCtxStr ? `Site context: ${pageCtxStr}` : ""}
 
-Write the prospecting email.`;
+Write the prospecting email. Return a JSON object with "body" (string) and "subjects" (array of exactly 3 strings).`;
 
-  const raw = await callGemini(systemPrompt, userMessage, {
-    temperature: 0.88,
-    maxOutputTokens: length === "long" ? 4000 : 3000,
-    responseMimeType: "application/json",
-    thinkingBudget: 512,
-  }, GEMINI_PRO);
+  // System messages: stable prefix (cached) + volatile per-call (not cached).
+  // The cache_control on the first block caches everything before it (no tools here, so just system block 1).
+  const systemBlocks = [
+    { type: "text", text: PITCH_STABLE_SYSTEM, cache_control: { type: "ephemeral" } },
+    { type: "text", text: perCallSystem },
+  ];
 
-  // Parsear JSON — con fallback progresivo ante respuestas mal formadas
+  const result = await callClaude({
+    model:     CLAUDE_SONNET,
+    maxTokens: length === "long" ? 4000 : 3000,
+    system:    systemBlocks,
+    messages:  [{ role: "user", content: userMessage }],
+    // Sonnet 4.6 chat/content workload — recommended low effort + thinking disabled
+    // for similar latency/cost to prior models. Quality is plenty for pitch generation.
+    thinking:  { type: "disabled" },
+    outputConfig: {
+      effort: "low",
+      format: { type: "json_schema", schema: PITCH_OUTPUT_SCHEMA },
+    },
+  });
+
+  // The output_config.format constraint guarantees valid JSON in the text content.
+  // Still wrap in try/catch for the rare refusal/max_tokens edge cases.
   try {
-    // Limpiar posibles wrappers de markdown
-    let cleaned = raw
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/```\s*$/, "")
-      .trim();
-    // Extraer el objeto JSON si hay texto extra alrededor
-    const objMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (objMatch) cleaned = objMatch[0];
-    const parsed = JSON.parse(cleaned);
+    const parsed = JSON.parse(result.text);
     return {
-      body:     parsed.body     || raw,
+      body:     parsed.body || "",
       subjects: Array.isArray(parsed.subjects) ? parsed.subjects.filter(Boolean) : [],
     };
   } catch {
-    // Último recurso: extraer el body manualmente con regex
-    const bodyMatch = raw.match(/"body"\s*:\s*"([\s\S]+?)(?:"\s*,\s*"subjects"|"\s*\}\s*$)/);
-    if (bodyMatch) {
-      const body = bodyMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "\t");
-      return { body, subjects: [] };
+    // Fallback: try to extract a {…} block from the raw text
+    const objMatch = result.text.match(/\{[\s\S]*\}/);
+    if (objMatch) {
+      try {
+        const parsed = JSON.parse(objMatch[0]);
+        return {
+          body:     parsed.body || result.text,
+          subjects: Array.isArray(parsed.subjects) ? parsed.subjects.filter(Boolean) : [],
+        };
+      } catch {}
     }
-    return { body: raw, subjects: [] };
+    return { body: result.text, subjects: [] };
   }
 }
 
-// ── generateFollowUp ─────────────────────────────────────────
+// ── generateFollowUp (Haiku 4.5 — short and cheap) ────────────
 export async function generateFollowUp({ domain, originalPitch, fuNumber, daysSinceSend }) {
-  const wordLimit = fuNumber === 1 ? "60 palabras" : "40 palabras";
-  const prompt = `Sos un consultor de ADEQ Media. Enviamos un pitch hace ${daysSinceSend} días a ${domain} y no respondieron.
+  const wordLimit = fuNumber === 1 ? "60 words" : "40 words";
+  const userMessage = `You are an Ad Ops consultant at ADEQ Media. We sent a pitch ${daysSinceSend} days ago to ${domain} and got no reply.
 
-El pitch original fue:
+The original pitch was:
 "${(originalPitch || "").substring(0, 300)}"
 
-Escribí un follow-up ${fuNumber === 1 ? "breve" : "muy breve"} (máx ${wordLimit}) para retomar el contacto.
+Write a ${fuNumber === 1 ? "short" : "very short"} follow-up (max ${wordLimit}) to re-open the conversation.
 
-REGLAS:
-1. No seas insistente ni agresivo.
-2. Referenciá el email anterior sin repetirlo.
-3. Preguntá si tuvieron tiempo de revisarlo o si hay alguien más indicado.
-4. En inglés. Solo el cuerpo del email, sin asunto ni firma.`;
+RULES:
+1. Not pushy or aggressive.
+2. Reference the previous email without repeating it.
+3. Ask if they had time to review it, or if there's someone else better suited to discuss this.
+4. Write in English. Email body only — no subject line, no sign-off, no signature.`;
 
-  return callGemini("", prompt, { temperature: 0.7, maxOutputTokens: 150 });
+  // Haiku 4.5: no effort param (errors), no thinking config (default disabled is fine).
+  const result = await callClaude({
+    model:     CLAUDE_HAIKU,
+    maxTokens: 250,
+    messages:  [{ role: "user", content: userMessage }],
+  });
+  return result.text;
 }
 
-// ── analyzeRevenueGap ────────────────────────────────────────
+// ── analyzeRevenueGap (Sonnet 4.6 — analytical) ───────────────
 export async function analyzeRevenueGap(ctx) {
   const { domain, traffic, techStack } = ctx;
-  const prompt = `Analiza brevemente el potencial de monetización de este sitio web para ADEQ Media:
-- Dominio: ${domain}
-- Tráfico: ${traffic?.toLocaleString()} visitas/mes
-- Ad tech actual: ${techStack?.join(", ") || "Ninguna detectada"}
+  const userMessage = `Briefly analyze the monetization potential of this website for ADEQ Media:
+- Domain: ${domain}
+- Traffic: ${traffic?.toLocaleString()} visits/month
+- Current ad tech: ${techStack?.join(", ") || "none detected"}
 
-En 2-3 líneas, estima:
-1. RPM potencial con optimización profesional
-2. El cambio técnico más impactante
-Responde en español. Sé directo y usa números.`;
+In 2-3 lines, estimate:
+1. Potential RPM with professional optimization
+2. The single most impactful technical change
+
+Respond in Spanish. Be direct and use numbers.`;
 
   try {
-    return await callGemini("", prompt, { temperature: 0.4, maxOutputTokens: 150 });
+    const result = await callClaude({
+      model:     CLAUDE_SONNET,
+      maxTokens: 200,
+      messages:  [{ role: "user", content: userMessage }],
+      // Light analytical workload — adaptive thinking with low effort.
+      thinking:  { type: "adaptive" },
+      outputConfig: { effort: "low" },
+    });
+    return result.text;
   } catch {
     return "";
-  }
-}
-
-// ── Helper interno ────────────────────────────────────────────
-async function callGemini(systemPrompt, userMessage, generationConfig = {}, model = GEMINI_FLASH) {
-  const gc = {
-    temperature:     generationConfig.temperature     ?? 0.7,
-    maxOutputTokens: generationConfig.maxOutputTokens ?? 300,
-    topP:            generationConfig.topP            ?? 0.9,
-  };
-  if (generationConfig.responseMimeType) gc.responseMimeType = generationConfig.responseMimeType;
-  if (generationConfig.thinkingBudget !== undefined) {
-    gc.thinkingConfig = { thinkingBudget: generationConfig.thinkingBudget };
-  }
-
-  const body = {
-    contents: [{ role: "user", parts: [{ text: userMessage }] }],
-    generationConfig: gc,
-  };
-  if (systemPrompt) {
-    body.system_instruction = { parts: [{ text: systemPrompt }] };
-  }
-
-  const tryModel = async (m) => {
-    const path = `/v1beta/models/${m}:generateContent`;
-    const response = await callProxy("gemini", path, { method: "POST", body });
-    if (!response.ok) {
-      const status = response.status;
-      const msg    = response.data?.error?.message || response.text || "sin detalle";
-      throw Object.assign(new Error(`Gemini error ${status}: ${msg}`), { status });
-    }
-    const data = response.data || {};
-    const candidate = data?.candidates?.[0];
-    const text = candidate?.content?.parts?.[0]?.text;
-    if (!text) {
-      const reason = candidate?.finishReason || "sin candidatos";
-      const blocked = data?.promptFeedback?.blockReason;
-      console.error("[Gemini] Respuesta sin texto:", JSON.stringify(data).substring(0, 400));
-      throw new Error(`Gemini sin respuesta — razón: ${blocked ? "bloqueado por " + blocked : reason}`);
-    }
-    return text.trim();
-  };
-
-  try {
-    return await tryModel(model);
-  } catch (err) {
-    // Si el modelo solicitado es Pro y devuelve 429 (quota) o 400 (free tier sin billing),
-    // reintentar automáticamente con Flash.
-    if (model === GEMINI_PRO && (err.status === 429 || err.status === 400)) {
-      console.warn("[Gemini] Pro sin cuota, usando Flash como fallback");
-      return await tryModel(GEMINI_FLASH);
-    }
-    throw err;
   }
 }
