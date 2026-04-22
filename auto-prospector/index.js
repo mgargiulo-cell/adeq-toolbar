@@ -1226,24 +1226,58 @@ async function runSession(token, cfg, sessionStart) {
       log(`Cloudflare Radar: consultando top domains para ${countryCodes.join(",")}...`);
       radarPool = await loadRadarPoolForCountries(countryCodes);
       if (radarPool) {
-        poolSource = "radar";
-        log(`Pool Radar listo: ${radarPool.size.toLocaleString()} dominios pre-filtrados por país.`);
+        log(`Pool Radar: ${radarPool.size.toLocaleString()} dominios pre-filtrados por país.`);
       } else {
-        log("Radar devolvió vacío — cayendo a Majestic Million.");
+        log("Radar devolvió vacío.");
       }
     }
   }
 
-  // Carga en paralelo: pool global, Monday, procesados, rechazos, uso Apollo
-  const [majesticPool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
-    radarPool ? Promise.resolve([...radarPool.keys()]) : loadDomainPool(),
+  // Carga en paralelo: Majestic, Monday, procesados, rechazos, uso Apollo
+  const [majesticFullPool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
+    loadDomainPool(),
     fetchMondayDomains(monday_api_key),
     getProcessedDomains(token),
     getRejectionPatterns(token),
     getApolloUsageToday(token),
   ]);
-  const pool = majesticPool;
-  log(`Fuente del pool: ${poolSource} (${pool.length.toLocaleString()} dominios)`);
+
+  // ── POOL HÍBRIDO ──
+  // Cuando hay target_geos: combinar Radar + Majestic-filtered-by-TLD
+  // Sin target_geos: usar Majestic completo
+  let pool;
+  if (hasTargetGeo) {
+    // Expandir targets a lista de TLDs relevantes
+    const targetTLDs = new Set();
+    for (const g of targetGeos) {
+      if (TLD_BY_REGION[g]) TLD_BY_REGION[g].forEach(t => targetTLDs.add(t));
+      else {
+        // Buscar TLD del país individual
+        for (const [tld, country] of Object.entries(TLD_TO_COUNTRY)) {
+          if (country === g) targetTLDs.add(tld);
+        }
+      }
+    }
+    const tldList = [...targetTLDs];
+    // Filtrar Majestic por TLDs relevantes
+    const majesticFiltered = tldList.length
+      ? majesticFullPool.filter(d => tldList.some(tld => d.endsWith(tld)))
+      : [];
+    log(`Majestic filtrado por TLD (${tldList.length} TLDs): ${majesticFiltered.length.toLocaleString()} dominios`);
+
+    // Merge sin duplicar — Radar primero (mejor ranking), Majestic relleno
+    const seen = new Set();
+    pool = [];
+    if (radarPool) {
+      for (const d of radarPool.keys()) { seen.add(d); pool.push(d); }
+    }
+    for (const d of majesticFiltered) { if (!seen.has(d)) { seen.add(d); pool.push(d); } }
+    poolSource = radarPool ? "radar+majestic-tld" : "majestic-tld";
+  } else {
+    pool = majesticFullPool;
+    poolSource = "majestic-global";
+  }
+  log(`Fuente del pool: ${poolSource} (${pool.length.toLocaleString()} dominios totales)`);
 
   let apolloCallsThisSession = 0;
   const apolloRemaining = apolloUsage.limit - apolloUsage.usedToday;
