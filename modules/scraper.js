@@ -213,8 +213,16 @@ async function apolloSearch(domain, apiKey, withTitleFilter) {
 
 function mapApolloPerson(p) {
   return {
-    email:    p.email, name: `${p.first_name || ""} ${p.last_name || ""}`.trim(),
-    title:    p.title || "", linkedin: p.linkedin_url || "", status: p.email_status || "",
+    id:       p.id || null,
+    email:    p.email || null,
+    name:     `${p.first_name || ""} ${p.last_name || ""}`.trim(),
+    first_name: p.first_name || "",
+    last_name:  p.last_name  || "",
+    title:    p.title || "",
+    linkedin: p.linkedin_url || "",
+    status:   p.email_status || "",
+    emailLocked: p.email_locked === true,
+    unlocked:   isUnlockedEmail(p.email, p.email_locked) && APOLLO_GOOD_STATUSES.has(p.email_status),
   };
 }
 
@@ -223,7 +231,7 @@ function mapApolloPerson(p) {
  * Return shape: { valid: [...], rawCount, lockedCount, noEmailCount, badStatusCount, sample, httpError }
  */
 async function apolloDomainSearch(domain, apiKey) {
-  const diag = { valid: [], rawCount: 0, lockedCount: 0, noEmailCount: 0, badStatusCount: 0, sample: [], httpError: null };
+  const diag = { valid: [], all: [], rawCount: 0, lockedCount: 0, noEmailCount: 0, badStatusCount: 0, sample: [], httpError: null };
 
   try {
     // Intento 1: con filtro de títulos
@@ -240,6 +248,7 @@ async function apolloDomainSearch(domain, apiKey) {
     }
 
     diag.rawCount = people.length;
+    diag.all = people.map(mapApolloPerson);
 
     for (const p of people) {
       const hasEmail    = !!p.email;
@@ -312,22 +321,49 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
 
   // ── Paso 2: Apollo mixed_people/search por dominio + títulos ──
   const diag = await apolloDomainSearch(cleanDomain, null);
-  if (diag.valid.length > 0) return diag.valid[0];
+  const primary = diag.valid[0] || null;
 
-  // Construir mensaje de diagnóstico específico
-  let reason;
-  if (diag.httpError)           reason = `Apollo API error: ${diag.httpError}`;
-  else if (diag.rawCount === 0) reason = `Apollo no tiene personas indexadas para ${cleanDomain}`;
-  else if (diag.lockedCount === diag.rawCount) reason = `Apollo encontró ${diag.rawCount} personas pero TODOS los emails están bloqueados por plan. Desbloqueá los contactos en Apollo.app o upgradeá el plan.`;
-  else if (diag.noEmailCount === diag.rawCount) reason = `Apollo encontró ${diag.rawCount} personas pero ninguna tiene email registrado`;
-  else reason = `Apollo encontró ${diag.rawCount} personas: ${diag.lockedCount} bloqueados · ${diag.noEmailCount} sin email · ${diag.badStatusCount} con status inválido`;
+  let note = "";
+  if (diag.httpError)               note = `Apollo API error: ${diag.httpError}`;
+  else if (diag.rawCount === 0)     note = `Apollo has no people indexed for ${cleanDomain}`;
+  else if (diag.valid.length === 0) {
+    if (diag.lockedCount === diag.rawCount)       note = `${diag.rawCount} people found — all emails locked (click 🔓 Reveal on a row)`;
+    else if (diag.noEmailCount === diag.rawCount) note = `${diag.rawCount} people found — no emails on file`;
+    else note = `${diag.rawCount} people: ${diag.lockedCount} locked · ${diag.noEmailCount} no email · ${diag.badStatusCount} bad status`;
+  } else {
+    note = `${diag.valid.length} valid · ${diag.rawCount - diag.valid.length} locked/other`;
+  }
 
   return {
-    name:  firstName ? `${firstName} ${lastName}`.trim() : "",
-    email: null, title, linkedin,
-    error: reason,
-    _apolloDiag: diag, // expuesto para debug en UI
+    name:     primary?.name     || (firstName ? `${firstName} ${lastName}`.trim() : ""),
+    email:    primary?.email    || null,
+    title:    primary?.title    || title,
+    linkedin: primary?.linkedin || linkedin,
+    people:   diag.all,           // ALL people (locked + unlocked) for UI rendering
+    note,
+    diag,
   };
+}
+
+/**
+ * Reveal a single Apollo contact via /v1/people/match — costs 1 Apollo credit.
+ * Pass { id } (preferred) OR { first_name, last_name, domain }.
+ */
+export async function revealApolloEmail({ id, first_name, last_name, domain }) {
+  const body = { reveal_personal_emails: true, reveal_phone_number: false };
+  if (id)         body.id = id;
+  if (first_name) body.first_name = first_name;
+  if (last_name)  body.last_name  = last_name;
+  if (domain)     body.organization_name = domain;
+  try {
+    const res = await callProxy("apollo", "/v1/people/match", { method: "POST", body });
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}: ${(res.text||"").substring(0,120)}` };
+    const p = res.data?.person || res.data;
+    if (!p) return { ok: false, error: "No person returned" };
+    const mapped = mapApolloPerson(p);
+    if (!mapped.unlocked) return { ok: false, error: "Apollo could not unlock — out of credits or not allowed by plan", person: mapped };
+    return { ok: true, person: mapped };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 // ============================================================

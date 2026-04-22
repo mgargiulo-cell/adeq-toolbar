@@ -4,7 +4,7 @@
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter } from "../modules/traffic.js";
-import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail } from "../modules/scraper.js";
+import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
 import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
@@ -972,6 +972,71 @@ function showLinkedIn(url) {
   link.href = url; row.style.display = "block";
 }
 
+// Render Apollo people list (unlocked + locked + no-email) with reveal buttons
+function renderApolloPeople(resultEl, result) {
+  const people = result.people || [];
+  if (!people.length) {
+    resultEl.textContent = result.note || "No Apollo data";
+    return;
+  }
+
+  const summary = result.note || `${people.length} people`;
+  const rows = people.map((p, i) => {
+    const emailCell = p.unlocked
+      ? `<a href="mailto:${esc(p.email)}" class="apollo-row-email">${esc(p.email)}</a>`
+      : p.email
+        ? `<span class="apollo-row-locked" title="${esc(p.status||"")}">🔒 locked</span>
+           <button class="apollo-reveal-btn" data-idx="${i}" title="Unlock (uses 1 Apollo credit)">🔓 Reveal</button>`
+        : `<span class="apollo-row-locked">— no email</span>
+           <button class="apollo-reveal-btn" data-idx="${i}" title="Try to reveal via match (uses 1 credit)">🔓 Try</button>`;
+    const linkedin = p.linkedin
+      ? `<a href="${esc(p.linkedin)}" target="_blank" rel="noopener" class="apollo-row-link">in</a>`
+      : "";
+    return `
+      <div class="apollo-row" data-idx="${i}">
+        <div class="apollo-row-main">
+          <div class="apollo-row-name">${esc(p.name || "(no name)")} ${linkedin}</div>
+          <div class="apollo-row-title">${esc(p.title || "")}</div>
+        </div>
+        <div class="apollo-row-email-cell">${emailCell}</div>
+      </div>`;
+  }).join("");
+
+  resultEl.innerHTML = `
+    <details class="apollo-details" open>
+      <summary class="apollo-summary">👥 ${esc(summary)} <span class="apollo-toggle">click to toggle</span></summary>
+      <div class="apollo-list">${rows}</div>
+    </details>
+  `;
+
+  // Reveal click handlers
+  resultEl.querySelectorAll(".apollo-reveal-btn").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.preventDefault();
+      const idx = parseInt(btn.dataset.idx);
+      const person = people[idx];
+      btn.disabled = true; btn.textContent = "⏳";
+      const r = await revealApolloEmail({
+        id:         person.id,
+        first_name: person.first_name,
+        last_name:  person.last_name,
+        domain:     state.domain,
+      });
+      if (r.ok && r.person?.email) {
+        people[idx] = r.person;
+        addEmailsWithSource([r.person.email], "Apollo");
+        setEmail(r.person.email);
+        autoPushReady.email = true; checkAutoPush(); updateScore();
+        renderApolloPeople(resultEl, result); // re-render with new state
+      } else {
+        btn.disabled = false;
+        btn.textContent = "❌";
+        btn.title = r.error || "Reveal failed";
+      }
+    });
+  });
+}
+
 // ============================================================
 // BOTONES
 // ============================================================
@@ -986,20 +1051,22 @@ async function bindButtons() {
     const resultEl = document.getElementById("apollo-result");
     btn.disabled   = true; btn.textContent = "⏳...";
     const result   = await findDecisionMakerViaApollo(state.domain);
-    if (result.error) {
-      resultEl.textContent = result.error;
-    } else {
-      resultEl.textContent = `${result.name} · ${result.title}`;
-      if (result.name) state.decisionMakerName = result.name.split(" ")[0]; // primer nombre
-      if (result.email && !result.email.includes("No disponible")) {
-        addEmailsWithSource([result.email], "Apollo");
-        setEmail(result.email);
-        autoPushReady.email = true;
-        checkAutoPush();
-        updateScore();
-      }
-      if (result.linkedin) showLinkedIn(result.linkedin);
+
+    // 1. Unlocked emails → add to email list immediately (preview)
+    const unlockedEmails = (result.people || []).filter(p => p.unlocked && p.email).map(p => p.email);
+    if (unlockedEmails.length) {
+      addEmailsWithSource(unlockedEmails, "Apollo");
+      setEmail(unlockedEmails[0]);
+      autoPushReady.email = true;
+      checkAutoPush();
+      updateScore();
     }
+    if (result.name) state.decisionMakerName = result.name.split(" ")[0];
+    if (result.linkedin) showLinkedIn(result.linkedin);
+
+    // 2. Render full people list on click-to-expand
+    renderApolloPeople(resultEl, result);
+
     btn.disabled = false; btn.textContent = "👤 Apollo";
   });
 
