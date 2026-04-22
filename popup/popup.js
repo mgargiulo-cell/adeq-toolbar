@@ -3690,9 +3690,11 @@ async function updateApiFooter() {
   if (!el) return;
   const usage = await getApiUsageToday(state.accessToken, state.loginEmail);
   const bp = usage.byProvider || {};
-  const g  = bp.gemini   || 0;
-  const a  = bp.apollo   || 0;
-  const r  = bp.rapidapi || 0;
-  el.textContent = `API today: ${usage.total} (G:${g}/A:${a}/R:${r})`;
+  const c  = bp.anthropic || 0;
+  const g  = bp.gemini    || 0;
+  const a  = bp.apollo    || 0;
+  const r  = bp.rapidapi  || 0;
+  el.textContent = `API today: ${usage.total} (C:${c}/G:${g}/A:${a}/R:${r})`;
+  el.title = `Anthropic (Claude): ${c}\nGemini: ${g}\nApollo: ${a}\nRapidAPI: ${r}`;
   el.style.color = usage.total > 400 ? "#e53e3e" : usage.total > 250 ? "#d97706" : "#a0aec0";
 }
