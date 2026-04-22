@@ -252,7 +252,7 @@ export async function getAutopilotState(accessToken) {
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
     const res  = await fetch(
-      `${url}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,auto_session_start,auto_heartbeat_at)&select=key,value`,
+      `${url}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,auto_session_start,auto_session_user,auto_heartbeat_at)&select=key,value`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     const rows = await res.json();
@@ -261,8 +261,9 @@ export async function getAutopilotState(accessToken) {
     const enabled      = map.auto_prospecting_enabled === "true";
     const sessionStart = map.auto_session_start ? new Date(map.auto_session_start) : null;
     const heartbeatAt  = map.auto_heartbeat_at  ? new Date(map.auto_heartbeat_at)  : null;
-    return { enabled, sessionStart, heartbeatAt };
-  } catch { return { enabled: false, sessionStart: null, heartbeatAt: null }; }
+    const sessionUser  = map.auto_session_user  || "";
+    return { enabled, sessionStart, heartbeatAt, sessionUser };
+  } catch { return { enabled: false, sessionStart: null, heartbeatAt: null, sessionUser: "" }; }
 }
 
 async function upsertConfig(url, key, headers, configKey, value) {

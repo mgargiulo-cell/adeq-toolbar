@@ -296,6 +296,21 @@ async function markProcessed(token, domains, reason = "processed") {
   });
 }
 
+// Bump the per-user/day/reason counter so the UI can show "today: 130 traffic_low / 25 added_to_review / ..."
+async function bumpStat(token, userEmail, reason, n = 1) {
+  if (!userEmail || !reason) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/rpc/bump_autopilot_stat`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ p_user_email: userEmail, p_reason: reason, p_count: n }),
+    });
+  } catch {} // best-effort, never block the loop
+}
+
 async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy }) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
@@ -781,6 +796,27 @@ const TLD_BY_REGION = {
   MENA:   [".ae",".sa",".eg",".ma",".tr",".il",".kw",".qa",".dz",".tn"],
   Asia:   [".in",".jp",".kr",".cn",".tw",".hk",".sg",".my",".id",".ph",".th",".vn",".pk",".bd"],
 };
+
+// Returns the "organization root" of a domain — collapses regional TLD variants
+// so clarin.com / clarin.com.ar / clarin.com.br dedupe to the same org key.
+// Heuristic — strips known multi-part TLDs first, then last TLD label, leaving
+// the brand part. Not perfect, but cuts >80% of obvious cross-region duplicates.
+const MULTI_PART_TLDS = new Set([
+  "com.ar","com.br","com.mx","com.co","com.pe","com.uy","com.ec","com.ve","com.bo",
+  "com.es","com.au","com.cn","com.tw","com.hk","com.sg","com.my","com.tr","com.eg",
+  "com.sa","com.ng","com.za","com.ph","com.vn","com.pk",
+  "co.uk","co.za","co.in","co.kr","co.jp","co.il",
+  "org.uk","org.ar","org.br","org.mx","gov.uk","ac.uk","ac.in","gov.ar",
+]);
+function coreDomain(domain) {
+  if (!domain) return "";
+  const parts = domain.toLowerCase().replace(/^www\./, "").split(".");
+  if (parts.length <= 2) return parts[0]; // foo.com → "foo"
+  // Last 2 labels — check if it's a multi-part TLD (e.g. "com.ar")
+  const last2 = parts.slice(-2).join(".");
+  if (MULTI_PART_TLDS.has(last2)) return parts[parts.length - 3]; // x.com.ar → "x"
+  return parts[parts.length - 2]; // sub.foo.com → "foo"
+}
 
 function isDomainBlocked(domain) {
   const d = domain.toLowerCase();
@@ -1335,7 +1371,9 @@ async function runSession(token, cfg, sessionStart) {
   // Cola dinámica: priorizar similares-de-likes primero, después pool random
   const toProcess     = [...likedSimilarDomains, ...candidates];
   const seenInSession = new Set(toProcess);
-  let count = 0, added = 0, skipped = 0, lowScore = 0, discovered = 0;
+  // Dedup por organización: si ya vimos clarin.com.ar, saltar clarin.com.br/.es/.co
+  const seenOrgs = new Set(toProcess.map(coreDomain).filter(Boolean));
+  let count = 0, added = 0, skipped = 0, lowScore = 0, discovered = 0, dupOrg = 0;
 
   while (toProcess.length > 0) {
     if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
@@ -1365,6 +1403,17 @@ async function runSession(token, cfg, sessionStart) {
 
     const domain = toProcess.shift();
     log(`→ [${count + 1} | +${discovered} desc | cola: ${toProcess.length}] ${domain}`);
+
+    // Pre-filtro GRATUITO #-1: dedup por organización (clarin.com vs clarin.com.ar)
+    const org = coreDomain(domain);
+    if (org && seenOrgs.has(org) && !seenInSession.has(`__seed:${domain}`)) {
+      // already saw a sibling in this session — skip without consuming any API
+      log(`  ⊘ ${domain} — duplicado por org "${org}" (ya procesado)`);
+      await markProcessed(token, [domain], "org_duplicate");
+      count++; dupOrg++;
+      continue;
+    }
+    if (org) seenOrgs.add(org);
 
     // Pre-filtro GRATUITO (antes de gastar créditos SimilarWeb / Apollo):
     // 0) Learning: dominio dislikeado directamente por el user
@@ -1487,9 +1536,10 @@ async function runSession(token, cfg, sessionStart) {
     // Scoring: tráfico + categoría + contacto + geo target + contenido accesible
     const rawScore = scoreCandidate({ visits, category, topCountry, contactName, emails: [], pageContent, allowedCountries });
 
-    // Penalización por patrones de rechazo aprendidos (globales)
-    const catPenalty = Math.min(20, (rejectionPatterns.categories[category] || 0) * 4);
-    const geoPenalty = Math.min(10, (rejectionPatterns.geos[topCountry]     || 0) * 2);
+    // Penalización por patrones de rechazo aprendidos (globales) — pesa poco
+    // para no contaminar el ranking de un user con preferencias de otros.
+    const catPenalty = Math.min(10, (rejectionPatterns.categories[category] || 0) * 2);
+    const geoPenalty = Math.min(5,  (rejectionPatterns.geos[topCountry]     || 0) * 1);
 
     // Penalización POR USUARIO (feedback like/dislike explícito) — mucho más fuerte
     const userCatDislikes = feedback.dislikedCategories.get(category) || 0;
@@ -1572,7 +1622,7 @@ async function runSession(token, cfg, sessionStart) {
     await sleep(DOMAIN_DELAY_MS);
   }
 
-  log(`Sesión completada — ${count} procesados | ${added} guardados | ${skipped} bajo tráfico | ${lowScore} bajo score | ${discovered} descubiertos vía similares`);
+  log(`Sesión completada — ${count} procesados | ${added} guardados | ${skipped} skipped | ${lowScore} bajo score | ${dupOrg} dup-org | ${discovered} descubiertos vía similares`);
   await saveApolloUsage(token, apolloCallsThisSession, apolloUsage.today);
 }
 

@@ -3143,10 +3143,21 @@ async function initAutopilot() {
   const currentLbl  = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
-  const [{ enabled, heartbeatAt }, target] = await Promise.all([
+  const [{ enabled, heartbeatAt, sessionUser }, target] = await Promise.all([
     getAutopilotState(state.accessToken),
     getAutopilotTarget(state.accessToken),
   ]);
+
+  // If autopilot is currently active under a different user, warn — don't silently
+  // overwrite their session. User can still enable, but knows they'll take over.
+  if (enabled && sessionUser && sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()) {
+    const heartbeatAge = heartbeatAt ? Math.round((Date.now() - heartbeatAt.getTime()) / 1000) : 999;
+    if (heartbeatAge < 120) {
+      console.warn(`[Autopilot] active under ${sessionUser} (heartbeat ${heartbeatAge}s ago). Enabling now will hijack their quota.`);
+      const heartEl = document.getElementById("railway-heartbeat");
+      if (heartEl) heartEl.title = `⚠️ ${sessionUser} is currently running autopilot — enabling will switch ownership`;
+    }
+  }
 
   renderRailwayHeartbeat(heartbeatAt);
   // Refresca heartbeat cada 15s mientras el tab Prospects esté visible
