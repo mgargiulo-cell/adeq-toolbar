@@ -596,22 +596,22 @@
       </select>
 
     </div>
-    <button id="btn-cascade-apply-filters" class="btn btn-secondary btn-full" style="margin-top:10px">🎯 Aplicar filtros</button>
+    <button id="btn-cascade-apply-filters" class="btn btn-secondary btn-full" style="margin-top:10px">🎯 Apply filters</button>
+
+    <!-- Bulk actions just below filters — no scroll needed -->
+    <div id="cascade-actions" class="actions" style="display:none;margin-top:10px">
+      <div class="cascade-actions-row">
+        <div class="cascade-summary" id="cascade-summary"></div>
+        <button id="btn-check-all" class="btn btn-secondary btn-sm">Check all</button>
+      </div>
+      <button id="btn-push-all" class="btn btn-primary btn-full">🌐 Open selected</button>
+      <div id="cascade-push-result" class="push-result"></div>
+    </div>
   </section>
 
   <!-- Results -->
   <section id="cascade-results" class="cascade-results">
     <div class="cascade-empty">Enter a seed domain or select a keyword.</div>
-  </section>
-
-  <!-- Bulk actions -->
-  <section id="cascade-actions" class="actions" style="display:none">
-    <div class="cascade-actions-row">
-      <div class="cascade-summary" id="cascade-summary"></div>
-      <button id="btn-check-all" class="btn btn-secondary btn-sm">Check all</button>
-    </div>
-    <button id="btn-push-all" class="btn btn-primary btn-full">🌐 Open selected</button>
-    <div id="cascade-push-result" class="push-result"></div>
   </section>
 
 </div>
