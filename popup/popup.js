@@ -20,7 +20,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
          getDailyValidationCount, getApiUsageToday, getCustomPrompt, setCustomPrompt,
-         insertPitchFeedback, matchPitchFeedback }                                           from "../modules/supabase.js";
+         insertPitchFeedback, matchPitchFeedback, getApiUsageForProvider }                   from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
@@ -1878,6 +1878,23 @@ async function openSettings() {
   if (promptEl) promptEl.value = state.customPrompt || "";
   const statusEl = document.getElementById("custom-prompt-status");
   if (statusEl) statusEl.textContent = state.customPrompt ? `${state.customPrompt.length} chars saved` : "empty";
+
+  // Claude usage counters (today + last 30 days) — non-blocking
+  const todayEl = document.getElementById("stats-claude-today");
+  const monthEl = document.getElementById("stats-claude-month");
+  if (todayEl && monthEl) {
+    todayEl.textContent = "…"; monthEl.textContent = "…";
+    Promise.all([
+      getApiUsageForProvider(state.accessToken, state.loginEmail, "anthropic", 1),
+      getApiUsageForProvider(state.accessToken, state.loginEmail, "anthropic", 30),
+    ]).then(([today, month]) => {
+      todayEl.textContent = String(today.total);
+      monthEl.textContent = String(month.total);
+    }).catch(() => {
+      todayEl.textContent = "–"; monthEl.textContent = "–";
+    });
+  }
+
   await refreshGmailStatus();
 }
 

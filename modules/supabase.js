@@ -16,6 +16,30 @@ async function getConfig() {
   };
 }
 
+// Sum API usage over the last N days for a single provider (e.g. "anthropic").
+// Returns { total: number, days: number } — convenient for "pitches this month".
+export async function getApiUsageForProvider(accessToken, userEmail, provider, days = 30) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !userEmail || !provider) return { total: 0, days: 0 };
+  try {
+    // Local day boundary (Argentina tz) so "today" and "this month" match the user's clock
+    const startLocal = new Date();
+    startLocal.setDate(startLocal.getDate() - (days - 1));
+    const startStr = startLocal.toLocaleDateString("en-CA");
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(userEmail)}&day=gte.${startStr}&select=by_provider`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return { total: 0, days: 0 };
+    const rows = await res.json();
+    if (!Array.isArray(rows)) return { total: 0, days: 0 };
+    let total = 0;
+    for (const r of rows) total += Number(r.by_provider?.[provider] || 0);
+    return { total, days: rows.length };
+  } catch { return { total: 0, days: 0 }; }
+}
+
 // Today's API usage (total + by_provider) for the current user
 export async function getApiUsageToday(accessToken, userEmail) {
   const url = CONFIG.SUPABASE_URL;
