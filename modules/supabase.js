@@ -103,6 +103,41 @@ export async function supabaseRefresh(refreshToken) {
   }
 }
 
+// ── Per-user custom Claude prompt (appended to system prompt on pitch generation) ──
+export async function getCustomPrompt(accessToken, userEmail) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !userEmail) return "";
+  const cfgKey = `custom_prompt_${userEmail.toLowerCase()}`;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_config?key=eq.${encodeURIComponent(cfgKey)}&select=value`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return "";
+    const rows = await res.json();
+    return (Array.isArray(rows) && rows[0]?.value) || "";
+  } catch { return ""; }
+}
+
+export async function setCustomPrompt(accessToken, userEmail, value) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !userEmail) return { ok: false, error: "auth required" };
+  const cfgKey = `custom_prompt_${userEmail.toLowerCase()}`;
+  const headers = {
+    "apikey": key, "Authorization": `Bearer ${accessToken}`,
+    "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+  };
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_config`, {
+      method: "POST", headers,
+      body: JSON.stringify([{ key: cfgKey, value: value || "" }]),
+    });
+    return { ok: res.ok, status: res.status };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 // Carga las API keys desde toolbar_config (requiere JWT de usuario autenticado)
 export async function fetchApiKeys(accessToken) {
   const url = CONFIG.SUPABASE_URL;

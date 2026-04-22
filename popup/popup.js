@@ -19,7 +19,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
-         getDailyValidationCount, getApiUsageToday }                                         from "../modules/supabase.js";
+         getDailyValidationCount, getApiUsageToday, getCustomPrompt, setCustomPrompt }       from "../modules/supabase.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -218,6 +218,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   initTabs();
   bindButtons();
   initPitchDrafts(); // used by Prospects cards + Analysis — cheap, keep eager
+  bindCustomPromptHandlers();
+  // Load per-user Claude custom prompt into state (no-op if empty). Used by generatePitch.
+  getCustomPrompt(auth.accessToken, auth.user).then(p => { state.customPrompt = p || ""; }).catch(() => {});
   // initKeywords, initAutopilot, initProspectsTab, initCsvQueue, loadHistoryTab → lazy on tab click
 
   // Show the toolbar login email as the Gmail "from" account
@@ -1206,6 +1209,7 @@ async function bindButtons() {
         decisionMakerName: state.decisionMakerName,
         previousPitches: state.generatedPitches.slice(-3),
         dislikes,
+        customPrompt: state.customPrompt || "",
         ...cfg, favExamples,
       });
       state.pitch = result.body;
@@ -1267,6 +1271,7 @@ async function bindButtons() {
         decisionMakerName: state.decisionMakerName,
         previousPitches: state.generatedPitches.slice(-3),
         dislikes,
+        customPrompt: state.customPrompt || "",
         ...cfg, favExamples,
       });
       state.pitch = result.body;
@@ -1801,7 +1806,39 @@ function detectPhraseLang(phrase) {
 
 async function openSettings() {
   document.getElementById("settings-modal").style.display = "flex";
+  // Hidratar custom prompt desde state (cargado al boot)
+  const promptEl = document.getElementById("settings-custom-prompt");
+  if (promptEl) promptEl.value = state.customPrompt || "";
+  const statusEl = document.getElementById("custom-prompt-status");
+  if (statusEl) statusEl.textContent = state.customPrompt ? `${state.customPrompt.length} chars saved` : "empty";
   await refreshGmailStatus();
+}
+
+function bindCustomPromptHandlers() {
+  const saveBtn  = document.getElementById("btn-save-custom-prompt");
+  const clearBtn = document.getElementById("btn-clear-custom-prompt");
+  const taEl     = document.getElementById("settings-custom-prompt");
+  const statusEl = document.getElementById("custom-prompt-status");
+  if (!saveBtn || !taEl) return;
+
+  saveBtn.addEventListener("click", async () => {
+    const value = taEl.value.trim();
+    saveBtn.disabled = true; saveBtn.textContent = "⏳ Saving...";
+    const r = await setCustomPrompt(state.accessToken, state.loginEmail, value);
+    saveBtn.disabled = false; saveBtn.textContent = "💾 Save prompt";
+    if (!r.ok) { statusEl.textContent = `❌ Save failed (${r.status || r.error})`; statusEl.style.color = "var(--danger)"; return; }
+    state.customPrompt = value;
+    statusEl.textContent = `✅ Saved · ${value.length} chars`;
+    statusEl.style.color = "var(--success-text)";
+    setTimeout(() => { statusEl.style.color = "var(--text-muted)"; }, 3000);
+  });
+
+  clearBtn?.addEventListener("click", async () => {
+    if (!confirm("Clear your custom prompt?")) return;
+    taEl.value = "";
+    const r = await setCustomPrompt(state.accessToken, state.loginEmail, "");
+    if (r.ok) { state.customPrompt = ""; statusEl.textContent = "empty"; }
+  });
 }
 
 // Feedback visible en el panel de Gmail (ok / warn / error)
@@ -3446,6 +3483,7 @@ function initProspectCard(card, data) {
         previousPitches:   [],
         dislikes:          [],
         favExamples,
+        customPrompt:      state.customPrompt || "",
         ...cfg,
       });
 

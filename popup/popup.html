@@ -940,6 +940,25 @@
       <div class="settings-gmail-hint">Emails are sent from this account. Must match your toolbar login.</div>
     </div>
 
+    <div class="settings-gmail-row" style="margin-top:14px">
+      <div class="settings-gmail-label">
+        🤖 Claude Prompt — your style instructions
+      </div>
+      <textarea id="settings-custom-prompt" class="form-input"
+        rows="6"
+        placeholder="Optional. Extra instructions appended to the system prompt every time Claude generates a pitch. Examples: tone, structure preferences, words to avoid, your value proposition, target verticals you care about, etc."
+        style="font-size:11px; padding:7px; resize:vertical; width:100%; min-height:120px; font-family:inherit"></textarea>
+      <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+        <button id="btn-save-custom-prompt" class="btn btn-secondary btn-sm" style="font-size:11px">💾 Save prompt</button>
+        <button id="btn-clear-custom-prompt" class="btn btn-secondary btn-sm" style="font-size:11px">Clear</button>
+        <span id="custom-prompt-status" style="font-size:10px;color:var(--text-muted)"></span>
+      </div>
+      <div class="settings-gmail-hint">
+        Per-user, stored in Supabase. Appended after the default style examples — does not replace them.
+        Updates apply to the next pitch you generate (no reload needed).
+      </div>
+    </div>
+
     <div class="modal-actions">
       <button id="btn-close-settings" class="btn btn-secondary">Close</button>
     </div>

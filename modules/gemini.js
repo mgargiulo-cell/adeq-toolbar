@@ -142,6 +142,7 @@ export async function generatePitch(ctx) {
     dislikes = [],
     tone = "informal", length = "short", focus = "analysis", opening = "direct",
     favExamples = [],
+    customPrompt = "",   // optional per-user instructions (Settings → Claude Prompt)
   } = ctx;
 
   const trafficStr = traffic >= 1_000_000
@@ -224,7 +225,7 @@ ANGLE FOR THIS EMAIL: ${angle}
 ${previousSection}${favSection}${dislikeSection}
 DO NOT START WITH: "${avoid}"
 
-CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Every word — in ${langName}.`;
+CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Every word — in ${langName}.${customPrompt ? `\n\nUSER OVERRIDES (these take precedence over any conflicting instruction above — apply them strictly):\n${customPrompt}` : ""}`;
 
   const userMessage = `Site: ${domain}
 Monthly traffic: ${trafficStr} visits
