@@ -341,24 +341,33 @@ async function getUserAutopilotCountToday(token, userEmail) {
 
 // Carga feedback del user: sets con categorías/geos/dominios que marcó como disliked
 async function loadAutopilotFeedback(token, userEmail) {
-  const dislikedCategories = new Map(); // category → count
+  const dislikedCategories = new Map();
   const dislikedGeos       = new Map();
   const dislikedDomains    = new Set();
-  if (!userEmail) return { dislikedCategories, dislikedGeos, dislikedDomains };
+  const likedDomains       = [];  // ordered by recency — use for similar-site seeding
+  const likedCategories    = new Map();
+  const likedGeos          = new Map();
+  if (!userEmail) return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.disliked&select=domain,category,geo&limit=1000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(liked,disliked)&select=domain,action,category,geo,created_at&order=created_at.desc&limit=2000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
-    if (!res.ok) return { dislikedCategories, dislikedGeos, dislikedDomains };
+    if (!res.ok) return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
     const rows = await res.json();
     for (const r of rows) {
-      if (r.domain)   dislikedDomains.add(r.domain.toLowerCase());
-      if (r.category) dislikedCategories.set(r.category, (dislikedCategories.get(r.category) || 0) + 1);
-      if (r.geo)      dislikedGeos.set(r.geo,             (dislikedGeos.get(r.geo)             || 0) + 1);
+      if (r.action === "disliked") {
+        if (r.domain)   dislikedDomains.add(r.domain.toLowerCase());
+        if (r.category) dislikedCategories.set(r.category, (dislikedCategories.get(r.category) || 0) + 1);
+        if (r.geo)      dislikedGeos.set(r.geo,             (dislikedGeos.get(r.geo)             || 0) + 1);
+      } else if (r.action === "liked") {
+        if (r.domain)   likedDomains.push(r.domain.toLowerCase());
+        if (r.category) likedCategories.set(r.category,     (likedCategories.get(r.category)    || 0) + 1);
+        if (r.geo)      likedGeos.set(r.geo,                (likedGeos.get(r.geo)               || 0) + 1);
+      }
     }
   } catch {}
-  return { dislikedCategories, dislikedGeos, dislikedDomains };
+  return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
 }
 
 async function getApolloUsageToday(token) {
@@ -1306,8 +1315,25 @@ async function runSession(token, cfg, sessionStart) {
     return;
   }
 
-  // Cola dinámica: permite inyectar sitios similares durante la sesión
-  const toProcess     = [...candidates];
+  // ── SEED desde likes: inyectar similares de los últimos 30 dominios que el user 👍 ──
+  // Esto crea un feedback loop positivo: te gustó X → próxima sesión busca sitios como X
+  const likedSeeds = feedback.likedDomains.slice(0, 30); // últimos 30
+  const likedSimilarDomains = new Set();
+  if (likedSeeds.length > 0) {
+    log(`Seeding similar-sites desde ${likedSeeds.length} likes recientes...`);
+    const simResults = await Promise.all(
+      likedSeeds.map(d => findSimilarSites(d, rapidapi_key).catch(() => []))
+    );
+    for (const list of simResults) {
+      for (const sim of list) {
+        if (!mondaySet.has(sim) && !processed.has(sim)) likedSimilarDomains.add(sim);
+      }
+    }
+    log(`  🔗 Similares de likes: +${likedSimilarDomains.size} dominios con prioridad`);
+  }
+
+  // Cola dinámica: priorizar similares-de-likes primero, después pool random
+  const toProcess     = [...likedSimilarDomains, ...candidates];
   const seenInSession = new Set(toProcess);
   let count = 0, added = 0, skipped = 0, lowScore = 0, discovered = 0;
 
@@ -1471,10 +1497,19 @@ async function runSession(token, cfg, sessionStart) {
     const userCatPenalty  = Math.min(40, userCatDislikes * 10);       // -10 por cada dislike, max -40
     const userGeoPenalty  = Math.min(30, userGeoDislikes * 8);
 
-    const finalScore = rawScore - catPenalty - geoPenalty - userCatPenalty - userGeoPenalty;
+    // Bonus por LIKES: si la categoría o geo matchea patterns que el user aprobó
+    const userCatLikes = feedback.likedCategories.get(category) || 0;
+    const userGeoLikes = feedback.likedGeos.get(topCountry)     || 0;
+    const userCatBonus = Math.min(30, userCatLikes * 6);  // +6 por like, max +30
+    const userGeoBonus = Math.min(20, userGeoLikes * 4);
+    // Bonus extra si viene de la inyección de similares de likes
+    const fromLikedSeed = likedSimilarDomains.has(domain) ? 15 : 0;
+
+    const finalScore = rawScore - catPenalty - geoPenalty - userCatPenalty - userGeoPenalty
+                     + userCatBonus + userGeoBonus + fromLikedSeed;
 
     if (finalScore < minScore) {
-      log(`  ✗ Score ${finalScore} (raw ${rawScore}, global cat:${catPenalty} geo:${geoPenalty}, user cat:${userCatPenalty} geo:${userGeoPenalty}) — descartado`);
+      log(`  ✗ Score ${finalScore} (raw ${rawScore}, -dis cat:${catPenalty+userCatPenalty} geo:${geoPenalty+userGeoPenalty}, +like cat:${userCatBonus} geo:${userGeoBonus} seed:${fromLikedSeed}) — descartado`);
       await markProcessed(token, [domain], "low_score");
       count++; lowScore++;
       await sleep(DOMAIN_DELAY_MS);
