@@ -6,10 +6,30 @@ Todo esto se hace UNA SOLA VEZ. Después queda andando para siempre.
 
 ---
 
-## Paso 1 — SQL en Supabase (1 min)
+## Resumen — qué corre cada pieza
+
+| Componente | Modelo / proveedor | Para qué |
+|---|---|---|
+| Pitch (Analysis + Prospects) | Claude Sonnet 4.6 | Generación de pitch + 3 subjects |
+| Follow-up | Claude Haiku 4.5 | Email corto post-no-respuesta |
+| Revenue gap | Claude Sonnet 4.6 | Análisis de potencial monetización |
+| Email decision-maker | Gemini Flash + Google Search | Web search en vivo (Claude no tiene equivalente) |
+| Email scraping bulk | Gemini Flash + Google Search | Idem |
+| Tráfico + similar sites | RapidAPI (SimilarWeb) | Datos directos |
+| Email contacts B2B | Apollo.io | Búsqueda + Reveal on-click |
+| Pool Autopilot | Cloudflare Radar + Majestic | Dominios país-indexados |
+| RAG ejemplos pitch | Voyage embeddings + pgvector | Retrieval semántico de likes/dislikes |
+
+Todo pasa por una Edge Function proxy en Supabase — keys nunca van al cliente.
+
+---
+
+## Paso 1 — SQL en Supabase (3 min)
 
 1. Abrí [supabase.com/dashboard/project/ticjpwimhtfkbccchfyp/sql](https://supabase.com/dashboard/project/ticjpwimhtfkbccchfyp/sql)
-2. Pegá este SQL y dale **Run**:
+2. Corré **los 3 SQL blocks** abajo (en orden — cada uno es independiente, si alguno ya existe, los `if not exists` lo saltean):
+
+### 1.1 Usage tracking (proxy quota)
 
 ```sql
 create table if not exists public.toolbar_api_usage (
@@ -32,7 +52,35 @@ create policy "usage_select_own" on public.toolbar_api_usage for select
 revoke insert, update, delete on public.toolbar_api_usage from anon, authenticated;
 ```
 
-Tiene que decir **Success. No rows returned**.
+### 1.2 Custom prompt per-user
+
+```sql
+create table if not exists public.toolbar_user_prompts (
+  user_email text primary key,
+  prompt     text not null default '',
+  updated_at timestamptz not null default now()
+);
+
+alter table public.toolbar_user_prompts enable row level security;
+revoke insert, update, delete on public.toolbar_user_prompts from anon;
+
+drop policy if exists "uprompt_select_own" on public.toolbar_user_prompts;
+drop policy if exists "uprompt_upsert_own" on public.toolbar_user_prompts;
+drop policy if exists "uprompt_update_own" on public.toolbar_user_prompts;
+
+create policy "uprompt_select_own" on public.toolbar_user_prompts for select
+  to authenticated using (user_email = auth.jwt() ->> 'email');
+create policy "uprompt_upsert_own" on public.toolbar_user_prompts for insert
+  to authenticated with check (user_email = auth.jwt() ->> 'email');
+create policy "uprompt_update_own" on public.toolbar_user_prompts for update
+  to authenticated using (user_email = auth.jwt() ->> 'email');
+```
+
+### 1.3 Voyage RAG (pgvector + pitch feedback)
+
+Ver archivo completo: `sql/pitch_feedback_rag.sql` — crea extensión `vector`, tabla `toolbar_pitch_feedback` con `vector(1024)`, índice HNSW, RLS, y función `match_pitch_feedback`.
+
+Los tres deben terminar en **Success**.
 
 ---
 
@@ -61,10 +109,20 @@ supabase secrets set \
   GEMINI_API_KEY=PEGAR_GEMINI_KEY_ACA \
   APOLLO_API_KEY=PEGAR_APOLLO_KEY_ACA \
   RAPIDAPI_KEY=PEGAR_RAPIDAPI_KEY_ACA \
-  ANTHROPIC_API_KEY=sk-ant-PEGAR_ANTHROPIC_KEY_ACA
+  ANTHROPIC_API_KEY=sk-ant-PEGAR_ANTHROPIC_KEY_ACA \
+  VOYAGE_API_KEY=pa-PEGAR_VOYAGE_KEY_ACA
 ```
 
-> **Nota:** `ANTHROPIC_API_KEY` es obligatoria ahora que el pitch, follow-up y revenue-gap usan Claude (Sonnet 4.6 / Haiku 4.5). Sin ella, esos 3 flujos fallan con `Missing ANTHROPIC_API_KEY secret`.
+> **Secrets obligatorios:**
+> - `ANTHROPIC_API_KEY` — sin esto, pitch/follow-up/revenue-gap fallan
+> - `VOYAGE_API_KEY` — sin esto, el RAG de likes/dislikes no guarda (toolbar sigue funcionando, solo que no hay aprendizaje)
+>
+> **Consigues las keys en:**
+> - Gemini: [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+> - Apollo: [app.apollo.io/settings/integrations/api](https://app.apollo.io/settings/integrations/api)
+> - RapidAPI: [rapidapi.com/hub](https://rapidapi.com/hub) (suscripción al plan SimilarWeb Insights)
+> - Anthropic: [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys)
+> - Voyage: [dashboard.voyageai.com](https://dashboard.voyageai.com) → API keys
 
 Tiene que responder `Finished supabase secrets set.`
 

@@ -3827,7 +3827,8 @@ async function updateApiFooter() {
   const g  = bp.gemini    || 0;
   const a  = bp.apollo    || 0;
   const r  = bp.rapidapi  || 0;
-  el.textContent = `API today: ${usage.total} (C:${c}/G:${g}/A:${a}/R:${r})`;
-  el.title = `Anthropic (Claude): ${c}\nGemini: ${g}\nApollo: ${a}\nRapidAPI: ${r}`;
+  const v  = bp.voyage    || 0;
+  el.textContent = `API today: ${usage.total} (C:${c}/G:${g}/A:${a}/R:${r}/V:${v})`;
+  el.title = `Anthropic (Claude): ${c}\nGemini: ${g}\nApollo: ${a}\nRapidAPI: ${r}\nVoyage (RAG): ${v}`;
   el.style.color = usage.total > 400 ? "#e53e3e" : usage.total > 250 ? "#d97706" : "#a0aec0";
 }
