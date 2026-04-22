@@ -321,7 +321,7 @@
           <option value="en">English</option>
           <option value="es">Spanish</option>
           <option value="it">Italian</option>
-          <option value="pt">Portuguesee</option>
+          <option value="pt">Portuguese</option>
           <option value="ar">Arabic</option>
         </select>
         <select id="pitch-category" class="category-select" title="Site category" style="font-size:11px;padding:2px 4px;">
@@ -641,8 +641,8 @@
   <section class="card" style="padding:12px; background:linear-gradient(135deg,#0f172a,#1e293b); border:1px solid #334155; color:#fff">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
-        <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 Autopilot — Automatic discovery</div>
-        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Runs for 1h, finds new sites on the web and adds them here for review. Limit 75/day per user.</div>
+        <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 AUTOPILOT — Discovery from Majestic Million</div>
+        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Finds NEW sites on the web (not already in Monday) for 1h. Limit 75/day per user. <strong>Independent of CSV queue.</strong></div>
         <div id="railway-heartbeat" style="font-size:10px;color:#94a3b8;margin-top:4px">Railway: checking...</div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
@@ -832,31 +832,26 @@
     <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
-      <select id="refresh-geo" class="form-select" style="font-size:11px">
+      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Must match the exact GEO label stored in Monday. Uses 'contains_text' — partial match OK.">
         <option value="">Geo: All</option>
-        <option value="Argentina">Argentina</option>
-        <option value="Mexico">Mexico</option>
-        <option value="Colombia">Colombia</option>
-        <option value="Chile">Chile</option>
-        <option value="Spain">Spain</option>
-        <option value="Brazil">Brazil</option>
-        <option value="Peru">Peru</option>
-        <option value="Ecuador">Ecuador</option>
-        <option value="Venezuela">Venezuela</option>
-        <option value="Uruguay">Uruguay</option>
-        <option value="United States">United States</option>
-        <option value="United Kingdom">United Kingdom</option>
-        <option value="France">France</option>
-        <option value="Germany">Germany</option>
-        <option value="Italy">Italy</option>
-        <option value="Portugal">Portugal</option>
-        <option value="UAE">UAE</option>
-        <option value="Saudi Arabia">Saudi Arabia</option>
-        <option value="India">India</option>
-        <option value="Japan">Japan</option>
-        <option value="Philippines">Philippines</option>
-        <option value="Indonesia">Indonesia</option>
-        <option value="Australia">Australia</option>
+        <option>United States</option><option>United Kingdom</option><option>Argentina</option>
+        <option>Mexico</option><option>Colombia</option><option>Chile</option>
+        <option>Spain</option><option>Brazil</option><option>France</option>
+        <option>Germany</option><option>Italy</option><option>Portugal</option>
+        <option>Netherlands</option><option>Belgium</option><option>Switzerland</option>
+        <option>Austria</option><option>Poland</option><option>Hungary</option>
+        <option>Czech Republic</option><option>Romania</option><option>Greece</option>
+        <option>Turkey</option><option>Israel</option><option>UAE</option>
+        <option>Saudi Arabia</option><option>Morocco</option><option>Egypt</option>
+        <option>India</option><option>Japan</option><option>South Korea</option>
+        <option>Australia</option><option>Canada</option><option>Sweden</option>
+        <option>Norway</option><option>Denmark</option><option>Finland</option>
+        <option>Vietnam</option><option>Thailand</option><option>Indonesia</option>
+        <option>Philippines</option><option>China</option><option>Singapore</option>
+        <option>South Africa</option><option>Nigeria</option><option>Peru</option>
+        <option>Ecuador</option><option>Venezuela</option><option>Bolivia</option>
+        <option>Paraguay</option><option>Uruguay</option><option>Russia</option>
+        <option>Ukraine</option>
       </select>
       <select id="refresh-idioma" class="form-select" style="font-size:11px">
         <option value="">Language: All</option>
@@ -885,13 +880,13 @@
       <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
     </div>
 
-    <!-- AUTO ON — required for Railway to process the queue -->
+    <!-- CSV QUEUE ON — processes uploaded CSV batches (independent of Autopilot) -->
     <div style="margin-bottom:10px;padding:10px;background:#fff7ed;border:2px solid #fb923c;border-radius:6px">
       <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;font-weight:600">
         <input id="csv-queue-enabled" type="checkbox" style="width:16px;height:16px" />
-        <span>🟢 AUTO ON — Railway processes automatically</span>
+        <span>📥 CSV QUEUE ON — Railway processes your uploaded batches</span>
       </label>
-      <div style="font-size:10px; color:var(--text-muted); margin-top:4px; margin-left:24px">If OFF, URLs are queued but not processed.</div>
+      <div style="font-size:10px; color:var(--text-muted); margin-top:4px; margin-left:24px">Processes URLs you uploaded via CSV or Monday Refresh. <strong>Does NOT trigger Autopilot discovery</strong> (that's a separate toggle in the Prospects tab).</div>
     </div>
 
     <!-- HISTORIAL tabs: External CSV / Monday -->

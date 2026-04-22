@@ -9,10 +9,15 @@
 
 import fetch from "node-fetch";
 
-const SUPABASE_URL      = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const SUPABASE_EMAIL    = process.env.SUPABASE_EMAIL;
-const SUPABASE_PASSWORD = process.env.SUPABASE_PASSWORD;
+const SUPABASE_URL              = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY         = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // bypass RLS (backend worker)
+const SUPABASE_EMAIL            = process.env.SUPABASE_EMAIL;
+const SUPABASE_PASSWORD         = process.env.SUPABASE_PASSWORD;
+
+// If a service-role key is set, use it as Bearer — bypasses RLS.
+// Otherwise fall back to user JWT (won't see items uploaded by other users with RLS on).
+const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 
 const SESSION_LIMIT_MS  = 60 * 60 * 1000; // 1 hora max por sesión de autopilot
 const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
@@ -159,7 +164,7 @@ async function supabaseLogin() {
 
 async function getConfig(token) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?select=key,value`, {
-    headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` },
+    headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
   });
   const rows = await res.json();
   const cfg = {};
@@ -172,7 +177,7 @@ async function getActiveFlags(token) {
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,csv_queue_enabled)&select=key,value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     const map = {};
@@ -190,7 +195,7 @@ async function setConfigValue(token, key, value) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.${key}`, {
     method: "PATCH",
     headers: {
-      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ value }),
@@ -200,7 +205,7 @@ async function setConfigValue(token, key, value) {
 async function getProcessedDomains(token) {
   const res = await fetch(
     `${SUPABASE_URL}/rest/v1/toolbar_import_queue?select=domain&expires_at=gt.${encodeURIComponent(new Date().toISOString())}`,
-    { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+    { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
   );
   const rows = await res.json();
   return new Set(rows.map(r => r.domain));
@@ -211,7 +216,7 @@ async function markProcessed(token, domains) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_import_queue`, {
     method: "POST",
     headers: {
-      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
       "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
     },
     body: JSON.stringify(domains.map(d => ({ domain: d, imported_by: "AUTO", expires_at: expiresAt }))),
@@ -222,7 +227,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
     headers: {
-      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
       "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
     },
     body: JSON.stringify({
@@ -253,7 +258,7 @@ async function getUserAutopilotCountToday(token, userEmail) {
     const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}&created_at=gte.${todayISO}T00:00:00Z&select=id`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
     );
     const cr = res.headers.get("content-range") || "";
     const m = cr.match(/\/(\d+)$/);
@@ -270,7 +275,7 @@ async function loadAutopilotFeedback(token, userEmail) {
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.disliked&select=domain,category,geo&limit=1000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return { dislikedCategories, dislikedGeos, dislikedDomains };
     const rows = await res.json();
@@ -287,7 +292,7 @@ async function getApolloUsageToday(token) {
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_daily_limit)&select=key,value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     const map  = {};
@@ -310,7 +315,7 @@ async function saveApolloUsage(token, callsThisSession, today) {
     // Leer valor actual primero (otra sesión pudo haber corrido en paralelo)
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date)&select=key,value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     const map  = {};
@@ -330,7 +335,7 @@ async function getRejectionPatterns(token) {
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=category,geo&status=eq.rejected&order=created_at.desc&limit=150`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     if (!Array.isArray(rows)) return { categories: {}, geos: {} };
@@ -817,7 +822,7 @@ async function getUserCsvDoneToday(token, userEmail) {
     const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_by=eq.${encodeURIComponent(userEmail)}&processed_at=gte.${todayISO}T00:00:00Z&select=id`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
     );
     const contentRange = res.headers.get("content-range") || "";
     const match = contentRange.match(/\/(\d+)$/);
@@ -835,7 +840,7 @@ async function getNextCsvItem(token, blockedUsers = new Set()) {
     }
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}&order=uploaded_at.asc&limit=1&select=id,domain,uploaded_by`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     if (!Array.isArray(rows) || rows.length === 0) return null;
@@ -847,7 +852,7 @@ async function getNextCsvItem(token, blockedUsers = new Set()) {
       {
         method: "PATCH",
         headers: {
-          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
           "Content-Type": "application/json", "Prefer": "return=representation",
         },
         body: JSON.stringify({ status: "processing" }),
@@ -863,7 +868,7 @@ async function revertCsvItemToPending(token, id) {
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${id}`, {
       method: "PATCH",
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ status: "pending" }),
     });
   } catch {}
@@ -901,7 +906,7 @@ async function markCsvItem(token, id, status, fields = {}) {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${id}`, {
       method: "PATCH",
       headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}`,
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ status, processed_at: new Date().toISOString(), ...fields }),
