@@ -178,51 +178,49 @@ export async function getTraffic(domain) {
   // Caché primero (60 días)
   const cached = await getTrafficCache(cleanDomain);
   if (cached) {
-    // Si el caché no tiene geo, intentar el endpoint /countries una vez; si tampoco, TLD
+    // Si el caché no tiene geo, inferir por TLD (sin gastar API)
     if (!cached.topCountries?.length) {
-      const fresh = await fetchTopCountries(cleanDomain);
-      if (fresh.length) {
-        cached.topCountries = fresh;
-      } else {
-        const inferred = inferCountryFromTLD(cleanDomain);
-        if (inferred) {
-          cached.topCountries = [{ code: inferred, name: CODE_TO_NAME[inferred] || inferred, share: 0, source: "tld" }];
-        }
+      const inferred = inferCountryFromTLD(cleanDomain);
+      if (inferred) {
+        cached.topCountries = [{ code: inferred, name: CODE_TO_NAME[inferred] || inferred, share: 0, source: "tld" }];
+        await saveTrafficCache(cleanDomain, cached);
       }
-      if (cached.topCountries?.length) await saveTrafficCache(cleanDomain, cached);
     }
     return cached;
   }
 
   try {
-    // ── Primario: /traffic — tiene Visits + PagePerVisit (engagement metrics) ──
-    const response = await rapidFetch(`/traffic?domain=${encodeURIComponent(cleanDomain)}`);
+    // ── Primario: /all-insights — devuelve TODO en una sola call ──
+    // (Visits, Engagement, TopCountries, Category, GlobalRank, etc.)
+    // Mucho más eficiente que /traffic + /countries + /engagement por separado
+    // (esos paths NO EXISTEN en este vendor de RapidAPI — devolvían 404).
+    let response = await rapidFetch(`/all-insights?domain=${encodeURIComponent(cleanDomain)}`);
+
+    // Fallback: si /all-insights falla (plan no lo cubre / 404), intentar /traffic
+    let usedFallback = false;
+    if (!response.ok) {
+      console.log(`[Traffic] /all-insights ${cleanDomain} HTTP ${response.status}, fallback /traffic`);
+      response = await rapidFetch(`/traffic?domain=${encodeURIComponent(cleanDomain)}`);
+      usedFallback = true;
+    }
 
     if (response.ok) {
       const data = response.data || {};
       if (!data.error && data.Visits) {
         const visits    = Math.round(data.Visits || 0);
         let pagesPerVisit  = extractPPV(data);
-        let ppvSource      = pagesPerVisit ? "traffic" : null;
-        if (!pagesPerVisit) {
-          console.log(`[Traffic] /traffic ${cleanDomain} sin PPV — keys: ${Object.keys(data).join(",")}`);
+        let ppvSource      = pagesPerVisit ? "all-insights" : null;
+        if (!pagesPerVisit && !usedFallback) {
+          console.log(`[Traffic] /all-insights ${cleanDomain} sin PPV — keys: ${Object.keys(data).join(",")}`);
         }
 
-        // Fallback 1: endpoint /engagement (suele tener metrics que /traffic omite)
-        if (!pagesPerVisit) {
-          const engagementPPV = await fetchEngagement(cleanDomain);
-          if (engagementPPV) { pagesPerVisit = engagementPPV; ppvSource = "engagement"; }
-        }
-
-        // Top countries — desde respuesta principal o endpoint separado
+        // Top countries — el response de /all-insights ya las incluye
         let topCountries = [];
         const inlineCountries = data.TopCountries || data.Countries || data.countries;
         if (Array.isArray(inlineCountries) && inlineCountries.length) {
           topCountries = inlineCountries.slice(0, 3).map(normalizeCountry).filter(Boolean);
-        } else {
-          topCountries = await fetchTopCountries(cleanDomain);
         }
-        // Fallback TLD: si /traffic ni /countries devolvieron país, inferir del dominio
+        // Fallback TLD: si todavía no hay país, inferir del dominio
         if (topCountries.length === 0) {
           const inferred = inferCountryFromTLD(cleanDomain);
           if (inferred) {

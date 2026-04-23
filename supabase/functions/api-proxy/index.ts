@@ -48,7 +48,7 @@ const PROVIDERS = {
     authMode: "header-rapidapi",
     keyEnv: "RAPIDAPI_KEY",
     hostHeader: "similarweb-insights.p.rapidapi.com",
-    allow: /^\/(traffic|engagement|countries|similar|category|description|keywords|general|website-analysis)\b/,
+    allow: /^\/(all-insights|traffic|ai-traffic|rank|seo|website-details|similar-sites|country-metadata|engagement|countries|similar|category|description|keywords|general|website-analysis)\b/,
   },
   anthropic: {
     base: "https://api.anthropic.com",
