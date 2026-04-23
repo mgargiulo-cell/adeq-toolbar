@@ -3143,7 +3143,7 @@ async function initAutopilot() {
   const currentLbl  = document.getElementById("autopilot-target-current");
   if (!btn) return;
 
-  const [{ enabled, heartbeatAt, sessionUser }, target] = await Promise.all([
+  const [{ enabled, heartbeatAt, sessionUser, sessionStart }, target] = await Promise.all([
     getAutopilotState(state.accessToken),
     getAutopilotTarget(state.accessToken),
   ]);
@@ -3169,12 +3169,27 @@ async function initAutopilot() {
     renderRailwayHeartbeat(st.heartbeatAt);
   }, 15_000);
 
-  // HARD RULE: autopilot must ALWAYS start OFF when the toolbar opens.
-  // If the DB has it on (stuck session or another tab), force-disable it now.
-  setAutopilotUI(btn, false);
-  if (enabled) {
-    await setAutopilotEnabled(false, state.accessToken);
-    console.log("[Autopilot] Forced OFF on panel open — user must re-enable manually");
+  // RULE: keep autopilot ON across side-panel reopens IF this user owns the
+  // active session and it hasn't exceeded its 60-min window. Force OFF only
+  // when the session expired or belongs to a different user.
+  const sessionAgeMs = (sessionStart instanceof Date)
+    ? Date.now() - sessionStart.getTime()
+    : Infinity;
+  const meSession = enabled && sessionUser
+    && sessionUser.toLowerCase() === (state.loginEmail || "").toLowerCase()
+    && sessionAgeMs < AUTOPILOT_DURATION_MS;
+
+  if (meSession) {
+    setAutopilotUI(btn, true);
+    const remaining = Math.max(0, AUTOPILOT_DURATION_MS - sessionAgeMs);
+    if (remaining > 0) startAutopilotCountdown(btn, remaining);
+  } else {
+    setAutopilotUI(btn, false);
+    if (enabled) {
+      // session expired or someone else's — flip OFF in DB
+      await setAutopilotEnabled(false, state.accessToken);
+      console.log("[Autopilot] Forced OFF on panel open — session expired or owned by another user");
+    }
   }
 
   updateTargetLabel(target, targetBtn, currentLbl);
