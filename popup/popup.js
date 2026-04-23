@@ -775,15 +775,25 @@ async function runPageContext() {
       func: () => {
         const langFull = (document.documentElement.lang || navigator.language || "").toLowerCase();
         const text = document.body?.innerText?.slice(0, 50_000) || "";
-        // Phone country codes seen in page text (e.g. "+54 11", "+52 55")
+        // Phone country codes (e.g. "+54 11", "+52 55")
         const phoneMatches = text.match(/\+\s?(\d{1,3})[\s\-(]/g) || [];
         const phoneCodes = [...new Set(phoneMatches.map(p => (p.match(/\d+/) || [""])[0]))].slice(0, 5);
-        // Currency hints — both symbol/code mentions
+        // Currency hints
         const currencyRx = /\b(ARS|MXN|COP|CLP|PEN|UYU|BRL|EUR|GBP|USD|JPY|CNY|INR|RUB|TRY|AED|SAR|EGP)\b|US\$|R\$|CHF|€|£|¥/gi;
-        const curMatches = (text.match(currencyRx) || []).map(s => s.toUpperCase());
-        const currencies = [...new Set(curMatches)].slice(0, 5);
-        // Address country hints (last-line country names — quick scan)
+        const currencies = [...new Set((text.match(currencyRx) || []).map(s => s.toUpperCase()))].slice(0, 5);
         const ogLocale = document.querySelector('meta[property="og:locale"]')?.content || "";
+
+        // Footer scan: address-aware country detection
+        // Footer suele tener "Buenos Aires, Argentina" / "México, CDMX" / "Av X 123, Lima, Perú"
+        const footerEls = document.querySelectorAll("footer, .footer, #footer, [class*='footer'], address");
+        let footerText = "";
+        for (const el of footerEls) {
+          footerText += (el.innerText || el.textContent || "") + "\n";
+          if (footerText.length > 5000) break;
+        }
+        // Si no hay footer, usar últimos 3000 chars del body (suelen tener address)
+        if (footerText.length < 100) footerText = text.slice(-3000);
+
         return {
           title:    document.title || "",
           lang:     langFull.substring(0, 2),
@@ -791,6 +801,7 @@ async function runPageContext() {
           ogLocale: ogLocale.toLowerCase(),
           phoneCodes,
           currencies,
+          footerText: footerText.slice(0, 5000),
           description: document.querySelector('meta[name="description"]')?.content
                     || document.querySelector('meta[property="og:description"]')?.content
                     || "",
@@ -804,6 +815,7 @@ async function runPageContext() {
     state.siteOgLocale    = result?.ogLocale || "";
     state.sitePhoneCodes  = result?.phoneCodes || [];
     state.siteCurrencies  = result?.currencies || [];
+    state.siteFooterText  = result?.footerText || "";
   } catch { /* sin permisos en esa página */ }
 }
 
@@ -852,6 +864,38 @@ function inferCountryFromPageSignals() {
   // 4. Currency
   for (const cur of (state.siteCurrencies || [])) {
     if (CURRENCY_TO_CC[cur]) return { code: CURRENCY_TO_CC[cur], source: "currency" };
+  }
+  // 5. Footer / address scan — busca menciones de país (Argentina, México, España, etc.)
+  //    Match más fuerte si está al final del texto (típico de address en footer).
+  const FOOTER_NAME_TO_CC = {
+    "argentina":"AR","méxico":"MX","mexico":"MX","colombia":"CO","chile":"CL","perú":"PE","peru":"PE",
+    "uruguay":"UY","paraguay":"PY","bolivia":"BO","ecuador":"EC","venezuela":"VE","brasil":"BR","brazil":"BR",
+    "españa":"ES","spain":"ES","estados unidos":"US","united states":"US","reino unido":"GB","united kingdom":"GB",
+    "francia":"FR","france":"FR","alemania":"DE","germany":"DE","italia":"IT","italy":"IT","portugal":"PT",
+    "países bajos":"NL","holanda":"NL","netherlands":"NL","bélgica":"BE","belgium":"BE","suiza":"CH","switzerland":"CH",
+    "austria":"AT","polonia":"PL","poland":"PL","hungría":"HU","hungary":"HU","república checa":"CZ","czech":"CZ",
+    "rumanía":"RO","romania":"RO","grecia":"GR","greece":"GR","irlanda":"IE","ireland":"IE","luxemburgo":"LU","luxembourg":"LU",
+    "suecia":"SE","sweden":"SE","noruega":"NO","norway":"NO","dinamarca":"DK","denmark":"DK","finlandia":"FI","finland":"FI",
+    "turquía":"TR","turkey":"TR","israel":"IL","emiratos árabes":"AE","uae":"AE","arabia saudita":"SA","saudi arabia":"SA",
+    "marruecos":"MA","morocco":"MA","egipto":"EG","egypt":"EG","india":"IN","japón":"JP","japan":"JP",
+    "corea del sur":"KR","south korea":"KR","china":"CN","singapur":"SG","singapore":"SG","filipinas":"PH","philippines":"PH",
+    "indonesia":"ID","vietnam":"VN","tailandia":"TH","thailand":"TH","sudáfrica":"ZA","south africa":"ZA","nigeria":"NG",
+    "australia":"AU","nueva zelanda":"NZ","new zealand":"NZ","canadá":"CA","canada":"CA",
+    "costa rica":"CR","panamá":"PA","panama":"PA","guatemala":"GT","honduras":"HN","el salvador":"SV","nicaragua":"NI",
+    "cuba":"CU","puerto rico":"PR","república dominicana":"DO",
+  };
+  const footerLower = (state.siteFooterText || "").toLowerCase();
+  if (footerLower) {
+    // Busca el match más al final del texto (más confiable — típicamente la address está al final)
+    let bestMatch = null;
+    let bestPos = -1;
+    for (const [name, code] of Object.entries(FOOTER_NAME_TO_CC)) {
+      // Word boundary: precedido por coma, espacio, salto de línea o inicio
+      const rx = new RegExp(`(?:^|[,\\s.\\n])${name.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}(?:[,.\\s\\n]|$)`, "i");
+      const idx = footerLower.search(rx);
+      if (idx > bestPos) { bestPos = idx; bestMatch = code; }
+    }
+    if (bestMatch) return { code: bestMatch, source: "footer-address" };
   }
   return null;
 }
@@ -1598,12 +1642,24 @@ async function bindButtons() {
     if (email && !isValidEmail(email)) {
       res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return;
     }
-    // Guard: no dejar pushear a Monday si todavía no se mandó el email
-    // (si es duplicado que ya existía, sí permitimos update sin mail nuevo)
+    // Guard #1: GEO obligatorio — Monday no debe recibir items sin país
+    if (!geo) {
+      res.textContent = "❌ GEO obligatorio. Completá el campo GEO antes de enviar a Monday.";
+      res.className = "push-result error";
+      document.getElementById("form-geo")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    // Guard #2: Páginas Vistas obligatorio — bloqueamos si traffic === 0
+    const traffic = state.traffic || state.visits || 0;
+    if (!traffic || traffic === 0) {
+      res.textContent = "❌ Páginas Vistas obligatorio. SimilarWeb no devolvió datos — completá manualmente o re-analizá.";
+      res.className = "push-result error";
+      return;
+    }
+    // Guard #3: no dejar pushear a Monday si todavía no se mandó el email
     if (!state.emailSentInSession && !state.duplicate?.found) {
       const msg = "❌ You need to send the email first via Gmail. Click 'Send Gmail' before pushing to Monday.";
       res.textContent = msg; res.className = "push-result error";
-      // Scroll al botón Gmail para guiar al usuario
       document.getElementById("btn-send-gmail")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
@@ -3916,7 +3972,12 @@ async function validateProspect(card, data, doSendEmail) {
     }
   }
   if (!geo) {
-    setResult("❌ GEO is required — please set it before pushing.", false);
+    setResult("❌ GEO obligatorio. Completá el campo GEO antes de enviar a Monday.", false);
+    return;
+  }
+  // Páginas Vistas obligatorio (Monday no debe recibir items con 0 visitas)
+  if (!data.traffic || data.traffic === 0) {
+    setResult("❌ Páginas Vistas obligatorio. SimilarWeb no devolvió datos — re-prospectá o completá manual.", false);
     return;
   }
 
