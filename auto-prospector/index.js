@@ -23,6 +23,7 @@ const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 const SESSION_LIMIT_MS  = 60 * 60 * 1000; // 1 hora max por sesión de autopilot
 const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
+const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
 const DOMAIN_DELAY_MS  = 2500;
 const MIN_TRAFFIC      = 400_000;
 
@@ -960,7 +961,9 @@ function shuffleArray(arr) {
 
 // ── CSV Queue — bulk refresh de Monday ────────────────────────
 
-const CSV_DAILY_LIMIT_PER_USER = 75;
+// Sin límite diario por user (antes 75). El costo real lo controla
+// Apollo (limit propio) + idle-exit del proceso Railway.
+const CSV_DAILY_LIMIT_PER_USER = Infinity;
 
 // Cuenta cuántos items terminó (done) un usuario específico hoy
 async function getUserCsvDoneToday(token, userEmail) {
@@ -1201,11 +1204,11 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
   let processed       = 0;
 
-  log(`▶ CSV queue start (apollo usados hoy: ${apolloUsage.usedToday}/${apolloUsage.limit}, límite diario por user: ${CSV_DAILY_LIMIT_PER_USER})`);
+  log(`▶ CSV queue start (apollo usados hoy: ${apolloUsage.usedToday}/${apolloUsage.limit})`);
 
   while (processed < maxItems) {
     const item = await getNextCsvItem(token, blockedUsers);
-    if (!item) { log("  (cola vacía o todos los users alcanzaron su límite diario)"); break; }
+    if (!item) { log("  (cola vacía)"); break; }
 
     const userEmail = item.uploaded_by?.toLowerCase() || "";
 
@@ -1214,16 +1217,16 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     const inBatch     = userCounts.get(userEmail) || 0;
     const userTotal   = alreadyDone + inBatch;
 
-    if (userTotal >= CSV_DAILY_LIMIT_PER_USER) {
+    if (Number.isFinite(CSV_DAILY_LIMIT_PER_USER) && userTotal >= CSV_DAILY_LIMIT_PER_USER) {
       log(`  ⏸ ${userEmail} alcanzó ${userTotal}/${CSV_DAILY_LIMIT_PER_USER} hoy — se reanuda mañana`);
       blockedUsers.add(userEmail);
-      await revertCsvItemToPending(token, item.id); // deja el item para mañana
+      await revertCsvItemToPending(token, item.id);
       continue;
     }
 
     processed++;
     userCounts.set(userEmail, inBatch + 1);
-    log(`→ [${processed}/${maxItems}] ${item.domain} (${userEmail}: ${userTotal + 1}/${CSV_DAILY_LIMIT_PER_USER})`);
+    log(`→ [${processed}/${maxItems}] ${item.domain} (${userEmail})`);
 
     try {
       await processCsvItem(token, item, cfg, apolloUsage, callsRef);
@@ -1663,6 +1666,8 @@ async function main() {
     }
   }
 
+  let idleSince = Date.now();
+
   while (true) {
     try {
       if (Date.now() > tokenExpiry) {
@@ -1683,9 +1688,15 @@ async function main() {
       // Poll liviano — lee autopilot + csv_queue flags
       const flags = await getActiveFlags(token);
       if (!flags.autopilot && !flags.csvQueue) {
+        // Auto-exit si llevamos > IDLE_EXIT_MS sin trabajo (Railway corta billing)
+        if (Date.now() - idleSince >= IDLE_EXIT_MS) {
+          log(`💤 Idle ${Math.round(IDLE_EXIT_MS / 60000)} min — exiting. Railway re-arranca cuando se prenda autopilot/csv desde el toolbar.`);
+          process.exit(0);
+        }
         await sleep(IDLE_INTERVAL_MS);
         continue;
       }
+      idleSince = Date.now(); // hay trabajo → reset contador idle
 
       // CSV queue — procesar primero si está activa y hay items
       // (NO es mutuamente exclusivo con el autopilot; si CSV no tiene items, sigue a autopilot)
