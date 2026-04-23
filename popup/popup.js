@@ -284,18 +284,23 @@ document.addEventListener("DOMContentLoaded", async () => {
 // AUTO-FILL FORMULARIO MONDAY
 // ============================================================
 // Códigos de país de SimilarWeb → texto del select #form-geo
+// Los nombres están en CASTELLANO con primera letra mayúscula porque ese es
+// el formato que tiene la columna GEO del board de Monday. Si Monday cambia
+// (ej. agregan Honduras, Costa Rica), agregar acá también.
 const GEO_LABEL = {
-  US:"United States",GB:"United Kingdom",AR:"Argentina",MX:"Mexico",CO:"Colombia",
-  CL:"Chile",ES:"Spain",BR:"Brazil",FR:"France",DE:"Germany",IT:"Italy",
-  PT:"Portugal",NL:"Netherlands",BE:"Belgium",CH:"Switzerland",AT:"Austria",
-  PL:"Poland",HU:"Hungary",CZ:"Czech Republic",RO:"Romania",GR:"Greece",
-  TR:"Turkey",IL:"Israel",AE:"UAE",SA:"Saudi Arabia",
-  MA:"Morocco",EG:"Egypt",IN:"India",JP:"Japan",KR:"South Korea",
-  AU:"Australia",CA:"Canada",SE:"Sweden",NO:"Norway",DK:"Denmark",
-  FI:"Finland",VN:"Vietnam",TH:"Thailand",ID:"Indonesia",PH:"Philippines",
-  CN:"China",SG:"Singapore",ZA:"South Africa",NG:"Nigeria",PE:"Peru",
-  EC:"Ecuador",VE:"Venezuela",BO:"Bolivia",PY:"Paraguay",UY:"Uruguay",
-  RU:"Russia",UA:"Ukraine",
+  US:"Estados Unidos", GB:"Reino Unido", AR:"Argentina", MX:"México", CO:"Colombia",
+  CL:"Chile", ES:"España", BR:"Brasil", FR:"Francia", DE:"Alemania", IT:"Italia",
+  PT:"Portugal", NL:"Países Bajos", BE:"Bélgica", CH:"Suiza", AT:"Austria",
+  PL:"Polonia", HU:"Hungría", CZ:"República Checa", RO:"Rumanía", GR:"Grecia",
+  TR:"Turquía", IL:"Israel", AE:"Emiratos Árabes Unidos", SA:"Arabia Saudita",
+  MA:"Marruecos", EG:"Egipto", IN:"India", JP:"Japón", KR:"Corea del Sur",
+  AU:"Australia", CA:"Canadá", SE:"Suecia", NO:"Noruega", DK:"Dinamarca",
+  FI:"Finlandia", VN:"Vietnam", TH:"Tailandia", ID:"Indonesia", PH:"Filipinas",
+  CN:"China", SG:"Singapur", ZA:"Sudáfrica", NG:"Nigeria", PE:"Perú",
+  EC:"Ecuador", VE:"Venezuela", BO:"Bolivia", PY:"Paraguay", UY:"Uruguay",
+  RU:"Rusia", UA:"Ucrania", IE:"Irlanda", LU:"Luxemburgo", DO:"República Dominicana",
+  CR:"Costa Rica", PA:"Panamá", GT:"Guatemala", HN:"Honduras", SV:"El Salvador",
+  NI:"Nicaragua", CU:"Cuba", PR:"Puerto Rico", NZ:"Nueva Zelanda",
 };
 
 // 2-letter language code → #form-idioma value (matches Monday column indexes)
