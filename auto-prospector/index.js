@@ -311,7 +311,7 @@ async function bumpStat(token, userEmail, reason, n = 1) {
   } catch {} // best-effort, never block the loop
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
     headers: {
@@ -332,7 +332,9 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
       score:          score          || 0,
       ad_networks:    adNetworks     || [],
       page_title:     pageTitle      || "",
-      created_by:     createdBy      || "",    // user que inició el autopilot
+      created_by:     createdBy      || "",
+      source,                                   // "autopilot" | "csv" | "monday_refresh"
+      monday_item_id: mondayItemId,             // si source="monday_refresh" el push hace UPDATE en vez de CREATE
       status:         "pending",
     }),
   });
@@ -1112,43 +1114,44 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const { rapidapi_key, apollo_api_key } = cfg;
   const domain = item.domain;
 
-  // Usar la Monday API key del usuario que subió el CSV (sus acciones se registran como él)
+  // Buscar en Monday para detectar si es CSV externo (no existe) o Monday Refresh (sí existe + Ciclo Finalizado)
   const mondayApiKey = getMondayKeyForUser(cfg, item.uploaded_by);
-  if (!mondayApiKey) {
-    await markCsvItem(token, item.id, "error", { error_message: "No Monday API key for user " + (item.uploaded_by || "unknown") });
-    log(`  ❌ ${domain} — sin API key para ${item.uploaded_by}`);
-    return;
+  let match = null;
+  let source = "csv"; // default: URL externa, no está en Monday todavía
+  let mondayItemId = null;
+
+  if (mondayApiKey) {
+    match = await findMondayItem(domain, mondayApiKey);
+    if (match) {
+      // Existe en Monday — solo procesar si está en Ciclo Finalizado
+      if (match.estado !== "Ciclo Finalizado") {
+        await markCsvItem(token, item.id, "skipped", {
+          error_message: `estado=${match.estado || "?"} (solo Ciclo Finalizado se re-prospecta)`,
+          monday_item_id: match.id,
+        });
+        log(`  ⏭ ${domain} — ya está en Monday con estado "${match.estado}"`);
+        return;
+      }
+      source = "monday_refresh";
+      mondayItemId = match.id;
+    }
   }
 
-  // 1. Buscar item en Monday y validar estado
-  const match = await findMondayItem(domain, mondayApiKey);
-  if (!match) {
-    await markCsvItem(token, item.id, "skipped", { error_message: "not in Monday" });
-    log(`  ⏭ ${domain} — no está en Monday`);
-    return;
-  }
-
-  // Solo procesar items cuyo Estado actual es "Ciclo Finalizado"
-  if (match.estado !== "Ciclo Finalizado") {
-    await markCsvItem(token, item.id, "skipped", { error_message: `estado=${match.estado || "?"} (solo Ciclo Finalizado)`, monday_item_id: match.id });
-    log(`  ⏭ ${domain} — estado "${match.estado}" (no es Ciclo Finalizado)`);
-    return;
-  }
-
-  // 2. Traffic + page content en paralelo
+  // 1. Traffic + page content en paralelo
   const [trafficData, pageContent] = await Promise.all([
     getTrafficData(domain, rapidapi_key),
     fetchPageContent(domain),
   ]);
   let { visits, topCountry } = trafficData;
-
-  // Fallback GEO: si SimilarWeb no trajo topCountry, inferir desde TLD
   if (!topCountry) {
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
   }
+  const category = pageContent?.category || "";
+  const adNetworks = pageContent?.adNetworks || [];
+  const pageTitle = pageContent?.title || "";
 
-  // 3. Emails — Apollo si visits >= 500K, scraping siempre como fallback
+  // 2. Emails — Apollo si visits >= 500K, scraping siempre como fallback
   const canUseApollo = apollo_api_key
     && visits >= 500_000
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit;
@@ -1160,31 +1163,33 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     scrapeEmailsForDomain(domain),
   ]);
   const emails = [...new Set([...apolloEmails, ...scraperEmails])];
-  const primaryEmail = emails[0] || "";
 
-  // 4. Update Monday: traffic + geo + email + fecha + ejecutivo + estado
-  const columnValues = {};
-  if (visits)       columnValues["texto7"] = formatVisitsForMonday(visits);              // Paginas Vistas formateado (K/M)
-  if (topCountry)   columnValues["texto6"] = topCountry;                                  // Top Geo
-  if (primaryEmail) columnValues["email_mm2edcd3"] = { email: primaryEmail, text: primaryEmail };
-
-  // Fecha Contacto = hoy
-  columnValues["deal_close_date"] = { date: new Date().toISOString().split("T")[0] };
-
-  // Ejecutivo = usuario que subió el CSV (persona column con user ID)
-  const userId = MONDAY_USER_IDS[item.uploaded_by?.toLowerCase()];
-  if (userId) columnValues["deal_owner"] = { personsAndTeams: [{ id: userId, kind: "person" }] };
-
-  // Estado = "Propuesta Vigente (T)" (index 4)
-  columnValues["deal_stage"] = { index: 4 };
-
+  // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
+  //    decida email + draft + push manualmente desde el tab Prospects.
   try {
-    await updateMondayItem(match.id, columnValues, mondayApiKey);
-    await markCsvItem(token, item.id, "done", { monday_item_id: match.id });
+    await saveToReviewQueue(token, {
+      domain,
+      traffic:        visits || 0,
+      geo:            topCountry || "",
+      language:       "",
+      category,
+      contactName:    "",
+      emails,
+      pitch:          "",
+      pitchSubject:   "",
+      pitchSubjects:  [],
+      score:          0,
+      adNetworks,
+      pageTitle,
+      createdBy:      item.uploaded_by || "",
+      source,
+      mondayItemId,
+    });
+    await markCsvItem(token, item.id, "done", { monday_item_id: mondayItemId });
     const vstr = visits ? formatVisitsForMonday(visits) : "-";
-    log(`  ✅ ${domain} — visits:${vstr} geo:${topCountry || "-"} email:${primaryEmail ? "yes" : "no"} apollo:${canUseApollo ? "yes" : "no"} → Propuesta Vigente (T)`);
+    log(`  ✅ ${domain} → review_queue (source:${source}, visits:${vstr}, geo:${topCountry || "-"}, ${emails.length} email(s))`);
   } catch (e) {
-    await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500), monday_item_id: match.id });
+    await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500), monday_item_id: mondayItemId });
     log(`  ❌ ${domain} — ${e.message}`);
   }
 }

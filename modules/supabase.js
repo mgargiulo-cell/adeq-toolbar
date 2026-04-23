@@ -345,10 +345,10 @@ export async function setAutopilotTarget(geo, category, minTraffic, accessToken)
 }
 
 // ── Review Queue — candidatos del auto-prospector para validación ─────
-export async function fetchReviewQueue(accessToken, { dateFilter = "" } = {}) {
+export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFilter = "" } = {}) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const cols = "id,domain,traffic,geo,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at";
+  const cols = "id,domain,traffic,geo,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id";
   // Date filter: "" | "today" | "yesterday" | "last7" | "last30"
   let dateClause = "";
   if (dateFilter) {
@@ -367,9 +367,10 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "" } = {}) {
       dateClause = `&created_at=gte.${tzDay(d30)}T00:00:00`;
     }
   }
+  const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}&order=score.desc,created_at.desc&limit=100&select=${cols}`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}&order=score.desc,created_at.desc&limit=100&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];

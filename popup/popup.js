@@ -3476,12 +3476,13 @@ async function loadProspectsTab() {
 
   listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
 
-  const dateFilter = document.getElementById("prospects-date-filter")?.value || "";
+  const dateFilter   = document.getElementById("prospects-date-filter")?.value   || "";
+  const sourceFilter = document.getElementById("prospects-source-filter")?.value || "";
   let rows = [];
   let dailyCount = 0;
   try {
     [rows, dailyCount, _cachedProspectDrafts] = await Promise.all([
-      fetchReviewQueue(state.accessToken, { dateFilter }),
+      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter }),
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
     ]);
@@ -3573,12 +3574,22 @@ function renderProspectCard(r) {
     : "";
 
   return `
-  <div class="pcard" data-id="${r.id}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;margin:0 8px 8px;overflow:hidden">
+  <div class="pcard" data-id="${r.id}" data-source="${esc(r.source || 'autopilot')}" data-monday-id="${r.monday_item_id || ''}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;margin:0 8px 8px;overflow:hidden">
 
     <!-- Summary row -->
     <div style="display:flex;align-items:center;gap:6px;padding:8px 10px">
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:center;gap:5px">
+          ${(() => {
+            const src = r.source || "autopilot";
+            const badges = {
+              autopilot:      ["🤖", "Auto",    "#6366f1"],
+              csv:            ["📥", "CSV",     "#0ea5e9"],
+              monday_refresh: ["🔄", "Refresh", "#f59e0b"],
+            };
+            const [icon, label, color] = badges[src] || badges.autopilot;
+            return `<span title="Origen: ${label}" style="font-size:9px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 5px;flex-shrink:0">${icon} ${label}</span>`;
+          })()}
           <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
              style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
             ${esc(r.domain)} ↗
@@ -3914,8 +3925,10 @@ async function validateProspect(card, data, doSendEmail) {
   setResult("⏳ Processing...", true);
 
   try {
-    // 1. Push to Monday
-    await pushToMonday({
+    // 1. Push to Monday — UPDATE si vino de Monday Refresh (tiene monday_item_id),
+    //    CREATE si es Autopilot/CSV externo (item nuevo)
+    const mondayItemId = data.monday_item_id || null;
+    const mondayPayload = {
       domain:    data.domain,
       traffic,
       email:     doSendEmail ? email : "",
@@ -3926,7 +3939,12 @@ async function validateProspect(card, data, doSendEmail) {
       idioma,
       fecha:     new Date().toISOString().split("T")[0],
       loginEmail: state.loginEmail,
-    });
+    };
+    if (mondayItemId) {
+      await updateMonday({ ...mondayPayload, itemId: mondayItemId });
+    } else {
+      await pushToMonday(mondayPayload);
+    }
 
     // 2. Send email (if requested and email available)
     if (doSendEmail && email) {
@@ -3988,6 +4006,9 @@ function initProspectsTab() {
     await loadProspectsTab();
   });
   document.getElementById("prospects-date-filter")?.addEventListener("change", async () => {
+    await loadProspectsTab();
+  });
+  document.getElementById("prospects-source-filter")?.addEventListener("change", async () => {
     await loadProspectsTab();
   });
   document.getElementById("btn-prospects-clear")?.addEventListener("click", async () => {
