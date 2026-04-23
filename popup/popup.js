@@ -314,28 +314,30 @@ function runAutoFill() {
   const dup    = state.duplicate;
   const isNew  = !dup?.found;
 
-  // Condición: nuevo, O duplicado con fecha > 30 días
+  // Condición para llenar campos SENSIBLES (email, idioma): nuevo o dup > 30 días
   let shouldFill = isNew;
   if (!isNew && dup?.fecha) {
     const daysSince = (Date.now() - new Date(dup.fecha).getTime()) / 86_400_000;
     shouldFill = daysSince > 30;
   }
-  if (!shouldFill) return;
 
-  // ── GEO: top país de SimilarWeb ──────────────────────────────
+  // ── GEO siempre se autocompleta si tenemos dato y el campo está vacío ────
+  // (no depende de shouldFill — si cambia el top country después de un mes,
+  //  debería reflejarse en Monday sin forzar que el ítem sea "nuevo")
   let topCountry = state.trafficData?.topCountries?.[0]?.code;
-  // Fallback: leer del chip ya renderizado en UI (cubre datos de caché sin topCountries)
   if (!topCountry) {
     const firstChip = document.querySelector(".country-flag-chip[data-code]");
     if (firstChip) topCountry = firstChip.dataset.code;
   }
   if (topCountry && GEO_LABEL[topCountry]) {
     const geoSel = document.getElementById("form-geo");
-    if (geoSel) {
+    if (geoSel && !geoSel.value) { // solo si el select está vacío — no pisa selección manual del user
       const opt = [...geoSel.options].find(o => o.text === GEO_LABEL[topCountry]);
       if (opt) geoSel.value = opt.value || opt.text;
     }
   }
+
+  if (!shouldFill) return;
 
   // ── IDIOMA: del DOM o TLD ─────────────────────────────────────
   const lang = state.siteLanguage || detectLangFromDomain(state.domain);
@@ -878,10 +880,9 @@ function renderEmailList(emails) {
   const isDup       = state.duplicate?.found;
   const mondayEmail = isDup ? (state.duplicate.email || "").trim() : "";
 
-  // Deduplicate, exclude Monday email from suggestions, cap at 5
+  // Deduplicate, exclude Monday email — show ALL (no cap). UI collapses >7 with "ver más"
   const suggested = [...new Set(emails.map(e => e.trim()).filter(Boolean))]
-    .filter(e => e !== mondayEmail)
-    .slice(0, 5);
+    .filter(e => e !== mondayEmail);
 
   if (!mondayEmail && suggested.length === 0) {
     resultEl.style.display = "block";
@@ -905,15 +906,40 @@ function renderEmailList(emails) {
   }
 
   if (suggested.length > 0) {
-    html += `<div class="email-group-label">${mondayEmail ? "💡 Sugeridas" : "📧 Encontradas"}</div>`;
-    suggested.forEach(email => {
+    const VISIBLE = 7;
+    const hidden  = suggested.length > VISIBLE ? suggested.slice(VISIBLE) : [];
+    const visible = suggested.slice(0, VISIBLE);
+    html += `<div class="email-group-label">${mondayEmail ? "💡 Sugeridas" : "📧 Encontradas"} (${suggested.length})</div>`;
+    visible.forEach(email => {
       const src = state.emailSources.get(email) || "";
-      const badge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
-      html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}${badge}</div>`;
+      const srcBadge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
+      html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}${srcBadge}</div>`;
     });
+    if (hidden.length > 0) {
+      html += `<div class="email-chips-hidden" style="display:none">`;
+      hidden.forEach(email => {
+        const src = state.emailSources.get(email) || "";
+        const srcBadge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
+        html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}${srcBadge}</div>`;
+      });
+      html += `</div>`;
+      html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:var(--adeq-blue);cursor:pointer;padding:4px 0;text-decoration:underline">+ ver ${hidden.length} más…</button>`;
+    }
   }
 
   listEl.innerHTML = html;
+
+  // Toggle "ver más"
+  const showMoreBtn = listEl.querySelector(".email-show-more");
+  if (showMoreBtn) {
+    showMoreBtn.addEventListener("click", () => {
+      const hiddenBlock = listEl.querySelector(".email-chips-hidden");
+      if (hiddenBlock) {
+        hiddenBlock.style.display = "block";
+        showMoreBtn.style.display = "none";
+      }
+    });
+  }
 
   // Seleccionar el primero por defecto
   const firstChip = listEl.querySelector(".email-chip");

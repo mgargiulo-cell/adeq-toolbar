@@ -78,16 +78,39 @@ async function fetchTopCountries(domain) {
   }
 }
 
+// Acepta cualquiera de las variantes que SimilarWeb-Insights ha usado en
+// distintas versiones del endpoint para la misma métrica.
+function extractPPV(data) {
+  if (!data || typeof data !== "object") return null;
+  const candidates = [
+    data.PagePerVisit, data.PagesPerVisit, data.pagesPerVisit, data.pages_per_visit,
+    data.PageViewsPerVisit, data.AvgPagesPerVisit, data.avg_pages_per_visit,
+    data.Engagement?.PagePerVisit, data.Engagement?.PagesPerVisit,
+    data.engagement?.pagesPerVisit, data.engagement?.pages_per_visit,
+    data.engagements?.pagesPerVisit,
+    // Algunos planes anidan todo dentro de "data" o "result"
+    data.data?.PagePerVisit, data.data?.PagesPerVisit,
+    data.result?.PagePerVisit, data.result?.PagesPerVisit,
+  ];
+  for (const v of candidates) {
+    if (v != null && v !== "") {
+      const n = parseFloat(v);
+      if (!isNaN(n) && n > 0) return n;
+    }
+  }
+  return null;
+}
+
 // ── fetchEngagement — endpoint secundario para PagePerVisit ───
-// Muchas cuentas tienen engagement metrics en /engagement aunque no en /traffic
 async function fetchEngagement(domain) {
   try {
     const res = await rapidFetch(`/engagement?domain=${encodeURIComponent(domain)}`);
     if (!res.ok) return null;
-    const data = res.data || {};
-    const ppv = data.PagePerVisit || data.PagesPerVisit || data.pagesPerVisit || data.pages_per_visit || null;
-    if (!ppv) return null;
-    return parseFloat(ppv);
+    const ppv = extractPPV(res.data);
+    if (!ppv) {
+      console.log(`[Traffic] /engagement ${domain} sin PPV — keys: ${Object.keys(res.data || {}).join(",")}`);
+    }
+    return ppv;
   } catch { return null; }
 }
 
@@ -145,8 +168,11 @@ export async function getTraffic(domain) {
       const data = response.data || {};
       if (!data.error && data.Visits) {
         const visits    = Math.round(data.Visits || 0);
-        let pagesPerVisit  = data.PagePerVisit || data.PagesPerVisit || null;
+        let pagesPerVisit  = extractPPV(data);
         let ppvSource      = pagesPerVisit ? "traffic" : null;
+        if (!pagesPerVisit) {
+          console.log(`[Traffic] /traffic ${cleanDomain} sin PPV — keys: ${Object.keys(data).join(",")}`);
+        }
 
         // Fallback 1: endpoint /engagement (suele tener metrics que /traffic omite)
         if (!pagesPerVisit) {
