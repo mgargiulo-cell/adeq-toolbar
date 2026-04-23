@@ -3335,6 +3335,16 @@ async function initAutopilot() {
       setAutopilotUI(btn, false);
       await setAutopilotEnabled(false, state.accessToken);
     } else {
+      // Mutex: si otro user tiene autopilot activo + heartbeat fresco, bloquear
+      const cur = await getAutopilotState(state.accessToken);
+      if (cur.enabled && cur.sessionUser
+          && cur.sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()
+          && cur.heartbeatAt && (Date.now() - cur.heartbeatAt.getTime()) < 120_000) {
+        const elapsed = cur.sessionStart ? Math.round((Date.now() - cur.sessionStart.getTime()) / 60000) : 0;
+        const remaining = Math.max(0, 60 - elapsed);
+        alert(`⚠️ ${cur.sessionUser} ya tiene Autopilot corriendo (hace ${elapsed} min · termina en ~${remaining} min).\n\nEsperá a que termine o pedile que lo apague antes de prender el tuyo. Si lo prendés ahora, le robás la sesión y los créditos del día.`);
+        return;
+      }
       // Turn on for up to AUTOPILOT_DURATION_MS (default 60 min)
       setAutopilotUI(btn, true);
       await setAutopilotEnabled(true, state.accessToken, state.loginEmail);

@@ -802,19 +802,32 @@ const TLD_BY_REGION = {
 // Heuristic — strips known multi-part TLDs first, then last TLD label, leaving
 // the brand part. Not perfect, but cuts >80% of obvious cross-region duplicates.
 const MULTI_PART_TLDS = new Set([
+  // commercial
   "com.ar","com.br","com.mx","com.co","com.pe","com.uy","com.ec","com.ve","com.bo",
   "com.es","com.au","com.cn","com.tw","com.hk","com.sg","com.my","com.tr","com.eg",
-  "com.sa","com.ng","com.za","com.ph","com.vn","com.pk",
-  "co.uk","co.za","co.in","co.kr","co.jp","co.il",
-  "org.uk","org.ar","org.br","org.mx","gov.uk","ac.uk","ac.in","gov.ar",
+  "com.sa","com.ng","com.za","com.ph","com.vn","com.pk","com.gt","com.do","com.pa",
+  "com.gh","com.ke","com.uy",
+  "co.uk","co.za","co.in","co.kr","co.jp","co.il","co.nz","co.id","co.cr","co.ve",
+  // organization
+  "org.uk","org.ar","org.br","org.mx","org.au","org.za","org.es","org.in","org.pl",
+  // government — todos los .gov.X conocidos
+  "gov.ar","gov.br","gov.mx","gov.co","gov.pe","gov.cl","gov.uy","gov.ec","gov.ve",
+  "gov.bo","gov.au","gov.in","gov.uk","gov.za","gov.eg","gov.sa","gov.ng",
+  // academic
+  "ac.uk","ac.in","ac.za","ac.jp","ac.kr","ac.nz","edu.ar","edu.br","edu.mx",
+  "edu.co","edu.pe","edu.uy","edu.au","edu.in","edu.eg",
+  // network/info per country
+  "net.ar","net.br","net.mx","net.au","net.in",
 ]);
 function coreDomain(domain) {
   if (!domain) return "";
   const parts = domain.toLowerCase().replace(/^www\./, "").split(".");
   if (parts.length <= 2) return parts[0]; // foo.com → "foo"
-  // Last 2 labels — check if it's a multi-part TLD (e.g. "com.ar")
+  // Last 2 labels — check if it's a multi-part TLD (e.g. "com.ar", "gov.co")
   const last2 = parts.slice(-2).join(".");
-  if (MULTI_PART_TLDS.has(last2)) return parts[parts.length - 3]; // x.com.ar → "x"
+  if (MULTI_PART_TLDS.has(last2) && parts.length >= 3) {
+    return parts[parts.length - 3]; // x.gov.co → "x", brand.com.ar → "brand"
+  }
   return parts[parts.length - 2]; // sub.foo.com → "foo"
 }
 
