@@ -1177,7 +1177,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
 }
 
 async function runCsvQueue(token, cfg, maxItems = 100) {
-  const apolloUsage   = await getApolloUsage(token, cfg);
+  const apolloUsage   = await getApolloUsageToday(token);
   const callsRef      = { count: 0 };
   const blockedUsers  = new Set(); // usuarios que alcanzaron el límite diario
   const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
