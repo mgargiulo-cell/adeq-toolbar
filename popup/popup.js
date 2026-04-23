@@ -560,6 +560,36 @@ async function autoDetectPageLanguage() {
   }
 }
 
+// Después de getTraffic, si SimilarWeb no devolvió país, completar con señales de página
+function enrichTrafficWithPageSignals(trafficData) {
+  if (!trafficData) return trafficData;
+  if (trafficData.topCountries?.length > 0) return trafficData; // ya tenemos
+  const inferred = inferCountryFromPageSignals();
+  if (inferred) {
+    const COUNTRY_NAMES = {
+      AR:"Argentina",MX:"Mexico",CO:"Colombia",CL:"Chile",BR:"Brazil",PE:"Peru",
+      UY:"Uruguay",PY:"Paraguay",BO:"Bolivia",EC:"Ecuador",VE:"Venezuela",ES:"Spain",
+      US:"United States",GB:"United Kingdom",CA:"Canada",FR:"France",DE:"Germany",
+      IT:"Italy",PT:"Portugal",NL:"Netherlands",BE:"Belgium",CH:"Switzerland",
+      AT:"Austria",SE:"Sweden",NO:"Norway",DK:"Denmark",FI:"Finland",PL:"Poland",
+      GR:"Greece",HU:"Hungary",CZ:"Czech Republic",RO:"Romania",IE:"Ireland",
+      IL:"Israel",AE:"UAE",SA:"Saudi Arabia",EG:"Egypt",MA:"Morocco",TR:"Turkey",
+      IN:"India",JP:"Japan",KR:"South Korea",CN:"China",SG:"Singapore",MY:"Malaysia",
+      ID:"Indonesia",PH:"Philippines",TH:"Thailand",VN:"Vietnam",AU:"Australia",
+      NZ:"New Zealand",ZA:"South Africa",NG:"Nigeria",RU:"Russia",UA:"Ukraine",
+      HK:"Hong Kong",TW:"Taiwan",PK:"Pakistan",BD:"Bangladesh",
+    };
+    trafficData.topCountries = [{
+      code: inferred.code,
+      name: COUNTRY_NAMES[inferred.code] || inferred.code,
+      share: 0,
+      source: inferred.source, // "lang-region" | "og-locale" | "phone" | "currency"
+    }];
+    console.log(`[GEO] ${state.domain} inferido por ${inferred.source}: ${inferred.code}`);
+  }
+  return trafficData;
+}
+
 async function runTrafficCheck() {
   const metricEl    = document.getElementById("traffic-result");
   const unitEl      = document.getElementById("traffic-unit");
@@ -585,7 +615,7 @@ async function runTrafficCheck() {
     state.traffic       = data.pageViews ?? data.rawVisits ?? 0;
     state.visits        = data.rawVisits || 0;
     state.pagesPerVisit = data.pagesPerVisit || null;
-    state.trafficData   = data;
+    state.trafficData   = enrichTrafficWithPageSignals(data);
     state.category      = data.category || "";
 
     // Auto-set categoría en el selector de pitch
@@ -718,18 +748,88 @@ async function runPageContext() {
   try {
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId: state.tabId },
-      func: () => ({
-        title:    document.title || "",
-        lang:     (document.documentElement.lang || navigator.language || "").toLowerCase().substring(0, 2),
-        description: document.querySelector('meta[name="description"]')?.content
-                  || document.querySelector('meta[property="og:description"]')?.content
-                  || "",
-      }),
+      func: () => {
+        const langFull = (document.documentElement.lang || navigator.language || "").toLowerCase();
+        const text = document.body?.innerText?.slice(0, 50_000) || "";
+        // Phone country codes seen in page text (e.g. "+54 11", "+52 55")
+        const phoneMatches = text.match(/\+\s?(\d{1,3})[\s\-(]/g) || [];
+        const phoneCodes = [...new Set(phoneMatches.map(p => (p.match(/\d+/) || [""])[0]))].slice(0, 5);
+        // Currency hints — both symbol/code mentions
+        const currencyRx = /\b(ARS|MXN|COP|CLP|PEN|UYU|BRL|EUR|GBP|USD|JPY|CNY|INR|RUB|TRY|AED|SAR|EGP)\b|US\$|R\$|CHF|€|£|¥/gi;
+        const curMatches = (text.match(currencyRx) || []).map(s => s.toUpperCase());
+        const currencies = [...new Set(curMatches)].slice(0, 5);
+        // Address country hints (last-line country names — quick scan)
+        const ogLocale = document.querySelector('meta[property="og:locale"]')?.content || "";
+        return {
+          title:    document.title || "",
+          lang:     langFull.substring(0, 2),
+          langFull,
+          ogLocale: ogLocale.toLowerCase(),
+          phoneCodes,
+          currencies,
+          description: document.querySelector('meta[name="description"]')?.content
+                    || document.querySelector('meta[property="og:description"]')?.content
+                    || "",
+        };
+      },
     });
     state.pageTitle       = (result?.title       || "").substring(0, 80);
     state.pageDescription = (result?.description || "").substring(0, 180);
     state.siteLanguage    = result?.lang || "";
+    state.siteLangFull    = result?.langFull || "";
+    state.siteOgLocale    = result?.ogLocale || "";
+    state.sitePhoneCodes  = result?.phoneCodes || [];
+    state.siteCurrencies  = result?.currencies || [];
   } catch { /* sin permisos en esa página */ }
+}
+
+// Heurística multi-señal para inferir país cuando SimilarWeb no devuelve nada.
+// Devuelve { code, name, source } o null. Ranking de señales:
+//   1. lang con región (es-AR, en-GB, pt-BR)  — más fuerte
+//   2. og:locale (es_AR)                       — idem
+//   3. phone country code (+54, +52)          — fuerte
+//   4. currency symbol (ARS, MXN, COP)         — fuerte
+//   5. TLD país-específico (.com.ar, .es)     — medio (ya cubierto en traffic.js)
+function inferCountryFromPageSignals() {
+  const PHONE_TO_CC = {
+    "54":"AR","52":"MX","57":"CO","56":"CL","55":"BR","51":"PE","598":"UY","595":"PY",
+    "591":"BO","593":"EC","58":"VE","34":"ES","1":"US","44":"GB","33":"FR","49":"DE",
+    "39":"IT","351":"PT","31":"NL","32":"BE","41":"CH","43":"AT","48":"PL","30":"GR",
+    "36":"HU","420":"CZ","40":"RO","353":"IE","972":"IL","971":"AE","966":"SA","20":"EG",
+    "212":"MA","90":"TR","91":"IN","81":"JP","82":"KR","86":"CN","65":"SG","60":"MY",
+    "62":"ID","63":"PH","66":"TH","84":"VN","61":"AU","64":"NZ","27":"ZA","234":"NG",
+    "7":"RU","380":"UA",
+  };
+  const CURRENCY_TO_CC = {
+    ARS:"AR", MXN:"MX", COP:"CO", CLP:"CL", PEN:"PE", UYU:"UY", BRL:"BR",
+    "R$":"BR", USD:"US", "US$":"US", GBP:"GB", "£":"GB", JPY:"JP", "¥":"JP",
+    CNY:"CN", INR:"IN", RUB:"RU", TRY:"TR", AED:"AE", SAR:"SA", EGP:"EG",
+    // EUR is ambiguous, skip
+  };
+  const LANG_REGION_TO_CC = {
+    "es-ar":"AR","es-mx":"MX","es-co":"CO","es-cl":"CL","es-pe":"PE","es-uy":"UY",
+    "es-py":"PY","es-bo":"BO","es-ec":"EC","es-ve":"VE","es-es":"ES","es-419":"AR",
+    "pt-br":"BR","pt-pt":"PT","en-us":"US","en-gb":"GB","en-au":"AU","en-ca":"CA",
+    "en-nz":"NZ","en-za":"ZA","fr-fr":"FR","fr-ca":"CA","de-de":"DE","de-at":"AT",
+    "de-ch":"CH","it-it":"IT","nl-nl":"NL","nl-be":"BE","pl-pl":"PL","ru-ru":"RU",
+    "tr-tr":"TR","ja-jp":"JP","ko-kr":"KR","zh-cn":"CN","zh-hk":"HK","zh-tw":"TW",
+    "ar-sa":"SA","ar-eg":"EG","ar-ae":"AE",
+  };
+  // 1. lang con región
+  const lf = (state.siteLangFull || "").replace("_","-").toLowerCase();
+  if (LANG_REGION_TO_CC[lf]) return { code: LANG_REGION_TO_CC[lf], source: "lang-region" };
+  // 2. og:locale (mismo formato típicamente)
+  const og = (state.siteOgLocale || "").replace("_","-").toLowerCase();
+  if (LANG_REGION_TO_CC[og]) return { code: LANG_REGION_TO_CC[og], source: "og-locale" };
+  // 3. Phone country code
+  for (const code of (state.sitePhoneCodes || [])) {
+    if (PHONE_TO_CC[code]) return { code: PHONE_TO_CC[code], source: "phone" };
+  }
+  // 4. Currency
+  for (const cur of (state.siteCurrencies || [])) {
+    if (CURRENCY_TO_CC[cur]) return { code: CURRENCY_TO_CC[cur], source: "currency" };
+  }
+  return null;
 }
 
 async function runEmailScraper() {
