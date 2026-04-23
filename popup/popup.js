@@ -218,6 +218,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // mediaBuyer is derived from auth login — do NOT override from legacy storage key
   prefillMondayForm();
   initTabs();
+  initHistoryModal();
   bindButtons();
   initPitchDrafts(); // used by Prospects cards + Analysis — cheap, keep eager
   bindCustomPromptHandlers();
@@ -420,6 +421,28 @@ function fillMondayFormFromDuplicate(dup) {
 // ============================================================
 // TABS
 // ============================================================
+function initHistoryModal() {
+  const openBtn  = document.getElementById("btn-history-open");
+  const closeBtn = document.getElementById("btn-history-close");
+  const modal    = document.getElementById("history-modal");
+  if (!openBtn || !modal) return;
+
+  openBtn.addEventListener("click", async () => {
+    modal.style.display = "flex";
+    const listEl = document.getElementById("history-list");
+    if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading history...</div>';
+    try { await loadHistoryTab(); }
+    catch (e) {
+      console.error("[History]", e);
+      if (listEl) listEl.innerHTML = '<div class="cascade-empty">Error loading history.</div>';
+    }
+  });
+  closeBtn?.addEventListener("click", () => { modal.style.display = "none"; });
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) modal.style.display = "none"; // click on backdrop closes
+  });
+}
+
 function initTabs() {
   const loadedTabs = new Set(["core"]); // core loads eagerly with the page
 
@@ -436,11 +459,7 @@ function initTabs() {
       if (!loadedTabs.has(tabId)) {
         loadedTabs.add(tabId);
         try {
-          if (tabId === "history") {
-            const listEl = document.getElementById("history-list");
-            if (listEl) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading history...</div>';
-            await loadHistoryTab();
-          } else if (tabId === "cascade") {
+          if (tabId === "cascade") {
             await initKeywords();
           } else if (tabId === "prospects") {
             await initProspectsTab();
@@ -899,8 +918,8 @@ async function runEmailScraper() {
     await chrome.storage.local.set({ [statsKey]: hs });
   }
 
-  // Solo refrescar el historial si el tab está visible (evita trabajo innecesario)
-  if (document.getElementById("tab-history")?.classList.contains("active")) {
+  // Solo refrescar si el modal de historial está abierto
+  if (document.getElementById("history-modal")?.style.display === "flex") {
     await loadHistoryTab();
   }
 }

@@ -36,6 +36,7 @@
   <div class="header-right">
     <div id="site-url" class="site-url">loading...</div>
     <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab" aria-label="Re-analyze current tab">↻</button>
+    <button id="btn-history-open" class="icon-btn" title="History" aria-label="Open history">🕐</button>
     <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
   </div>
 </header>
@@ -168,7 +169,6 @@
 <nav class="tabs">
   <button class="tab-btn active" data-tab="core">🔍 Analysis</button>
   <button class="tab-btn" data-tab="cascade">🌊 Cascade</button>
-  <button class="tab-btn" data-tab="history">🕐 History</button>
   <button class="tab-btn" data-tab="prospects">🤖 Prospects</button>
   <button class="tab-btn" data-tab="import">📥 Import</button>
 </nav>
@@ -621,18 +621,21 @@
 </div>
 
 <!-- ====================================================
-     TAB: HISTORY
+     HISTORY MODAL (popup desde botón 🕐 del header)
      ==================================================== -->
-<div id="tab-history" class="tab-content">
-  <section class="card card-tight">
-    <div class="history-header">
-      <div class="card-title" style="margin:0"><span class="icon">🕐</span> History</div>
-      <button id="btn-clear-history" class="btn-link-sm">Clear</button>
+<div id="history-modal" class="modal" style="display:none">
+  <div class="modal-content" style="max-width:520px;max-height:80vh;overflow-y:auto">
+    <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+      <span>🕐 History</span>
+      <div style="display:flex;gap:6px">
+        <button id="btn-clear-history" class="btn btn-secondary btn-sm" style="font-size:11px">Clear</button>
+        <button id="btn-history-close" class="icon-btn" aria-label="Close" title="Close" style="font-size:14px">✕</button>
+      </div>
     </div>
     <div id="history-stats" class="history-stats"></div>
-  </section>
-  <div id="history-list" class="history-list">
-    <div class="cascade-empty">No sites analyzed yet.</div>
+    <div id="history-list" class="history-list">
+      <div class="cascade-empty">No sites analyzed yet.</div>
+    </div>
   </div>
 </div>
 
