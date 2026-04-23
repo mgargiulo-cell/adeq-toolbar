@@ -63,6 +63,35 @@ function normalizeCountry(c) {
   return { code, name, share };
 }
 
+// TLD → ISO alpha-2 (último recurso cuando SimilarWeb no devuelve país)
+const TLD_TO_ALPHA2 = {
+  ar:"AR", mx:"MX", co:"CO", cl:"CL", br:"BR", pe:"PE", ec:"EC", ve:"VE", uy:"UY",
+  py:"PY", bo:"BO", es:"ES", us:"US", ca:"CA", uk:"GB", fr:"FR", de:"DE", it:"IT",
+  pt:"PT", nl:"NL", be:"BE", ch:"CH", at:"AT", se:"SE", no:"NO", dk:"DK", fi:"FI",
+  pl:"PL", gr:"GR", hu:"HU", cz:"CZ", ro:"RO", ie:"IE", lu:"LU", il:"IL", ae:"AE",
+  sa:"SA", eg:"EG", ma:"MA", tr:"TR", in:"IN", jp:"JP", kr:"KR", cn:"CN", sg:"SG",
+  my:"MY", id:"ID", ph:"PH", th:"TH", vn:"VN", au:"AU", nz:"NZ", za:"ZA", ng:"NG",
+  ru:"RU", ua:"UA", tw:"TW", hk:"HK", pk:"PK", bd:"BD",
+};
+
+function inferCountryFromTLD(domain) {
+  if (!domain) return null;
+  const d = domain.toLowerCase();
+  // Check 2-part TLDs first (.com.ar, .co.uk, etc.)
+  const parts = d.split(".");
+  if (parts.length >= 3) {
+    const last2 = parts.slice(-2).join(".");
+    const map2 = { "com.ar":"AR","com.mx":"MX","com.br":"BR","com.co":"CO","com.pe":"PE",
+                   "com.uy":"UY","com.ec":"EC","com.ve":"VE","com.bo":"BO","com.es":"ES",
+                   "co.uk":"GB","org.uk":"GB","ac.uk":"GB","co.za":"ZA","com.au":"AU",
+                   "com.cn":"CN","co.in":"IN","co.jp":"JP","co.kr":"KR","com.tr":"TR",
+                   "com.eg":"EG","com.sa":"SA","com.ng":"NG","com.ph":"PH","com.vn":"VN" };
+    if (map2[last2]) return map2[last2];
+  }
+  const tld = parts[parts.length - 1];
+  return TLD_TO_ALPHA2[tld] || null;
+}
+
 // ── fetchTopCountries — endpoint separado ─────────────────────
 async function fetchTopCountries(domain) {
   try {
@@ -149,13 +178,18 @@ export async function getTraffic(domain) {
   // Caché primero (60 días)
   const cached = await getTrafficCache(cleanDomain);
   if (cached) {
-    // Si el caché no tiene geo, intentar el endpoint /countries una vez y rellenar
+    // Si el caché no tiene geo, intentar el endpoint /countries una vez; si tampoco, TLD
     if (!cached.topCountries?.length) {
       const fresh = await fetchTopCountries(cleanDomain);
       if (fresh.length) {
         cached.topCountries = fresh;
-        await saveTrafficCache(cleanDomain, cached);
+      } else {
+        const inferred = inferCountryFromTLD(cleanDomain);
+        if (inferred) {
+          cached.topCountries = [{ code: inferred, name: CODE_TO_NAME[inferred] || inferred, share: 0, source: "tld" }];
+        }
       }
+      if (cached.topCountries?.length) await saveTrafficCache(cleanDomain, cached);
     }
     return cached;
   }
@@ -184,13 +218,17 @@ export async function getTraffic(domain) {
         let topCountries = [];
         const inlineCountries = data.TopCountries || data.Countries || data.countries;
         if (Array.isArray(inlineCountries) && inlineCountries.length) {
-          topCountries = inlineCountries.slice(0, 3).map(c => ({
-            code:  (c.CountryCode || c.Country || "").toUpperCase().slice(0, 2),
-            name:  c.CountryName || c.CountryCode || "",
-            share: parseFloat(c.CountryShare || c.Share || 0),
-          })).filter(c => c.code.length === 2);
+          topCountries = inlineCountries.slice(0, 3).map(normalizeCountry).filter(Boolean);
         } else {
           topCountries = await fetchTopCountries(cleanDomain);
+        }
+        // Fallback TLD: si /traffic ni /countries devolvieron país, inferir del dominio
+        if (topCountries.length === 0) {
+          const inferred = inferCountryFromTLD(cleanDomain);
+          if (inferred) {
+            topCountries = [{ code: inferred, name: CODE_TO_NAME[inferred] || inferred, share: 0, source: "tld" }];
+            console.log(`[Traffic] ${cleanDomain} GEO inferido por TLD: ${inferred}`);
+          }
         }
 
         const category = data.Category || "";
