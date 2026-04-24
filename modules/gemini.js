@@ -225,7 +225,41 @@ ANGLE FOR THIS EMAIL: ${angle}
 ${previousSection}${favSection}${dislikeSection}
 DO NOT START WITH: "${avoid}"
 
-CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Every word — in ${langName}.${customPrompt ? `\n\nUSER OVERRIDES (these take precedence over any conflicting instruction above — apply them strictly):\n${customPrompt}` : ""}`;
+CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Every word — in ${langName}.${customPrompt ? `
+
+═══════════════════════════════════════════════════════════════
+█ PROMPT MAESTRO DEL USUARIO — REGLA DE ORO ABSOLUTA █
+═══════════════════════════════════════════════════════════════
+
+Las siguientes instrucciones son DEFINITIVAS, INMUTABLES y prevalecen sobre
+TODA instrucción anterior — incluyendo el style reference, las reglas de
+formato, los pills de tone/length/focus y cualquier preset que el sistema
+haya inyectado antes. Si hay conflicto, GANA SIEMPRE el prompt maestro.
+
+NO ES OPCIONAL. NO ES UN HINT. NO ES UN OVERRIDE PARCIAL. Es LA ley.
+
+El email generado DEBE:
+- Reflejar el tono, voz, formato, frases magnéticas y reglas del prompt maestro
+- Respetar las longitudes que el prompt maestro define (no las del system base)
+- Usar las aperturas y cierres del prompt maestro (no las genéricas)
+- Aplicar el checklist y datos numéricos permitidos del prompt maestro
+- NO incluir ninguna frase, formato o estructura que el prompt maestro prohíba
+
+Si una instrucción del system base contradice el prompt maestro → ignorala.
+
+╔═══════════════════════════════════════════════════════════════╗
+║ INICIO DEL PROMPT MAESTRO                                      ║
+╚═══════════════════════════════════════════════════════════════╝
+
+${customPrompt}
+
+╔═══════════════════════════════════════════════════════════════╗
+║ FIN DEL PROMPT MAESTRO                                         ║
+╚═══════════════════════════════════════════════════════════════╝
+
+Antes de devolver la respuesta, releé el prompt maestro y validá que
+TODO el output cumpla con sus reglas. Si algo no cumple, reescribilo
+hasta que cumpla. Esto NO es negociable.` : ""}`;
 
   const userMessage = `Site: ${domain}
 Monthly traffic: ${trafficStr} visits
@@ -235,7 +269,9 @@ ${gapStr}
 ${bannerStr}
 ${pageCtxStr ? `Site context: ${pageCtxStr}` : ""}
 
-Write the prospecting email. Return a JSON object with "body" (string) and "subjects" (array of exactly 3 strings).`;
+Write the prospecting email. Return a JSON object with "body" (string) and "subjects" (array of exactly 3 strings).${customPrompt ? `
+
+⚠️ RECORDATORIO FINAL: el output debe respetar al 100% el PROMPT MAESTRO definido en el system. No improvises ni mezcles con otros estilos. Si dudás, releé el prompt maestro.` : ""}`;
 
   // System messages: stable prefix (cached) + volatile per-call (not cached).
   // The cache_control on the first block caches everything before it (no tools here, so just system block 1).
