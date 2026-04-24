@@ -83,7 +83,6 @@ const EXCLUDE_DOMAINS = new Set([
 
 // Detecta dominios de universidades e institutos académicos
 function isUniversityDomain(domain) {
-  // TLDs académicos
   if (domain.endsWith(".edu")) return true;
   if (domain.endsWith(".ac.uk"))  return true;
   if (domain.endsWith(".edu.au")) return true;
@@ -94,17 +93,63 @@ function isUniversityDomain(domain) {
   if (domain.endsWith(".edu.co")) return true;
   if (domain.endsWith(".ac.nz"))  return true;
   if (domain.endsWith(".ac.za"))  return true;
-  // Palabras clave en el dominio
-  const kw = /\b(university|universidad|universidade|universit[aey]|uni[-.]|college|instituto[-.]tecnol|polytechnic|akademi|hochschule|facultad)\b/i;
+  if (domain.endsWith(".sch.uk")) return true;
+  if (domain.endsWith(".edu.es")) return true;
+  if (domain.endsWith(".edu.it")) return true;
+  if (domain.endsWith(".unimi.it")) return true;
+  const kw = /\b(university|universidad|universidade|universit[aey]|uni[-.]|college|instituto[-.]tecnol|polytechnic|akademi|hochschule|facultad|school|escuela|colegio)\b/i;
   return kw.test(domain);
+}
+
+// Patrones de palabra clave para descartar verticales que NO son publishers.
+// Aplica al nombre del dominio antes del primer punto. Más liviano que mantener
+// listas exhaustivas — si un dominio matchea alguno de estos, no es prospect ADEQ.
+const EXCLUDE_KEYWORDS = [
+  // Adulto / porno
+  "porn","xxx","sex","adult","cam","escort","fetish","hentai","onlyfans","pornhub","xvideos","xnxx","redtube",
+  "youporn","brazzers","chaturbate","stripchat","camsoda","myfreecams","livejasmin","bongacams",
+  // Gobierno / instituciones
+  "gov","gob","government","municipalidad","ayuntamiento","ministerio","ministry","parliament","congreso",
+  // Bancos grandes / fintech enterprise
+  "bank","banco","banca","banking","santander","bbva","caixabank","sabadell","unicredit","intesasanpaolo",
+  // Seguros enterprise
+  "insurance","seguros","mapfre","allianz","axa","zurich","prudential",
+  // Pharma enterprise
+  "pharma","pfizer","novartis","roche","merck","sanofi","gsk","astrazeneca",
+  // Telco enterprise
+  "telecom","telefonica","movistar","orange","vodafone","telmex","claro","mts",
+  // Energía enterprise
+  "petroleum","petrobras","exxon","chevron","totalenergies","shell","bp-",
+  // Aerolineas enterprise
+  "airlines","aerolineas","iberia","lufthansa","ryanair","emirates","qatarairways","americanairlines",
+  // Search / ad networks que se cuelan
+  "doubleclick","adservice","adsystem","adnxs","criteo","outbrain","taboola",
+  // Hosting / CDN
+  "cloudflare","cloudfront","fastly","akamai","jsdelivr","unpkg","cdn",
+  // Marketplace gigantes locales
+  "olx","craigslist","mercadolivre","gumtree","letgo","wallapop","jiji",
+  // Apuestas/gambling enterprise (legales pero gigantes)
+  "bet365","williamhill","ladbrokes","betfair","draftkings","fanduel","pokerstars",
+];
+
+const EXCLUDE_KEYWORD_RE = new RegExp(`\\b(${EXCLUDE_KEYWORDS.join("|")})\\b`, "i");
+
+function matchesExcludeKeyword(domain) {
+  // Solo chequea el nombre antes del primer punto + sufijos relevantes
+  return EXCLUDE_KEYWORD_RE.test(domain);
 }
 
 function isDomainAllowed(domain) {
   if (!domain || !domain.includes(".")) return false;
   if (EXCLUDE_DOMAINS.has(domain)) return false;
   if (isUniversityDomain(domain)) return false;
+  if (matchesExcludeKeyword(domain)) return false;
   return true;
 }
+
+// Cap superior de tráfico — sitios con > 40M visits/mes son demasiado grandes
+// para que ADEQ pueda venderles. El SDR perdió tiempo persiguiéndolos.
+const MAX_TRAFFIC_FOR_PROSPECT = 40_000_000;
 
 // Pool global — se carga una vez al iniciar el proceso
 let domainPool = null;
@@ -169,10 +214,18 @@ async function loadRadarPoolForCountries(countryCodes) {
 
   for (const cc of countryCodes) {
     try {
-      const url = `https://api.cloudflare.com/client/v4/radar/ranking/top?location=${encodeURIComponent(cc)}&limit=${LIMIT}`;
+      // Cloudflare Radar /ranking/top devuelve TOP 100 por país (max).
+      // Antes pedíamos limit=1000 → HTTP 400. También faltaba name=top.
+      // Token requiere scope "Radar:Read" en Cloudflare dashboard.
+      const url = `https://api.cloudflare.com/client/v4/radar/ranking/top?name=top&location=${encodeURIComponent(cc)}&limit=100`;
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
       if (!res.ok) {
-        log(`  ⚠️ Radar ${cc}: HTTP ${res.status} — saltado`);
+        let detail = "";
+        try {
+          const errBody = await res.json();
+          detail = errBody?.errors?.[0]?.message || JSON.stringify(errBody?.errors || errBody).substring(0, 120);
+        } catch {}
+        log(`  ⚠️ Radar ${cc}: HTTP ${res.status}${detail ? " — " + detail : ""}`);
         continue;
       }
       const data = await res.json();
@@ -280,6 +333,7 @@ const PERMANENT_REASONS = new Set([
   "government",         // .gov/.edu — won't change
   "blocklist",          // static exclude list (google.com, etc.) — won't change
   "rejected_by_user",   // user clicked ❌ Reject in Prospects
+  "traffic_too_high",   // > 40M visits/mes — too big for ADEQ, won't change quickly
 ]);
 // Other reasons (traffic_low, page_unreachable, api_error) → 60-day TTL, re-evaluate eventually
 
@@ -1533,6 +1587,14 @@ async function runSession(token, cfg, sessionStart) {
     if (visits < sessionMinTraffic) {
       log(`  ✗ Tráfico (${Math.round(visits/1000)}K) < ${(sessionMinTraffic/1000)}K — descartado`);
       await markProcessed(token, [domain], "traffic_low");
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
+    // Cap superior — sitios mega-grandes no son target ADEQ
+    if (visits > MAX_TRAFFIC_FOR_PROSPECT) {
+      log(`  ✗ Tráfico (${Math.round(visits/1_000_000)}M) > ${MAX_TRAFFIC_FOR_PROSPECT/1_000_000}M cap — too big for ADEQ`);
+      await markProcessed(token, [domain], "traffic_too_high");
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);
       continue;
