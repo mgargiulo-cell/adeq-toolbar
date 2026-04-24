@@ -37,6 +37,7 @@
     <div id="site-url" class="site-url">loading...</div>
     <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab" aria-label="Re-analyze current tab">↻</button>
     <button id="btn-history-open" class="icon-btn" title="History" aria-label="Open history">🕐</button>
+    <button id="btn-pitch-draft" class="icon-btn" title="Borradores de pitch" aria-label="Open drafts">📝</button>
     <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
   </div>
 </header>
@@ -378,11 +379,19 @@
         </div>
       </div>
 
-      <textarea id="pitch-text" class="pitch-textarea" placeholder="Click Generate to create the pitch..."></textarea>
+      <div style="position:relative">
+        <textarea id="pitch-text" class="pitch-textarea" placeholder="Borrador del idioma de la GEO se autocarga acá..."></textarea>
+        <div style="position:absolute; top:6px; right:6px; display:flex; gap:4px; align-items:center">
+          <button id="btn-pitch-flag" type="button" title="Click para rotar entre templates del mismo idioma" style="position:relative; background:rgba(255,255,255,0.92); border:1px solid var(--border); border-radius:6px; padding:3px 6px; cursor:pointer; font-size:14px; line-height:1; box-shadow:0 1px 2px rgba(0,0,0,0.06)">
+            <span id="pitch-flag-emoji">🌐</span>
+            <span id="pitch-flag-badge" style="position:absolute; top:-6px; right:-6px; background:#0ea5e9; color:#fff; font-size:9px; font-weight:700; padding:1px 4px; border-radius:8px; min-width:14px; text-align:center; display:none"></span>
+          </button>
+          <button id="btn-pitch-clear" type="button" title="Limpiar pitch" style="background:rgba(255,255,255,0.92); border:1px solid var(--border); border-radius:6px; padding:3px 6px; cursor:pointer; font-size:13px; line-height:1; box-shadow:0 1px 2px rgba(0,0,0,0.06)">🗑️</button>
+        </div>
+      </div>
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
         <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
-        <button id="btn-pitch-draft" class="btn btn-secondary btn-sm" title="Seleccionar un borrador guardado">📋 Draft</button>
         <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Save as style example">👍</button>
         <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Gemini will avoid it">👎</button>
         <span id="pitch-like-status" class="pitch-like-status"></span>
@@ -1027,19 +1036,26 @@
       <div style="font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:.4px; margin-bottom:6px">
         <span id="drafts-form-mode">New draft</span>
       </div>
-      <input id="draft-name" type="text" class="form-input" placeholder="Draft name (e.g.: Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
+      <input id="draft-name" type="text" class="form-input" placeholder="Nombre del borrador (ej: Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
       <div style="display:flex; gap:6px; margin-bottom:6px">
         <select id="draft-language" class="form-select" style="flex:1; font-size:12px">
-          <option value="es">Spanish</option>
-          <option value="en">English</option>
-          <option value="pt">Português</option>
-          <option value="it">Italian</option>
-          <option value="fr">Français</option>
-          <option value="de">Deutsch</option>
-          <option value="ar">العربية</option>
+          <option value="es">🇪🇸 Spanish</option>
+          <option value="en">🇬🇧 English</option>
+          <option value="pt">🇵🇹 Português</option>
+          <option value="it">🇮🇹 Italian</option>
+          <option value="fr">🇫🇷 Français</option>
+          <option value="de">🇩🇪 Deutsch</option>
+          <option value="ar">🇸🇦 العربية</option>
         </select>
-        <input id="draft-subject" type="text" class="form-input" placeholder="Subject (optional)" style="flex:2; font-size:12px" />
+        <select id="draft-priority" class="form-select" style="width:90px; font-size:12px" title="1 = se autocarga; 2-5 rotan con click en bandera">
+          <option value="1">⭐ 1</option>
+          <option value="2">⭐ 2</option>
+          <option value="3" selected>⭐ 3</option>
+          <option value="4">⭐ 4</option>
+          <option value="5">⭐ 5</option>
+        </select>
       </div>
+      <input id="draft-subject" type="text" class="form-input" placeholder="Asunto del email (opcional)" style="margin-bottom:6px; font-size:12px" />
       <textarea id="draft-body" class="form-input" placeholder="Email body... Use {{domain}} as placeholder." style="width:100%; min-height:120px; font-size:12px; font-family:inherit"></textarea>
 
       <div style="display:flex; gap:6px; margin-top:8px">

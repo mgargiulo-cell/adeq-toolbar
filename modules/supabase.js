@@ -969,7 +969,7 @@ export async function getPitchDrafts(accessToken, userEmail, language = null) {
   const userFilter = `user_email=in.(${encodeURIComponent(userEmail)},_default_)`;
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_pitch_drafts?${userFilter}${langFilter}&order=is_default.desc,updated_at.desc&select=id,user_email,name,language,subject,body,is_default,updated_at`,
+      `${url}/rest/v1/toolbar_pitch_drafts?${userFilter}${langFilter}&order=priority.asc,is_default.desc,updated_at.desc&select=id,user_email,name,language,subject,body,is_default,priority,updated_at`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -977,10 +977,11 @@ export async function getPitchDrafts(accessToken, userEmail, language = null) {
   } catch (e) { console.warn("getPitchDrafts:", e.message); return []; }
 }
 
-export async function savePitchDraft(accessToken, { id, user_email, name, language, subject, body }) {
+export async function savePitchDraft(accessToken, { id, user_email, name, language, subject, body, priority }) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const payload = { user_email, name, language, subject: subject || "", body, updated_at: new Date().toISOString() };
+  const prio = Math.max(1, Math.min(5, parseInt(priority) || 3));
+  const payload = { user_email, name, language, subject: subject || "", body, priority: prio, updated_at: new Date().toISOString() };
   try {
     if (id) {
       const res = await fetch(`${url}/rest/v1/toolbar_pitch_drafts?id=eq.${id}`, {

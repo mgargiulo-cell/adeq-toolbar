@@ -221,6 +221,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   initHistoryModal();
   bindButtons();
   initPitchDrafts(); // used by Prospects cards + Analysis — cheap, keep eager
+  initPitchInlineControls(); // bandera + trash al lado del pitch
   bindCustomPromptHandlers();
   // Load per-user Claude custom prompt into state (no-op if empty). Used by generatePitch.
   getCustomPrompt(auth.accessToken, auth.user).then(p => { state.customPrompt = p || ""; }).catch(() => {});
@@ -248,6 +249,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     runPageContext()    .catch(e => console.error("[PageCtx]",    e)),
   ]).then(async () => {
     runAutoFill();
+    // Autocarga del borrador del idioma de la GEO (priority asc).
+    // Se hace AFTER runAutoFill para que form-geo ya esté seteado.
+    autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill]", e));
     // Guardar en caché de sesión los datos costosos (evita créditos en subpáginas)
     setSessionCache(state.domain, {
       duplicate:   state.duplicate,
@@ -3177,6 +3181,148 @@ async function initCsvQueue() {
 const AUTOPILOT_DURATION_MS = 60 * 60 * 1000; // 1 hora max de sesión autopilot
 let _autopilotTimer = null;
 
+// ── Pitch Drafts: cache + helpers ─────────────────────────────
+// Cache de drafts del user (toda la lista, ordenada por priority asc).
+// Se rellena en la primera apertura del modal o en el primer auto-fill.
+const _draftsState = {
+  all: [],            // todos los drafts del user + defaults
+  byLang: new Map(),  // language -> drafts[] (ordenados priority asc)
+  flagIdxByLang: new Map(), // language -> índice actual del rotator
+  loaded: false,
+  currentLang: "",
+};
+
+const LANG_FLAG = { es:"🇪🇸", en:"🇬🇧", pt:"🇵🇹", it:"🇮🇹", fr:"🇫🇷", de:"🇩🇪", ar:"🇸🇦" };
+// GEO (alpha-2) → idioma del template
+const GEO_TO_LANG = {
+  AR:"es", MX:"es", CO:"es", CL:"es", PE:"es", UY:"es", PY:"es", BO:"es",
+  EC:"es", VE:"es", DO:"es", CR:"es", PA:"es", GT:"es", HN:"es", SV:"es",
+  NI:"es", CU:"es", PR:"es", ES:"es",
+  US:"en", GB:"en", CA:"en", AU:"en", NZ:"en", IE:"en", IN:"en", ZA:"en", SG:"en",
+  BR:"pt", PT:"pt",
+  IT:"it", CH:"it",
+  FR:"fr", BE:"fr", LU:"fr",
+  DE:"de", AT:"de",
+  AE:"ar", SA:"ar", EG:"ar", MA:"ar",
+};
+
+function _rebuildDraftsByLang() {
+  _draftsState.byLang.clear();
+  for (const d of _draftsState.all) {
+    const lang = d.language || "es";
+    if (!_draftsState.byLang.has(lang)) _draftsState.byLang.set(lang, []);
+    _draftsState.byLang.get(lang).push(d);
+  }
+  // priority asc, defaults primero ante empate
+  for (const arr of _draftsState.byLang.values()) {
+    arr.sort((a, b) => {
+      const pa = a.priority ?? 3, pb = b.priority ?? 3;
+      if (pa !== pb) return pa - pb;
+      return (a.user_email === "_default_" ? -1 : 1) - (b.user_email === "_default_" ? -1 : 1);
+    });
+  }
+}
+
+async function loadDraftsCache(force = false) {
+  if (_draftsState.loaded && !force) return;
+  if (!state.accessToken) return;
+  const drafts = await getPitchDrafts(state.accessToken, state.loginEmail);
+  _draftsState.all = Array.isArray(drafts) ? drafts : [];
+  _rebuildDraftsByLang();
+  _draftsState.loaded = true;
+}
+
+function applyDraftToPitch(d, { silent = false } = {}) {
+  if (!d) return;
+  const domain = state.domain || "example.com";
+  const subject = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
+  const body    = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
+  const pitchEl   = document.getElementById("pitch-text");
+  const subjectEl = document.getElementById("form-subject");
+  if (pitchEl)   pitchEl.value   = body;
+  if (subjectEl && subject) subjectEl.value = subject;
+  if (!silent) pitchEl?.dispatchEvent(new Event("input"));
+}
+
+// Decide qué idioma matchea con la GEO actual del form (o cae en siteLanguage)
+function _resolvePitchLang() {
+  const geoSel = document.getElementById("form-geo");
+  const geoText = (geoSel?.value || "").toLowerCase();
+  // buscar en GEO_LABEL inverso para sacar el code
+  let geoCode = "";
+  for (const [code, label] of Object.entries(GEO_LABEL)) {
+    if (label.toLowerCase() === geoText) { geoCode = code; break; }
+  }
+  const langFromGeo = GEO_TO_LANG[geoCode];
+  return langFromGeo || state.siteLanguage || "en";
+}
+
+function updatePitchFlagButton() {
+  const flagBtn   = document.getElementById("btn-pitch-flag");
+  const flagEmoji = document.getElementById("pitch-flag-emoji");
+  const badge     = document.getElementById("pitch-flag-badge");
+  if (!flagBtn || !flagEmoji || !badge) return;
+  const lang   = _draftsState.currentLang || _resolvePitchLang();
+  const drafts = _draftsState.byLang.get(lang) || [];
+  flagEmoji.textContent = LANG_FLAG[lang] || "🌐";
+  if (drafts.length === 0) {
+    badge.style.display = "none";
+    flagBtn.title = `No hay drafts en ${lang}. Click 📝 en el header para crear uno.`;
+    return;
+  }
+  const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
+  const current = drafts[idx];
+  badge.textContent = current?.name?.substring(0, 6) || `T${idx + 1}`;
+  badge.style.display = "inline-block";
+  flagBtn.title = `Template ${idx + 1}/${drafts.length} (${lang}): "${current?.name || ""}". Click para rotar.`;
+}
+
+// Auto-carga el draft de prioridad 1 (o el primero ordenado) en el pitch al cargar la web.
+// Se invoca después de runAutoFill para tener la GEO ya seteada.
+async function autofillDraftOnLoad() {
+  await loadDraftsCache();
+  const lang   = _resolvePitchLang();
+  _draftsState.currentLang = lang;
+  const drafts = _draftsState.byLang.get(lang) || [];
+  if (drafts.length === 0) {
+    updatePitchFlagButton();
+    return;
+  }
+  _draftsState.flagIdxByLang.set(lang, 0);
+  applyDraftToPitch(drafts[0], { silent: true });
+  updatePitchFlagButton();
+}
+
+function rotatePitchTemplate() {
+  const lang   = _draftsState.currentLang || _resolvePitchLang();
+  const drafts = _draftsState.byLang.get(lang) || [];
+  if (drafts.length === 0) return;
+  const cur  = _draftsState.flagIdxByLang.get(lang) ?? 0;
+  const next = (cur + 1) % drafts.length;
+  _draftsState.flagIdxByLang.set(lang, next);
+  applyDraftToPitch(drafts[next], { silent: true });
+  updatePitchFlagButton();
+}
+
+function initPitchInlineControls() {
+  const flagBtn  = document.getElementById("btn-pitch-flag");
+  const clearBtn = document.getElementById("btn-pitch-clear");
+  const pitchEl  = document.getElementById("pitch-text");
+  flagBtn?.addEventListener("click", rotatePitchTemplate);
+  clearBtn?.addEventListener("click", () => {
+    if (!pitchEl) return;
+    pitchEl.value = "";
+    pitchEl.dispatchEvent(new Event("input"));
+    pitchEl.focus();
+  });
+  // Si cambia la GEO manualmente, recalcular bandera (sin pisar lo que escribió)
+  document.getElementById("form-geo")?.addEventListener("change", () => {
+    _draftsState.currentLang = _resolvePitchLang();
+    _draftsState.flagIdxByLang.set(_draftsState.currentLang, 0);
+    updatePitchFlagButton();
+  });
+}
+
 // ── Pitch Drafts modal ────────────────────────────────────────
 function initPitchDrafts() {
   const openBtn    = document.getElementById("btn-pitch-draft");
@@ -3186,6 +3332,7 @@ function initPitchDrafts() {
   const listEl     = document.getElementById("drafts-list");
   const nameEl     = document.getElementById("draft-name");
   const langEl     = document.getElementById("draft-language");
+  const prioEl     = document.getElementById("draft-priority");
   const subjectEl  = document.getElementById("draft-subject");
   const bodyEl     = document.getElementById("draft-body");
   const saveBtn    = document.getElementById("btn-draft-save");
@@ -3195,14 +3342,15 @@ function initPitchDrafts() {
   const resultEl   = document.getElementById("draft-save-result");
   if (!openBtn || !modal) return;
 
-  let editingId = null; // si estamos editando un draft existente del usuario
+  let editingId = null;
   let lastDrafts = [];
 
   const clearForm = () => {
     editingId = null;
     nameEl.value = ""; subjectEl.value = ""; bodyEl.value = "";
     langEl.value = state.siteLanguage || "es";
-    modeLbl.textContent = "New draft";
+    if (prioEl) prioEl.value = "3";
+    modeLbl.textContent = "Nuevo borrador";
     delBtn.style.display = "none";
     resultEl.textContent = "";
   };
@@ -3210,27 +3358,41 @@ function initPitchDrafts() {
   const renderList = (drafts) => {
     lastDrafts = drafts;
     if (drafts.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">No drafts yet. Create one below.</div>';
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">Sin borradores. Creá el primero abajo.</div>';
       return;
     }
-    listEl.innerHTML = drafts.map(d => {
-      const isDefault = d.user_email === "_default_";
-      const langName  = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", fr:"🇫🇷 FR", de:"🇩🇪 DE", ar:"🇸🇦 AR" }[d.language] || d.language;
-      const tagClass  = isDefault ? "color:#0369a1" : "color:var(--text-muted)";
-      return `
-        <div class="draft-item" data-id="${d.id}" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;cursor:pointer">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-            <strong style="font-size:12px">${esc(d.name)}</strong>
-            <span style="font-size:10px; ${tagClass}">${langName}${isDefault ? " · DEFAULT" : ""}</span>
-          </div>
-          ${d.subject ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${esc(d.subject)}</div>` : ""}
-          <div style="font-size:10px;color:var(--text-muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc((d.body || "").substring(0, 80))}</div>
-          <div style="display:flex;gap:4px;margin-top:6px">
-            <button class="btn btn-primary btn-sm draft-use-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px;flex:1">✅ Usar este</button>
-            ${isDefault ? "" : `<button class="btn btn-secondary btn-sm draft-edit-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px">✏️ Editar</button>`}
-          </div>
-        </div>`;
-    }).join("");
+    // Agrupar por idioma para que se vea más prolijo
+    const groups = new Map();
+    for (const d of drafts) {
+      const k = d.language || "??";
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(d);
+    }
+    const html = [];
+    for (const [lang, items] of groups) {
+      const flag = LANG_FLAG[lang] || "🌐";
+      html.push(`<div style="font-size:10px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin:8px 0 4px">${flag} ${lang.toUpperCase()} · ${items.length} ${items.length === 1 ? "borrador" : "borradores"}</div>`);
+      for (const d of items) {
+        const isDefault = d.user_email === "_default_";
+        const tagClass  = isDefault ? "color:#0369a1" : "color:var(--text-muted)";
+        const prio      = d.priority ?? 3;
+        const stars     = "⭐".repeat(prio);
+        html.push(`
+          <div class="draft-item" data-id="${d.id}" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:var(--bg-soft, #fafafa)">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+              <strong style="font-size:12px">${esc(d.name)}</strong>
+              <span style="font-size:10px; ${tagClass}" title="Prioridad ${prio}">${stars}${isDefault ? " · DEFAULT" : ""}</span>
+            </div>
+            ${d.subject ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${esc(d.subject)}</div>` : ""}
+            <div style="font-size:10px;color:var(--text-muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc((d.body || "").substring(0, 80))}</div>
+            <div style="display:flex;gap:4px;margin-top:6px">
+              <button class="btn btn-primary btn-sm draft-use-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px;flex:1">✅ Usar</button>
+              ${isDefault ? "" : `<button class="btn btn-secondary btn-sm draft-edit-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px">✏️ Editar</button>`}
+            </div>
+          </div>`);
+      }
+    }
+    listEl.innerHTML = html.join("");
 
     listEl.querySelectorAll(".draft-use-btn").forEach(b => b.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -3247,27 +3409,19 @@ function initPitchDrafts() {
       const d  = lastDrafts.find(x => String(x.id) === id);
       if (!d) return;
       editingId = d.id;
-      nameEl.value = d.name; langEl.value = d.language; subjectEl.value = d.subject || ""; bodyEl.value = d.body;
+      nameEl.value = d.name; langEl.value = d.language;
+      if (prioEl) prioEl.value = String(d.priority ?? 3);
+      subjectEl.value = d.subject || ""; bodyEl.value = d.body;
       modeLbl.textContent = `Editando: ${d.name}`;
       delBtn.style.display = "inline-block";
     }));
   };
 
-  const applyDraftToPitch = (d) => {
-    const domain = state.domain || "example.com";
-    const subject = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
-    const body    = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
-    const pitchEl   = document.getElementById("pitch-text");
-    const subjectEl = document.getElementById("form-subject");
-    if (pitchEl)   pitchEl.value   = body;
-    if (subjectEl && subject) subjectEl.value = subject;
-    // Disparar evento para que el autopush/snapshot detecte el cambio
-    pitchEl?.dispatchEvent(new Event("input"));
-  };
-
   const load = async () => {
     const drafts = await getPitchDrafts(state.accessToken, state.loginEmail);
+    _draftsState.all = drafts; _rebuildDraftsByLang(); _draftsState.loaded = true;
     renderList(drafts);
+    updatePitchFlagButton();
   };
 
   const open = () => {
@@ -3288,20 +3442,21 @@ function initPitchDrafts() {
     const body    = bodyEl.value.trim();
     const language = langEl.value;
     const subject  = subjectEl.value.trim();
-    if (!name)    { resultEl.textContent = "❌ Name is required"; resultEl.style.color = "#e53e3e"; return; }
-    if (!body)    { resultEl.textContent = "❌ Email body is required"; resultEl.style.color = "#e53e3e"; return; }
+    const priority = parseInt(prioEl?.value || "3", 10) || 3;
+    if (!name)    { resultEl.textContent = "❌ Falta el nombre"; resultEl.style.color = "#e53e3e"; return; }
+    if (!body)    { resultEl.textContent = "❌ Falta el cuerpo del email"; resultEl.style.color = "#e53e3e"; return; }
 
     saveBtn.disabled = true; saveBtn.textContent = "⏳...";
     const result = await savePitchDraft(state.accessToken, {
-      id: editingId, user_email: state.loginEmail, name, language, subject, body,
+      id: editingId, user_email: state.loginEmail, name, language, subject, body, priority,
     });
-    saveBtn.disabled = false; saveBtn.textContent = "💾 Save";
+    saveBtn.disabled = false; saveBtn.textContent = "💾 Guardar";
 
     if (result.ok) {
-      resultEl.textContent = editingId ? "✅ Updated" : "✅ Saved";
+      resultEl.textContent = editingId ? "✅ Actualizado" : "✅ Guardado";
       resultEl.style.color = "#16a34a";
       editingId = result.data?.id || null;
-      modeLbl.textContent = editingId ? `Editing: ${name}` : "New draft";
+      modeLbl.textContent = editingId ? `Editando: ${name}` : "Nuevo borrador";
       delBtn.style.display = editingId ? "inline-block" : "none";
       await load();
     } else {
@@ -3312,7 +3467,7 @@ function initPitchDrafts() {
 
   delBtn.addEventListener("click", async () => {
     if (!editingId) return;
-    if (!confirm("Delete this draft?")) return;
+    if (!confirm("¿Borrar este borrador?")) return;
     await deletePitchDraft(state.accessToken, editingId);
     clearForm();
     await load();
