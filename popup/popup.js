@@ -4039,7 +4039,26 @@ function updateProspectsDailyBar(count) {
 }
 
 function renderProspectCard(r) {
-  const trafficFmt  = r.traffic ? formatTraffic(r.traffic) : "N/A";
+  const trafficFmt  = r.traffic ? formatTraffic(r.traffic) : "Sin data";
+  // Resolver idioma sincronicamente al render — evita que aparezca "🌐 —"
+  // mientras carga el cache de drafts. Default a EN si no hay matcheo.
+  const _initLang = (() => {
+    const dl = (r.language || "").toLowerCase().split("-")[0];
+    if (LANG_FLAG[dl]) return dl;
+    const geoText = (r.geo || "").trim().toLowerCase();
+    for (const [code, label] of Object.entries(GEO_LABEL)) {
+      if (label.toLowerCase() === geoText) {
+        const lang = GEO_TO_LANG[code];
+        if (LANG_FLAG[lang]) return lang;
+      }
+    }
+    return "en";
+  })();
+  // Pre-render de los 5 chips de banderas — visibles desde el primer paint
+  const _langFlagsHTML = ["es", "en", "it", "pt", "ar"].map(l => {
+    const isActive = l === _initLang;
+    return `<button type="button" class="pitch-lang-flag${isActive ? " active" : ""}" data-lang="${l}" title="${l.toUpperCase()}">${LANG_FLAG[l]}</button>`;
+  }).join("");
   // Filtrar garbage (whois, abuse, postmaster, etc.) y dedupe.
   // Backend ya guarda Apollo primero (apolloEmails antes que scraperEmails),
   // así que el orden del array preserva la prioridad Apollo.
@@ -4213,11 +4232,11 @@ function renderProspectCard(r) {
         <!-- Toolbar idéntica a Analysis: bandera+rotator | chips de idiomas + Limpiar -->
         <div class="pitch-toolbar">
           <button type="button" class="pcard-flag-btn pitch-tool-btn pitch-tool-flag" title="Click para rotar templates del idioma">
-            <span class="pcard-flag-emoji">🌐</span>
-            <span class="pcard-flag-name pitch-tool-name">—</span>
+            <span class="pcard-flag-emoji">${LANG_FLAG[_initLang] || "🇬🇧"}</span>
+            <span class="pcard-flag-name pitch-tool-name">cargando…</span>
           </button>
           <div class="pitch-toolbar-right">
-            <div class="pcard-lang-flags pitch-lang-flags" title="Cambiar idioma del template"></div>
+            <div class="pcard-lang-flags pitch-lang-flags" title="Cambiar idioma del template">${_langFlagsHTML}</div>
             <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
           </div>
         </div>
@@ -4246,7 +4265,7 @@ function renderProspectCard(r) {
         <label class="form-label">Date</label>
         <input type="text" class="form-input pcard-date" value="${toDisplayDate(new Date().toISOString().split("T")[0])}" placeholder="DD/MM/YYYY" maxlength="10" style="font-size:11px;padding:4px 7px" title="Auto-completada con hoy — editable" />
         <label class="form-label">Traffic</label>
-        <div style="font-size:12px;font-weight:600;padding:4px 0">${trafficFmt}</div>
+        <input type="text" class="form-input pcard-traffic" value="${esc(r.traffic ? formatTraffic(r.traffic) : "")}" placeholder="ej: 500K, 1.2M, 3500000" style="font-size:11px;padding:4px 7px" title="Editable — si SimilarWeb no devolvió, completá manualmente. Acepta '500K', '1.2M' o número crudo." />
       </div>
 
       <!-- Action buttons in panel -->
@@ -4687,7 +4706,21 @@ async function validateProspect(card, data, doSendEmail) {
   const idioma    = card.querySelector(".pcard-lang")?.value              || LANG_TO_IDX[data.language] || "0";
   const geo       = card.querySelector(".pcard-geo")?.value?.trim()       || data.geo || "";
   const dateStr   = card.querySelector(".pcard-date")?.value?.trim()      || "";
-  const traffic   = data.traffic ? formatTraffic(data.traffic) : "";
+
+  // Tráfico EDITABLE: leer del input pcard-traffic. Acepta "500K" / "1.2M" / número crudo.
+  const trafficInputRaw = card.querySelector(".pcard-traffic")?.value?.trim() || "";
+  const parseTrafficInput = (s) => {
+    if (!s) return 0;
+    const cleaned = s.toLowerCase().replace(/[\s,.]/g, "").replace(",", "");
+    const m = cleaned.match(/^([\d]+(?:\.[\d]+)?)([km])?$/);
+    if (!m) return 0;
+    const n = parseFloat(m[1]);
+    if (m[2] === "k") return Math.round(n * 1000);
+    if (m[2] === "m") return Math.round(n * 1000000);
+    return Math.round(n);
+  };
+  const trafficNum = parseTrafficInput(trafficInputRaw) || data.traffic || 0;
+  const traffic    = trafficNum ? formatTraffic(trafficNum) : "";
 
   // ── VALIDACIONES OBLIGATORIAS ────────────────────────────────
   // Misma lógica que Analysis (btn-push-monday). Si falta cualquier
@@ -4699,9 +4732,10 @@ async function validateProspect(card, data, doSendEmail) {
     card.querySelector(".pcard-geo")?.focus();
     return;
   }
-  // 2. Tráfico (Páginas Vistas) > 0
-  if (!data.traffic || data.traffic === 0) {
-    setResult("❌ Páginas Vistas obligatorio. SimilarWeb no devolvió data — re-prospectá o editá la card.", false);
+  // 2. Tráfico (Páginas Vistas) > 0 — leído del input editable
+  if (!trafficNum || trafficNum === 0) {
+    setResult("❌ Páginas Vistas obligatorio. Completá el campo Traffic (acepta 500K, 1.2M o número crudo).", false);
+    card.querySelector(".pcard-traffic")?.focus();
     return;
   }
   // 3. Email válido (siempre obligatorio para push, aún si no se manda mail)
