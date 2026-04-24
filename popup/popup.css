@@ -283,6 +283,22 @@ body {
 .email-chip.verify-warn    { border-left: 3px solid #f59e0b; background: #fffbeb; }
 .email-chip.verify-bad     { border-left: 3px solid #dc2626; background: #fef2f2; color: #7f1d1d; opacity: 0.75; }
 .email-chip.verify-bad.selected { background: #fee2e2; border-color: #dc2626; color: #7f1d1d; opacity: 1; }
+/* Pitch style — fila compacta de pills cíclicos (1 fila vs 4) */
+.pitch-style-row {
+  display:flex; flex-wrap:wrap; gap:5px; margin: 6px 0;
+  padding: 6px 8px; background:#fafafa; border:1px solid #e2e8f0;
+  border-radius:6px;
+}
+.pitch-cycle-pills .pitch-pill {
+  display:inline-flex; align-items:center; gap:4px;
+  background:#fff; border:1px solid #cbd5e1; border-radius:14px;
+  padding:3px 10px; font-size:11px; cursor:pointer; line-height:1.2;
+  color:#334155; transition:all .12s; font-family:inherit;
+}
+.pitch-cycle-pills .pitch-pill:hover { background:#e0f2fe; border-color:#7dd3fc; }
+.pitch-cycle-pills .pitch-pill.active { background:#dbeafe; border-color:#3b82f6; color:#1d4ed8; font-weight:600; }
+.pitch-cycle-pills .pitch-pill[hidden] { display:none !important; }
+
 /* Toggle switch ON/OFF — reusable */
 .toggle-switch { position:relative; display:inline-block; width:42px; height:22px; flex-shrink:0; }
 .toggle-switch input { opacity:0; width:0; height:0; }

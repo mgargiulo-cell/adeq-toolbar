@@ -322,36 +322,26 @@
         </select>
       </div>
 
-      <!-- Pitch style controls -->
-      <div class="pitch-controls">
-        <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Tone</span>
-          <div class="pitch-pills" data-group="tone">
-            <button class="pitch-pill active" data-val="informal">Informal</button>
-            <button class="pitch-pill" data-val="formal">Formal</button>
-          </div>
+      <!-- Pitch style — single row, click cada pill rota al próximo valor.
+           Cada pill guarda el .active val internamente vía data-val (compatible
+           con getPitchConfig). Iconos por grupo: tono/length/focus/opening. -->
+      <div class="pitch-style-row">
+        <div class="pitch-cycle-pills" data-group="tone" data-icon="💬">
+          <button class="pitch-pill active" data-val="informal" type="button">💬 Informal</button>
+          <button class="pitch-pill" data-val="formal" type="button" hidden>💬 Formal</button>
         </div>
-        <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Length</span>
-          <div class="pitch-pills" data-group="length">
-            <button class="pitch-pill active" data-val="short">Short</button>
-            <button class="pitch-pill" data-val="long">Long</button>
-          </div>
+        <div class="pitch-cycle-pills" data-group="length" data-icon="📏">
+          <button class="pitch-pill active" data-val="short" type="button">📏 Short</button>
+          <button class="pitch-pill" data-val="long" type="button" hidden>📏 Long</button>
         </div>
-        <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Focus</span>
-          <div class="pitch-pills" data-group="focus">
-            <button class="pitch-pill active" data-val="analysis">With analysis</button>
-            <button class="pitch-pill" data-val="nodataanalysis">No analysis</button>
-          </div>
+        <div class="pitch-cycle-pills" data-group="focus" data-icon="📊">
+          <button class="pitch-pill active" data-val="analysis" type="button">📊 Análisis</button>
+          <button class="pitch-pill" data-val="nodataanalysis" type="button" hidden>📊 Sin análisis</button>
         </div>
-        <div class="pitch-ctrl-row">
-          <span class="pitch-ctrl-label">Opening</span>
-          <div class="pitch-pills" data-group="opening">
-            <button class="pitch-pill active" data-val="direct">Direct</button>
-            <button class="pitch-pill" data-val="problem">Problem</button>
-            <button class="pitch-pill" data-val="praise">Praise</button>
-          </div>
+        <div class="pitch-cycle-pills" data-group="opening" data-icon="🚀">
+          <button class="pitch-pill active" data-val="direct" type="button">🚀 Directo</button>
+          <button class="pitch-pill" data-val="problem" type="button" hidden>🚀 Problema</button>
+          <button class="pitch-pill" data-val="praise" type="button" hidden>🚀 Elogio</button>
         </div>
       </div>
 

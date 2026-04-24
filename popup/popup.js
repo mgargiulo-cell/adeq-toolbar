@@ -1470,8 +1470,23 @@ async function bindButtons() {
   });
 
   // Generar Pitch
-  // ── Pitch pills — toggle exclusivo por grupo ──────────────
-  document.querySelectorAll(".pitch-pills").forEach(group => {
+  // ── Pitch style: pills CICLAN al click — solo el active es visible ─
+  // Cada grupo tiene N pills (.active visible, resto hidden). Click en el
+  // visible avanza al siguiente del array. Compatible con getPitchConfig.
+  const cycleGroup = (group) => {
+    const pills  = [...group.querySelectorAll(".pitch-pill")];
+    const curIdx = pills.findIndex(p => p.classList.contains("active"));
+    const nextIdx = (curIdx + 1) % pills.length;
+    pills.forEach((p, i) => {
+      p.classList.toggle("active", i === nextIdx);
+      p.hidden = i !== nextIdx;
+    });
+  };
+  document.querySelectorAll(".pitch-cycle-pills").forEach(group => {
+    group.addEventListener("click", () => cycleGroup(group));
+  });
+  // Compat: viejo .pitch-pills (no-cycle) sigue funcionando
+  document.querySelectorAll(".pitch-pills:not(.pitch-cycle-pills)").forEach(group => {
     group.querySelectorAll(".pitch-pill").forEach(pill => {
       pill.addEventListener("click", () => {
         group.querySelectorAll(".pitch-pill").forEach(p => p.classList.remove("active"));
@@ -1481,7 +1496,8 @@ async function bindButtons() {
   });
 
   function getPitchConfig() {
-    const val = (group) => document.querySelector(`.pitch-pills[data-group="${group}"] .pitch-pill.active`)?.dataset.val || "";
+    // Soporta tanto .pitch-cycle-pills como .pitch-pills (legacy)
+    const val = (group) => document.querySelector(`[data-group="${group}"] .pitch-pill.active`)?.dataset.val || "";
     return {
       tone:    val("tone")    || "informal",
       length:  val("length")  || "short",
@@ -4156,35 +4172,24 @@ function renderProspectCard(r) {
           </select>
         </div>
 
-        <div class="pitch-controls">
-          <div class="pitch-ctrl-row">
-            <span class="pitch-ctrl-label">Tone</span>
-            <div class="pitch-pills pcard-pitch-pills" data-group="tone">
-              <button class="pitch-pill active" data-val="informal" type="button">Informal</button>
-              <button class="pitch-pill" data-val="formal" type="button">Formal</button>
-            </div>
+        <!-- Style compacto: pills ciclan al click (1 fila) -->
+        <div class="pitch-style-row">
+          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="tone">
+            <button class="pitch-pill active" data-val="informal" type="button">💬 Informal</button>
+            <button class="pitch-pill" data-val="formal" type="button" hidden>💬 Formal</button>
           </div>
-          <div class="pitch-ctrl-row">
-            <span class="pitch-ctrl-label">Length</span>
-            <div class="pitch-pills pcard-pitch-pills" data-group="length">
-              <button class="pitch-pill active" data-val="short" type="button">Short</button>
-              <button class="pitch-pill" data-val="long" type="button">Long</button>
-            </div>
+          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="length">
+            <button class="pitch-pill active" data-val="short" type="button">📏 Short</button>
+            <button class="pitch-pill" data-val="long" type="button" hidden>📏 Long</button>
           </div>
-          <div class="pitch-ctrl-row">
-            <span class="pitch-ctrl-label">Focus</span>
-            <div class="pitch-pills pcard-pitch-pills" data-group="focus">
-              <button class="pitch-pill active" data-val="analysis" type="button">With analysis</button>
-              <button class="pitch-pill" data-val="nodataanalysis" type="button">No analysis</button>
-            </div>
+          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="focus">
+            <button class="pitch-pill active" data-val="analysis" type="button">📊 Análisis</button>
+            <button class="pitch-pill" data-val="nodataanalysis" type="button" hidden>📊 Sin análisis</button>
           </div>
-          <div class="pitch-ctrl-row">
-            <span class="pitch-ctrl-label">Opening</span>
-            <div class="pitch-pills pcard-pitch-pills" data-group="opening">
-              <button class="pitch-pill active" data-val="direct" type="button">Direct</button>
-              <button class="pitch-pill" data-val="problem" type="button">Problem</button>
-              <button class="pitch-pill" data-val="praise" type="button">Praise</button>
-            </div>
+          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="opening">
+            <button class="pitch-pill active" data-val="direct" type="button">🚀 Directo</button>
+            <button class="pitch-pill" data-val="problem" type="button" hidden>🚀 Problema</button>
+            <button class="pitch-pill" data-val="praise" type="button" hidden>🚀 Elogio</button>
           </div>
         </div>
 
@@ -4325,13 +4330,16 @@ function initProspectCard(card, data) {
   };
   renderProspectEmailList();
 
-  // ── Pitch style pills (tone/length/focus/opening) — replica del Analysis ──
+  // ── Pitch style pills CICLAN al click (compacto, 1 fila) ──────
   try {
     card.querySelectorAll(".pcard-pitch-pills").forEach(group => {
-      group.querySelectorAll(".pitch-pill").forEach(pill => {
-        pill.addEventListener("click", () => {
-          group.querySelectorAll(".pitch-pill").forEach(p => p.classList.remove("active"));
-          pill.classList.add("active");
+      group.addEventListener("click", () => {
+        const pills  = [...group.querySelectorAll(".pitch-pill")];
+        const cur    = pills.findIndex(p => p.classList.contains("active"));
+        const next   = (cur + 1) % pills.length;
+        pills.forEach((p, i) => {
+          p.classList.toggle("active", i === next);
+          p.hidden = i !== next;
         });
       });
     });
