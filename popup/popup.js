@@ -4111,8 +4111,7 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
-        <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Ver datos + email" style="padding:3px 7px">▼</button>
-        <button class="btn btn-success btn-sm pcard-validate-btn" title="✅ Push a Monday + enviar email (positivo, lo quiero)" style="padding:3px 7px">✅</button>
+        <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
