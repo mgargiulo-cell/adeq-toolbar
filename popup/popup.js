@@ -3391,37 +3391,100 @@ function applyDraftToPitch(d, { silent = false } = {}) {
   if (!silent) pitchEl?.dispatchEvent(new Event("input"));
 }
 
-// Decide qué idioma matchea con la GEO actual del form (o cae en siteLanguage)
+// ── Detección robusta del idioma del pitch ───────────────────
+// Cascada de señales (de más confiable a menos):
+//   1. <html lang="..."> de la página + meta og:locale (lo que captura runPageContext)
+//   2. Análisis del texto real (page title + description + footer) con heurísticas
+//      por idioma (palabras frecuentes, caracteres únicos)
+//   3. GEO_TO_LANG (mapeo país→idioma)
+//   4. Fallback: "en"
+// El user reporta que español a veces detecta inglés. Causa: SimilarWeb a veces
+// devuelve GEO US para sitios .com.ar, y siteLanguage queda vacío si no hay
+// <html lang>. La detección de texto resuelve ese caso.
+
+function _detectLangFromText(text) {
+  if (!text || text.length < 30) return null;
+  const t = text.toLowerCase();
+  // Caracteres únicos por idioma (señales fuertes)
+  const hasArabic     = /[؀-ۿ]/.test(text);
+  if (hasArabic) return "ar";
+
+  // Conteo de palabras-marcador frecuentes (stopwords muy típicas)
+  const markers = {
+    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|nuestra|nuestro|hola|gracias|hace)\b/g,
+    pt: /\b(que|nao|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|ola|obrigad|dele|dela|voce)\b/g,
+    it: /\b(che|non|per|con|una|del|della|sono|sono|questo|questa|quando|dove|come|perche|sopra|grazie|nostra|nostro|ciao)\b/g,
+    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks)\b/g,
+  };
+  const scores = {};
+  let total = 0;
+  for (const [lang, re] of Object.entries(markers)) {
+    const m = t.match(re);
+    scores[lang] = m ? m.length : 0;
+    total += scores[lang];
+  }
+  // Bonus por caracteres únicos
+  if (/[ñáéíóúü¿¡]/.test(text)) scores.es += 5;
+  if (/[ãõçàáâ]/.test(text))    scores.pt += 5;
+  if (/[àèéìòù]/.test(text))    scores.it += 5;
+
+  if (total < 3) return null; // muy poca señal
+  // Ganador con margen de >=2 sobre el segundo (evita empates dudosos)
+  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  if (sorted[0][1] >= sorted[1][1] + 2) return sorted[0][0];
+  return null;
+}
+
+const SUPPORTED_LANGS = new Set(["es", "en", "it", "pt", "ar"]);
+
 function _resolvePitchLang() {
+  // 1. siteLanguage del <html lang> — el más confiable cuando existe
+  const htmlLang = (state.siteLanguage || "").toLowerCase().split("-")[0];
+  if (SUPPORTED_LANGS.has(htmlLang)) return htmlLang;
+
+  // 2. og:locale (es_AR, pt_BR, etc.)
+  const og = (state.siteOgLocale || "").toLowerCase().split(/[-_]/)[0];
+  if (SUPPORTED_LANGS.has(og)) return og;
+
+  // 3. Análisis del texto real de la página (página + meta + footer)
+  const sample = [state.pageTitle, state.pageDescription, state.siteFooterText]
+    .filter(Boolean).join(" ").substring(0, 4000);
+  const detected = _detectLangFromText(sample);
+  if (detected && SUPPORTED_LANGS.has(detected)) return detected;
+
+  // 4. Mapeo GEO → idioma (último recurso)
   const geoSel = document.getElementById("form-geo");
   const geoText = (geoSel?.value || "").toLowerCase();
-  // buscar en GEO_LABEL inverso para sacar el code
   let geoCode = "";
   for (const [code, label] of Object.entries(GEO_LABEL)) {
     if (label.toLowerCase() === geoText) { geoCode = code; break; }
   }
   const langFromGeo = GEO_TO_LANG[geoCode];
-  return langFromGeo || state.siteLanguage || "en";
+  if (SUPPORTED_LANGS.has(langFromGeo)) return langFromGeo;
+
+  // 5. Default
+  return "en";
 }
 
 function updatePitchFlagButton() {
   const flagBtn   = document.getElementById("btn-pitch-flag");
   const flagEmoji = document.getElementById("pitch-flag-emoji");
-  const badge     = document.getElementById("pitch-flag-badge");
-  if (!flagBtn || !flagEmoji || !badge) return;
+  const nameEl    = document.getElementById("pitch-flag-name");
+  if (!flagBtn || !flagEmoji || !nameEl) return;
   const lang   = _draftsState.currentLang || _resolvePitchLang();
   const drafts = _draftsState.byLang.get(lang) || [];
   flagEmoji.textContent = LANG_FLAG[lang] || "🌐";
   if (drafts.length === 0) {
-    badge.style.display = "none";
+    nameEl.textContent = "sin drafts";
     flagBtn.title = `No hay drafts en ${lang}. Click 📝 en el header para crear uno.`;
     return;
   }
   const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
   const current = drafts[idx];
-  badge.textContent = current?.name?.substring(0, 6) || `T${idx + 1}`;
-  badge.style.display = "inline-block";
-  flagBtn.title = `Template ${idx + 1}/${drafts.length} (${lang}): "${current?.name || ""}". Click para rotar.`;
+  // Sacar el sufijo "ES · " / "EN · " del nombre para no repetir bandera
+  const cleanName = (current?.name || `Template ${idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
+  nameEl.textContent = `${cleanName} (${idx + 1}/${drafts.length})`;
+  flagBtn.title = `Click para rotar templates del mismo idioma`;
 }
 
 // Auto-carga el draft de prioridad 1 (o el primero ordenado) en el pitch al cargar la web.
@@ -4058,16 +4121,14 @@ function renderProspectCard(r) {
         <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
         <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
 
-        <div style="position:relative">
-          <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
-          <div style="position:absolute; top:6px; right:6px; display:flex; gap:4px; align-items:center">
-            <button type="button" class="pcard-flag-btn" title="Click para rotar templates del idioma" style="position:relative; background:rgba(255,255,255,0.92); border:1px solid var(--border); border-radius:6px; padding:3px 6px; cursor:pointer; font-size:14px; line-height:1; box-shadow:0 1px 2px rgba(0,0,0,0.06)">
-              <span class="pcard-flag-emoji">🌐</span>
-              <span class="pcard-flag-badge" style="position:absolute; top:-6px; right:-6px; background:#0ea5e9; color:#fff; font-size:9px; font-weight:700; padding:1px 4px; border-radius:8px; min-width:14px; text-align:center; display:none"></span>
-            </button>
-            <button type="button" class="pcard-clear-btn" title="Limpiar pitch" style="background:rgba(255,255,255,0.92); border:1px solid var(--border); border-radius:6px; padding:3px 6px; cursor:pointer; font-size:13px; line-height:1; box-shadow:0 1px 2px rgba(0,0,0,0.06)">🗑️</button>
-          </div>
+        <div class="pitch-toolbar">
+          <button type="button" class="pcard-flag-btn pitch-tool-btn pitch-tool-flag" title="Click para rotar templates del idioma">
+            <span class="pcard-flag-emoji">🌐</span>
+            <span class="pcard-flag-name pitch-tool-name">—</span>
+          </button>
+          <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
         </div>
+        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
 
         <div class="pitch-actions" style="margin-top:6px">
           <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate" : "✨ Generate"}</button>
@@ -4156,37 +4217,53 @@ function initProspectCard(card, data) {
   }
 
   // ── Pitch style pills (tone/length/focus/opening) — replica del Analysis ──
-  card.querySelectorAll(".pcard-pitch-pills").forEach(group => {
-    group.querySelectorAll(".pitch-pill").forEach(pill => {
-      pill.addEventListener("click", () => {
-        group.querySelectorAll(".pitch-pill").forEach(p => p.classList.remove("active"));
-        pill.classList.add("active");
+  try {
+    card.querySelectorAll(".pcard-pitch-pills").forEach(group => {
+      group.querySelectorAll(".pitch-pill").forEach(pill => {
+        pill.addEventListener("click", () => {
+          group.querySelectorAll(".pitch-pill").forEach(p => p.classList.remove("active"));
+          pill.classList.add("active");
+        });
       });
     });
-  });
 
-  // Pre-set selectores con datos del prospect
-  const langSel = card.querySelector(".pcard-pitch-language");
-  if (langSel && data.language && langSel.querySelector(`option[value="${data.language}"]`)) {
-    langSel.value = data.language;
-  }
-  const catSel = card.querySelector(".pcard-pitch-category");
-  if (catSel && data.category) {
-    const mapped = mapCategory(data.category);
-    if (mapped && catSel.querySelector(`option[value="${mapped}"]`)) catSel.value = mapped;
+    const langSel = card.querySelector(".pcard-pitch-language");
+    const langVal = (data.language || "").split("-")[0];
+    if (langSel && langVal) {
+      const opt = [...langSel.options].find(o => o.value === langVal);
+      if (opt) langSel.value = langVal;
+    }
+    const catSel = card.querySelector(".pcard-pitch-category");
+    if (catSel && data.category) {
+      try {
+        const mapped = mapCategory(data.category);
+        const opt = mapped ? [...catSel.options].find(o => o.value === mapped) : null;
+        if (opt) catSel.value = mapped;
+      } catch {}
+    }
+  } catch (e) {
+    console.warn("[ProspectCard] pills init failed:", e);
   }
 
   // ── Bandera + trash + autocarga del draft del idioma de la card ────
-  // Resolver idioma desde data.language o (fallback) desde data.geo
+  // Cascada: data.language > análisis del pitch existente > GEO > default
   const _resolveCardLang = () => {
-    if (data.language && LANG_FLAG[data.language]) return data.language;
-    // GEO label → alpha2 → lang
+    // 1. Idioma explícito del prospect
+    const dl = (data.language || "").toLowerCase().split("-")[0];
+    if (SUPPORTED_LANGS.has(dl)) return dl;
+    // 2. Análisis del pitch + page_title si ya hay texto
+    const sample = [data.pitch, data.page_title].filter(Boolean).join(" ");
+    const detected = _detectLangFromText(sample);
+    if (detected && SUPPORTED_LANGS.has(detected)) return detected;
+    // 3. GEO label → alpha2 → lang
     const geoText = (data.geo || "").trim().toLowerCase();
     let geoCode = "";
     for (const [code, label] of Object.entries(GEO_LABEL)) {
       if (label.toLowerCase() === geoText) { geoCode = code; break; }
     }
-    return GEO_TO_LANG[geoCode] || "en";
+    if (SUPPORTED_LANGS.has(GEO_TO_LANG[geoCode])) return GEO_TO_LANG[geoCode];
+    // 4. Default
+    return "en";
   };
   const cardLang = _resolveCardLang();
   // Estado local del rotator de esta card
@@ -4196,16 +4273,16 @@ function initProspectCard(card, data) {
 
   const _updateCardFlagBtn = () => {
     const flagEmoji = card.querySelector(".pcard-flag-emoji");
-    const badge     = card.querySelector(".pcard-flag-badge");
+    const nameEl    = card.querySelector(".pcard-flag-name");
     const flagBtn   = card.querySelector(".pcard-flag-btn");
-    if (!flagEmoji || !badge || !flagBtn) return;
+    if (!flagEmoji || !nameEl || !flagBtn) return;
     const drafts = _cardDrafts();
     flagEmoji.textContent = LANG_FLAG[cardFlag.lang] || "🌐";
-    if (drafts.length === 0) { badge.style.display = "none"; flagBtn.title = `Sin drafts en ${cardFlag.lang}`; return; }
+    if (drafts.length === 0) { nameEl.textContent = "sin drafts"; flagBtn.title = `Sin drafts en ${cardFlag.lang}`; return; }
     const cur = drafts[cardFlag.idx];
-    badge.textContent = (cur?.name || `T${cardFlag.idx + 1}`).substring(0, 5);
-    badge.style.display = "inline-block";
-    flagBtn.title = `Template ${cardFlag.idx + 1}/${drafts.length}: "${cur?.name || ""}". Click para rotar.`;
+    const cleanName = (cur?.name || `Template ${cardFlag.idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
+    nameEl.textContent = `${cleanName} (${cardFlag.idx + 1}/${drafts.length})`;
+    flagBtn.title = `Click para rotar templates`;
   };
 
   const _applyCardDraft = (d) => {

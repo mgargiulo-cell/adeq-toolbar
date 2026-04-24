@@ -283,6 +283,14 @@ body {
 .email-chip.verify-warn    { border-left: 3px solid #f59e0b; background: #fffbeb; }
 .email-chip.verify-bad     { border-left: 3px solid #dc2626; background: #fef2f2; color: #7f1d1d; opacity: 0.75; }
 .email-chip.verify-bad.selected { background: #fee2e2; border-color: #dc2626; color: #7f1d1d; opacity: 1; }
+/* Pitch toolbar (bandera + limpiar) — encima del textarea, no overlay */
+.pitch-toolbar { display:flex; justify-content:space-between; align-items:center; gap:6px; margin: 4px 0 4px 0; }
+.pitch-tool-btn { display:inline-flex; align-items:center; gap:5px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:3px 9px; cursor:pointer; font-size:11px; line-height:1.2; color:#334155; transition:all .15s; font-family:inherit; }
+.pitch-tool-btn:hover { background:#e0f2fe; border-color:#7dd3fc; }
+.pitch-tool-flag { font-weight:600; }
+.pitch-tool-flag .pitch-tool-name { font-weight:500; color:#64748b; font-size:10px; }
+.pitch-tool-clear { color:#dc2626; }
+.pitch-tool-clear:hover { background:#fef2f2; border-color:#fca5a5; }
 .email-src-badge       { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; margin-left: 5px; padding: 1px 4px; border-radius: 3px; background: #e2e8f0; color: #64748b; vertical-align: middle; }
 .linkedin-row  { margin-bottom: 5px; }
 .linkedin-link { font-size: 12px; color: #0369a1; text-decoration: none; }
