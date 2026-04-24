@@ -3476,6 +3476,49 @@ function _resolvePitchLang() {
   return "en";
 }
 
+// Render del chip strip — todos los drafts visibles, idioma detectado primero.
+// Reusable: pasale el contenedor, callback de selección, draftId activo.
+function renderDraftChips(containerEl, { activeId = null, preferredLang = null, onPick }) {
+  if (!containerEl) return;
+  const all = _draftsState.all || [];
+  if (all.length === 0) {
+    containerEl.innerHTML = `<div class="draft-chips-empty">Sin borradores. Creá uno desde 📝 (header).</div>`;
+    return;
+  }
+  // Ordenar: idioma preferido primero (por priority), después el resto agrupado por idioma
+  const lang = preferredLang || "en";
+  const matchLang = all.filter(d => d.language === lang)
+                       .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3));
+  const otherLangs = all.filter(d => d.language !== lang)
+                         .sort((a, b) => {
+                           if (a.language !== b.language) return a.language.localeCompare(b.language);
+                           return (a.priority ?? 3) - (b.priority ?? 3);
+                         });
+  const ordered = [...matchLang, ...otherLangs];
+
+  containerEl.innerHTML = ordered.map(d => {
+    const flag = LANG_FLAG[d.language] || "🌐";
+    const cleanName = (d.name || "Template").replace(/^[A-Z]{2}\s*·\s*/, "");
+    const isActive = String(d.id) === String(activeId);
+    return `<button type="button" class="draft-chip${isActive ? " active" : ""}" data-id="${esc(String(d.id))}" title="${esc(d.subject || cleanName)}">
+      <span class="draft-chip-flag">${flag}</span>${esc(cleanName)}
+    </button>`;
+  }).join("");
+
+  containerEl.querySelectorAll(".draft-chip").forEach(chip => {
+    chip.addEventListener("click", () => {
+      const id = chip.dataset.id;
+      const d  = all.find(x => String(x.id) === id);
+      if (!d) return;
+      // Marcar activo
+      containerEl.querySelectorAll(".draft-chip").forEach(c => c.classList.remove("active"));
+      chip.classList.add("active");
+      onPick?.(d);
+    });
+  });
+}
+
+// Analysis tab: bandera + nombre del template, click rota dentro del idioma actual
 function updatePitchFlagButton() {
   const flagBtn   = document.getElementById("btn-pitch-flag");
   const flagEmoji = document.getElementById("pitch-flag-emoji");
@@ -3485,13 +3528,12 @@ function updatePitchFlagButton() {
   const drafts = _draftsState.byLang.get(lang) || [];
   flagEmoji.textContent = LANG_FLAG[lang] || "🌐";
   if (drafts.length === 0) {
-    nameEl.textContent = "sin drafts";
-    flagBtn.title = `No hay drafts en ${lang}. Click 📝 en el header para crear uno.`;
+    nameEl.textContent = LANG_FLAG[lang] ? `Sin templates en ${lang.toUpperCase()}` : "Idioma desconocido";
+    flagBtn.title = `No hay drafts. Abrí 📝 (header) para crear uno.`;
     return;
   }
   const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
   const current = drafts[idx];
-  // Sacar el sufijo "ES · " / "EN · " del nombre para no repetir bandera
   const cleanName = (current?.name || `Template ${idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
   nameEl.textContent = `${cleanName} (${idx + 1}/${drafts.length})`;
   flagBtn.title = `Click para rotar templates del mismo idioma`;
@@ -3535,62 +3577,12 @@ function initPitchInlineControls() {
     pitchEl.dispatchEvent(new Event("input"));
     pitchEl.focus();
   });
-  // Si cambia la GEO manualmente, recalcular bandera (sin pisar lo que escribió)
+  // Si cambia la GEO manualmente, recalcular idioma + actualizar bandera
   document.getElementById("form-geo")?.addEventListener("change", () => {
     _draftsState.currentLang = _resolvePitchLang();
     _draftsState.flagIdxByLang.set(_draftsState.currentLang, 0);
     updatePitchFlagButton();
   });
-
-  // Dropdown "📋 Load draft..." — manual override cuando GEO/idioma falló.
-  // Idéntico al de Prospect cards. Agrupado por idioma con optgroups.
-  const draftSel = document.getElementById("analysis-draft-select");
-  if (draftSel) {
-    const populate = () => {
-      while (draftSel.options.length > 1) draftSel.remove(1);
-      const langGroups = { es: [], en: [], pt: [], it: [], ar: [] };
-      for (const d of _draftsState.all) {
-        if (langGroups[d.language]) langGroups[d.language].push(d);
-      }
-      const langLabel = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", ar:"🇸🇦 AR" };
-      for (const [lang, list] of Object.entries(langGroups)) {
-        if (list.length === 0) continue;
-        const og = document.createElement("optgroup");
-        og.label = langLabel[lang] || lang;
-        for (const d of list) {
-          const o = document.createElement("option");
-          o.value = d.id;
-          o.textContent = d.name + (d.user_email === "_default_" ? " · default" : "");
-          og.appendChild(o);
-        }
-        draftSel.appendChild(og);
-      }
-    };
-    // Populate ahora si la cache existe, y refrescar tras cargarla
-    if (_draftsState.loaded) populate();
-    else loadDraftsCache().then(populate).catch(() => {});
-
-    draftSel.addEventListener("change", (e) => {
-      const id = e.target.value;
-      if (!id) return;
-      const d = _draftsState.all.find(x => String(x.id) === id);
-      if (!d) return;
-      // Aplicar pisando lo que esté
-      const domain = state.domain || "example.com";
-      const subjEl = document.getElementById("form-subject");
-      const ptEl   = document.getElementById("pitch-text");
-      if (ptEl)  ptEl.value  = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
-      if (subjEl) subjEl.value = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
-      // Sincronizar bandera al idioma de este draft (override manual del usuario)
-      _draftsState.currentLang = d.language;
-      const drafts = _draftsState.byLang.get(d.language) || [];
-      const idx = drafts.findIndex(x => x.id === d.id);
-      _draftsState.flagIdxByLang.set(d.language, idx >= 0 ? idx : 0);
-      updatePitchFlagButton();
-      ptEl?.dispatchEvent(new Event("input"));
-      draftSel.value = ""; // reset
-    });
-  }
 }
 
 // ── Pitch Drafts modal ────────────────────────────────────────
@@ -4181,14 +4173,14 @@ function renderProspectCard(r) {
         <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
         <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
 
-        <div class="pitch-toolbar">
-          <button type="button" class="pcard-flag-btn pitch-tool-btn pitch-tool-flag" title="Click para rotar templates del idioma">
-            <span class="pcard-flag-emoji">🌐</span>
-            <span class="pcard-flag-name pitch-tool-name">—</span>
-          </button>
-          <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
+        <!-- Chip strip: TODOS los templates con bandera. 1 click para usar.
+             En Prospects mostramos todos porque la GEO viene de scraping
+             cacheado y a veces falla — mejor que el user pueda elegir directo. -->
+        <div class="pcard-draft-chips draft-chips"></div>
+        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Click un borrador arriba para cargarlo...">${esc(r.pitch || "")}</textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:3px">
+          <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch" style="font-size:10px;padding:2px 7px">🗑️ Limpiar</button>
         </div>
-        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
 
         <div class="pitch-actions" style="margin-top:6px">
           <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate Pitch" : "✨ Generate Pitch"}</button>
@@ -4329,27 +4321,6 @@ function initProspectCard(card, data) {
   // Estado local del rotator de esta card
   const cardFlag = { lang: cardLang, idx: 0 };
 
-  const _cardDrafts = () => (_draftsState.byLang.get(cardFlag.lang) || []);
-
-  const _updateCardFlagBtn = () => {
-    const flagEmoji = card.querySelector(".pcard-flag-emoji");
-    const nameEl    = card.querySelector(".pcard-flag-name");
-    const flagBtn   = card.querySelector(".pcard-flag-btn");
-    if (!flagEmoji || !nameEl || !flagBtn) return;
-    const drafts = _cardDrafts();
-    const flag   = LANG_FLAG[cardFlag.lang];
-    flagEmoji.textContent = flag || "🌐";
-    if (drafts.length === 0) {
-      nameEl.textContent = flag ? `Sin templates en ${cardFlag.lang.toUpperCase()}` : "Idioma desconocido";
-      flagBtn.title = `No hay drafts en este idioma. Abrí 📝 (header) para crear uno.`;
-      return;
-    }
-    const cur = drafts[cardFlag.idx];
-    const cleanName = (cur?.name || `Template ${cardFlag.idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
-    nameEl.textContent = `${cleanName} (${cardFlag.idx + 1}/${drafts.length})`;
-    flagBtn.title = `Click para rotar templates`;
-  };
-
   const _applyCardDraft = (d) => {
     if (!d) return;
     const replaceVars = (s) => (s || "").replace(/\{\{domain\}\}/g, data.domain || "");
@@ -4359,36 +4330,50 @@ function initProspectCard(card, data) {
     if (subjectEl) subjectEl.value = replaceVars(d.subject || "");
   };
 
-  // Init asíncrono: si la cache de drafts está vacía, la cargamos primero
-  // (puede pasar si el user abrió Prospects sin haber abierto Analysis antes)
+  // Render del chip strip + autocarga del prio-1 del idioma detectado.
+  // Init asíncrono porque la cache puede no estar lista todavía.
+  let cardActiveDraftId = null;
+  const _renderChips = () => {
+    const chipsEl = card.querySelector(".pcard-draft-chips");
+    if (!chipsEl) return;
+    renderDraftChips(chipsEl, {
+      activeId: cardActiveDraftId,
+      preferredLang: cardFlag.lang,
+      onPick: (d) => {
+        cardActiveDraftId = d.id;
+        _applyCardDraft(d);
+      },
+    });
+  };
+
   (async () => {
     if (!_draftsState.loaded) {
       try { await loadDraftsCache(); } catch {}
     }
-    // Autocarga draft prio-1 al render SOLO si el pitch viene vacío
+    // Autocarga draft prio-1 del idioma detectado SOLO si el pitch viene vacío
     if (!r.pitch || !r.pitch.trim()) {
-      const drafts = _cardDrafts();
+      const drafts = _draftsState.byLang.get(cardFlag.lang) || [];
       if (drafts.length > 0) {
-        cardFlag.idx = 0;
+        cardActiveDraftId = drafts[0].id;
         _applyCardDraft(drafts[0]);
+      } else {
+        // Sin drafts en el idioma detectado — usar el de prioridad 1 de cualquiera
+        const fallback = (_draftsState.all || []).sort((a,b) => (a.priority??3)-(b.priority??3))[0];
+        if (fallback) {
+          cardActiveDraftId = fallback.id;
+          _applyCardDraft(fallback);
+        }
       }
     }
-    _updateCardFlagBtn();
+    _renderChips();
   })();
 
-  // Click en bandera = rotar
-  card.querySelector(".pcard-flag-btn")?.addEventListener("click", () => {
-    const drafts = _cardDrafts();
-    if (drafts.length === 0) return;
-    cardFlag.idx = (cardFlag.idx + 1) % drafts.length;
-    _applyCardDraft(drafts[cardFlag.idx]);
-    _updateCardFlagBtn();
-  });
-
-  // Click en trash = limpiar pitch
+  // Trash = limpiar pitch
   card.querySelector(".pcard-clear-btn")?.addEventListener("click", () => {
     const pitchEl = card.querySelector(".pcard-pitch");
     if (pitchEl) { pitchEl.value = ""; pitchEl.focus(); }
+    cardActiveDraftId = null;
+    _renderChips();
   });
 
   // Subject chips — click selects subject into input

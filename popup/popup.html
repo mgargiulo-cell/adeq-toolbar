@@ -355,7 +355,8 @@
         </div>
       </div>
 
-      <!-- Mini-toolbar OUTSIDE el textarea — bandera+template a la izquierda, trash a la derecha -->
+      <!-- Bandera + rotator + limpiar — funciona bien en Analysis porque
+           el idioma se detecta desde la página real (no scraping cacheado) -->
       <div class="pitch-toolbar">
         <button id="btn-pitch-flag" type="button" class="pitch-tool-btn pitch-tool-flag" title="Click para rotar templates del mismo idioma">
           <span id="pitch-flag-emoji">🌐</span>
@@ -363,11 +364,10 @@
         </button>
         <button id="btn-pitch-clear" type="button" class="pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
       </div>
-      <textarea id="pitch-text" class="pitch-textarea" placeholder="Borrador del idioma de la GEO se autocarga acá..."></textarea>
+      <textarea id="pitch-text" class="pitch-textarea" placeholder="Borrador del idioma se autocarga acá..."></textarea>
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
         <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
-        <select id="analysis-draft-select" class="form-select" style="font-size:10px;padding:2px 6px;max-width:160px"><option value="">📋 Load draft...</option></select>
         <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Save as style example">👍</button>
         <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Claude will avoid it">👎</button>
         <span id="pitch-like-status" class="pitch-like-status"></span>
