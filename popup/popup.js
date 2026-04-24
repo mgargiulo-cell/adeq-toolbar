@@ -655,17 +655,24 @@ async function runTrafficCheck() {
 
     const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
 
+    // Bandera del top country (la que vamos a mostrar pegada al métrica principal)
+    // Buscar primero en topCountries, fallback a la inferida desde page signals
+    const topC = (data.topCountries || []).find(c => c.code) || null;
+    const mainFlagHtml = topC
+      ? `<span class="main-country-flag" title="País principal de tráfico: ${esc(topC.name || topC.code)}" data-code="${esc(topC.code)}" style="font-size:18px;margin-left:6px;cursor:help">${countryFlag(topC.code)}</span>`
+      : "";
+
     if (data.noPageViewData) {
-      metricEl.textContent = formatTraffic(state.visits);
+      metricEl.innerHTML = `${formatTraffic(state.visits)}${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "visits/mo";
       breakdownEl.innerHTML = `<span class="no-pageview-note">No page-view data</span>${cacheStr}`;
     } else if (data.estimatedPages) {
-      // Estimación por categoría — mostrar pero claramente etiquetado como ~
-      metricEl.textContent = `~${formatTraffic(state.traffic)}`;
+      // Estimación por categoría — claramente etiquetado como ~
+      metricEl.innerHTML = `~${formatTraffic(state.traffic)}${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "pages/mo (est.)";
-      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ~${data.pagesPerVisit} p/v <span class="pv-estimated">(estimated by category)</span>${cacheStr}`;
+      breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ~${data.pagesPerVisit} p/v <span class="pv-estimated">(estimado conservador)</span>${cacheStr}`;
     } else {
-      metricEl.textContent = formatTraffic(state.traffic);
+      metricEl.innerHTML = `${formatTraffic(state.traffic)}${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "pages/mo";
       const srcLabel = data.ppvSource === "engagement" ? ` <span class="pv-source">via /engagement</span>` : "";
       breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ${data.pagesPerVisit} p/v${srcLabel}${cacheStr}`;
@@ -676,13 +683,22 @@ async function runTrafficCheck() {
     const pvDisplay = document.getElementById("form-pv-display");
     if (pvDisplay) pvDisplay.textContent = formatTraffic(state.traffic);
 
-    // Top 3 países con banderas
+    // Top 3 países con banderas — chips secundarios SOLO si el % es significativo (>1%)
+    // y con tooltip claro. El % es "share del tráfico mundial del sitio".
     const countriesEl = document.getElementById("traffic-countries");
     if (countriesEl) {
-      if (data.topCountries?.length) {
-        countriesEl.innerHTML = data.topCountries.slice(0, 3).map(c => {
-          const pct = c.share > 1 ? `${Math.round(c.share)}%` : `${Math.round(c.share * 100)}%`;
-          return `<span class="country-flag-chip" data-code="${esc(c.code)}" title="${esc(c.name)}">${countryFlag(c.code)} ${pct}</span>`;
+      const chips = (data.topCountries || [])
+        .map(c => {
+          const raw = Number(c.share) || 0;
+          const pct = raw > 1 ? Math.round(raw) : Math.round(raw * 100);
+          return { ...c, pct };
+        })
+        .filter(c => c.code && c.pct >= 1) // descarta el "0%" confuso
+        .slice(0, 3);
+      if (chips.length) {
+        countriesEl.innerHTML = chips.map(c => {
+          const tip = `${esc(c.name || c.code)} — ${c.pct}% del tráfico del sitio viene de acá`;
+          return `<span class="country-flag-chip" data-code="${esc(c.code)}" title="${tip}">${countryFlag(c.code)} ${c.pct}%</span>`;
         }).join("");
       } else {
         countriesEl.innerHTML = "";
@@ -1042,23 +1058,82 @@ function addEmailsWithSource(emails, source) {
   }
 }
 
+// Cache de resultados de verifyEmail para no re-verificar el mismo email
+// dentro de la misma sesión del side panel.
+const _emailVerifyCache = new Map(); // email -> {valid, tags, reason, score}
+
+function _verifyClass(result) {
+  if (!result) return "verify-pending";
+  const tags = result.tags || [];
+  if (!result.valid || tags.includes("typo") || tags.includes("descartable") ||
+      tags.includes("sin-dns") || tags.includes("sin-mx") || tags.includes("proxy-whois")) {
+    return "verify-bad";
+  }
+  if (tags.includes("rol") || tags.includes("tld-sospechoso") || tags.includes("catch-all")) {
+    return "verify-warn";
+  }
+  return "verify-good";
+}
+
+function _verifyTooltip(result) {
+  if (!result) return "Verificando…";
+  const status = result.valid ? "✔ Válido" : "✖ Inválido";
+  const reason = result.reason || "";
+  const tags   = (result.tags || []).join(", ");
+  return [status, reason, tags ? `[${tags}]` : ""].filter(Boolean).join(" — ");
+}
+
+async function autoVerifyEmailChips(listEl) {
+  const chips = [...listEl.querySelectorAll(".email-chip[data-email]")];
+  // Limit a 12 emails en paralelo para no saturar (DNS-over-HTTPS soporta esto sin drama)
+  const batch = chips.slice(0, 12);
+  await Promise.all(batch.map(async (chip) => {
+    const email = chip.dataset.email;
+    if (!email) return;
+    let result = _emailVerifyCache.get(email);
+    if (!result) {
+      try { result = await verifyEmail(email); }
+      catch { result = { valid: false, reason: "Error verifying", tags: ["error"] }; }
+      _emailVerifyCache.set(email, result);
+    }
+    const cls = _verifyClass(result);
+    chip.classList.remove("verify-pending", "verify-good", "verify-warn", "verify-bad");
+    chip.classList.add(cls);
+    chip.title = _verifyTooltip(result);
+    // Si era el chip seleccionado, sincronizar el badge global con el color
+    const badge = document.getElementById("email-verify-badge");
+    if (chip.classList.contains("selected") && badge) {
+      _renderVerifyBadge(badge, result);
+    }
+  }));
+}
+
+function _renderVerifyBadge(badge, result) {
+  if (!result) { badge.style.display = "none"; return; }
+  const cls = _verifyClass(result);
+  badge.style.display = "inline-block";
+  badge.title = _verifyTooltip(result);
+  if (cls === "verify-good") { badge.textContent = "✔"; badge.className = "verify-badge ok"; }
+  else if (cls === "verify-warn") { badge.textContent = "⚠"; badge.className = "verify-badge unknown"; }
+  else { badge.textContent = "✖"; badge.className = "verify-badge fail"; }
+}
+
 function renderEmailList(emails) {
   const resultEl = document.getElementById("email-result");
   const listEl   = document.getElementById("email-list");
   const badge    = document.getElementById("email-verify-badge");
-  const verBtn   = document.getElementById("btn-verify-email");
   const formEl   = document.getElementById("form-email");
 
   const isDup       = state.duplicate?.found;
   const mondayEmail = isDup ? (state.duplicate.email || "").trim() : "";
 
-  // Deduplicate, exclude Monday email — show ALL (no cap). UI collapses >7 with "ver más"
+  // Deduplicate, exclude Monday email — show ALL (no cap). UI collapses >7 con "ver más"
   const suggested = [...new Set(emails.map(e => e.trim()).filter(Boolean))]
     .filter(e => e !== mondayEmail);
 
   if (!mondayEmail && suggested.length === 0) {
     resultEl.style.display = "block";
-    resultEl.textContent   = "Not found — try Apollo or Gemini";
+    resultEl.textContent   = "Sin emails — probá Apollo";
     resultEl.className     = "email-value";
     listEl.style.display   = "none";
     return;
@@ -1068,13 +1143,19 @@ function renderEmailList(emails) {
   listEl.style.display   = "block";
   listEl.className       = "email-list";
   badge.style.display    = "none";
-  verBtn.style.display   = "inline-block";
 
   let html = "";
 
+  const chipFor = (email, extraClass = "") => {
+    const src = state.emailSources.get(email) || "";
+    const srcBadge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
+    const cached = _emailVerifyCache.get(email);
+    const verCls = cached ? _verifyClass(cached) : "verify-pending";
+    return `<div class="email-chip ${extraClass} ${verCls}" data-email="${esc(email)}" title="Verificando…">${esc(email)}${srcBadge}</div>`;
+  };
+
   if (mondayEmail) {
-    html += `<div class="email-group-label">📋 Actual (Monday)</div>
-      <div class="email-chip monday" data-email="${esc(mondayEmail)}">${esc(mondayEmail)}</div>`;
+    html += `<div class="email-group-label">📋 Actual (Monday)</div>${chipFor(mondayEmail, "monday")}`;
   }
 
   if (suggested.length > 0) {
@@ -1082,18 +1163,10 @@ function renderEmailList(emails) {
     const hidden  = suggested.length > VISIBLE ? suggested.slice(VISIBLE) : [];
     const visible = suggested.slice(0, VISIBLE);
     html += `<div class="email-group-label">${mondayEmail ? "💡 Sugeridas" : "📧 Encontradas"} (${suggested.length})</div>`;
-    visible.forEach(email => {
-      const src = state.emailSources.get(email) || "";
-      const srcBadge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
-      html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}${srcBadge}</div>`;
-    });
+    visible.forEach(email => { html += chipFor(email); });
     if (hidden.length > 0) {
       html += `<div class="email-chips-hidden" style="display:none">`;
-      hidden.forEach(email => {
-        const src = state.emailSources.get(email) || "";
-        const srcBadge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
-        html += `<div class="email-chip" data-email="${esc(email)}">${esc(email)}${srcBadge}</div>`;
-      });
+      hidden.forEach(email => { html += chipFor(email); });
       html += `</div>`;
       html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:var(--adeq-blue);cursor:pointer;padding:4px 0;text-decoration:underline">+ ver ${hidden.length} más…</button>`;
     }
@@ -1126,9 +1199,14 @@ function renderEmailList(emails) {
       listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
       chip.classList.add("selected");
       formEl.value = chip.dataset.email;
-      badge.style.display = "none";
+      // Sincronizar badge con el resultado cacheado del chip seleccionado
+      const cached = _emailVerifyCache.get(chip.dataset.email);
+      _renderVerifyBadge(badge, cached);
     });
   });
+
+  // Auto-verify en background — sin bloquear el render
+  autoVerifyEmailChips(listEl).catch(e => console.warn("[autoVerify]", e));
 }
 
 function setEmail(email) {
@@ -1288,7 +1366,7 @@ async function ragSavePitchFeedback(action, pitchBody, pitchSubject, ctxFields) 
 async function bindButtons() {
 
   // Verificar email
-  document.getElementById("btn-verify-email").addEventListener("click", verifyCurrentEmail);
+  // btn-verify-email REMOVIDO — la verificación es automática on-render (autoVerifyEmailChips)
 
   // Apollo
   document.getElementById("btn-apollo").addEventListener("click", async () => {
@@ -1315,26 +1393,8 @@ async function bindButtons() {
     btn.disabled = false; btn.textContent = "👤 Apollo";
   });
 
-  // Gemini email
-  document.getElementById("btn-gemini-email").addEventListener("click", async () => {
-    const btn      = document.getElementById("btn-gemini-email");
-    const resultEl = document.getElementById("apollo-result");
-    btn.disabled   = true; btn.textContent = "⏳...";
-    resultEl.textContent = "Querying Gemini...";
-    const result = await searchEmailsWithGemini(state.domain);
-    if (result.emails?.length > 0) {
-      addEmailsWithSource(result.emails, "Gemini");
-      setEmail(result.emails[0]);
-      resultEl.textContent = result.owner ? `Owner: ${result.owner}` : "";
-      if (result.linkedin) showLinkedIn(result.linkedin);
-      autoPushReady.email = true;
-      checkAutoPush();
-      updateScore();
-    } else {
-      resultEl.textContent = result.note || "No public emails found for this site";
-    }
-    btn.disabled = false; btn.textContent = "🤖 Gemini";
-  });
+  // Botón Gemini email — REMOVIDO. La búsqueda Gemini consumía $$ y nadie lo
+  // tildaba. El scraper + Apollo cubren los emails reales.
 
   // Fecha Hoy
   document.getElementById("btn-fecha-hoy").addEventListener("click", () => {
@@ -1833,6 +1893,23 @@ async function bindButtons() {
 
   // Refresh — re-analiza la pestaña activa
   document.getElementById("btn-refresh").addEventListener("click", () => window.location.reload());
+
+  // ── Cascade · Import Monday collapsable ──────────────────────
+  // El card "Import URLs from Monday" se mudó a Cascade. Lo dejo colapsado
+  // por default para no robarle espacio a Keywords/Filtros que son lo más usado.
+  (() => {
+    const toggle = document.getElementById("cascade-monday-toggle");
+    const panel  = document.getElementById("cascade-monday-panel");
+    const arrow  = document.getElementById("cascade-monday-arrow");
+    if (!toggle || !panel) return;
+    panel.style.display = "none";
+    arrow && (arrow.textContent = "▶");
+    toggle.addEventListener("click", () => {
+      const open = panel.style.display !== "none";
+      panel.style.display = open ? "none" : "block";
+      if (arrow) arrow.textContent = open ? "▶" : "▼";
+    });
+  })();
 
   // ── Import Tab ────────────────────────────────────────────────
   document.getElementById("btn-import-go").addEventListener("click", async () => {
@@ -3192,18 +3269,24 @@ const _draftsState = {
   currentLang: "",
 };
 
-const LANG_FLAG = { es:"🇪🇸", en:"🇬🇧", pt:"🇵🇹", it:"🇮🇹", fr:"🇫🇷", de:"🇩🇪", ar:"🇸🇦" };
-// GEO (alpha-2) → idioma del template
+// Solo soportamos 5 idiomas en drafts: ES / EN / IT / PT / AR
+const LANG_FLAG = { es:"🇪🇸", en:"🇬🇧", it:"🇮🇹", pt:"🇵🇹", ar:"🇸🇦" };
+// GEO (alpha-2) → idioma del template. Países sin idioma soportado caen a EN.
 const GEO_TO_LANG = {
+  // Spanish-speaking
   AR:"es", MX:"es", CO:"es", CL:"es", PE:"es", UY:"es", PY:"es", BO:"es",
   EC:"es", VE:"es", DO:"es", CR:"es", PA:"es", GT:"es", HN:"es", SV:"es",
   NI:"es", CU:"es", PR:"es", ES:"es",
+  // English-speaking
   US:"en", GB:"en", CA:"en", AU:"en", NZ:"en", IE:"en", IN:"en", ZA:"en", SG:"en",
+  // Portuguese
   BR:"pt", PT:"pt",
+  // Italian
   IT:"it", CH:"it",
-  FR:"fr", BE:"fr", LU:"fr",
-  DE:"de", AT:"de",
+  // Arabic
   AE:"ar", SA:"ar", EG:"ar", MA:"ar",
+  // Otros países sin idioma propio en nuestro stack → EN como default razonable
+  FR:"en", BE:"en", LU:"en", DE:"en", AT:"en", NL:"en", PL:"en", TR:"en",
 };
 
 function _rebuildDraftsByLang() {

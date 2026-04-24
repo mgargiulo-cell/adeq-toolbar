@@ -143,21 +143,23 @@ async function fetchEngagement(domain) {
   } catch { return null; }
 }
 
-// Estimación de PagePerVisit según categoría del sitio — último recurso
-// Basado en industry benchmarks públicos (SimilarWeb, Statista, ComScore)
+// Estimación de PagePerVisit cuando SimilarWeb no devuelve dato real.
+// Se usa como ÚLTIMO RECURSO. Cap conservador a 1.5 — sobrestimar páginas
+// vistas infla el "qualifies" y termina pusheando basura a Monday. Mejor
+// quedarse corto que largo.
 const CATEGORY_PAGES_PER_VISIT = {
-  news:          4.5,
-  sports:        5.0,
-  entertainment: 5.5,
-  gambling:      6.0,
-  finance:       2.8,
-  technology:    2.5,
-  business:      2.5,
-  health:        3.0,
-  travel:        4.0,
-  automotive:    3.5,
-  food:          3.8,
-  other:         3.0,
+  news:          1.5,
+  sports:        1.5,
+  entertainment: 1.5,
+  gambling:      1.5,
+  finance:       1.3,
+  technology:    1.3,
+  business:      1.3,
+  health:        1.4,
+  travel:        1.5,
+  automotive:    1.4,
+  food:          1.4,
+  other:         1.2,
 };
 
 function estimatePagesPerVisit(category) {
