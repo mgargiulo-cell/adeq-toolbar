@@ -297,7 +297,7 @@
     <!-- Pitch -->
     <div class="sub-section">
       <div class="sub-title-row">
-        <span class="sub-title">🤖 Pitch with Gemini</span>
+        <span class="sub-title">🤖 Pitch with Claude</span>
         <select id="pitch-language" class="category-select" title="Email language" style="font-size:11px;padding:2px 4px;">
           <option value="en">English</option>
           <option value="es">Spanish</option>
@@ -367,8 +367,9 @@
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
         <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
+        <select id="analysis-draft-select" class="form-select" style="font-size:10px;padding:2px 6px;max-width:160px"><option value="">📋 Load draft...</option></select>
         <button id="btn-pitch-like" class="btn btn-secondary btn-sm pitch-like-btn" style="display:none" title="Save as style example">👍</button>
-        <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Gemini will avoid it">👎</button>
+        <button id="btn-pitch-dislike" class="btn btn-ghost btn-sm pitch-dislike-btn" style="display:none" title="Mark as bad — Claude will avoid it">👎</button>
         <span id="pitch-like-status" class="pitch-like-status"></span>
       </div>
     </div>

@@ -3541,6 +3541,56 @@ function initPitchInlineControls() {
     _draftsState.flagIdxByLang.set(_draftsState.currentLang, 0);
     updatePitchFlagButton();
   });
+
+  // Dropdown "📋 Load draft..." — manual override cuando GEO/idioma falló.
+  // Idéntico al de Prospect cards. Agrupado por idioma con optgroups.
+  const draftSel = document.getElementById("analysis-draft-select");
+  if (draftSel) {
+    const populate = () => {
+      while (draftSel.options.length > 1) draftSel.remove(1);
+      const langGroups = { es: [], en: [], pt: [], it: [], ar: [] };
+      for (const d of _draftsState.all) {
+        if (langGroups[d.language]) langGroups[d.language].push(d);
+      }
+      const langLabel = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", ar:"🇸🇦 AR" };
+      for (const [lang, list] of Object.entries(langGroups)) {
+        if (list.length === 0) continue;
+        const og = document.createElement("optgroup");
+        og.label = langLabel[lang] || lang;
+        for (const d of list) {
+          const o = document.createElement("option");
+          o.value = d.id;
+          o.textContent = d.name + (d.user_email === "_default_" ? " · default" : "");
+          og.appendChild(o);
+        }
+        draftSel.appendChild(og);
+      }
+    };
+    // Populate ahora si la cache existe, y refrescar tras cargarla
+    if (_draftsState.loaded) populate();
+    else loadDraftsCache().then(populate).catch(() => {});
+
+    draftSel.addEventListener("change", (e) => {
+      const id = e.target.value;
+      if (!id) return;
+      const d = _draftsState.all.find(x => String(x.id) === id);
+      if (!d) return;
+      // Aplicar pisando lo que esté
+      const domain = state.domain || "example.com";
+      const subjEl = document.getElementById("form-subject");
+      const ptEl   = document.getElementById("pitch-text");
+      if (ptEl)  ptEl.value  = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
+      if (subjEl) subjEl.value = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
+      // Sincronizar bandera al idioma de este draft (override manual del usuario)
+      _draftsState.currentLang = d.language;
+      const drafts = _draftsState.byLang.get(d.language) || [];
+      const idx = drafts.findIndex(x => x.id === d.id);
+      _draftsState.flagIdxByLang.set(d.language, idx >= 0 ? idx : 0);
+      updatePitchFlagButton();
+      ptEl?.dispatchEvent(new Event("input"));
+      draftSel.value = ""; // reset
+    });
+  }
 }
 
 // ── Pitch Drafts modal ────────────────────────────────────────
@@ -4141,7 +4191,7 @@ function renderProspectCard(r) {
         <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
 
         <div class="pitch-actions" style="margin-top:6px">
-          <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate" : "✨ Generate"}</button>
+          <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate Pitch" : "✨ Generate Pitch"}</button>
           <select class="pcard-draft-select form-select" style="font-size:10px;padding:2px 6px;max-width:160px"><option value="">📋 Load draft...</option></select>
         </div>
         ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-top:4px">📡 Ad networks: ${esc(adNetworks.join(", "))}</div>` : ""}
@@ -4287,8 +4337,13 @@ function initProspectCard(card, data) {
     const flagBtn   = card.querySelector(".pcard-flag-btn");
     if (!flagEmoji || !nameEl || !flagBtn) return;
     const drafts = _cardDrafts();
-    flagEmoji.textContent = LANG_FLAG[cardFlag.lang] || "🌐";
-    if (drafts.length === 0) { nameEl.textContent = "sin drafts"; flagBtn.title = `Sin drafts en ${cardFlag.lang}`; return; }
+    const flag   = LANG_FLAG[cardFlag.lang];
+    flagEmoji.textContent = flag || "🌐";
+    if (drafts.length === 0) {
+      nameEl.textContent = flag ? `Sin templates en ${cardFlag.lang.toUpperCase()}` : "Idioma desconocido";
+      flagBtn.title = `No hay drafts en este idioma. Abrí 📝 (header) para crear uno.`;
+      return;
+    }
     const cur = drafts[cardFlag.idx];
     const cleanName = (cur?.name || `Template ${cardFlag.idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
     nameEl.textContent = `${cleanName} (${cardFlag.idx + 1}/${drafts.length})`;
@@ -4304,16 +4359,22 @@ function initProspectCard(card, data) {
     if (subjectEl) subjectEl.value = replaceVars(d.subject || "");
   };
 
-  // Autocarga draft prio-1 al render SOLO si el pitch viene vacío
-  // (no pisar lo que ya existe en review_queue)
-  if (!r.pitch || !r.pitch.trim()) {
-    const drafts = _cardDrafts();
-    if (drafts.length > 0) {
-      cardFlag.idx = 0;
-      _applyCardDraft(drafts[0]);
+  // Init asíncrono: si la cache de drafts está vacía, la cargamos primero
+  // (puede pasar si el user abrió Prospects sin haber abierto Analysis antes)
+  (async () => {
+    if (!_draftsState.loaded) {
+      try { await loadDraftsCache(); } catch {}
     }
-  }
-  _updateCardFlagBtn();
+    // Autocarga draft prio-1 al render SOLO si el pitch viene vacío
+    if (!r.pitch || !r.pitch.trim()) {
+      const drafts = _cardDrafts();
+      if (drafts.length > 0) {
+        cardFlag.idx = 0;
+        _applyCardDraft(drafts[0]);
+      }
+    }
+    _updateCardFlagBtn();
+  })();
 
   // Click en bandera = rotar
   card.querySelector(".pcard-flag-btn")?.addEventListener("click", () => {
