@@ -3656,17 +3656,19 @@ function initPitchDrafts() {
         const tagClass  = isDefault ? "color:#0369a1" : "color:var(--text-muted)";
         const prio      = d.priority ?? 3;
         const stars     = "⭐".repeat(prio);
+        // Toda la card es clickeable para editar (incluso defaults — al editar
+        // un default se crea una copia privada del user, los demás siguen viendo el original)
         html.push(`
-          <div class="draft-item" data-id="${d.id}" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:var(--bg-soft, #fafafa)">
+          <div class="draft-item" data-id="${d.id}" style="padding:10px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:var(--bg-soft, #fafafa);cursor:pointer" title="Click para editar">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
-              <strong style="font-size:12px">${esc(d.name)}</strong>
+              <strong style="font-size:13px">${esc(d.name)}</strong>
               <span style="font-size:10px; ${tagClass}" title="Prioridad ${prio}">${stars}${isDefault ? " · DEFAULT" : ""}</span>
             </div>
-            ${d.subject ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${esc(d.subject)}</div>` : ""}
-            <div style="font-size:10px;color:var(--text-muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc((d.body || "").substring(0, 80))}</div>
-            <div style="display:flex;gap:4px;margin-top:6px">
-              <button class="btn btn-primary btn-sm draft-use-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px;flex:1">✅ Usar</button>
-              ${isDefault ? "" : `<button class="btn btn-secondary btn-sm draft-edit-btn" data-id="${d.id}" style="font-size:10px;padding:2px 8px">✏️ Editar</button>`}
+            ${d.subject ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px"><strong>Asunto:</strong> ${esc(d.subject)}</div>` : ""}
+            <div style="font-size:10px;color:var(--text-muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc((d.body || "").substring(0, 100))}…</div>
+            <div style="display:flex;gap:4px;margin-top:8px">
+              <button class="btn btn-primary btn-sm draft-use-btn" data-id="${d.id}" style="font-size:10px;padding:3px 10px">✅ Usar este</button>
+              <button class="btn btn-secondary btn-sm draft-edit-btn" data-id="${d.id}" style="font-size:10px;padding:3px 10px">✏️ Editar</button>
             </div>
           </div>`);
       }
@@ -4109,11 +4111,9 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
-        <button class="btn btn-secondary btn-sm pcard-expand-btn" title="See email &amp; data" style="padding:3px 7px">▼</button>
-        <button class="btn btn-sm pcard-like-btn" title="I want more like this — train the autopilot" aria-label="Like" style="padding:3px 6px;color:#16a34a;background:transparent;border:1px solid var(--border)">👍</button>
-        <button class="btn btn-sm pcard-dislike-btn" title="Not useful — autopilot will avoid these" aria-label="Dislike" style="padding:3px 6px;background:transparent;border:1px solid var(--border)">👎</button>
-        <button class="btn btn-success btn-sm pcard-validate-btn" title="Push to Monday + Send Email" style="padding:3px 7px">✅</button>
-        <button class="btn btn-sm pcard-reject-btn" title="Reject permanently" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
+        <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Ver datos + email" style="padding:3px 7px">▼</button>
+        <button class="btn btn-success btn-sm pcard-validate-btn" title="✅ Push a Monday + enviar email (positivo, lo quiero)" style="padding:3px 7px">✅</button>
+        <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
 
@@ -4247,6 +4247,15 @@ function renderProspectCard(r) {
 
 function initProspectCard(card, data) {
   const id = data.id;
+
+  // Re-computar emails filtrados (mismo filtro que renderProspectCard).
+  // OJO: antes usábamos `emails` del closure de renderProspectCard → ReferenceError
+  // que mataba TODOS los handlers de la card (expand, validate, reject).
+  const emails = (Array.isArray(data.emails) ? data.emails : [])
+    .map(e => (e || "").trim())
+    .filter(Boolean)
+    .filter(e => !isGarbageEmail(e))
+    .filter((e, i, arr) => arr.indexOf(e) === i);
 
   // Domain link → open tab
   card.querySelector(".pcard-domain-link")?.addEventListener("click", e => {

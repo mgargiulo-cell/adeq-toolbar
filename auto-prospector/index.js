@@ -491,13 +491,21 @@ async function rapidFetchWithRetry(url, headers, timeout = 8000) {
 async function getTrafficData(domain, rapidApiKey) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "similarweb-insights.p.rapidapi.com" };
   try {
-    const data = await rapidFetchWithRetry(
-      `https://similarweb-insights.p.rapidapi.com/traffic?domain=${encodeURIComponent(domain)}`,
+    // Primary: /all-insights (devuelve Visits + TopCountries + Category en una sola llamada)
+    let data = await rapidFetchWithRetry(
+      `https://similarweb-insights.p.rapidapi.com/all-insights?domain=${encodeURIComponent(domain)}`,
       headers
     );
-    if (!data) return { visits: null, topCountry: null, error: null };             // 4xx = domain not in SW
-    if (data.__error) return { visits: null, topCountry: null, error: data.__error }; // retries exhausted
-    const visits = data?.Visits || data?.visits || data?.pageViews || null;
+    // Fallback: /traffic si /all-insights falla (plan no lo cubre)
+    if (!data || data.__error) {
+      data = await rapidFetchWithRetry(
+        `https://similarweb-insights.p.rapidapi.com/traffic?domain=${encodeURIComponent(domain)}`,
+        headers
+      );
+    }
+    if (!data) return { visits: null, topCountry: null, error: null };
+    if (data.__error) return { visits: null, topCountry: null, error: data.__error };
+    const visits = data?.Visits || data?.visits || data?.pageViews || data?.PageViews || null;
 
     // Extract top country — try inline data first, then separate /countries endpoint
     let topCountry = null;
