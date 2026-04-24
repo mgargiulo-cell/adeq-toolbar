@@ -355,14 +355,24 @@
         </div>
       </div>
 
-      <!-- Bandera + rotator + limpiar — funciona bien en Analysis porque
-           el idioma se detecta desde la página real (no scraping cacheado) -->
+      <!-- Asunto del email — separado visualmente del cuerpo -->
+      <div class="pitch-subject-row">
+        <label class="pitch-subject-label">📨 Asunto</label>
+        <input id="form-subject" class="form-input pitch-subject-input" type="text" placeholder="Asunto del email..." />
+      </div>
+
+      <!-- Toolbar: bandera+nombre del template (izq) | chips de idiomas + Limpiar (der) -->
       <div class="pitch-toolbar">
         <button id="btn-pitch-flag" type="button" class="pitch-tool-btn pitch-tool-flag" title="Click para rotar templates del mismo idioma">
           <span id="pitch-flag-emoji">🌐</span>
           <span id="pitch-flag-name" class="pitch-tool-name">—</span>
         </button>
-        <button id="btn-pitch-clear" type="button" class="pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
+        <div class="pitch-toolbar-right">
+          <div id="pitch-lang-flags" class="pitch-lang-flags" title="Cambiar idioma del template">
+            <!-- llenado por JS — chips pequeños 🇪🇸 🇬🇧 🇮🇹 🇵🇹 🇸🇦 -->
+          </div>
+          <button id="btn-pitch-clear" type="button" class="pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
+        </div>
       </div>
       <textarea id="pitch-text" class="pitch-textarea" placeholder="Borrador del idioma se autocarga acá..."></textarea>
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
@@ -382,10 +392,9 @@
       <button id="btn-autopush-prepare" class="btn btn-success btn-full" style="margin-top:8px">⚡ Prepare all</button>
     </div>
 
-    <!-- Gmail -->
+    <!-- Gmail (subject ya está arriba del textarea, junto al pitch) -->
     <div class="sub-section" style="padding-bottom:4px">
       <div id="gmail-from" class="gmail-from"></div>
-      <input id="form-subject" class="form-input" type="text" placeholder="Email subject..." style="margin-bottom:6px" />
       <button id="btn-send-gmail" class="btn btn-gmail btn-full">📧 Send via Gmail</button>
       <div id="gmail-result" class="push-result"></div>
     </div>

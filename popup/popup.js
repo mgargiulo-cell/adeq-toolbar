@@ -3504,7 +3504,9 @@ function renderDraftChips(containerEl, { activeId = null, preferredLang = null, 
   });
 }
 
-// Analysis tab: bandera + nombre del template, click rota dentro del idioma actual
+// Analysis tab: bandera + nombre del template + chips de idiomas a la derecha.
+// Click bandera → rota dentro del idioma actual.
+// Click chip de idioma → cambia el idioma + carga prio-1 de ese idioma.
 function updatePitchFlagButton() {
   const flagBtn   = document.getElementById("btn-pitch-flag");
   const flagEmoji = document.getElementById("pitch-flag-emoji");
@@ -3516,13 +3518,42 @@ function updatePitchFlagButton() {
   if (drafts.length === 0) {
     nameEl.textContent = LANG_FLAG[lang] ? `Sin templates en ${lang.toUpperCase()}` : "Idioma desconocido";
     flagBtn.title = `No hay drafts. Abrí 📝 (header) para crear uno.`;
-    return;
+  } else {
+    const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
+    const current = drafts[idx];
+    const cleanName = (current?.name || `Template ${idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
+    nameEl.textContent = `${cleanName} (${idx + 1}/${drafts.length})`;
+    flagBtn.title = `Click para rotar templates del mismo idioma`;
   }
-  const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
-  const current = drafts[idx];
-  const cleanName = (current?.name || `Template ${idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
-  nameEl.textContent = `${cleanName} (${idx + 1}/${drafts.length})`;
-  flagBtn.title = `Click para rotar templates del mismo idioma`;
+  // Chips de idioma — solo los que tienen al menos 1 draft
+  const flagsContainer = document.getElementById("pitch-lang-flags");
+  if (flagsContainer) {
+    const order = ["es", "en", "it", "pt", "ar"];
+    flagsContainer.innerHTML = order.map(l => {
+      const flag    = LANG_FLAG[l];
+      const has     = (_draftsState.byLang.get(l) || []).length > 0;
+      const cls     = `pitch-lang-flag${l === lang ? " active" : ""}${has ? "" : " disabled"}`;
+      return `<button type="button" class="${cls}" data-lang="${l}" title="${has ? "Cambiar a " + l.toUpperCase() : "Sin templates en " + l.toUpperCase()}">${flag}</button>`;
+    }).join("");
+    flagsContainer.querySelectorAll(".pitch-lang-flag").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const l = btn.dataset.lang;
+        const list = _draftsState.byLang.get(l) || [];
+        if (list.length === 0) return;
+        _draftsState.currentLang = l;
+        _draftsState.flagIdxByLang.set(l, 0);
+        // Aplicar prio-1 del nuevo idioma
+        const d = list[0];
+        const domain = state.domain || "example.com";
+        const ptEl   = document.getElementById("pitch-text");
+        const subjEl = document.getElementById("form-subject");
+        if (ptEl)   ptEl.value   = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
+        if (subjEl) subjEl.value = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
+        ptEl?.dispatchEvent(new Event("input"));
+        updatePitchFlagButton();
+      });
+    });
+  }
 }
 
 // Auto-carga el draft de prioridad 1 (o el primero ordenado) en el pitch al cargar la web.
@@ -4089,9 +4120,11 @@ function renderProspectCard(r) {
     <!-- Expandable detail panel -->
     <div class="pcard-detail" style="display:none;border-top:1px solid var(--border);padding:10px">
 
-      <!-- Email selection -->
+      <!-- Email selection — autoverify + Apollo first + ver más toggle (mismo sistema que Analysis) -->
       <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px">Select email to send</div>
-      ${hasEmail ? emailOptions : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails found — enter manually.</div>'}
+      <div class="pcard-email-list email-list">
+        ${hasEmail ? "" : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails — escribilo manualmente abajo</div>'}
+      </div>
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
       <!-- Pitch — replica EXACTA del bloque del tab Analysis para que el user
@@ -4156,21 +4189,28 @@ function renderProspectCard(r) {
           </div>
         </div>
 
-        <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
+        <!-- Asunto separado visualmente (igual que Analysis) -->
+        <div class="pitch-subject-row">
+          <label class="pitch-subject-label">📨 Asunto</label>
+          <input type="text" class="form-input pitch-subject-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Asunto del email..." />
+        </div>
         <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
 
-        <!-- Chip strip: TODOS los templates con bandera. 1 click para usar.
-             En Prospects mostramos todos porque la GEO viene de scraping
-             cacheado y a veces falla — mejor que el user pueda elegir directo. -->
-        <div class="pcard-draft-chips draft-chips"></div>
-        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Click un borrador arriba para cargarlo...">${esc(r.pitch || "")}</textarea>
-        <div style="display:flex;justify-content:flex-end;margin-top:3px">
-          <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch" style="font-size:10px;padding:2px 7px">🗑️ Limpiar</button>
+        <!-- Toolbar idéntica a Analysis: bandera+rotator | chips de idiomas + Limpiar -->
+        <div class="pitch-toolbar">
+          <button type="button" class="pcard-flag-btn pitch-tool-btn pitch-tool-flag" title="Click para rotar templates del idioma">
+            <span class="pcard-flag-emoji">🌐</span>
+            <span class="pcard-flag-name pitch-tool-name">—</span>
+          </button>
+          <div class="pitch-toolbar-right">
+            <div class="pcard-lang-flags pitch-lang-flags" title="Cambiar idioma del template"></div>
+            <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
+          </div>
         </div>
+        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
 
         <div class="pitch-actions" style="margin-top:6px">
           <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate Pitch" : "✨ Generate Pitch"}</button>
-          <select class="pcard-draft-select form-select" style="font-size:10px;padding:2px 6px;max-width:160px"><option value="">📋 Load draft...</option></select>
         </div>
         ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-top:4px">📡 Ad networks: ${esc(adNetworks.join(", "))}</div>` : ""}
         <div class="pcard-generate-result" style="font-size:10px;color:#e53e3e;margin-top:3px"></div>
@@ -4187,6 +4227,10 @@ function renderProspectCard(r) {
         <select class="form-select pcard-lang">${langOptions}</select>
         <label class="form-label">GEO</label>
         <input type="text" class="form-input pcard-geo" value="${esc(r.geo || "")}" placeholder="e.g. Mexico" style="font-size:11px;padding:4px 7px" />
+        <label class="form-label">Email</label>
+        <input type="text" class="form-input pcard-email-monday" value="${esc(emails[0] || "")}" placeholder="Email a Monday" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
+        <label class="form-label">Date</label>
+        <input type="text" class="form-input pcard-date" value="${toDisplayDate(new Date().toISOString().split("T")[0])}" placeholder="DD/MM/YYYY" maxlength="10" style="font-size:11px;padding:4px 7px" title="Auto-completada con hoy — editable" />
         <label class="form-label">Traffic</label>
         <div style="font-size:12px;font-weight:600;padding:4px 0">${trafficFmt}</div>
       </div>
@@ -4219,40 +4263,59 @@ function initProspectCard(card, data) {
     btn.textContent     = open ? "▲" : "▼";
   });
 
-  // Draft dropdown — populate + handler
-  const draftSelect = card.querySelector(".pcard-draft-select");
-  if (draftSelect && _cachedProspectDrafts.length > 0) {
-    const langGroups = { es: [], en: [], pt: [], it: [], ar: [] };
-    for (const d of _cachedProspectDrafts) {
-      if (langGroups[d.language]) langGroups[d.language].push(d);
+  // Draft dropdown REMOVIDO — ahora hay chips de banderas + bandera-rotator (ver _updateCardUI)
+
+  // ── Lista de emails con autoverify + Apollo first + ver más toggle ────
+  // Mismo sistema que Analysis. Apollo va primero. Click sincroniza el
+  // campo "Email" de Monday data abajo.
+  const renderProspectEmailList = () => {
+    const listEl = card.querySelector(".pcard-email-list");
+    if (!listEl || emails.length === 0) return;
+
+    // Backend ya guardó Apollo primero en r.emails (apolloEmails antes que scraperEmails),
+    // pero por las dudas reordenamos por source si lo tenemos
+    const sorted = emails;
+
+    const VISIBLE = 5;
+    const visible = sorted.slice(0, VISIBLE);
+    const hidden  = sorted.slice(VISIBLE);
+
+    const chipFor = (e) => {
+      const cached = _emailVerifyCache.get(e);
+      const cls    = cached ? _verifyClass(cached) : "verify-pending";
+      return `<div class="email-chip ${cls}" data-email="${esc(e)}" title="Verificando…">${esc(e)}</div>`;
+    };
+
+    let html = visible.map(chipFor).join("");
+    if (hidden.length > 0) {
+      html += `<div class="email-chips-hidden" style="display:none">${hidden.map(chipFor).join("")}</div>`;
+      html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline">+ ver ${hidden.length} más…</button>`;
     }
-    const langLabel = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", ar:"🇸🇦 AR" };
-    for (const [lang, drafts] of Object.entries(langGroups)) {
-      if (drafts.length === 0) continue;
-      const optgroup = document.createElement("optgroup");
-      optgroup.label = langLabel[lang] || lang.toUpperCase();
-      for (const d of drafts) {
-        const opt = document.createElement("option");
-        opt.value = d.id;
-        opt.textContent = d.name + (d.user_email === "_default_" ? " · default" : "");
-        optgroup.appendChild(opt);
-      }
-      draftSelect.appendChild(optgroup);
-    }
-    draftSelect.addEventListener("change", (e) => {
-      const id = e.target.value;
-      if (!id) return;
-      const draft = _cachedProspectDrafts.find(x => String(x.id) === id);
-      if (!draft) return;
-      // Replace {{domain}} placeholder and inject
-      const replaceVars = (s) => (s || "").replace(/\{\{domain\}\}/g, data.domain);
-      const pitchEl   = card.querySelector(".pcard-pitch");
-      const subjectEl = card.querySelector(".pcard-subject");
-      if (pitchEl)   pitchEl.value   = replaceVars(draft.body);
-      if (subjectEl) subjectEl.value = replaceVars(draft.subject || "");
-      draftSelect.value = ""; // reset after selection
+    listEl.innerHTML = html;
+
+    // Toggle ver más
+    listEl.querySelector(".email-show-more")?.addEventListener("click", (e) => {
+      const block = listEl.querySelector(".email-chips-hidden");
+      if (block) { block.style.display = "block"; e.target.style.display = "none"; }
     });
-  }
+
+    // Click chip = seleccionar + sincronizar email a Monday data
+    const mondayEmailEl = card.querySelector(".pcard-email-monday");
+    listEl.querySelectorAll(".email-chip").forEach(chip => {
+      chip.addEventListener("click", () => {
+        listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+        chip.classList.add("selected");
+        if (mondayEmailEl) mondayEmailEl.value = chip.dataset.email;
+      });
+    });
+    // Pre-seleccionar el primero (Apollo)
+    const first = listEl.querySelector(".email-chip");
+    if (first) first.classList.add("selected");
+
+    // Auto-verify en background — pinta colores
+    autoVerifyEmailChips(listEl).catch(e => console.warn("[pcard autoVerify]", e));
+  };
+  renderProspectEmailList();
 
   // ── Pitch style pills (tone/length/focus/opening) — replica del Analysis ──
   try {
@@ -4316,50 +4379,87 @@ function initProspectCard(card, data) {
     if (subjectEl) subjectEl.value = replaceVars(d.subject || "");
   };
 
-  // Render del chip strip + autocarga del prio-1 del idioma detectado.
-  // Init asíncrono porque la cache puede no estar lista todavía.
-  let cardActiveDraftId = null;
-  const _renderChips = () => {
-    const chipsEl = card.querySelector(".pcard-draft-chips");
-    if (!chipsEl) return;
-    renderDraftChips(chipsEl, {
-      activeId: cardActiveDraftId,
-      preferredLang: cardFlag.lang,
-      onPick: (d) => {
-        cardActiveDraftId = d.id;
-        _applyCardDraft(d);
-      },
-    });
+  const _cardDraftsForLang = () => (_draftsState.byLang.get(cardFlag.lang) || []);
+
+  const _updateCardUI = () => {
+    // Bandera + nombre del template
+    const flagEmoji = card.querySelector(".pcard-flag-emoji");
+    const nameEl    = card.querySelector(".pcard-flag-name");
+    const flagBtn   = card.querySelector(".pcard-flag-btn");
+    const drafts    = _cardDraftsForLang();
+    if (flagEmoji && nameEl && flagBtn) {
+      const flag = LANG_FLAG[cardFlag.lang];
+      flagEmoji.textContent = flag || "🌐";
+      if (drafts.length === 0) {
+        nameEl.textContent = flag ? `Sin templates en ${cardFlag.lang.toUpperCase()}` : "Idioma desconocido";
+        flagBtn.title = `No hay drafts en este idioma`;
+      } else {
+        const cur = drafts[cardFlag.idx];
+        const cleanName = (cur?.name || `Template ${cardFlag.idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
+        nameEl.textContent = `${cleanName} (${cardFlag.idx + 1}/${drafts.length})`;
+        flagBtn.title = `Click para rotar`;
+      }
+    }
+    // Chips de idiomas
+    const flagsEl = card.querySelector(".pcard-lang-flags");
+    if (flagsEl) {
+      const order = ["es", "en", "it", "pt", "ar"];
+      flagsEl.innerHTML = order.map(l => {
+        const flag    = LANG_FLAG[l];
+        const has     = (_draftsState.byLang.get(l) || []).length > 0;
+        const cls     = `pitch-lang-flag${l === cardFlag.lang ? " active" : ""}${has ? "" : " disabled"}`;
+        return `<button type="button" class="${cls}" data-lang="${l}" title="${has ? "Cambiar a " + l.toUpperCase() : "Sin templates"}">${flag}</button>`;
+      }).join("");
+      flagsEl.querySelectorAll(".pitch-lang-flag").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const l = btn.dataset.lang;
+          const list = _draftsState.byLang.get(l) || [];
+          if (list.length === 0) return;
+          cardFlag.lang = l;
+          cardFlag.idx  = 0;
+          _applyCardDraft(list[0]);
+          _updateCardUI();
+        });
+      });
+    }
   };
 
   (async () => {
     if (!_draftsState.loaded) {
       try { await loadDraftsCache(); } catch {}
     }
-    // Autocarga draft prio-1 del idioma detectado SOLO si el pitch viene vacío
     if (!r.pitch || !r.pitch.trim()) {
-      const drafts = _draftsState.byLang.get(cardFlag.lang) || [];
+      const drafts = _cardDraftsForLang();
       if (drafts.length > 0) {
-        cardActiveDraftId = drafts[0].id;
+        cardFlag.idx = 0;
         _applyCardDraft(drafts[0]);
       } else {
-        // Sin drafts en el idioma detectado — usar el de prioridad 1 de cualquiera
-        const fallback = (_draftsState.all || []).sort((a,b) => (a.priority??3)-(b.priority??3))[0];
-        if (fallback) {
-          cardActiveDraftId = fallback.id;
-          _applyCardDraft(fallback);
+        // Fallback: prio-1 de cualquier idioma
+        const sorted = (_draftsState.all || []).slice().sort((a,b) => (a.priority??3)-(b.priority??3));
+        const fb = sorted[0];
+        if (fb) {
+          cardFlag.lang = fb.language;
+          cardFlag.idx  = 0;
+          _applyCardDraft(fb);
         }
       }
     }
-    _renderChips();
+    _updateCardUI();
   })();
+
+  // Bandera = rotar template del mismo idioma
+  card.querySelector(".pcard-flag-btn")?.addEventListener("click", () => {
+    const drafts = _cardDraftsForLang();
+    if (drafts.length === 0) return;
+    cardFlag.idx = (cardFlag.idx + 1) % drafts.length;
+    _applyCardDraft(drafts[cardFlag.idx]);
+    _updateCardUI();
+  });
 
   // Trash = limpiar pitch
   card.querySelector(".pcard-clear-btn")?.addEventListener("click", () => {
     const pitchEl = card.querySelector(".pcard-pitch");
     if (pitchEl) { pitchEl.value = ""; pitchEl.focus(); }
-    cardActiveDraftId = null;
-    _renderChips();
   });
 
   // Subject chips — click selects subject into input
@@ -4527,10 +4627,17 @@ function initProspectCard(card, data) {
 }
 
 function getSelectedEmail(card) {
-  const manual = card.querySelector(".pcard-email-manual")?.value?.trim();
+  // Prioridad: 1) campo "Email" de Monday data (auto-completado pero editable)
+  //            2) input manual
+  //            3) chip seleccionado en la lista
+  const monday  = card.querySelector(".pcard-email-monday")?.value?.trim();
+  if (monday && monday.includes("@")) return monday;
+  const manual  = card.querySelector(".pcard-email-manual")?.value?.trim();
   if (manual && manual.includes("@")) return manual;
-  const checked = card.querySelector(".pcard-email-radio:checked");
-  return checked?.value || "";
+  const selected = card.querySelector(".pcard-email-list .email-chip.selected");
+  if (selected?.dataset.email) return selected.dataset.email;
+  const radio   = card.querySelector(".pcard-email-radio:checked");
+  return radio?.value || "";
 }
 
 async function validateProspect(card, data, doSendEmail) {
