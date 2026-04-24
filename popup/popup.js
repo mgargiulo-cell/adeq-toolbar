@@ -4693,18 +4693,29 @@ async function validateProspect(card, data, doSendEmail) {
 
   try {
     // 1. Push to Monday — UPDATE si vino de Monday Refresh (tiene monday_item_id),
-    //    CREATE si es Autopilot/CSV externo (item nuevo)
+    //    CREATE si es Autopilot/CSV externo (item nuevo).
+    //    En AMBOS casos pisamos TODAS las columnas con la data fresca del review_queue
+    //    + lo que el user editó en la card (geo, email, date, etc.).
     const mondayItemId = data.monday_item_id || null;
+    // Date desde el campo editable de la card (DD/MM/YYYY → YYYY-MM-DD para Monday)
+    const dateInput = card.querySelector(".pcard-date")?.value?.trim() || "";
+    let fechaISO = new Date().toISOString().split("T")[0];
+    if (dateInput) {
+      const parts = dateInput.split("/");
+      if (parts.length === 3 && parts[2].length === 4) {
+        fechaISO = `${parts[2]}-${parts[1].padStart(2,"0")}-${parts[0].padStart(2,"0")}`;
+      }
+    }
     const mondayPayload = {
       domain:    data.domain,
       traffic,
-      email:     doSendEmail ? email : "",
+      email,                        // Siempre se envía a Monday (no solo si doSendEmail)
       geo,
       pitch,
       estado,
       ejecutivo,
       idioma,
-      fecha:     new Date().toISOString().split("T")[0],
+      fecha:     fechaISO,
       loginEmail: state.loginEmail,
     };
     if (mondayItemId) {
