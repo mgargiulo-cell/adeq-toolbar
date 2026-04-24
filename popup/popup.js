@@ -8,7 +8,7 @@ import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, r
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
 import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
-import { verifyEmail, isGarbageEmail }                                                          from "../modules/emailVerifier.js";
+import { verifyEmail, verifyEmailDeep, isGarbageEmail }                                         from "../modules/emailVerifier.js";
 import { runCascade, getSimilarSites }                                                         from "../modules/cascade.js";
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
 import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
@@ -1119,11 +1119,16 @@ const _emailVerifyCache = new Map(); // email -> {valid, tags, reason, score}
 function _verifyClass(result) {
   if (!result) return "verify-pending";
   const tags = result.tags || [];
+  // Rojo: garbage absoluta o SMTP rechazó
   if (!result.valid || tags.includes("typo") || tags.includes("descartable") ||
-      tags.includes("sin-dns") || tags.includes("sin-mx") || tags.includes("proxy-whois")) {
+      tags.includes("descartable-remoto") || tags.includes("undeliverable") ||
+      tags.includes("spam") || tags.includes("sin-dns") || tags.includes("sin-mx") ||
+      tags.includes("proxy-whois")) {
     return "verify-bad";
   }
-  if (tags.includes("rol") || tags.includes("tld-sospechoso") || tags.includes("catch-all")) {
+  // Amarillo: válido pero dudoso (rol, catch-all, TLD raro)
+  if (tags.includes("rol") || tags.includes("tld-sospechoso") ||
+      tags.includes("catch-all") || tags.includes("catch-all-provider")) {
     return "verify-warn";
   }
   return "verify-good";
@@ -1134,7 +1139,11 @@ function _verifyTooltip(result) {
   const status = result.valid ? "✔ Válido" : "✖ Inválido";
   const reason = result.reason || "";
   const tags   = (result.tags || []).join(", ");
-  return [status, reason, tags ? `[${tags}]` : ""].filter(Boolean).join(" — ");
+  const src    = result.deepSource === "eva" ? "[SMTP confirmado]"
+               : result.deepSource === "local-only" ? "[solo DNS local]"
+               : "";
+  const cache  = result.fromCache ? "[cache]" : "";
+  return [status, reason, tags ? `[${tags}]` : "", src, cache].filter(Boolean).join(" — ");
 }
 
 async function autoVerifyEmailChips(listEl) {
@@ -1146,7 +1155,8 @@ async function autoVerifyEmailChips(listEl) {
     if (!email) return;
     let result = _emailVerifyCache.get(email);
     if (!result) {
-      try { result = await verifyEmail(email); }
+      // verifyEmailDeep = local + remote (eva.pingutil con cache 30 días)
+      try { result = await verifyEmailDeep(email); }
       catch { result = { valid: false, reason: "Error verifying", tags: ["error"] }; }
       _emailVerifyCache.set(email, result);
     }

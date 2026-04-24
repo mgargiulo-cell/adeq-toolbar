@@ -297,6 +297,120 @@ export async function verifyEmail(email) {
   };
 }
 
+// ── Verificación remota (deep) ────────────────────────────────
+// API gratuita pública (sin key, sin login): eva.pingutil.com hace
+// MX + SMTP RCPT TO + checks de spam/disposable del lado server.
+// Devuelve { deliverable, disposable, spam, mx_records, valid_syntax }.
+//
+// Estrategia:
+//   1. Corremos verifyEmail() local primero — descarta basura sin gastar request
+//   2. Si pasa el filtro local, llamamos a la API
+//   3. Cache 30 días en chrome.storage (un email por mes, máximo)
+//   4. Timeout 4s — si la red anda mal, fallback a resultado local
+
+const EVA_ENDPOINT = "https://api.eva.pingutil.com/email";
+const VERIFY_CACHE_KEY = "email_verify_deep_cache_v1";
+const VERIFY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días
+
+async function _getCachedVerify(email) {
+  try {
+    if (typeof chrome === "undefined" || !chrome.storage?.local) return null;
+    const { [VERIFY_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(VERIFY_CACHE_KEY);
+    const entry = cache[email.toLowerCase()];
+    if (!entry || (Date.now() - entry.t) > VERIFY_CACHE_TTL_MS) return null;
+    return entry.r;
+  } catch { return null; }
+}
+
+async function _setCachedVerify(email, result) {
+  try {
+    if (typeof chrome === "undefined" || !chrome.storage?.local) return;
+    const { [VERIFY_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(VERIFY_CACHE_KEY);
+    cache[email.toLowerCase()] = { t: Date.now(), r: result };
+    // Evict si pasa de 500 entries (un email pesa ~200 bytes → 100KB max)
+    const keys = Object.keys(cache);
+    if (keys.length > 500) {
+      const sorted = keys.map(k => [k, cache[k].t]).sort((a, b) => a[1] - b[1]);
+      for (let i = 0; i < keys.length - 400; i++) delete cache[sorted[i][0]];
+    }
+    await chrome.storage.local.set({ [VERIFY_CACHE_KEY]: cache });
+  } catch {}
+}
+
+export async function verifyEmailDeep(email) {
+  if (!email) return { valid: false, reason: "vacío", tags: ["formato"] };
+
+  // 1. Cache hit
+  const cached = await _getCachedVerify(email);
+  if (cached) return { ...cached, fromCache: true };
+
+  // 2. Local primero — si es garbage/inválido obvio, no malgastes la llamada remota
+  const local = await verifyEmail(email);
+  const localTags = local.tags || [];
+  if (!local.valid && (
+      localTags.includes("formato") || localTags.includes("typo") ||
+      localTags.includes("descartable") || localTags.includes("proxy-whois") ||
+      localTags.includes("sin-dns") || localTags.includes("sin-mx")
+  )) {
+    await _setCachedVerify(email, local);
+    return local;
+  }
+
+  // 3. Remote check (eva.pingutil.com) con timeout 4s
+  let remote = null;
+  try {
+    const ctrl = new AbortController();
+    const tid  = setTimeout(() => ctrl.abort(), 4000);
+    const res  = await fetch(`${EVA_ENDPOINT}?email=${encodeURIComponent(email)}`, { signal: ctrl.signal });
+    clearTimeout(tid);
+    if (res.ok) {
+      const json = await res.json();
+      // {status, data:{deliverable, disposable, spam, mx_records, valid_syntax, ...}}
+      remote = json?.data || json || null;
+    }
+  } catch { /* timeout o red caída — usamos solo local */ }
+
+  // 4. Combinar local + remote
+  if (!remote) {
+    // Sin info remota — usamos local pero marcamos que es solo local
+    const result = { ...local, deepSource: "local-only" };
+    await _setCachedVerify(email, result);
+    return result;
+  }
+
+  const tags = [...localTags];
+  let valid  = local.valid;
+  let reason = local.reason;
+  let score  = local.score;
+
+  if (remote.disposable) {
+    valid = false;
+    tags.push("descartable-remoto");
+    reason = "Marcado como descartable por servicio de verificación";
+    score = Math.min(score, 10);
+  }
+  if (remote.spam) {
+    valid = false;
+    tags.push("spam");
+    reason = "Marcado como spam-trap por servicio de verificación";
+    score = Math.min(score, 5);
+  }
+  if (remote.deliverable === false) {
+    valid = false;
+    tags.push("undeliverable");
+    reason = "SMTP rechazó el email — buzón no existe";
+    score = Math.min(score, 0);
+  } else if (remote.deliverable === true && local.valid) {
+    // Confirmación remota — boost
+    score = Math.max(score, 90);
+    if (!reason.includes("SMTP")) reason = `${reason} (confirmado SMTP)`;
+  }
+
+  const result = { valid, reason, tags, score, mxFound: local.mxFound, deepSource: "eva", remote };
+  await _setCachedVerify(email, result);
+  return result;
+}
+
 export async function verifyEmailList(emails) {
   const results = await Promise.all(
     emails.map(async email => ({ email, ...(await verifyEmail(email)) }))
