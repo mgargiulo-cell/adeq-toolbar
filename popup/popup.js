@@ -4183,13 +4183,13 @@ function renderProspectCard(r) {
             <button class="pitch-pill" data-val="long" type="button" hidden>📏 Long</button>
           </div>
           <div class="pitch-cycle-pills pcard-pitch-pills" data-group="focus">
-            <button class="pitch-pill active" data-val="analysis" type="button">📊 Análisis</button>
-            <button class="pitch-pill" data-val="nodataanalysis" type="button" hidden>📊 Sin análisis</button>
+            <button class="pitch-pill active" data-val="analysis" type="button">📊 Analysis</button>
+            <button class="pitch-pill" data-val="nodataanalysis" type="button" hidden>📊 No analysis</button>
           </div>
           <div class="pitch-cycle-pills pcard-pitch-pills" data-group="opening">
-            <button class="pitch-pill active" data-val="direct" type="button">🚀 Directo</button>
-            <button class="pitch-pill" data-val="problem" type="button" hidden>🚀 Problema</button>
-            <button class="pitch-pill" data-val="praise" type="button" hidden>🚀 Elogio</button>
+            <button class="pitch-pill active" data-val="direct" type="button">🚀 Direct</button>
+            <button class="pitch-pill" data-val="problem" type="button" hidden>🚀 Problem</button>
+            <button class="pitch-pill" data-val="praise" type="button" hidden>🚀 Praise</button>
           </div>
         </div>
 
