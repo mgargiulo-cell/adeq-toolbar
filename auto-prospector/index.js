@@ -352,6 +352,50 @@ async function markProcessed(token, domains, reason = "processed") {
 }
 
 // Bump the per-user/day/reason counter so the UI can show "today: 130 traffic_low / 25 added_to_review / ..."
+// ── GEO Cache (toolbar_domain_geo_cache) ──────────────────────
+// Cache compartido frontend+backend. Acá se usa para:
+//  1. Pre-filtrar pool ANTES de llamar SimilarWeb (gran ahorro)
+//  2. Persistir cada GEO obtenido (Radar + SimilarWeb)
+
+async function getCachedGeoBulk(token, domains) {
+  if (!Array.isArray(domains) || domains.length === 0) return new Map();
+  const result = new Map();
+  const CHUNK = 500;
+  for (let i = 0; i < domains.length; i += CHUNK) {
+    const slice = domains.slice(i, i + CHUNK);
+    const list  = slice.map(d => `"${d.replace(/"/g, "")}"`).join(",");
+    try {
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_domain_geo_cache?domain=in.(${encodeURIComponent(list)})&select=domain,country`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (!res.ok) continue;
+      const rows = await res.json();
+      for (const r of rows) result.set(r.domain, r.country);
+    } catch {}
+  }
+  return result;
+}
+
+async function setCachedGeo(token, domain, country, source = "unknown", confidence = 5) {
+  if (!domain || !country) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_domain_geo_cache?on_conflict=domain`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({
+        domain, country: country.toUpperCase().slice(0, 2),
+        source, confidence: Math.max(1, Math.min(10, parseInt(confidence) || 5)),
+        updated_at: new Date().toISOString(),
+      }),
+    });
+  } catch {}
+}
+
 async function bumpStat(token, userEmail, reason, n = 1) {
   if (!userEmail || !reason) return;
   try {
@@ -1419,10 +1463,34 @@ async function runSession(token, cfg, sessionStart) {
   }
 
   const mondaySet  = new Set(mondayDomains);
-  const candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
+  let candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
+
+  // ── PRE-FILTRO POR GEO CACHE ──────────────────────────────────
+  // Para cada candidato chequeamos si ya conocemos su país en cache.
+  // Si está y NO matchea allowedCountries → descartar SIN llamar SimilarWeb.
+  // Si está y SÍ matchea → priorizamos al frente del array.
+  // Si no está → queda como candidato normal (vamos a llamar SimilarWeb).
+  let geoFilteredOut = 0;
+  let geoCacheHits   = 0;
+  if (hasTargetGeo && candidates.length > 0) {
+    log(`Consultando GEO cache para ${candidates.length.toLocaleString()} candidatos...`);
+    const cachedGeos = await getCachedGeoBulk(token, candidates);
+    geoCacheHits = cachedGeos.size;
+    const matchedFirst = [];
+    const unknown      = [];
+    for (const d of candidates) {
+      const cc = cachedGeos.get(d);
+      if (!cc) { unknown.push(d); continue; }
+      if (allowedCountries.has(COUNTRY_CODES[cc] || cc)) matchedFirst.push(d);
+      else { geoFilteredOut++; }
+    }
+    candidates = [...matchedFirst, ...unknown];
+    log(`GEO cache: ${geoCacheHits} conocidos, ${matchedFirst.length} matchean target, ${geoFilteredOut} descartados sin gastar SimilarWeb, ${unknown.length} desconocidos por consultar.`);
+  }
+
   shuffleArray(candidates);
 
-  log(`Pool: ${pool.length.toLocaleString()} | Excluidos (Monday): ${mondayDomains.length} | Ya procesados: ${processed.size} | Candidatos: ${candidates.length.toLocaleString()}`);
+  log(`Pool: ${pool.length.toLocaleString()} | Excluidos (Monday): ${mondayDomains.length} | Ya procesados: ${processed.size} | Candidatos finales: ${candidates.length.toLocaleString()}`);
 
   if (candidates.length === 0) {
     if (pool.length === 0) {
@@ -1551,10 +1619,12 @@ async function runSession(token, cfg, sessionStart) {
     }
 
     // Fallback GEO orden: SimilarWeb > Radar hint > TLD
+    let geoSource = topCountry ? "similarweb" : null;
     if (!topCountry && radarPool?.has(domain)) {
       const cc = [...radarPool.get(domain)][0];
       if (cc && COUNTRY_CODES[cc]) {
         topCountry = COUNTRY_CODES[cc];
+        geoSource  = "radar";
         log(`  ℹ ${domain} — GEO del Radar: ${topCountry}`);
       }
     }
@@ -1562,8 +1632,16 @@ async function runSession(token, cfg, sessionStart) {
       const inferred = inferCountryFromTLD(domain);
       if (inferred) {
         topCountry = inferred;
+        geoSource  = "tld";
         log(`  ℹ ${domain} — GEO inferido por TLD: ${topCountry}`);
       }
+    }
+
+    // Persistir al cache compartido (alpha-2 code)
+    if (topCountry && geoSource) {
+      const cc = Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === topCountry) || topCountry.slice(0, 2).toUpperCase();
+      const conf = geoSource === "similarweb" ? 9 : geoSource === "radar" ? 8 : 3;
+      setCachedGeo(token, domain, cc, geoSource, conf).catch(() => {});
     }
 
     // Blacklist geográfica post-traffic — permanente, el país no va a cambiar

@@ -4,8 +4,18 @@
 // ============================================================
 
 import { CONFIG }                            from "../config.js";
-import { getTrafficCache, saveTrafficCache } from "./supabase.js";
+import { getTrafficCache, saveTrafficCache, getDomainGeo, setDomainGeo } from "./supabase.js";
 import { callProxy }                         from "./apiProxy.js";
+
+// Token de auth — se setea desde popup.js al iniciar sesión, lo necesitamos
+// para llamar al cache GEO en Supabase. Si no está, los lookups silently fallan.
+let _authToken = null;
+export function setTrafficAuthToken(t) { _authToken = t || null; }
+
+const SOURCE_CONFIDENCE = {
+  "similarweb": 9, "radar": 8, "footer-address": 7, "og-locale": 6,
+  "lang-region": 5, "phone-code": 5, "currency": 4, "tld": 3,
+};
 
 // Every RapidAPI call now goes through the Edge Function proxy (keys stay server-side)
 async function rapidFetch(path) {
@@ -267,6 +277,11 @@ export async function getTraffic(domain) {
           tags:           data.Tags         || [],
         };
         await saveTrafficCache(cleanDomain, result);
+        // Persistir GEO al cache compartido (autopilot lo aprovecha también)
+        if (topCountries[0]?.code && _authToken) {
+          const src = topCountries[0]?.source === "tld" ? "tld" : "similarweb";
+          setDomainGeo(_authToken, cleanDomain, topCountries[0].code, src, SOURCE_CONFIDENCE[src]).catch(() => {});
+        }
         return result;
       }
     }
@@ -306,6 +321,10 @@ export async function getTraffic(domain) {
       tags: [], topCountries,
     };
     await saveTrafficCache(cleanDomain, result);
+    if (topCountries[0]?.code && _authToken) {
+      const src = topCountries[0]?.source === "tld" ? "tld" : "similarweb";
+      setDomainGeo(_authToken, cleanDomain, topCountries[0].code, src, SOURCE_CONFIDENCE[src]).catch(() => {});
+    }
     return result;
 
   } catch (err) {

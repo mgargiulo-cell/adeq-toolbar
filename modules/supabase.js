@@ -1098,3 +1098,78 @@ export async function setCsvQueueEnabled(enabled, accessToken) {
     console.warn("setCsvQueueEnabled failed:", e.message);
   }
 }
+
+// ── Domain GEO cache ────────────────────────────────────────────
+// Cache permanente por dominio. Se llena oportunamente desde cualquier flow
+// que ya obtiene el país (SimilarWeb, Radar, footer, page-signal, TLD).
+// Uso típico:
+//   const cached = await getDomainGeo(token, "site.com");
+//   if (cached) → skip SimilarWeb call (gratis)
+//   if (!cached + SimilarWeb returned country) → setDomainGeo(token, "site.com", "AR", "similarweb")
+
+export async function getDomainGeo(accessToken, domain) {
+  if (!domain || !accessToken) return null;
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_domain_geo_cache?domain=eq.${encodeURIComponent(domain)}&select=domain,country,source,confidence,updated_at&limit=1`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows?.[0] || null;
+  } catch { return null; }
+}
+
+// Bulk: trae GEO de varios dominios en 1 request. Usado por autopilot para
+// pre-filtrar pool sin llamar SimilarWeb.
+export async function getDomainGeosBulk(accessToken, domains) {
+  if (!Array.isArray(domains) || domains.length === 0 || !accessToken) return new Map();
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  // PostgREST in.() acepta hasta unos 1000 elementos en URL; chunk si pasamos
+  const CHUNK = 500;
+  const result = new Map();
+  for (let i = 0; i < domains.length; i += CHUNK) {
+    const slice = domains.slice(i, i + CHUNK);
+    const list  = slice.map(d => `"${d.replace(/"/g, "")}"`).join(",");
+    try {
+      const res = await fetch(
+        `${url}/rest/v1/toolbar_domain_geo_cache?domain=in.(${encodeURIComponent(list)})&select=domain,country,source`,
+        { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+      );
+      if (!res.ok) continue;
+      const rows = await res.json();
+      for (const r of rows) result.set(r.domain, { country: r.country, source: r.source });
+    } catch {}
+  }
+  return result;
+}
+
+// Guarda (upsert). Confidence: 1-10 según fuente.
+//   similarweb: 9, radar: 8, footer-address: 7, og-locale: 6, lang-region: 5,
+//   phone-code: 5, currency: 4, tld: 3
+export async function setDomainGeo(accessToken, domain, country, source = "unknown", confidence = 5) {
+  if (!domain || !country || !accessToken) return false;
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    await fetch(`${url}/rest/v1/toolbar_domain_geo_cache?on_conflict=domain`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({
+        domain,
+        country: country.toUpperCase().slice(0, 2),
+        source,
+        confidence: Math.max(1, Math.min(10, parseInt(confidence) || 5)),
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    return true;
+  } catch { return false; }
+}

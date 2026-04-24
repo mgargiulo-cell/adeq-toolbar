@@ -3,7 +3,7 @@
 // ============================================================
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh } from "../modules/monday.js";
-import { getTraffic, formatTraffic, passesTrafficFilter } from "../modules/traffic.js";
+import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
@@ -20,7 +20,8 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, mark
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
          getDailyValidationCount, getApiUsageToday, getCustomPrompt, setCustomPrompt,
-         insertPitchFeedback, matchPitchFeedback, getApiUsageForProvider }                   from "../modules/supabase.js";
+         insertPitchFeedback, matchPitchFeedback, getApiUsageForProvider,
+         setDomainGeo, getDomainGeo }                                                          from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
@@ -157,6 +158,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Seed the shared Supabase auth token so every supabase.js request uses the user JWT (not anon)
   setSupabaseAuth(auth.accessToken);
+  setTrafficAuthToken(auth.accessToken);
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
   setProxyAuth(auth.accessToken);
 
@@ -175,6 +177,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           await chrome.storage.local.set({ auth });
           setSupabaseAuth(r.access_token);
           setProxyAuth(r.access_token);
+          setTrafficAuthToken(r.access_token);
           scheduleRefresh();
         }
       } catch (e) { console.warn("[AuthRefresh]", e.message); }
@@ -666,6 +669,13 @@ function enrichTrafficWithPageSignals(trafficData) {
       source: inferred.source, // "lang-region" | "og-locale" | "phone" | "currency"
     }];
     console.log(`[GEO] ${state.domain} inferido por ${inferred.source}: ${inferred.code}`);
+    // Persistir al cache compartido — esto es info que NO viene de SimilarWeb,
+    // muy valiosa porque sale del análisis de la página real.
+    const SOURCE_CONF = { "lang-region": 5, "og-locale": 6, "phone": 5, "currency": 4, "footer-name": 7 };
+    if (state.accessToken && state.domain) {
+      setDomainGeo(state.accessToken, state.domain, inferred.code,
+                   inferred.source, SOURCE_CONF[inferred.source] || 5).catch(() => {});
+    }
   }
   return trafficData;
 }
