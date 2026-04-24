@@ -1079,24 +1079,10 @@ function checkAutoPush() {
 // FOLLOW-UP
 // ============================================================
 function checkFUStatus(sendInfo) {
-  const today   = new Date().toISOString().split("T")[0];
-  const banner  = document.getElementById("fu-banner");
-  const textEl  = document.getElementById("fu-banner-text");
-  if (!banner || !textEl) return;
-
-  let fuNumber = null;
-  if (!sendInfo.fu1Sent && sendInfo.fu1Date && sendInfo.fu1Date <= today) {
-    fuNumber = 1;
-  } else if (!sendInfo.fu2Sent && sendInfo.fu2Date && sendInfo.fu2Date <= today) {
-    fuNumber = 2;
-  }
-
-  if (fuNumber) {
-    const days = Math.floor((Date.now() - new Date(sendInfo.sendDate)) / 86_400_000);
-    textEl.textContent         = `⏰ FU${fuNumber} pending — you sent the pitch ${days} days ago`;
-    banner.dataset.fuNumber    = fuNumber;
-    banner.style.display       = "flex";
-  }
+  // Banner FU oculto a pedido del user — confunde y no se está usando.
+  // Si querés volver a activarlo, restaurar la lógica del git history (commit anterior).
+  const banner = document.getElementById("fu-banner");
+  if (banner) banner.style.display = "none";
 }
 
 // ============================================================
