@@ -239,29 +239,7 @@
         <label class="form-label">GEO</label>
         <select id="form-geo" class="form-select">
           <option value="">— elegir —</option>
-          <option>Argentina</option><option>México</option><option>Colombia</option>
-          <option>Chile</option><option>Perú</option><option>Uruguay</option>
-          <option>Paraguay</option><option>Bolivia</option><option>Ecuador</option>
-          <option>Venezuela</option><option>Brasil</option><option>España</option>
-          <option>Costa Rica</option><option>Panamá</option><option>Guatemala</option>
-          <option>Honduras</option><option>El Salvador</option><option>Nicaragua</option>
-          <option>Cuba</option><option>Puerto Rico</option><option>República Dominicana</option>
-          <option>Estados Unidos</option><option>Canadá</option>
-          <option>Reino Unido</option><option>Francia</option><option>Alemania</option>
-          <option>Italia</option><option>Portugal</option><option>Países Bajos</option>
-          <option>Bélgica</option><option>Suiza</option><option>Austria</option>
-          <option>Polonia</option><option>Hungría</option><option>República Checa</option>
-          <option>Rumanía</option><option>Grecia</option><option>Irlanda</option>
-          <option>Luxemburgo</option><option>Suecia</option><option>Noruega</option>
-          <option>Dinamarca</option><option>Finlandia</option>
-          <option>Turquía</option><option>Israel</option><option>Emiratos Árabes Unidos</option>
-          <option>Arabia Saudita</option><option>Marruecos</option><option>Egipto</option>
-          <option>India</option><option>Japón</option><option>Corea del Sur</option>
-          <option>China</option><option>Singapur</option><option>Filipinas</option>
-          <option>Indonesia</option><option>Vietnam</option><option>Tailandia</option>
-          <option>Sudáfrica</option><option>Nigeria</option>
-          <option>Australia</option><option>Nueva Zelanda</option>
-          <option>Rusia</option><option>Ucrania</option>
+          <!-- Opciones se rellenan via populateCountryDropdown() desde MONDAY_COUNTRIES -->
         </select>
 
         <label class="form-label">Traffic</label>
@@ -437,58 +415,7 @@
           <span class="form-label">Geo</span>
           <select id="import-geo" class="form-select">
             <option value="">All</option>
-            <option value="Argentina">Argentina</option>
-            <option value="Mexico">Mexico</option>
-            <option value="Colombia">Colombia</option>
-            <option value="Chile">Chile</option>
-            <option value="Spain">Spain</option>
-            <option value="Brazil">Brazil</option>
-            <option value="Peru">Peru</option>
-            <option value="Ecuador">Ecuador</option>
-            <option value="Venezuela">Venezuela</option>
-            <option value="Bolivia">Bolivia</option>
-            <option value="Paraguay">Paraguay</option>
-            <option value="Uruguay">Uruguay</option>
-            <option value="United States">United States</option>
-            <option value="Canada">Canada</option>
-            <option value="United Kingdom">United Kingdom</option>
-            <option value="France">France</option>
-            <option value="Germany">Germany</option>
-            <option value="Italy">Italy</option>
-            <option value="Portugal">Portugal</option>
-            <option value="Netherlands">Netherlands</option>
-            <option value="Belgium">Belgium</option>
-            <option value="Switzerland">Switzerland</option>
-            <option value="Austria">Austria</option>
-            <option value="Sweden">Sweden</option>
-            <option value="Norway">Norway</option>
-            <option value="Denmark">Denmark</option>
-            <option value="Finland">Finland</option>
-            <option value="Poland">Poland</option>
-            <option value="Hungary">Hungary</option>
-            <option value="Czech Republic">Czech Republic</option>
-            <option value="Romania">Romania</option>
-            <option value="Greece">Greece</option>
-            <option value="Turkey">Turkey</option>
-            <option value="Israel">Israel</option>
-            <option value="UAE">UAE</option>
-            <option value="Saudi Arabia">Saudi Arabia</option>
-            <option value="Morocco">Morocco</option>
-            <option value="Egypt">Egypt</option>
-            <option value="Nigeria">Nigeria</option>
-            <option value="South Africa">South Africa</option>
-            <option value="India">India</option>
-            <option value="Japan">Japan</option>
-            <option value="South Korea">South Korea</option>
-            <option value="China">China</option>
-            <option value="Singapore">Singapore</option>
-            <option value="Indonesia">Indonesia</option>
-            <option value="Philippines">Philippines</option>
-            <option value="Thailand">Thailand</option>
-            <option value="Vietnam">Vietnam</option>
-            <option value="Australia">Australia</option>
-            <option value="Russia">Russia</option>
-            <option value="Ukraine">Ukraine</option>
+            <!-- Opciones rellenadas dinámicamente desde MONDAY_COUNTRIES -->
           </select>
         </div>
         <div class="import-filter-row">
@@ -863,30 +790,9 @@
     <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
-      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Debe matchear el valor exacto de la columna GEO en Monday. Usa 'contains_text' — match parcial OK.">
+      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Debe matchear el valor exacto de la columna GEO en Monday.">
         <option value="">Geo: Todos</option>
-        <option>Argentina</option><option>México</option><option>Colombia</option>
-        <option>Chile</option><option>Perú</option><option>Uruguay</option>
-        <option>Paraguay</option><option>Bolivia</option><option>Ecuador</option>
-        <option>Venezuela</option><option>Brasil</option><option>España</option>
-        <option>Costa Rica</option><option>Panamá</option><option>Guatemala</option>
-        <option>Honduras</option><option>El Salvador</option><option>Nicaragua</option>
-        <option>Cuba</option><option>Puerto Rico</option><option>República Dominicana</option>
-        <option>Estados Unidos</option><option>Canadá</option>
-        <option>Reino Unido</option><option>Francia</option><option>Alemania</option>
-        <option>Italia</option><option>Portugal</option><option>Países Bajos</option>
-        <option>Bélgica</option><option>Suiza</option><option>Austria</option>
-        <option>Polonia</option><option>Hungría</option><option>República Checa</option>
-        <option>Rumanía</option><option>Grecia</option><option>Irlanda</option>
-        <option>Suecia</option><option>Noruega</option><option>Dinamarca</option>
-        <option>Finlandia</option>
-        <option>Turquía</option><option>Israel</option><option>Emiratos Árabes Unidos</option>
-        <option>Arabia Saudita</option><option>Marruecos</option><option>Egipto</option>
-        <option>India</option><option>Japón</option><option>Corea del Sur</option>
-        <option>China</option><option>Singapur</option><option>Filipinas</option>
-        <option>Indonesia</option><option>Vietnam</option><option>Tailandia</option>
-        <option>Sudáfrica</option><option>Nigeria</option>
-        <option>Australia</option><option>Nueva Zelanda</option>
+        <!-- Opciones rellenadas dinámicamente desde MONDAY_COUNTRIES -->
       </select>
       <select id="refresh-idioma" class="form-select" style="font-size:11px">
         <option value="">Language: All</option>

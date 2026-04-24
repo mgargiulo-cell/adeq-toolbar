@@ -222,7 +222,16 @@ export async function getTraffic(domain) {
         if (Array.isArray(inlineCountries) && inlineCountries.length) {
           topCountries = inlineCountries.slice(0, 3).map(normalizeCountry).filter(Boolean);
         }
-        // Fallback TLD: si todavía no hay país, inferir del dominio
+        // Fallback 1: /countries endpoint (algunos planes lo exponen separado
+        // del /all-insights — vale el costo del request extra para asegurar GEO)
+        if (topCountries.length === 0) {
+          const sep = await fetchTopCountries(cleanDomain);
+          if (sep.length) {
+            topCountries = sep;
+            console.log(`[Traffic] ${cleanDomain} GEO via /countries: ${topCountries.map(c => c.code).join(",")}`);
+          }
+        }
+        // Fallback 2: TLD del dominio (.com.ar → AR, .es → ES)
         if (topCountries.length === 0) {
           const inferred = inferCountryFromTLD(cleanDomain);
           if (inferred) {
@@ -230,6 +239,8 @@ export async function getTraffic(domain) {
             console.log(`[Traffic] ${cleanDomain} GEO inferido por TLD: ${inferred}`);
           }
         }
+        // Las señales de página (lang-region, og:locale, footer-address) se aplican
+        // después en popup.js → enrichTrafficWithPageSignals(). Acá no las tenemos.
 
         const category = data.Category || "";
         // Fallback 2: estimar por categoría si ningún endpoint nos dió metrics

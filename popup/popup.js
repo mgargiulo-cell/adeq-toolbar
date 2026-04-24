@@ -222,6 +222,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindButtons();
   initPitchDrafts(); // used by Prospects cards + Analysis — cheap, keep eager
   initPitchInlineControls(); // bandera + trash al lado del pitch
+  // Poblar dropdowns de países desde MONDAY_COUNTRIES (lista exacta del board)
+  populateCountryDropdown(document.getElementById("form-geo"));
+  populateCountryDropdown(document.getElementById("import-geo"));
+  populateCountryDropdown(document.getElementById("refresh-geo"));
   bindCustomPromptHandlers();
   // Load per-user Claude custom prompt into state (no-op if empty). Used by generatePitch.
   getCustomPrompt(auth.accessToken, auth.user).then(p => { state.customPrompt = p || ""; }).catch(() => {});
@@ -292,21 +296,69 @@ document.addEventListener("DOMContentLoaded", async () => {
 // Los nombres están en CASTELLANO con primera letra mayúscula porque ese es
 // el formato que tiene la columna GEO del board de Monday. Si Monday cambia
 // (ej. agregan Honduras, Costa Rica), agregar acá también.
+// ── Lista exacta de países del board Monday ───────────────────
+// Esta es la "lista final" que se mostró en el dropdown del board. Tiene
+// duplicados/variantes (Bosnia + Bosnia y Herzegovina, Holanda + Netherlands
+// + Paises Bajos, Reino Unido + Gran Bretaña) que se preservan a propósito —
+// si Monday los tiene como opciones distintas, el toolbar también.
+const MONDAY_COUNTRIES = [
+  "Afghanistan","Albania","Alemania","Algeria","Arabia Saudita","Argelia","Argentina",
+  "Australia","Austria","Bangladesh","Bielorrusia","Bolivia","Bosnia",
+  "Bosnia y Herzegovina","Brasil","Bulgaria","Bélgica","Camerun","Canadá","Catar",
+  "Chile","China","Chipre","Colombia","Congo","Corea","Corea del Norte","Corea del Sur",
+  "Costa Rica","Costa de Marfil","Croacia","Dinamarca","Dubai","Ecuador","Egipto",
+  "El Salvador","Emiratos Arabes","Emiratos Arabes Unidos","Eslovaquia","Eslovenia",
+  "España","Estados Unidos","Filipinas","Finlandia","Francia","Georgia","Ghana",
+  "Gran Bretaña","Grecia","Guatemala","Haiti","Holanda","Honduras","Hungria",
+  "India","Indonesia","Iran","Iraq","Irlanda","Israel","Italia","Jamaica","Japon",
+  "Jordan","Jordania","Kenia","Kuwait","Letonia","Lituania","Macedonia","Malasia",
+  "Marruecos","Mauricio","Mexico","Moldavia","Myanmar","Nambia","Netherlands",
+  "Nicaragua","Nigeria","Noruega","Nueva Zelanda","Oman","Paises Bajos","Pakistan",
+  "Palestina","Panama","Paraguay","Peru","Polonia","Portugal","Puerto Rico","Qatar",
+  "Reino Unido","Republica Checa","Republica Dominicana","Republica de Corea",
+  "Rumania","Rusia","Senegal","Serbia","Singapur","Siria","Somalia","Sri Lanka",
+  "Sudafrica","Suecia","Suiza","Tailandia","Taiwan","Tanzania","Trinidad y Tobago",
+  "Tunez","Turquia","Ucrania","Uganda","Uruguay","Venezuela","Vietnam","Yermen","Zimbabwe"
+];
+
+// ISO alpha-2 → label canónico que matchea EXACTAMENTE una entrada de
+// MONDAY_COUNTRIES (mismo string, misma capitalización, mismas tildes/sin tildes).
+// Cuando el toolbar autocompleta #form-geo, busca por este label, así que
+// debe coincidir char-by-char con una <option> del select.
 const GEO_LABEL = {
-  US:"Estados Unidos", GB:"Reino Unido", AR:"Argentina", MX:"México", CO:"Colombia",
+  US:"Estados Unidos", GB:"Reino Unido", AR:"Argentina", MX:"Mexico", CO:"Colombia",
   CL:"Chile", ES:"España", BR:"Brasil", FR:"Francia", DE:"Alemania", IT:"Italia",
-  PT:"Portugal", NL:"Países Bajos", BE:"Bélgica", CH:"Suiza", AT:"Austria",
-  PL:"Polonia", HU:"Hungría", CZ:"República Checa", RO:"Rumanía", GR:"Grecia",
-  TR:"Turquía", IL:"Israel", AE:"Emiratos Árabes Unidos", SA:"Arabia Saudita",
-  MA:"Marruecos", EG:"Egipto", IN:"India", JP:"Japón", KR:"Corea del Sur",
-  AU:"Australia", CA:"Canadá", SE:"Suecia", NO:"Noruega", DK:"Dinamarca",
-  FI:"Finlandia", VN:"Vietnam", TH:"Tailandia", ID:"Indonesia", PH:"Filipinas",
-  CN:"China", SG:"Singapur", ZA:"Sudáfrica", NG:"Nigeria", PE:"Perú",
+  PT:"Portugal", NL:"Paises Bajos", BE:"Bélgica", CH:"Suiza", AT:"Austria",
+  PL:"Polonia", HU:"Hungria", CZ:"Republica Checa", RO:"Rumania", GR:"Grecia",
+  TR:"Turquia", IL:"Israel", AE:"Emiratos Arabes Unidos", SA:"Arabia Saudita",
+  MA:"Marruecos", EG:"Egipto", IN:"India", JP:"Japon", KR:"Corea del Sur",
+  KP:"Corea del Norte", AU:"Australia", CA:"Canadá", SE:"Suecia", NO:"Noruega",
+  DK:"Dinamarca", FI:"Finlandia", VN:"Vietnam", TH:"Tailandia", ID:"Indonesia",
+  PH:"Filipinas", CN:"China", SG:"Singapur", ZA:"Sudafrica", NG:"Nigeria", PE:"Peru",
   EC:"Ecuador", VE:"Venezuela", BO:"Bolivia", PY:"Paraguay", UY:"Uruguay",
-  RU:"Rusia", UA:"Ucrania", IE:"Irlanda", LU:"Luxemburgo", DO:"República Dominicana",
-  CR:"Costa Rica", PA:"Panamá", GT:"Guatemala", HN:"Honduras", SV:"El Salvador",
-  NI:"Nicaragua", CU:"Cuba", PR:"Puerto Rico", NZ:"Nueva Zelanda",
+  RU:"Rusia", UA:"Ucrania", IE:"Irlanda", DO:"Republica Dominicana",
+  CR:"Costa Rica", PA:"Panama", GT:"Guatemala", HN:"Honduras", SV:"El Salvador",
+  NI:"Nicaragua", PR:"Puerto Rico", NZ:"Nueva Zelanda",
+  // Países nuevos del listado Monday
+  AF:"Afghanistan", AL:"Albania", DZ:"Algeria", BD:"Bangladesh", BY:"Bielorrusia",
+  BA:"Bosnia y Herzegovina", BG:"Bulgaria", CM:"Camerun", QA:"Qatar", CY:"Chipre",
+  CG:"Congo", CI:"Costa de Marfil", HR:"Croacia", SK:"Eslovaquia", SI:"Eslovenia",
+  GE:"Georgia", GH:"Ghana", HT:"Haiti", IR:"Iran", IQ:"Iraq", JM:"Jamaica",
+  JO:"Jordania", KE:"Kenia", KW:"Kuwait", LV:"Letonia", LT:"Lituania",
+  MK:"Macedonia", MY:"Malasia", MU:"Mauricio", MD:"Moldavia", MM:"Myanmar",
+  NA:"Nambia", OM:"Oman", PK:"Pakistan", PS:"Palestina", RS:"Serbia",
+  SY:"Siria", SO:"Somalia", LK:"Sri Lanka", TW:"Taiwan", TZ:"Tanzania",
+  TT:"Trinidad y Tobago", TN:"Tunez", UG:"Uganda", YE:"Yermen", ZW:"Zimbabwe",
+  SN:"Senegal",
 };
+
+// Helper: poblar dinámicamente un <select> con MONDAY_COUNTRIES + opción "All"/"-".
+// keepFirst: si true, no toca la primera <option> existente (el "All"/"— elegir —")
+function populateCountryDropdown(selectEl, { keepFirst = true } = {}) {
+  if (!selectEl) return;
+  const firstOpt = keepFirst && selectEl.options[0] ? selectEl.options[0].outerHTML : "";
+  selectEl.innerHTML = firstOpt + MONDAY_COUNTRIES.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+}
 
 // 2-letter language code → #form-idioma value (matches Monday column indexes)
 // Supported: English(0), Spanish(1), Italian(2), Portuguese(3), Arabic(6)
@@ -3780,6 +3832,10 @@ async function loadProspectsTab() {
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
     ]);
+    // Sincronizar la cache global de drafts (la usa la bandera+autocarga de cada card)
+    _draftsState.all = _cachedProspectDrafts;
+    _rebuildDraftsByLang();
+    _draftsState.loaded = true;
   } catch (err) {
     listEl.innerHTML = `<div class="cascade-empty" style="color:#e53e3e">❌ Error loading prospects: ${esc(err.message || String(err))}</div>`;
     return;
@@ -3918,23 +3974,89 @@ function renderProspectCard(r) {
       ${hasEmail ? emailOptions : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails found — enter manually.</div>'}
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
-      <!-- Pitch -->
-      <div style="display:flex;align-items:center;justify-content:space-between;margin:10px 0 4px;gap:4px">
-        <div style="font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px">Email</div>
-        <div style="display:flex;gap:4px">
-          <select class="pcard-draft-select form-select" style="font-size:10px;padding:2px 6px;max-width:140px">
-            <option value="">📋 Load draft...</option>
+      <!-- Pitch — replica EXACTA del bloque del tab Analysis para que el user
+           se acostumbre a una sola visual. Reusa las mismas CSS classes
+           (.pitch-controls, .pitch-pills, .pitch-textarea, .pitch-actions). -->
+      <div class="sub-section" style="padding:0;margin-top:10px">
+        <div class="sub-title-row">
+          <span class="sub-title">🤖 Pitch with Claude</span>
+          <select class="category-select pcard-pitch-language" title="Email language" style="font-size:11px;padding:2px 4px">
+            <option value="en">English</option>
+            <option value="es">Spanish</option>
+            <option value="it">Italian</option>
+            <option value="pt">Portuguese</option>
+            <option value="ar">Arabic</option>
           </select>
-          <button class="btn btn-sm pcard-generate-btn" style="font-size:10px;padding:2px 8px;background:var(--primary);color:#fff;border:none;border-radius:4px;cursor:pointer">
-            ${r.pitch ? "✨ Regenerate" : "✨ Generate"}
-          </button>
+          <select class="category-select pcard-pitch-category" title="Site category" style="font-size:11px;padding:2px 4px">
+            <option value="">Auto category</option>
+            <option value="sports">Sports</option>
+            <option value="news">News &amp; Media</option>
+            <option value="finance">Finance</option>
+            <option value="technology">Technology</option>
+            <option value="entertainment">Entertainment</option>
+            <option value="health">Health</option>
+            <option value="travel">Travel</option>
+            <option value="gambling">Gambling</option>
+            <option value="automotive">Automotive</option>
+            <option value="food">Food &amp; Drink</option>
+            <option value="realestate">Real Estate</option>
+            <option value="business">Business / B2B</option>
+          </select>
         </div>
+
+        <div class="pitch-controls">
+          <div class="pitch-ctrl-row">
+            <span class="pitch-ctrl-label">Tone</span>
+            <div class="pitch-pills pcard-pitch-pills" data-group="tone">
+              <button class="pitch-pill active" data-val="informal" type="button">Informal</button>
+              <button class="pitch-pill" data-val="formal" type="button">Formal</button>
+            </div>
+          </div>
+          <div class="pitch-ctrl-row">
+            <span class="pitch-ctrl-label">Length</span>
+            <div class="pitch-pills pcard-pitch-pills" data-group="length">
+              <button class="pitch-pill active" data-val="short" type="button">Short</button>
+              <button class="pitch-pill" data-val="long" type="button">Long</button>
+            </div>
+          </div>
+          <div class="pitch-ctrl-row">
+            <span class="pitch-ctrl-label">Focus</span>
+            <div class="pitch-pills pcard-pitch-pills" data-group="focus">
+              <button class="pitch-pill active" data-val="analysis" type="button">With analysis</button>
+              <button class="pitch-pill" data-val="nodataanalysis" type="button">No analysis</button>
+            </div>
+          </div>
+          <div class="pitch-ctrl-row">
+            <span class="pitch-ctrl-label">Opening</span>
+            <div class="pitch-pills pcard-pitch-pills" data-group="opening">
+              <button class="pitch-pill active" data-val="direct" type="button">Direct</button>
+              <button class="pitch-pill" data-val="problem" type="button">Problem</button>
+              <button class="pitch-pill" data-val="praise" type="button">Praise</button>
+            </div>
+          </div>
+        </div>
+
+        <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
+        <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
+
+        <div style="position:relative">
+          <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
+          <div style="position:absolute; top:6px; right:6px; display:flex; gap:4px; align-items:center">
+            <button type="button" class="pcard-flag-btn" title="Click para rotar templates del idioma" style="position:relative; background:rgba(255,255,255,0.92); border:1px solid var(--border); border-radius:6px; padding:3px 6px; cursor:pointer; font-size:14px; line-height:1; box-shadow:0 1px 2px rgba(0,0,0,0.06)">
+              <span class="pcard-flag-emoji">🌐</span>
+              <span class="pcard-flag-badge" style="position:absolute; top:-6px; right:-6px; background:#0ea5e9; color:#fff; font-size:9px; font-weight:700; padding:1px 4px; border-radius:8px; min-width:14px; text-align:center; display:none"></span>
+            </button>
+            <button type="button" class="pcard-clear-btn" title="Limpiar pitch" style="background:rgba(255,255,255,0.92); border:1px solid var(--border); border-radius:6px; padding:3px 6px; cursor:pointer; font-size:13px; line-height:1; box-shadow:0 1px 2px rgba(0,0,0,0.06)">🗑️</button>
+          </div>
+        </div>
+
+        <div class="pitch-actions" style="margin-top:6px">
+          <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate" : "✨ Generate"}</button>
+          <select class="pcard-draft-select form-select" style="font-size:10px;padding:2px 6px;max-width:160px"><option value="">📋 Load draft...</option></select>
+        </div>
+        ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-top:4px">📡 Ad networks: ${esc(adNetworks.join(", "))}</div>` : ""}
+        <div class="pcard-generate-result" style="font-size:10px;color:#e53e3e;margin-top:3px"></div>
       </div>
-      ${adNetworks.length > 0 ? `<div style="font-size:10px;color:#7c3aed;margin-bottom:5px">📡 Ad networks detected: ${esc(adNetworks.join(", "))}</div>` : ""}
-      <div class="pcard-chips-area">${r.pitch ? subjectChips : ""}</div>
-      <input type="text" class="form-input pcard-subject" value="${esc(subjects[0] || r.pitch_subject || "")}" placeholder="Subject line..." style="margin-bottom:5px;font-size:11px;padding:4px 7px" />
-      <textarea class="form-input pcard-pitch" rows="5" style="font-size:11px;padding:6px 7px;resize:vertical;min-height:80px">${esc(r.pitch || "")}</textarea>
-      <div class="pcard-generate-result" style="font-size:10px;color:#e53e3e;margin-top:3px"></div>
 
       <!-- Monday fields -->
       <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Monday data</div>
@@ -3982,11 +4104,11 @@ function initProspectCard(card, data) {
   // Draft dropdown — populate + handler
   const draftSelect = card.querySelector(".pcard-draft-select");
   if (draftSelect && _cachedProspectDrafts.length > 0) {
-    const langGroups = { es: [], en: [], pt: [], it: [], fr: [], de: [], ar: [] };
+    const langGroups = { es: [], en: [], pt: [], it: [], ar: [] };
     for (const d of _cachedProspectDrafts) {
       if (langGroups[d.language]) langGroups[d.language].push(d);
     }
-    const langLabel = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", fr:"🇫🇷 FR", de:"🇩🇪 DE", ar:"🇸🇦 AR" };
+    const langLabel = { es:"🇪🇸 ES", en:"🇬🇧 EN", pt:"🇵🇹 PT", it:"🇮🇹 IT", ar:"🇸🇦 AR" };
     for (const [lang, drafts] of Object.entries(langGroups)) {
       if (drafts.length === 0) continue;
       const optgroup = document.createElement("optgroup");
@@ -4013,6 +4135,94 @@ function initProspectCard(card, data) {
       draftSelect.value = ""; // reset after selection
     });
   }
+
+  // ── Pitch style pills (tone/length/focus/opening) — replica del Analysis ──
+  card.querySelectorAll(".pcard-pitch-pills").forEach(group => {
+    group.querySelectorAll(".pitch-pill").forEach(pill => {
+      pill.addEventListener("click", () => {
+        group.querySelectorAll(".pitch-pill").forEach(p => p.classList.remove("active"));
+        pill.classList.add("active");
+      });
+    });
+  });
+
+  // Pre-set selectores con datos del prospect
+  const langSel = card.querySelector(".pcard-pitch-language");
+  if (langSel && data.language && langSel.querySelector(`option[value="${data.language}"]`)) {
+    langSel.value = data.language;
+  }
+  const catSel = card.querySelector(".pcard-pitch-category");
+  if (catSel && data.category) {
+    const mapped = mapCategory(data.category);
+    if (mapped && catSel.querySelector(`option[value="${mapped}"]`)) catSel.value = mapped;
+  }
+
+  // ── Bandera + trash + autocarga del draft del idioma de la card ────
+  // Resolver idioma desde data.language o (fallback) desde data.geo
+  const _resolveCardLang = () => {
+    if (data.language && LANG_FLAG[data.language]) return data.language;
+    // GEO label → alpha2 → lang
+    const geoText = (data.geo || "").trim().toLowerCase();
+    let geoCode = "";
+    for (const [code, label] of Object.entries(GEO_LABEL)) {
+      if (label.toLowerCase() === geoText) { geoCode = code; break; }
+    }
+    return GEO_TO_LANG[geoCode] || "en";
+  };
+  const cardLang = _resolveCardLang();
+  // Estado local del rotator de esta card
+  const cardFlag = { lang: cardLang, idx: 0 };
+
+  const _cardDrafts = () => (_draftsState.byLang.get(cardFlag.lang) || []);
+
+  const _updateCardFlagBtn = () => {
+    const flagEmoji = card.querySelector(".pcard-flag-emoji");
+    const badge     = card.querySelector(".pcard-flag-badge");
+    const flagBtn   = card.querySelector(".pcard-flag-btn");
+    if (!flagEmoji || !badge || !flagBtn) return;
+    const drafts = _cardDrafts();
+    flagEmoji.textContent = LANG_FLAG[cardFlag.lang] || "🌐";
+    if (drafts.length === 0) { badge.style.display = "none"; flagBtn.title = `Sin drafts en ${cardFlag.lang}`; return; }
+    const cur = drafts[cardFlag.idx];
+    badge.textContent = (cur?.name || `T${cardFlag.idx + 1}`).substring(0, 5);
+    badge.style.display = "inline-block";
+    flagBtn.title = `Template ${cardFlag.idx + 1}/${drafts.length}: "${cur?.name || ""}". Click para rotar.`;
+  };
+
+  const _applyCardDraft = (d) => {
+    if (!d) return;
+    const replaceVars = (s) => (s || "").replace(/\{\{domain\}\}/g, data.domain || "");
+    const pitchEl   = card.querySelector(".pcard-pitch");
+    const subjectEl = card.querySelector(".pcard-subject");
+    if (pitchEl)   pitchEl.value   = replaceVars(d.body);
+    if (subjectEl) subjectEl.value = replaceVars(d.subject || "");
+  };
+
+  // Autocarga draft prio-1 al render SOLO si el pitch viene vacío
+  // (no pisar lo que ya existe en review_queue)
+  if (!r.pitch || !r.pitch.trim()) {
+    const drafts = _cardDrafts();
+    if (drafts.length > 0) {
+      cardFlag.idx = 0;
+      _applyCardDraft(drafts[0]);
+    }
+  }
+  _updateCardFlagBtn();
+
+  // Click en bandera = rotar
+  card.querySelector(".pcard-flag-btn")?.addEventListener("click", () => {
+    const drafts = _cardDrafts();
+    if (drafts.length === 0) return;
+    cardFlag.idx = (cardFlag.idx + 1) % drafts.length;
+    _applyCardDraft(drafts[cardFlag.idx]);
+    _updateCardFlagBtn();
+  });
+
+  // Click en trash = limpiar pitch
+  card.querySelector(".pcard-clear-btn")?.addEventListener("click", () => {
+    const pitchEl = card.querySelector(".pcard-pitch");
+    if (pitchEl) { pitchEl.value = ""; pitchEl.focus(); }
+  });
 
   // Subject chips — click selects subject into input
   card.querySelectorAll(".pcard-subject-chip").forEach(chip => {
@@ -4041,19 +4251,32 @@ function initProspectCard(card, data) {
     errEl.textContent = "";
 
     try {
-      const cfg         = getPitchConfig();
-      const [favLocal, rag] = await Promise.all([
-        loadFavPitches(cfg),
-        ragRetrievePitchExamples({
-          domain:   data.domain,
-          category: data.category || "",
-          geo:      data.geo      || "",
-          language: data.language || "en",
-          traffic:  data.traffic  || 0,
-        }),
-      ]);
-      const favExamples = [...new Set([...rag.likeBodies,    ...favLocal])].slice(0, 5);
-      const dislikes    = [...new Set([...rag.dislikeBodies])].slice(0, 5);
+      // Config local de la card (los pills/selectores propios). Si no existen
+      // (caso tabs viejas), cae al getPitchConfig global del Analysis.
+      const _localPillVal = (group) => card.querySelector(`.pcard-pitch-pills[data-group="${group}"] .pitch-pill.active`)?.dataset.val || "";
+      const cfg = (() => {
+        const localCfg = {
+          tone:    _localPillVal("tone")    || "informal",
+          length:  _localPillVal("length")  || "short",
+          focus:   _localPillVal("focus")   || "analysis",
+          opening: _localPillVal("opening") || "direct",
+        };
+        return localCfg;
+      })();
+      const cardLanguage = card.querySelector(".pcard-pitch-language")?.value || data.language || "en";
+      const cardCategory = card.querySelector(".pcard-pitch-category")?.value || data.category || "";
+
+      // Solo RAG (Voyage) — loadFavPitches/getPitchConfig viven en otro
+      // closure y no son accesibles desde acá, pero el RAG es suficiente.
+      const rag = await ragRetrievePitchExamples({
+        domain:   data.domain,
+        category: cardCategory,
+        geo:      data.geo || "",
+        language: cardLanguage,
+        traffic:  data.traffic  || 0,
+      });
+      const favExamples = [...new Set(rag.likeBodies)].slice(0, 5);
+      const dislikes    = [...new Set(rag.dislikeBodies)].slice(0, 5);
       const result      = await generatePitch({
         domain:            data.domain,
         traffic:           data.traffic,
@@ -4061,8 +4284,8 @@ function initProspectCard(card, data) {
         adsTxt:            null,
         revenueGap:        null,
         banners:           "",
-        category:          data.category     || "",
-        siteLanguage:      data.language     || "en",
+        category:          cardCategory,
+        siteLanguage:      cardLanguage,
         pageTitle:         data.page_title   || "",
         pageDescription:   "",
         decisionMakerName: data.contact_name || "",
