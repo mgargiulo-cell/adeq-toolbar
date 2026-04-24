@@ -8,7 +8,7 @@ import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, r
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
 import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
-import { verifyEmail }                                                                         from "../modules/emailVerifier.js";
+import { verifyEmail, isGarbageEmail }                                                          from "../modules/emailVerifier.js";
 import { runCascade, getSimilarSites }                                                         from "../modules/cascade.js";
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
 import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
@@ -1105,6 +1105,8 @@ function checkFUStatus(sendInfo) {
 function addEmailsWithSource(emails, source) {
   for (const e of emails) {
     if (!e) continue;
+    // Filtro garbage al ingreso — no contamina state.emails con whois/abuse/etc.
+    if (isGarbageEmail(e)) continue;
     if (!state.emailSources.has(e)) state.emailSources.set(e, source);
     if (!state.emails.includes(e)) state.emails.push(e);
   }
@@ -1179,13 +1181,23 @@ function renderEmailList(emails) {
   const isDup       = state.duplicate?.found;
   const mondayEmail = isDup ? (state.duplicate.email || "").trim() : "";
 
-  // Deduplicate, exclude Monday email — show ALL (no cap). UI collapses >7 con "ver más"
-  const suggested = [...new Set(emails.map(e => e.trim()).filter(Boolean))]
-    .filter(e => e !== mondayEmail);
+  // 1. Dedupe + excluir el email de Monday + DESCARTAR garbage (whois/proxy/abuse).
+  //    Estos emails nunca deberían aparecer en la UI — son inservibles.
+  const cleaned = [...new Set(emails.map(e => e.trim()).filter(Boolean))]
+    .filter(e => e !== mondayEmail)
+    .filter(e => !isGarbageEmail(e));
+
+  // 2. ORDEN: Apollo primero (siempre), después scraping/Gemini/otros.
+  //    Dentro de cada bucket, conservar el orden original.
+  const isApollo = (e) => (state.emailSources.get(e) || "").toLowerCase() === "apollo";
+  const suggested = [
+    ...cleaned.filter(isApollo),
+    ...cleaned.filter(e => !isApollo(e)),
+  ];
 
   if (!mondayEmail && suggested.length === 0) {
     resultEl.style.display = "block";
-    resultEl.textContent   = "Sin emails — probá Apollo";
+    resultEl.textContent   = "Sin emails válidos — probá Apollo";
     resultEl.className     = "email-value";
     listEl.style.display   = "none";
     return;
@@ -3868,7 +3880,14 @@ function updateProspectsDailyBar(count) {
 
 function renderProspectCard(r) {
   const trafficFmt  = r.traffic ? formatTraffic(r.traffic) : "N/A";
-  const emails      = Array.isArray(r.emails) ? r.emails : [];
+  // Filtrar garbage (whois, abuse, postmaster, etc.) y dedupe.
+  // Backend ya guarda Apollo primero (apolloEmails antes que scraperEmails),
+  // así que el orden del array preserva la prioridad Apollo.
+  const emails      = (Array.isArray(r.emails) ? r.emails : [])
+    .map(e => (e || "").trim())
+    .filter(Boolean)
+    .filter(e => !isGarbageEmail(e))
+    .filter((e, i, arr) => arr.indexOf(e) === i);
   const hasEmail    = emails.length > 0;
   const owner       = defaultOwnerForLang(r.language);
   const status      = defaultStatusForOwner(owner);

@@ -83,6 +83,61 @@ const WHOIS_PROXY_LOCALS = new Set([
   "legal-notices","takedown","dmca",
 ]);
 
+// ── Garbage emails que NUNCA deben llegar a la UI ─────────────
+// Filtro sincrónico (sin DNS/red), corre antes del render. Más agresivo que
+// ROLE_PREFIXES — acá sólo van los que son INSERVIBLES como contacto comercial.
+const GARBAGE_LOCAL_PREFIXES = [
+  "abuse","abuse-",
+  "postmaster","mailer-daemon","mailer_daemon","mail-daemon","daemon",
+  "hostmaster","dns-admin","dnsadmin","webmaster",
+  "noreply","no-reply","no_reply","donotreply","do-not-reply","do_not_reply",
+  "bounce","bounces","bounced","mailer","mailerbot",
+  "registrar","registrarcontact","registrar-contact",
+  "whois","whoisprivacy","whoisguard","whoisrequest",
+  "takedown","dmca","copyright-claim","copyrightclaim","legal-notices","legalnotices",
+  "domainabuse","domain-abuse","abusereport",
+];
+const GARBAGE_DOMAIN_SUFFIXES = [
+  // proxies/registrars
+  "markmonitor.com","whoisguard.com","whoisprivacy.com","whoisprivacyservice.org",
+  "domainsbyproxy.com","contactprivacy.com","privacyprotect.org","privacy-protect.org",
+  "namebright.com","namesilo.com","registerdomainsafe.com","registrarsafe.com",
+  "anonymize.com","onamae.com","withheldforprivacy.com","withheldforprivacy.email",
+  "perfectprivacy.com","protecteddomainservices.com","whoisproxy.com","proxydomain.com",
+  "csc-global.com","redacted-gandi.net",
+  // genericos que aparecen scrappeados pero nunca son contactos comerciales
+  "sentry.io","sentry-next.wixpress.com","email-od.com",
+];
+
+/**
+ * Filtro RÁPIDO (sin red) — devuelve true si el email NO debe mostrarse al user.
+ * Cubre proxies de WhoIs, buzones administrativos, mailer-daemon, abuse, etc.
+ * Más permisivo que verifyEmail — éste sólo bloquea lo que es inservible per se.
+ */
+export function isGarbageEmail(email) {
+  if (!email || typeof email !== "string") return true;
+  const e = email.toLowerCase().trim();
+  if (!e.includes("@")) return true;
+  const [local, domain] = e.split("@");
+  if (!local || !domain) return true;
+
+  // 1. Dominio de proxy/whois (exacto o subdominio)
+  for (const d of GARBAGE_DOMAIN_SUFFIXES) {
+    if (domain === d || domain.endsWith("." + d)) return true;
+  }
+
+  // 2. Local-part: prefijo administrativo. Aceptamos "abuse", "abuse-domain", "abuse_2024".
+  for (const prefix of GARBAGE_LOCAL_PREFIXES) {
+    if (local === prefix) return true;
+    if (local.startsWith(prefix) && (local[prefix.length] === "-" || local[prefix.length] === "_" || local[prefix.length] === "." || /\d/.test(local[prefix.length] || ""))) return true;
+  }
+
+  // 3. Sufijo "-abuse" / "_abuse"
+  if (/[-_.]abuse(\d|$)/.test(local)) return true;
+
+  return false;
+}
+
 export async function verifyEmail(email) {
   if (!email || !email.includes("@")) {
     return { valid: false, score: 0, reason: "Formato inválido", tags: ["formato"] };
