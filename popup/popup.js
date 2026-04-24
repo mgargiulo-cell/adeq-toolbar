@@ -4668,30 +4668,62 @@ async function validateProspect(card, data, doSendEmail) {
   const estado    = card.querySelector(".pcard-status")?.value            || defaultStatusForOwner(ejecutivo);
   const idioma    = card.querySelector(".pcard-lang")?.value              || LANG_TO_IDX[data.language] || "0";
   const geo       = card.querySelector(".pcard-geo")?.value?.trim()       || data.geo || "";
+  const dateStr   = card.querySelector(".pcard-date")?.value?.trim()      || "";
   const traffic   = data.traffic ? formatTraffic(data.traffic) : "";
 
-  // Validations (block before sending)
+  // ── VALIDACIONES OBLIGATORIAS ────────────────────────────────
+  // Misma lógica que Analysis (btn-push-monday). Si falta cualquier
+  // dato esencial, NO se pushea a Monday.
+
+  // 1. GEO
+  if (!geo) {
+    setResult("❌ GEO obligatorio. Completá el campo GEO antes de enviar.", false);
+    card.querySelector(".pcard-geo")?.focus();
+    return;
+  }
+  // 2. Tráfico (Páginas Vistas) > 0
+  if (!data.traffic || data.traffic === 0) {
+    setResult("❌ Páginas Vistas obligatorio. SimilarWeb no devolvió data — re-prospectá o editá la card.", false);
+    return;
+  }
+  // 3. Email válido (siempre obligatorio para push, aún si no se manda mail)
+  if (!email) {
+    setResult("❌ Email obligatorio. Elegí uno arriba o escribilo manualmente.", false);
+    card.querySelector(".pcard-email-monday")?.focus();
+    return;
+  }
+  if (!isValidEmail(email)) {
+    setResult(`❌ Email inválido: ${email}`, false);
+    card.querySelector(".pcard-email-monday")?.focus();
+    return;
+  }
+  // 4. Subject + Pitch (obligatorios para enviar mail)
   if (doSendEmail) {
-    if (!email || !isValidEmail(email)) {
-      setResult("❌ Valid email required. Pick one from the list or enter manually.", false);
-      return;
-    }
     if (!subject) {
-      setResult("❌ Subject required. Fill it in before sending.", false);
+      setResult("❌ Asunto obligatorio. Completalo antes de enviar.", false);
+      card.querySelector(".pcard-subject")?.focus();
       return;
     }
     if (!pitch) {
-      setResult("❌ Pitch body required.", false);
+      setResult("❌ Cuerpo del email obligatorio.", false);
+      card.querySelector(".pcard-pitch")?.focus();
       return;
     }
   }
-  if (!geo) {
-    setResult("❌ GEO obligatorio. Completá el campo GEO antes de enviar a Monday.", false);
+  // 5. Owner / Status / Language deben estar seteados
+  if (!ejecutivo)        { setResult("❌ Owner obligatorio.", false);    return; }
+  if (!estado)           { setResult("❌ Status obligatorio.", false);   return; }
+  if (idioma === "" || idioma == null) { setResult("❌ Language obligatorio.", false); return; }
+  // 6. Date — debe ser DD/MM/YYYY parseable
+  if (!dateStr) {
+    setResult("❌ Date obligatorio.", false);
+    card.querySelector(".pcard-date")?.focus();
     return;
   }
-  // Páginas Vistas obligatorio (Monday no debe recibir items con 0 visitas)
-  if (!data.traffic || data.traffic === 0) {
-    setResult("❌ Páginas Vistas obligatorio. SimilarWeb no devolvió datos — re-prospectá o completá manual.", false);
+  const dateParts = dateStr.split("/");
+  if (dateParts.length !== 3 || dateParts[2].length !== 4 || isNaN(parseInt(dateParts[0])) || isNaN(parseInt(dateParts[1]))) {
+    setResult("❌ Date inválido. Formato DD/MM/YYYY.", false);
+    card.querySelector(".pcard-date")?.focus();
     return;
   }
 
