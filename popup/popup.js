@@ -2,7 +2,7 @@
 // ADEQ TOOLBAR — Popup v4
 // ============================================================
 
-import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh } from "../modules/monday.js";
+import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -448,6 +448,16 @@ function prefillMondayForm() {
 function fillMondayFormFromDuplicate(dup) {
   if (dup.email) document.getElementById("form-email").value = dup.email;
   if (dup.fecha) document.getElementById("form-fecha").value = toDisplayDate(dup.fecha);
+  // Pre-fill Traffic desde Monday — solo si todavía no tenemos dato de SimilarWeb.
+  // Cubre el caso "duplicado + SimilarWeb sin datos": evita el bloqueo del push.
+  if (dup.trafico && !state.traffic) {
+    const parsed = parseTrafficText(dup.trafico);
+    if (parsed > 0) {
+      state.traffic = parsed;
+      const pvInput = document.getElementById("form-pv-display");
+      if (pvInput) pvInput.value = formatTraffic(parsed);
+    }
+  }
   if (dup.geo) {
     const sel = document.getElementById("form-geo");
     const opt = [...sel.options].find(o => o.value === dup.geo || o.text === dup.geo);
@@ -742,8 +752,11 @@ async function runTrafficCheck() {
     metricEl.className = "metric";
 
     // Actualizar Páginas Vistas en formulario Monday
+    // Solo sobrescribir el input de Traffic si SimilarWeb devolvió un dato real.
+    // Si SimilarWeb falló (state.traffic === 0), preservamos lo prefilled desde Monday
+    // o lo que el usuario haya tipeado manualmente.
     const pvDisplay = document.getElementById("form-pv-display");
-    if (pvDisplay) pvDisplay.textContent = formatTraffic(state.traffic);
+    if (pvDisplay && state.traffic) pvDisplay.value = formatTraffic(state.traffic);
 
     // Top 3 países con banderas — chips secundarios SOLO si el % es significativo (>1%)
     // y con tooltip claro. El % es "share del tráfico mundial del sitio".
@@ -1778,6 +1791,12 @@ async function bindButtons() {
     if (el) el.addEventListener(el.tagName === "TEXTAREA" ? "input" : "change", checkMondayChanged);
   });
   document.getElementById("form-email")?.addEventListener("input", checkMondayChanged);
+
+  // Traffic editable: parsear input del usuario → state.traffic
+  document.getElementById("form-pv-display")?.addEventListener("input", (e) => {
+    state.traffic = parseTrafficText(e.target.value);
+    checkMondayChanged();
+  });
 
   document.getElementById("btn-push-monday").addEventListener("click", async () => {
     const btn    = document.getElementById("btn-push-monday");

@@ -215,15 +215,31 @@ function cleanDomain(str) {
     .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").trim();
 }
 
-// Parsea strings de tráfico con sufijo K/M (ej: "500K", "1.5M") a número entero
-function parseTrafficText(str) {
-  if (!str) return 0;
-  const s = str.trim().toUpperCase().replace(/[,\s]/g, "");
-  const n = parseFloat(s);
-  if (isNaN(n)) return 0;
-  if (s.includes("M")) return Math.round(n * 1_000_000);
-  if (s.includes("K")) return Math.round(n * 1_000);
-  return parseInt(s.replace(/[^0-9]/g, "")) || 0;
+// Parsea strings de tráfico de Monday a número entero.
+// Acepta sufijos K/M/B (mayúsc o minúsc), decimales con `.` o `,` (estilo europeo),
+// separadores de miles, espacios y texto extra (ej: "500 vistas", "1,5 M", "2.5m").
+export function parseTrafficText(str) {
+  if (str == null) return 0;
+  let s = String(str).trim();
+  if (!s) return 0;
+
+  // Detectar sufijo K/M/B en cualquier posición, ignorando case
+  const upper = s.toUpperCase();
+  let mult = 1;
+  if (/[MB]/.test(upper))      mult = upper.includes("B") ? 1_000_000_000 : 1_000_000;
+  else if (/K/.test(upper))    mult = 1_000;
+
+  if (mult > 1) {
+    // Con sufijo: extraer el primer número (decimal con . o ,)
+    const m = upper.match(/(\d+(?:[.,]\d+)?)/);
+    if (!m) return 0;
+    const n = parseFloat(m[1].replace(",", "."));
+    return isNaN(n) ? 0 : Math.round(n * mult);
+  }
+
+  // Sin sufijo: tratar . y , como separadores de miles → quedarse solo con dígitos
+  const digits = s.replace(/[^\d]/g, "");
+  return digits ? parseInt(digits, 10) : 0;
 }
 
 // ── fetchMondayForRefresh — para MONDAY CSV AUTO PROSPECTOR ─────

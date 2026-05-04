@@ -527,11 +527,8 @@ a:hover { text-decoration: underline; }
   font-size: var(--fs-md);
   font-weight: 700;
   color: var(--text);
-  padding: 7px 9px;
-  background: var(--bg-secondary);
-  border-radius: var(--r-md);
-  border: 1px dashed var(--input-border);
 }
+input.form-pv-display { font-weight: 700; }
 
 .fecha-row { display: flex; gap: 5px; align-items: center; }
 .fecha-row .form-input { flex: 1; }
