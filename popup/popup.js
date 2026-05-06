@@ -29,6 +29,19 @@ import { scoreProspect }                                                        
 import { CONFIG }                                                                               from "../config.js";
 import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
 
+// ---- RapidAPI footer counter (siempre visible) ----
+function renderRapidApiFooterCounter({ used, limit, period } = {}) {
+  const el = document.getElementById("rapidapi-monthly-counter");
+  if (!el || used == null || limit == null) return;
+  const pct = limit > 0 ? (used / limit) * 100 : 0;
+  el.classList.remove("usage-warning", "usage-danger", "usage-reached");
+  if (pct >= 100)     el.classList.add("usage-reached");
+  else if (pct >= 80) el.classList.add("usage-danger");
+  else if (pct >= 50) el.classList.add("usage-warning");
+  el.textContent = `SW: ${used.toLocaleString()} / ${limit.toLocaleString()}`;
+  el.title = `SimilarWeb este mes (${period || "—"}): ${used.toLocaleString()} hits de ${limit.toLocaleString()} (${pct.toFixed(1)}%). Compará con tu dashboard de RapidAPI.`;
+}
+
 // ---- RapidAPI monthly usage banner (3 niveles: 50% / 80% / 100%) ----
 function renderRapidApiUsageBanner({ used, limit, period } = {}) {
   const banner = document.getElementById("rapidapi-cap-banner");
@@ -202,16 +215,18 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
   setProxyAuth(auth.accessToken);
 
-  // Banner de uso mensual de RapidAPI:
-  //  - Check inicial al login (renderiza si ≥50%)
-  //  - Re-chequea cada 60s mientras el popup esté abierto (refleja hits de otros MBs)
-  //  - Notif inmediata si llegamos al 100% durante el uso
-  onRapidApiCapReached(renderRapidApiUsageBanner);
-  const refreshUsageBanner = () => {
-    getRapidApiMonthlyStatus().then(s => renderRapidApiUsageBanner(s)).catch(() => {});
+  // Uso mensual de RapidAPI: footer counter (siempre visible) + banner (≥50%).
+  // Re-chequea cada 60s para reflejar hits de otros MBs en paralelo.
+  const handleUsageUpdate = (s) => {
+    renderRapidApiFooterCounter(s);
+    renderRapidApiUsageBanner(s);
   };
-  refreshUsageBanner();
-  setInterval(refreshUsageBanner, 60_000);
+  onRapidApiCapReached(handleUsageUpdate);
+  const refreshUsage = () => {
+    getRapidApiMonthlyStatus().then(handleUsageUpdate).catch(() => {});
+  };
+  refreshUsage();
+  setInterval(refreshUsage, 60_000);
 
   // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
   const scheduleRefresh = () => {
