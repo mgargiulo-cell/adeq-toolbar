@@ -707,6 +707,22 @@ async function getTrafficData(domain, rapidApiKey) {
     if (!data) return { visits: null, topCountry: null, error: null };
     if (data.__error4xx) return { visits: null, topCountry: null, error: data.__error4xx };
     if (data.__error)    return { visits: null, topCountry: null, error: data.__error };
+
+    // ── Adaptador del shape nuevo de website-insights ──────────
+    // Visits ahora es {YYYY-MM-DD: n} → tomar el más reciente.
+    if (data.Traffic?.Visits && typeof data.Traffic.Visits === "object" && !Array.isArray(data.Traffic.Visits)) {
+      const dates = Object.keys(data.Traffic.Visits).sort().reverse();
+      if (dates.length) data.Visits = parseFloat(data.Traffic.Visits[dates[0]]) || 0;
+    }
+    // TopCountries: convertir TopCountryShares {US: 0.7, ...} → array {CountryCode, Share}
+    if (data.Traffic?.TopCountryShares && typeof data.Traffic.TopCountryShares === "object" && !Array.isArray(data.Traffic.TopCountryShares)) {
+      data.TopCountries = Object.entries(data.Traffic.TopCountryShares)
+        .map(([code, share]) => ({ CountryCode: code, Share: parseFloat(share) || 0 }))
+        .sort((a, b) => b.Share - a.Share);
+    }
+    // Category bajo WebsiteDetails
+    if (data.WebsiteDetails?.Category && !data.Category) data.Category = data.WebsiteDetails.Category;
+
     const visits = data?.Visits || data?.visits || data?.pageViews || data?.PageViews || null;
 
     // Extract top country — try inline data first, then separate /countries endpoint

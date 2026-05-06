@@ -117,6 +117,69 @@ async function fetchTopCountries(domain) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Adaptador del shape nuevo de website-insights (Mayo 2026 en adelante).
+// La nueva API anida todo y cambia tipos vs la vieja similarweb-insights:
+//   - Visits: objeto {YYYY-MM-DD: number} → tomamos el mes más reciente
+//   - PagePerVisit: vive en data.Traffic.Engagement.PagesPerVisit
+//   - TopCountries: TopCountryShares {US: 0.761, ...} → array tradicional
+//   - Category: data.WebsiteDetails.Category
+//   - GlobalRank/CategoryRank: dentro de data.Rank
+// El resto del código sigue usando el shape viejo, así que normalizamos acá.
+// ─────────────────────────────────────────────────────────────────
+function normalizeWebsiteInsightsResponse(data) {
+  if (!data || typeof data !== "object") return data;
+  // Detectar shape nueva: tiene Traffic + WebsiteDetails como objetos top-level
+  const isNewShape = (data.Traffic && typeof data.Traffic === "object")
+                  || (data.WebsiteDetails && typeof data.WebsiteDetails === "object");
+  if (!isNewShape) return data; // shape vieja, devolver tal cual
+
+  const out = { ...data };
+
+  // Visits: tomar el valor del mes más reciente del objeto histórico
+  const visitsObj = data.Traffic?.Visits;
+  if (visitsObj && typeof visitsObj === "object" && !Array.isArray(visitsObj)) {
+    const dates = Object.keys(visitsObj).sort().reverse();
+    if (dates.length) out.Visits = parseFloat(visitsObj[dates[0]]) || 0;
+  } else if (typeof visitsObj === "number") {
+    out.Visits = visitsObj;
+  }
+
+  // PagesPerVisit (lo que la toolbar mostraba como "estimado conservador")
+  const ppv = data.Traffic?.Engagement?.PagesPerVisit;
+  if (ppv != null) {
+    out.PagePerVisit  = ppv;
+    out.PagesPerVisit = ppv;
+  }
+  // BounceRate y TimeOnSite por si los queremos exponer en futuro
+  if (data.Traffic?.Engagement?.BounceRate != null)  out.BounceRate  = data.Traffic.Engagement.BounceRate;
+  if (data.Traffic?.Engagement?.TimeOnSite != null)  out.AvgVisitDuration = data.Traffic.Engagement.TimeOnSite;
+
+  // TopCountries: convertir {US: 0.761, CA: 0.045} a [{CountryCode, Share}, ...]
+  const tcs = data.Traffic?.TopCountryShares;
+  if (tcs && typeof tcs === "object" && !Array.isArray(tcs)) {
+    out.TopCountries = Object.entries(tcs)
+      .map(([code, share]) => ({ CountryCode: code, Share: parseFloat(share) || 0 }))
+      .sort((a, b) => b.Share - a.Share)
+      .slice(0, 5);
+  }
+
+  // Category — la nueva API la pone dentro de WebsiteDetails
+  if (data.WebsiteDetails?.Category && !out.Category) {
+    out.Category = data.WebsiteDetails.Category;
+  }
+
+  // Ranks
+  if (data.Rank?.GlobalRank != null && out.GlobalRank == null) {
+    out.GlobalRank = data.Rank.GlobalRank;
+  }
+  if (data.Rank?.CategoryRank?.Rank != null && out.CategoryRank == null) {
+    out.CategoryRank = data.Rank.CategoryRank.Rank;
+  }
+
+  return out;
+}
+
 // Acepta cualquiera de las variantes que SimilarWeb-Insights ha usado en
 // distintas versiones del endpoint para la misma métrica.
 function extractPPV(data) {
@@ -246,7 +309,10 @@ export async function getTraffic(domain) {
     }
 
     if (response.ok) {
-      const data = response.data || {};
+      // Normalizar el shape de la nueva API website-insights (Mayo 2026+)
+      // que anida todo bajo Traffic/WebsiteDetails/Rank — el resto del código
+      // sigue esperando el shape viejo (data.Visits como número, etc.)
+      const data = normalizeWebsiteInsightsResponse(response.data || {});
       if (!data.error && data.Visits) {
         const visits    = Math.round(data.Visits || 0);
         let pagesPerVisit  = extractPPV(data);
@@ -323,7 +389,7 @@ export async function getTraffic(domain) {
     }
     const fallback = await rapidFetch(`/similar-sites?domain=${encodeURIComponent(cleanDomain)}`);
     if (!fallback.ok) return null;
-    const fData = fallback.data || {};
+    const fData = normalizeWebsiteInsightsResponse(fallback.data || {});
     const visits        = Math.round(fData.Visits || 0);
     let pagesPerVisit   = fData.PagePerVisit || fData.PagesPerVisit || null;
     let ppvSource       = pagesPerVisit ? "similar-sites" : null;
