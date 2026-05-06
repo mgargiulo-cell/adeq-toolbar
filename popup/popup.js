@@ -29,16 +29,45 @@ import { scoreProspect }                                                        
 import { CONFIG }                                                                               from "../config.js";
 import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
 
-// ---- RapidAPI monthly cap banner ----
-function showRapidApiCapBanner({ used, limit, period } = {}) {
+// ---- RapidAPI monthly usage banner (3 niveles: 50% / 80% / 100%) ----
+function renderRapidApiUsageBanner({ used, limit, period } = {}) {
   const banner = document.getElementById("rapidapi-cap-banner");
+  const icon   = document.getElementById("cap-banner-icon");
+  const title  = document.getElementById("cap-banner-title");
   const detail = document.getElementById("cap-banner-detail");
-  if (!banner) return;
+  if (!banner || used == null || limit == null) return;
+
+  const pct = limit > 0 ? (used / limit) * 100 : 0;
+  banner.classList.remove("cap-warning", "cap-danger", "cap-reached");
+
+  // < 50% → no mostrar nada
+  if (pct < 50) { banner.style.display = "none"; return; }
+
   banner.style.display = "flex";
-  if (detail && used != null && limit != null) {
-    detail.textContent = `— ${used.toLocaleString()} / ${limit.toLocaleString()} en ${period || "este mes"}. Las consultas de tráfico están pausadas hasta el próximo mes.`;
+  const usedStr  = used.toLocaleString();
+  const limitStr = limit.toLocaleString();
+  const periodStr = period || "este mes";
+
+  if (pct >= 100) {
+    banner.classList.add("cap-reached");
+    icon.textContent  = "⛔";
+    title.textContent = "Límite mensual de SimilarWeb alcanzado";
+    detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Las consultas de tráfico están pausadas hasta el próximo mes.`;
+  } else if (pct >= 80) {
+    banner.classList.add("cap-danger");
+    icon.textContent  = "🔶";
+    title.textContent = `Uso de SimilarWeb al ${Math.round(pct)}% — atención`;
+    detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Quedan pocas consultas; el autopilot puede cortarse pronto.`;
+  } else {
+    banner.classList.add("cap-warning");
+    icon.textContent  = "⚠️";
+    title.textContent = `Uso de SimilarWeb al ${Math.round(pct)}%`;
+    detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Avisamos para que estés al tanto.`;
   }
 }
+
+// Llamado por apiProxy cuando se llega al cap (100%)
+function showRapidApiCapBanner(state) { renderRapidApiUsageBanner(state); }
 
 // ---- Estado global ----
 const state = {
@@ -173,11 +202,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
   setProxyAuth(auth.accessToken);
 
-  // Banner del cap mensual de RapidAPI: suscribirse al evento + check al inicio
-  onRapidApiCapReached(showRapidApiCapBanner);
-  getRapidApiMonthlyStatus().then(s => {
-    if (s && s.used >= s.limit) showRapidApiCapBanner(s);
-  }).catch(() => {});
+  // Banner de uso mensual de RapidAPI:
+  //  - Check inicial al login (renderiza si ≥50%)
+  //  - Re-chequea cada 60s mientras el popup esté abierto (refleja hits de otros MBs)
+  //  - Notif inmediata si llegamos al 100% durante el uso
+  onRapidApiCapReached(renderRapidApiUsageBanner);
+  const refreshUsageBanner = () => {
+    getRapidApiMonthlyStatus().then(s => renderRapidApiUsageBanner(s)).catch(() => {});
+  };
+  refreshUsageBanner();
+  setInterval(refreshUsageBanner, 60_000);
 
   // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
   const scheduleRefresh = () => {

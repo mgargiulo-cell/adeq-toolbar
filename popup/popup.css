@@ -225,21 +225,38 @@ a:hover { text-decoration: underline; }
 }
 .header-right { display: flex; align-items: center; gap: var(--sp-2); }
 
-/* Banner que aparece cuando se alcanza el cap mensual de RapidAPI */
+/* Banner de uso mensual de RapidAPI — 3 niveles: warning / danger / reached */
 .cap-banner {
-  background: linear-gradient(90deg, #fee2e2, #fecaca);
-  color: #7f1d1d;
-  padding: 10px 14px;
+  padding: 8px 14px;
   font-size: 12px;
-  border-bottom: 1px solid #ef4444;
   display: flex; align-items: center; gap: 10px;
   font-weight: 600;
   flex-shrink: 0;
+  border-bottom: 1px solid;
 }
 .cap-banner .cap-icon { font-size: 16px; }
 .cap-banner .cap-text { line-height: 1.4; }
-.cap-banner strong { display: block; font-weight: 800; }
+.cap-banner strong    { display: block; font-weight: 800; }
 .cap-banner #cap-banner-detail { font-weight: 500; opacity: 0.9; }
+
+/* ≥50% — amarillo */
+.cap-banner.cap-warning {
+  background: linear-gradient(90deg, #fef3c7, #fde68a);
+  color: #78350f;
+  border-bottom-color: #f59e0b;
+}
+/* ≥80% — naranja */
+.cap-banner.cap-danger {
+  background: linear-gradient(90deg, #ffedd5, #fed7aa);
+  color: #7c2d12;
+  border-bottom-color: #ea580c;
+}
+/* ≥100% — rojo bloqueante */
+.cap-banner.cap-reached {
+  background: linear-gradient(90deg, #fee2e2, #fecaca);
+  color: #7f1d1d;
+  border-bottom-color: #ef4444;
+}
 .site-url     {
   font-size: var(--fs-sm); color: #cbd5e1;
   max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

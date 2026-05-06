@@ -44,12 +44,13 @@
   </div>
 </header>
 
-<!-- RAPIDAPI MONTHLY CAP BANNER (oculto por default; lo muestra apiProxy.js si llegamos al límite) -->
+<!-- RAPIDAPI MONTHLY USAGE BANNER (oculto por default).
+     Estados: warning (≥50%, amarillo) | danger (≥80%, naranja) | reached (≥100%, rojo, bloqueante). -->
 <div id="rapidapi-cap-banner" class="cap-banner" style="display:none">
-  <span class="cap-icon">⛔</span>
+  <span class="cap-icon" id="cap-banner-icon">⚠️</span>
   <span class="cap-text">
-    <strong>Límite mensual de SimilarWeb alcanzado</strong>
-    <span id="cap-banner-detail">— las consultas de tráfico están pausadas hasta el próximo mes.</span>
+    <strong id="cap-banner-title">Uso de SimilarWeb este mes</strong>
+    <span id="cap-banner-detail"></span>
   </span>
 </div>
 
