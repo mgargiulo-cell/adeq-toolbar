@@ -122,19 +122,39 @@ async function fetchTopCountries(domain) {
 function extractPPV(data) {
   if (!data || typeof data !== "object") return null;
   const candidates = [
+    // Variantes principales (SimilarWeb classic + website-insights)
     data.PagePerVisit, data.PagesPerVisit, data.pagesPerVisit, data.pages_per_visit,
     data.PageViewsPerVisit, data.AvgPagesPerVisit, data.avg_pages_per_visit,
-    data.Engagement?.PagePerVisit, data.Engagement?.PagesPerVisit,
-    data.engagement?.pagesPerVisit, data.engagement?.pages_per_visit,
-    data.engagements?.pagesPerVisit,
+    data.AvgPageViews, data.AveragePagesPerVisit, data.AveragePageViews,
+    data.PagesViewed, data.PageViews,
+    // Anidados comunes
+    data.Engagement?.PagePerVisit, data.Engagement?.PagesPerVisit, data.Engagement?.AvgPagesPerVisit,
+    data.engagement?.pagesPerVisit, data.engagement?.pages_per_visit, data.engagement?.PagePerVisit,
+    data.engagements?.pagesPerVisit, data.engagements?.PagePerVisit,
+    data.Metrics?.PagePerVisit, data.Metrics?.PagesPerVisit,
+    data.metrics?.pagesPerVisit, data.metrics?.PagePerVisit,
     // Algunos planes anidan todo dentro de "data" o "result"
-    data.data?.PagePerVisit, data.data?.PagesPerVisit,
-    data.result?.PagePerVisit, data.result?.PagesPerVisit,
+    data.data?.PagePerVisit, data.data?.PagesPerVisit, data.data?.pagesPerVisit,
+    data.result?.PagePerVisit, data.result?.PagesPerVisit, data.result?.pagesPerVisit,
+    // Snake case
+    data.page_per_visit, data.avg_page_views,
   ];
   for (const v of candidates) {
     if (v != null && v !== "") {
       const n = parseFloat(v);
       if (!isNaN(n) && n > 0) return n;
+    }
+  }
+  // Diagnóstico: si no encontramos PPV, loguear las top-level keys para debug.
+  // Esto sale 1 sola vez en console y nos dice qué nombres usa la API real.
+  if (!extractPPV._loggedKeys) {
+    extractPPV._loggedKeys = true;
+    console.warn("[Traffic] PPV no encontrado. Top-level keys del response:", Object.keys(data));
+    // Si hay objetos anidados, también loguearlos
+    for (const k of Object.keys(data)) {
+      if (data[k] && typeof data[k] === "object" && !Array.isArray(data[k])) {
+        console.warn(`[Traffic] keys de "${k}":`, Object.keys(data[k]));
+      }
     }
   }
   return null;
