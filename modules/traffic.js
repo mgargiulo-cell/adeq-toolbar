@@ -145,18 +145,23 @@ function extractPPV(data) {
       if (!isNaN(n) && n > 0) return n;
     }
   }
-  // Diagnóstico: si no encontramos PPV, loguear las top-level keys para debug.
-  // Esto sale 1 sola vez en console y nos dice qué nombres usa la API real.
-  if (!extractPPV._loggedKeys) {
-    extractPPV._loggedKeys = true;
-    console.warn("[Traffic] PPV no encontrado. Top-level keys del response:", Object.keys(data));
-    // Si hay objetos anidados, también loguearlos
-    for (const k of Object.keys(data)) {
-      if (data[k] && typeof data[k] === "object" && !Array.isArray(data[k])) {
-        console.warn(`[Traffic] keys de "${k}":`, Object.keys(data[k]));
-      }
+  // Diagnóstico: si no encontramos PPV, guardar el response completo en chrome.storage
+  // para inspección posterior. Console.warn también, por si miran ahí.
+  console.warn("[Traffic] PPV no encontrado. Top-level keys:", Object.keys(data));
+  for (const k of Object.keys(data)) {
+    if (data[k] && typeof data[k] === "object" && !Array.isArray(data[k])) {
+      console.warn(`[Traffic] keys de "${k}":`, Object.keys(data[k]));
     }
   }
+  try {
+    chrome.storage.local.set({
+      _debug_last_api_response: {
+        timestamp: new Date().toISOString(),
+        topLevelKeys: Object.keys(data),
+        fullResponse: data,
+      }
+    });
+  } catch {}
   return null;
 }
 
