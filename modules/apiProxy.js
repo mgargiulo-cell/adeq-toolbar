@@ -20,12 +20,13 @@ function proxyUrl() {
  * @param {object} opts - { method, headers, body, query }
  * @returns {Promise<{ ok, status, data, text, quota }>}
  */
-// Retry config — comportamiento humano de "abrir 50 tabs y mirar todas" puede
-// disparar 429 del proxy/vendor. En vez de tirar error al usuario, hacemos
-// backoff exponencial transparente. Solo aplica a 429 (rate limit) y 5xx (server).
-const MAX_RETRIES        = 4;
-const BASE_BACKOFF_MS    = 600;   // 600 → 1200 → 2400 → 4800 (~9s total worst case)
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+// Retry config — SOLO 5xx (server errors NO cuentan en la factura del vendor).
+// 429 NO se reintenta: cada retry de 429 es 1 request facturada por nada
+// (RapidAPI cobra por hit HTTP, no por response útil). Si el usuario ve "No data"
+// por 429, debe esperar — preferimos UX peor a factura de 400 USD por overage.
+const MAX_RETRIES        = 2;
+const BASE_BACKOFF_MS    = 800;
+const RETRYABLE_STATUSES = new Set([500, 502, 503, 504]);
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 

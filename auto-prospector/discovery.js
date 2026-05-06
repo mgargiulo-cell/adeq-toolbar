@@ -19,7 +19,7 @@ const SUPABASE_URL      = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const RAPIDAPI_KEY      = process.env.RAPIDAPI_KEY; // misma key que usa la toolbar
 
-const SIMILARWEB_HOST   = "similarweb-insights.p.rapidapi.com";
+const SIMILARWEB_HOST   = "website-insights.p.rapidapi.com";
 const RAPIDAPI_HEADERS  = () => ({
   "x-rapidapi-key":  RAPIDAPI_KEY,
   "x-rapidapi-host": SIMILARWEB_HOST,

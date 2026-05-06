@@ -507,6 +507,50 @@ async function getApolloUsageToday(token) {
   } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10) }; }
 }
 
+// ── Hard cap diario de RapidAPI ─────────────────────────────────────
+// Sumamos ALL hits (autopilot + similar-sites + countries) y cortamos al límite.
+// Default: 5000/día (vs. plan PRO de 25k/mes ≈ 833/día → con margen de seguridad).
+// Cambiable en runtime via Supabase: toolbar_config.rapidapi_daily_limit
+async function getRapidApiUsageToday(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(rapidapi_calls_today,rapidapi_calls_date,rapidapi_daily_limit)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+
+    const today       = new Date().toISOString().slice(0, 10);
+    const storedDate  = map.rapidapi_calls_date  || "";
+    const storedCount = parseInt(map.rapidapi_calls_today || "0", 10);
+    const limit       = parseInt(map.rapidapi_daily_limit || "5000", 10);
+    const usedToday   = storedDate === today ? storedCount : 0;
+    return { usedToday, limit, today };
+  } catch { return { usedToday: 0, limit: 5000, today: new Date().toISOString().slice(0, 10) }; }
+}
+
+async function saveRapidApiUsage(token, callsThisSession, today) {
+  if (callsThisSession <= 0) return;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(rapidapi_calls_today,rapidapi_calls_date)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+
+    const storedDate  = map.rapidapi_calls_date || "";
+    const storedCount = storedDate === today ? parseInt(map.rapidapi_calls_today || "0", 10) : 0;
+    const newCount    = storedCount + callsThisSession;
+
+    await setConfigValue(token, "rapidapi_calls_today", String(newCount));
+    await setConfigValue(token, "rapidapi_calls_date",  today);
+    log(`RapidAPI usage guardado: ${newCount} hits hoy (sumé ${callsThisSession} en esta sesión)`);
+  } catch {}
+}
+
 async function saveApolloUsage(token, callsThisSession, today) {
   if (callsThisSession === 0) return;
   try {
@@ -567,42 +611,59 @@ async function fetchMondayDomains(apiKey) {
 }
 
 // Retry helper — 3 attempts with exponential backoff for transient RapidAPI errors.
-// 5xx + network errors retry; 4xx (bad domain) fails fast. Returns null on permanent failure.
+// SOLO retry en 5xx + network (no facturan). 429 = abandonar inmediato porque
+// cada retry de 429 es 1 request facturada por RapidAPI (incidente del 02/04
+// — overage de 400 USD por retries en cascada en día con vendor degradado).
+// 4xx también fail-fast.
 async function rapidFetchWithRetry(url, headers, timeout = 8000) {
   let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
+      // Pre-check del cap diario global (evita facturar si ya pasamos el límite)
+      if (_rapidCapReached) return { __error4xx: "daily_cap_reached" };
+      _rapidGlobalCounter++;
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
       if (res.ok) return await res.json();
-      // 4xx = client error, don't retry
-      if (res.status >= 400 && res.status < 500 && res.status !== 429) return null;
-      // 429 / 5xx = retry
+      // 4xx (incluido 429) = NO retry. Cada hit cuesta plata, no pagamos por error.
+      // Devuelvo __error4xx para que el caller NO active fallback (mismo plan, mismo resultado).
+      if (res.status >= 400 && res.status < 500) {
+        return { __error4xx: `HTTP ${res.status}${res.status === 429 ? " (rate limited)" : ""}` };
+      }
+      // Solo 5xx llega acá → retry una vez (los 5xx no facturan en RapidAPI)
       lastErr = `HTTP ${res.status}`;
     } catch (e) {
       lastErr = e.message;
     }
-    if (attempt < 2) await sleep(500 * Math.pow(2, attempt)); // 500ms, 1s
+    if (attempt < 1) await sleep(800);
   }
-  return { __error: lastErr }; // signal to caller: distinguish from "empty"
+  return { __error: lastErr }; // 5xx exhaustivo o network → caller puede intentar fallback
 }
 
+// Counter en memoria de RapidAPI hits de la sesión actual de Railway.
+// Se persiste a Supabase periódicamente (toolbar_config.rapidapi_calls_today).
+let _rapidGlobalCounter = 0;
+let _rapidCapReached    = false;
+
 async function getTrafficData(domain, rapidApiKey) {
-  const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "similarweb-insights.p.rapidapi.com" };
+  const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" };
   try {
     // Primary: /all-insights (devuelve Visits + TopCountries + Category en una sola llamada)
     let data = await rapidFetchWithRetry(
-      `https://similarweb-insights.p.rapidapi.com/all-insights?domain=${encodeURIComponent(domain)}`,
+      `https://website-insights.p.rapidapi.com/all-insights?domain=${encodeURIComponent(domain)}`,
       headers
     );
-    // Fallback: /traffic si /all-insights falla (plan no lo cubre)
-    if (!data || data.__error) {
+    // Fallback: /traffic SOLO si /all-insights falló por 5xx/network (no factura).
+    // Si fue 4xx (404/403/429), NO insistir — el endpoint hermano del mismo plan
+    // tirará el mismo error y solo gastamos otra request facturada.
+    if (data?.__error && !data.__error4xx) {
       data = await rapidFetchWithRetry(
-        `https://similarweb-insights.p.rapidapi.com/traffic?domain=${encodeURIComponent(domain)}`,
+        `https://website-insights.p.rapidapi.com/traffic?domain=${encodeURIComponent(domain)}`,
         headers
       );
     }
     if (!data) return { visits: null, topCountry: null, error: null };
-    if (data.__error) return { visits: null, topCountry: null, error: data.__error };
+    if (data.__error4xx) return { visits: null, topCountry: null, error: data.__error4xx };
+    if (data.__error)    return { visits: null, topCountry: null, error: data.__error };
     const visits = data?.Visits || data?.visits || data?.pageViews || data?.PageViews || null;
 
     // Extract top country — try inline data first, then separate /countries endpoint
@@ -616,10 +677,11 @@ async function getTrafficData(domain, rapidApiKey) {
     }
 
     // Fallback: dedicated /countries endpoint (used by extension too)
-    if (!topCountry) {
+    if (!topCountry && !_rapidCapReached) {
       try {
+        _rapidGlobalCounter++;
         const r2 = await fetch(
-          `https://similarweb-insights.p.rapidapi.com/countries?domain=${encodeURIComponent(domain)}`,
+          `https://website-insights.p.rapidapi.com/countries?domain=${encodeURIComponent(domain)}`,
           { headers, signal: AbortSignal.timeout(6000) }
         );
         if (r2.ok) {
@@ -641,13 +703,15 @@ async function getTrafficData(domain, rapidApiKey) {
 async function findSimilarSites(domain, rapidApiKey) {
   const [swSites, ssSites] = await Promise.all([
     (async () => {
+      if (_rapidCapReached) return [];
       try {
+        _rapidGlobalCounter++;
         const res = await fetch(
-          `https://similarweb-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
+          `https://website-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
           {
             headers: {
               "x-rapidapi-key":  rapidApiKey,
-              "x-rapidapi-host": "similarweb-insights.p.rapidapi.com",
+              "x-rapidapi-host": "website-insights.p.rapidapi.com",
             },
             signal: AbortSignal.timeout(8000),
           }
@@ -1305,12 +1369,22 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
 
 async function runCsvQueue(token, cfg, maxItems = 100) {
   const apolloUsage   = await getApolloUsageToday(token);
+  const rapidUsage    = await getRapidApiUsageToday(token);
   const callsRef      = { count: 0 };
   const blockedUsers  = new Set(); // usuarios que alcanzaron el límite diario
   const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
   let processed       = 0;
 
-  log(`▶ CSV queue start (apollo usados hoy: ${apolloUsage.usedToday}/${apolloUsage.limit})`);
+  log(`▶ CSV queue start (apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} · rapidapi: ${rapidUsage.usedToday}/${rapidUsage.limit})`);
+
+  // Hard cap RapidAPI — no procesar si ya pasamos el límite diario
+  if (rapidUsage.usedToday >= rapidUsage.limit) {
+    log(`⛔ Cap diario de RapidAPI alcanzado — CSV queue no arranca. Reset mañana.`);
+    return 0;
+  }
+  _rapidGlobalCounter = 0;
+  _rapidCapReached    = false;
+  const _rapidStart   = rapidUsage.usedToday;
 
   while (processed < maxItems) {
     const item = await getNextCsvItem(token, blockedUsers);
@@ -1341,11 +1415,21 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
       log(`  ❌ ${item.domain} — uncaught: ${e.message}`);
     }
 
+    // Hard cap RapidAPI mid-queue: cortar si pasamos el límite
+    const rapidUsedNow = _rapidStart + _rapidGlobalCounter;
+    if (rapidUsedNow >= rapidUsage.limit) {
+      _rapidCapReached = true;
+      log(`⛔ Cap diario de RapidAPI alcanzado mid-queue (${rapidUsedNow}/${rapidUsage.limit}) — corte. Reset mañana.`);
+      break;
+    }
+
     await sleep(DOMAIN_DELAY_MS);
   }
 
-  await saveApolloUsage(token, callsRef.count, new Date().toISOString().split("T")[0]);
-  log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}`);
+  const today = new Date().toISOString().split("T")[0];
+  await saveApolloUsage(token, callsRef.count, today);
+  await saveRapidApiUsage(token, _rapidGlobalCounter, today);
+  log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}, rapidapi: ${_rapidGlobalCounter}`);
   return processed;
 }
 
@@ -1405,14 +1489,28 @@ async function runSession(token, cfg, sessionStart) {
     }
   }
 
-  // Carga en paralelo: Majestic, Monday, procesados, rechazos, uso Apollo
-  const [majesticFullPool, mondayDomains, processed, rejectionPatterns, apolloUsage] = await Promise.all([
+  // Carga en paralelo: Majestic, Monday, procesados, rechazos, uso Apollo + RapidAPI
+  const [majesticFullPool, mondayDomains, processed, rejectionPatterns, apolloUsage, rapidUsage] = await Promise.all([
     loadDomainPool(),
     fetchMondayDomains(monday_api_key),
     getProcessedDomains(token),
     getRejectionPatterns(token),
     getApolloUsageToday(token),
+    getRapidApiUsageToday(token),
   ]);
+
+  // Hard cap de RapidAPI — si ya pasamos el límite del día, ni arrancar
+  const rapidRemaining = rapidUsage.limit - rapidUsage.usedToday;
+  log(`RapidAPI: ${rapidUsage.usedToday}/${rapidUsage.limit} hits hoy — ${rapidRemaining} disponibles`);
+  if (rapidRemaining <= 0) {
+    log(`⛔ Cap diario de RapidAPI alcanzado (${rapidUsage.usedToday}/${rapidUsage.limit}) — autopilot no arranca. Reset mañana.`);
+    await setConfigValue(token, "auto_prospecting_enabled", "false");
+    return;
+  }
+  // Resetear contadores de sesión + arm el cap-watcher
+  _rapidGlobalCounter = 0;
+  _rapidCapReached    = false;
+  const _rapidStart   = rapidUsage.usedToday;
 
   // ── POOL HÍBRIDO ──
   // Cuando hay target_geos: combinar Radar + Majestic-filtered-by-TLD
@@ -1504,7 +1602,9 @@ async function runSession(token, cfg, sessionStart) {
 
   // ── SEED desde likes: inyectar similares de los últimos 30 dominios que el user 👍 ──
   // Esto crea un feedback loop positivo: te gustó X → próxima sesión busca sitios como X
-  const likedSeeds = feedback.likedDomains.slice(0, 30); // últimos 30
+  // Reducido de 30 → 10 para limitar coste de RapidAPI: 30 likes × 1 call = 30 hits
+  // por arranque de sesión. Con 10 son 10 hits/sesión × 5 MBs = 50/día solo en seeds.
+  const likedSeeds = feedback.likedDomains.slice(0, 10);
   const likedSimilarDomains = new Set();
   if (likedSeeds.length > 0) {
     log(`Seeding similar-sites desde ${likedSeeds.length} likes recientes...`);
@@ -1542,6 +1642,17 @@ async function runSession(token, cfg, sessionStart) {
         await setConfigValue(token, "auto_prospecting_enabled", "false");
         break;
       }
+    }
+
+    // Hard cap global de RapidAPI — corta inmediato si pasamos el límite del día.
+    // Esto previene incidentes como el de mayo (overage de 400 USD por retries
+    // en cascada en día con vendor degradado).
+    const rapidUsedNow = _rapidStart + _rapidGlobalCounter;
+    if (rapidUsedNow >= rapidUsage.limit) {
+      _rapidCapReached = true;
+      log(`⛔ Cap diario de RapidAPI alcanzado (${rapidUsedNow}/${rapidUsage.limit}) — sesión cortada. Reset mañana.`);
+      await setConfigValue(token, "auto_prospecting_enabled", "false");
+      break;
     }
 
     if (count % 10 === 0 && count > 0) {
@@ -1792,7 +1903,9 @@ async function runSession(token, cfg, sessionStart) {
   }
 
   log(`Sesión completada — ${count} procesados | ${added} guardados | ${skipped} skipped | ${lowScore} bajo score | ${dupOrg} dup-org | ${discovered} descubiertos vía similares`);
+  log(`RapidAPI esta sesión: ${_rapidGlobalCounter} hits`);
   await saveApolloUsage(token, apolloCallsThisSession, apolloUsage.today);
+  await saveRapidApiUsage(token, _rapidGlobalCounter, rapidUsage.today);
 }
 
 // ── Loop principal ────────────────────────────────────────────

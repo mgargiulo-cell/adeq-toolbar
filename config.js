@@ -15,7 +15,7 @@ export const CONFIG = {
   MONDAY_API_KEY:        "",
   MONDAY_ACTIVE_BOARD:   "1420268379",
   RAPIDAPI_KEY:          "",
-  RAPIDAPI_TRAFFIC_HOST: "similarweb-insights.p.rapidapi.com",
+  RAPIDAPI_TRAFFIC_HOST: "website-insights.p.rapidapi.com",
   GEMINI_API_KEY:        "",
   APOLLO_API_KEY:        "",
 

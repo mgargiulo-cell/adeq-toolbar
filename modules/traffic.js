@@ -208,12 +208,16 @@ export async function getTraffic(domain) {
     // (esos paths NO EXISTEN en este vendor de RapidAPI — devolvían 404).
     let response = await rapidFetch(`/all-insights?domain=${encodeURIComponent(cleanDomain)}`);
 
-    // Fallback: si /all-insights falla (plan no lo cubre / 404), intentar /traffic
+    // Fallback: solo si fue 5xx/network. Si fue 4xx (404/403/429), NO insistir
+    // — /traffic vive en el mismo plan y vendor: si /all-insights tiró 4xx,
+    // /traffic también va a tirar 4xx y solo gastamos otra request facturada.
     let usedFallback = false;
-    if (!response.ok) {
-      console.log(`[Traffic] /all-insights ${cleanDomain} HTTP ${response.status}, fallback /traffic`);
+    if (!response.ok && response.status >= 500) {
+      console.log(`[Traffic] /all-insights ${cleanDomain} HTTP ${response.status} (5xx), fallback /traffic`);
       response = await rapidFetch(`/traffic?domain=${encodeURIComponent(cleanDomain)}`);
       usedFallback = true;
+    } else if (!response.ok) {
+      console.log(`[Traffic] /all-insights ${cleanDomain} HTTP ${response.status} — no fallback (4xx, evita gastar request)`);
     }
 
     if (response.ok) {
@@ -286,7 +290,12 @@ export async function getTraffic(domain) {
       }
     }
 
-    // ── Fallback: /similar-sites ──────────────────────────────
+    // ── Fallback: /similar-sites — SOLO si los anteriores fueron 5xx/network ──
+    // Mismo razonamiento: en 4xx el endpoint hermano va a tirar 4xx también.
+    if (response.status >= 400 && response.status < 500) {
+      console.log(`[Traffic] ${cleanDomain} sin /similar-sites fallback — primaria fue 4xx`);
+      return null;
+    }
     const fallback = await rapidFetch(`/similar-sites?domain=${encodeURIComponent(cleanDomain)}`);
     if (!fallback.ok) return null;
     const fData = fallback.data || {};
