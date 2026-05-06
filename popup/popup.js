@@ -27,7 +27,18 @@ import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllC
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
-import { callProxy, setProxyAuth }                                                              from "../modules/apiProxy.js";
+import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
+
+// ---- RapidAPI monthly cap banner ----
+function showRapidApiCapBanner({ used, limit, period } = {}) {
+  const banner = document.getElementById("rapidapi-cap-banner");
+  const detail = document.getElementById("cap-banner-detail");
+  if (!banner) return;
+  banner.style.display = "flex";
+  if (detail && used != null && limit != null) {
+    detail.textContent = `— ${used.toLocaleString()} / ${limit.toLocaleString()} en ${period || "este mes"}. Las consultas de tráfico están pausadas hasta el próximo mes.`;
+  }
+}
 
 // ---- Estado global ----
 const state = {
@@ -161,6 +172,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   setTrafficAuthToken(auth.accessToken);
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
   setProxyAuth(auth.accessToken);
+
+  // Banner del cap mensual de RapidAPI: suscribirse al evento + check al inicio
+  onRapidApiCapReached(showRapidApiCapBanner);
+  getRapidApiMonthlyStatus().then(s => {
+    if (s && s.used >= s.limit) showRapidApiCapBanner(s);
+  }).catch(() => {});
 
   // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
   const scheduleRefresh = () => {

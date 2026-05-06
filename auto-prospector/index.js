@@ -507,6 +507,49 @@ async function getApolloUsageToday(token) {
   } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10) }; }
 }
 
+// ── Hard cap MENSUAL de RapidAPI ────────────────────────────────────
+// Default 40.000/mes (vs FREE de 500k) — protección contra overage.
+// Compartido entre worker y toolbar manual (mismas keys en toolbar_config).
+async function getRapidApiUsageThisMonth(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(rapidapi_calls_month,rapidapi_calls_month_period,rapidapi_monthly_limit)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+
+    const period      = new Date().toISOString().slice(0, 7); // YYYY-MM
+    const storedPer   = map.rapidapi_calls_month_period || "";
+    const storedCount = parseInt(map.rapidapi_calls_month || "0", 10);
+    const limit       = parseInt(map.rapidapi_monthly_limit || "40000", 10);
+    const usedThisMonth = storedPer === period ? storedCount : 0;
+    return { usedThisMonth, limit, period };
+  } catch { return { usedThisMonth: 0, limit: 40000, period: new Date().toISOString().slice(0, 7) }; }
+}
+
+async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {
+  if (callsThisSession <= 0) return;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(rapidapi_calls_month,rapidapi_calls_month_period)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+
+    const storedPer   = map.rapidapi_calls_month_period || "";
+    const storedCount = storedPer === period ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
+    const newCount    = storedCount + callsThisSession;
+
+    await setConfigValue(token, "rapidapi_calls_month",        String(newCount));
+    await setConfigValue(token, "rapidapi_calls_month_period", period);
+    log(`RapidAPI mensual guardado: ${newCount} hits en ${period} (sumé ${callsThisSession} esta sesión)`);
+  } catch {}
+}
+
 // ── Hard cap diario de RapidAPI ─────────────────────────────────────
 // Sumamos ALL hits (autopilot + similar-sites + countries) y cortamos al límite.
 // Default: 5000/día (vs. plan PRO de 25k/mes ≈ 833/día → con margen de seguridad).
@@ -1370,21 +1413,28 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
 async function runCsvQueue(token, cfg, maxItems = 100) {
   const apolloUsage   = await getApolloUsageToday(token);
   const rapidUsage    = await getRapidApiUsageToday(token);
+  const rapidMonth    = await getRapidApiUsageThisMonth(token);
   const callsRef      = { count: 0 };
   const blockedUsers  = new Set(); // usuarios que alcanzaron el límite diario
   const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
   let processed       = 0;
 
-  log(`▶ CSV queue start (apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} · rapidapi: ${rapidUsage.usedToday}/${rapidUsage.limit})`);
+  log(`▶ CSV queue start (apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} · rapidapi día: ${rapidUsage.usedToday}/${rapidUsage.limit} · mes: ${rapidMonth.usedThisMonth}/${rapidMonth.limit})`);
 
-  // Hard cap RapidAPI — no procesar si ya pasamos el límite diario
+  // Hard cap MENSUAL — no procesar si pasamos el límite del mes
+  if (rapidMonth.usedThisMonth >= rapidMonth.limit) {
+    log(`⛔ Cap MENSUAL de RapidAPI alcanzado — CSV queue no arranca hasta próximo mes.`);
+    return 0;
+  }
+  // Hard cap DIARIO
   if (rapidUsage.usedToday >= rapidUsage.limit) {
     log(`⛔ Cap diario de RapidAPI alcanzado — CSV queue no arranca. Reset mañana.`);
     return 0;
   }
   _rapidGlobalCounter = 0;
   _rapidCapReached    = false;
-  const _rapidStart   = rapidUsage.usedToday;
+  const _rapidStart      = rapidUsage.usedToday;
+  const _rapidMonthStart = rapidMonth.usedThisMonth;
 
   while (processed < maxItems) {
     const item = await getNextCsvItem(token, blockedUsers);
@@ -1415,7 +1465,14 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
       log(`  ❌ ${item.domain} — uncaught: ${e.message}`);
     }
 
-    // Hard cap RapidAPI mid-queue: cortar si pasamos el límite
+    // Hard cap MENSUAL mid-queue
+    const rapidMonthUsedNow = _rapidMonthStart + _rapidGlobalCounter;
+    if (rapidMonthUsedNow >= rapidMonth.limit) {
+      _rapidCapReached = true;
+      log(`⛔ Cap MENSUAL de RapidAPI alcanzado mid-queue (${rapidMonthUsedNow}/${rapidMonth.limit}) — corte hasta próximo mes.`);
+      break;
+    }
+    // Hard cap diario mid-queue
     const rapidUsedNow = _rapidStart + _rapidGlobalCounter;
     if (rapidUsedNow >= rapidUsage.limit) {
       _rapidCapReached = true;
@@ -1429,6 +1486,7 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const today = new Date().toISOString().split("T")[0];
   await saveApolloUsage(token, callsRef.count, today);
   await saveRapidApiUsage(token, _rapidGlobalCounter, today);
+  await saveRapidApiMonthlyUsage(token, _rapidGlobalCounter, rapidMonth.period);
   log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}, rapidapi: ${_rapidGlobalCounter}`);
   return processed;
 }
@@ -1489,19 +1547,28 @@ async function runSession(token, cfg, sessionStart) {
     }
   }
 
-  // Carga en paralelo: Majestic, Monday, procesados, rechazos, uso Apollo + RapidAPI
-  const [majesticFullPool, mondayDomains, processed, rejectionPatterns, apolloUsage, rapidUsage] = await Promise.all([
+  // Carga en paralelo: Majestic, Monday, procesados, rechazos, uso Apollo + RapidAPI (diario + mensual)
+  const [majesticFullPool, mondayDomains, processed, rejectionPatterns, apolloUsage, rapidUsage, rapidMonth] = await Promise.all([
     loadDomainPool(),
     fetchMondayDomains(monday_api_key),
     getProcessedDomains(token),
     getRejectionPatterns(token),
     getApolloUsageToday(token),
     getRapidApiUsageToday(token),
+    getRapidApiUsageThisMonth(token),
   ]);
 
-  // Hard cap de RapidAPI — si ya pasamos el límite del día, ni arrancar
+  // Hard cap MENSUAL de RapidAPI — protección principal contra overage
+  log(`RapidAPI mensual: ${rapidMonth.usedThisMonth}/${rapidMonth.limit} en ${rapidMonth.period}`);
+  if (rapidMonth.usedThisMonth >= rapidMonth.limit) {
+    log(`⛔ Cap MENSUAL de RapidAPI alcanzado (${rapidMonth.usedThisMonth}/${rapidMonth.limit}) — autopilot no arranca hasta el próximo mes.`);
+    await setConfigValue(token, "auto_prospecting_enabled", "false");
+    return;
+  }
+
+  // Hard cap DIARIO — defensa secundaria
   const rapidRemaining = rapidUsage.limit - rapidUsage.usedToday;
-  log(`RapidAPI: ${rapidUsage.usedToday}/${rapidUsage.limit} hits hoy — ${rapidRemaining} disponibles`);
+  log(`RapidAPI diario: ${rapidUsage.usedToday}/${rapidUsage.limit} hits hoy — ${rapidRemaining} disponibles`);
   if (rapidRemaining <= 0) {
     log(`⛔ Cap diario de RapidAPI alcanzado (${rapidUsage.usedToday}/${rapidUsage.limit}) — autopilot no arranca. Reset mañana.`);
     await setConfigValue(token, "auto_prospecting_enabled", "false");
@@ -1511,6 +1578,7 @@ async function runSession(token, cfg, sessionStart) {
   _rapidGlobalCounter = 0;
   _rapidCapReached    = false;
   const _rapidStart   = rapidUsage.usedToday;
+  const _rapidMonthStart = rapidMonth.usedThisMonth;
 
   // ── POOL HÍBRIDO ──
   // Cuando hay target_geos: combinar Radar + Majestic-filtered-by-TLD
@@ -1644,9 +1712,15 @@ async function runSession(token, cfg, sessionStart) {
       }
     }
 
-    // Hard cap global de RapidAPI — corta inmediato si pasamos el límite del día.
-    // Esto previene incidentes como el de mayo (overage de 400 USD por retries
-    // en cascada en día con vendor degradado).
+    // Hard cap MENSUAL — corte primario, protege contra overage tipo incidente May 02.
+    const rapidMonthUsedNow = _rapidMonthStart + _rapidGlobalCounter;
+    if (rapidMonthUsedNow >= rapidMonth.limit) {
+      _rapidCapReached = true;
+      log(`⛔ Cap MENSUAL de RapidAPI alcanzado (${rapidMonthUsedNow}/${rapidMonth.limit}) — sesión cortada hasta próximo mes.`);
+      await setConfigValue(token, "auto_prospecting_enabled", "false");
+      break;
+    }
+    // Hard cap diario — defensa secundaria
     const rapidUsedNow = _rapidStart + _rapidGlobalCounter;
     if (rapidUsedNow >= rapidUsage.limit) {
       _rapidCapReached = true;
@@ -1906,6 +1980,7 @@ async function runSession(token, cfg, sessionStart) {
   log(`RapidAPI esta sesión: ${_rapidGlobalCounter} hits`);
   await saveApolloUsage(token, apolloCallsThisSession, apolloUsage.today);
   await saveRapidApiUsage(token, _rapidGlobalCounter, rapidUsage.today);
+  await saveRapidApiMonthlyUsage(token, _rapidGlobalCounter, rapidMonth.period);
 }
 
 // ── Loop principal ────────────────────────────────────────────

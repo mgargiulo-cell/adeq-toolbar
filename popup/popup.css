@@ -224,6 +224,22 @@ a:hover { text-decoration: underline; }
   padding: 2px 7px; border-radius: var(--r-sm);
 }
 .header-right { display: flex; align-items: center; gap: var(--sp-2); }
+
+/* Banner que aparece cuando se alcanza el cap mensual de RapidAPI */
+.cap-banner {
+  background: linear-gradient(90deg, #fee2e2, #fecaca);
+  color: #7f1d1d;
+  padding: 10px 14px;
+  font-size: 12px;
+  border-bottom: 1px solid #ef4444;
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.cap-banner .cap-icon { font-size: 16px; }
+.cap-banner .cap-text { line-height: 1.4; }
+.cap-banner strong { display: block; font-weight: 800; }
+.cap-banner #cap-banner-detail { font-weight: 500; opacity: 0.9; }
 .site-url     {
   font-size: var(--fs-sm); color: #cbd5e1;
   max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
