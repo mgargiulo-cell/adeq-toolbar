@@ -121,6 +121,49 @@ function _capReached() {
   return _monthState.used >= _monthState.limit;
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Cap personal por usuario (toolbar_user_limits.monthly_api_cap).
+// Cuando el admin lo setea, el usuario no puede pasar de ese número
+// aún si el cap global de 40K tiene espacio. Lee 1 vez al login y
+// cachea (cambios del admin se reflejan al siguiente refresh).
+// ─────────────────────────────────────────────────────────────────
+let _userPersonalCap     = null;   // null = sin cap personal, usa solo el global
+let _userPersonalUsed    = 0;
+let _userCapLoadedFor    = null;
+let _userCapLoadedPeriod = null;
+
+async function loadUserPersonalCap() {
+  if (!_sbAuthToken || !_sbUserEmail) return;
+  const period = currentPeriod();
+  if (_userCapLoadedFor === _sbUserEmail && _userCapLoadedPeriod === period) return;
+  try {
+    const limitRes = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_user_limits?user_email=eq.${encodeURIComponent(_sbUserEmail)}&select=monthly_api_cap&limit=1`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${_sbAuthToken}` } }
+    );
+    if (limitRes.ok) {
+      const rows = await limitRes.json();
+      _userPersonalCap = rows?.[0]?.monthly_api_cap ? parseInt(rows[0].monthly_api_cap, 10) : null;
+    }
+    // Sumar todos los hits de ESTE user en el mes corriente desde toolbar_api_usage
+    const usageRes = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(_sbUserEmail)}&day=gte.${period}-01&select=by_provider`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${_sbAuthToken}` } }
+    );
+    if (usageRes.ok) {
+      const rows = await usageRes.json();
+      _userPersonalUsed = rows.reduce((acc, r) => acc + parseInt(r.by_provider?.rapidapi || 0, 10), 0);
+    }
+    _userCapLoadedFor    = _sbUserEmail;
+    _userCapLoadedPeriod = period;
+  } catch (e) { console.warn("[apiProxy] loadUserPersonalCap:", e.message); }
+}
+
+function _userCapReached() {
+  if (_userPersonalCap == null) return false;
+  return _userPersonalUsed >= _userPersonalCap;
+}
+
 /**
  * Call the Edge Function proxy.
  * @param {"gemini"|"apollo"|"rapidapi"} provider
@@ -151,9 +194,23 @@ export async function callProxy(provider, path, opts = {}) {
     if (!_monthState || _monthState.period !== currentPeriod()) {
       await loadMonthlyCounter();
     }
+    // Cap personal del usuario tiene prioridad sobre el global.
+    await loadUserPersonalCap();
+    if (_userCapReached()) {
+      console.warn(`[apiProxy] ⛔ Cap PERSONAL del usuario alcanzado: ${_userPersonalUsed}/${_userPersonalCap}`);
+      try { _onCapReachedCb?.({ used: _userPersonalUsed, limit: _userPersonalCap, period: _monthState?.period, scope: "user" }); } catch {}
+      return {
+        ok:     false,
+        status: 429,
+        data:   null,
+        text:   "user_monthly_cap_reached",
+        error:  "user_monthly_cap_reached",
+        capReached: true,
+      };
+    }
     if (_capReached()) {
-      console.warn(`[apiProxy] ⛔ RapidAPI cap mensual alcanzado: ${_monthState.used}/${_monthState.limit}`);
-      try { _onCapReachedCb?.({ used: _monthState.used, limit: _monthState.limit, period: _monthState.period }); } catch {}
+      console.warn(`[apiProxy] ⛔ RapidAPI cap mensual GLOBAL alcanzado: ${_monthState.used}/${_monthState.limit}`);
+      try { _onCapReachedCb?.({ used: _monthState.used, limit: _monthState.limit, period: _monthState.period, scope: "global" }); } catch {}
       return {
         ok:     false,
         status: 429,
@@ -187,14 +244,18 @@ export async function callProxy(provider, path, opts = {}) {
       // Incrementar contador mensual SOLO para rapidapi (cualquier status, sí o sí
       // es 1 hit facturable — incluso 4xx/5xx cuentan en RapidAPI billing).
       if (provider === "rapidapi" && _monthState) {
-        _monthState.used += 1 + attempt; // sumar también los retries de 5xx que se ejecutaron
-        _monthState.dirty = true;
-        _hitsSinceFlush  += 1 + attempt;
+        const inc = 1 + attempt;
+        _monthState.used    += inc; // sumar también los retries de 5xx que se ejecutaron
+        _userPersonalUsed   += inc; // counter personal del user (también facturable)
+        _monthState.dirty    = true;
+        _hitsSinceFlush     += inc;
         // Persistir async, sin bloquear
         flushMonthlyCounter().catch(() => {});
-        // Si justo cruzamos el límite con esta call, alertar UI
-        if (_capReached()) {
-          try { _onCapReachedCb?.({ used: _monthState.used, limit: _monthState.limit, period: _monthState.period }); } catch {}
+        // Si cruzamos cap personal o global, alertar UI
+        if (_userCapReached()) {
+          try { _onCapReachedCb?.({ used: _userPersonalUsed, limit: _userPersonalCap, period: _monthState.period, scope: "user" }); } catch {}
+        } else if (_capReached()) {
+          try { _onCapReachedCb?.({ used: _monthState.used, limit: _monthState.limit, period: _monthState.period, scope: "global" }); } catch {}
         }
       }
 

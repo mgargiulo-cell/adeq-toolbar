@@ -318,6 +318,13 @@ function wireAdminViewToggle() {
 }
 
 function toggleAdminView() {
+  // Re-validar el role en cada toggle. Defense in depth: aunque el wire del
+  // listener solo se hace si role==admin al login, esto previene que
+  // mutación de state.role en DevTools abra el panel.
+  if (!isAdminEmail(state.loginEmail)) {
+    console.warn("[admin] toggle bloqueado — solo admin puede activar");
+    return;
+  }
   state.adminViewActive = !state.adminViewActive;
   document.body.setAttribute("data-admin-view", state.adminViewActive ? "on" : "off");
   const panel = document.getElementById("admin-panel");
@@ -1029,7 +1036,7 @@ function renderRapidApiFooterCounter({ used, limit, period } = {}) {
 }
 
 // ---- RapidAPI monthly usage banner (3 niveles: 50% / 80% / 100%) ----
-function renderRapidApiUsageBanner({ used, limit, period } = {}) {
+function renderRapidApiUsageBanner({ used, limit, period, scope } = {}) {
   const banner = document.getElementById("rapidapi-cap-banner");
   const icon   = document.getElementById("cap-banner-icon");
   const title  = document.getElementById("cap-banner-title");
@@ -1047,20 +1054,23 @@ function renderRapidApiUsageBanner({ used, limit, period } = {}) {
   const limitStr = limit.toLocaleString();
   const periodStr = period || "este mes";
 
+  // Etiqueta para distinguir cap personal vs global del equipo
+  const scopeLabel = scope === "user" ? "TU CAP PERSONAL" : "Cap del equipo";
+
   if (pct >= 100) {
     banner.classList.add("cap-reached");
     icon.textContent  = "⛔";
-    title.textContent = "Límite mensual de SimilarWeb alcanzado";
+    title.textContent = `${scopeLabel}: límite mensual alcanzado`;
     detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Las consultas de tráfico están pausadas hasta el próximo mes.`;
   } else if (pct >= 80) {
     banner.classList.add("cap-danger");
     icon.textContent  = "🔶";
-    title.textContent = `Uso de SimilarWeb al ${Math.round(pct)}% — atención`;
+    title.textContent = `${scopeLabel} al ${Math.round(pct)}% — atención`;
     detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Quedan pocas consultas; el autopilot puede cortarse pronto.`;
   } else {
     banner.classList.add("cap-warning");
     icon.textContent  = "⚠️";
-    title.textContent = `Uso de SimilarWeb al ${Math.round(pct)}%`;
+    title.textContent = `${scopeLabel} al ${Math.round(pct)}%`;
     detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Avisamos para que estés al tanto.`;
   }
 }
@@ -1200,7 +1210,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setSupabaseAuth(auth.accessToken);
   setTrafficAuthToken(auth.accessToken);
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
-  setProxyAuth(auth.accessToken);
+  setProxyAuth(auth.accessToken, auth.user);
 
   // Uso mensual de RapidAPI: footer counter (siempre visible) + banner (≥50%).
   // Re-chequea cada 60s para reflejar hits de otros MBs en paralelo.
@@ -1229,7 +1239,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           state.accessToken = r.access_token;
           await chrome.storage.local.set({ auth });
           setSupabaseAuth(r.access_token);
-          setProxyAuth(r.access_token);
+          setProxyAuth(r.access_token, auth.user);
           setTrafficAuthToken(r.access_token);
           scheduleRefresh();
         }
