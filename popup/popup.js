@@ -298,6 +298,24 @@ function runAnalysisPipeline() {
 // admin con triple-click en el logo (no llama la atención y no clutterea
 // la UI normal).
 // ============================================================
+function showAdminDeniedToast() {
+  // Toast efímero que se auto-destruye. No alert() porque interrumpe demasiado.
+  let t = document.getElementById("admin-denied-toast");
+  if (t) { t.remove(); }
+  t = document.createElement("div");
+  t.id = "admin-denied-toast";
+  t.style.cssText = `
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    background: #fee2e2; color: #991b1b; border: 1px solid #ef4444;
+    padding: 10px 16px; border-radius: 8px; font-size: 12px; font-weight: 600;
+    z-index: 99999; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  `;
+  t.textContent = "🔒 Solo el admin (mgargiulo@adeqmedia.com) puede abrir este panel.";
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity 0.4s"; }, 2200);
+  setTimeout(() => { t.remove(); }, 2700);
+}
+
 function wireAdminViewToggle() {
   const logo = document.querySelector(".logo");
   if (!logo || logo._adminWired) return;
@@ -318,11 +336,10 @@ function wireAdminViewToggle() {
 }
 
 function toggleAdminView() {
-  // Re-validar el role en cada toggle. Defense in depth: aunque el wire del
-  // listener solo se hace si role==admin al login, esto previene que
-  // mutación de state.role en DevTools abra el panel.
+  // Solo el admin (mgargiulo@adeqmedia.com) puede abrir el panel.
+  // Los demás MBs reciben feedback visible si triple-clickean por accidente.
   if (!isAdminEmail(state.loginEmail)) {
-    console.warn("[admin] toggle bloqueado — solo admin puede activar");
+    showAdminDeniedToast();
     return;
   }
   state.adminViewActive = !state.adminViewActive;
@@ -4256,7 +4273,9 @@ function applyUserFromAuth(auth) {
   state.role         = getRole(email);
   // Marcar el body con el role para que el CSS pueda mostrar/ocultar UI admin
   document.body.setAttribute("data-role", state.role);
-  if (state.role === "admin") wireAdminViewToggle();
+  // Wire del triple-click para TODOS los users — los no-admin reciben un alert
+  // visible cuando lo intentan (en vez de fallar silencioso)
+  wireAdminViewToggle();
 
   // Pre-seleccionar ejecutivo en el form de Monday
   const execSel = document.getElementById("form-ejecutivo");
