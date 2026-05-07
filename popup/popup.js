@@ -6197,18 +6197,9 @@ function initProspectsTab() {
   document.getElementById("prospects-source-filter")?.addEventListener("change", async () => {
     await loadProspectsTab();
   });
-  document.getElementById("btn-prospects-clear")?.addEventListener("click", async () => {
-    if (!confirm("Delete ALL your prospects (pending, rejected, validated, failed)?\n\nThis cannot be undone. Only your own items are affected.")) return;
-    const btn = document.getElementById("btn-prospects-clear");
-    btn.disabled = true; btn.textContent = "⏳ Deleting...";
-    const r = await clearPendingProspects(state.accessToken, state.loginEmail);
-    btn.disabled = false; btn.textContent = "🗑 Clear all";
-    if (!r.ok) { alert("Delete failed: " + (r.error || "unknown")); return; }
-    if (r.deleted === 0) {
-      alert("No rows deleted.\n\nPossible causes:\n• Rows belong to other users (RLS blocks them)\n• Rows have no 'created_by' set and RLS won't allow deletion\n\nAsk an admin to clear them via service role if needed.");
-    }
-    await loadProspectsTab();
-  });
+  // Clear all de Prospects ELIMINADO — el botón borraba TODA la cola compartida
+  // del equipo (autopilot + Monday + manual). Riesgo demasiado alto. Si en algún
+  // momento hace falta limpiar, el admin lo hace desde Supabase SQL Editor.
 }
 
 async function updateApiFooter() {
