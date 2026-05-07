@@ -7,7 +7,7 @@ import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } f
 import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch }                                                                     from "../modules/gemini.js";
-import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
+// (geminiSearch.searchEmailsWithGemini removido — no se usa en popup, solo en scraper.js)
 import { verifyEmail, verifyEmailDeep, isGarbageEmail }                                         from "../modules/emailVerifier.js";
 import { runCascade, getSimilarSites }                                                         from "../modules/cascade.js";
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
@@ -35,8 +35,8 @@ import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
 import { startUsageSession, endUsageSession, fetchUsageStats }                                   from "../modules/usageTracking.js";
 import { lockProspect, getActiveProspectLock, unlockProspect, createHandoff,
          fetchPendingHandoffsForUser, updateHandoffStatus,
-         setVacationStatus, getUserStatus, getActiveUsers }                                      from "../modules/coordination.js";
-import { logAuditEvent, fetchAuditLog }                                                          from "../modules/auditLog.js";
+         setVacationStatus, getUserStatus }                                                      from "../modules/coordination.js";
+import { logAuditEvent }                                                                         from "../modules/auditLog.js";
 
 // ============================================================
 // DEMO MODE
@@ -1063,6 +1063,27 @@ function renderAdminLiveFeed(rows) {
     wrap.appendChild(row);
   });
 }
+
+// ── Global toast helper para errores que antes iban silenciosos a console.
+//    Reemplaza el patrón console.warn() puro por un aviso visible al user.
+function showToast(message, kind = "info", durationMs = 4000) {
+  if (!message) return;
+  const t = document.createElement("div");
+  t.className = `global-toast ${kind}`;
+  t.textContent = message;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity 0.4s"; }, durationMs);
+  setTimeout(() => { t.remove(); }, durationMs + 500);
+}
+
+// Wrapper para console.warn que ADEMÁS muestra toast en errores user-facing.
+// Para warnings de debug interno, seguimos usando console.warn directo.
+window.notifyUserError = (msg) => {
+  console.warn("[user-error]", msg);
+  try { showToast(msg, "error"); } catch {}
+};
+window.notifyUserOk    = (msg) => { try { showToast(msg, "ok"); } catch {} };
+window.notifyUserWarn  = (msg) => { try { showToast(msg, "warn"); } catch {} };
 
 // ---- RapidAPI footer counter (siempre visible) ----
 function renderRapidApiFooterCounter({ used, limit, period } = {}) {
@@ -5727,13 +5748,27 @@ function initProspectCard(card, data) {
     }
   });
 
-  // Expand toggle
-  card.querySelector(".pcard-expand-btn")?.addEventListener("click", () => {
+  // Expand toggle — al abrir, lock del prospect 30 min para que otros MBs no lo
+  // toquen al mismo tiempo. Se libera al cerrar la card o al cerrar la toolbar.
+  card.querySelector(".pcard-expand-btn")?.addEventListener("click", async () => {
     const panel = card.querySelector(".pcard-detail");
     const btn   = card.querySelector(".pcard-expand-btn");
     const open  = panel.style.display === "none";
     panel.style.display = open ? "block" : "none";
     btn.textContent     = open ? "▲" : "▼";
+    if (open && data.domain) {
+      // Verificar si otro MB ya lo lockeó
+      const lock = await getActiveProspectLock(state.accessToken, data.domain);
+      if (lock && lock.locked_by.toLowerCase() !== (state.loginEmail || "").toLowerCase()) {
+        const minLeft = Math.max(0, Math.round((new Date(lock.expires_at) - Date.now()) / 60000));
+        showToast(`🔒 ${lock.locked_by} está revisando este prospecto (${minLeft} min). Coordiná antes de pushear.`, "warn", 6000);
+      } else {
+        lockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
+      }
+    } else if (!open && data.domain) {
+      // Al cerrar, liberar el lock SI somos el dueño
+      unlockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
+    }
   });
 
   // Draft dropdown REMOVIDO — ahora hay chips de banderas + bandera-rotator (ver _updateCardUI)

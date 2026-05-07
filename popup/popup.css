@@ -1083,6 +1083,27 @@ input.form-pv-display { font-weight: 700; }
 .autopush-steps      { display: flex; flex-direction: column; gap: 2px; }
 .autopush-step       { font-size: var(--fs-base); color: #374151; }
 
+/* Global error toast — agregado por auditoría UX */
+.global-toast {
+  position: fixed;
+  bottom: 70px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 90%;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  z-index: 99998;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+  animation: toast-in 0.25s ease-out;
+}
+.global-toast.error { background: #fee2e2; color: #991b1b; border: 1px solid #ef4444; }
+.global-toast.warn  { background: #fef3c7; color: #78350f; border: 1px solid #f59e0b; }
+.global-toast.info  { background: #dbeafe; color: #1e3a8a; border: 1px solid #3b82f6; }
+.global-toast.ok    { background: #d1fae5; color: #064e3b; border: 1px solid #10b981; }
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
 /* ============================================================
    COORDINATION (lock + handoff)
    ============================================================ */

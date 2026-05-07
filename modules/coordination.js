@@ -101,16 +101,34 @@ export async function createHandoff(token, { domain, monday_item_id, from_email,
   } catch { return { ok: false }; }
 }
 
+// TTL de 7 días — handoffs que nadie aceptó en 7 días se descartan del feed.
+// Evita que se acumulen pendings de gente que no usó la toolbar en mucho tiempo.
+const HANDOFF_TTL_DAYS = 7;
 export async function fetchPendingHandoffsForUser(token, email) {
   if (!token || !email) return [];
   try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - HANDOFF_TTL_DAYS);
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_handoffs?to_email=eq.${encodeURIComponent(email)}&status=eq.pending&select=*&order=created_at.desc`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_handoffs?to_email=eq.${encodeURIComponent(email)}&status=eq.pending&created_at=gte.${cutoff.toISOString()}&select=*&order=created_at.desc`,
       { headers: _headers(token) }
     );
     if (!res.ok) return [];
     return await res.json();
   } catch { return []; }
+}
+
+// Marca como expired los handoffs viejos (admin-callable, opcional).
+export async function expireOldHandoffs(token) {
+  if (!token) return;
+  try {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - HANDOFF_TTL_DAYS);
+    await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_handoffs?status=eq.pending&created_at=lt.${cutoff.toISOString()}`,
+      { method: "PATCH", headers: { ..._headers(token), "Prefer": "return=minimal" }, body: JSON.stringify({ status: "expired" }) }
+    );
+  } catch {}
 }
 
 export async function updateHandoffStatus(token, id, status) {
