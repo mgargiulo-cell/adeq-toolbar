@@ -32,6 +32,105 @@ import { isAdminEmail, getRole }                                                
 import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
          getUserDailyUsage, incrementUserDailyCounter, checkUserCanDo }                          from "../modules/userLimits.js";
 import { startUsageSession, endUsageSession, fetchUsageStats }                                   from "../modules/usageTracking.js";
+import { lockProspect, getActiveProspectLock, unlockProspect, createHandoff,
+         fetchPendingHandoffsForUser, updateHandoffStatus,
+         setVacationStatus, getUserStatus, getActiveUsers }                                      from "../modules/coordination.js";
+
+// ============================================================
+// COORDINACIÓN ENTRE MBs (lock + handoff + vacation)
+// ============================================================
+async function checkProspectLock() {
+  if (!state.domain || !state.accessToken) return;
+  const lock = await getActiveProspectLock(state.accessToken, state.domain);
+  const el = document.getElementById("duplicate-result");
+  if (!lock) {
+    // Auto-claim: si está libre y vos lo abriste, te lo asignamos
+    lockProspect(state.accessToken, state.domain, state.loginEmail).catch(() => {});
+    return;
+  }
+  if (lock.locked_by.toLowerCase() === (state.loginEmail || "").toLowerCase()) return;
+  // Otro MB lo tiene tomado → mostrar warning
+  if (el) {
+    const minutesLeft = Math.max(0, Math.round((new Date(lock.expires_at) - Date.now()) / 60_000));
+    const warn = document.createElement("div");
+    warn.className = "lock-warning";
+    warn.innerHTML = `🔒 ${esc(lock.locked_by)} está trabajando este prospecto (${minutesLeft} min restantes). Coordiná antes de pushear.`;
+    el.parentElement?.insertBefore(warn, el.nextSibling);
+  }
+}
+
+function setupVacationToggle() {
+  const settings = document.getElementById("settings-modal");
+  if (!settings) return;
+  // Si ya existe la sección, no duplicarla
+  if (document.getElementById("vacation-toggle-section")) return;
+  const sec = document.createElement("div");
+  sec.id = "vacation-toggle-section";
+  sec.innerHTML = `
+    <h3 style="margin-top:16px;font-size:13px">🏖️ Estado</h3>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:6px 0">
+      <input type="checkbox" id="vacation-checkbox" />
+      En vacaciones / no asignar nuevos leads
+    </label>
+    <input type="date" id="vacation-until" class="form-input" style="font-size:11px" placeholder="Hasta cuándo" />
+    <div id="vacation-status" style="font-size:10px;color:#94a3b8;margin-top:4px"></div>
+  `;
+  settings.querySelector(".modal-content")?.appendChild(sec) || settings.appendChild(sec);
+
+  const cb     = document.getElementById("vacation-checkbox");
+  const until  = document.getElementById("vacation-until");
+  const status = document.getElementById("vacation-status");
+
+  // Cargar estado actual
+  getUserStatus(state.accessToken, state.loginEmail).then(s => {
+    if (s?.vacation_until) {
+      cb.checked = true;
+      until.value = s.vacation_until;
+      status.textContent = `Estás marcado como en vacaciones hasta ${s.vacation_until}.`;
+    }
+  }).catch(() => {});
+
+  const save = async () => {
+    const u = cb.checked ? (until.value || null) : null;
+    await setVacationStatus(state.accessToken, state.loginEmail, u);
+    status.textContent = u ? `✅ Marcado como en vacaciones hasta ${u}.` : "✅ Activo.";
+  };
+  cb.addEventListener("change", save);
+  until.addEventListener("change", save);
+}
+
+async function checkPendingHandoffs() {
+  if (!state.loginEmail || !state.accessToken) return;
+  const pending = await fetchPendingHandoffsForUser(state.accessToken, state.loginEmail);
+  if (!pending.length) return;
+  // Mostrar como banner amarillo
+  const header = document.querySelector(".header");
+  if (!header || document.getElementById("handoff-banner")) return;
+  const banner = document.createElement("div");
+  banner.id = "handoff-banner";
+  banner.className = "handoff-banner";
+  banner.innerHTML = `
+    <strong>📨 ${pending.length} hand-off${pending.length > 1 ? "s" : ""} pendiente${pending.length > 1 ? "s" : ""}:</strong>
+    <ul style="margin:6px 0 0;padding-left:20px;font-size:11px">
+      ${pending.slice(0, 5).map(h => `
+        <li>
+          ${esc(h.from_email)} → vos · <strong>${esc(h.domain)}</strong>${h.note ? ` · "${esc(h.note)}"` : ""}
+          <button data-handoff-id="${h.id}" data-action="accepted" class="handoff-btn-accept">✅</button>
+          <button data-handoff-id="${h.id}" data-action="rejected" class="handoff-btn-reject">❌</button>
+        </li>
+      `).join("")}
+    </ul>
+  `;
+  header.parentElement?.insertBefore(banner, header.nextSibling);
+  banner.addEventListener("click", async (e) => {
+    const id = e.target.dataset?.handoffId;
+    const action = e.target.dataset?.action;
+    if (!id || !action) return;
+    await updateHandoffStatus(state.accessToken, id, action);
+    e.target.closest("li").remove();
+    if (!banner.querySelector("li")) banner.remove();
+  });
+}
 
 // ============================================================
 // AUTO-REFRESH ON URL CHANGE
@@ -810,6 +909,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Tracking real de tiempo: abrir sesión "popup" en Supabase. Se cierra al
   // unload o cuando el side panel se oculta (visibility change).
   startUsageSession(state.accessToken, state.loginEmail, "popup").catch(() => {});
+
+  // Coordinación entre MBs: vacation toggle en settings + check de handoffs pendientes
+  setupVacationToggle();
+  checkPendingHandoffs();
   window.addEventListener("beforeunload", () => endUsageSession(state.accessToken));
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") endUsageSession(state.accessToken);
@@ -1168,6 +1271,8 @@ async function runDuplicateCheck() {
       autoPushReady.notDup = true;
       checkAutoPush();
     }
+    // Lock check: si OTRO MB ya está trabajando este dominio, mostrar warning
+    checkProspectLock();
     // Detectar idioma siempre (nuevo y duplicado) para el pitch
     autoDetectPageLanguage();
   } catch {

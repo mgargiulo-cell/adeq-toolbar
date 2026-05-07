@@ -1069,6 +1069,36 @@ input.form-pv-display { font-weight: 700; }
 .autopush-step       { font-size: var(--fs-base); color: #374151; }
 
 /* ============================================================
+   COORDINATION (lock + handoff)
+   ============================================================ */
+.lock-warning {
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  color: #78350f;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  margin: 6px 0;
+}
+.handoff-banner {
+  background: #dbeafe;
+  border-bottom: 2px solid #3b82f6;
+  color: #1e3a8a;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.handoff-btn-accept, .handoff-btn-reject {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  margin-left: 4px;
+}
+.handoff-btn-accept:hover { background: #34d399; border-radius: 3px; padding: 0 3px; }
+.handoff-btn-reject:hover { background: #f87171; border-radius: 3px; padding: 0 3px; }
+
+/* ============================================================
    PROMINENT DISCLOSURE (Chrome Web Store)
    ============================================================ */
 .disclosure-box {
