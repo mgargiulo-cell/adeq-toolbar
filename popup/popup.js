@@ -5264,42 +5264,42 @@ async function renderProspectsEmptyState(listEl) {
   const csvProcessing = csvItems.find(i => i.status === "processing");
   const csvPendingCount = csvItems.filter(i => i.status === "pending").length;
 
-  // Caso 1: Autopilot activo y procesando
+  // Case 1: Autopilot active and processing
   let html = "";
   if (autopilotOn && apActive) {
     html += `
       <div class="cascade-empty" style="background:#dbeafe;border:1px solid #3b82f6;color:#1e3a8a;padding:12px;border-radius:8px;margin-bottom:8px;text-align:left">
-        <div style="font-weight:700;margin-bottom:4px">🤖 Autopilot procesando · ${esc(apUser || "?")}</div>
+        <div style="font-weight:700;margin-bottom:4px">🤖 Autopilot processing · ${esc(apUser || "?")}</div>
         <div style="font-size:11px;line-height:1.5">
-          Último analizado: <strong>${esc(apStats?.lastDomain || "—")}</strong><br/>
-          📊 ${apStats?.processed || 0} procesados · ✅ ${apStats?.added || 0} guardados · ⚠️ ${apStats?.filtered || 0} filtrados (sub-threshold o GEO mismatch)
+          Last analyzed: <strong>${esc(apStats?.lastDomain || "—")}</strong><br/>
+          📊 ${apStats?.processed || 0} processed · ✅ ${apStats?.added || 0} added · ⚠️ ${apStats?.filtered || 0} filtered (sub-threshold or GEO mismatch)
         </div>
       </div>
     `;
   }
 
-  // Caso 2: CSV/Monday URL queue activa con items
+  // Case 2: CSV/Monday URL queue active with items
   if (csvQueueOn && (csvProcessing || csvPendingCount > 0)) {
     const sourceLabel = csvProcessing?.source === "monday" ? "Monday URL" : "External CSV";
     html += `
       <div class="cascade-empty" style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:12px;border-radius:8px;margin-bottom:8px;text-align:left">
-        <div style="font-weight:700;margin-bottom:4px">📥 Auto Import procesando · ${esc(sourceLabel)}</div>
+        <div style="font-weight:700;margin-bottom:4px">📥 Auto Import processing · ${esc(sourceLabel)}</div>
         <div style="font-size:11px;line-height:1.5">
-          ${csvProcessing ? `Procesando ahora: <strong>${esc(csvProcessing.domain)}</strong><br/>` : ""}
-          ⏳ ${csvPendingCount} en cola pending
+          ${csvProcessing ? `Currently processing: <strong>${esc(csvProcessing.domain)}</strong><br/>` : ""}
+          ⏳ ${csvPendingCount} pending in queue
         </div>
       </div>
     `;
   }
 
-  // Caso 3: nada activo
+  // Case 3: nothing active
   if (!html) {
     if (!autopilotOn && !csvQueueOn) {
-      html = '<div class="cascade-empty">No hay actividad. Prendé el Autopilot o subí un CSV/Monday URL para empezar.</div>';
+      html = '<div class="cascade-empty">No activity. Turn on Autopilot or upload a CSV / Monday URL to get started.</div>';
     } else if (autopilotOn && !apActive) {
-      html = `<div class="cascade-empty">🤖 Autopilot prendido (${esc(apUser || "?")}), pero el worker no reportó actividad en los últimos 5 min. Verificá Railway logs si esto persiste.</div>`;
+      html = `<div class="cascade-empty">🤖 Autopilot ON (${esc(apUser || "?")}), but the worker hasn't reported activity in the last 5 minutes. Check Railway logs if this persists.</div>`;
     } else if (csvQueueOn && csvPendingCount === 0) {
-      html = '<div class="cascade-empty">📥 Auto Import prendido pero la cola está vacía. Subí un CSV o hacé Monday URL refresh.</div>';
+      html = '<div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:12px;border-radius:8px;text-align:left"><div style="font-weight:700;margin-bottom:4px">✅ Work finished</div><div style="font-size:11px">All imports processed. Pending prospects went through filtering. Upload a new CSV or Monday URL refresh to add more.</div></div>';
     } else {
       html = '<div class="cascade-empty">No pending prospects.</div>';
     }
