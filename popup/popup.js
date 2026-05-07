@@ -28,7 +28,7 @@ import { getKeywords, searchGoogleForDomain }                                   
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
 import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
-import { isAdminEmail, getRole }                                                                from "../modules/roles.js";
+import { isAdminEmail, getRole, TEAM_EMAILS }                                                   from "../modules/roles.js";
 import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
          getUserDailyUsage, incrementUserDailyCounter, checkUserCanDo }                          from "../modules/userLimits.js";
 import { startUsageSession, endUsageSession, fetchUsageStats }                                   from "../modules/usageTracking.js";
@@ -366,11 +366,21 @@ async function loadAdminLimits() {
   list.innerHTML = '<div class="admin-help">Cargando...</div>';
   const limits = await fetchAllUserLimits(state.accessToken);
   list.innerHTML = "";
-  if (!limits.length) {
-    list.innerHTML = '<div class="admin-help">No hay límites configurados. Click en "+ Agregar usuario" para empezar.</div>';
-    return;
-  }
-  limits.forEach(l => list.appendChild(buildLimitRow(l)));
+  // Mergear: existentes en DB + cualquier TEAM_EMAILS que falte.
+  // Así el admin siempre ve filas para todo el equipo, aunque no estén en DB.
+  const seen = new Set();
+  limits.forEach(l => { if (l.user_email) seen.add(l.user_email.toLowerCase()); list.appendChild(buildLimitRow(l)); });
+  TEAM_EMAILS.forEach(email => {
+    if (!seen.has(email.toLowerCase())) {
+      list.appendChild(buildLimitRow({
+        user_email: email,
+        autopilot_enabled: true,
+        monthly_api_cap: null,
+        daily_emails_cap: 100,
+        daily_monday_cap: 100,
+      }, false)); // false = no es nuevo (email readonly), pero sin row en DB todavía
+    }
+  });
 }
 
 function addAdminLimitRow() {
@@ -581,17 +591,18 @@ async function loadAdminActivity() {
 function renderAdminLeaderboard(historial, usage) {
   const wrap = document.getElementById("admin-leaderboard");
   if (!wrap) return;
-  // Score = pushes a Monday (más relevante que solo análisis)
+  // Score = pushes a Monday (más relevante que solo análisis).
+  // Pre-seed con TEAM_EMAILS para que el equipo aparezca aunque tenga 0 pushes.
   const byUser = new Map();
+  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), { monday: 0, emails: 0 }));
   usage.forEach(r => {
-    const u = r.user_email || "unknown";
+    const u = (r.user_email || "unknown").toLowerCase();
     const monday = parseInt(r.by_provider?._monday_pushes || 0, 10);
     const emails = parseInt(r.by_provider?._emails_sent || 0, 10);
     if (!byUser.has(u)) byUser.set(u, { monday: 0, emails: 0 });
     byUser.get(u).monday += monday;
     byUser.get(u).emails += emails;
   });
-  if (byUser.size === 0) { wrap.innerHTML = '<div class="admin-help">Sin pushes en este período.</div>'; return; }
   const ranked = [...byUser.entries()].sort((a, b) => b[1].monday - a[1].monday);
   const medals = ["gold", "silver", "bronze"];
   wrap.innerHTML = "";
@@ -637,6 +648,15 @@ async function populateUserFilter() {
   if (_userFilterPopulated) return;
   const sel = document.getElementById("admin-filter-user");
   if (!sel) return;
+  // Pre-poblar con el equipo conocido (incluso si todavía no tienen actividad).
+  // Después mergeamos con los emails que aparecen en toolbar_api_usage por si
+  // hay usuarios fuera del team que también usaron la herramienta.
+  const seen = new Set(TEAM_EMAILS.map(e => e.toLowerCase()));
+  TEAM_EMAILS.forEach(e => {
+    const opt = document.createElement("option");
+    opt.value = e; opt.textContent = e;
+    sel.appendChild(opt);
+  });
   try {
     const res = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?select=user_email&order=user_email`,
@@ -644,12 +664,13 @@ async function populateUserFilter() {
     );
     if (!res.ok) return;
     const rows = await res.json();
-    const emails = [...new Set(rows.map(r => r.user_email).filter(Boolean))];
-    emails.forEach(e => {
-      const opt = document.createElement("option");
-      opt.value = e; opt.textContent = e;
-      sel.appendChild(opt);
-    });
+    [...new Set(rows.map(r => (r.user_email || "").toLowerCase()).filter(Boolean))]
+      .filter(e => !seen.has(e))
+      .forEach(e => {
+        const opt = document.createElement("option");
+        opt.value = e; opt.textContent = e;
+        sel.appendChild(opt);
+      });
     _userFilterPopulated = true;
   } catch {}
 }
@@ -744,20 +765,21 @@ function renderRapidApiChart(usage, from, to) {
 function renderAdminByUser(historial, usage) {
   const wrap = document.getElementById("admin-by-user");
   if (!wrap) return;
+  // Pre-seed con TEAM_EMAILS para que el equipo aparezca aunque tenga 0 actividad.
   const byUser = new Map();
+  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), { sites: 0, autopilot: 0, emails: 0, monday: 0 }));
   historial.forEach(h => {
-    const u = h.user_email || h.created_by || "unknown";
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0 });
+    const u = (h.user_email || h.created_by || "unknown").toLowerCase();
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0, emails: 0, monday: 0 });
     byUser.get(u).sites++;
     if (h.source === "autopilot") byUser.get(u).autopilot++;
   });
   usage.forEach(r => {
-    const u = r.user_email || "unknown";
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0 });
-    byUser.get(u).emails = parseInt(r.by_provider?._emails_sent || 0, 10) + (byUser.get(u).emails || 0);
-    byUser.get(u).monday = parseInt(r.by_provider?._monday_pushes || 0, 10) + (byUser.get(u).monday || 0);
+    const u = (r.user_email || "unknown").toLowerCase();
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0, emails: 0, monday: 0 });
+    byUser.get(u).emails += parseInt(r.by_provider?._emails_sent || 0, 10);
+    byUser.get(u).monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
   });
-  if (byUser.size === 0) { wrap.innerHTML = '<div class="admin-help">Sin actividad en este período.</div>'; return; }
   wrap.innerHTML = "";
   [...byUser.entries()].sort((a, b) => b[1].sites - a[1].sites).forEach(([u, s]) => {
     const row = document.createElement("div");
