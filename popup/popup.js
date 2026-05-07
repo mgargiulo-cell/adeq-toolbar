@@ -28,6 +28,43 @@ import { getKeywords, searchGoogleForDomain }                                   
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
 import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
+import { isAdminEmail, getRole }                                                                from "../modules/roles.js";
+
+// ============================================================
+// ADMIN VIEW TOGGLE
+// El admin tiene la misma UI que el media buyer, pero puede activar el modo
+// admin con triple-click en el logo (no llama la atención y no clutterea
+// la UI normal).
+// ============================================================
+function wireAdminViewToggle() {
+  const logo = document.querySelector(".logo");
+  if (!logo || logo._adminWired) return;
+  logo._adminWired = true;
+  logo.style.cursor = "pointer";
+  logo.title = "Triple-click para abrir Admin Panel";
+
+  let clicks = 0; let timer = null;
+  logo.addEventListener("click", () => {
+    clicks++;
+    clearTimeout(timer);
+    timer = setTimeout(() => { clicks = 0; }, 600);
+    if (clicks >= 3) {
+      clicks = 0;
+      toggleAdminView();
+    }
+  });
+}
+
+function toggleAdminView() {
+  state.adminViewActive = !state.adminViewActive;
+  document.body.setAttribute("data-admin-view", state.adminViewActive ? "on" : "off");
+  // Mostrar / ocultar panel admin
+  const panel = document.getElementById("admin-panel");
+  if (panel) panel.style.display = state.adminViewActive ? "block" : "none";
+  // Pintar el logo de un color distinto para feedback visual
+  const logo = document.querySelector(".logo .logo-text");
+  if (logo) logo.style.color = state.adminViewActive ? "#fbbf24" : "";
+}
 
 // ---- RapidAPI footer counter (siempre visible) ----
 function renderRapidApiFooterCounter({ used, limit, period } = {}) {
@@ -101,6 +138,8 @@ const state = {
   loginEmail: "",
   gmailEmail: "",
   accessToken: "",
+  role: "media_buyer",   // "admin" | "media_buyer" — set en init()
+  adminViewActive: false, // toggle UI admin (logo triple-click)
 };
 
 // Auto-push conditions
@@ -3180,6 +3219,10 @@ function applyUserFromAuth(auth) {
   state.mediaBuyer   = name;
   state.loginEmail   = email;
   state.accessToken  = auth?.accessToken || "";
+  state.role         = getRole(email);
+  // Marcar el body con el role para que el CSS pueda mostrar/ocultar UI admin
+  document.body.setAttribute("data-role", state.role);
+  if (state.role === "admin") wireAdminViewToggle();
 
   // Pre-seleccionar ejecutivo en el form de Monday
   const execSel = document.getElementById("form-ejecutivo");

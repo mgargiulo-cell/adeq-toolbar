@@ -54,6 +54,69 @@
   </span>
 </div>
 
+<!-- ADMIN PANEL (oculto excepto cuando admin hace triple-click en el logo) -->
+<div id="admin-panel" class="admin-panel" style="display:none">
+  <div class="admin-panel-header">
+    <span class="admin-panel-title">🛡️ Admin Panel</span>
+    <div class="admin-panel-tabs">
+      <button class="admin-tab-btn active" data-admin-tab="activity">📊 Activity</button>
+      <button class="admin-tab-btn" data-admin-tab="limits">⚙️ Limits</button>
+      <button class="admin-tab-btn" data-admin-tab="blocklist">🚫 Blocklist</button>
+    </div>
+  </div>
+
+  <!-- Tab: Activity -->
+  <div id="admin-tab-activity" class="admin-tab-content active">
+    <div class="admin-filters">
+      <select id="admin-filter-period" class="form-select">
+        <option value="today">Hoy</option>
+        <option value="yesterday">Ayer</option>
+        <option value="last7" selected>Últimos 7 días</option>
+        <option value="this_month">Este mes</option>
+        <option value="last_month">Mes pasado</option>
+        <option value="last30">Últimos 30 días</option>
+      </select>
+      <select id="admin-filter-user" class="form-select">
+        <option value="">Todos los usuarios</option>
+      </select>
+      <button id="admin-refresh-stats" class="btn btn-sm btn-primary">🔄</button>
+    </div>
+    <div id="admin-stats-summary" class="admin-stats-summary">
+      <div class="stat-card"><div class="stat-num" id="stat-sites">--</div><div class="stat-label">Sitios analizados</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-emails">--</div><div class="stat-label">Emails enviados</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-monday">--</div><div class="stat-label">Pushes Monday</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-500k-up">--</div><div class="stat-label">+500K visits</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-500k-down">--</div><div class="stat-label">&lt;500K visits</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-autopilot">--</div><div class="stat-label">Tiempo Autopilot</div></div>
+    </div>
+    <div class="admin-chart-wrap">
+      <canvas id="admin-chart" width="540" height="180"></canvas>
+    </div>
+    <div class="admin-section-title">Por usuario</div>
+    <div id="admin-by-user" class="admin-by-user"></div>
+    <div class="admin-section-title">Live activity (últimas 30)</div>
+    <div id="admin-live-feed" class="admin-live-feed"></div>
+  </div>
+
+  <!-- Tab: Limits -->
+  <div id="admin-tab-limits" class="admin-tab-content">
+    <p class="admin-help">Configurá límites por usuario. Los caps se cuentan dentro del límite global de 40k.</p>
+    <div id="admin-limits-list" class="admin-limits-list"></div>
+    <button id="admin-add-user-limit" class="btn btn-sm btn-primary">+ Agregar usuario</button>
+  </div>
+
+  <!-- Tab: Blocklist -->
+  <div id="admin-tab-blocklist" class="admin-tab-content">
+    <p class="admin-help">Dominios donde la toolbar NO va a gastar API. Subí un CSV con un dominio por línea o pegá una lista.</p>
+    <textarea id="admin-blocklist-text" class="form-input" rows="6" placeholder="google.com&#10;facebook.com&#10;amazon.com" style="font-family:ui-monospace,monospace;font-size:11px"></textarea>
+    <div style="display:flex;gap:6px;margin-top:8px">
+      <input id="admin-blocklist-csv" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
+      <button id="admin-blocklist-save" class="btn btn-sm btn-primary">💾 Guardar</button>
+    </div>
+    <div id="admin-blocklist-status" class="admin-help" style="margin-top:6px"></div>
+  </div>
+</div>
+
 <!-- AUTOPILOT TARGET PANEL -->
 <div id="autopilot-target-panel" style="display:none;background:var(--card-bg);border-bottom:1px solid var(--border);padding:10px 12px">
   <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">🎯 Autopilot Target</div>
