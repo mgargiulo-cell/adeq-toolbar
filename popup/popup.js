@@ -31,6 +31,7 @@ import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus
 import { isAdminEmail, getRole }                                                                from "../modules/roles.js";
 import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
          getUserDailyUsage, incrementUserDailyCounter, checkUserCanDo }                          from "../modules/userLimits.js";
+import { startUsageSession, endUsageSession, fetchUsageStats }                                   from "../modules/usageTracking.js";
 
 // ============================================================
 // AUTO-REFRESH ON URL CHANGE
@@ -382,10 +383,11 @@ async function loadAdminActivity() {
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
 
-  const [histRes, trackRes, usageRes] = await Promise.all([
+  const [histRes, trackRes, usageRes, sessionsRes] = await Promise.all([
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?fecha=gte.${from}&fecha=lte.${to}T23:59:59${userClause}&select=*&order=fecha.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${from}&send_date=lte.${to}&select=domain,send_date`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${from}&day=lte.${to}${userClause}&select=*`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetchUsageStats(state.accessToken, { from, to, userEmail: userFilter }),
   ]);
 
   // Agregar stats
@@ -394,14 +396,20 @@ async function loadAdminActivity() {
   const monday = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
   const above500k = histRes.filter(h => (parseInt(h.traffic || 0, 10) >= 500000)).length;
   const below500k = histRes.filter(h => (parseInt(h.traffic || 0, 10) < 500000)).length;
-  const apTimeMin = histRes.filter(h => h.source === "autopilot").length * 0.5; // approx 30s por dominio en autopilot
+  // Tiempo REAL de autopilot (sumar duration_sec de sesiones kind=autopilot)
+  const apSec = sessionsRes
+    .filter(s => s.kind === "autopilot" && s.duration_sec)
+    .reduce((acc, s) => acc + s.duration_sec, 0);
+  const apTimeStr = apSec >= 3600
+    ? `${Math.floor(apSec / 3600)}h ${Math.round((apSec % 3600) / 60)}m`
+    : `${Math.round(apSec / 60)}m`;
 
   document.getElementById("stat-sites").textContent     = sites.toLocaleString();
   document.getElementById("stat-emails").textContent    = emails.toLocaleString();
   document.getElementById("stat-monday").textContent    = monday.toLocaleString();
   document.getElementById("stat-500k-up").textContent   = above500k.toLocaleString();
   document.getElementById("stat-500k-down").textContent = below500k.toLocaleString();
-  document.getElementById("stat-autopilot").textContent = apTimeMin > 60 ? `${Math.round(apTimeMin / 60)}h` : `${Math.round(apTimeMin)}m`;
+  document.getElementById("stat-autopilot").textContent = apTimeStr;
 
   // Chart por día
   renderAdminChart(histRes, from, to);
@@ -798,6 +806,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Check personal quota: si el usuario está al 80% de su cap mensual personal,
   // mostrar banner discreto encima del header.
   checkPersonalQuotaWarning();
+
+  // Tracking real de tiempo: abrir sesión "popup" en Supabase. Se cierra al
+  // unload o cuando el side panel se oculta (visibility change).
+  startUsageSession(state.accessToken, state.loginEmail, "popup").catch(() => {});
+  window.addEventListener("beforeunload", () => endUsageSession(state.accessToken));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") endUsageSession(state.accessToken);
+    else startUsageSession(state.accessToken, state.loginEmail, "popup").catch(() => {});
+  });
 
   // mediaBuyer is derived from auth login — do NOT override from legacy storage key
   prefillMondayForm();
@@ -4455,6 +4472,10 @@ async function initAutopilot() {
       clearAutopilotTimer();
       setAutopilotUI(btn, false);
       await setAutopilotEnabled(false, state.accessToken);
+      // Cerrar sesión de tracking de autopilot
+      endUsageSession(state.accessToken).catch(() => {});
+      // Re-abrir sesión de popup (la habíamos cerrado al iniciar autopilot)
+      startUsageSession(state.accessToken, state.loginEmail, "popup").catch(() => {});
     } else {
       // Cap por usuario: el admin pudo desactivarle el autopilot a este MB
       const can = await checkUserCanDo(state.accessToken, state.loginEmail, "autopilot_on");
@@ -4474,6 +4495,8 @@ async function initAutopilot() {
       setAutopilotUI(btn, true);
       await setAutopilotEnabled(true, state.accessToken, state.loginEmail);
       startAutopilotCountdown(btn, AUTOPILOT_DURATION_MS);
+      // Tracking real: cerrar sesión "popup" y abrir "autopilot"
+      startUsageSession(state.accessToken, state.loginEmail, "autopilot").catch(() => {});
     }
   });
 
