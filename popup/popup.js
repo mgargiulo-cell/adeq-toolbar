@@ -231,11 +231,181 @@ function handleBlocklistCsvUpload(e) {
   reader.readAsText(file);
 }
 
-// ── Activity tab (stub — implementación completa en commit siguiente) ─
+// ── Activity tab — fetch + render stats + chart + per-user + live feed ─
+function _periodToRange(period) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  switch (period) {
+    case "today":     return { from: fmt(today), to: fmt(today) };
+    case "yesterday": { const y = new Date(today); y.setDate(y.getDate() - 1); return { from: fmt(y), to: fmt(y) }; }
+    case "last7":     { const f = new Date(today); f.setDate(f.getDate() - 6); return { from: fmt(f), to: fmt(today) }; }
+    case "last30":    { const f = new Date(today); f.setDate(f.getDate() - 29); return { from: fmt(f), to: fmt(today) }; }
+    case "this_month": { const f = new Date(now.getFullYear(), now.getMonth(), 1); return { from: fmt(f), to: fmt(today) }; }
+    case "last_month": {
+      const f = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const t = new Date(now.getFullYear(), now.getMonth(), 0);
+      return { from: fmt(f), to: fmt(t) };
+    }
+    default: return { from: fmt(today), to: fmt(today) };
+  }
+}
+
 async function loadAdminActivity() {
   const summary = document.getElementById("admin-stats-summary");
   if (summary) summary.querySelectorAll(".stat-num").forEach(el => { el.textContent = "..."; });
-  await renderAdminActivity();
+  const period = document.getElementById("admin-filter-period")?.value || "last7";
+  const userFilter = document.getElementById("admin-filter-user")?.value || "";
+  const { from, to } = _periodToRange(period);
+
+  // Cargar lista de usuarios para el filtro (1 vez)
+  await populateUserFilter();
+
+  // Fetch en paralelo: historial + sendtrack + api_usage
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+  const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
+
+  const [histRes, trackRes, usageRes] = await Promise.all([
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?fecha=gte.${from}&fecha=lte.${to}T23:59:59${userClause}&select=*&order=fecha.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${from}&send_date=lte.${to}&select=domain,send_date`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${from}&day=lte.${to}${userClause}&select=*`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+  ]);
+
+  // Agregar stats
+  const sites = histRes.length;
+  const emails = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
+  const monday = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
+  const above500k = histRes.filter(h => (parseInt(h.traffic || 0, 10) >= 500000)).length;
+  const below500k = histRes.filter(h => (parseInt(h.traffic || 0, 10) < 500000)).length;
+  const apTimeMin = histRes.filter(h => h.source === "autopilot").length * 0.5; // approx 30s por dominio en autopilot
+
+  document.getElementById("stat-sites").textContent     = sites.toLocaleString();
+  document.getElementById("stat-emails").textContent    = emails.toLocaleString();
+  document.getElementById("stat-monday").textContent    = monday.toLocaleString();
+  document.getElementById("stat-500k-up").textContent   = above500k.toLocaleString();
+  document.getElementById("stat-500k-down").textContent = below500k.toLocaleString();
+  document.getElementById("stat-autopilot").textContent = apTimeMin > 60 ? `${Math.round(apTimeMin / 60)}h` : `${Math.round(apTimeMin)}m`;
+
+  // Chart por día
+  renderAdminChart(histRes, from, to);
+
+  // Per-user breakdown
+  renderAdminByUser(histRes, usageRes);
+
+  // Live feed (últimas 30)
+  renderAdminLiveFeed(histRes.slice(0, 30));
+}
+
+let _userFilterPopulated = false;
+async function populateUserFilter() {
+  if (_userFilterPopulated) return;
+  const sel = document.getElementById("admin-filter-user");
+  if (!sel) return;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?select=user_email&order=user_email`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const emails = [...new Set(rows.map(r => r.user_email).filter(Boolean))];
+    emails.forEach(e => {
+      const opt = document.createElement("option");
+      opt.value = e; opt.textContent = e;
+      sel.appendChild(opt);
+    });
+    _userFilterPopulated = true;
+  } catch {}
+}
+
+function renderAdminChart(historial, from, to) {
+  const canvas = document.getElementById("admin-chart");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  // Buckets por día
+  const days = [];
+  const start = new Date(from); const end = new Date(to);
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    days.push(d.toISOString().slice(0, 10));
+  }
+  const counts = days.map(day => historial.filter(h => (h.fecha || "").startsWith(day)).length);
+  const max = Math.max(1, ...counts);
+
+  // Dibujar
+  const W = canvas.width = canvas.offsetWidth * 2; // retina
+  const H = canvas.height = 360;
+  ctx.scale(2, 2);
+  const w = W / 2; const h = H / 2;
+  ctx.clearRect(0, 0, w, h);
+  // Bars
+  const barW = (w - 40) / days.length;
+  ctx.font = "10px -apple-system, sans-serif";
+  ctx.textAlign = "center";
+  days.forEach((day, i) => {
+    const x = 20 + i * barW;
+    const barHeight = (counts[i] / max) * (h - 40);
+    ctx.fillStyle = "#38bdf8";
+    ctx.fillRect(x + 1, h - 20 - barHeight, barW - 2, barHeight);
+    // Label valor
+    if (counts[i] > 0) {
+      ctx.fillStyle = "#e2e8f0";
+      ctx.fillText(counts[i], x + barW / 2, h - 22 - barHeight);
+    }
+    // Label día (solo cada N para que entren)
+    const showLabel = days.length <= 14 || i % Math.ceil(days.length / 14) === 0;
+    if (showLabel) {
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText(day.slice(5), x + barW / 2, h - 6);
+    }
+  });
+}
+
+function renderAdminByUser(historial, usage) {
+  const wrap = document.getElementById("admin-by-user");
+  if (!wrap) return;
+  const byUser = new Map();
+  historial.forEach(h => {
+    const u = h.user_email || h.created_by || "unknown";
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0 });
+    byUser.get(u).sites++;
+    if (h.source === "autopilot") byUser.get(u).autopilot++;
+  });
+  usage.forEach(r => {
+    const u = r.user_email || "unknown";
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0 });
+    byUser.get(u).emails = parseInt(r.by_provider?._emails_sent || 0, 10) + (byUser.get(u).emails || 0);
+    byUser.get(u).monday = parseInt(r.by_provider?._monday_pushes || 0, 10) + (byUser.get(u).monday || 0);
+  });
+  if (byUser.size === 0) { wrap.innerHTML = '<div class="admin-help">Sin actividad en este período.</div>'; return; }
+  wrap.innerHTML = "";
+  [...byUser.entries()].sort((a, b) => b[1].sites - a[1].sites).forEach(([u, s]) => {
+    const row = document.createElement("div");
+    row.className = "admin-by-user-row";
+    row.innerHTML = `
+      <span class="user">${esc(u)}</span>
+      <span class="nums">${s.sites} sites · ${s.emails || 0} mails · ${s.monday || 0} monday · ${s.autopilot} AP</span>
+    `;
+    wrap.appendChild(row);
+  });
+}
+
+function renderAdminLiveFeed(rows) {
+  const wrap = document.getElementById("admin-live-feed");
+  if (!wrap) return;
+  if (!rows.length) { wrap.innerHTML = '<div class="admin-help">Sin actividad reciente.</div>'; return; }
+  wrap.innerHTML = "";
+  rows.forEach(r => {
+    const time = r.fecha ? new Date(r.fecha).toLocaleString() : "";
+    const row = document.createElement("div");
+    row.className = "admin-feed-row";
+    const traffic = r.traffic ? `· ${parseInt(r.traffic).toLocaleString()} visits` : "";
+    row.innerHTML = `
+      <span style="font-weight:600">${esc(r.user_email || r.created_by || "?")}</span>
+      <span style="color:#94a3b8">→ ${esc(r.dominio || r.domain || "?")} ${esc(traffic)}</span>
+      <span style="color:#64748b;font-size:9px">${esc(time)}</span>
+    `;
+    wrap.appendChild(row);
+  });
 }
 
 // ---- RapidAPI footer counter (siempre visible) ----
