@@ -86,15 +86,19 @@ export async function supabaseSignIn(email, password) {
   }
 }
 
-// Envía email de recovery. Supabase dispara el correo con el link de reset.
+// Envía email de recovery. Supabase dispara el correo con el link de reset
+// que redirige a nuestra página de reset hosteada en GitHub Pages.
+const RESET_PASSWORD_REDIRECT = "https://mgargiulo-cell.github.io/adeq-toolbar/docs/reset-password.html";
+
 export async function supabaseResetPassword(email) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
-    const res = await fetch(`${url}/auth/v1/recover`, {
+    // redirect_to en el query string + body — Supabase espera ambos en algunos endpoints
+    const res = await fetch(`${url}/auth/v1/recover?redirect_to=${encodeURIComponent(RESET_PASSWORD_REDIRECT)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "apikey": key },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, redirect_to: RESET_PASSWORD_REDIRECT }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
