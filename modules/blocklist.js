@@ -15,6 +15,15 @@ const BLOCKED_TLDS = new Set([
   "edu.ar", "edu.mx", "edu.br", "edu.au",
 ]);
 
+// ── 1b. Categorías auto-bloqueadas (pre-check sobre el dominio antes de gastar API) ─
+// Si el dominio matchea uno de estos patrones de subdominio/path típicos, lo bloqueamos
+// porque suelen ser sitios institucionales / no-publishers que no convierten en deals.
+const BLOCKED_PATTERNS = [
+  /^(www\.)?(login|admin|portal|intranet|sso|hr|recruiting)\./,
+  /(insurance|seguro|salud|hospital|clinic[ao]|medical|farmacia|pharma)\./,
+  /^bank|banco/i,
+];
+
 // ── 2. Dominios gigantes / corporativos donde jamás vamos a vender ─
 const BLOCKED_DOMAINS = new Set([
   // Tech giants
@@ -86,6 +95,11 @@ export async function checkDomainBlocked(domain, accessToken) {
   // 3. Subdominio de un dominio gigante
   for (const big of BLOCKED_DOMAINS) {
     if (d.endsWith("." + big)) return { blocked: true, reason: `Subdominio de ${big}` };
+  }
+
+  // 3b. Patrones por categoría (insurance/banking/medical/portales corporativos)
+  for (const re of BLOCKED_PATTERNS) {
+    if (re.test(d)) return { blocked: true, reason: "Categoría auto-bloqueada (no-publisher)" };
   }
 
   // 4. Admin blocklist (Supabase)

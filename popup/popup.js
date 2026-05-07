@@ -98,6 +98,48 @@ function resetAnalysisUI() {
   });
 }
 
+async function forceRefreshAnalysis() {
+  // Borrar cache local del dominio actual antes de re-correr la pipeline
+  if (state.domain) {
+    try {
+      const all = await chrome.storage.local.get(null);
+      const keys = Object.keys(all).filter(k => k.includes(state.domain));
+      if (keys.length) await chrome.storage.local.remove(keys);
+    } catch {}
+  }
+  resetAnalysisUI();
+  runAnalysisPipeline();
+}
+
+async function checkPersonalQuotaWarning() {
+  if (!state.loginEmail || !state.accessToken) return;
+  try {
+    const limit = await fetchUserLimit(state.accessToken, state.loginEmail);
+    if (!limit?.monthly_api_cap) return; // sin cap personal, no aplica
+    // El usage personal lo aproximamos con la suma del mes en toolbar_api_usage.
+    const period = new Date().toISOString().slice(0, 7);
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(state.loginEmail)}&day=gte.${period}-01&select=by_provider`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const used = rows.reduce((acc, r) => acc + parseInt(r.by_provider?.rapidapi || 0, 10), 0);
+    const pct = (used / limit.monthly_api_cap) * 100;
+    if (pct >= 80) showPersonalQuotaBanner({ used, limit: limit.monthly_api_cap, pct });
+  } catch {}
+}
+
+function showPersonalQuotaBanner({ used, limit, pct }) {
+  const banner = document.getElementById("rapidapi-cap-banner");
+  if (!banner || banner.style.display !== "none") return; // ya hay banner global
+  banner.style.display = "flex";
+  banner.classList.add(pct >= 100 ? "cap-reached" : "cap-warning");
+  document.getElementById("cap-banner-icon").textContent = pct >= 100 ? "⛔" : "⚠️";
+  document.getElementById("cap-banner-title").textContent = `Tu cap personal está al ${Math.round(pct)}%`;
+  document.getElementById("cap-banner-detail").textContent = ` — ${used.toLocaleString()} / ${limit.toLocaleString()} hits este mes.`;
+}
+
 function runAnalysisPipeline() {
   runDuplicateCheck().catch(() => {});
   runTrafficCheck().catch(() => {});
@@ -742,6 +784,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Auto-refresh on URL change (side panel queda abierto al navegar):
   // detectamos cambios de tab/URL y disparamos re-análisis después de 3s estables.
   setupAutoRefreshOnUrlChange();
+
+  // Atajo de teclado: Cmd/Ctrl+Shift+R fuerza re-análisis del dominio actual
+  // (ignora cache local, va directo a la API).
+  document.addEventListener("keydown", (e) => {
+    const isRefresh = (e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "R" || e.key === "r");
+    if (isRefresh) {
+      e.preventDefault();
+      forceRefreshAnalysis();
+    }
+  });
+
+  // Check personal quota: si el usuario está al 80% de su cap mensual personal,
+  // mostrar banner discreto encima del header.
+  checkPersonalQuotaWarning();
 
   // mediaBuyer is derived from auth login — do NOT override from legacy storage key
   prefillMondayForm();
