@@ -712,17 +712,18 @@ export async function saveSimilarCache(domain, sites) {
 }
 
 // ============================================================
-// CACHÉ DE TRÁFICO — 60 días
+// CACHÉ DE TRÁFICO — 90 días
 // Tabla: toolbar_traffic_cache
 //   domain TEXT PRIMARY KEY, data JSONB, fetched_at TIMESTAMPTZ DEFAULT NOW()
 // ============================================================
+const TRAFFIC_CACHE_DAYS = 90;
 export async function getTrafficCache(domain) {
   const { url, key } = await getConfig();
   if (!url || !key) return null;
 
   try {
     const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 60);
+    cutoff.setDate(cutoff.getDate() - TRAFFIC_CACHE_DAYS);
 
     const res = await fetch(
       `${url}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,

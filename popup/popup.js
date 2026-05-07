@@ -29,6 +29,8 @@ import { scoreProspect }                                                        
 import { CONFIG }                                                                               from "../config.js";
 import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
 import { isAdminEmail, getRole }                                                                from "../modules/roles.js";
+import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
+         getUserDailyUsage, incrementUserDailyCounter, checkUserCanDo }                          from "../modules/userLimits.js";
 
 // ============================================================
 // ADMIN VIEW TOGGLE
@@ -58,12 +60,182 @@ function wireAdminViewToggle() {
 function toggleAdminView() {
   state.adminViewActive = !state.adminViewActive;
   document.body.setAttribute("data-admin-view", state.adminViewActive ? "on" : "off");
-  // Mostrar / ocultar panel admin
   const panel = document.getElementById("admin-panel");
   if (panel) panel.style.display = state.adminViewActive ? "block" : "none";
-  // Pintar el logo de un color distinto para feedback visual
   const logo = document.querySelector(".logo .logo-text");
   if (logo) logo.style.color = state.adminViewActive ? "#fbbf24" : "";
+  if (state.adminViewActive && !state._adminInited) {
+    initAdminPanel();
+    state._adminInited = true;
+  }
+}
+
+// ============================================================
+// ADMIN PANEL — init + lógica de tabs
+// ============================================================
+function initAdminPanel() {
+  // Tab switcher
+  document.querySelectorAll(".admin-tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const tab = btn.dataset.adminTab;
+      document.querySelectorAll(".admin-tab-btn").forEach(b => b.classList.toggle("active", b === btn));
+      document.querySelectorAll(".admin-tab-content").forEach(c => {
+        c.classList.toggle("active", c.id === `admin-tab-${tab}`);
+      });
+      if (tab === "activity") loadAdminActivity();
+      if (tab === "limits")   loadAdminLimits();
+      if (tab === "blocklist") loadAdminBlocklist();
+    });
+  });
+  // Wire activity filters
+  document.getElementById("admin-filter-period")?.addEventListener("change", loadAdminActivity);
+  document.getElementById("admin-filter-user")?.addEventListener("change", loadAdminActivity);
+  document.getElementById("admin-refresh-stats")?.addEventListener("click", loadAdminActivity);
+  // Wire limits
+  document.getElementById("admin-add-user-limit")?.addEventListener("click", () => addAdminLimitRow());
+  // Wire blocklist
+  document.getElementById("admin-blocklist-save")?.addEventListener("click", saveAdminBlocklist);
+  document.getElementById("admin-blocklist-csv")?.addEventListener("change", handleBlocklistCsvUpload);
+
+  loadAdminActivity();
+}
+
+// ── Limits tab ─────────────────────────────────────────────
+async function loadAdminLimits() {
+  const list = document.getElementById("admin-limits-list");
+  if (!list) return;
+  list.innerHTML = '<div class="admin-help">Cargando...</div>';
+  const limits = await fetchAllUserLimits(state.accessToken);
+  list.innerHTML = "";
+  if (!limits.length) {
+    list.innerHTML = '<div class="admin-help">No hay límites configurados. Click en "+ Agregar usuario" para empezar.</div>';
+    return;
+  }
+  limits.forEach(l => list.appendChild(buildLimitRow(l)));
+}
+
+function addAdminLimitRow() {
+  const list = document.getElementById("admin-limits-list");
+  if (!list) return;
+  list.appendChild(buildLimitRow({
+    user_email: "",
+    autopilot_enabled: true,
+    monthly_api_cap: null,
+    daily_emails_cap: 100,
+    daily_monday_cap: 100,
+  }, true));
+}
+
+function buildLimitRow(l, isNew = false) {
+  const row = document.createElement("div");
+  row.className = "admin-limit-row";
+  row.innerHTML = `
+    <input type="email" class="form-input lim-email" value="${esc(l.user_email)}" placeholder="user@adeqmedia.com" ${isNew ? "" : "readonly"} />
+    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="cap mensual" min="0" />
+    <input type="number" class="form-input lim-emails" value="${l.daily_emails_cap}" placeholder="emails/día" min="0" />
+    <input type="number" class="form-input lim-monday" value="${l.daily_monday_cap}" placeholder="monday/día" min="0" />
+    <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
+    <button class="del-btn" title="Eliminar">×</button>
+  `;
+  // Toggle autopilot
+  row.querySelector(".lim-autopilot").addEventListener("click", (e) => {
+    const isOn = e.target.classList.contains("toggle-yes");
+    e.target.classList.toggle("toggle-yes", !isOn);
+    e.target.classList.toggle("toggle-no", isOn);
+    e.target.textContent = !isOn ? "AP ✓" : "AP ✗";
+    if (!isNew) saveLimitRow(row);
+  });
+  // Delete
+  row.querySelector(".del-btn").addEventListener("click", async () => {
+    const email = row.querySelector(".lim-email").value;
+    if (email && confirm(`Eliminar límites de ${email}?`)) {
+      await deleteUserLimit(state.accessToken, email);
+    }
+    row.remove();
+  });
+  // Auto-save on blur (campos numéricos)
+  row.querySelectorAll("input[type=number], input[type=email]").forEach(inp => {
+    inp.addEventListener("change", () => saveLimitRow(row));
+  });
+  return row;
+}
+
+async function saveLimitRow(row) {
+  const email = row.querySelector(".lim-email").value.trim().toLowerCase();
+  if (!email) return;
+  const limit = {
+    user_email:        email,
+    autopilot_enabled: row.querySelector(".lim-autopilot").classList.contains("toggle-yes"),
+    monthly_api_cap:   parseInt(row.querySelector(".lim-monthly").value, 10) || null,
+    daily_emails_cap:  parseInt(row.querySelector(".lim-emails").value, 10) || 100,
+    daily_monday_cap:  parseInt(row.querySelector(".lim-monday").value, 10) || 100,
+  };
+  const ok = await upsertUserLimit(state.accessToken, limit);
+  row.style.borderColor = ok ? "#34d399" : "#f87171";
+  setTimeout(() => { row.style.borderColor = ""; }, 800);
+}
+
+// ── Blocklist tab ──────────────────────────────────────────
+async function loadAdminBlocklist() {
+  const ta = document.getElementById("admin-blocklist-text");
+  const status = document.getElementById("admin-blocklist-status");
+  if (!ta) return;
+  status.textContent = "Cargando...";
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain&order=domain`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (!res.ok) { status.textContent = "Error cargando blocklist."; return; }
+    const rows = await res.json();
+    ta.value = rows.map(r => r.domain).join("\n");
+    status.textContent = `${rows.length} dominios bloqueados.`;
+  } catch (e) { status.textContent = "Error: " + e.message; }
+}
+
+async function saveAdminBlocklist() {
+  const ta = document.getElementById("admin-blocklist-text");
+  const status = document.getElementById("admin-blocklist-status");
+  const domains = (ta.value || "")
+    .split(/[\n,]/).map(d => d.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, ""))
+    .filter(d => d && d.includes("."));
+  if (!domains.length) { status.textContent = "❌ Lista vacía."; return; }
+  status.textContent = "⏳ Guardando...";
+  try {
+    // Borrar todo y re-insertar (operación admin, no es alta frecuencia)
+    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?domain=neq.zzz_never_match`, {
+      method: "DELETE",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` },
+    });
+    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist`, {
+      method: "POST",
+      headers: {
+        "apikey": CONFIG.SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${state.accessToken}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(domains.map(d => ({ domain: d, added_by: state.loginEmail }))),
+    });
+    status.textContent = `✅ ${domains.length} dominios guardados.`;
+  } catch (e) { status.textContent = "❌ Error: " + e.message; }
+}
+
+function handleBlocklistCsvUpload(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    document.getElementById("admin-blocklist-text").value = ev.target.result;
+  };
+  reader.readAsText(file);
+}
+
+// ── Activity tab (stub — implementación completa en commit siguiente) ─
+async function loadAdminActivity() {
+  const summary = document.getElementById("admin-stats-summary");
+  if (summary) summary.querySelectorAll(".stat-num").forEach(el => { el.textContent = "..."; });
+  await renderAdminActivity();
 }
 
 // ---- RapidAPI footer counter (siempre visible) ----
@@ -1860,6 +2032,11 @@ async function bindButtons() {
     const res    = document.getElementById("push-result");
     const { email, geo, idioma, estado, fecha, pitch, ejecutivo } = getMondayFormValues();
 
+    // Cap diario de Monday pushes por usuario (admin lo configura)
+    const can = await checkUserCanDo(state.accessToken, state.loginEmail, "push_monday");
+    if (!can.allowed) {
+      res.textContent = `⛔ ${can.reason}`; res.className = "push-result error"; return;
+    }
     // Rate limit check
     if (!_rateLimiter.check()) {
       res.textContent = "⚠️ Too many requests — please wait a moment"; res.className = "push-result error"; return;
@@ -1904,6 +2081,7 @@ async function bindButtons() {
           loginEmail: state.loginEmail,
         });
         res.textContent = "✅ Updated in Monday"; res.className = "push-result ok";
+        incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
       } else {
         const item = await pushToMonday({
           domain: state.domain,
@@ -1913,6 +2091,7 @@ async function bindButtons() {
         });
         state.mondayItemId = item?.id;
         res.textContent = `✅ Created: ${item?.name || state.domain}`; res.className = "push-result ok";
+        incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
         // Actualizar caché de sesión: ahora sí es duplicado para futuras subpáginas
         state.duplicate = { found: true, itemId: item?.id, status: "", ejecutivo: state.mediaBuyer, email, geo };
@@ -1968,6 +2147,11 @@ async function bindButtons() {
     if (!isValidEmail(email)) {
       res.textContent = "❌ Enter a valid email first"; res.className = "push-result error"; return;
     }
+    // Cap diario de emails enviados por usuario (admin lo configura)
+    const can = await checkUserCanDo(state.accessToken, state.loginEmail, "send_email");
+    if (!can.allowed) {
+      res.textContent = `⛔ ${can.reason}`; res.className = "push-result error"; return;
+    }
     // Subject obligatorio — no dejamos enviar si está vacío
     if (!subjectRaw) {
       res.textContent = "❌ El asunto (Subject) es obligatorio. Completalo antes de enviar el email.";
@@ -2004,6 +2188,7 @@ async function bindButtons() {
 
     if (result.ok) {
       state.emailSentInSession = true; // unlock el push a Monday
+      incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
       const today = new Date().toISOString().split("T")[0];
       // Persistir el envío para tracking/historial (sin generar follow-ups,
       // los hace el CRM externo).
@@ -3950,6 +4135,10 @@ async function initAutopilot() {
       setAutopilotUI(btn, false);
       await setAutopilotEnabled(false, state.accessToken);
     } else {
+      // Cap por usuario: el admin pudo desactivarle el autopilot a este MB
+      const can = await checkUserCanDo(state.accessToken, state.loginEmail, "autopilot_on");
+      if (!can.allowed) { alert(`⛔ ${can.reason}`); return; }
+
       // Mutex: si otro user tiene autopilot activo + heartbeat fresco, bloquear
       const cur = await getAutopilotState(state.accessToken);
       if (cur.enabled && cur.sessionUser

@@ -1,6 +1,6 @@
 // ============================================================
 // ADEQ TOOLBAR — Módulo de Tráfico v3.2
-// Caché de 60 días + contador de requests + límites de RapidAPI
+// Caché de 90 días + contador de requests + límites de RapidAPI
 // ============================================================
 
 import { CONFIG }                            from "../config.js";
@@ -275,7 +275,7 @@ export async function getTraffic(domain) {
     .replace(/^www\./, "")
     .replace(/\/$/, "");
 
-  // Caché primero (60 días)
+  // Caché primero (90 días)
   const cached = await getTrafficCache(cleanDomain);
   if (cached) {
     // Si el caché no tiene geo, inferir por TLD (sin gastar API)
