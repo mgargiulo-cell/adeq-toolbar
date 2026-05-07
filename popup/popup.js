@@ -427,6 +427,21 @@ async function loadAdminLimits() {
   list.innerHTML = '<div class="admin-help">Cargando...</div>';
   const limits = await fetchAllUserLimits(state.accessToken);
   list.innerHTML = "";
+  // Header con labels de cada columna
+  const header = document.createElement("div");
+  header.className = "admin-limit-row";
+  header.style.background = "transparent";
+  header.style.border = "none";
+  header.style.padding = "0 4px";
+  header.innerHTML = `
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px">Email</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">API/mes</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP min/sesión</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP prosp/día</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP on</span>
+    <span></span>
+  `;
+  list.appendChild(header);
   // Mergear: existentes en DB + cualquier TEAM_EMAILS que falte.
   // Así el admin siempre ve filas para todo el equipo, aunque no estén en DB.
   const seen = new Set();
@@ -461,8 +476,10 @@ function buildLimitRow(l, isNew = false) {
   row.className = "admin-limit-row";
   row.innerHTML = `
     <input type="email" class="form-input lim-email" value="${esc(l.user_email)}" placeholder="user@adeqmedia.com" ${isNew ? "" : "readonly"} />
-    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API hits/mes" min="0" title="Cap de SimilarWeb hits por mes para este usuario" />
-    <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
+    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API/mes" min="0" title="Cap mensual de RapidAPI hits para este usuario (vacío = sin cap individual)" />
+    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 60}" placeholder="min" min="5" max="240" title="Duración máxima de UNA sesión de autopilot, en minutos" />
+    <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Cantidad máxima de prospectos procesados por día por este usuario en autopilot" />
+    <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot ON/OFF">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
     <button class="del-btn" title="Eliminar">×</button>
   `;
   // Toggle autopilot
@@ -481,23 +498,29 @@ function buildLimitRow(l, isNew = false) {
     }
     row.remove();
   });
-  // Auto-save on blur (campos numéricos)
+  // Auto-save on blur de cualquier input numérico o de email
   row.querySelectorAll("input[type=number], input[type=email]").forEach(inp => {
     inp.addEventListener("change", () => saveLimitRow(row));
   });
   return row;
 }
 
+function addAdminLimitRowExisting(row) { /* placeholder por si se necesita más adelante */ }
+
 async function saveLimitRow(row) {
   const email = row.querySelector(".lim-email").value.trim().toLowerCase();
   if (!email) return;
+  const apMins = parseInt(row.querySelector(".lim-ap-mins").value, 10);
+  const apProsp = parseInt(row.querySelector(".lim-ap-prospects").value, 10);
   const limit = {
-    user_email:        email,
-    autopilot_enabled: row.querySelector(".lim-autopilot").classList.contains("toggle-yes"),
-    monthly_api_cap:   parseInt(row.querySelector(".lim-monthly").value, 10) || null,
+    user_email:                email,
+    autopilot_enabled:         row.querySelector(".lim-autopilot").classList.contains("toggle-yes"),
+    monthly_api_cap:           parseInt(row.querySelector(".lim-monthly").value, 10) || null,
+    autopilot_daily_minutes:   isNaN(apMins) || apMins < 5 ? 60 : Math.min(apMins, 240),
+    autopilot_daily_prospects: isNaN(apProsp) || apProsp < 0 ? 75 : Math.min(apProsp, 500),
     // Caps de email/monday quedaron descontinuados por simplicidad; mando 999999 para que no bloqueen.
-    daily_emails_cap:  999999,
-    daily_monday_cap:  999999,
+    daily_emails_cap:          999999,
+    daily_monday_cap:          999999,
   };
   const ok = await upsertUserLimit(state.accessToken, limit);
   row.style.borderColor = ok ? "#34d399" : "#f87171";

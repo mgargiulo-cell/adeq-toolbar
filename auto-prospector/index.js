@@ -497,6 +497,28 @@ async function loadAutopilotFeedback(token, userEmail) {
   return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
 }
 
+// Lee límites custom del usuario desde toolbar_user_limits (admin panel).
+// Defaults si no existe la fila.
+async function getUserLimits(token, userEmail) {
+  if (!userEmail) return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null };
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_user_limits?user_email=eq.${encodeURIComponent(userEmail.toLowerCase())}&select=*&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null };
+    const rows = await res.json();
+    if (!rows.length) return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null };
+    const r = rows[0];
+    return {
+      autopilot_enabled:         r.autopilot_enabled !== false,
+      autopilot_daily_minutes:   parseInt(r.autopilot_daily_minutes || 60, 10),
+      autopilot_daily_prospects: parseInt(r.autopilot_daily_prospects || 75, 10),
+      monthly_api_cap:           r.monthly_api_cap ? parseInt(r.monthly_api_cap, 10) : null,
+    };
+  } catch { return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null }; }
+}
+
 async function getApolloUsageToday(token) {
   try {
     const res = await fetch(
@@ -1518,7 +1540,23 @@ async function runSession(token, cfg, sessionStart) {
   const minScore       = Number(cfg.min_score)    || 20;
   const sessionMinTraffic = Number(cfg.min_traffic) || MIN_TRAFFIC;
   const sessionUser    = cfg.auto_session_user || "";
-  const AUTOPILOT_DAILY_LIMIT = 75;
+
+  // Per-user limits configurables por el admin (toolbar_user_limits).
+  // Defaults: 75 prospectos/día y 60 min/sesión. Si el admin los cambió, los usa.
+  let AUTOPILOT_DAILY_LIMIT = 75;
+  let userSessionLimitMs    = SESSION_LIMIT_MS;
+  if (sessionUser) {
+    try {
+      const userLimits = await getUserLimits(token, sessionUser);
+      if (userLimits.autopilot_daily_prospects > 0) AUTOPILOT_DAILY_LIMIT = userLimits.autopilot_daily_prospects;
+      if (userLimits.autopilot_daily_minutes >= 5)  userSessionLimitMs    = userLimits.autopilot_daily_minutes * 60 * 1000;
+      if (userLimits.autopilot_enabled === false) {
+        log(`⛔ ${sessionUser} tiene autopilot DISABLED por el admin — sesión no arranca`);
+        await setConfigValue(token, "auto_prospecting_enabled", "false");
+        return;
+      }
+    } catch (e) { log(`(per-user limits no disponibles: ${e.message} — usando defaults)`); }
+  }
 
   // Expand regions to concrete country lists for matching
   const allowedCountries = new Set();
@@ -1709,8 +1747,8 @@ async function runSession(token, cfg, sessionStart) {
   let count = 0, added = 0, skipped = 0, lowScore = 0, discovered = 0, dupOrg = 0;
 
   while (toProcess.length > 0) {
-    if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
-      log("⏱ 60 minutos — auto-apagando.");
+    if (Date.now() - sessionStart >= userSessionLimitMs) {
+      log(`⏱ ${Math.round(userSessionLimitMs / 60000)} minutos (límite del usuario) — auto-apagando.`);
       await setConfigValue(token, "auto_prospecting_enabled", "false");
       await setConfigValue(token, "auto_session_start", "");
       break;

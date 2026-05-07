@@ -12,10 +12,12 @@
 import { CONFIG } from "../config.js";
 
 const DEFAULTS = {
-  autopilot_enabled: true,
-  monthly_api_cap:   null,   // null = solo aplica el cap global de 40k
-  daily_emails_cap:  100,
-  daily_monday_cap:  100,
+  autopilot_enabled:       true,
+  monthly_api_cap:         null,   // null = solo aplica el cap global de 40k
+  daily_emails_cap:        100,
+  daily_monday_cap:        100,
+  autopilot_daily_minutes: 60,    // duración máxima de UNA sesión de autopilot
+  autopilot_daily_prospects: 75,  // cap de dominios procesados por día por este user
 };
 
 function _headers(token) {
@@ -61,12 +63,14 @@ export async function upsertUserLimit(accessToken, limit) {
         method: "POST",
         headers: { ..._headers(accessToken), "Prefer": "resolution=merge-duplicates,return=minimal" },
         body: JSON.stringify({
-          user_email:        limit.user_email.toLowerCase(),
-          autopilot_enabled: !!limit.autopilot_enabled,
-          monthly_api_cap:   limit.monthly_api_cap || null,
-          daily_emails_cap:  parseInt(limit.daily_emails_cap || 100, 10),
-          daily_monday_cap:  parseInt(limit.daily_monday_cap || 100, 10),
-          updated_at:        new Date().toISOString(),
+          user_email:                limit.user_email.toLowerCase(),
+          autopilot_enabled:         !!limit.autopilot_enabled,
+          monthly_api_cap:           limit.monthly_api_cap || null,
+          daily_emails_cap:          parseInt(limit.daily_emails_cap || 100, 10),
+          daily_monday_cap:          parseInt(limit.daily_monday_cap || 100, 10),
+          autopilot_daily_minutes:   parseInt(limit.autopilot_daily_minutes || 60, 10),
+          autopilot_daily_prospects: parseInt(limit.autopilot_daily_prospects || 75, 10),
+          updated_at:                new Date().toISOString(),
         }),
       }
     );
