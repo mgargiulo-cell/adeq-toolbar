@@ -91,53 +91,44 @@ export async function getSimilarSitesFromSimilarSites(domain) {
 }
 
 /**
- * Cascada de 2 niveles: semilla → similares → similares de similares.
- * Usa caché — solo llama a la API si el dominio no fue consultado en 60 días.
+ * Cascade — descubre webs similares SIN GASTAR HITS DE RAPIDAPI.
+ *
+ * Decisión user 2026-05-08: no tiene sentido enriquecer visits/geo de sitios
+ * similares hasta que el MB decida abrirlos para prospectar. Cascade solo
+ * trae la lista de dominios desde el scrape público de similarsites.com
+ * (gratis, sin API key). Cuando el MB haga click en uno, la pestaña abre y
+ * el toolbar (Analysis) ahí sí dispara el getTraffic que enriquece el
+ * dominio elegido.
+ *
+ * Resultado: 0 hits de RapidAPI por sesión de Cascade.
  */
 export async function runCascade(seedDomain, onProgress) {
-  const found   = new Map();
-  const checked = new Set();
+  const found = new Map();
 
   onProgress?.({ status: "searching", domain: seedDomain, level: 1 });
-  const [swLevel1, ssLevel1] = await Promise.all([
-    getSimilarSites(seedDomain),
-    getSimilarSitesFromSimilarSites(seedDomain),
-  ]);
-  // Merge: SimilarWeb objects take priority; add similarsites.com-only domains as minimal stubs
-  const swMap = new Map(swLevel1.map(s => [s.domain, s]));
+  const ssLevel1 = await getSimilarSitesFromSimilarSites(seedDomain);
+
+  // Stub objects — sin visits/geo (los traerá Analysis cuando el MB haga click)
   for (const d of ssLevel1) {
-    if (!swMap.has(d)) swMap.set(d, { domain: d, title: d, visits: 0, country: "N/A", countryCode: "", globalRank: null, description: "", favicon: "" });
-  }
-  const level1 = [...swMap.values()];
-  checked.add(seedDomain);
-
-  for (const site of level1) {
-    if (!found.has(site.domain)) {
-      found.set(site.domain, { ...site, level: 1 });
-      onProgress?.({ status: "found", site, level: 1 });
+    if (!found.has(d) && d !== seedDomain) {
+      const stub = {
+        domain:      d,
+        title:       d,
+        visits:      0,           // placeholder — se completa cuando user hace Analysis
+        country:     "",
+        countryCode: "",
+        globalRank:  null,
+        description: "",
+        favicon:     `https://www.google.com/s2/favicons?domain=${d}&sz=32`,
+        level:       1,
+      };
+      found.set(d, stub);
+      onProgress?.({ status: "found", site: stub, level: 1 });
     }
   }
 
-  for (const site of level1.slice(0, 10)) {
-    if (checked.has(site.domain)) continue;
-    checked.add(site.domain);
-
-    // Solo duerme si no hay caché (para no saturar la API en calls reales)
-    const cached = await getSimilarCache(site.domain.replace(/^www\./, "").toLowerCase());
-    if (!cached) await sleep(1500);
-
-    onProgress?.({ status: "searching", domain: site.domain, level: 2 });
-    const level2 = await getSimilarSites(site.domain);
-
-    for (const s2 of level2) {
-      if (!found.has(s2.domain) && s2.domain !== seedDomain) {
-        found.set(s2.domain, { ...s2, level: 2 });
-        onProgress?.({ status: "found", site: s2, level: 2 });
-      }
-    }
-  }
-
-  return [...found.values()].sort((a, b) => b.visits - a.visits);
+  // Devolvemos sin sort por visits (no las tenemos) — alfabético.
+  return [...found.values()].sort((a, b) => a.domain.localeCompare(b.domain));
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

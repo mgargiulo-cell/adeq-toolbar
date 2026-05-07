@@ -3934,16 +3934,20 @@ function appendCascadeItem(site, container) {
 
   const rankColor  = !site.globalRank ? "" : site.globalRank < 50000 ? "rank-ok" : site.globalRank < 200000 ? "rank-warn" : "rank-bad";
   const rankText   = site.globalRank ? `#${site.globalRank.toLocaleString()}` : "—";
-  const countryStr = site.countryCode ? (COUNTRY_NAMES[site.countryCode] || site.countryCode) : "";
+  const countryStr = site.countryCode ? (COUNTRY_NAMES[site.countryCode] || site.countryCode) : "—";
 
-  const s    = scoreProspect({ pageViews: site.visits, rawVisits: site.visits });
-  const grade = `<span class="score-grade-sm" style="background:${s.color}" title="${s.label}">${s.grade}</span>`;
+  // Si visits=0 (Cascade post-refactor: no enriquece para ahorrar hits) → mostrar "?".
+  // El usuario verá los datos reales recién al abrir Analysis del dominio elegido.
+  const visitsLabel = site.visits > 0 ? formatTraffic(site.visits) : "?";
+  const grade = site.visits > 0
+    ? (() => { const s = scoreProspect({ pageViews: site.visits, rawVisits: site.visits }); return `<span class="score-grade-sm" style="background:${s.color}" title="${s.label}">${s.grade}</span>`; })()
+    : `<span class="score-grade-sm" style="background:#94a3b8" title="Sin enriquecer — abrí el dominio para ver datos">?</span>`;
 
   item.innerHTML = `
     <input type="checkbox" />
     <img class="cascade-favicon" loading="lazy" src="https://www.google.com/s2/favicons?domain=${esc(site.domain)}&sz=16" onerror="this.style.display='none'" />
     <span class="cascade-domain" title="${esc(site.domain)}">${esc(site.domain)}</span>
-    <span class="cascade-visits">${esc(formatTraffic(site.visits))}</span>
+    <span class="cascade-visits">${esc(visitsLabel)}</span>
     <span class="cascade-rank ${rankColor}">${rankText}</span>
     <span class="cascade-country">${esc(countryStr)}</span>
     ${grade}
@@ -4005,11 +4009,17 @@ function applyCascadeFilters() {
     const clean = site.domain.replace(/^www\./, "").toLowerCase();
     if (BLOCKLIST.has(clean)) return false;
     if (cascadeBlockedExecSet.has(clean)) return false;
-    if (tMin > 0 && site.visits < tMin) return false;
-    if (tMax !== Infinity && site.visits > tMax) return false;
+    // Filtros traffic/rank/lang SOLO si el site tiene esos datos. Cascade
+    // ahora no enriquece (decisión user 2026-05-08), entonces visits=0 y
+    // countryCode="" para todos. Los filtros se aplican post-Analysis del
+    // dominio elegido.
+    if (site.visits > 0) {
+      if (tMin > 0 && site.visits < tMin) return false;
+      if (tMax !== Infinity && site.visits > tMax) return false;
+    }
     if (rMin > 0 && site.globalRank && site.globalRank < rMin) return false;
     if (rMax !== Infinity && site.globalRank && site.globalRank > rMax) return false;
-    if (langFilter && site.countryCode !== langFilter) return false;
+    if (langFilter && site.countryCode && site.countryCode !== langFilter) return false;
     return true;
   }).slice(0, LIMIT);
 
