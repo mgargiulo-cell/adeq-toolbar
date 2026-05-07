@@ -1628,6 +1628,10 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     if (Number.isFinite(CSV_DAILY_LIMIT_PER_USER) && userTotal >= CSV_DAILY_LIMIT_PER_USER) {
       log(`  ⏸ ${userEmail} alcanzó ${userTotal}/${CSV_DAILY_LIMIT_PER_USER} hoy — se reanuda mañana`);
       blockedUsers.add(userEmail);
+      // Persistir cap-reached para que la toolbar muestre alert al user
+      await setConfigValue(token, `csv_cap_reached_${userEmail}`, JSON.stringify({
+        limit: CSV_DAILY_LIMIT_PER_USER, reachedAt: new Date().toISOString(),
+      })).catch(() => {});
       await revertCsvItemToPending(token, item.id);
       continue;
     }

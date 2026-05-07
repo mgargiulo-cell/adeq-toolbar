@@ -896,7 +896,6 @@
   <section class="card">
     <div class="card-title">📤 External URLs Auto Prospector</div>
     <p class="import-desc">Upload a CSV (1 domain per line) with <strong>external</strong> URLs. The auto-prospector processes them in the background — analyzes traffic, emails, and pushes them to Monday as new prospects.</p>
-    <p class="import-warn">⚠️ El toggle <strong>AUTO IMPORT</strong> (abajo) debe estar prendido para que el worker procese la cola. Independiente del Autopilot de Prospects. Límite: <strong>300/día/usuario</strong>.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
@@ -915,7 +914,6 @@
   <section class="card">
     <div class="card-title">🔄 Monday URL Auto Prospector</div>
     <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
-    <p class="import-warn">⚠️ El toggle <strong>AUTO IMPORT</strong> (abajo) debe estar prendido para que el worker procese la cola. Independiente del Autopilot de Prospects. Límite: <strong>300/día/usuario</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
       <select id="refresh-geo" class="form-select" style="font-size:11px" title="Debe matchear el valor exacto de la columna GEO en Monday.">

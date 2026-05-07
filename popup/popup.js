@@ -4442,7 +4442,11 @@ async function initCsvQueue() {
       }
       resultEl.textContent = `Found ${domains.length}, uploading to queue...`;
       const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken, "monday");
-      resultEl.textContent = `✅ ${up.inserted} added (${domains.length - up.inserted} already queued). Railway processes 75/day/user.`;
+      resultEl.textContent = `✅ ${up.inserted} added (${domains.length - up.inserted} already queued).`;
+      // Si tu user ya alcanzó el límite diario, avisar
+      if (up.inserted === 0 && domains.length > 0) {
+        resultEl.textContent += " Si llegaste al cap diario de 300, esperá hasta mañana o pedile al admin que lo suba.";
+      }
       resultEl.className = "push-result ok";
       await refreshAll();
     } catch (err) {
