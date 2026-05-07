@@ -33,6 +33,81 @@ import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
          getUserDailyUsage, incrementUserDailyCounter, checkUserCanDo }                          from "../modules/userLimits.js";
 
 // ============================================================
+// AUTO-REFRESH ON URL CHANGE
+// El side panel queda abierto al navegar de tab/URL. Detectamos cambios
+// y disparamos re-análisis después de 3s estables (evita refresh constante
+// si el user navega rápido).
+// ============================================================
+let _autoRefreshTimer = null;
+let _autoRefreshLastDomain = null;
+let _autoRefreshWired = false;
+
+function setupAutoRefreshOnUrlChange() {
+  if (_autoRefreshWired) return;
+  _autoRefreshWired = true;
+  _autoRefreshLastDomain = state.domain;
+
+  const scheduleRecheck = (newUrl, tabId) => {
+    if (!newUrl || newUrl.startsWith("chrome://") || newUrl.startsWith("about:")) return;
+    const newDomain = extractDomain(newUrl);
+    if (!newDomain || newDomain === _autoRefreshLastDomain) return;
+    clearTimeout(_autoRefreshTimer);
+    _autoRefreshTimer = setTimeout(async () => {
+      // Re-confirmar que la tab activa sigue siendo esta URL (si el user navegó otra vez, esperamos)
+      try {
+        const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!active || active.id !== tabId) return; // user cambió de tab
+        if (extractDomain(active.url) !== newDomain) return; // URL cambió de nuevo
+        _autoRefreshLastDomain = newDomain;
+        // Re-trigger analysis sobre la nueva URL
+        state.tabId  = active.id;
+        state.url    = active.url;
+        state.domain = newDomain;
+        const siteEl = document.getElementById("site-url");
+        if (siteEl) siteEl.textContent = newDomain;
+        const seedEl = document.getElementById("cascade-seed");
+        if (seedEl) seedEl.value = newDomain;
+        // Limpiar resultados previos antes de re-analizar
+        resetAnalysisUI();
+        // Re-correr el flujo de análisis
+        runAnalysisPipeline();
+      } catch (e) { console.warn("[auto-refresh] failed:", e.message); }
+    }, 3000);
+  };
+
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.url) scheduleRecheck(changeInfo.url, tabId);
+  });
+  chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab?.url) scheduleRecheck(tab.url, tabId);
+    } catch {}
+  });
+}
+
+function resetAnalysisUI() {
+  // Limpiar los resultados visibles para evitar confundir al user con datos del dominio anterior
+  ["traffic-result", "traffic-breakdown", "traffic-countries", "traffic-category", "traffic-filter",
+   "duplicate-result", "email-result", "pitch-text", "form-pv-display"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") el.value = "";
+      else el.textContent = "";
+    }
+  });
+}
+
+function runAnalysisPipeline() {
+  runDuplicateCheck().catch(() => {});
+  runTrafficCheck().catch(() => {});
+  runEmailScraper().catch(() => {});
+  if (typeof runAuditCheck === "function")     runAuditCheck().catch(() => {});
+  if (typeof runBannerDetection === "function") runBannerDetection().catch(() => {});
+  if (typeof runPageContext === "function")    runPageContext().catch(() => {});
+}
+
+// ============================================================
 // ADMIN VIEW TOGGLE
 // El admin tiene la misma UI que el media buyer, pero puede activar el modo
 // admin con triple-click en el logo (no llama la atención y no clutterea
@@ -663,6 +738,10 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   document.getElementById("site-url").textContent = state.domain;
   document.getElementById("cascade-seed").value   = state.domain;
+
+  // Auto-refresh on URL change (side panel queda abierto al navegar):
+  // detectamos cambios de tab/URL y disparamos re-análisis después de 3s estables.
+  setupAutoRefreshOnUrlChange();
 
   // mediaBuyer is derived from auth login — do NOT override from legacy storage key
   prefillMondayForm();
