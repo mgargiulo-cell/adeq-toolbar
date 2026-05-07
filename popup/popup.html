@@ -828,6 +828,19 @@
         </button>
       </div>
     </div>
+    <!-- Status live de la sesión actual de autopilot — se llena desde toolbar_config.auto_session_stats -->
+    <div id="autopilot-live-stats" style="display:none;margin-top:6px;padding:6px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:6px;font-size:11px;color:#cbd5e1">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span><strong style="color:#34d399">⚡ Procesando</strong> · <span id="ap-live-user" style="color:#94a3b8"></span></span>
+        <span style="color:#64748b;font-size:10px" id="ap-live-age"></span>
+      </div>
+      <div style="margin-top:3px;display:flex;gap:10px;font-size:10.5px">
+        <span>📊 <strong id="ap-live-processed">0</strong> procesados</span>
+        <span style="color:#34d399">✅ <strong id="ap-live-added">0</strong> guardados</span>
+        <span style="color:#fbbf24">⚠️ <strong id="ap-live-filtered">0</strong> filtrados</span>
+      </div>
+      <div style="margin-top:2px;font-size:10px;color:#94a3b8" id="ap-live-last"></div>
+    </div>
   </section>
 
   <section class="card" style="padding-bottom:10px">

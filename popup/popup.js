@@ -5054,6 +5054,35 @@ async function initAutopilot() {
     }
   });
 
+  // Refresco de live stats del autopilot cada 10s
+  const refreshAutopilotLiveStats = async () => {
+    try {
+      const res = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.auto_session_stats&select=value`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+      );
+      if (!res.ok) return;
+      const rows = await res.json();
+      const raw  = rows?.[0]?.value;
+      if (!raw) { document.getElementById("autopilot-live-stats").style.display = "none"; return; }
+      let stats; try { stats = JSON.parse(raw); } catch { return; }
+      const ageSec = stats.lastUpdate ? Math.round((Date.now() - stats.lastUpdate) / 1000) : Infinity;
+      // Mostrar solo si hay update en los últimos 5 minutos (sesión "activa")
+      const wrap = document.getElementById("autopilot-live-stats");
+      if (!wrap) return;
+      if (ageSec > 300) { wrap.style.display = "none"; return; }
+      wrap.style.display = "block";
+      document.getElementById("ap-live-user").textContent      = stats.sessionUser || "?";
+      document.getElementById("ap-live-processed").textContent = (stats.processed || 0).toLocaleString();
+      document.getElementById("ap-live-added").textContent     = (stats.added || 0).toLocaleString();
+      document.getElementById("ap-live-filtered").textContent  = (stats.filtered || 0).toLocaleString();
+      document.getElementById("ap-live-age").textContent       = `hace ${ageSec}s`;
+      document.getElementById("ap-live-last").textContent      = stats.lastDomain ? `Último: ${stats.lastDomain}` : "";
+    } catch {}
+  };
+  refreshAutopilotLiveStats();
+  setInterval(refreshAutopilotLiveStats, 10_000);
+
   // Refresco periódico del estado mutex (cada 30s) para que cuando el dueño
   // apague desde su browser, los demás vean el lock liberado sin reload manual.
   setInterval(async () => {

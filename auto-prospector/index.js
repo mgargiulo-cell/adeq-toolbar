@@ -422,11 +422,11 @@ async function bumpStat(token, userEmail, reason, n = 1) {
 }
 
 async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
-  await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
     headers: {
       "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-      "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
+      "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
     },
     body: JSON.stringify({
       domain,
@@ -448,6 +448,42 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
       status:         "pending",
     }),
   });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    log(`  ❌ saveToReviewQueue ${domain} HTTP ${res.status}: ${txt.substring(0, 200)}`);
+    return false;
+  }
+  return true;
+}
+
+// ── Stats en vivo del autopilot, persistidas a toolbar_config ─────
+// Los popups de los MBs leen estas keys cada 30s y muestran el progreso.
+let _autopilotStatsLocal = { processed: 0, added: 0, filtered: 0, lastDomain: "", lastUpdate: 0, sessionUser: "" };
+let _autopilotStatsLastFlush = 0;
+
+async function flushAutopilotStats(token, force = false) {
+  const now = Date.now();
+  if (!force && (now - _autopilotStatsLastFlush) < 5000) return; // máx 1 vez cada 5s
+  _autopilotStatsLastFlush = now;
+  try {
+    await setConfigValue(token, "auto_session_stats", JSON.stringify({
+      ..._autopilotStatsLocal,
+      lastUpdate: now,
+    }));
+  } catch (e) { /* silent */ }
+}
+
+function resetAutopilotStats(sessionUser) {
+  _autopilotStatsLocal = { processed: 0, added: 0, filtered: 0, lastDomain: "", lastUpdate: Date.now(), sessionUser: sessionUser || "" };
+}
+
+function trackAutopilotEvent(kind, domain) {
+  // kind: "processed" | "added" | "filtered"
+  _autopilotStatsLocal.processed = (kind === "processed" ? _autopilotStatsLocal.processed + 1 : _autopilotStatsLocal.processed);
+  if (kind === "added")    _autopilotStatsLocal.added++;
+  if (kind === "filtered") _autopilotStatsLocal.filtered++;
+  _autopilotStatsLocal.lastDomain = domain || _autopilotStatsLocal.lastDomain;
+  _autopilotStatsLocal.lastUpdate = Date.now();
 }
 
 // Cuenta items de autopilot creados por un user hoy (para quota 75/día)
@@ -1674,6 +1710,9 @@ async function runSession(token, cfg, sessionStart) {
 
   const targetInfo = [targetGeos.join("+"), targetCategory].filter(Boolean).join(" / ") || "sin filtros";
   log(`Sesión iniciada. User: ${sessionUser || "(desconocido)"} | Target: ${targetInfo} | Min score: ${minScore} | Min traffic: ${(sessionMinTraffic/1000).toFixed(0)}K`);
+  // Reset stats live para que el popup muestre 0 al arrancar la sesión nueva
+  resetAutopilotStats(sessionUser);
+  await flushAutopilotStats(token, true).catch(() => {});
 
   // Quota diaria per-user para el autopilot
   const userTodayCount = await getUserAutopilotCountToday(token, sessionUser);
@@ -2015,6 +2054,9 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ✗ pageViews (${Math.round(pageViews/1000)}K = ${Math.round(visits/1000)}K visits × ${ppvSafe.toFixed(1)} ppv) < ${(sessionMinTraffic/1000)}K — descartado`);
       await markProcessed(token, [domain], "traffic_low");
       count++; skipped++;
+      trackAutopilotEvent("filtered", domain);
+      trackAutopilotEvent("processed", domain);
+      flushAutopilotStats(token).catch(() => {});
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
@@ -2038,6 +2080,9 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ✗ Categoría ${category} ≠ objetivo ${targetCategory} — descartado`);
       await markProcessed(token, [domain], "category_mismatch");
       count++; skipped++;
+      trackAutopilotEvent("filtered", domain);
+      trackAutopilotEvent("processed", domain);
+      flushAutopilotStats(token).catch(() => {});
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
@@ -2047,6 +2092,9 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ✗ GEO ${topCountry} ∉ {${[...allowedCountries].slice(0,5).join(",")}${allowedCountries.size>5?"...":""}} — descartado`);
       await markProcessed(token, [domain], "geo_target_mismatch");
       count++; skipped++;
+      trackAutopilotEvent("filtered", domain);
+      trackAutopilotEvent("processed", domain);
+      flushAutopilotStats(token).catch(() => {});
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
@@ -2114,7 +2162,7 @@ async function runSession(token, cfg, sessionStart) {
 
     if (adNetworks.length > 0) log(`  📡 Ad networks: ${adNetworks.join(", ")}`);
 
-    await saveToReviewQueue(token, {
+    const saveOk = await saveToReviewQueue(token, {
       domain,
       traffic:       visits,
       geo:           topCountry,
@@ -2130,8 +2178,18 @@ async function runSession(token, cfg, sessionStart) {
       pageTitle,
       createdBy:     sessionUser,
     });
-    await markProcessed(token, [domain], "added_to_review");
-    count++; added++;
+    if (saveOk) {
+      await markProcessed(token, [domain], "added_to_review");
+      count++; added++;
+      trackAutopilotEvent("added", domain);
+    } else {
+      // Save falló — no marcar como added pero sí como processed para no re-evaluar
+      await markProcessed(token, [domain], "save_failed");
+      count++; skipped++;
+      trackAutopilotEvent("filtered", domain);
+    }
+    trackAutopilotEvent("processed", domain);
+    flushAutopilotStats(token).catch(() => {});
 
     log(`  ✓ score:${scoreWithEmails} | ${Math.round(visits/1000)}K | ${topCountry||"N/A"} | ${language} | ${category} | ${contactName||"—"} | ${emails.length} email(s)`);
     await sleep(DOMAIN_DELAY_MS);
@@ -2142,6 +2200,7 @@ async function runSession(token, cfg, sessionStart) {
   await saveApolloUsage(token, apolloCallsThisSession, apolloUsage.today);
   await saveRapidApiUsage(token, _rapidGlobalCounter, rapidUsage.today);
   await saveRapidApiMonthlyUsage(token, _rapidGlobalCounter, rapidMonth.period);
+  await flushAutopilotStats(token, true).catch(() => {});
 }
 
 // ── Loop principal ────────────────────────────────────────────
