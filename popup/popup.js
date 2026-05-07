@@ -400,10 +400,8 @@ function buildLimitRow(l, isNew = false) {
   row.className = "admin-limit-row";
   row.innerHTML = `
     <input type="email" class="form-input lim-email" value="${esc(l.user_email)}" placeholder="user@adeqmedia.com" ${isNew ? "" : "readonly"} />
-    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="cap mensual" min="0" />
-    <input type="number" class="form-input lim-emails" value="${l.daily_emails_cap}" placeholder="emails/día" min="0" />
-    <input type="number" class="form-input lim-monday" value="${l.daily_monday_cap}" placeholder="monday/día" min="0" />
-    <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
+    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API hits/mes" min="0" title="Cap de SimilarWeb hits por mes para este usuario" />
+    <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
     <button class="del-btn" title="Eliminar">×</button>
   `;
   // Toggle autopilot
@@ -436,8 +434,9 @@ async function saveLimitRow(row) {
     user_email:        email,
     autopilot_enabled: row.querySelector(".lim-autopilot").classList.contains("toggle-yes"),
     monthly_api_cap:   parseInt(row.querySelector(".lim-monthly").value, 10) || null,
-    daily_emails_cap:  parseInt(row.querySelector(".lim-emails").value, 10) || 100,
-    daily_monday_cap:  parseInt(row.querySelector(".lim-monday").value, 10) || 100,
+    // Caps de email/monday quedaron descontinuados por simplicidad; mando 999999 para que no bloqueen.
+    daily_emails_cap:  999999,
+    daily_monday_cap:  999999,
   };
   const ok = await upsertUserLimit(state.accessToken, limit);
   row.style.borderColor = ok ? "#34d399" : "#f87171";

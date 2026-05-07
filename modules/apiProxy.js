@@ -7,7 +7,11 @@
 import { CONFIG } from "../config.js";
 
 let _sbAuthToken = null;
-export function setProxyAuth(accessToken) { _sbAuthToken = accessToken || null; }
+let _sbUserEmail = null;
+export function setProxyAuth(accessToken, email) {
+  _sbAuthToken = accessToken || null;
+  if (email) _sbUserEmail = email.toLowerCase();
+}
 
 function proxyUrl() {
   return `${CONFIG.SUPABASE_URL}/functions/v1/api-proxy`;

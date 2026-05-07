@@ -1201,7 +1201,7 @@ input.form-pv-display { font-weight: 700; }
 .admin-limits-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
 .admin-limit-row {
   background: #1e293b; padding: 8px; border-radius: 6px; border: 1px solid #334155;
-  display: grid; grid-template-columns: 1fr 90px 70px 70px 50px 30px; gap: 6px; align-items: center;
+  display: grid; grid-template-columns: 1fr 110px 60px 28px; gap: 8px; align-items: center;
 }
 .admin-limit-row .form-input, .admin-limit-row .form-select {
   background: #0f172a; color: #e2e8f0; border: 1px solid #475569;
