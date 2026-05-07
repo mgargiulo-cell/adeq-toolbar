@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ADEQ Toolbar — Privacy Policy</title>
+  <title>ADEQ Toolbar — Política de Privacidad</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -37,241 +37,253 @@
 </head>
 <body>
   <main>
-    <h1>ADEQ Toolbar — Privacy Policy</h1>
-    <p class="meta">Effective date: May 7, 2026 · Last updated: May 7, 2026 · Contact: <a href="mailto:mgargiulo@adeqmedia.com">mgargiulo@adeqmedia.com</a></p>
+    <h1>ADEQ Toolbar — Política de Privacidad</h1>
+    <p class="meta">Fecha de entrada en vigor: 7 de mayo de 2026 · Última actualización: 7 de mayo de 2026 · Contacto: <a href="mailto:contact@adeqmedia.com">contact@adeqmedia.com</a></p>
 
-    <h2>1. Introduction and scope</h2>
+    <h2>1. Introducción y alcance</h2>
     <p>
-      ADEQ Toolbar ("the extension", "we", "us") is a private Chrome extension developed by
-      <strong>ADEQ Media</strong> for the exclusive use of authorized employees performing
-      internal B2B prospecting and outreach. This Privacy Policy describes in detail what
-      data the extension collects, how it is collected, used, stored, shared, retained and
-      how authorized users can exercise their rights over that data.
+      ADEQ Toolbar ("la extensión", "nosotros") es una extensión privada de Chrome
+      desarrollada por <strong>ADEQ Media</strong> para uso exclusivo de empleados
+      autorizados que realizan prospección B2B y outreach interno. Esta Política de
+      Privacidad describe en detalle qué datos recopila la extensión, cómo se recopilan,
+      utilizan, almacenan, comparten y conservan, y cómo los usuarios autorizados
+      pueden ejercer sus derechos sobre dichos datos.
     </p>
     <p>
-      The extension is <strong>not a public consumer product</strong>. Sign-in is restricted
-      by an explicit email allowlist of ADEQ Media staff accounts. Anyone outside the
-      allowlist who installs the extension cannot authenticate and the extension performs no
-      data collection for them.
+      La extensión <strong>no es un producto público de consumo</strong>. El acceso está
+      restringido por una lista explícita de cuentas de empleados de ADEQ Media. Cualquier
+      persona fuera de esa lista que instale la extensión no podrá autenticarse y no se
+      recopilará ningún dato suyo.
     </p>
 
-    <h2>2. Information we collect</h2>
+    <h2>2. Información que recopilamos</h2>
 
-    <h3>2.1. Information collected directly from the authorized employee</h3>
+    <h3>2.1. Información recopilada directamente del empleado autorizado</h3>
     <ul>
-      <li><strong>Authentication credentials:</strong> the work email address and a
-        password (managed by Supabase Auth) used to sign into the extension. The password
-        is hashed by Supabase and is never visible to the extension code.</li>
-      <li><strong>OAuth access tokens:</strong> when the employee enables Gmail sending,
-        Google issues an OAuth 2.0 access token granting permission to send messages on
-        behalf of the signed-in employee. The token is stored in
-        <code>chrome.storage.local</code> and refreshed automatically by Chrome's identity
-        API.</li>
-      <li><strong>User preferences and history:</strong> recently analyzed domains, custom
-        keyword lists, draft pitches, UI settings — all stored in
-        <code>chrome.storage.local</code> on the employee's own machine.</li>
-      <li><strong>Telemetry of toolbar actions:</strong> timestamps and counts of API
-        calls, emails sent, prospects pushed to CRM. This is used to enforce per-user
-        quotas and to display usage dashboards to administrators.</li>
+      <li><strong>Credenciales de autenticación:</strong> el correo de trabajo y una
+        contraseña (gestionada por Supabase Auth) utilizados para iniciar sesión en la
+        extensión. La contraseña se guarda hasheada por Supabase y nunca es visible para
+        el código de la extensión.</li>
+      <li><strong>Tokens OAuth:</strong> cuando el empleado habilita el envío de Gmail,
+        Google emite un token OAuth 2.0 que otorga permiso para enviar mensajes en su
+        nombre. El token se almacena en <code>chrome.storage.local</code> y se renueva
+        automáticamente mediante la API de identidad de Chrome.</li>
+      <li><strong>Preferencias e historial del usuario:</strong> dominios analizados
+        recientemente, listas personalizadas de palabras clave, borradores de pitches
+        y configuración de UI — todo almacenado en <code>chrome.storage.local</code> en
+        la propia máquina del empleado.</li>
+      <li><strong>Telemetría de acciones de la barra:</strong> marcas de tiempo y conteos
+        de llamadas a APIs, correos enviados, prospectos enviados al CRM. Se utiliza para
+        aplicar cuotas por usuario y mostrar paneles de uso a los administradores.</li>
     </ul>
 
-    <h3>2.2. Information collected from the websites the employee analyzes</h3>
+    <h3>2.2. Información recopilada de los sitios web que el empleado analiza</h3>
     <ul>
-      <li>The current tab's <strong>URL, title and meta description</strong> at the moment
-        the employee chooses to analyze it. The extension does not run in the background on
-        other tabs and does not collect history of pages the employee did not analyze.</li>
-      <li>Visible <strong>ad-tech signals</strong> (e.g. presence of Google AdSense /
-        Google Ad Manager / Prebid scripts, banner sizes) read from the page DOM.</li>
-      <li>Public <strong>contact information</strong> scraped from the same domain's
-        contact page (e.g. <code>info@example.com</code>) for outreach purposes.</li>
+      <li>La <strong>URL, título y descripción meta</strong> de la pestaña actual en el
+        momento en que el empleado decide analizarla. La extensión no se ejecuta en
+        segundo plano sobre otras pestañas y no recopila historial de navegación de
+        páginas que el empleado no haya analizado.</li>
+      <li><strong>Señales visibles de ad-tech</strong> (presencia de Google AdSense /
+        Google Ad Manager / scripts de Prebid, tamaños de banners) leídas del DOM de la
+        página.</li>
+      <li><strong>Información pública de contacto</strong> obtenida de la página de
+        contacto del mismo dominio (por ejemplo <code>info@example.com</code>) con fines
+        de outreach.</li>
     </ul>
 
-    <h3>2.3. Information retrieved from third-party APIs</h3>
-    <p>The extension queries the following third-party APIs to enrich each analyzed domain:</p>
+    <h3>2.3. Información obtenida de APIs de terceros</h3>
+    <p>La extensión consulta las siguientes APIs de terceros para enriquecer cada dominio analizado:</p>
     <table>
       <thead>
-        <tr><th>Provider</th><th>Data retrieved</th><th>Purpose</th></tr>
+        <tr><th>Proveedor</th><th>Datos obtenidos</th><th>Finalidad</th></tr>
       </thead>
       <tbody>
         <tr>
-          <td>SimilarWeb / DataLoom (via RapidAPI)</td>
-          <td>Aggregated public traffic estimates (visits, bounce rate, top countries, category)</td>
-          <td>Qualify the prospect's audience size</td>
+          <td>SimilarWeb / DataLoom (vía RapidAPI)</td>
+          <td>Estimaciones públicas y agregadas de tráfico (visitas, bounce rate, países principales, categoría)</td>
+          <td>Calificar el tamaño de audiencia del prospecto</td>
         </tr>
         <tr>
           <td>Apollo.io</td>
-          <td>Business contact name, role, business email of decision-makers at the analyzed company</td>
-          <td>Direct outreach to the right person</td>
+          <td>Nombre, rol y email comercial de los tomadores de decisión de la empresa analizada</td>
+          <td>Outreach directo a la persona indicada</td>
         </tr>
         <tr>
           <td>Google Gemini / Anthropic Claude</td>
-          <td>AI-generated draft pitch text using the analyzed domain's metadata</td>
-          <td>Speed up email drafting (the employee reviews before sending)</td>
+          <td>Borrador de pitch generado por IA usando los metadatos del dominio analizado</td>
+          <td>Acelerar la redacción del email (el empleado lo revisa antes de enviar)</td>
         </tr>
         <tr>
-          <td>Google DNS-over-HTTPS, public WHOIS endpoints, eva.pingutil.com</td>
-          <td>Domain ownership / mailbox validity checks</td>
-          <td>Improve email deliverability</td>
+          <td>Google DNS-over-HTTPS, endpoints públicos de WHOIS, eva.pingutil.com</td>
+          <td>Validaciones de propiedad de dominio y de existencia de buzones</td>
+          <td>Mejorar la entregabilidad de los emails</td>
         </tr>
         <tr>
           <td>Monday.com</td>
-          <td>CRM records ADEQ Media owns; the extension reads / writes its own private board only</td>
-          <td>Persist prospect status</td>
+          <td>Registros de CRM propiedad de ADEQ Media; la extensión solo lee/escribe en su tablero privado</td>
+          <td>Persistir el estado del prospecto</td>
         </tr>
       </tbody>
     </table>
 
-    <h2>3. How information is collected</h2>
+    <h2>3. Cómo se recopila la información</h2>
     <ul>
-      <li>The employee <strong>actively initiates</strong> every analysis by clicking the
-        toolbar icon. The extension never analyses, scrapes or transmits data from a tab
-        unless the employee opens the side panel for that tab.</li>
-      <li>The employee's email is collected when they sign in via the login form.</li>
-      <li>Third-party API responses are received over HTTPS only.</li>
-      <li>The extension does not deploy any tracking pixel, cookie, fingerprinting,
-        beacon, behavioural analytics or session-replay technology.</li>
+      <li>El empleado <strong>inicia activamente</strong> cada análisis al hacer clic en
+        el ícono de la barra. La extensión nunca analiza, recopila ni transmite datos de
+        una pestaña a menos que el empleado abra explícitamente el panel lateral en ella.</li>
+      <li>El email del empleado se recopila cuando inicia sesión en el formulario de login.</li>
+      <li>Las respuestas de las APIs de terceros se reciben únicamente por HTTPS.</li>
+      <li>La extensión no utiliza píxeles de seguimiento, cookies, fingerprinting,
+        beacons, analítica de comportamiento ni tecnologías de session-replay.</li>
     </ul>
 
-    <h2>4. How information is used</h2>
+    <h2>4. Cómo se utiliza la información</h2>
     <ul>
-      <li>To <strong>authenticate</strong> the employee against ADEQ Media's allowlist.</li>
-      <li>To <strong>display enriched prospect data</strong> in the side panel (traffic,
-        category, contact, draft pitch).</li>
-      <li>To <strong>send sales emails</strong> from the employee's authenticated Gmail
-        account, on the employee's explicit click of the "Send via Gmail" button.</li>
-      <li>To <strong>create or update CRM records</strong> in ADEQ Media's private
-        Monday.com board, on the employee's explicit click of the push button.</li>
-      <li>To <strong>enforce usage limits</strong> (per-user daily caps for emails sent
-        and CRM pushes; team-wide monthly cap on third-party API requests) preventing
-        abuse and overage.</li>
-      <li>To produce <strong>internal admin dashboards</strong> showing aggregated
-        team activity (sites analyzed, emails sent, time spent in autopilot).</li>
+      <li>Para <strong>autenticar</strong> al empleado contra la lista permitida de ADEQ Media.</li>
+      <li>Para <strong>mostrar datos enriquecidos del prospecto</strong> en el panel
+        lateral (tráfico, categoría, contacto, borrador de pitch).</li>
+      <li>Para <strong>enviar correos comerciales</strong> desde la cuenta de Gmail
+        autenticada del empleado, únicamente al hacer clic explícito en "Send via Gmail".</li>
+      <li>Para <strong>crear o actualizar registros de CRM</strong> en el tablero privado
+        de Monday.com de ADEQ Media, únicamente al hacer clic explícito en el botón de push.</li>
+      <li>Para <strong>aplicar límites de uso</strong> (cap diario por usuario para
+        emails enviados y pushes a CRM; cap mensual del equipo para llamadas a APIs de
+        terceros) y prevenir abuso o sobrecostos.</li>
+      <li>Para producir <strong>paneles internos de administración</strong> que muestran
+        actividad agregada del equipo (sitios analizados, emails enviados, tiempo de
+        autopilot).</li>
     </ul>
     <p>
-      We do <strong>not</strong> use any collected data for advertising, profiling,
-      retargeting, credit scoring, lending, employment decisions, insurance, or for
-      any purpose unrelated to ADEQ Media's internal sales operation.
+      <strong>No</strong> utilizamos los datos recopilados para publicidad, perfilado,
+      retargeting, scoring crediticio, préstamos, decisiones de empleo, seguros ni para
+      ningún otro fin no relacionado con la operación interna de ventas de ADEQ Media.
     </p>
 
-    <h2>5. How information is stored</h2>
+    <h2>5. Cómo se almacena la información</h2>
     <ul>
-      <li><strong>On the employee's device:</strong> session tokens, cached lookups,
-        keyword lists and drafts are stored in <code>chrome.storage.local</code>. This
-        data is removed automatically by Chrome when the extension is uninstalled.</li>
-      <li><strong>On Supabase (Postgres + Auth):</strong> employee authentication data,
-        encrypted at rest by Supabase, protected by Row-Level Security policies
-        scoped to authenticated ADEQ Media accounts. Hosted in EU region.</li>
-      <li><strong>On Supabase Edge Functions:</strong> third-party API keys are kept as
-        server-side secrets and are never exposed to the extension client. The extension
-        proxies all paid API calls through this function, so keys never reach the
-        employee's browser.</li>
-      <li><strong>On Monday.com:</strong> CRM records under ADEQ Media's account. Access
-        controlled by Monday.com's permissions.</li>
+      <li><strong>En el dispositivo del empleado:</strong> tokens de sesión, búsquedas
+        cacheadas, listas de palabras clave y borradores se almacenan en
+        <code>chrome.storage.local</code>. Estos datos se eliminan automáticamente cuando
+        Chrome desinstala la extensión.</li>
+      <li><strong>En Supabase (Postgres + Auth):</strong> datos de autenticación de
+        empleados, cifrados en reposo por Supabase, protegidos por políticas Row-Level
+        Security restringidas a cuentas autenticadas de ADEQ Media. Hospedado en la
+        región UE.</li>
+      <li><strong>En Supabase Edge Functions:</strong> las claves de APIs de terceros se
+        guardan como secretos del lado del servidor y nunca se exponen al cliente de la
+        extensión. Todas las llamadas a APIs de pago se enrutan a través de esta
+        función, por lo que las claves nunca llegan al navegador del empleado.</li>
+      <li><strong>En Monday.com:</strong> registros de CRM bajo la cuenta de ADEQ Media.
+        Acceso controlado por los permisos propios de Monday.com.</li>
     </ul>
 
-    <h2>6. How information is shared</h2>
+    <h2>6. Cómo se comparte la información</h2>
     <ul>
-      <li>We <strong>do not sell, rent, lease, trade or otherwise transfer</strong>
-        collected data to brokers, advertisers, or any third party for monetary or
-        non-monetary consideration.</li>
-      <li>We share data only with the third-party providers listed in section 2.3 and
-        only to the extent necessary to perform their function (e.g. sending the analyzed
-        domain to SimilarWeb to retrieve traffic data). Each provider operates under its
-        own privacy policy and security controls.</li>
-      <li>We do not transfer data to law enforcement except where required by valid
-        legal process applicable to ADEQ Media.</li>
-      <li>The extension does not include any analytics SDKs (no Google Analytics, no
+      <li><strong>No vendemos, alquilamos, intercambiamos ni transferimos</strong> los
+        datos recopilados a brokers, anunciantes ni a terceros para ninguna contraprestación
+        económica o no económica.</li>
+      <li>Compartimos datos únicamente con los proveedores externos listados en la
+        sección 2.3 y solo en la medida necesaria para que cumplan su función (por ejemplo,
+        enviar el dominio analizado a SimilarWeb para obtener métricas de tráfico). Cada
+        proveedor opera bajo su propia política de privacidad y controles de seguridad.</li>
+      <li>No transferimos datos a fuerzas de seguridad salvo cuando un proceso legal
+        válido aplicable a ADEQ Media así lo requiera.</li>
+      <li>La extensión no incluye ningún SDK de analítica (no Google Analytics, no
         Mixpanel, no Sentry, no Crashlytics).</li>
     </ul>
 
-    <h2>7. Data retention and deletion</h2>
+    <h2>7. Retención y eliminación de datos</h2>
     <ul>
-      <li><strong>Local cache</strong> of analyzed-domain results expires automatically
-        after 90 days, or earlier if the employee clears the extension's storage.</li>
-      <li><strong>Session tokens</strong> are refreshed every hour and invalidated on
-        sign-out.</li>
-      <li><strong>Activity logs</strong> on Supabase (used for the admin dashboards and
-        quota enforcement) are retained for the duration of the ADEQ Media account.
-        An employee may request earlier deletion of their personal log entries by
-        emailing the contact below.</li>
-      <li><strong>OAuth tokens</strong> issued by Google are revoked when the employee
-        signs out or removes the extension's access from
-        <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">their Google Account permissions page</a>.</li>
+      <li>El <strong>caché local</strong> de resultados de dominios analizados expira
+        automáticamente a los 90 días, o antes si el empleado limpia el almacenamiento
+        de la extensión.</li>
+      <li>Los <strong>tokens de sesión</strong> se renuevan cada hora y se invalidan al
+        cerrar sesión.</li>
+      <li>Los <strong>registros de actividad</strong> en Supabase (utilizados para los
+        paneles administrativos y el control de cuotas) se conservan durante la vida
+        útil de la cuenta de ADEQ Media. Un empleado puede solicitar la eliminación
+        anticipada de sus registros personales escribiendo al contacto indicado abajo.</li>
+      <li>Los <strong>tokens OAuth</strong> emitidos por Google se revocan cuando el
+        empleado cierra sesión o quita el acceso de la extensión desde
+        <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">la página de permisos de su Cuenta de Google</a>.</li>
     </ul>
 
-    <h2>8. Your rights</h2>
-    <p>Authorized ADEQ Media employees can, at any time:</p>
+    <h2>8. Tus derechos</h2>
+    <p>Los empleados autorizados de ADEQ Media pueden, en cualquier momento:</p>
     <ul>
-      <li>Sign out and revoke the OAuth grant.</li>
-      <li>Clear all locally stored extension data via Chrome's extension settings.</li>
-      <li>Request a copy of, or deletion of, their personal records held in the
-        ADEQ Media Supabase project, by writing to the contact below.</li>
-      <li>Object to specific processing by ceasing to use the extension.</li>
+      <li>Cerrar sesión y revocar la concesión de OAuth.</li>
+      <li>Borrar todos los datos almacenados localmente desde la configuración de
+        extensiones de Chrome.</li>
+      <li>Solicitar una copia, o la eliminación, de sus registros personales en el
+        proyecto Supabase de ADEQ Media, escribiendo al contacto indicado abajo.</li>
+      <li>Oponerse a un procesamiento específico dejando de usar la extensión.</li>
     </ul>
 
-    <h2>9. Permissions justification (Chrome Web Store)</h2>
+    <h2>9. Justificación de permisos (Chrome Web Store)</h2>
     <ul>
-      <li><code>activeTab</code> + <code>scripting</code> — read URL/title/meta only of
-        the tab the employee actively opens the side panel on.</li>
-      <li><code>tabs</code> — open shortlisted prospect URLs in background tabs when the
-        employee triggers a bulk action.</li>
-      <li><code>storage</code> — local cache for session, drafts, settings.</li>
-      <li><code>identity</code> — Google OAuth so the employee can send sales emails
-        from their own Gmail account.</li>
-      <li><code>sidePanel</code> — render the toolbar UI as a side panel.</li>
-      <li><code>&lt;all_urls&gt;</code> host permission — the team prospects across the
-        open web; we cannot predict in advance which publisher domain the employee will
-        analyze. Access is still strictly per-tab and only when the employee opens the
-        side panel.</li>
+      <li><code>activeTab</code> + <code>scripting</code> — leer URL/título/meta solo de
+        la pestaña sobre la cual el empleado abre activamente el panel lateral.</li>
+      <li><code>tabs</code> — abrir URLs de prospectos seleccionados en pestañas en
+        segundo plano cuando el empleado dispara una acción masiva.</li>
+      <li><code>storage</code> — caché local de sesión, borradores y configuración.</li>
+      <li><code>identity</code> — OAuth de Google para que el empleado pueda enviar
+        correos comerciales desde su propia cuenta de Gmail.</li>
+      <li><code>sidePanel</code> — renderizar la UI de la barra como panel lateral.</li>
+      <li>Permiso de host <code>&lt;all_urls&gt;</code> — el equipo prospecta a través
+        de toda la web abierta; no podemos predecir qué dominio publisher analizará el
+        empleado. El acceso sigue siendo estrictamente por pestaña y solo cuando el
+        empleado abre el panel lateral.</li>
     </ul>
 
-    <h2>10. Security measures</h2>
+    <h2>10. Medidas de seguridad</h2>
     <ul>
-      <li>All network traffic uses HTTPS / TLS 1.2+.</li>
-      <li>Third-party API keys live as server-side Supabase secrets — never bundled in
-        the extension and never exposed to the browser.</li>
-      <li>Supabase Row-Level Security restricts every table to authenticated ADEQ Media
-        accounts.</li>
-      <li>Gmail identity is checked against the signed-in Supabase email before any
-        email is sent, preventing one employee from sending from another's mailbox.</li>
-      <li>The extension contains no remotely loaded code; the entire bundle is reviewed
-        before each Chrome Web Store submission.</li>
+      <li>Todo el tráfico de red usa HTTPS / TLS 1.2 o superior.</li>
+      <li>Las claves de APIs de terceros viven como secretos del lado del servidor en
+        Supabase — nunca se empaquetan en la extensión y nunca se exponen al navegador.</li>
+      <li>Row-Level Security de Supabase restringe cada tabla a cuentas autenticadas
+        de ADEQ Media.</li>
+      <li>La identidad de Gmail se verifica contra el email autenticado en Supabase
+        antes de enviar cualquier correo, evitando que un empleado envíe desde la
+        casilla de otro.</li>
+      <li>La extensión no contiene código cargado remotamente; el bundle completo se
+        revisa antes de cada envío al Chrome Web Store.</li>
     </ul>
 
-    <h2>11. Children's privacy</h2>
+    <h2>11. Privacidad de menores</h2>
     <p>
-      ADEQ Toolbar is an internal corporate tool for adult employees of ADEQ Media. It
-      is not directed at children and does not knowingly collect any data from anyone
-      under the age of 16. If we discover that data from a minor has been collected in
-      error, it will be deleted immediately upon notification.
+      ADEQ Toolbar es una herramienta corporativa interna para empleados adultos de
+      ADEQ Media. No está dirigida a menores y no recopila intencionalmente datos de
+      personas menores de 16 años. Si descubrimos que se han recopilado datos de un
+      menor por error, serán eliminados de inmediato tras la notificación.
     </p>
 
-    <h2>12. International data transfers</h2>
+    <h2>12. Transferencias internacionales de datos</h2>
     <p>
-      ADEQ Media operates from Latin America. Supabase resources are hosted in the EU.
-      Third-party providers (Google, Apollo, Anthropic, RapidAPI vendors) operate
-      globally; data sent to them may be processed in the United States or other
-      jurisdictions where they maintain infrastructure. By using the extension,
-      employees consent to such cross-border processing for the limited purposes
-      described above.
+      ADEQ Media opera desde Latinoamérica. Los recursos de Supabase están alojados en
+      la UE. Los proveedores externos (Google, Apollo, Anthropic, vendors de RapidAPI)
+      operan globalmente; los datos enviados a ellos pueden ser procesados en Estados
+      Unidos u otras jurisdicciones donde mantengan infraestructura. Al usar la
+      extensión, los empleados consienten dicho procesamiento transfronterizo para los
+      fines limitados descritos arriba.
     </p>
 
-    <h2>13. Changes to this policy</h2>
+    <h2>13. Cambios en esta política</h2>
     <p>
-      We may update this Privacy Policy from time to time. The "Last updated" date at
-      the top reflects the latest revision. Material changes will be communicated by
-      email to all allowlisted ADEQ Media accounts. Continued use of the extension
-      after a change constitutes acceptance of the revised policy.
+      Podemos actualizar esta Política de Privacidad ocasionalmente. La fecha de
+      "Última actualización" en la parte superior refleja la última revisión. Los
+      cambios sustanciales serán comunicados por email a todas las cuentas autorizadas
+      de ADEQ Media. El uso continuado de la extensión tras un cambio constituye
+      aceptación de la política revisada.
     </p>
 
-    <h2>14. Contact</h2>
+    <h2>14. Contacto</h2>
     <p>
-      For any question, request, complaint or to exercise the rights described above:
+      Para cualquier consulta, reclamo o para ejercer los derechos descritos arriba:
     </p>
     <ul>
-      <li>Email: <a href="mailto:mgargiulo@adeqmedia.com">mgargiulo@adeqmedia.com</a></li>
-      <li>Postal: ADEQ Media — Privacy Officer (use the email above to request the
-        current registered address).</li>
+      <li>Email: <a href="mailto:contact@adeqmedia.com">contact@adeqmedia.com</a></li>
+      <li>Correspondencia postal: ADEQ Media — Privacy Officer (escribir al email de
+        arriba para solicitar la dirección registrada actual).</li>
     </ul>
   </main>
 </body>
