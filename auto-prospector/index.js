@@ -1474,7 +1474,13 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
 
   while (processed < maxItems) {
     const item = await getNextCsvItem(token, blockedUsers);
-    if (!item) { log("  (cola vacía)"); break; }
+    if (!item) {
+      log("  (cola vacía) — apagando csv_queue_enabled automáticamente");
+      // Auto-pausa: el toggle de la UI se apaga solo cuando no hay más items.
+      // El user lo vuelve a prender cuando sube un nuevo CSV.
+      await setConfigValue(token, "csv_queue_enabled", "false");
+      break;
+    }
 
     const userEmail = item.uploaded_by?.toLowerCase() || "";
 

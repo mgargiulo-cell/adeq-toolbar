@@ -4973,16 +4973,34 @@ async function initAutopilot() {
     && sessionUser.toLowerCase() === (state.loginEmail || "").toLowerCase()
     && sessionAgeMs < AUTOPILOT_DURATION_MS;
 
+  // Mostrar el toggle ON si CUALQUIER user tiene autopilot activo (visibilidad
+  // compartida del estado del equipo). Si no soy el dueño, el botón queda
+  // bloqueado con un cartel "Locked by <user>".
+  const otherActive = enabled && !meSession && sessionUser
+                   && sessionAgeMs < AUTOPILOT_DURATION_MS;
+
   if (meSession) {
     setAutopilotUI(btn, true);
+    setAutopilotLockBadge(null); // limpio el lock badge si lo tenía
     const remaining = Math.max(0, AUTOPILOT_DURATION_MS - sessionAgeMs);
     if (remaining > 0) startAutopilotCountdown(btn, remaining);
+  } else if (otherActive) {
+    // Otro user lo tiene corriendo. Mostramos toggle ON pero bloqueado.
+    setAutopilotUI(btn, true);
+    btn.disabled = true;
+    btn.style.opacity = "0.6";
+    btn.style.cursor = "not-allowed";
+    setAutopilotLockBadge(sessionUser, sessionAgeMs);
   } else {
     setAutopilotUI(btn, false);
+    btn.disabled = false;
+    btn.style.opacity = "";
+    btn.style.cursor = "";
+    setAutopilotLockBadge(null);
     if (enabled) {
-      // session expired or someone else's — flip OFF in DB
+      // session expired and nobody owns it — flip OFF in DB
       await setAutopilotEnabled(false, state.accessToken);
-      console.log("[Autopilot] Forced OFF on panel open — session expired or owned by another user");
+      console.log("[Autopilot] Forced OFF on panel open — session expired");
     }
   }
 
@@ -4996,39 +5014,66 @@ async function initAutopilot() {
   if (trafficSel) trafficSel.value = target.minTraffic || "400000";
 
   btn.addEventListener("click", async () => {
+    if (btn.disabled) return; // locked por otro user
     const isOn = btn.classList.contains("active");
     if (isOn) {
-      // Apagar
+      // Solo el dueño puede apagar — re-validar antes de cerrar
+      const cur = await getAutopilotState(state.accessToken);
+      if (cur.enabled && cur.sessionUser
+          && cur.sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()) {
+        alert(`🔒 Autopilot corriendo bajo ${cur.sessionUser}. Solo ese usuario puede apagarlo.`);
+        return;
+      }
+      // Apagar (soy el dueño)
       clearAutopilotTimer();
       setAutopilotUI(btn, false);
       await setAutopilotEnabled(false, state.accessToken);
-      // Cerrar sesión de tracking de autopilot
       endUsageSession(state.accessToken).catch(() => {});
-      // Re-abrir sesión de popup (la habíamos cerrado al iniciar autopilot)
       startUsageSession(state.accessToken, state.loginEmail, "popup").catch(() => {});
     } else {
       // Cap por usuario: el admin pudo desactivarle el autopilot a este MB
       const can = await checkUserCanDo(state.accessToken, state.loginEmail, "autopilot_on");
       if (!can.allowed) { alert(`⛔ ${can.reason}`); return; }
 
-      // Mutex: si otro user tiene autopilot activo + heartbeat fresco, bloquear
+      // Mutex: otro user lo tiene activo
       const cur = await getAutopilotState(state.accessToken);
       if (cur.enabled && cur.sessionUser
           && cur.sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()
           && cur.heartbeatAt && (Date.now() - cur.heartbeatAt.getTime()) < 120_000) {
         const elapsed = cur.sessionStart ? Math.round((Date.now() - cur.sessionStart.getTime()) / 60000) : 0;
         const remaining = Math.max(0, 60 - elapsed);
-        alert(`⚠️ ${cur.sessionUser} ya tiene Autopilot corriendo (hace ${elapsed} min · termina en ~${remaining} min).\n\nEsperá a que termine o pedile que lo apague antes de prender el tuyo. Si lo prendés ahora, le robás la sesión y los créditos del día.`);
+        alert(`🔒 ${cur.sessionUser} ya tiene Autopilot corriendo (hace ${elapsed} min · termina en ~${remaining} min).\n\nNo se puede prender 2 autopilots a la vez. Esperá a que termine o pedile que lo apague.`);
         return;
       }
-      // Turn on for up to AUTOPILOT_DURATION_MS (default 60 min)
+      // Turn on
       setAutopilotUI(btn, true);
+      setAutopilotLockBadge(null);
       await setAutopilotEnabled(true, state.accessToken, state.loginEmail);
       startAutopilotCountdown(btn, AUTOPILOT_DURATION_MS);
-      // Tracking real: cerrar sesión "popup" y abrir "autopilot"
       startUsageSession(state.accessToken, state.loginEmail, "autopilot").catch(() => {});
     }
   });
+
+  // Refresco periódico del estado mutex (cada 30s) para que cuando el dueño
+  // apague desde su browser, los demás vean el lock liberado sin reload manual.
+  setInterval(async () => {
+    try {
+      const cur = await getAutopilotState(state.accessToken);
+      const isMe = cur.sessionUser?.toLowerCase() === (state.loginEmail || "").toLowerCase();
+      const ageMs = cur.sessionStart ? Date.now() - cur.sessionStart.getTime() : Infinity;
+      if (cur.enabled && !isMe && cur.sessionUser && ageMs < AUTOPILOT_DURATION_MS) {
+        setAutopilotUI(btn, true);
+        btn.disabled = true; btn.style.opacity = "0.6"; btn.style.cursor = "not-allowed";
+        setAutopilotLockBadge(cur.sessionUser, ageMs);
+      } else if (!cur.enabled || !cur.sessionUser) {
+        if (btn.disabled) {
+          btn.disabled = false; btn.style.opacity = ""; btn.style.cursor = "";
+          setAutopilotUI(btn, false);
+          setAutopilotLockBadge(null);
+        }
+      }
+    } catch {}
+  }, 30_000);
 
   targetBtn?.addEventListener("click", () => {
     if (!panel) return;
@@ -5088,6 +5133,29 @@ function updateTargetLabel(target, targetBtn, currentLbl) {
   if (targetBtn) targetBtn.title = `Target: ${label}`;
   if (currentLbl) currentLbl.textContent = `Active target: ${label}`;
   if (targetBtn) targetBtn.style.color = (geos.length || target.category) ? "var(--primary)" : "";
+}
+
+function setAutopilotLockBadge(ownerEmail, sessionAgeMs) {
+  // Crea/actualiza un cartel "🔒 Locked by X" al lado del btn-autopilot.
+  // Pasar ownerEmail=null para removerlo.
+  let badge = document.getElementById("autopilot-lock-badge");
+  if (!ownerEmail) { badge?.remove(); return; }
+  const remaining = Math.max(0, Math.round((AUTOPILOT_DURATION_MS - sessionAgeMs) / 60000));
+  const ownerShort = ownerEmail.split("@")[0];
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.id = "autopilot-lock-badge";
+    badge.style.cssText = `
+      display: inline-flex; align-items: center; gap: 4px;
+      background: rgba(239,68,68,0.15); color: #fca5a5;
+      border: 1px solid rgba(239,68,68,0.3); border-radius: 6px;
+      padding: 3px 8px; font-size: 10px; font-weight: 700;
+      margin-left: 6px;
+    `;
+    document.getElementById("btn-autopilot")?.parentElement?.appendChild(badge);
+  }
+  badge.innerHTML = `🔒 Locked by <strong>${esc(ownerShort)}</strong> · ~${remaining}m`;
+  badge.title = `Autopilot corriendo bajo ${ownerEmail}. Solo ese usuario puede apagarlo.`;
 }
 
 function setAutopilotUI(btn, enabled) {
@@ -5204,7 +5272,10 @@ function renderProspectCard(r) {
     .filter(e => !isGarbageEmail(e))
     .filter((e, i, arr) => arr.indexOf(e) === i);
   const hasEmail    = emails.length > 0;
-  const owner       = defaultOwnerForLang(r.language);
+  // Owner = SIEMPRE el usuario logueado (mediaBuyer). Antes usaba
+  // defaultOwnerForLang(r.language) que asignaba según idioma del prospect,
+  // ignorando quién está realmente trabajando el lead.
+  const owner       = state.mediaBuyer || defaultOwnerForLang(r.language);
   const status      = defaultStatusForOwner(owner);
   const langIdx     = LANG_TO_IDX[r.language] || "0";
   const langName    = LANG_NAMES_PRO[r.language] || r.language || "—";
@@ -5292,6 +5363,7 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
+        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Buscar tráfico + emails frescos (Apollo + scraper)" style="padding:3px 7px;font-size:10px" ${(r.traffic && hasEmail) ? "style='display:none'" : ""}>🔍 Enriquecer</button>
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -5430,6 +5502,48 @@ function initProspectCard(card, data) {
   card.querySelector(".pcard-domain-link")?.addEventListener("click", e => {
     e.preventDefault();
     chrome.tabs.create({ url: e.currentTarget.dataset.url, active: false });
+  });
+
+  // Enriquecer: tráfico fresco + Apollo si faltan datos
+  card.querySelector(".pcard-enrich-btn")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "⏳ ...";
+    try {
+      // Disparar getTraffic + Apollo en paralelo
+      const [traffic, apollo] = await Promise.all([
+        getTraffic(data.domain).catch(() => null),
+        findDecisionMakerViaApollo(data.domain).catch(() => null),
+      ]);
+      // Update local state + UI
+      let updated = false;
+      if (traffic && (traffic.pageViews || traffic.rawVisits)) {
+        const newTraffic = traffic.pageViews || traffic.rawVisits;
+        data.traffic = newTraffic;
+        const trafficSpan = card.querySelector(".pcard-summary-row span");
+        // Re-render entera la card con la data actualizada (más simple que parchear DOM)
+        updated = true;
+      }
+      if (apollo?.email && !data.emails?.includes(apollo.email)) {
+        data.emails = [apollo.email, ...(data.emails || [])];
+        if (apollo.first_name) data.contact_name = `${apollo.first_name} ${apollo.last_name || ""}`.trim();
+        updated = true;
+      }
+      if (updated) {
+        // Re-render esta card en su lugar
+        const newHtml = renderProspectCard(data);
+        const tmp = document.createElement("div");
+        tmp.innerHTML = newHtml;
+        const newCard = tmp.firstElementChild;
+        card.replaceWith(newCard);
+        initProspectCard(newCard, data);
+      } else {
+        btn.textContent = "Sin más data";
+        setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Enriquecer"; }, 2000);
+      }
+    } catch (err) {
+      console.warn("[pcard enrich]", err);
+      btn.disabled = false; btn.textContent = "🔍 Enriquecer";
+    }
   });
 
   // Expand toggle
@@ -5609,7 +5723,10 @@ function initProspectCard(card, data) {
     if (!_draftsState.loaded) {
       try { await loadDraftsCache(); } catch {}
     }
-    if (!r.pitch || !r.pitch.trim()) {
+    // Si el prospect no trae pitch, autocargar el draft del idioma detectado.
+    // BUGFIX: antes usaba `r` (undefined en este scope) → throw silencioso →
+    // el draft jamás se aplicaba. Ahora usa `data` que sí está definido.
+    if (!data.pitch || !data.pitch.trim()) {
       const drafts = _cardDraftsForLang();
       if (drafts.length > 0) {
         cardFlag.idx = 0;
