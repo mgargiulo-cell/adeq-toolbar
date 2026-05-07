@@ -82,7 +82,32 @@ async function pushRecentDomain(domain) {
 // ============================================================
 // COORDINACIÓN ENTRE MBs (lock + handoff + vacation)
 // ============================================================
+// Liberar locks al cerrar la toolbar (fix audit Bug 1)
+// Sin esto, los locks duraban 30 min completos aunque el MB cierre la pestaña.
+// Ahora se libera apenas el side panel se descarga.
+function _wireProspectLockCleanup() {
+  if (window._lockCleanupWired) return;
+  window._lockCleanupWired = true;
+  const release = () => {
+    if (state.domain && state.accessToken && state.loginEmail) {
+      try {
+        // sendBeacon es la única manera confiable de mandar request en unload
+        const url  = `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_prospect_locks?domain=eq.${encodeURIComponent(state.domain)}&locked_by=eq.${encodeURIComponent(state.loginEmail)}`;
+        // Fallback con keepalive fetch (sendBeacon no soporta DELETE)
+        fetch(url, {
+          method: "DELETE",
+          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` },
+          keepalive: true,
+        }).catch(() => {});
+      } catch {}
+    }
+  };
+  window.addEventListener("beforeunload", release);
+  window.addEventListener("pagehide", release);
+}
+
 async function checkProspectLock() {
+  _wireProspectLockCleanup();
   if (!state.domain || !state.accessToken) return;
   const lock = await getActiveProspectLock(state.accessToken, state.domain);
   const el = document.getElementById("duplicate-result");
@@ -3469,6 +3494,18 @@ let kwNextRotation   = Date.now() + KW_ROTATION_MS;
 let kwSearchTimer    = null; // debounce para búsqueda
 
 async function initKeywords() {
+  // Restaurar filtros de Cascade guardados de sesiones previas (UX audit fix)
+  try {
+    const { _cascadeFilters } = await chrome.storage.local.get("_cascadeFilters");
+    if (_cascadeFilters) {
+      const t = document.getElementById("cascade-min-traffic");
+      const r = document.getElementById("cascade-max-rank");
+      const l = document.getElementById("cascade-language");
+      if (t && _cascadeFilters.traffic) t.value = _cascadeFilters.traffic;
+      if (r && _cascadeFilters.rank)    r.value = _cascadeFilters.rank;
+      if (l && _cascadeFilters.lang)    l.value = _cascadeFilters.lang;
+    }
+  } catch {}
   // Cargar muestra inicial para rotación en pantalla
   const rows = await loadKeywordsFromDB();
   dbKeywords = rows
@@ -3924,9 +3961,13 @@ function applyCascadeFilters() {
     const [a, b] = val.split(":");
     return [a === "" || a == null ? 0 : Number(a), b === "" || b == null ? Infinity : Number(b)];
   };
-  const [tMin, tMax] = parseRange(document.getElementById("cascade-min-traffic").value);
-  const [rMin, rMax] = parseRange(document.getElementById("cascade-max-rank").value);
-  const langFilter   = document.getElementById("cascade-language").value;
+  const trafficVal = document.getElementById("cascade-min-traffic").value;
+  const rankVal    = document.getElementById("cascade-max-rank").value;
+  const langFilter = document.getElementById("cascade-language").value;
+  const [tMin, tMax] = parseRange(trafficVal);
+  const [rMin, rMax] = parseRange(rankVal);
+  // Persistir filtros para próximas sesiones (UX audit fix)
+  chrome.storage.local.set({ _cascadeFilters: { traffic: trafficVal, rank: rankVal, lang: langFilter } }).catch(() => {});
 
   const BLOCKLIST = new Set([
     "google.com","youtube.com","facebook.com","instagram.com","twitter.com","x.com",
