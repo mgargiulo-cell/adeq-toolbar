@@ -1068,14 +1068,6 @@ input.form-pv-display { font-weight: 700; }
 .autopush-steps      { display: flex; flex-direction: column; gap: 2px; }
 .autopush-step       { font-size: var(--fs-base); color: #374151; }
 
-/* ---- FOLLOW-UP BANNER ---- */
-.fu-banner {
-  display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3);
-  background: var(--warning-bg); border: 1px solid #fcd34d; border-radius: var(--r-lg);
-  padding: var(--sp-4); margin: 0 0 var(--sp-3);
-}
-.fu-banner-text { font-size: var(--fs-md); color: #92400e; font-weight: 600; flex: 1; }
-
 /* ---- DIAGNOSTICS ---- */
 .diag-result       { font-size: var(--fs-base); display: flex; flex-direction: column; gap: 5px; }
 .diag-row          { display: flex; gap: var(--sp-3); align-items: flex-start; }

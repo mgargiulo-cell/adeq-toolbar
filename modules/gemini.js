@@ -1,7 +1,6 @@
 // ============================================================
 // ADEQ TOOLBAR — Módulo de generación de texto IA
 // generatePitch     → Claude Sonnet 4.6 (prompt caching on stable style prefix)
-// generateFollowUp  → Claude Haiku 4.5 (short, simple)
 // analyzeRevenueGap → Claude Sonnet 4.6
 //
 // Gemini-backed flows (web search grounding) live in geminiSearch.js and
@@ -316,31 +315,6 @@ Write the prospecting email. Return a JSON object with "body" (string) and "subj
     }
     return { body: result.text, subjects: [] };
   }
-}
-
-// ── generateFollowUp (Haiku 4.5 — short and cheap) ────────────
-export async function generateFollowUp({ domain, originalPitch, fuNumber, daysSinceSend }) {
-  const wordLimit = fuNumber === 1 ? "60 words" : "40 words";
-  const userMessage = `You are an Ad Ops consultant at ADEQ Media. We sent a pitch ${daysSinceSend} days ago to ${domain} and got no reply.
-
-The original pitch was:
-"${(originalPitch || "").substring(0, 300)}"
-
-Write a ${fuNumber === 1 ? "short" : "very short"} follow-up (max ${wordLimit}) to re-open the conversation.
-
-RULES:
-1. Not pushy or aggressive.
-2. Reference the previous email without repeating it.
-3. Ask if they had time to review it, or if there's someone else better suited to discuss this.
-4. Write in English. Email body only — no subject line, no sign-off, no signature.`;
-
-  // Haiku 4.5: no effort param (errors), no thinking config (default disabled is fine).
-  const result = await callClaude({
-    model:     CLAUDE_HAIKU,
-    maxTokens: 250,
-    messages:  [{ role: "user", content: userMessage }],
-  });
-  return result.text;
 }
 
 // ── analyzeRevenueGap (Sonnet 4.6 — analytical) ───────────────

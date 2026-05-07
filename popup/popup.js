@@ -2,16 +2,16 @@
 // ADEQ TOOLBAR — Popup v4
 // ============================================================
 
-import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, setFollowUpDates, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText } from "../modules/monday.js";
+import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
-import { generatePitch, generateFollowUp }                                                    from "../modules/gemini.js";
+import { generatePitch }                                                                     from "../modules/gemini.js";
 import { searchEmailsWithGemini }                                                              from "../modules/geminiSearch.js";
 import { verifyEmail, verifyEmailDeep, isGarbageEmail }                                         from "../modules/emailVerifier.js";
 import { runCascade, getSimilarSites }                                                         from "../modules/cascade.js";
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
-import { saveHistory, loadHistory, clearHistory, saveSendDate, getSendInfo, markFUSent,
+import { saveHistory, loadHistory, clearHistory, saveSendDate,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys, setSupabaseAuth,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
@@ -93,7 +93,6 @@ const state = {
   score: null,
   mondayItemId: null,
   mondaySnapshot: null,
-  sendInfo: null,
   category: "",
   siteLanguage: "",
   pageTitle: "", pageDescription: "",
@@ -303,11 +302,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Show the toolbar login email as the Gmail "from" account
   const fromEl = document.getElementById("gmail-from");
   if (fromEl && state.loginEmail) fromEl.textContent = `From: ${state.loginEmail}`;
-
-  // Follow-up check
-  getSendInfo(state.domain).then(info => {
-    if (info) { state.sendInfo = info; checkFUStatus(info); }
-  });
 
   // Contador de API calls + límites del plan en footer
   updateApiFooter();
@@ -1165,16 +1159,6 @@ function checkAutoPush() {
 }
 
 // ============================================================
-// FOLLOW-UP
-// ============================================================
-function checkFUStatus(sendInfo) {
-  // Banner FU oculto a pedido del user — confunde y no se está usando.
-  // Si querés volver a activarlo, restaurar la lógica del git history (commit anterior).
-  const banner = document.getElementById("fu-banner");
-  if (banner) banner.style.display = "none";
-}
-
-// ============================================================
 // EMAIL
 // ============================================================
 function addEmailsWithSource(emails, source) {
@@ -1787,38 +1771,6 @@ async function bindButtons() {
     }
   });
 
-  // Generar Follow-Up
-  document.getElementById("btn-generate-fu").addEventListener("click", async () => {
-    const btn      = document.getElementById("btn-generate-fu");
-    const fuNumber = parseInt(document.getElementById("fu-banner")?.dataset?.fuNumber || "1");
-    const pitchEl  = document.getElementById("pitch-text");
-
-    if (!state.sendInfo?.sendDate) {
-      alert("Original send date not found. Send the first pitch before generating a follow-up.");
-      return;
-    }
-
-    btn.disabled   = true; btn.textContent = "⏳...";
-
-    try {
-      const days = Math.floor((Date.now() - new Date(state.sendInfo.sendDate)) / 86_400_000);
-      const text = await generateFollowUp({
-        domain:        state.domain,
-        originalPitch: state.sendInfo?.pitch || "",
-        fuNumber,
-        daysSinceSend: days,
-      });
-      document.getElementById("pitch-text").value   = text;
-      document.getElementById("form-subject").value = `Re: Partnership opportunity — ${state.domain}`;
-      document.querySelector('[data-tab="core"]')?.click();
-      btn.textContent = "✅ Generated";
-    } catch (err) {
-      console.error("[Generate FU]", err);
-      alert("Follow-up generation failed: " + (err.message || "unknown error"));
-      btn.disabled = false; btn.textContent = "✨ Generate FU";
-    }
-  });
-
   // Monday push
   // ── Monday snapshot helpers ───────────────────────────────
   function getMondayFormValues() {
@@ -2014,24 +1966,17 @@ async function bindButtons() {
     if (result.ok) {
       state.emailSentInSession = true; // unlock el push a Monday
       const today = new Date().toISOString().split("T")[0];
-      const { fu1Date, fu2Date } = await saveSendDate(state.domain, {
-        sendDate: today,
-        pitch,
-        email,
-      });
-      if (state.mondayItemId) setFollowUpDates(state.mondayItemId, fu1Date, fu2Date);
-      const fuNumber = parseInt(document.getElementById("fu-banner")?.dataset?.fuNumber || "0");
-      if (fuNumber) {
-        markFUSent(state.domain, fuNumber);
-        document.getElementById("fu-banner").style.display = "none";
-      }
+      // Persistir el envío para tracking/historial (sin generar follow-ups,
+      // los hace el CRM externo).
+      await saveSendDate(state.domain, { sendDate: today, pitch, email }).catch(() => {});
+
       // Update "From" label with the actual Gmail account used
       const fromEl = document.getElementById("gmail-from");
       if (fromEl) fromEl.textContent = `From: ${state.loginEmail}`;
       const assocEl = document.getElementById("settings-gmail-assoc");
       if (assocEl) assocEl.textContent = state.loginEmail;
 
-      res.textContent = `✅ Email sent · FU1: ${fu1Date} · FU2: ${fu2Date}`;
+      res.textContent = `✅ Email sent`;
       res.className   = "push-result ok";
       btn.textContent = "✅ Sent";
     } else {

@@ -476,12 +476,6 @@ export async function markDomainsImported(domains, importedBy, accessToken) {
   } catch {}
 }
 
-function addDays(dateStr, days) {
-  const d = new Date(dateStr);
-  d.setDate(d.getDate() + days);
-  return d.toISOString().split("T")[0];
-}
-
 // ============================================================
 // HISTORIAL
 // ============================================================
@@ -770,24 +764,13 @@ export async function saveTrafficCache(domain, data) {
 }
 
 // ============================================================
-// SEGUIMIENTO DE ENVÍOS Y FOLLOW-UPS
-// Tabla: toolbar_sendtrack
-//   domain    TEXT PRIMARY KEY
-//   send_date DATE
-//   fu1_date  DATE
-//   fu2_date  DATE
-//   fu1_sent  BOOLEAN DEFAULT FALSE
-//   fu2_sent  BOOLEAN DEFAULT FALSE
-//   pitch     TEXT
-//   email     TEXT
+// SEGUIMIENTO DE ENVÍOS
+// Tabla: toolbar_sendtrack — historial de pitches enviados por dominio.
+// (Los follow-ups los maneja el CRM externo, no la toolbar.)
 // ============================================================
 export async function saveSendDate(domain, { sendDate, pitch, email }) {
-  const fu1Date = addDays(sendDate, 7);
-  const fu2Date = addDays(sendDate, 14);
-
-  // Chrome storage fallback
   const { sendtrack = {} } = await chrome.storage.local.get("sendtrack");
-  sendtrack[domain] = { sendDate, fu1Date, fu2Date, fu1Sent: false, fu2Sent: false, pitch, email };
+  sendtrack[domain] = { sendDate, pitch, email };
   await chrome.storage.local.set({ sendtrack });
 
   const { url, key } = await getConfig();
@@ -804,10 +787,6 @@ export async function saveSendDate(domain, { sendDate, pitch, email }) {
         body: JSON.stringify({
           domain,
           send_date: sendDate,
-          fu1_date:  fu1Date,
-          fu2_date:  fu2Date,
-          fu1_sent:  false,
-          fu2_sent:  false,
           pitch:     pitch || "",
           email:     email || "",
         }),
@@ -815,78 +794,6 @@ export async function saveSendDate(domain, { sendDate, pitch, email }) {
     } catch (err) {
       console.warn("SendTrack save failed:", err.message);
     }
-  }
-
-  return { fu1Date, fu2Date };
-}
-
-export async function getSendInfo(domain) {
-  const { url, key } = await getConfig();
-
-  if (url && key) {
-    try {
-      const res = await fetch(
-        `${url}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&limit=1`,
-        { headers: { "apikey": key, "Authorization": bearer(key) } }
-      );
-      if (res.ok) {
-        const rows = await res.json();
-        if (rows.length) {
-          const r = rows[0];
-          return {
-            sendDate: r.send_date,
-            fu1Date:  r.fu1_date,
-            fu2Date:  r.fu2_date,
-            fu1Sent:  r.fu1_sent,
-            fu2Sent:  r.fu2_sent,
-            pitch:    r.pitch,
-            email:    r.email,
-          };
-        }
-      }
-    } catch {}
-  }
-
-  const { sendtrack = {} } = await chrome.storage.local.get("sendtrack");
-  const t = sendtrack[domain];
-  if (!t) return null;
-  return {
-    sendDate: t.sendDate,
-    fu1Date:  t.fu1Date,
-    fu2Date:  t.fu2Date,
-    fu1Sent:  t.fu1Sent  || false,
-    fu2Sent:  t.fu2Sent  || false,
-    pitch:    t.pitch    || "",
-    email:    t.email    || "",
-  };
-}
-
-export async function markFUSent(domain, fuNumber) {
-  const { sendtrack = {} } = await chrome.storage.local.get("sendtrack");
-  if (sendtrack[domain]) {
-    sendtrack[domain][`fu${fuNumber}Sent`] = true;
-    await chrome.storage.local.set({ sendtrack });
-  }
-
-  const { url, key } = await getConfig();
-  if (!url || !key) return;
-
-  try {
-    await fetch(
-      `${url}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}`,
-      {
-        method: "PATCH",
-        headers: {
-          "Content-Type":  "application/json",
-          "apikey":        key,
-          "Authorization": bearer(key),
-          "Prefer":        "return=minimal",
-        },
-        body: JSON.stringify({ [`fu${fuNumber}_sent`]: true }),
-      }
-    );
-  } catch (err) {
-    console.warn("markFUSent failed:", err.message);
   }
 }
 

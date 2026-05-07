@@ -32,8 +32,6 @@ export const CONFIG = {
     estado:          "deal_stage",
     ejecutivo:       "deal_owner",       // person column
     fecha_contacto:  "deal_close_date",
-    fecha_fu1:       "fecha2",
-    fecha_fu2:       "fecha_1",
     geo:             "texto6",
     trafico:         "texto7",
     idioma:          "estado_12",

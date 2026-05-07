@@ -193,23 +193,6 @@ export async function getMondayBoardIndex() {
   }
 }
 
-// ── Setear fechas de Follow Up en Monday ──────────────────────
-export async function setFollowUpDates(itemId, fu1Date, fu2Date) {
-  const safe = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const columnValues = {
-    [CONFIG.MONDAY_COLUMNS.fecha_fu1]: JSON.stringify({ date: fu1Date }),
-    [CONFIG.MONDAY_COLUMNS.fecha_fu2]: JSON.stringify({ date: fu2Date }),
-  };
-  const mutation = `mutation {
-    change_multiple_column_values(
-      item_id: ${itemId},
-      board_id: ${CONFIG.MONDAY_ACTIVE_BOARD},
-      column_values: "${safe(JSON.stringify(columnValues))}"
-    ) { id }
-  }`;
-  return mondayRequest(mutation).catch(err => console.warn("setFollowUpDates:", err.message));
-}
-
 function cleanDomain(str) {
   return (str || "").toLowerCase()
     .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").trim();
