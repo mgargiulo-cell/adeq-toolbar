@@ -20,12 +20,12 @@ const CLOUDFLARE_API_TOKEN      = process.env.CLOUDFLARE_API_TOKEN || null; // o
 // Otherwise fall back to user JWT (won't see items uploaded by other users with RLS on).
 const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 
-const SESSION_LIMIT_MS  = 60 * 60 * 1000; // 1 hora max por sesión de autopilot
+const SESSION_LIMIT_MS  = 20 * 60 * 1000; // 20 minutos máx por sesión de autopilot — auto-corte
 const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
 const DOMAIN_DELAY_MS  = 2500;
-const MIN_TRAFFIC      = 300_000;  // pageViews mínimos (visits × pagesPerVisit) — debajo de esto el dominio se descarta sin enriquecer.
+const MIN_TRAFFIC      = 350_000;  // pageViews mínimos (visits × pagesPerVisit) — debajo de esto el dominio se descarta sin enriquecer.
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
@@ -722,6 +722,22 @@ let _rapidCapReached    = false;
 
 async function getTrafficData(domain, rapidApiKey) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" };
+
+  // REGLA DE ORO: cache compartida 90 días en Supabase. Antes de gastar 1 hit
+  // a RapidAPI, chequeamos si ya tenemos data fresca de este dominio.
+  const cleanD = cleanDomain(domain);
+  const cached = await getTrafficCacheServer(cleanD);
+  if (cached) {
+    log(`  💾 traffic cache HIT ${cleanD} (sin gastar hit)`);
+    return {
+      visits:        cached.rawVisits || cached.visits || 0,
+      pagesPerVisit: cached.pagesPerVisit || null,
+      topCountry:    cached.topCountries?.[0]?.code ? COUNTRY_CODES[cached.topCountries[0].code] || cached.topCountries[0].code : null,
+      error:         null,
+      fromCache:     true,
+    };
+  }
+
   try {
     // Primary: /all-insights (devuelve Visits + TopCountries + Category en una sola llamada)
     let data = await rapidFetchWithRetry(
@@ -775,11 +791,61 @@ async function getTrafficData(domain, rapidApiKey) {
       if (code) topCountry = COUNTRY_CODES[code] || code;
     }
 
+    // Guardar en cache compartida para próximas consultas (regla de oro 90 días)
+    if (visits) {
+      saveTrafficCacheServer(cleanD, {
+        rawVisits:     visits,
+        visits,
+        pagesPerVisit,
+        pageViews:     pagesPerVisit ? Math.round(visits * pagesPerVisit) : null,
+        topCountries:  topCountry ? [{ code: Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === topCountry) || topCountry, name: topCountry, share: 0 }] : [],
+        category:      data?.WebsiteDetails?.Category || data?.Category || "",
+      }).catch(() => {});
+    }
     return { visits, pagesPerVisit, topCountry, error: null };
   } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, error: e.message }; }
 }
 
+// Cache helpers de tráfico para el worker (acceso directo a Supabase).
+async function getTrafficCacheServer(domain) {
+  if (!domain) return null;
+  try {
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 90);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows.length ? rows[0].data : null;
+  } catch { return null; }
+}
+
+async function saveTrafficCacheServer(domain, data) {
+  if (!domain) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_traffic_cache`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":        SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${BACKEND_BEARER}`,
+        "Prefer":        "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({ domain, data, fetched_at: new Date().toISOString() }),
+    });
+  } catch {}
+}
+
 async function findSimilarSites(domain, rapidApiKey) {
+  // REGLA DE ORO: cache compartida 90 días en Supabase. Antes de gastar 1 hit
+  // a RapidAPI, chequeamos si ya tenemos los similar-sites de este dominio.
+  const cleanD = cleanDomain(domain);
+  const cachedSimilar = await getSimilarSitesCacheServer(cleanD);
+  if (cachedSimilar) {
+    log(`  💾 similar-sites cache HIT ${cleanD} (${cachedSimilar.length} sitios — sin gastar hit)`);
+    return cachedSimilar.filter(d => isDomainAllowed(d));
+  }
   const [swSites, ssSites] = await Promise.all([
     (async () => {
       if (_rapidCapReached) return [];
@@ -841,7 +907,41 @@ async function findSimilarSites(domain, rapidApiKey) {
     })(),
   ]);
 
-  return [...new Set([...swSites, ...ssSites])];
+  const merged = [...new Set([...swSites, ...ssSites])];
+  // Persistir en cache para próximas consultas (regla de oro)
+  if (merged.length) await saveSimilarSitesCacheServer(cleanD, merged).catch(() => {});
+  return merged;
+}
+
+// Cache helpers para el worker (acceso directo a Supabase, sin import client-side)
+async function getSimilarSitesCacheServer(domain) {
+  if (!domain) return null;
+  try {
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 90);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_similar_sites_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows.length && Array.isArray(rows[0].sites) ? rows[0].sites : null;
+  } catch { return null; }
+}
+
+async function saveSimilarSitesCacheServer(domain, sites) {
+  if (!domain) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_similar_sites_cache`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":        SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${BACKEND_BEARER}`,
+        "Prefer":        "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({ domain, sites, fetched_at: new Date().toISOString() }),
+    });
+  } catch {}
 }
 
 const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
@@ -1976,13 +2076,10 @@ async function runSession(token, cfg, sessionStart) {
     const finalScore = rawScore - catPenalty - geoPenalty - userCatPenalty - userGeoPenalty
                      + userCatBonus + userGeoBonus + fromLikedSeed;
 
-    if (finalScore < minScore) {
-      log(`  ✗ Score ${finalScore} (raw ${rawScore}, -dis cat:${catPenalty+userCatPenalty} geo:${geoPenalty+userGeoPenalty}, +like cat:${userCatBonus} geo:${userGeoBonus} seed:${fromLikedSeed}) — descartado`);
-      await markProcessed(token, [domain], "low_score");
-      count++; lowScore++;
-      await sleep(DOMAIN_DELAY_MS);
-      continue;
-    }
+    // GATE PRINCIPAL: solo el threshold de pageViews (350K). Sin score check —
+    // si el sitio supera 350K pageViews ya es candidato. El score se persiste
+    // en review_queue por si en futuro el admin quiere ordenar/filtrar por él.
+    // (decisión user 2026-05-08)
 
     // Paso 2: emails + pitch + sitios similares en paralelo
     // Apollo solo si quedan créditos disponibles hoy

@@ -679,17 +679,18 @@ export async function getMonthStats() {
 
 // ============================================================
 // CACHÉ DE SIMILARES — 60 días
-// Tabla: toolbar_similar_cache
+// Tabla: toolbar_similar_sites_cache (90 días, regla de oro)
 //   domain TEXT PRIMARY KEY, sites JSONB, fetched_at TIMESTAMPTZ DEFAULT NOW()
 // ============================================================
+const SIMILAR_CACHE_DAYS_OLD = 90;
 export async function getSimilarCache(domain) {
   const { url, key } = await getConfig();
-  if (!url || !key) return null;
+  if (!url || !key || !domain) return null;
   try {
     const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 60);
+    cutoff.setDate(cutoff.getDate() - SIMILAR_CACHE_DAYS_OLD);
     const res = await fetch(
-      `${url}/rest/v1/toolbar_similar_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
+      `${url}/rest/v1/toolbar_similar_sites_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
       { headers: { "apikey": key, "Authorization": bearer(key) } }
     );
     if (!res.ok) return null;
@@ -700,9 +701,9 @@ export async function getSimilarCache(domain) {
 
 export async function saveSimilarCache(domain, sites) {
   const { url, key } = await getConfig();
-  if (!url || !key) return;
+  if (!url || !key || !domain) return;
   try {
-    await fetch(`${url}/rest/v1/toolbar_similar_cache`, {
+    await fetch(`${url}/rest/v1/toolbar_similar_sites_cache`, {
       method: "POST",
       headers: {
         "Content-Type":  "application/json",
@@ -710,7 +711,7 @@ export async function saveSimilarCache(domain, sites) {
         "Authorization": bearer(key),
         "Prefer":        "resolution=merge-duplicates,return=minimal",
       },
-      body: JSON.stringify({ domain, sites, fetched_at: new Date().toISOString() }),
+      body: JSON.stringify({ domain, sites: Array.isArray(sites) ? sites : [], fetched_at: new Date().toISOString() }),
     });
   } catch (err) { console.warn("saveSimilarCache failed:", err.message); }
 }
