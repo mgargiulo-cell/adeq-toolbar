@@ -4454,15 +4454,27 @@ async function initCsvQueue() {
   });
 
   clearProc.addEventListener("click", async () => {
-    if (!confirm("Delete all processed entries (done/error/skipped) from the queue?")) return;
+    if (!confirm("¿Limpiar entries ya procesados (done/error/skipped)?\n\nNO afecta los prospectos generados ni la cola pending.")) return;
     await clearCsvQueue(state.accessToken, true);
     await refreshAll();
   });
 
+  // Show toggle: revela el botón Clear ALL solo si el user lo pide explícitamente
+  document.getElementById("btn-csv-show-clear-all")?.addEventListener("click", (e) => {
+    const allBtn = clearAll;
+    if (allBtn.style.display === "none") { allBtn.style.display = ""; e.target.style.display = "none"; }
+  });
+
   clearAll.addEventListener("click", async () => {
-    if (!confirm("⚠️ Delete ALL entries from the CSV queue (including pending)?")) return;
+    // Doble confirmación: primero un confirm general, después escribir "BORRAR" para confirmar
+    if (!confirm("⚠️ Esto borra TODO de la cola de imports incluyendo items PENDING (en cola sin procesar).\n\nLos prospectos ya generados en Prospects NO se borran, solo la cola de input.\n\n¿Continuar?")) return;
+    const confirmText = prompt("Para confirmar, escribí BORRAR (en mayúsculas):");
+    if (confirmText !== "BORRAR") { alert("Cancelado."); return; }
     await clearCsvQueue(state.accessToken, false);
     await refreshStats();
+    // Re-ocultar el botón ALL después de usarlo
+    clearAll.style.display = "none";
+    document.getElementById("btn-csv-show-clear-all").style.display = "";
   });
 }
 

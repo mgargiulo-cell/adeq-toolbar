@@ -972,8 +972,9 @@
     </div>
 
     <div style="display:flex;gap:6px;margin-top:8px">
-      <button id="btn-csv-clear-processed" class="btn btn-secondary btn-sm" style="font-size:10px">Clear processed</button>
-      <button id="btn-csv-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e">Clear ALL</button>
+      <button id="btn-csv-clear-processed" class="btn btn-secondary btn-sm" style="font-size:10px" title="Borra solo items ya procesados (done/error/skipped). Limpia el historial visual. Lo que se generó en Prospects queda intacto.">🧹 Clear processed</button>
+      <button id="btn-csv-show-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#94a3b8;border-color:#cbd5e1" title="Mostrar opción peligrosa de borrar TODO incluyendo cola pending">⋯</button>
+      <button id="btn-csv-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e;display:none" title="⚠️ Borra TODO incluyendo cola pending. NO uses esto si tenés items procesando.">🚨 Clear ALL (incluye pending)</button>
     </div>
   </section>
 </div>
