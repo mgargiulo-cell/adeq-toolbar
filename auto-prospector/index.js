@@ -536,23 +536,23 @@ async function loadAutopilotFeedback(token, userEmail) {
 // Lee límites custom del usuario desde toolbar_user_limits (admin panel).
 // Defaults si no existe la fila.
 async function getUserLimits(token, userEmail) {
-  if (!userEmail) return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null };
+  if (!userEmail) return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null };
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_user_limits?user_email=eq.${encodeURIComponent(userEmail.toLowerCase())}&select=*&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
-    if (!res.ok) return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null };
+    if (!res.ok) return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null };
     const rows = await res.json();
-    if (!rows.length) return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null };
+    if (!rows.length) return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null };
     const r = rows[0];
     return {
       autopilot_enabled:         r.autopilot_enabled !== false,
-      autopilot_daily_minutes:   parseInt(r.autopilot_daily_minutes || 60, 10),
-      autopilot_daily_prospects: parseInt(r.autopilot_daily_prospects || 75, 10),
+      autopilot_daily_minutes:   parseInt(r.autopilot_daily_minutes || 20, 10),
+      autopilot_daily_prospects: parseInt(r.autopilot_daily_prospects || 300, 10),
       monthly_api_cap:           r.monthly_api_cap ? parseInt(r.monthly_api_cap, 10) : null,
     };
-  } catch { return { autopilot_enabled: true, autopilot_daily_minutes: 60, autopilot_daily_prospects: 75, monthly_api_cap: null }; }
+  } catch { return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null }; }
 }
 
 async function getApolloUsageToday(token) {
@@ -1348,7 +1348,7 @@ function shuffleArray(arr) {
 
 // Sin límite diario por user (antes 75). El costo real lo controla
 // Apollo (limit propio) + idle-exit del proceso Railway.
-const CSV_DAILY_LIMIT_PER_USER = Infinity;
+const CSV_DAILY_LIMIT_PER_USER = 300; // 300 dominios/día/usuario para CSV (Monday URL + External CSV)
 
 // Cuenta cuántos items terminó (done) un usuario específico hoy
 async function getUserCsvDoneToday(token, userEmail) {
@@ -1685,7 +1685,7 @@ async function runSession(token, cfg, sessionStart) {
 
   // Per-user limits configurables por el admin (toolbar_user_limits).
   // Defaults: 75 prospectos/día y 60 min/sesión. Si el admin los cambió, los usa.
-  let AUTOPILOT_DAILY_LIMIT = 75;
+  let AUTOPILOT_DAILY_LIMIT = 300; // default 300/día/usuario; admin lo puede sobrescribir per-user
   let userSessionLimitMs    = SESSION_LIMIT_MS;
   if (sessionUser) {
     try {

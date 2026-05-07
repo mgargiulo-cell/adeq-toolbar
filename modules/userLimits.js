@@ -16,8 +16,8 @@ const DEFAULTS = {
   monthly_api_cap:         null,   // null = solo aplica el cap global de 40k
   daily_emails_cap:        100,
   daily_monday_cap:        100,
-  autopilot_daily_minutes: 60,    // duración máxima de UNA sesión de autopilot
-  autopilot_daily_prospects: 75,  // cap de dominios procesados por día por este user
+  autopilot_daily_minutes: 20,    // 20 min/sesión por default (auto-corte)
+  autopilot_daily_prospects: 300, // 300 prospectos/día/user
 };
 
 function _headers(token) {

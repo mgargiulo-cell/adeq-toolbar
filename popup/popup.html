@@ -817,7 +817,7 @@
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
         <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 AUTOPILOT — Discovery from Majestic Million</div>
-        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Finds NEW sites on the web (not already in Monday) for 1h. Limit 75/day per user. <strong>Independent of CSV queue.</strong></div>
+        <div style="font-size:10px;color:#94a3b8;margin-top:2px">Finds NEW sites on the web (not already in Monday) for 1h. Limit 300/day per user. <strong>Independent of CSV queue.</strong></div>
         <div id="railway-heartbeat" style="font-size:10px;color:#94a3b8;margin-top:4px">Railway: checking...</div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
@@ -896,7 +896,7 @@
   <section class="card">
     <div class="card-title">📤 External URLs Auto Prospector</div>
     <p class="import-desc">Upload a CSV (1 domain per line) with <strong>external</strong> URLs. The auto-prospector processes them in the background — analyzes traffic, emails, and pushes them to Monday as new prospects.</p>
-    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
+    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>300/day/user</strong>.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
@@ -915,7 +915,7 @@
   <section class="card">
     <div class="card-title">🔄 Monday URL Auto Prospector</div>
     <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
-    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>75/day/user</strong>.</p>
+    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>300/day/user</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
       <select id="refresh-geo" class="form-select" style="font-size:11px" title="Debe matchear el valor exacto de la columna GEO en Monday.">
@@ -930,7 +930,7 @@
         <option value="3">Portuguese</option>
         <option value="6">Arabic</option>
       </select>
-      <input id="refresh-limit" type="number" class="form-input" min="1" max="75" value="75" style="font-size:11px; padding:6px" title="Max quantity (75/day/user)" />
+      <input id="refresh-limit" type="number" class="form-input" min="1" max="300" value="300" style="font-size:11px; padding:6px" title="Max quantity (300/day/user)" />
     </div>
     <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
