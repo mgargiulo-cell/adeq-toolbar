@@ -1226,9 +1226,15 @@ input.form-pv-display { font-weight: 700; }
 .admin-limit-row {
   background: #1e293b; padding: 8px; border-radius: 6px; border: 1px solid #334155;
   display: grid;
-  grid-template-columns: 1.4fr repeat(3, 80px) 50px 24px;
+  grid-template-columns: 1.4fr repeat(3, 80px) 50px 50px 24px;
   gap: 6px; align-items: center;
 }
+.admin-limit-row .save-btn {
+  background: #34d399; color: #0f172a; border: none;
+  padding: 4px 6px; border-radius: 4px; font-size: 10px; font-weight: 700;
+  cursor: pointer;
+}
+.admin-limit-row .save-btn.saved { background: #1e293b; color: #34d399; border: 1px solid #34d399; }
 .admin-limit-row input[type=number] { text-align: right; }
 .admin-limit-row .col-label {
   grid-column: 1 / -1;

@@ -439,6 +439,7 @@ async function loadAdminLimits() {
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP min/sesión</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP prosp/día</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP on</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">Save</span>
     <span></span>
   `;
   list.appendChild(header);
@@ -480,8 +481,16 @@ function buildLimitRow(l, isNew = false) {
     <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 60}" placeholder="min" min="5" max="240" title="Duración máxima de UNA sesión de autopilot, en minutos" />
     <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Cantidad máxima de prospectos procesados por día por este usuario en autopilot" />
     <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot ON/OFF">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
+    <button class="save-btn" title="Guardar cambios">💾</button>
     <button class="del-btn" title="Eliminar">×</button>
   `;
+  // Click en Save → fuerza guardado + feedback visual
+  row.querySelector(".save-btn").addEventListener("click", async () => {
+    await saveLimitRow(row);
+    const btn = row.querySelector(".save-btn");
+    btn.textContent = "✓"; btn.classList.add("saved");
+    setTimeout(() => { btn.textContent = "💾"; btn.classList.remove("saved"); }, 1500);
+  });
   // Toggle autopilot
   row.querySelector(".lim-autopilot").addEventListener("click", (e) => {
     const isOn = e.target.classList.contains("toggle-yes");
@@ -539,14 +548,18 @@ async function loadAdminBlocklist() {
   if (!ta) return;
   status.textContent = "Cargando...";
   try {
+    const { TOP_500_BLOCKED } = await import("../modules/blockedDomainsTop500.js");
     const res = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain&order=domain`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
     );
-    if (!res.ok) { status.textContent = "Error cargando blocklist."; return; }
-    const rows = await res.json();
-    ta.value = rows.map(r => r.domain).join("\n");
-    status.textContent = `${rows.length} dominios bloqueados.`;
+    const adminList = res.ok ? (await res.json()).map(r => r.domain) : [];
+    ta.value = adminList.join("\n");
+    status.innerHTML = `
+      <strong>${adminList.length}</strong> dominios admin custom (editables) +
+      <strong>${TOP_500_BLOCKED.length}</strong> dominios baked-in (top 500 no-publishers, gratuitos).
+      <br/><span style="opacity:.7">Total efectivo: ${(adminList.length + TOP_500_BLOCKED.length).toLocaleString()} dominios bloqueados pre-API.</span>
+    `;
   } catch (e) { status.textContent = "Error: " + e.message; }
 }
 
