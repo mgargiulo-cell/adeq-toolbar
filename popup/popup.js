@@ -29,6 +29,7 @@ import { scoreProspect }                                                        
 import { CONFIG }                                                                               from "../config.js";
 import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
 import { isAdminEmail, getRole, TEAM_EMAILS }                                                   from "../modules/roles.js";
+import { DIEGO_VOICE_PROMPT, GLOBAL_PROMPT_KEY }                                                from "../modules/diegoVoicePrompt.js";
 import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
          getUserDailyUsage, incrementUserDailyCounter, checkUserCanDo }                          from "../modules/userLimits.js";
 import { startUsageSession, endUsageSession, fetchUsageStats }                                   from "../modules/usageTracking.js";
@@ -580,11 +581,119 @@ async function loadAdminActivity() {
   renderAdminLeaderboard(histRes, usageRes);
   renderAdminFunnel({ sites, emails, monday });
 
+  // Resumen narrativo por MB (cards con tips para 1:1)
+  renderAdminMBSummaries(histRes, usageRes, sessionsRes);
+
   // Per-user breakdown
   renderAdminByUser(histRes, usageRes);
 
   // Live feed (últimas 30)
   renderAdminLiveFeed(histRes.slice(0, 30));
+}
+
+// ── Resumen narrativo por MB ──────────────────────────────
+// Genera cards con frases en lenguaje natural sobre la actividad de cada MB.
+// Pensado para que el admin lea durante un 1:1 ("mirá tu resumen").
+function renderAdminMBSummaries(historial, usage, sessions) {
+  const wrap = document.getElementById("admin-mb-summaries");
+  if (!wrap) return;
+  // Agrupar todo por usuario
+  const byUser = new Map();
+  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), {
+    sites: 0, autopilotSites: 0, geos: {}, categories: {},
+    above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0,
+    apSec: 0, popupSec: 0,
+  }));
+  historial.forEach(h => {
+    const u = (h.user_email || h.created_by || "unknown").toLowerCase();
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    const o = byUser.get(u);
+    o.sites++;
+    if (h.source === "autopilot") o.autopilotSites++;
+    const g = (h.geo || "").trim();
+    if (g) o.geos[g] = (o.geos[g] || 0) + 1;
+    const c = (h.category || "").trim();
+    if (c) o.categories[c] = (o.categories[c] || 0) + 1;
+    const traffic = parseInt(h.traffic || 0, 10);
+    if (traffic >= 500000) o.above500k++;
+    else if (traffic > 0)  o.below500k++;
+  });
+  usage.forEach(r => {
+    const u = (r.user_email || "unknown").toLowerCase();
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    const o = byUser.get(u);
+    o.emails += parseInt(r.by_provider?._emails_sent || 0, 10);
+    o.monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
+    o.claude += parseInt(r.by_provider?.anthropic || 0, 10);
+  });
+  sessions.forEach(s => {
+    const u = (s.user_email || "unknown").toLowerCase();
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    const o = byUser.get(u);
+    if (s.kind === "autopilot") o.apSec += s.duration_sec || 0;
+    if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
+  });
+
+  wrap.innerHTML = "";
+  [...byUser.entries()].sort((a, b) => b[1].sites - a[1].sites).forEach(([email, s]) => {
+    const card = document.createElement("div");
+    card.className = "mb-summary-card";
+
+    // Grade automático en base a actividad + conversion
+    let grade = "none", gradeLabel = "Sin actividad";
+    if (s.sites > 0) {
+      const conv = s.sites > 0 ? (s.monday / s.sites) * 100 : 0;
+      if (s.sites >= 30 && conv >= 5)      { grade = "high"; gradeLabel = "🔥 Activo y conversor"; }
+      else if (s.sites >= 30 && conv < 5)  { grade = "mid";  gradeLabel = "🟡 Activo, pocas conversiones"; }
+      else if (s.sites > 0)                { grade = "low";  gradeLabel = "🔻 Baja actividad"; }
+    }
+
+    // Top GEO + categoría
+    const topGeoArr = Object.entries(s.geos).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const topCatArr = Object.entries(s.categories).sort((a, b) => b[1] - a[1]).slice(0, 2);
+    const topGeoStr = topGeoArr.length
+      ? topGeoArr.map(([g, n]) => `${g} (${Math.round((n / s.sites) * 100)}%)`).join(", ")
+      : "—";
+    const topCatStr = topCatArr.length ? topCatArr.map(([c]) => c).join(", ") : "—";
+
+    // Tiempos legibles
+    const apHrs = Math.floor(s.apSec / 3600), apMin = Math.round((s.apSec % 3600) / 60);
+    const apTimeStr = s.apSec >= 3600 ? `${apHrs}h ${apMin}m` : `${Math.round(s.apSec / 60)}m`;
+    const popupHrs = Math.floor(s.popupSec / 3600), popupMin = Math.round((s.popupSec % 3600) / 60);
+    const popupTimeStr = s.popupSec >= 3600 ? `${popupHrs}h ${popupMin}m` : `${Math.round(s.popupSec / 60)}m`;
+
+    // Conversiones
+    const convPct = s.sites > 0 ? ((s.monday / s.sites) * 100).toFixed(1) : "0";
+    const emailPct = s.monday > 0 ? Math.round((s.emails / s.monday) * 100) : 0;
+
+    // Frases narrativas — solo las que tengan datos relevantes
+    const lines = [];
+    if (s.sites === 0) {
+      lines.push("Sin actividad registrada en este período.");
+    } else {
+      lines.push(`Analizó <strong>${s.sites}</strong> sitios (${s.autopilotSites} via autopilot, ${s.sites - s.autopilotSites} manual).`);
+      if (topGeoArr.length) lines.push(`Foco geográfico: <strong>${topGeoStr}</strong>.`);
+      if (topCatArr.length) lines.push(`Categorías más analizadas: <strong>${topCatStr}</strong>.`);
+      lines.push(`Calidad de leads: <strong>${s.above500k}</strong> sitios +500K vs <strong>${s.below500k}</strong> chicos.`);
+      if (s.emails > 0 || s.monday > 0) {
+        lines.push(`Outreach: <strong>${s.emails}</strong> emails enviados, <strong>${s.monday}</strong> pushes a Monday (conv: <strong>${convPct}%</strong>).`);
+      } else {
+        lines.push(`⚠️ Cero emails enviados y cero pushes a Monday — analizó pero no avanzó leads.`);
+      }
+      if (s.apSec > 0)    lines.push(`Tiempo Autopilot ON: <strong>${apTimeStr}</strong>.`);
+      if (s.popupSec > 0) lines.push(`Tiempo con toolbar abierta: <strong>${popupTimeStr}</strong>.`);
+      if (s.claude > 0)   lines.push(`Pitches generados con IA: <strong>${s.claude}</strong>.`);
+    }
+
+    card.innerHTML = `
+      <div class="head">
+        <span class="who">${esc(email)}</span>
+        <span class="grade ${grade}">${gradeLabel}</span>
+      </div>
+      <ul>${lines.map(l => `<li>${l}</li>`).join("")}</ul>
+    `;
+    wrap.appendChild(card);
+  });
 }
 
 function renderAdminLeaderboard(historial, usage) {
@@ -1109,8 +1218,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   populateCountryDropdown(document.getElementById("import-geo"));
   populateCountryDropdown(document.getElementById("refresh-geo"));
   bindCustomPromptHandlers();
-  // Load per-user Claude custom prompt into state (no-op if empty). Used by generatePitch.
-  getCustomPrompt(auth.accessToken, auth.user).then(p => { state.customPrompt = p || ""; }).catch(() => {});
+  // Prompt GLOBAL obligatorio (Diego's voice). Todos los MBs lo usan, no
+  // pueden editarlo. Solo el admin puede cambiarlo desde Settings.
+  // Fetch del valor en Supabase (key=__global__); si no existe, fallback al
+  // constante bakeado en diegoVoicePrompt.js.
+  getCustomPrompt(auth.accessToken, GLOBAL_PROMPT_KEY)
+    .then(p => { state.customPrompt = (p && p.trim()) ? p : DIEGO_VOICE_PROMPT; })
+    .catch(() => { state.customPrompt = DIEGO_VOICE_PROMPT; });
   // initKeywords, initAutopilot, initProspectsTab, initCsvQueue, loadHistoryTab → lazy on tab click
 
   // Show the toolbar login email as the Gmail "from" account
@@ -3105,26 +3219,19 @@ function detectPhraseLang(phrase) {
 
 async function openSettings() {
   document.getElementById("settings-modal").style.display = "flex";
-  // Hidratar custom prompt desde state (cargado al boot)
-  const promptEl = document.getElementById("settings-custom-prompt");
-  if (promptEl) promptEl.value = state.customPrompt || "";
-  const statusEl = document.getElementById("custom-prompt-status");
-  if (statusEl) statusEl.textContent = state.customPrompt ? `${state.customPrompt.length} chars saved` : "empty";
 
-  // Claude usage counters (today + last 30 days) — non-blocking
-  const todayEl = document.getElementById("stats-claude-today");
-  const monthEl = document.getElementById("stats-claude-month");
-  if (todayEl && monthEl) {
-    todayEl.textContent = "…"; monthEl.textContent = "…";
-    Promise.all([
-      getApiUsageForProvider(state.accessToken, state.loginEmail, "anthropic", 1),
-      getApiUsageForProvider(state.accessToken, state.loginEmail, "anthropic", 30),
-    ]).then(([today, month]) => {
-      todayEl.textContent = String(today.total);
-      monthEl.textContent = String(month.total);
-    }).catch(() => {
-      todayEl.textContent = "–"; monthEl.textContent = "–";
-    });
+  // Prompt GLOBAL — solo el admin lo ve y lo puede editar.
+  // Para los MBs, ocultamos toda la sección.
+  const promptSection = document.getElementById("settings-custom-prompt")?.closest(".settings-gmail-row");
+  const isAdmin = state.role === "admin";
+  if (promptSection) promptSection.style.display = isAdmin ? "" : "none";
+  if (isAdmin) {
+    const promptEl = document.getElementById("settings-custom-prompt");
+    if (promptEl) promptEl.value = state.customPrompt || "";
+    const statusEl = document.getElementById("custom-prompt-status");
+    if (statusEl) statusEl.textContent = state.customPrompt
+      ? `${state.customPrompt.length} chars saved (GLOBAL — afecta a todo el equipo)`
+      : "empty";
   }
 
   await refreshGmailStatus();
@@ -3138,22 +3245,37 @@ function bindCustomPromptHandlers() {
   if (!saveBtn || !taEl) return;
 
   saveBtn.addEventListener("click", async () => {
+    if (state.role !== "admin") {
+      statusEl.textContent = "❌ Solo admin puede modificar el prompt global.";
+      statusEl.style.color = "var(--danger)";
+      return;
+    }
     const value = taEl.value.trim();
     saveBtn.disabled = true; saveBtn.textContent = "⏳ Saving...";
-    const r = await setCustomPrompt(state.accessToken, state.loginEmail, value);
+    // Guarda como prompt GLOBAL (key = __global__) que todos los MBs van a leer.
+    const r = await setCustomPrompt(state.accessToken, GLOBAL_PROMPT_KEY, value);
     saveBtn.disabled = false; saveBtn.textContent = "💾 Save prompt";
     if (!r.ok) { statusEl.textContent = `❌ Save failed (${r.status || r.error})`; statusEl.style.color = "var(--danger)"; return; }
     state.customPrompt = value;
-    statusEl.textContent = `✅ Saved · ${value.length} chars`;
+    statusEl.textContent = `✅ Saved · ${value.length} chars (GLOBAL)`;
     statusEl.style.color = "var(--success-text)";
     setTimeout(() => { statusEl.style.color = "var(--text-muted)"; }, 3000);
+    // Audit log
+    logAuditEvent(state.accessToken, {
+      user_email: state.loginEmail, action: "edit_global_prompt",
+      details: { length: value.length },
+    });
   });
 
   clearBtn?.addEventListener("click", async () => {
-    if (!confirm("Clear your custom prompt?")) return;
-    taEl.value = "";
-    const r = await setCustomPrompt(state.accessToken, state.loginEmail, "");
-    if (r.ok) { state.customPrompt = ""; statusEl.textContent = "empty"; }
+    if (state.role !== "admin") return;
+    if (!confirm("¿Resetear al prompt baked-in (Diego's voice default)?")) return;
+    const r = await setCustomPrompt(state.accessToken, GLOBAL_PROMPT_KEY, "");
+    if (r.ok) {
+      state.customPrompt = DIEGO_VOICE_PROMPT;
+      taEl.value = DIEGO_VOICE_PROMPT;
+      statusEl.textContent = "Reset al default";
+    }
   });
 }
 

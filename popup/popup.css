@@ -1198,6 +1198,30 @@ input.form-pv-display { font-weight: 700; }
 .admin-by-user-row .user { font-weight: 600; color: #e2e8f0; }
 .admin-by-user-row .nums { color: #94a3b8; font-size: 10px; }
 
+.admin-mb-summaries { display: flex; flex-direction: column; gap: 8px; }
+.mb-summary-card {
+  background: #1e293b; border-radius: 8px; padding: 10px 12px;
+  border: 1px solid #334155;
+}
+.mb-summary-card .head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid #334155;
+}
+.mb-summary-card .head .who { font-weight: 700; color: #fbbf24; font-size: 12px; }
+.mb-summary-card .head .grade {
+  font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 700;
+}
+.mb-summary-card .head .grade.high  { background: rgba(52,211,153,0.20); color: #34d399; }
+.mb-summary-card .head .grade.mid   { background: rgba(245,158,11,0.20); color: #fbbf24; }
+.mb-summary-card .head .grade.low   { background: rgba(239,68,68,0.20);  color: #fca5a5; }
+.mb-summary-card .head .grade.none  { background: rgba(148,163,184,0.15); color: #94a3b8; }
+.mb-summary-card ul {
+  margin: 0; padding-left: 16px; font-size: 11px; color: #cbd5e1;
+  line-height: 1.6;
+}
+.mb-summary-card ul li { margin-bottom: 2px; }
+.mb-summary-card ul strong { color: #f1f5f9; }
+
 .admin-limits-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
 .admin-limit-row {
   background: #1e293b; padding: 8px; border-radius: 6px; border: 1px solid #334155;
