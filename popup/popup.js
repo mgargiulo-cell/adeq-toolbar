@@ -35,7 +35,7 @@ import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
 import { startUsageSession, endUsageSession, fetchUsageStats }                                   from "../modules/usageTracking.js";
 import { lockProspect, getActiveProspectLock, unlockProspect, createHandoff,
          fetchPendingHandoffsForUser, updateHandoffStatus,
-         setVacationStatus, getUserStatus }                                                      from "../modules/coordination.js";
+         setVacationStatus, getUserStatus, expireOldHandoffs }                                   from "../modules/coordination.js";
 import { logAuditEvent }                                                                         from "../modules/auditLog.js";
 
 // ============================================================
@@ -4338,6 +4338,11 @@ function applyUserFromAuth(auth) {
   // Wire del triple-click para TODOS los users — los no-admin reciben un alert
   // visible cuando lo intentan (en vez de fallar silencioso)
   wireAdminViewToggle();
+  // Cleanup periódico que solo el admin dispara: marca como 'expired' los
+  // handoffs que llevan +7 días sin aceptarse. No bloquea, fire-and-forget.
+  if (state.role === "admin") {
+    expireOldHandoffs(state.accessToken).catch(() => {});
+  }
 
   // Pre-seleccionar ejecutivo en el form de Monday
   const execSel = document.getElementById("form-ejecutivo");
@@ -6340,14 +6345,24 @@ async function refreshProspectsStats() {
   updateProspectsDailyBar(count);
 }
 
-function initProspectsTab() {
+async function initProspectsTab() {
+  // Restore filtros guardados de sesiones previas
+  try {
+    const { _prospectsDateFilter, _prospectsSourceFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter"]);
+    const dateEl   = document.getElementById("prospects-date-filter");
+    const sourceEl = document.getElementById("prospects-source-filter");
+    if (dateEl   && _prospectsDateFilter)   dateEl.value   = _prospectsDateFilter;
+    if (sourceEl && _prospectsSourceFilter) sourceEl.value = _prospectsSourceFilter;
+  } catch {}
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
   });
-  document.getElementById("prospects-date-filter")?.addEventListener("change", async () => {
+  document.getElementById("prospects-date-filter")?.addEventListener("change", async (e) => {
+    chrome.storage.local.set({ _prospectsDateFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
-  document.getElementById("prospects-source-filter")?.addEventListener("change", async () => {
+  document.getElementById("prospects-source-filter")?.addEventListener("change", async (e) => {
+    chrome.storage.local.set({ _prospectsSourceFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
   // Clear all de Prospects ELIMINADO — el botón borraba TODA la cola compartida
