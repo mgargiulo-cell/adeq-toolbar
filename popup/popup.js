@@ -35,6 +35,48 @@ import { startUsageSession, endUsageSession, fetchUsageStats }                  
 import { lockProspect, getActiveProspectLock, unlockProspect, createHandoff,
          fetchPendingHandoffsForUser, updateHandoffStatus,
          setVacationStatus, getUserStatus, getActiveUsers }                                      from "../modules/coordination.js";
+import { logAuditEvent, fetchAuditLog }                                                          from "../modules/auditLog.js";
+
+// ============================================================
+// DEMO MODE
+// Cuando el admin lo prende, ningún hit a APIs pagas se ejecuta.
+// Devuelve datos mockeados realistas para presentar la herramienta sin gastar.
+// ============================================================
+let _demoModeEnabled = false;
+export function setDemoMode(on) {
+  _demoModeEnabled = !!on;
+  chrome.storage.local.set({ _demoMode: _demoModeEnabled }).catch(() => {});
+  document.body.setAttribute("data-demo-mode", _demoModeEnabled ? "on" : "off");
+  const indicator = document.getElementById("demo-mode-indicator");
+  if (indicator) indicator.style.display = _demoModeEnabled ? "inline-block" : "none";
+}
+export function isDemoMode() { return _demoModeEnabled; }
+
+async function loadDemoModeFromStorage() {
+  try {
+    const { _demoMode } = await chrome.storage.local.get("_demoMode");
+    setDemoMode(!!_demoMode);
+  } catch {}
+}
+
+// ============================================================
+// QUICK ACCESS — últimos 20 dominios analizados
+// ============================================================
+async function getRecentDomains(n = 20) {
+  try {
+    const { _recentDomains = [] } = await chrome.storage.local.get("_recentDomains");
+    return _recentDomains.slice(0, n);
+  } catch { return []; }
+}
+async function pushRecentDomain(domain) {
+  if (!domain) return;
+  try {
+    const { _recentDomains = [] } = await chrome.storage.local.get("_recentDomains");
+    const filtered = _recentDomains.filter(d => d !== domain);
+    filtered.unshift(domain);
+    await chrome.storage.local.set({ _recentDomains: filtered.slice(0, 20) });
+  } catch {}
+}
 
 // ============================================================
 // COORDINACIÓN ENTRE MBs (lock + handoff + vacation)
@@ -390,6 +432,11 @@ async function saveLimitRow(row) {
   const ok = await upsertUserLimit(state.accessToken, limit);
   row.style.borderColor = ok ? "#34d399" : "#f87171";
   setTimeout(() => { row.style.borderColor = ""; }, 800);
+  // Audit
+  if (ok) logAuditEvent(state.accessToken, {
+    user_email: state.loginEmail, action: "set_user_limit",
+    target: email, details: limit,
+  });
 }
 
 // ── Blocklist tab ──────────────────────────────────────────
@@ -435,6 +482,10 @@ async function saveAdminBlocklist() {
       body: JSON.stringify(domains.map(d => ({ domain: d, added_by: state.loginEmail }))),
     });
     status.textContent = `✅ ${domains.length} dominios guardados.`;
+    logAuditEvent(state.accessToken, {
+      user_email: state.loginEmail, action: "edit_blocklist",
+      details: { count: domains.length },
+    });
   } catch (e) { status.textContent = "❌ Error: " + e.message; }
 }
 
@@ -513,6 +564,9 @@ async function loadAdminActivity() {
   // Chart por día
   renderAdminChart(histRes, from, to);
 
+  // RapidAPI hits por día
+  renderRapidApiChart(usageRes, from, to);
+
   // Per-user breakdown
   renderAdminByUser(histRes, usageRes);
 
@@ -576,6 +630,51 @@ function renderAdminChart(historial, from, to) {
       ctx.fillText(counts[i], x + barW / 2, h - 22 - barHeight);
     }
     // Label día (solo cada N para que entren)
+    const showLabel = days.length <= 14 || i % Math.ceil(days.length / 14) === 0;
+    if (showLabel) {
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText(day.slice(5), x + barW / 2, h - 6);
+    }
+  });
+}
+
+function renderRapidApiChart(usage, from, to) {
+  const canvas = document.getElementById("admin-rapidapi-chart");
+  const totalEl = document.getElementById("admin-rapidapi-total");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  // Buckets por día — sumar by_provider.rapidapi de cada row
+  const days = [];
+  const start = new Date(from); const end = new Date(to);
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    days.push(d.toISOString().slice(0, 10));
+  }
+  const counts = days.map(day => {
+    return usage
+      .filter(r => r.day === day)
+      .reduce((acc, r) => acc + parseInt(r.by_provider?.rapidapi || 0, 10), 0);
+  });
+  const total = counts.reduce((a, b) => a + b, 0);
+  const max = Math.max(1, ...counts);
+  if (totalEl) totalEl.textContent = `Total período: ${total.toLocaleString()} hits`;
+  // Dibujar
+  const W = canvas.width = canvas.offsetWidth * 2;
+  const H = canvas.height = 360;
+  ctx.scale(2, 2);
+  const w = W / 2; const h = H / 2;
+  ctx.clearRect(0, 0, w, h);
+  const barW = (w - 40) / days.length;
+  ctx.font = "10px -apple-system, sans-serif";
+  ctx.textAlign = "center";
+  days.forEach((day, i) => {
+    const x = 20 + i * barW;
+    const barHeight = (counts[i] / max) * (h - 40);
+    ctx.fillStyle = "#fbbf24";
+    ctx.fillRect(x + 1, h - 20 - barHeight, barW - 2, barHeight);
+    if (counts[i] > 0) {
+      ctx.fillStyle = "#e2e8f0";
+      ctx.fillText(counts[i].toLocaleString(), x + barW / 2, h - 22 - barHeight);
+    }
     const showLabel = days.length <= 14 || i % Math.ceil(days.length / 14) === 0;
     if (showLabel) {
       ctx.fillStyle = "#94a3b8";

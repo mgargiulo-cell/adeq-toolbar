@@ -110,7 +110,15 @@
       <div class="stat-card"><div class="stat-num" id="stat-autopilot">--</div><div class="stat-label">Tiempo Autopilot</div></div>
     </div>
     <div class="admin-chart-wrap">
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">Sitios analizados por día</div>
       <canvas id="admin-chart" width="540" height="180"></canvas>
+    </div>
+    <div class="admin-chart-wrap" style="margin-top:8px">
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:4px;display:flex;justify-content:space-between">
+        <span>RapidAPI hits por día (compará con el dashboard de RapidAPI)</span>
+        <span id="admin-rapidapi-total" style="color:#fbbf24;font-weight:700"></span>
+      </div>
+      <canvas id="admin-rapidapi-chart" width="540" height="180"></canvas>
     </div>
     <div class="admin-section-title">Por usuario</div>
     <div id="admin-by-user" class="admin-by-user"></div>
