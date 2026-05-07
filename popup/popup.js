@@ -567,11 +567,69 @@ async function loadAdminActivity() {
   // RapidAPI hits por día
   renderRapidApiChart(usageRes, from, to);
 
+  // Leaderboard + funnel
+  renderAdminLeaderboard(histRes, usageRes);
+  renderAdminFunnel({ sites, emails, monday });
+
   // Per-user breakdown
   renderAdminByUser(histRes, usageRes);
 
   // Live feed (últimas 30)
   renderAdminLiveFeed(histRes.slice(0, 30));
+}
+
+function renderAdminLeaderboard(historial, usage) {
+  const wrap = document.getElementById("admin-leaderboard");
+  if (!wrap) return;
+  // Score = pushes a Monday (más relevante que solo análisis)
+  const byUser = new Map();
+  usage.forEach(r => {
+    const u = r.user_email || "unknown";
+    const monday = parseInt(r.by_provider?._monday_pushes || 0, 10);
+    const emails = parseInt(r.by_provider?._emails_sent || 0, 10);
+    if (!byUser.has(u)) byUser.set(u, { monday: 0, emails: 0 });
+    byUser.get(u).monday += monday;
+    byUser.get(u).emails += emails;
+  });
+  if (byUser.size === 0) { wrap.innerHTML = '<div class="admin-help">Sin pushes en este período.</div>'; return; }
+  const ranked = [...byUser.entries()].sort((a, b) => b[1].monday - a[1].monday);
+  const medals = ["gold", "silver", "bronze"];
+  wrap.innerHTML = "";
+  ranked.forEach(([u, s], i) => {
+    const row = document.createElement("div");
+    row.className = "leaderboard-row";
+    const medal = i < 3 ? `<span class="leaderboard-rank ${medals[i]}">${["🥇", "🥈", "🥉"][i]}</span>` : `<span class="leaderboard-rank">${i + 1}</span>`;
+    row.innerHTML = `
+      ${medal}
+      <span style="flex:1;font-weight:600">${esc(u)}</span>
+      <span style="color:#94a3b8;font-size:10px">${s.monday} push · ${s.emails} mail</span>
+    `;
+    wrap.appendChild(row);
+  });
+}
+
+function renderAdminFunnel({ sites, emails, monday }) {
+  const wrap = document.getElementById("admin-funnel");
+  if (!wrap) return;
+  if (!sites) { wrap.innerHTML = '<div class="admin-help">Sin datos en este período.</div>'; return; }
+  const steps = [
+    { label: "Sites analizados", count: sites },
+    { label: "Emails enviados",  count: emails },
+    { label: "Pushes Monday",    count: monday },
+  ];
+  const max = Math.max(1, sites);
+  wrap.innerHTML = steps.map(s => {
+    const pct = ((s.count / max) * 100).toFixed(0);
+    const conv = sites > 0 ? ((s.count / sites) * 100).toFixed(0) : 0;
+    const w = Math.max(8, (s.count / max) * 100);
+    return `
+      <div class="funnel-step">
+        <span class="funnel-label">${esc(s.label)}</span>
+        <div class="funnel-bar" style="width:${w}%">${s.count.toLocaleString()}</div>
+        <span class="funnel-pct">${conv}% del top</span>
+      </div>
+    `;
+  }).join("");
 }
 
 let _userFilterPopulated = false;
