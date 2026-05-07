@@ -7,6 +7,7 @@
 // ============================================================
 
 import { CONFIG } from "../config.js";
+import { TOP_500_BLOCKED } from "./blockedDomainsTop500.js";
 
 // ── 1. TLDs siempre bloqueados ──────────────────────────────
 const BLOCKED_TLDS = new Set([
@@ -25,22 +26,15 @@ const BLOCKED_PATTERNS = [
 ];
 
 // ── 2. Dominios gigantes / corporativos donde jamás vamos a vender ─
+// Combina TOP_500_BLOCKED (lista grande pre-cargada de sitios no-publishers)
+// + ADEQ-specific entries que no están en el top 500.
 const BLOCKED_DOMAINS = new Set([
-  // Tech giants
-  "google.com", "facebook.com", "youtube.com", "instagram.com", "twitter.com",
-  "x.com", "linkedin.com", "amazon.com", "microsoft.com", "apple.com",
-  "netflix.com", "tiktok.com", "snapchat.com", "pinterest.com", "reddit.com",
-  "wikipedia.org", "github.com", "stackoverflow.com", "openai.com",
+  ...TOP_500_BLOCKED,
+  // Extras de ADEQ
+  "x.com", "tiktok.com", "snapchat.com", "openai.com",
   "anthropic.com", "claude.ai", "chatgpt.com", "gemini.google.com",
-  // Cloud / SaaS
   "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
-  "salesforce.com", "hubspot.com", "stripe.com", "shopify.com",
-  "notion.so", "slack.com", "zoom.us", "dropbox.com",
-  // Plataformas que no son publishers
-  "monday.com", "atlassian.com", "trello.com", "asana.com",
-  // Search engines / portales
-  "bing.com", "yahoo.com", "duckduckgo.com", "baidu.com", "yandex.ru",
-  // Sites internos de ADEQ / herramientas
+  "stripe.com", "notion.so", "atlassian.com", "monday.com",
   "adeqmedia.com",
 ]);
 
