@@ -193,9 +193,24 @@ a:hover { text-decoration: underline; }
   background: rgba(255,255,255,0.08);
   border-color: rgba(255,255,255,0.15);
   color: #f1f5f9;
+  -webkit-text-fill-color: #f1f5f9;
 }
 .login-card .form-input::placeholder { color: #64748b; }
-.login-card .form-input:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56,189,248,0.2); }
+.login-card .form-input:focus,
+.login-card .form-input:hover {
+  background: rgba(255,255,255,0.12) !important;
+  border-color: #38bdf8 !important;
+  box-shadow: 0 0 0 3px rgba(56,189,248,0.2);
+  color: #f1f5f9 !important;
+  -webkit-text-fill-color: #f1f5f9 !important;
+}
+/* Chrome autofill: anular el background amarillo y el texto negro automáticos */
+.login-card .form-input:-webkit-autofill,
+.login-card .form-input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px rgba(30,41,59,0.95) inset !important;
+  -webkit-text-fill-color: #f1f5f9 !important;
+  caret-color: #f1f5f9 !important;
+}
 .login-error { font-size: var(--fs-base); color: #fc8181; text-align: center; margin-top: var(--sp-3); min-height: 16px; }
 .login-forgot-link {
   display: block; width: 100%; background: none; border: none;
