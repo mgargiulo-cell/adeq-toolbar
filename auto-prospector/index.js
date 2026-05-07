@@ -267,6 +267,17 @@ function targetGeosToCountryCodes(targetGeos) {
 // ── Supabase helpers ──────────────────────────────────────────
 
 async function supabaseLogin() {
+  // Si tenemos SERVICE_ROLE_KEY (recomendado en backend), saltamos el login con
+  // email/password. Las queries usan BACKEND_BEARER directamente y bypassan RLS.
+  // Esto evita el punto de falla "Invalid login credentials" cuando alguien
+  // cambia la password del usuario admin desde la toolbar.
+  if (SUPABASE_SERVICE_ROLE_KEY) {
+    return SUPABASE_SERVICE_ROLE_KEY;
+  }
+  // Fallback: login con email/password si no hay service role configurado
+  if (!SUPABASE_EMAIL || !SUPABASE_PASSWORD) {
+    throw new Error("Falta SUPABASE_SERVICE_ROLE_KEY (preferido) o SUPABASE_EMAIL+PASSWORD");
+  }
   const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, {
     method: "POST",
     headers: { "apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json" },
