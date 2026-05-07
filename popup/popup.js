@@ -5548,12 +5548,30 @@ function initProspectCard(card, data) {
   // Enriquecer: tráfico fresco + Apollo si faltan datos
   card.querySelector(".pcard-enrich-btn")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
+    // Pre-check: si la card YA tiene tráfico Y emails, no gastar hits
+    const hasTrafficAlready = !!(data.traffic && data.traffic > 0);
+    const hasEmailsAlready  = Array.isArray(data.emails) && data.emails.filter(em => em && !isGarbageEmail(em)).length > 0;
+    if (hasTrafficAlready && hasEmailsAlready) {
+      btn.disabled = true;
+      btn.style.background = "#f1f5f9";
+      btn.style.color = "#64748b";
+      btn.textContent = "✅ Ya tiene datos";
+      btn.title = `Tráfico: ${data.traffic.toLocaleString()} · ${data.emails.length} email(s). Ya tiene todo lo importante — no se gasta hit.`;
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.style.background = "";
+        btn.style.color = "";
+        btn.textContent = "🔍 Enriquecer";
+      }, 2500);
+      return;
+    }
     btn.disabled = true; btn.textContent = "⏳ ...";
     try {
-      // Disparar getTraffic + Apollo en paralelo
+      // Optimización: si ya tiene tráfico, NO llamar getTraffic. Si ya tiene
+      // emails, NO llamar Apollo. Solo disparamos lo que falta.
       const [traffic, apollo] = await Promise.all([
-        getTraffic(data.domain).catch(() => null),
-        findDecisionMakerViaApollo(data.domain).catch(() => null),
+        hasTrafficAlready ? Promise.resolve(null) : getTraffic(data.domain).catch(() => null),
+        hasEmailsAlready  ? Promise.resolve(null) : findDecisionMakerViaApollo(data.domain).catch(() => null),
       ]);
       // Update local state + UI
       let updated = false;
