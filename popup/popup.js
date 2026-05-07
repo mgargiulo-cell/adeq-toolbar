@@ -356,8 +356,68 @@ function initAdminPanel() {
   // Wire blocklist
   document.getElementById("admin-blocklist-save")?.addEventListener("click", saveAdminBlocklist);
   document.getElementById("admin-blocklist-csv")?.addEventListener("change", handleBlocklistCsvUpload);
+  // Wire reset cache button
+  document.getElementById("admin-reset-cache-btn")?.addEventListener("click", resetTrafficCacheAboveThreshold);
 
   loadAdminActivity();
+}
+
+async function resetTrafficCacheAboveThreshold() {
+  const threshold = parseInt(document.getElementById("admin-reset-cache-threshold").value, 10) || 400000;
+  const status = document.getElementById("admin-reset-cache-status");
+  if (!confirm(`¿Borrar TODOS los dominios cacheados con visits ≥ ${threshold.toLocaleString()}?\n\nEsto fuerza al equipo a re-analizarlos (gastará API).`)) return;
+  status.textContent = "⏳ Borrando...";
+  try {
+    // Borrar via PostgREST con filtros sobre el JSONB.
+    // PostgREST no soporta operaciones JSON >= directamente — usamos RPC alternativa:
+    // delete WHERE data->>'rawVisits' >= threshold.
+    // En PostgREST esto se hace así (filter en columna data sub-key):
+    const headers = {
+      "apikey": CONFIG.SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${state.accessToken}`,
+      "Prefer": "return=representation",
+    };
+    // Trick: traer todos los rows, filtrar client-side, deletear los matches.
+    // Funciona OK porque la cache no debería tener millones de rows.
+    const listRes = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_traffic_cache?select=domain,data`,
+      { headers }
+    );
+    if (!listRes.ok) { status.textContent = "❌ No se pudo leer la cache."; return; }
+    const rows = await listRes.json();
+    const toDelete = rows.filter(r => {
+      const d = r.data || {};
+      const visits = Math.max(
+        parseInt(d.rawVisits || 0, 10),
+        parseInt(d.visits || 0, 10),
+        parseInt(d.pageViews || 0, 10),
+        parseInt(d.monthly || 0, 10),
+      );
+      return visits >= threshold;
+    });
+    if (!toDelete.length) { status.textContent = `✅ No hay dominios cacheados con visits ≥ ${threshold.toLocaleString()}.`; return; }
+
+    // Delete en bulk usando in.()
+    const domains = toDelete.map(r => r.domain);
+    const chunks = [];
+    for (let i = 0; i < domains.length; i += 50) chunks.push(domains.slice(i, i + 50));
+    let deleted = 0;
+    for (const chunk of chunks) {
+      const inList = chunk.map(d => `"${encodeURIComponent(d)}"`).join(",");
+      const delRes = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_traffic_cache?domain=in.(${inList})`,
+        { method: "DELETE", headers }
+      );
+      if (delRes.ok) deleted += chunk.length;
+    }
+    status.textContent = `✅ ${deleted} dominios borrados de la cache compartida. El equipo los re-analizará en el próximo análisis.`;
+    logAuditEvent(state.accessToken, {
+      user_email: state.loginEmail, action: "reset_traffic_cache",
+      details: { threshold, deleted, sample: domains.slice(0, 10) },
+    });
+  } catch (e) {
+    status.textContent = "❌ Error: " + e.message;
+  }
 }
 
 // ── Limits tab ─────────────────────────────────────────────

@@ -151,6 +151,16 @@
       <button id="admin-blocklist-save" class="btn btn-sm btn-primary">💾 Guardar</button>
     </div>
     <div id="admin-blocklist-status" class="admin-help" style="margin-top:6px"></div>
+
+    <hr style="border:none;border-top:1px solid #334155;margin:18px 0" />
+    <div class="admin-section-title" style="margin-top:0">🗑️ Cache de tráfico</div>
+    <p class="admin-help">Borra dominios cacheados con tráfico ≥ X. Útil después de cambiar de proveedor de API o cuando la data queda desactualizada.</p>
+    <div style="display:flex;gap:6px;align-items:center">
+      <span style="font-size:11px;color:#94a3b8">Borrar cache de sitios con visits ≥</span>
+      <input id="admin-reset-cache-threshold" type="number" class="form-input" value="400000" style="width:110px;font-size:11px" />
+      <button id="admin-reset-cache-btn" class="btn btn-sm" style="background:#ef4444;color:white;border:none">🗑️ Reset</button>
+    </div>
+    <div id="admin-reset-cache-status" class="admin-help" style="margin-top:6px"></div>
   </div>
 </div>
 
