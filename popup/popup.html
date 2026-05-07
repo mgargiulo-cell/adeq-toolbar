@@ -19,10 +19,30 @@
       <span class="logo-sub">TOOLBAR</span>
     </div>
     <p class="login-subtitle">ADEQ Media — Authorized Access Only</p>
+
+    <!-- Prominent Disclosure (Chrome Web Store requirement) -->
+    <div class="disclosure-box">
+      <div class="disclosure-title">📋 Data we handle when you sign in:</div>
+      <ul class="disclosure-list">
+        <li>Your work email + password (authenticated via Supabase Auth, password is hashed).</li>
+        <li>The URL, title and meta of any tab where you actively open the toolbar.</li>
+        <li>Public traffic & contact data of analyzed domains via SimilarWeb / Apollo / WHOIS.</li>
+        <li>Gmail OAuth token (only if you choose to send mail) — used to send from your account.</li>
+      </ul>
+      <p class="disclosure-foot">
+        We do not sell your data, do not run remote code, and do not collect browsing history of pages you don't analyze.
+        Read the full <a id="open-privacy-link" href="../docs/privacy.html" target="_blank" rel="noopener">Privacy Policy</a>.
+      </p>
+      <label class="disclosure-consent">
+        <input id="consent-checkbox" type="checkbox" />
+        I have read and accept the Privacy Policy.
+      </label>
+    </div>
+
     <input id="login-email"    class="form-input" type="email"    placeholder="user@adeqmedia.com" autocomplete="email" />
     <input id="login-password" class="form-input" type="password" placeholder="Password" autocomplete="current-password" style="margin-top:8px" />
     <div id="login-error" class="login-error"></div>
-    <button id="btn-login" class="btn btn-primary btn-full" style="margin-top:14px">Sign In</button>
+    <button id="btn-login" class="btn btn-primary btn-full" style="margin-top:14px" disabled>Sign In</button>
     <button id="btn-forgot-password" type="button" class="login-forgot-link">Forgot password?</button>
     <div id="login-info" class="login-info"></div>
   </div>

@@ -3316,6 +3316,22 @@ function initLoginScreen() {
 
   btn.addEventListener("click", attemptLogin);
 
+  // Prominent Disclosure (Chrome Web Store): el botón se habilita solo
+  // cuando el usuario marca el consent. Persistimos en chrome.storage para
+  // no pedirlo cada vez después del primer login.
+  const consentBox = document.getElementById("consent-checkbox");
+  if (consentBox) {
+    chrome.storage.local.get(["_privacyConsentAt"]).then(({ _privacyConsentAt }) => {
+      if (_privacyConsentAt) { consentBox.checked = true; btn.disabled = false; }
+    }).catch(() => {});
+    consentBox.addEventListener("change", () => {
+      btn.disabled = !consentBox.checked;
+      if (consentBox.checked) {
+        chrome.storage.local.set({ _privacyConsentAt: new Date().toISOString() }).catch(() => {});
+      }
+    });
+  }
+
   forgotBtn?.addEventListener("click", async () => {
     const email = document.getElementById("login-email").value.trim().toLowerCase();
     errorEl.textContent = ""; infoEl.textContent = "";

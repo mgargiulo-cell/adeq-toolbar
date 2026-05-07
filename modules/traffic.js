@@ -5,6 +5,7 @@
 
 import { CONFIG }                            from "../config.js";
 import { getTrafficCache, saveTrafficCache, getDomainGeo, setDomainGeo } from "./supabase.js";
+import { checkDomainBlocked } from "./blocklist.js";
 import { callProxy }                         from "./apiProxy.js";
 
 // Token de auth — se setea desde popup.js al iniciar sesión, lo necesitamos
@@ -274,6 +275,13 @@ export async function getTraffic(domain) {
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
     .replace(/\/$/, "");
+
+  // Pre-check blocklist (gratis, no consume API)
+  const block = await checkDomainBlocked(cleanDomain, _authToken);
+  if (block.blocked) {
+    console.log(`[Traffic] ${cleanDomain} bloqueado: ${block.reason}`);
+    return { visits: 0, pagesPerVisit: null, pageViews: 0, monthly: 0, rawVisits: 0, noPageViewData: true, ppvSource: null, estimatedPages: false, category: "", topCountries: [], blocked: true, blockedReason: block.reason };
+  }
 
   // Caché primero (90 días)
   const cached = await getTrafficCache(cleanDomain);

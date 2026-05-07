@@ -1069,6 +1069,30 @@ input.form-pv-display { font-weight: 700; }
 .autopush-step       { font-size: var(--fs-base); color: #374151; }
 
 /* ============================================================
+   PROMINENT DISCLOSURE (Chrome Web Store)
+   ============================================================ */
+.disclosure-box {
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 14px 0;
+  text-align: left;
+  font-size: 11px;
+}
+.disclosure-title { font-weight: 800; color: #92400e; margin-bottom: 6px; }
+.disclosure-list  { padding-left: 18px; margin: 0 0 8px; color: #78350f; line-height: 1.5; }
+.disclosure-list li { margin-bottom: 3px; }
+.disclosure-foot  { color: #78350f; margin: 8px 0 6px; font-size: 10.5px; }
+.disclosure-foot a { color: #1d4ed8; font-weight: 600; }
+.disclosure-consent {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 600; color: #92400e;
+  cursor: pointer; user-select: none;
+}
+.disclosure-consent input { width: 14px; height: 14px; cursor: pointer; }
+
+/* ============================================================
    ADMIN PANEL
    ============================================================ */
 .admin-panel {
