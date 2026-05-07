@@ -896,7 +896,7 @@
   <section class="card">
     <div class="card-title">📤 External URLs Auto Prospector</div>
     <p class="import-desc">Upload a CSV (1 domain per line) with <strong>external</strong> URLs. The auto-prospector processes them in the background — analyzes traffic, emails, and pushes them to Monday as new prospects.</p>
-    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>300/day/user</strong>.</p>
+    <p class="import-warn">⚠️ El toggle <strong>AUTO IMPORT</strong> (abajo) debe estar prendido para que el worker procese la cola. Independiente del Autopilot de Prospects. Límite: <strong>300/día/usuario</strong>.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
@@ -915,7 +915,7 @@
   <section class="card">
     <div class="card-title">🔄 Monday URL Auto Prospector</div>
     <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
-    <p class="import-warn">⚠️ <strong>AUTO ON</strong> must be enabled below for processing to start. Limit: <strong>300/day/user</strong>.</p>
+    <p class="import-warn">⚠️ El toggle <strong>AUTO IMPORT</strong> (abajo) debe estar prendido para que el worker procese la cola. Independiente del Autopilot de Prospects. Límite: <strong>300/día/usuario</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
       <select id="refresh-geo" class="form-select" style="font-size:11px" title="Debe matchear el valor exacto de la columna GEO en Monday.">
@@ -949,10 +949,13 @@
       <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
     </div>
 
-    <!-- CSV Queue toggle (independiente de Autopilot) -->
+    <!-- AUTO IMPORT toggle (independiente del Autopilot de Prospects) -->
     <div style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:#fff7ed;border:1px solid #fb923c;border-radius:6px">
-      <span style="font-size:12px;font-weight:600">📥 CSV Queue</span>
-      <label class="toggle-switch" title="Procesa URLs de tu CSV/Monday Refresh. Independiente del Autopilot.">
+      <div>
+        <div style="font-size:12px;font-weight:700">📥 AUTO IMPORT</div>
+        <div style="font-size:10px;color:#92400e;margin-top:2px">Procesa la cola de URLs (External CSV + Monday URL). Independiente del Autopilot de Prospects.</div>
+      </div>
+      <label class="toggle-switch" title="Procesa la cola de URLs cargadas (CSV externo + Monday URL refresh). Es totalmente independiente del Autopilot que descubre desde Majestic.">
         <input id="csv-queue-enabled" type="checkbox" />
         <span class="toggle-slider"></span>
       </label>
