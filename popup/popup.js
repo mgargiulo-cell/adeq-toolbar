@@ -5236,6 +5236,78 @@ function defaultStatusForOwner(_owner) {
 
 let _cachedProspectDrafts = []; // cache de borradores para los dropdowns de las cards
 
+// Empty state inteligente: lee toolbar_config.auto_session_stats + flags +
+// toolbar_csv_queue.pending para decidir qué mostrar al user.
+async function renderProspectsEmptyState(listEl) {
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+
+  const [statsRes, flagsRes, csvCountRes] = await Promise.all([
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_session_stats,auto_prospecting_enabled,csv_queue_enabled,auto_session_user)&select=key,value`, { headers }),
+    Promise.resolve(null), // placeholder
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=domain,status,source&limit=5&order=updated_at.desc.nullslast`, { headers }),
+  ]);
+
+  const cfgMap = {};
+  if (statsRes.ok) {
+    const rows = await statsRes.json();
+    rows.forEach(r => { cfgMap[r.key] = r.value; });
+  }
+  const csvItems = csvCountRes.ok ? await csvCountRes.json() : [];
+
+  const autopilotOn = cfgMap.auto_prospecting_enabled === "true";
+  const csvQueueOn  = cfgMap.csv_queue_enabled === "true";
+  const apUser      = cfgMap.auto_session_user || "";
+  let apStats = null;
+  try { apStats = JSON.parse(cfgMap.auto_session_stats || "null"); } catch {}
+  const apActive = apStats && apStats.lastUpdate && (Date.now() - apStats.lastUpdate < 5 * 60 * 1000);
+
+  const csvProcessing = csvItems.find(i => i.status === "processing");
+  const csvPendingCount = csvItems.filter(i => i.status === "pending").length;
+
+  // Caso 1: Autopilot activo y procesando
+  let html = "";
+  if (autopilotOn && apActive) {
+    html += `
+      <div class="cascade-empty" style="background:#dbeafe;border:1px solid #3b82f6;color:#1e3a8a;padding:12px;border-radius:8px;margin-bottom:8px;text-align:left">
+        <div style="font-weight:700;margin-bottom:4px">🤖 Autopilot procesando · ${esc(apUser || "?")}</div>
+        <div style="font-size:11px;line-height:1.5">
+          Último analizado: <strong>${esc(apStats?.lastDomain || "—")}</strong><br/>
+          📊 ${apStats?.processed || 0} procesados · ✅ ${apStats?.added || 0} guardados · ⚠️ ${apStats?.filtered || 0} filtrados (sub-threshold o GEO mismatch)
+        </div>
+      </div>
+    `;
+  }
+
+  // Caso 2: CSV/Monday URL queue activa con items
+  if (csvQueueOn && (csvProcessing || csvPendingCount > 0)) {
+    const sourceLabel = csvProcessing?.source === "monday" ? "Monday URL" : "External CSV";
+    html += `
+      <div class="cascade-empty" style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:12px;border-radius:8px;margin-bottom:8px;text-align:left">
+        <div style="font-weight:700;margin-bottom:4px">📥 Auto Import procesando · ${esc(sourceLabel)}</div>
+        <div style="font-size:11px;line-height:1.5">
+          ${csvProcessing ? `Procesando ahora: <strong>${esc(csvProcessing.domain)}</strong><br/>` : ""}
+          ⏳ ${csvPendingCount} en cola pending
+        </div>
+      </div>
+    `;
+  }
+
+  // Caso 3: nada activo
+  if (!html) {
+    if (!autopilotOn && !csvQueueOn) {
+      html = '<div class="cascade-empty">No hay actividad. Prendé el Autopilot o subí un CSV/Monday URL para empezar.</div>';
+    } else if (autopilotOn && !apActive) {
+      html = `<div class="cascade-empty">🤖 Autopilot prendido (${esc(apUser || "?")}), pero el worker no reportó actividad en los últimos 5 min. Verificá Railway logs si esto persiste.</div>`;
+    } else if (csvQueueOn && csvPendingCount === 0) {
+      html = '<div class="cascade-empty">📥 Auto Import prendido pero la cola está vacía. Subí un CSV o hacé Monday URL refresh.</div>';
+    } else {
+      html = '<div class="cascade-empty">No pending prospects.</div>';
+    }
+  }
+
+  listEl.innerHTML = html;
+}
+
 async function loadProspectsTab() {
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
@@ -5266,7 +5338,12 @@ async function loadProspectsTab() {
   if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidates` : "No pending candidates";
 
   if (!rows.length) {
-    listEl.innerHTML = '<div class="cascade-empty">No pending prospects. The auto-pilot will add candidates here.</div>';
+    // Empty state inteligente: si hay actividad activa del worker, mostrar qué
+    // está procesando; si todo está apagado, mostrar el mensaje genérico.
+    listEl.innerHTML = '<div class="cascade-empty">⏳ Verificando actividad del worker...</div>';
+    renderProspectsEmptyState(listEl).catch(() => {
+      listEl.innerHTML = '<div class="cascade-empty">No pending prospects.</div>';
+    });
     return;
   }
 
