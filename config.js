@@ -42,5 +42,5 @@ export const CONFIG = {
 
   // ── General ────────────────────────────────────────────────────
   MEDIA_BUYER: "Max",
-  MIN_TRAFFIC: 400000,
+  MIN_TRAFFIC: 300000,  // pageViews mínimos (visits × pagesPerVisit). Debajo: descartar sin enriquecer.
 };

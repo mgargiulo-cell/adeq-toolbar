@@ -25,7 +25,7 @@ const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
 const DOMAIN_DELAY_MS  = 2500;
-const MIN_TRAFFIC      = 400_000;
+const MIN_TRAFFIC      = 300_000;  // pageViews mínimos (visits × pagesPerVisit) — debajo de esto el dominio se descarta sin enriquecer.
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
@@ -736,7 +736,14 @@ async function getTrafficData(domain, rapidApiKey) {
 
     const visits = data?.Visits || data?.visits || data?.pageViews || data?.PageViews || null;
 
-    // Extract top country — try inline data first, then separate /countries endpoint
+    // Pages per visit del nuevo shape (Traffic.Engagement.PagesPerVisit) o legacy (PagePerVisit)
+    const pagesPerVisit = data?.Traffic?.Engagement?.PagesPerVisit
+                       || data?.PagePerVisit || data?.PagesPerVisit
+                       || data?.pagesPerVisit || null;
+
+    // Extract top country del response. NO llamamos /countries fallback — desde
+    // el switch a website-insights, el GEO viene siempre inline en /all-insights.
+    // Si no viene → el caller usa fallback gratis (TLD + Cloudflare Radar hint).
     let topCountry = null;
     const inlineList = data?.TopCountries || data?.Countries || data?.countries
                     || data?.topCountryShares || data?.CountryShares || [];
@@ -746,28 +753,8 @@ async function getTrafficData(domain, rapidApiKey) {
       if (code) topCountry = COUNTRY_CODES[code] || code;
     }
 
-    // Fallback: dedicated /countries endpoint (used by extension too)
-    if (!topCountry && !_rapidCapReached) {
-      try {
-        _rapidGlobalCounter++;
-        const r2 = await fetch(
-          `https://website-insights.p.rapidapi.com/countries?domain=${encodeURIComponent(domain)}`,
-          { headers, signal: AbortSignal.timeout(6000) }
-        );
-        if (r2.ok) {
-          const d2   = await r2.json();
-          const list = Array.isArray(d2) ? d2 : (d2?.TopCountries || d2?.Countries || d2?.countries || []);
-          if (list.length) {
-            const c    = list[0];
-            const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
-            if (code) topCountry = COUNTRY_CODES[code] || code;
-          }
-        }
-      } catch {}
-    }
-
-    return { visits, topCountry, error: null };
-  } catch (e) { return { visits: null, topCountry: null, error: e.message }; }
+    return { visits, pagesPerVisit, topCountry, error: null };
+  } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, error: e.message }; }
 }
 
 async function findSimilarSites(domain, rapidApiKey) {
@@ -1819,7 +1806,7 @@ async function runSession(token, cfg, sessionStart) {
       fetchPageContent(domain),
     ]);
 
-    let { visits, topCountry, error: rapidError } = trafficData;
+    let { visits, pagesPerVisit, topCountry, error: rapidError } = trafficData;
 
     // Si el RapidAPI devolvió error tras 3 retries, no descartar permanentemente
     if (rapidError) {
@@ -1874,8 +1861,14 @@ async function runSession(token, cfg, sessionStart) {
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
-    if (visits < sessionMinTraffic) {
-      log(`  ✗ Tráfico (${Math.round(visits/1000)}K) < ${(sessionMinTraffic/1000)}K — descartado`);
+    // Threshold REAL del negocio: visits × pagesPerVisit (= pageViews mensuales).
+    // Si pagesPerVisit no vino en la respuesta, asumimos 1.0 (conservador) para
+    // que solo descarte sitios que ni siquiera con un PPV optimista lleguen al
+    // mínimo. Esto evita false-negatives por data faltante.
+    const ppvSafe   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : 1.0;
+    const pageViews = Math.round(visits * ppvSafe);
+    if (pageViews < sessionMinTraffic) {
+      log(`  ✗ pageViews (${Math.round(pageViews/1000)}K = ${Math.round(visits/1000)}K visits × ${ppvSafe.toFixed(1)} ppv) < ${(sessionMinTraffic/1000)}K — descartado`);
       await markProcessed(token, [domain], "traffic_low");
       count++; skipped++;
       await sleep(DOMAIN_DELAY_MS);

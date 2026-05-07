@@ -1836,7 +1836,7 @@ async function runTrafficCheck() {
     }
 
     const trafficForFilter = state.traffic || state.visits;
-    filterEl.textContent = passesTrafficFilter(trafficForFilter) ? "✅ Supera umbral 500K" : "❌ Bajo umbral 500K";
+    filterEl.textContent = passesTrafficFilter(trafficForFilter) ? "✅ Supera umbral 300K" : "❌ Bajo umbral 300K — no enriquecer";
     filterEl.className   = `filter-tag ${passesTrafficFilter(trafficForFilter) ? "pass" : "fail"}`;
 
     if (passesTrafficFilter(trafficForFilter)) {
