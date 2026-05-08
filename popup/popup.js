@@ -27,7 +27,7 @@ import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllC
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
-import { callProxy, setProxyAuth, onRapidApiCapReached, getRapidApiMonthlyStatus }              from "../modules/apiProxy.js";
+import { callProxy, setProxyAuth, onRapidApiCapReached, onRapidApiHit, getRapidApiMonthlyStatus } from "../modules/apiProxy.js";
 import { isAdminEmail, getRole, TEAM_EMAILS }                                                   from "../modules/roles.js";
 import { DIEGO_VOICE_PROMPT, GLOBAL_PROMPT_KEY }                                                from "../modules/diegoVoicePrompt.js";
 import { fetchAllUserLimits, fetchUserLimit, upsertUserLimit, deleteUserLimit,
@@ -1285,6 +1285,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderRapidApiUsageBanner(s);
   };
   onRapidApiCapReached(handleUsageUpdate);
+  // Refresh inmediato del footer counter al instante después de cada hit
+  // (en vez de esperar al polling de 60s). Permite al user ver subir el
+  // contador en tiempo real al analizar un dominio nuevo.
+  onRapidApiHit(handleUsageUpdate);
   const refreshUsage = () => {
     getRapidApiMonthlyStatus().then(handleUsageUpdate).catch(() => {});
   };

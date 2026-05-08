@@ -126,6 +126,12 @@ async function flushMonthlyCounter(force = false) {
 let _onCapReachedCb = null;
 export function onRapidApiCapReached(cb) { _onCapReachedCb = cb; }
 
+// Hook adicional que dispara DESPUÉS de cada hit RapidAPI exitoso.
+// Permite que el footer counter se refresque al instante en vez de esperar
+// los 60s de polling. Decisión user 2026-05-08: monitoreo en tiempo real.
+let _onRapidHitCb = null;
+export function onRapidApiHit(cb) { _onRapidHitCb = cb; }
+
 export async function getRapidApiMonthlyStatus() {
   if (!_monthState || _monthState.period !== currentPeriod()) await loadMonthlyCounter();
   return { ..._monthState };
@@ -266,6 +272,8 @@ export async function callProxy(provider, path, opts = {}) {
         _hitsSinceFlush     += inc;
         // Persistir async, sin bloquear
         flushMonthlyCounter().catch(() => {});
+        // Refresh UI footer inmediato en cada hit (no esperar polling 60s)
+        try { _onRapidHitCb?.({ used: _monthState.used, limit: _monthState.limit, period: _monthState.period }); } catch {}
         // Si cruzamos cap personal o global, alertar UI
         if (_userCapReached()) {
           try { _onCapReachedCb?.({ used: _userPersonalUsed, limit: _userPersonalCap, period: _monthState.period, scope: "user" }); } catch {}
