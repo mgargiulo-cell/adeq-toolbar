@@ -4521,17 +4521,19 @@ async function initCsvQueue() {
       // Dedupe
       const unique = [...new Set(domains)];
 
-      // Aviso si pasa el límite diario de 75 — solo se procesarán los primeros 75 hoy
+      // ERROR si pasa el límite por tirada (75). Decisión user 2026-05-08:
+      // no permitir uploads de más de 75 por vez. Si tienen un CSV grande,
+      // que lo dividan en archivos de hasta 75 dominios cada uno.
       if (unique.length > 75) {
-        const ok = confirm(`⚠️ You uploaded ${unique.length} domains but the limit is 75/day per user.\n\nThe first 75 will be processed today and the rest over following days automatically.\n\nContinue?`);
-        if (!ok) { uploadRes.textContent = "Upload canceled."; uploadRes.className = "push-result"; return; }
+        uploadRes.innerHTML = `❌ <strong>Too many domains:</strong> ${unique.length} found. Per-batch limit is <strong>75 domains</strong>. Split your CSV into smaller files (max 75 each) and upload them separately. Daily cap stays at 300/user.`;
+        uploadRes.className = "push-result error";
+        return;
       }
 
       uploadRes.textContent = `Uploading ${unique.length} domains...`;
 
       const result = await uploadCsvDomains(unique, state.loginEmail, state.accessToken);
-      const note = unique.length > 75 ? ` 75/day will be processed.` : "";
-      uploadRes.textContent = `✅ ${result.inserted} added (${result.attempted - result.inserted} duplicates ignored).${note}`;
+      uploadRes.textContent = `✅ ${result.inserted} added (${result.attempted - result.inserted} duplicates ignored).`;
       uploadRes.className = "push-result ok";
       fileInput.value = "";
       await refreshAll();
@@ -4549,7 +4551,9 @@ async function initCsvQueue() {
     const resultEl = document.getElementById("refresh-from-monday-result");
     const geo      = document.getElementById("refresh-geo").value;
     const idioma   = document.getElementById("refresh-idioma").value;
-    const limit    = parseInt(document.getElementById("refresh-limit").value) || 75;
+    // Cap fijo 75 por tirada (decisión user 2026-05-08). El input refresh-limit
+    // ahora es hidden con value="75" — ya no hay UI para cambiarlo.
+    const limit    = 75;
 
     btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
     resultEl.textContent = ""; resultEl.className = "push-result";

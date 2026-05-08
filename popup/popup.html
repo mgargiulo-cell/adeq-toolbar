@@ -866,9 +866,12 @@
         <option value="3">Portuguese</option>
         <option value="6">Arabic</option>
       </select>
-      <input id="refresh-limit" type="number" class="form-input" min="1" max="300" value="300" style="font-size:11px; padding:6px" title="Max quantity (300/day/user)" />
+      <!-- Limit input REMOVIDO. Cap fijo 75 por tirada (decisión user 2026-05-08).
+           El cap diario sigue en 300 (acumulado de varias tiradas). -->
+      <input id="refresh-limit" type="hidden" value="75" />
     </div>
-    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday</button>
+    <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Each search brings up to <strong>75 domains</strong> (per-batch cap). Daily cap: 300/user.</div>
+    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday (max 75)</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
   </section>
 
@@ -889,9 +892,9 @@
     <div style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:#fff7ed;border:1px solid #fb923c;border-radius:6px">
       <div>
         <div style="font-size:12px;font-weight:700">📥 AUTO IMPORT</div>
-        <div style="font-size:10px;color:#92400e;margin-top:2px">Procesa la cola de URLs (External CSV + Monday URL). Independiente del Autopilot de Prospects.</div>
+        <div style="font-size:10px;color:#92400e;margin-top:2px">Processes the URL queue (External CSV + Monday URL). Independent of the Prospects Autopilot.</div>
       </div>
-      <label class="toggle-switch" title="Procesa la cola de URLs cargadas (CSV externo + Monday URL refresh). Es totalmente independiente del Autopilot que descubre desde Majestic.">
+      <label class="toggle-switch" title="Processes the queue of uploaded URLs (External CSV + Monday URL refresh). Fully independent of the Autopilot that discovers from Majestic.">
         <input id="csv-queue-enabled" type="checkbox" />
         <span class="toggle-slider"></span>
       </label>
