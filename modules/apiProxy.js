@@ -31,8 +31,23 @@ const FLUSH_EVERY_MS  = 30_000; // persiste como mucho cada 30s
 const FLUSH_EVERY_HITS = 10;    // o cada 10 hits, lo que ocurra antes
 let _hitsSinceFlush = 0;
 
+// Período de facturación: ciclo del 6 al 6 (NO calendario natural).
+// Si hoy es ≥ día 6 → período empieza este mes-6. Si es < día 6 → empezó el
+// mes pasado-6. Devuelve string "YYYY-MM-DD" del primer día del ciclo.
+// Decisión user 2026-05-08: el RapidAPI plan se factura el día 6, alinear cap
+// con la facturación real.
 function currentPeriod() {
-  return new Date().toISOString().slice(0, 7); // YYYY-MM
+  const now = new Date();
+  const day = now.getDate();
+  const y = now.getFullYear();
+  const m = now.getMonth(); // 0-indexed
+  const cycleStart = day >= 6
+    ? new Date(y, m, 6)
+    : new Date(y, m - 1, 6);
+  const yyyy = cycleStart.getFullYear();
+  const mm   = String(cycleStart.getMonth() + 1).padStart(2, "0");
+  const dd   = "06";
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 async function _readConfigKeys(keys) {

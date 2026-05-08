@@ -589,13 +589,25 @@ async function getRapidApiUsageThisMonth(token) {
     const map  = {};
     if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
 
-    const period      = new Date().toISOString().slice(0, 7); // YYYY-MM
+    const period      = _billingCyclePeriod();
     const storedPer   = map.rapidapi_calls_month_period || "";
     const storedCount = parseInt(map.rapidapi_calls_month || "0", 10);
     const limit       = parseInt(map.rapidapi_monthly_limit || "40000", 10);
     const usedThisMonth = storedPer === period ? storedCount : 0;
     return { usedThisMonth, limit, period };
-  } catch { return { usedThisMonth: 0, limit: 40000, period: new Date().toISOString().slice(0, 7) }; }
+  } catch { return { usedThisMonth: 0, limit: 40000, period: _billingCyclePeriod() }; }
+}
+
+// Período de facturación 6→6 (alineado al billing real de RapidAPI plan PRO).
+function _billingCyclePeriod() {
+  const now = new Date();
+  const day = now.getDate();
+  const cycleStart = day >= 6
+    ? new Date(now.getFullYear(), now.getMonth(), 6)
+    : new Date(now.getFullYear(), now.getMonth() - 1, 6);
+  const yyyy = cycleStart.getFullYear();
+  const mm   = String(cycleStart.getMonth() + 1).padStart(2, "0");
+  return `${yyyy}-${mm}-06`;
 }
 
 async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {

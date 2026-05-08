@@ -1086,6 +1086,9 @@ window.notifyUserOk    = (msg) => { try { showToast(msg, "ok"); } catch {} };
 window.notifyUserWarn  = (msg) => { try { showToast(msg, "warn"); } catch {} };
 
 // ---- RapidAPI footer counter (siempre visible) ----
+// Counter SHARED entre todos los MBs (lee desde Supabase toolbar_config).
+// Período de facturación: 6 al 6 (alineado al billing real de RapidAPI plan PRO).
+// Reset automático cuando entra un nuevo período.
 function renderRapidApiFooterCounter({ used, limit, period } = {}) {
   const el = document.getElementById("rapidapi-monthly-counter");
   if (!el || used == null || limit == null) return;
@@ -1095,7 +1098,7 @@ function renderRapidApiFooterCounter({ used, limit, period } = {}) {
   else if (pct >= 80) el.classList.add("usage-danger");
   else if (pct >= 50) el.classList.add("usage-warning");
   el.textContent = `SW: ${used.toLocaleString()} / ${limit.toLocaleString()}`;
-  el.title = `SimilarWeb este mes (${period || "—"}): ${used.toLocaleString()} hits de ${limit.toLocaleString()} (${pct.toFixed(1)}%). Compará con tu dashboard de RapidAPI.`;
+  el.title = `SimilarWeb cycle (${period || "—"} → next 6th): ${used.toLocaleString()} hits of ${limit.toLocaleString()} (${pct.toFixed(1)}%). Shared across all team MBs. Compare with your RapidAPI dashboard.`;
 }
 
 // ---- RapidAPI monthly usage banner (3 niveles: 50% / 80% / 100%) ----
