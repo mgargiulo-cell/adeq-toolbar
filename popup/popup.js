@@ -9,7 +9,7 @@ import { runAudit }                                                             
 import { generatePitch }                                                                     from "../modules/gemini.js";
 // (geminiSearch.searchEmailsWithGemini removido — no se usa en popup, solo en scraper.js)
 import { verifyEmail, verifyEmailDeep, isGarbageEmail }                                         from "../modules/emailVerifier.js";
-import { runCascade, getSimilarSites }                                                         from "../modules/cascade.js";
+import { runCascade }                                                                          from "../modules/cascade.js";
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
 import { saveHistory, loadHistory, clearHistory, saveSendDate,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,

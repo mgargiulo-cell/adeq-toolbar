@@ -11,6 +11,11 @@ import { callProxy }                           from "./apiProxy.js";
  * Obtiene sitios similares a un dominio.
  * Primero consulta caché de 60 días, si no hay hace la llamada real.
  */
+// ⚠️ DEPRECATED — esta función gasta 1 hit RapidAPI por dominio. Hoy NO se llama
+// desde ningún lado (cascade usa solo getSimilarSitesFromSimilarSites que es
+// scrape gratis). Mantengo la función exportada por si en futuro se quiere
+// reactivar enrichment opcional, pero NO importarla sin necesidad porque
+// si se llama, suma al counter SW.
 export async function getSimilarSites(domain) {
   const clean = domain.replace(/^www\./, "").toLowerCase();
 
