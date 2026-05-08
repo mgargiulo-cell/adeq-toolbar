@@ -986,20 +986,32 @@ export async function clearCsvQueue(accessToken, onlyProcessed = false) {
   }
 }
 
-export async function getCsvQueueEnabled(accessToken) {
+export async function getCsvQueueState(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_config?key=eq.csv_queue_enabled&select=value`,
+      `${url}/rest/v1/toolbar_config?key=in.(csv_queue_enabled,csv_queue_session_user,csv_queue_session_start)&select=key,value`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     const rows = await res.json();
-    return rows?.[0]?.value === "true";
-  } catch { return false; }
+    const map  = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+    return {
+      enabled:      map.csv_queue_enabled === "true",
+      sessionUser:  map.csv_queue_session_user || "",
+      sessionStart: map.csv_queue_session_start ? new Date(map.csv_queue_session_start) : null,
+    };
+  } catch { return { enabled: false, sessionUser: "", sessionStart: null }; }
 }
 
-export async function setCsvQueueEnabled(enabled, accessToken) {
+// Backwards-compat: muchas partes del código solo necesitan el bool.
+export async function getCsvQueueEnabled(accessToken) {
+  const st = await getCsvQueueState(accessToken);
+  return st.enabled;
+}
+
+export async function setCsvQueueEnabled(enabled, accessToken, userEmail = "") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   try {
@@ -1008,6 +1020,23 @@ export async function setCsvQueueEnabled(enabled, accessToken) {
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ value: enabled ? "true" : "false" }),
     });
+    // Mutex: registrar quién prendió + timestamp para que otros MBs vean el lock
+    if (enabled && userEmail) {
+      const upsert = (k, v) => fetch(`${url}/rest/v1/toolbar_config`, {
+        method: "POST",
+        headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ key: k, value: v }),
+      });
+      await upsert("csv_queue_session_user", userEmail);
+      await upsert("csv_queue_session_start", new Date().toISOString());
+    } else if (!enabled) {
+      // Al apagar, limpiar el lock
+      await fetch(`${url}/rest/v1/toolbar_config?key=eq.csv_queue_session_user`, {
+        method: "PATCH",
+        headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ value: "" }),
+      });
+    }
   } catch (e) {
     console.warn("setCsvQueueEnabled failed:", e.message);
   }

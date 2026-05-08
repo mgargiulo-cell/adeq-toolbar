@@ -4488,14 +4488,47 @@ async function initCsvQueue() {
   };
   const stopHeartbeat = () => { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } };
 
-  // Estado inicial del toggle
-  enabledCbx.checked = await getCsvQueueEnabled(state.accessToken);
+  // Estado inicial del toggle + mutex check
+  const refreshCsvMutex = async () => {
+    const st = await import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => null);
+    if (!st) return;
+    enabledCbx.checked = st.enabled;
+    const isMine = st.sessionUser && st.sessionUser.toLowerCase() === (state.loginEmail || "").toLowerCase();
+    const otherActive = st.enabled && st.sessionUser && !isMine;
+    // UI lock cuando otro user lo tiene activo
+    enabledCbx.disabled = otherActive;
+    let badge = document.getElementById("csv-queue-lock-badge");
+    if (otherActive) {
+      if (!badge) {
+        badge = document.createElement("div");
+        badge.id = "csv-queue-lock-badge";
+        badge.style.cssText = "font-size:10px;color:#991b1b;background:rgba(239,68,68,0.12);border:1px solid #ef4444;border-radius:4px;padding:3px 6px;margin-top:6px";
+        enabledCbx.closest("div").parentElement?.appendChild(badge);
+      }
+      const ownerShort = st.sessionUser.split("@")[0];
+      badge.textContent = `🔒 Locked by ${ownerShort}. Solo ese user puede apagar este toggle.`;
+    } else {
+      badge?.remove();
+    }
+  };
+  await refreshCsvMutex();
   if (enabledCbx.checked) startHeartbeat();
   enabledCbx.addEventListener("change", async () => {
-    await setCsvQueueEnabled(enabledCbx.checked, state.accessToken);
+    // Pre-check mutex antes de tocar
+    const st = await import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => null);
+    if (st && st.enabled && st.sessionUser
+        && st.sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()) {
+      alert(`🔒 ${st.sessionUser} prendió Auto Import. Solo ese usuario puede apagarlo.`);
+      enabledCbx.checked = true; // forzar a quedar visualmente ON
+      return;
+    }
+    await setCsvQueueEnabled(enabledCbx.checked, state.accessToken, state.loginEmail);
     if (enabledCbx.checked) startHeartbeat();
     else stopHeartbeat();
+    await refreshCsvMutex();
   });
+  // Polling cada 30s para refrescar el lock badge si otro MB cambia el toggle
+  setInterval(refreshCsvMutex, 30_000);
 
   refreshBtn.addEventListener("click", refreshStats);
   historyRefresh?.addEventListener("click", refreshHistory);
