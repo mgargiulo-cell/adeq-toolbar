@@ -25,7 +25,7 @@ const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
 const DOMAIN_DELAY_MS  = 2500;
-const MIN_TRAFFIC      = 350_000;  // pageViews mínimos (visits × pagesPerVisit) — debajo de esto el dominio se descarta sin enriquecer.
+const MIN_TRAFFIC      = 400_000;  // pageViews mínimos (visits × pagesPerVisit) — debajo de esto el dominio se descarta sin enriquecer. (User 2026-05-08: filtro fijo +400K)
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";

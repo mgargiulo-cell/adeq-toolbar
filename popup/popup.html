@@ -251,33 +251,8 @@
         <option value="business">💼 Business</option>
       </select>
     </div>
-    <div>
-      <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px">Min Traffic</div>
-      <select id="autopilot-target-traffic" class="form-select" style="font-size:11px">
-        <option value="400000">Any (+400K)</option>
-        <option value="500000">+500K</option>
-        <option value="1000000">+1M</option>
-        <option value="1500000">+1.5M</option>
-        <option value="2000000">+2M</option>
-        <option value="2500000">+2.5M</option>
-        <option value="3000000">+3M</option>
-        <option value="3500000">+3.5M</option>
-        <option value="4000000">+4M</option>
-        <option value="4500000">+4.5M</option>
-        <option value="5000000">+5M</option>
-        <option value="5500000">+5.5M</option>
-        <option value="6000000">+6M</option>
-        <option value="6500000">+6.5M</option>
-        <option value="7000000">+7M</option>
-        <option value="7500000">+7.5M</option>
-        <option value="8000000">+8M</option>
-        <option value="8500000">+8.5M</option>
-        <option value="9000000">+9M</option>
-        <option value="9500000">+9.5M</option>
-        <option value="10000000">+10M</option>
-        <option value="10000001">+10M+</option>
-      </select>
-    </div>
+    <!-- Min Traffic select REMOVIDO. Threshold fijo en 350K pageViews,
+         hardcoded en MIN_TRAFFIC del worker (decisión user 2026-05-08). -->
   </div>
   <div style="display:flex;justify-content:space-between;align-items:center">
     <span id="autopilot-target-current" style="font-size:10px;color:var(--text-muted)"></span>

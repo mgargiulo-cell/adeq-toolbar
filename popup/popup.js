@@ -1945,7 +1945,7 @@ async function runTrafficCheck() {
     }
 
     const trafficForFilter = state.traffic || state.visits;
-    filterEl.textContent = passesTrafficFilter(trafficForFilter) ? "✅ Supera umbral 350K" : "❌ Bajo umbral 350K — no enriquecer";
+    filterEl.textContent = passesTrafficFilter(trafficForFilter) ? "✅ Supera umbral 400K" : "❌ Bajo umbral 400K — no enriquecer";
     filterEl.className   = `filter-tag ${passesTrafficFilter(trafficForFilter) ? "pass" : "fail"}`;
 
     if (passesTrafficFilter(trafficForFilter)) {
@@ -2160,14 +2160,40 @@ async function runEmailScraper() {
     // Si ya tenemos emails en caché de sesión (misma visita al dominio), usarlos
     // Igualmente re-scrapeamos la página actual para no perdernos emails de subpáginas
     const sess = await getSessionCache(state.domain);
-    // Only scrape the page DOM automatically (free + no external leak).
-    // Informer/WhoIs are paid third-parties that leak the visited domain — run only on-demand via Apollo/Gemini buttons.
-    const pageEmails = await scrapeEmailsFromPage(state.tabId);
+    // Page scrape (free) + Apollo (paid pero auto, decisión user 2026-05-08:
+    // mostrar al menos 2 emails de Apollo por default sin necesidad de click).
+    // Apollo se cachea en session, así que re-visitar subpáginas no re-paga.
     state.emails = []; state.emailSources = new Map();
     addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail), "Cache");
-    addEmailsWithSource(pageEmails.filter(quickValidateEmail),           "Page");
-    const allEmails = state.emails;
 
+    const [pageEmails, apolloResult] = await Promise.all([
+      scrapeEmailsFromPage(state.tabId),
+      // Si la cache de sesión ya tiene Apollo emails, no re-disparar
+      (sess?.apolloPreloaded)
+        ? Promise.resolve(null)
+        : findDecisionMakerViaApollo(state.domain).catch(() => null),
+    ]);
+    addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page");
+
+    // Apollo: agregar los unlocked al pool + render preview
+    if (apolloResult) {
+      const unlockedEmails = (apolloResult.people || []).filter(p => p.unlocked && p.email).map(p => p.email);
+      if (unlockedEmails.length) {
+        addEmailsWithSource(unlockedEmails, "Apollo");
+      }
+      if (apolloResult.name)     state.decisionMakerName = apolloResult.name.split(" ")[0];
+      if (apolloResult.linkedin) showLinkedIn(apolloResult.linkedin);
+      // Pre-render Apollo people block (default 2 visible + ver más)
+      const apolloEl = document.getElementById("apollo-result");
+      if (apolloEl) renderApolloPeople(apolloEl, apolloResult);
+      // Persistir Apollo en session cache para subpáginas
+      try {
+        const cur = await getSessionCache(state.domain) || {};
+        await setSessionCache(state.domain, { ...cur, apolloPreloaded: true });
+      } catch {}
+    }
+
+    const allEmails = state.emails;
     if (allEmails.length > 0 || state.duplicate?.email) {
       renderEmailList(allEmails);
       autoPushReady.email = true;
@@ -2494,7 +2520,11 @@ function renderApolloPeople(resultEl, result) {
   }
 
   const summary = result.note || `${people.length} people`;
-  const rows = people.map((p, i) => {
+  // Por default muestra hasta 2 personas; el resto detrás de un "Ver más" toggle.
+  // Decisión user 2026-05-08: Apollo auto-trigger + preview de 2 emails por
+  // default sin click adicional.
+  const PREVIEW_COUNT = 2;
+  const renderRow = (p, i) => {
     const emailCell = p.unlocked
       ? `<a href="mailto:${esc(p.email)}" class="apollo-row-email">${esc(p.email)}</a>`
       : p.email
@@ -2513,14 +2543,28 @@ function renderApolloPeople(resultEl, result) {
         </div>
         <div class="apollo-row-email-cell">${emailCell}</div>
       </div>`;
-  }).join("");
+  };
+  const visibleRows = people.slice(0, PREVIEW_COUNT).map(renderRow).join("");
+  const hiddenRows  = people.slice(PREVIEW_COUNT).map(renderRow).join("");
+  const showMoreBtn = people.length > PREVIEW_COUNT
+    ? `<button class="apollo-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline;width:100%;text-align:left">+ ver ${people.length - PREVIEW_COUNT} más…</button>`
+    : "";
 
   resultEl.innerHTML = `
     <details class="apollo-details" open>
       <summary class="apollo-summary">👥 ${esc(summary)} <span class="apollo-toggle">click to toggle</span></summary>
-      <div class="apollo-list">${rows}</div>
+      <div class="apollo-list">
+        ${visibleRows}
+        ${hiddenRows ? `<div class="apollo-hidden" style="display:none">${hiddenRows}</div>` : ""}
+        ${showMoreBtn}
+      </div>
     </details>
   `;
+  // Wire show-more
+  resultEl.querySelector(".apollo-show-more")?.addEventListener("click", (e) => {
+    const block = resultEl.querySelector(".apollo-hidden");
+    if (block) { block.style.display = "block"; e.target.style.display = "none"; }
+  });
 
   // Reveal click handlers
   resultEl.querySelectorAll(".apollo-reveal-btn").forEach(btn => {
