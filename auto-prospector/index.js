@@ -2302,9 +2302,18 @@ async function main() {
       }
 
       if (Date.now() - sessionStart >= SESSION_LIMIT_MS) {
-        log("⏱ Sesión expirada (60 min) — auto-apagando.");
+        const minutesAgo = Math.round((Date.now() - sessionStart) / 60000);
+        log(`⏱ Sesión expirada (start hace ${minutesAgo}min, limit ${SESSION_LIMIT_MS/60000}min) — auto-apagando. El user debe re-prender el toggle.`);
         await setConfigValue(token, "auto_prospecting_enabled", "false");
         await setConfigValue(token, "auto_session_start", "");
+        // Marcar en auto_session_stats que la sesión expiró sin trabajar — la
+        // toolbar lo lee y muestra mensaje claro al user
+        await setConfigValue(token, "auto_session_stats", JSON.stringify({
+          processed: 0, added: 0, filtered: 0,
+          lastDomain: "(session expired before processing — toggle OFF/ON to restart)",
+          lastUpdate: Date.now(),
+          sessionUser: cfg.auto_session_user || "",
+        })).catch(() => {});
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
