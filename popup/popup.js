@@ -5703,7 +5703,7 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
-        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Buscar tráfico + emails frescos (Apollo + scraper)" style="padding:3px 7px;font-size:10px" ${(r.traffic && hasEmail) ? "style='display:none'" : ""}>🔍 Enriquecer</button>
+        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Buscar tráfico + emails frescos (Apollo + scraper)" style="padding:3px 7px;font-size:10px" ${(r.traffic && hasEmail) ? "style='display:none'" : ""}>🔍 Data</button>
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -5860,7 +5860,7 @@ function initProspectCard(card, data) {
         btn.disabled = false;
         btn.style.background = "";
         btn.style.color = "";
-        btn.textContent = "🔍 Enriquecer";
+        btn.textContent = "🔍 Data";
       }, 2500);
       return;
     }
@@ -5896,11 +5896,11 @@ function initProspectCard(card, data) {
         initProspectCard(newCard, data);
       } else {
         btn.textContent = "Sin más data";
-        setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Enriquecer"; }, 2000);
+        setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Data"; }, 2000);
       }
     } catch (err) {
       console.warn("[pcard enrich]", err);
-      btn.disabled = false; btn.textContent = "🔍 Enriquecer";
+      btn.disabled = false; btn.textContent = "🔍 Data";
     }
   });
 
