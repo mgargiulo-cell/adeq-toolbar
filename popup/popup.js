@@ -1707,6 +1707,13 @@ function initTabs() {
       }
     });
   });
+
+  // Banner global Railway muerto — corre siempre que el popup esté abierto.
+  // Solo aparece cuando autopilot/csv_queue ON + heartbeat > 5min stale.
+  pollRailwayDeadBanner();
+  setInterval(() => {
+    if (document.visibilityState !== "hidden") pollRailwayDeadBanner();
+  }, 30_000);
 }
 
 // ============================================================
@@ -5088,6 +5095,37 @@ function initPitchDrafts() {
   });
 }
 
+// Banner global rojo cuando un flag está ON pero Railway no late hace > 5 min.
+// NO auto-apaga el toggle (evita loops). Solo avisa.
+function renderRailwayDeadBanner({ heartbeatAt, autopilotEnabled, csvEnabled }) {
+  const flagOn = autopilotEnabled || csvEnabled;
+  const ageMs  = heartbeatAt ? (Date.now() - heartbeatAt.getTime()) : Infinity;
+  const dead   = flagOn && ageMs > 5 * 60_000;
+  let el = document.getElementById("railway-dead-banner");
+  if (!dead) { el?.remove(); return; }
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "railway-dead-banner";
+    el.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;font-size:12px;padding:8px 12px;text-align:center;border-bottom:2px solid #ef4444;cursor:pointer";
+    el.title = "Click para ocultar (volverá a aparecer en 30s si sigue caído)";
+    el.addEventListener("click", () => el.remove());
+    document.body.prepend(el);
+  }
+  const ageLabel = ageMs === Infinity ? "nunca" : (ageMs > 3600_000 ? `${Math.round(ageMs/3600_000)}h` : `${Math.round(ageMs/60_000)}m`);
+  const which = [autopilotEnabled && "Autopilot", csvEnabled && "Auto Import"].filter(Boolean).join(" + ");
+  el.textContent = `⚠️ ${which} ON pero Railway no responde hace ${ageLabel}. Apagá y volvé a prender el toggle, o revisá Railway dashboard.`;
+}
+
+async function pollRailwayDeadBanner() {
+  try {
+    const [{ enabled: autopilotEnabled, heartbeatAt }, csvSt] = await Promise.all([
+      getAutopilotState(state.accessToken),
+      import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => ({ enabled: false })),
+    ]);
+    renderRailwayDeadBanner({ heartbeatAt, autopilotEnabled, csvEnabled: !!csvSt?.enabled });
+  } catch {}
+}
+
 function renderRailwayHeartbeat(heartbeatAt) {
   const el = document.getElementById("railway-heartbeat");
   if (!el) return;
@@ -6487,6 +6525,21 @@ async function initProspectsTab() {
   // Clear all de Prospects ELIMINADO — el botón borraba TODA la cola compartida
   // del equipo (autopilot + Monday + manual). Riesgo demasiado alto. Si en algún
   // momento hace falta limpiar, el admin lo hace desde Supabase SQL Editor.
+
+  // Auto-refresh: si autopilot o csv_queue ON, recargar lista cada 30s
+  // para que prospects de Railway aparezcan progresivamente sin click manual.
+  setInterval(async () => {
+    if (document.visibilityState === "hidden") return;
+    const tab = document.getElementById("tab-prospects");
+    if (!tab?.classList.contains("active")) return;
+    try {
+      const [{ enabled: ap }, csvSt] = await Promise.all([
+        getAutopilotState(state.accessToken),
+        import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => ({ enabled: false })),
+      ]);
+      if (ap || csvSt?.enabled) await loadProspectsTab();
+    } catch {}
+  }, 30_000);
 }
 
 async function updateApiFooter() {
