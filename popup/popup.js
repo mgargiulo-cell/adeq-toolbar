@@ -5394,11 +5394,12 @@ async function loadProspectsTab() {
 
   const dateFilter   = document.getElementById("prospects-date-filter")?.value   || "";
   const sourceFilter = document.getElementById("prospects-source-filter")?.value || "";
+  const userFilter   = document.getElementById("prospects-user-filter")?.value   || "";
   let rows = [];
   let dailyCount = 0;
   try {
     [rows, dailyCount, _cachedProspectDrafts] = await Promise.all([
-      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter }),
+      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter, userFilter }),
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
     ]);
@@ -5543,6 +5544,20 @@ function renderProspectCard(r) {
             };
             const [icon, label, color] = badges[src] || badges.autopilot;
             return `<span title="Origen: ${label}" style="font-size:9px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 5px;flex-shrink:0">${icon} ${label}</span>`;
+          })()}
+          ${(() => {
+            // Badge del usuario que generó el item (autopilot o import). Mapea
+            // email a nombre corto: Maxi / Diego / Agus. Si no matchea, usa
+            // la parte antes del @.
+            const email = (r.created_by || "").toLowerCase();
+            if (!email) return "";
+            const userMap = {
+              "mgargiulo@adeqmedia.com": ["Maxi",  "#10b981"],
+              "dhorovitz@adeqmedia.com": ["Diego", "#a855f7"],
+              "sales@adeqmedia.com":     ["Agus",  "#ec4899"],
+            };
+            const [name, color] = userMap[email] || [email.split("@")[0], "#64748b"];
+            return `<span title="Origen del item: ${esc(email)}" style="font-size:9px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 5px;flex-shrink:0">👤 ${esc(name)}</span>`;
           })()}
           <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
              style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
@@ -6358,11 +6373,13 @@ async function refreshProspectsStats() {
 async function initProspectsTab() {
   // Restore filtros guardados de sesiones previas
   try {
-    const { _prospectsDateFilter, _prospectsSourceFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter"]);
+    const { _prospectsDateFilter, _prospectsSourceFilter, _prospectsUserFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter", "_prospectsUserFilter"]);
     const dateEl   = document.getElementById("prospects-date-filter");
     const sourceEl = document.getElementById("prospects-source-filter");
+    const userEl   = document.getElementById("prospects-user-filter");
     if (dateEl   && _prospectsDateFilter)   dateEl.value   = _prospectsDateFilter;
     if (sourceEl && _prospectsSourceFilter) sourceEl.value = _prospectsSourceFilter;
+    if (userEl   && _prospectsUserFilter)   userEl.value   = _prospectsUserFilter;
   } catch {}
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
@@ -6373,6 +6390,10 @@ async function initProspectsTab() {
   });
   document.getElementById("prospects-source-filter")?.addEventListener("change", async (e) => {
     chrome.storage.local.set({ _prospectsSourceFilter: e.target.value }).catch(() => {});
+    await loadProspectsTab();
+  });
+  document.getElementById("prospects-user-filter")?.addEventListener("change", async (e) => {
+    chrome.storage.local.set({ _prospectsUserFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
   // Clear all de Prospects ELIMINADO — el botón borraba TODA la cola compartida
