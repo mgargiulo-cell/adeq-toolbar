@@ -716,11 +716,20 @@ async function getRejectionPatterns(token) {
 
 // ── APIs externas ─────────────────────────────────────────────
 
+// Estados Monday que SE PUEDEN re-prospectar (autopilot + CSV pueden traerlos).
+// Cualquier otro estado bloquea el dominio (En Negociacion / Propuesta Vigente / etc).
+const REPROSPECTABLE_STATES = new Set(["Ciclo Finalizado", "Mail No Enviado"]);
+
 async function fetchMondayDomains(apiKey) {
+  // Trae name + estado y devuelve solo dominios cuyo estado NO es re-prospectable.
+  // Esos son los que el autopilot debe excluir del pool Majestic.
   const query = `{
     boards(ids: [1420268379]) {
       items_page(limit: 500) {
-        items { name }
+        items {
+          name
+          column_values(ids: ["deal_stage"]) { text }
+        }
       }
     }
   }`;
@@ -731,7 +740,13 @@ async function fetchMondayDomains(apiKey) {
   });
   const data = await res.json();
   const items = data?.data?.boards?.[0]?.items_page?.items || [];
-  return items.map(i => cleanDomain(i.name)).filter(Boolean);
+  return items
+    .filter(i => {
+      const estado = i.column_values?.[0]?.text || "";
+      return !REPROSPECTABLE_STATES.has(estado);
+    })
+    .map(i => cleanDomain(i.name))
+    .filter(Boolean);
 }
 
 // Retry helper — 3 attempts with exponential backoff for transient RapidAPI errors.
@@ -1524,9 +1539,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     match = await findMondayItem(domain, mondayApiKey);
     if (match) {
       // Existe en Monday — solo procesar si está en Ciclo Finalizado
-      if (match.estado !== "Ciclo Finalizado") {
+      if (!REPROSPECTABLE_STATES.has(match.estado)) {
         await markCsvItem(token, item.id, "skipped", {
-          error_message: `estado=${match.estado || "?"} (solo Ciclo Finalizado se re-prospecta)`,
+          error_message: `estado=${match.estado || "?"} (solo ${[...REPROSPECTABLE_STATES].join(" / ")} se re-prospecta)`,
           monday_item_id: match.id,
         });
         log(`  ⏭ ${domain} — ya está en Monday con estado "${match.estado}"`);
