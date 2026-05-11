@@ -2905,7 +2905,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_PITCH]:     payload.pitch_body || "",
   };
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
-    create_item (board_id: $board, item_name: $name, column_values: $cols) { id }
+    create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: true) { id }
   }`;
   const res = await fetch("https://api.monday.com/v2", {
     method: "POST",
@@ -2918,7 +2918,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
   });
   if (!res.ok) throw new Error(`Monday HTTP ${res.status}`);
   const data = await res.json();
-  if (data?.errors) throw new Error(`Monday errors: ${JSON.stringify(data.errors).slice(0,200)}`);
+  if (data?.errors) throw new Error(`Monday errors: ${JSON.stringify(data.errors).slice(0,500)}`);
   return data?.data?.create_item?.id || null;
 }
 
