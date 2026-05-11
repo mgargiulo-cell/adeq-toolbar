@@ -3157,7 +3157,7 @@ async function main() {
       let csvProcessed = 0;
       if (flags.csvQueue) {
         const cfgCsv = await getConfig(token);
-        csvProcessed = await runCsvQueue(token, cfgCsv, 50); // batch chico para poder alternar con autopilot
+        csvProcessed = await runCsvQueue(token, cfgCsv, 5); // batch micro para que agent + autopilot se intercalen entre tandas
         if (csvProcessed > 0) {
           // Hubo trabajo — volver al loop rápido (próxima iteración sigue con CSV o pasa a autopilot)
           await sleep(POLL_INTERVAL_MS);
