@@ -3287,8 +3287,8 @@ async function main() {
         const rows = await fres.json();
         const ts = rows?.[0]?.value;
         if (ts && new Date(ts).getTime() > _processStartedAt) {
-          log(`🔄 Force restart triggered at ${ts} — exiting for clean restart`);
-          process.exit(0);
+          log(`🔄 Force restart triggered at ${ts} — exiting (code 1) for Railway auto-restart`);
+          process.exit(1); // exit code 1 = Railway interpreta como crash y reinicia automático
         }
       } catch {}
 
