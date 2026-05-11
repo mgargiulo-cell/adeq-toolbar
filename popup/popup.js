@@ -1071,15 +1071,48 @@ function renderAdminChart(historial, from, to) {
 // ── Global toast helper para errores que antes iban silenciosos a console.
 //    Reemplaza el patrón console.warn() puro por un aviso visible al user.
 // Cierra cualquier modal visible al presionar Escape — UX estándar.
+// Y atajos de teclado para acciones frecuentes:
+//   Cmd/Ctrl+M  → Push to Monday
+//   Cmd/Ctrl+E  → Send via Gmail
+//   Cmd/Ctrl+G  → Generate pitch with Claude
 // Se setea una sola vez al cargar.
 if (typeof window !== "undefined" && !window._modalEscWired) {
   window._modalEscWired = true;
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape") return;
-    document.querySelectorAll(".modal").forEach(m => {
-      if (m.style.display && m.style.display !== "none") m.style.display = "none";
-    });
+    if (e.key === "Escape") {
+      document.querySelectorAll(".modal").forEach(m => {
+        if (m.style.display && m.style.display !== "none") m.style.display = "none";
+      });
+      return;
+    }
+    // Shortcuts requieren Cmd (Mac) o Ctrl (Win/Linux). Skip si user está
+    // tipeando en input/textarea (excepto Cmd+Enter para submit).
+    if (!(e.metaKey || e.ctrlKey)) return;
+    const tag = (e.target?.tagName || "").toLowerCase();
+    const inField = tag === "input" || tag === "textarea" || e.target?.isContentEditable;
+    const key = e.key.toLowerCase();
+    let btn = null;
+    if (key === "m" && !inField) btn = document.getElementById("btn-push-monday");
+    else if (key === "e" && !inField) btn = document.getElementById("btn-send-gmail");
+    else if (key === "g" && !inField) btn = document.getElementById("btn-pitch-generate") || document.getElementById("btn-autopush-prepare");
+    if (btn && !btn.disabled) {
+      e.preventDefault();
+      btn.click();
+      btn.style.outline = "2px solid #fbbf24";
+      setTimeout(() => { btn.style.outline = ""; }, 400);
+    }
   });
+}
+
+// Anti-flicker helper para botones: garantiza que el "loading state" dure al
+// menos 350ms aunque la operación termine antes. Evita el parpadeo
+// "⏳... ↻" que confunde al user porque no llega a leer.
+async function withMinDuration(promise, minMs = 350) {
+  const start = Date.now();
+  const result = await promise;
+  const elapsed = Date.now() - start;
+  if (elapsed < minMs) await new Promise(r => setTimeout(r, minMs - elapsed));
+  return result;
 }
 
 function showToast(message, kind = "info", durationMs) {
@@ -1369,7 +1402,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   state.url    = tab.url;
   state.domain = extractDomain(tab.url);
 
-  document.getElementById("site-url").textContent = state.domain;
+  const _siteUrlEl = document.getElementById("site-url");
+  _siteUrlEl.textContent = state.domain;
+  _siteUrlEl.title = state.domain; // tooltip por si está truncado por ellipsis
   document.getElementById("cascade-seed").value   = state.domain;
 
   // Auto-refresh on URL change (side panel queda abierto al navegar):
@@ -2684,7 +2719,42 @@ async function ragSavePitchFeedback(action, pitchBody, pitchSubject, ctxFields) 
   }
 }
 
+// Auto-save del pitch text en chrome.storage.local (debounce 3s).
+// Persiste por dominio. Si el user cierra la toolbar antes de mandar,
+// al volver al mismo dominio se restaura el draft.
+let _pitchDraftTimer = null;
+function _autoSavePitchDraft() {
+  const ta = document.getElementById("pitch-text");
+  if (!ta || !state.domain) return;
+  clearTimeout(_pitchDraftTimer);
+  _pitchDraftTimer = setTimeout(() => {
+    const v = ta.value;
+    if (!v || v.trim().length < 20) return; // no guardar drafts triviales
+    chrome.storage.local.set({ [`_draft_pitch_${state.domain}`]: { body: v, ts: Date.now() } }).catch(() => {});
+  }, 3000);
+}
+async function _restorePitchDraft() {
+  const ta = document.getElementById("pitch-text");
+  if (!ta || !state.domain || ta.value) return; // no pisar pitch ya generado
+  try {
+    const key = `_draft_pitch_${state.domain}`;
+    const { [key]: draft } = await chrome.storage.local.get(key);
+    if (!draft?.body) return;
+    // TTL 7d — drafts viejos se descartan
+    if (Date.now() - (draft.ts || 0) > 7 * 86_400_000) {
+      chrome.storage.local.remove(key).catch(() => {});
+      return;
+    }
+    ta.value = draft.body;
+    showToast(`📝 Draft restaurado para ${state.domain} (${Math.round((Date.now() - draft.ts) / 60000)}m atrás)`, "info");
+  } catch {}
+}
+
 async function bindButtons() {
+
+  // Auto-save draft del pitch (debounce 3s) + restore al cargar
+  document.getElementById("pitch-text")?.addEventListener("input", _autoSavePitchDraft);
+  _restorePitchDraft();
 
   // Verificar email
   // btn-verify-email REMOVIDO — la verificación es automática on-render (autoVerifyEmailChips)
@@ -6853,6 +6923,46 @@ async function initProspectsTab() {
     chrome.storage.local.set({ _prospectsUserFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
+  // ── Filter presets: combos rápidos de un click ──────────
+  document.querySelectorAll(".prospects-preset").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const preset = btn.dataset.preset;
+      const dateEl   = document.getElementById("prospects-date-filter");
+      const sourceEl = document.getElementById("prospects-source-filter");
+      const userEl   = document.getElementById("prospects-user-filter");
+      const myEmail  = (state.loginEmail || "").toLowerCase();
+      switch (preset) {
+        case "mine7":
+          if (dateEl)   dateEl.value   = "last7";
+          if (sourceEl) sourceEl.value = "";
+          if (userEl)   userEl.value   = TEAM_EMAILS.find(e => e.toLowerCase() === myEmail) || "";
+          break;
+        case "all-today":
+          if (dateEl)   dateEl.value   = "today";
+          if (sourceEl) sourceEl.value = "";
+          if (userEl)   userEl.value   = "";
+          break;
+        case "all-time":
+          if (dateEl)   dateEl.value   = "";
+          if (sourceEl) sourceEl.value = "";
+          if (userEl)   userEl.value   = "";
+          break;
+        case "autopilot-only":
+          if (dateEl)   dateEl.value   = "last7";
+          if (sourceEl) sourceEl.value = "autopilot";
+          if (userEl)   userEl.value   = "";
+          break;
+      }
+      // Persistir + recargar
+      chrome.storage.local.set({
+        _prospectsDateFilter:   dateEl?.value || "",
+        _prospectsSourceFilter: sourceEl?.value || "",
+        _prospectsUserFilter:   userEl?.value || "",
+      }).catch(() => {});
+      await loadProspectsTab();
+    });
+  });
+
   // ── Bulk actions: checkbox selection + reject masivo ──────────
   // Validate masivo NO se ofrece: cada lead requiere chequear email/pitch/tráfico
   // antes de enviar. Reject sí porque es seguro y el caso más común (descartar
