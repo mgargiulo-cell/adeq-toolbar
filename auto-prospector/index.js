@@ -2679,7 +2679,17 @@ async function runAgentCycle(token, allFlags) {
     return; // silencioso
   }
 
+  // Whitelist HARDCODED de users autorizados a usar el agent.
+  // Defense-in-depth: aunque alguien cambie agent_enabled_users en config,
+  // el worker solo procesa users de esta lista. Para agregar un user:
+  // editar este Set + UI + RLS policy.
+  const AGENT_WHITELIST = new Set(["mgargiulo@adeqmedia.com"]);
+
   for (const userEmail of allFlags.agentUsers) {
+    if (!AGENT_WHITELIST.has((userEmail || "").toLowerCase())) {
+      log(`🚫 Agent: user ${userEmail} no está en whitelist hardcoded — skip`);
+      continue;
+    }
     // Kill switch check
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
     // Daily cap
