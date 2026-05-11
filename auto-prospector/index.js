@@ -2680,6 +2680,29 @@ Write the prospecting email. Return JSON only.`;
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
 const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|security|domain-abuse|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints)@/i;
+
+// Score email por probabilidad de ser un buen contacto. Más alto = mejor.
+// Garbage ya filtrado antes de llegar acá.
+function scoreEmail(email, siteDomain) {
+  if (!email || !email.includes("@")) return -1;
+  const [local, dom] = email.toLowerCase().split("@");
+  let score = 0;
+  // Roles comerciales / editoriales (target ideal de outreach)
+  if (/^(marketing|comercial|business|partnerships|partner|ads|advertising|publicidad|monetiza|ventas|sales|bd|director|gerente|manager|jefe|head)/.test(local)) score += 80;
+  if (/^(editor|redacao|redaccion|redazione|writer|periodista|journalist)/.test(local)) score += 60;
+  // Nombre personal (first.last o first_last) muy probable persona real
+  if (/^[a-z]+[._-][a-z]+/.test(local)) score += 70;
+  // Solo nombre corto sin dots — puede ser persona o role genérico
+  else if (/^[a-z]{3,15}$/.test(local)) score += 30;
+  // Roles genéricos OK pero menos efectivos
+  if (/^(info|contact|contacto|hello|hi|hola|support|soporte)$/.test(local)) score += 20;
+  // Dominio del sitio matchea (no proxy random)
+  const cleanSite = (siteDomain || "").replace(/^www\./, "");
+  if (dom === cleanSite || dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom)) score += 30;
+  // Email free webmail = penalizar (no es corporativo)
+  if (/^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex)\./.test(dom)) score -= 30;
+  return score;
+}
 const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|enom\.|networksolutions|tucows/i;
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
@@ -3082,8 +3105,15 @@ async function runAgentCycle(token, allFlags) {
           } catch (e) { log(`  ⚠️ on-the-fly Apollo ${domain}: ${e.message}`); }
         }
 
-        // Re-pickear el email best-candidate después del enrichment
-        const email = emails.find(e => e && /\@/.test(e));
+        // Re-pickear el MEJOR email después del enrichment (score-based, no first-match)
+        const scored = emails
+          .map(e => ({ email: e, score: scoreEmail(e, domain) }))
+          .filter(x => x.score >= 0)
+          .sort((a, b) => b.score - a.score);
+        const email = scored[0]?.email;
+        if (email && scored.length > 1) {
+          log(`  ✉️ ${domain}: pickeado ${email} (score=${scored[0].score}) de ${scored.length} candidatos`);
+        }
         if (!email) {
           await logAgentAction(token, userEmail, {
             domain, action: "skipped", reason: "no_email_after_enrichment",
