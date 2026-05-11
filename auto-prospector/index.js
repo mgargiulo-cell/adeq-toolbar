@@ -3001,30 +3001,73 @@ async function runAgentCycle(token, allFlags) {
     for (const lead of fresh) {
       if (processed >= batchSize) break;
       const domain = lead.domain;
-      const emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
-      // Pickear el primer email candidato (cualquiera con @). El scoring real es abajo.
-      const email = emails.find(e => e && /\@/.test(e));
-
-      if (!email) {
-        await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "no_email_at_all" });
-        continue;
-      }
+      let emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
+      let leadTraffic = leadTraffic || 0;
+      let leadGeo = leadGeo || "";
 
       try {
-        // NOTA: NO chequeamos Monday acá. Los filtros upstream (autopilot,
-        // CSV, Monday refresh) ya bloquean dominios en estado activo. Una
-        // vez que el agente procesa un lead, lo marca status=validated y
-        // no se vuelve a leer. Re-procesar requeriría que alguien cree un
-        // nuevo row, lo cual upstream ya bloquea. Ahorro 1 Monday call/lead.
+        // ── ENRICHMENT ON-THE-FLY (igual que el botón Data del MB humano) ──
+        // Si falta data, intentamos traerla AHORA antes de descartar el lead.
+        // Cache 90d (traffic) + 7d (Apollo) → la mayoría son hits gratis.
 
-        // 1. EMAIL SCORE — verifica antes de gastar Claude/template
-        // 🔴 red = skip, 🟡 yellow = manda igual (es lo mejor que hay), 🟢 green = ideal
+        // 1a. Si NO hay traffic, fetchear getTrafficData
+        if (!leadTraffic || leadTraffic <= 0) {
+          if (cfg.rapidapi_key) {
+            try {
+              const td = await getTrafficData(domain, cfg.rapidapi_key);
+              if (td?.visits > 0) {
+                leadTraffic = td.visits;
+                if (!leadGeo && td.topCountry) leadGeo = td.topCountry;
+                // Persistir para futuros runs
+                await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+                  method: "PATCH",
+                  headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+                  body: JSON.stringify({ traffic: leadTraffic, geo: leadGeo || undefined }),
+                });
+                log(`  🔄 ${domain}: traffic on-the-fly → ${leadTraffic} (${leadGeo})`);
+              }
+            } catch (e) { log(`  ⚠️ on-the-fly traffic ${domain}: ${e.message}`); }
+          }
+        }
+
+        // 1b. Si NO hay email decente, dispara Apollo (cache 7d)
+        const hasGoodEmail = emails.some(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e));
+        if (!hasGoodEmail && cfg.apollo_api_key) {
+          try {
+            const apolloEmails = await findAllEmails(domain, cfg.apollo_api_key, token);
+            if (Array.isArray(apolloEmails) && apolloEmails.length > 0) {
+              const newEmails = [...new Set([...emails, ...apolloEmails])];
+              emails = newEmails;
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+                method: "PATCH",
+                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+                body: JSON.stringify({ emails: newEmails }),
+              });
+              log(`  🔄 ${domain}: Apollo on-the-fly → +${apolloEmails.length} emails`);
+            }
+          } catch (e) { log(`  ⚠️ on-the-fly Apollo ${domain}: ${e.message}`); }
+        }
+
+        // Re-pickear el email best-candidate después del enrichment
+        const email = emails.find(e => e && /\@/.test(e));
+        if (!email) {
+          await logAgentAction(token, userEmail, {
+            domain, action: "skipped", reason: "no_email_after_enrichment",
+            details: { traffic: leadTraffic, geo: leadGeo },
+          });
+          continue;
+        }
+
+        // NOTA: NO chequeamos Monday acá. Los filtros upstream ya lo cubren.
+
+        // 2. EMAIL SCORE — verifica antes de gastar Claude/template
+        // 🔴 red = skip, 🟡 yellow = manda igual, 🟢 green = ideal
         const emailScore = await scoreEmail(email);
         if (emailScore.color === "red") {
           await logAgentAction(token, userEmail, {
             domain, action: "skipped",
             reason: `email_red_${emailScore.reason}`,
-            details: { email },
+            details: { email, traffic: leadTraffic },
           });
           continue;
         }
@@ -3036,7 +3079,7 @@ async function runAgentCycle(token, allFlags) {
         if (source === "claude") {
           // Variedad estilística — A/B test futuro
           pitch = await generatePitchAgent(token, {
-            domain, traffic: lead.traffic, geo: lead.geo, language: lead.language || "en",
+            domain, traffic: leadTraffic, geo: leadGeo, language: lead.language || "en",
             category: lead.category, contactName: lead.contact_name,
             adNetworks: lead.ad_networks,
           });
@@ -3056,7 +3099,7 @@ async function runAgentCycle(token, allFlags) {
           // Template (80% de los casos) — sin costo Claude
           const tpl = pickRandomTemplate(lead.language);
           pitch = fillTemplate(tpl, {
-            domain, geo: lead.geo, traffic: lead.traffic,
+            domain, geo: leadGeo, traffic: leadTraffic,
           });
         }
 
@@ -3079,7 +3122,7 @@ async function runAgentCycle(token, allFlags) {
         let mondayItemId = null;
         try {
           mondayItemId = await pushToMondayServer(mondayApiKey, {
-            domain, email, geo: lead.geo, traffic_text: `${Math.round(lead.traffic/1000)}K`,
+            domain, email, geo: leadGeo, traffic_text: `${Math.round(leadTraffic/1000)}K`,
             pitch_body: pitch.body, idioma_idx: ({ en:0, es:1, it:2, pt:3, ar:6 })[lead.language] ?? 0,
             monday_user_id: mondayUserId,
             estado_idx: 3, // Propuesta Vigente (T)
@@ -3092,7 +3135,7 @@ async function runAgentCycle(token, allFlags) {
           await logAgentAction(token, userEmail, {
             domain, action: "sent", reason: "sent_but_monday_failed",
             pitch_subject: subject,
-            details: { email, traffic: lead.traffic, geo: lead.geo, language: lead.language, monday_error: mondayErr.message?.substring(0, 200) },
+            details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language, monday_error: mondayErr.message?.substring(0, 200) },
           });
           // Igual marcamos sendtrack + review_queue para no re-mandar
         }
@@ -3121,8 +3164,8 @@ async function runAgentCycle(token, allFlags) {
               email,
               email_score: emailScore.color,
               source,                  // "template" | "claude" — para A/B futuro
-              traffic: lead.traffic,
-              geo: lead.geo,
+              traffic: leadTraffic,
+              geo: leadGeo,
               language: lead.language,
             },
           });
