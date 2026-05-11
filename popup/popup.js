@@ -6061,11 +6061,10 @@ async function loadProspectsTab() {
     return;
   }
 
-  // Mix puro al azar PER-MB: cada navegador hace shuffle propio + sample 100.
-  // Si el pool tiene >100, cada MB ve subset distinto (no solo orden).
-  // Si tiene <=100, ven los mismos pero en orden distinto.
-  // Resultado: Maxi puede tener 'eldeportivo.com' arriba mientras Diego no
-  // lo ve para nada → paralelización natural sin colisiones.
+  // Mix puro: traemos hasta 500 del pool, shuffleamos y mostramos 100.
+  // Resultado: cada MB ve 100 leads aleatorios de TODO el pool — no quedan
+  // pegados los últimos 100 importados de Brasil (o lo que sea) juntos.
+  // El "buzón" siempre es un mix del histórico pending.
   const VISIBLE_CAP = 100;
   const shuffled = [...rows];
   for (let i = shuffled.length - 1; i > 0; i--) {
