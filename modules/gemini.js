@@ -82,7 +82,7 @@ Hemos hablado algunas veces en el pasado, pero nunca llegamos a implementar. Me 
 ¿Cómo lo ves?"
 
 Email 2 (Spanish, geo-specific traffic angle):
-"Hola, espero que estes muy bien. Te cuento que estamos buscando tráfico de nigeria porque venimos obteniendo muy buenos resultados con distintas demandas, tanto en display como en video. Viendo tu sitio creo que podemos replicar el mismo esquema y sacar un extra en la monetización. Trabajamos con un revshare 80-20 a tu favor y no tenemos ataduras comerciales. Me gustaría que nos puedan probar y sacar sus conclusiones sabiendo que estamos sumando nuevas campañas en el comienzo de Abril. ¿Qué te parece?"
+"Hola, espero que estes muy bien. Te cuento que estamos buscando tráfico de nigeria porque venimos obteniendo muy buenos resultados con distintas demandas, tanto en display como en video. Viendo tu sitio creo que podemos replicar el mismo esquema y sacar un extra en la monetización. Trabajamos con un revshare 80-20 a tu favor y no tenemos ataduras comerciales. Me gustaría que nos puedan probar y sacar sus conclusiones sabiendo que estamos sumando nuevas campañas. ¿Qué te parece?"
 
 Email 3 (Spanish, follow-up / no response):
 "Hola, ¿cómo estás? ¿Tuviste la oportunidad de ver mi correo? Me gustaría recibir tu feedback. Te escribo nuevamente porque estamos obteniendo muy buenos resultados y me gustaría que puedan probarlo, teniendo en cuenta que no tenemos ataduras comerciales y que nuestro objetivo es generar ingresos adicionales para el sitio. Avisame si tenés alguna reserva sobre algún formato o si tenés prioridad en algunas posiciones que te gustaría reemplazar porque no están rindiendo como esperabas."
@@ -97,7 +97,7 @@ Email 6 (English, reconnect + header bidding + video):
 "Hi Michal, how have you been? It's been a while. I'd really like us to reconnect and test the alternatives we're currently working with. The company has grown significantly, and I believe you'll notice the difference. We've implemented an internal header bidding setup that allows all our demand sources to compete for display inventory. For video, we offer both slider and instream options. How does that sound to you? Let me know what your current priorities are on your side."
 
 Email 7 (Spanish, video instream + display header bidding, format preference question):
-"Hola Fernando, ¿cómo estás? Dispongo de dos opciones que están teniendo un desempeño muy bueno. Por un lado, un video instream que, en los momentos en que no está reproduciendo publicidad, se puede configurar para mostrar avances de otras noticias de tu sitio; esto ayuda a la recirculación de contenido y aumenta el tiempo de permanencia del usuario. Por otro lado, en todo lo que respecta a display, trabajamos con un header bidding interno con el objetivo de maximizar las ganancias en cada ubicación. ¿Tenés preferencia por algún formato? Estamos cargando nuevas campañas para el mes de abril, por lo que es un buen momento para avanzar."
+"Hola Fernando, ¿cómo estás? Dispongo de dos opciones que están teniendo un desempeño muy bueno. Por un lado, un video instream que, en los momentos en que no está reproduciendo publicidad, se puede configurar para mostrar avances de otras noticias de tu sitio; esto ayuda a la recirculación de contenido y aumenta el tiempo de permanencia del usuario. Por otro lado, en todo lo que respecta a display, trabajamos con un header bidding interno con el objetivo de maximizar las ganancias en cada ubicación. ¿Tenés preferencia por algún formato? Estamos cargando nuevas campañas, por lo que es un buen momento para avanzar."
 
 KEY STYLE TRAITS TO REPLICATE:
 - Conversational, direct, no corporate jargon
@@ -112,6 +112,8 @@ GENERAL RULES:
 - Every sentence must be complete. Never cut off mid-thought.
 - The email must read as a cohesive whole — not a list of disconnected facts.
 - Every email must feel freshly written — vary sentence structure, word choice, and angle.
+- NEVER mention specific month names (January/Enero/Febrero/March/Abril/etc.) or specific dates. Use generic phrases like "este trimestre", "estos próximos meses", "ahora", "in the coming weeks". Hardcoded months become outdated and look like spam.
+- NEVER claim absence of technical features (e.g. "no tienen ads.txt", "no veo header bidding") UNLESS the input data explicitly states "ads.txt: no ads.txt" or "Ad tech: no ad tech detected". If ads.txt or tech is present in the input data, do NOT contradict it.
 
 OUTPUT FORMAT:
 Return a JSON object with two fields:

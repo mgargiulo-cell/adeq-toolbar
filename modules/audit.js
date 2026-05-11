@@ -106,39 +106,64 @@ export async function runAudit(baseUrl, monthlyTraffic = 0) {
 }
 
 async function checkAdsTxt(baseUrl) {
-  // Ahora usamos activeTab + chrome.scripting.executeScript para fetchear ads.txt
-  // desde el context de la página (esquiva la CSP del extension page).
+  // Estrategia: 1) fetch directo desde popup (host_permissions = <all_urls>
+  //    permite cross-origin desde context del extension). 2) fallback a
+  //    executeScript en activeTab si el directo falla. El bug previo era
+  //    que solo usaba executeScript — y si el activeTab estaba en un
+  //    dominio distinto, CORS bloqueaba el ads.txt del prospect.
+  const url = (() => {
+    try { return new URL("/ads.txt", baseUrl).href; } catch { return null; }
+  })();
+  if (!url) return { exists: false, entries: 0, hasGoogle: false };
+
+  let text = null;
+
+  // 1) Direct fetch (extension origin con <all_urls> permite esto)
   try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) return { exists: false, entries: 0, hasGoogle: false };
-
-    const url = new URL("/ads.txt", baseUrl).href;
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: async (adsUrl) => {
-        try {
-          const res = await fetch(adsUrl, { method: "GET" });
-          if (!res.ok) return null;
-          return await res.text();
-        } catch { return null; }
-      },
-      args: [url],
+    const res = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(6000),
     });
+    if (res.ok) {
+      const t = await res.text();
+      // Sanity: ads.txt es text/plain — si recibimos HTML (404 page), descartar
+      if (t && !/^\s*<!doctype|<html/i.test(t.trim())) text = t;
+    }
+  } catch {}
 
-    const text = result?.result;
-    if (!text) return { exists: false, entries: 0, hasGoogle: false };
-
-    const lines = text.split("\n").filter(l => l.trim() && !l.startsWith("#"));
-    return {
-      exists:    true,
-      entries:   lines.length,
-      hasGoogle: text.toLowerCase().includes("google.com/doubleclick") || text.toLowerCase().includes("adx.google.com"),
-      hasEzoic:  text.toLowerCase().includes("ezoic"),
-      raw:       text.substring(0, 500),
-    };
-  } catch {
-    return { exists: false, entries: 0, hasGoogle: false };
+  // 2) Fallback: inyectar en activeTab (sirve si el user está en el sitio)
+  if (!text) {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        const [result] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async (adsUrl) => {
+            try {
+              const r = await fetch(adsUrl, { method: "GET" });
+              if (!r.ok) return null;
+              return await r.text();
+            } catch { return null; }
+          },
+          args: [url],
+        });
+        const t = result?.result;
+        if (t && !/^\s*<!doctype|<html/i.test(t.trim())) text = t;
+      }
+    } catch {}
   }
+
+  if (!text) return { exists: false, entries: 0, hasGoogle: false };
+
+  const lines = text.split("\n").filter(l => l.trim() && !l.startsWith("#"));
+  return {
+    exists:    lines.length > 0,
+    entries:   lines.length,
+    hasGoogle: text.toLowerCase().includes("google.com/doubleclick") || text.toLowerCase().includes("adx.google.com"),
+    hasEzoic:  text.toLowerCase().includes("ezoic"),
+    raw:       text.substring(0, 500),
+  };
 }
 
 async function detectAdsTech() {
