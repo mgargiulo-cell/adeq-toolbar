@@ -3158,7 +3158,9 @@ async function main() {
       let csvProcessed = 0;
       if (flags.csvQueue) {
         parallelTasks.push(
-          runCsvQueue(token, cfgShared, 5).then(n => { csvProcessed = n; }).catch(e => log(`⚠️ runCsvQueue: ${e.message}`))
+          // Batch 25 — agent corre en paralelo (Promise.all), no necesita
+          // batch chico para intercalarse. Más throughput por tanda.
+          runCsvQueue(token, cfgShared, 25).then(n => { csvProcessed = n; }).catch(e => log(`⚠️ runCsvQueue: ${e.message}`))
         );
       }
       if (flags.agent) {
