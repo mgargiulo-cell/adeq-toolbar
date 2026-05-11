@@ -3308,9 +3308,12 @@ async function bindButtons() {
       res.className = "push-result error";
       return;
     }
-    // Guard #3: no dejar pushear a Monday si todavía no se mandó el email
-    if (!state.emailSentInSession && !state.duplicate?.found) {
-      const msg = "❌ You need to send the email first via Gmail. Click 'Send Gmail' before pushing to Monday.";
+    // Guard #3: no dejar pushear NI updatear Monday si todavía no se mandó email
+    // en esta sesión. Aplica también a duplicados (botón "🔄 Update in Monday")
+    // para evitar que se actualice un item sin haber re-mandado el pitch.
+    if (!state.emailSentInSession) {
+      const action = state.duplicate?.found ? "update" : "push";
+      const msg = `❌ Mandá el email primero (botón Send via Gmail) antes de hacer ${action} en Monday.`;
       res.textContent = msg; res.className = "push-result error";
       document.getElementById("btn-send-gmail")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
