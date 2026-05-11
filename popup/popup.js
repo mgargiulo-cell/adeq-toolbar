@@ -288,7 +288,7 @@ async function checkPersonalQuotaWarning() {
     // El usage personal lo aproximamos con la suma del mes en toolbar_api_usage.
     const period = new Date().toISOString().slice(0, 7);
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(state.loginEmail)}&day=gte.${period}-01&select=by_provider`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(state.loginEmail)}&day=gte.${period}-01&select=by_provider&limit=100`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
     );
     if (!res.ok) return;
