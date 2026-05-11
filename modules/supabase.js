@@ -398,6 +398,25 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
+// Marca COMO VALIDATED todos los items pending de este dominio en review_queue.
+// Se llama cuando un MB manda mail manual desde Analysis (o el agent procesa).
+// Asegura que el lead desaparezca inmediato de la cola de Prospects, sin importar
+// si el push a Monday ocurrió o no — el contacto YA se hizo.
+export async function markReviewQueueAsContacted(accessToken, domain, validatedBy) {
+  if (!domain || !accessToken) return { ok: false };
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const cleanDomain = (domain || "").toLowerCase().replace(/^www\./, "").trim();
+  try {
+    await fetch(`${url}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(cleanDomain)}&status=eq.pending`, {
+      method: "PATCH",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: "validated", validated_by: validatedBy, validated_at: new Date().toISOString() }),
+    });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 export async function rejectReviewItem(accessToken, id, domain) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;

@@ -24,6 +24,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          setDomainGeo, getDomainGeo }                                                          from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
+import { markReviewQueueAsContacted } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
@@ -3445,6 +3446,9 @@ async function bindButtons() {
       // Persistir el envío para tracking/historial (sin generar follow-ups,
       // los hace el CRM externo).
       await saveSendDate(state.domain, { sendDate: today, pitch, email }).catch(() => {});
+      // Marcar review_queue items de este dominio como contactados — desaparecen
+      // de Prospects inmediato (otros MBs no los van a re-contactar).
+      markReviewQueueAsContacted(state.accessToken, state.domain, state.loginEmail).catch(() => {});
 
       // Update "From" label with the actual Gmail account used
       const fromEl = document.getElementById("gmail-from");
@@ -6057,11 +6061,20 @@ async function loadProspectsTab() {
     return;
   }
 
-  listEl.innerHTML = rows.map(r => renderProspectCard(r)).join("");
+  // Shuffle de la lista para que NO aparezcan agrupados por tanda del worker
+  // (autopilot tiende a procesar bloques de un mismo geo/categoría seguidos).
+  // Mix natural ayuda a que el MB vea variedad en cada refresh.
+  // Fisher-Yates shuffle.
+  const shuffled = [...rows];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  listEl.innerHTML = shuffled.map(r => renderProspectCard(r)).join("");
 
   listEl.querySelectorAll(".pcard").forEach(card => {
     const id   = parseInt(card.dataset.id);
-    const data = rows.find(r => r.id === id);
+    const data = shuffled.find(r => r.id === id);
     if (data) initProspectCard(card, data);
   });
 }
@@ -7034,10 +7047,10 @@ async function validateProspect(card, data, doSendEmail) {
     const mark = await validateReviewItem(state.accessToken, data.id, state.loginEmail);
     if (!mark.ok) throw new Error(`Could not mark validated: ${mark.error}`);
 
-    // 5. Update UI
+    // 5. Update UI — desaparece inmediato (200ms para mostrar el ✅)
     card.style.opacity = "0.3";
     setResult(doSendEmail && email ? "✅ Monday + Email sent!" : "✅ Pushed to Monday");
-    setTimeout(() => { card.remove(); refreshProspectsStats(); }, 1200);
+    setTimeout(() => { card.remove(); refreshProspectsStats(); }, 200);
 
   } catch (err) {
     console.error("[Prospects validate]", err.message);
