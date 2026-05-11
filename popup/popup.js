@@ -6061,18 +6061,52 @@ async function loadProspectsTab() {
     return;
   }
 
-  // Mix puro: traemos hasta 500 del pool, shuffleamos y mostramos 100.
-  // Resultado: cada MB ve 100 leads aleatorios de TODO el pool — no quedan
-  // pegados los últimos 100 importados de Brasil (o lo que sea) juntos.
-  // El "buzón" siempre es un mix del histórico pending.
-  const VISIBLE_CAP = 100;
-  const shuffled = [...rows];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  // ── Cap diario de visibilidad: 20 leads random per MB ──
+  // Cada día el MB recibe asignados 20 leads random del pool. Esos quedan
+  // guardados en chrome.storage.local (key: _daily_pool_<email>_<YYYY-MM-DD>).
+  // Si ya se asignaron, se respeta esa selección — no se re-randomiza al refrescar.
+  // Si alguno fue procesado/contactado por otro MB, se descarta de la lista
+  // visible (pero NO se reemplaza — el cap diario sigue siendo 20).
+  const DAILY_CAP = 20;
+  const today = new Date().toISOString().split("T")[0];
+  const userKey = (state.loginEmail || "anon").toLowerCase();
+  const storageKey = `_daily_pool_${userKey}_${today}`;
+  let assignedIds = [];
+  try {
+    const stored = await chrome.storage.local.get(storageKey);
+    if (stored?.[storageKey] && Array.isArray(stored[storageKey])) {
+      assignedIds = stored[storageKey];
+    }
+  } catch {}
+
+  if (assignedIds.length === 0) {
+    // Primera apertura del día: shuffle + slice 20 + persistir
+    const shuffled = [...rows];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    assignedIds = shuffled.slice(0, DAILY_CAP).map(r => r.id);
+    await chrome.storage.local.set({ [storageKey]: assignedIds }).catch(() => {});
   }
-  const sample = shuffled.slice(0, VISIBLE_CAP);
+
+  // Filtrar: solo mostramos los IDs asignados que SIGUEN en el pool pending
+  const idSet = new Set(assignedIds);
+  const sample = rows.filter(r => idSet.has(r.id));
+  // Limpiar storage de días anteriores (housekeeping — solo guardamos hoy)
+  try {
+    const all = await chrome.storage.local.get(null);
+    const stale = Object.keys(all).filter(k => k.startsWith(`_daily_pool_${userKey}_`) && k !== storageKey);
+    if (stale.length > 0) await chrome.storage.local.remove(stale);
+  } catch {}
+
   listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
+  // Mostrar contador en stats
+  if (statsEl) {
+    const remaining = sample.length;
+    const consumed  = DAILY_CAP - remaining;
+    statsEl.innerHTML = `${remaining} pending de tu pool diario (${consumed}/${DAILY_CAP} ya procesados o contactados por otro MB)`;
+  }
 
   listEl.querySelectorAll(".pcard").forEach(card => {
     const id   = parseInt(card.dataset.id);
