@@ -4750,7 +4750,7 @@ async function initCsvQueue() {
 const MAX_QUEUE_PENDING = 300;
 
 async function initSellersJsonImport(refreshAll) {
-  const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson } = await import("../modules/sellersJson.js");
+  const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson, findKnownDomains } = await import("../modules/sellersJson.js");
   const sel        = document.getElementById("sellers-company-select");
   const urlEl      = document.getElementById("sellers-company-url");
   const capInput   = document.getElementById("sellers-cap-input");
@@ -4848,13 +4848,30 @@ async function initSellersJsonImport(refreshAll) {
         resEl.innerHTML = `<span style="color:#d97706">⚠️ No se encontraron PUBLISHER en sellers.json.</span>`;
         return;
       }
-      const slice = domains.slice(0, allowed);
-      const skipped = domains.length - slice.length;
+      // ── Dedup: filtrar dominios YA conocidos por el sistema ────
+      // Skip los que están en csv_queue / review_queue / historial / sendtrack /
+      // blocklist. Evita re-procesar leads que ya pasamos.
+      resEl.innerHTML = `🔍 Found ${domains.length}. Chequeando duplicados contra sistema...`;
+      const known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains);
+      const fresh = domains.filter(d => !known.has(d));
+      const knownCount = domains.length - fresh.length;
+      if (fresh.length === 0) {
+        resEl.innerHTML = `<span style="color:#d97706">⚠️ ${domains.length} dominios — TODOS ya conocidos por el sistema (csv_queue/review_queue/historial/blocklist). Nada nuevo para encolar.</span>`;
+        return;
+      }
+      const slice   = fresh.slice(0, allowed);
+      const skipped = fresh.length - slice.length;
       const { uploadCsvDomains } = await import("../modules/supabase.js");
       const result = await uploadCsvDomains(slice, state.loginEmail, state.accessToken, "sellers_json");
       const ins = result?.inserted || 0;
       const dup = slice.length - ins;
-      resEl.innerHTML = `<span style="color:#16a34a">✅ ${company.name}: ${ins} encolados${dup > 0 ? ` (${dup} duplicados ya en cola)` : ""}${skipped > 0 ? `. ${skipped} no encolados (cap ${allowed} de ${domains.length} totales).` : `.`}</span>`;
+      const lines = [
+        `✅ ${company.name}: <strong>${ins} nuevos encolados</strong>`,
+        `📊 Found total: ${domains.length} | Ya conocidos: ${knownCount} | Frescos: ${fresh.length}`,
+      ];
+      if (dup > 0)     lines.push(`⚠️ ${dup} duplicados a último momento (race con otro MB)`);
+      if (skipped > 0) lines.push(`📥 ${skipped} no encolados (cap ${allowed} alcanzado)`);
+      resEl.innerHTML = `<span style="color:#16a34a;line-height:1.5;display:block">${lines.join("<br/>")}</span>`;
       await refreshAll?.();
     } catch (e) {
       resEl.innerHTML = `<span style="color:#dc2626">❌ Error: ${esc(e.message || String(e))}</span>`;

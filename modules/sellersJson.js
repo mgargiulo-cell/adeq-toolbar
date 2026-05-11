@@ -28,7 +28,48 @@ export const DEFAULT_SELLERS_COMPANIES = [
   { name: "Missena (165 pubs)",      url: "https://missena.com/sellers.json" },
   { name: "Flower-Ads (111 pubs)",   url: "https://flower-ads.com/sellers.json" },
   { name: "Carambola (27 pubs)",     url: "https://carambola.com/sellers.json" },
+  // ── Agregadas user 2026-05-11 ────────────────────────────────
+  { name: "The Moneytizer (6105 pubs)", url: "https://www.themoneytizer.com/sellers.json" },
+  { name: "OptAd360 (2496 pubs)",       url: "https://optad360.com/sellers.json" },
+  { name: "NSightVideo (1208 pubs)",    url: "https://nsightvideo.com/sellers.json" },
+  { name: "Verve (635 pubs)",           url: "https://verve.com/sellers.json" },
+  { name: "Spacefoot (277 pubs)",       url: "https://spacefoot.com/sellers.json" },
+  { name: "360Playvid (213 pubs)",      url: "https://360playvid.com/sellers.json" },
+  { name: "Seznam (115 pubs)",          url: "https://www.seznam.cz/sellers.json" },
 ];
+
+// Check si los dominios ya fueron procesados antes (csv_queue + review_queue + historial).
+// Devuelve Set de dominios ya conocidos. Útil para no re-encolar leads que ya pasamos.
+export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candidates) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return new Set();
+  const known = new Set();
+  const headers = { "apikey": anonKey, "Authorization": `Bearer ${accessToken}` };
+  // PostgREST acepta in.(...) con URL larga, pero por las dudas batcheo 200 por query.
+  const BATCH = 200;
+  const tables = [
+    { table: "toolbar_csv_queue",     col: "domain" },
+    { table: "toolbar_review_queue",  col: "domain" },
+    { table: "toolbar_historial",     col: "domain" },
+    { table: "toolbar_sendtrack",     col: "domain" },
+    { table: "toolbar_url_blocklist", col: "domain" },
+  ];
+  for (let i = 0; i < candidates.length; i += BATCH) {
+    const slice = candidates.slice(i, i + BATCH);
+    const inList = slice.map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
+    await Promise.all(tables.map(async ({ table, col }) => {
+      try {
+        const res = await fetch(
+          `${supabaseUrl}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}`,
+          { headers }
+        );
+        if (!res.ok) return;
+        const rows = await res.json();
+        rows.forEach(r => { if (r[col]) known.add(r[col].toLowerCase()); });
+      } catch {}
+    }));
+  }
+  return known;
+}
 
 // Empresas verificadas SIN sellers.json público (al 2026-05-11):
 //   - Ezoic       (https://www.ezoic.com/sellers.json → 404)
