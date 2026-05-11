@@ -2837,29 +2837,44 @@ async function runAgentCycle(token, allFlags) {
           continue;
         }
 
-        // 3. Push to Monday (CREATE — agent solo crea cuando manda, igual que MB humano)
+        // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──
+        // Si el send falla, NO ensuciamos Monday con items "Mail No Enviado".
+
+        // 3. Pre-check Monday config (early exit si falta API key)
         const mondayUserId = (cfg[`monday_user_id_${userEmail.toLowerCase()}`] || "").trim();
         const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || monday_api_key_default).trim();
         if (!mondayApiKey) {
           await logAgentAction(token, userEmail, { domain, action: "failed", reason: "no_monday_api_key" });
           continue;
         }
-        const mondayItemId = await pushToMondayServer(mondayApiKey, {
-          domain, email, geo: lead.geo, traffic_text: `${Math.round(lead.traffic/1000)}K`,
-          pitch_body: pitch.body, idioma_idx: ({ en:0, es:1, it:2, pt:3, ar:6 })[lead.language] ?? 0,
-          monday_user_id: mondayUserId,
-        }, AGENT_DEFAULTS.monday_board_id);
 
-        // 4. Send Gmail
+        // 4. Send Gmail PRIMERO — si falla, no toca Monday
         const subject = pitch.subjects[0];
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body });
 
-        // 5. Update Monday estado a "Propuesta Vigente (T)" (idx 3) post-envío
-        if (mondayItemId) {
-          await updateMondayEstado(mondayApiKey, mondayItemId, AGENT_DEFAULTS.monday_board_id, 3);
+        // 5. Push to Monday CON estado correcto desde el inicio (Propuesta Vigente T = idx 3)
+        let mondayItemId = null;
+        try {
+          mondayItemId = await pushToMondayServer(mondayApiKey, {
+            domain, email, geo: lead.geo, traffic_text: `${Math.round(lead.traffic/1000)}K`,
+            pitch_body: pitch.body, idioma_idx: ({ en:0, es:1, it:2, pt:3, ar:6 })[lead.language] ?? 0,
+            monday_user_id: mondayUserId,
+            estado_idx: 3, // Propuesta Vigente (T)
+          }, AGENT_DEFAULTS.monday_board_id);
+        } catch (mondayErr) {
+          // Edge case raro: mail YA se mandó pero Monday falló.
+          // Loggeamos como sent_no_monday para que admin pueda crear el item manual.
+          // No es crítico — el lead recibió el pitch, solo falta tracking en CRM.
+          log(`⚠️ Agent ${userEmail}: Gmail OK pero Monday falló para ${domain}: ${mondayErr.message}`);
+          await logAgentAction(token, userEmail, {
+            domain, action: "sent", reason: "sent_but_monday_failed",
+            pitch_subject: subject,
+            details: { email, traffic: lead.traffic, geo: lead.geo, language: lead.language, monday_error: mondayErr.message?.substring(0, 200) },
+          });
+          // Igual marcamos sendtrack + review_queue para no re-mandar
         }
 
-        // 6. Track en sendtrack para no re-enviar
+        // 6. Track en sendtrack para no re-enviar (siempre, mail YA salió)
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
           method: "POST",
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
@@ -2873,13 +2888,15 @@ async function runAgentCycle(token, allFlags) {
           body: JSON.stringify({ status: "validated", validated_by: `agent:${userEmail}`, validated_at: new Date().toISOString() }),
         });
 
-        // 8. Log success
-        await logAgentAction(token, userEmail, {
-          domain, action: "sent", reason: "ok",
-          pitch_subject: subject,
-          monday_item_id: mondayItemId,
-          details: { email, traffic: lead.traffic, geo: lead.geo, language: lead.language },
-        });
+        // 8. Log success completo (solo si Monday también OK; si falló ya logueamos arriba)
+        if (mondayItemId) {
+          await logAgentAction(token, userEmail, {
+            domain, action: "sent", reason: "ok",
+            pitch_subject: subject,
+            monday_item_id: mondayItemId,
+            details: { email, traffic: lead.traffic, geo: lead.geo, language: lead.language },
+          });
+        }
 
         log(`🤖 Agent ${userEmail}: SENT to ${email} for ${domain} (subj: "${subject.substring(0,50)}")`);
         processed++;
