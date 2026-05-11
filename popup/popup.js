@@ -2637,11 +2637,15 @@ async function ragRetrievePitchExamples({ domain, category, geo, language, traff
 // Best-effort: non-blocking, never throws to caller.
 async function ragSavePitchFeedback(action, pitchBody, pitchSubject, ctxFields) {
   try {
-    const ctxStr = buildPitchContext(ctxFields);
+    // reason (si lo hay) entra al context para que el embedding capture el porqué
+    // del dislike y el RAG futuro pueda evitar errores similares.
+    const { reason, ...ctxClean } = ctxFields || {};
+    let ctxStr = buildPitchContext(ctxClean);
+    if (reason) ctxStr += `\nUSER_FEEDBACK_REASON: ${reason}`;
     const embedding = await voyageEmbed(ctxStr, "document");
     if (!embedding) return;
     await insertPitchFeedback(state.accessToken, state.loginEmail, {
-      ...ctxFields,
+      ...ctxClean,
       pitch_body:    pitchBody,
       pitch_subject: pitchSubject || "",
       context:       ctxStr,
@@ -2867,13 +2871,21 @@ async function bindButtons() {
     const pitch   = document.getElementById("pitch-text").value.trim();
     const subject = document.getElementById("form-subject")?.value?.trim() || "";
     if (!pitch) return;
+    // Pedir razón opcional — entra al embedding para que el RAG aprenda QUÉ evitar.
+    // Vacío = sin comentario, igual marca dislike.
+    const reason = prompt(
+      "👎 ¿Qué falló? (opcional — ayuda a la IA a evitar ese error en el futuro)\n\n" +
+      "Ejemplos: 'inventó un mes', 'dijo que no tiene ads.txt cuando sí tiene', 'tono muy formal', 'muy largo'",
+      ""
+    );
     await saveDislikePitch(pitch);
     ragSavePitchFeedback("disliked", pitch, subject, {
       domain: state.domain, category: state.category,
       geo: detectGeo?.() || "", language: state.siteLanguage || "", traffic: state.traffic || 0,
+      reason: (reason || "").trim().substring(0, 500),
     });
     const likeStatus = document.getElementById("pitch-like-status");
-    likeStatus.textContent = "✗ Marked to avoid (RAG)";
+    likeStatus.textContent = reason ? "✗ Saved with reason (RAG)" : "✗ Marked to avoid (RAG)";
     setTimeout(() => { likeStatus.textContent = ""; }, 2500);
   });
 
