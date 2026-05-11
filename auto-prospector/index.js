@@ -896,9 +896,18 @@ async function getTrafficData(domain, rapidApiKey) {
         headers
       );
     }
-    if (!data) return { visits: null, topCountry: null, error: null };
-    if (data.__error4xx) return { visits: null, topCountry: null, error: data.__error4xx };
-    if (data.__error)    return { visits: null, topCountry: null, error: data.__error };
+    if (!data) {
+      log(`  ⚠️ getTrafficData ${domain}: response null (key vacía o servicio caído)`);
+      return { visits: null, topCountry: null, error: "null_response" };
+    }
+    if (data.__error4xx) {
+      log(`  ⚠️ getTrafficData ${domain}: ${data.__error4xx}`);
+      return { visits: null, topCountry: null, error: data.__error4xx };
+    }
+    if (data.__error) {
+      log(`  ⚠️ getTrafficData ${domain}: ${data.__error}`);
+      return { visits: null, topCountry: null, error: data.__error };
+    }
 
     // ── Adaptador del shape nuevo de website-insights ──────────
     // Visits ahora es {YYYY-MM-DD: n} → tomar el más reciente.
@@ -916,6 +925,12 @@ async function getTrafficData(domain, rapidApiKey) {
     if (data.WebsiteDetails?.Category && !data.Category) data.Category = data.WebsiteDetails.Category;
 
     const visits = data?.Visits || data?.visits || data?.pageViews || data?.PageViews || null;
+
+    // Log diagnóstico si el shape de la API cambió y no extrajimos visits
+    if (!visits) {
+      const sampleKeys = Object.keys(data || {}).slice(0, 8).join(",");
+      log(`  ⚠️ getTrafficData ${domain}: response OK pero sin visits. Top-level keys: [${sampleKeys}]. Posible cambio de shape de la API.`);
+    }
 
     // Pages per visit del nuevo shape (Traffic.Engagement.PagesPerVisit) o legacy (PagePerVisit)
     const pagesPerVisit = data?.Traffic?.Engagement?.PagesPerVisit
@@ -3079,6 +3094,24 @@ const _processStartedAt = Date.now();
 
 async function main() {
   log("ADEQ Auto-Prospector v3 iniciado.");
+  // Cleanup: resetear items "processing" trabados de un crash anterior.
+  // Sin esto, items con status=processing se quedan invisibles para getNextCsvItem.
+  try {
+    const cleanupRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.processing`, {
+      method: "PATCH",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${BACKEND_BEARER || ""}`,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({ status: "pending" }),
+    });
+    if (cleanupRes.ok) log("🧹 Cleanup: items processing → pending (recovery from previous run)");
+  } catch (e) {
+    log(`⚠️ Cleanup processing items failed: ${e.message}`);
+  }
+
 
   let token = null;
   let tokenExpiry = 0;
@@ -3158,9 +3191,11 @@ async function main() {
       let csvProcessed = 0;
       if (flags.csvQueue) {
         parallelTasks.push(
-          // Batch 25 — agent corre en paralelo (Promise.all), no necesita
-          // batch chico para intercalarse. Más throughput por tanda.
-          runCsvQueue(token, cfgShared, 25).then(n => { csvProcessed = n; }).catch(e => log(`⚠️ runCsvQueue: ${e.message}`))
+          // Sin batch — procesa TODA la cola hasta vaciarla. Agent corre en
+          // paralelo via Promise.all. Si crashea mid-queue, Railway reinicia
+          // automático y el worker continúa desde donde quedó (items processing
+          // se resetean a pending por el cleanup, pendientes se procesan).
+          runCsvQueue(token, cfgShared, Infinity).then(n => { csvProcessed = n; }).catch(e => log(`⚠️ runCsvQueue: ${e.message}`))
         );
       }
       if (flags.agent) {
