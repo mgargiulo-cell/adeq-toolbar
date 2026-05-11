@@ -7,6 +7,21 @@ import { callProxy } from "./apiProxy.js";
 
 const VOYAGE_MODEL = "voyage-3"; // 1024 dims, $0.06/M tokens
 
+// ── Cache in-memory (TTL 1h, max 200 entries) ──────────────
+// Evita re-embeber el mismo input string en una sesión. Útil cuando el user
+// re-genera pitches con la misma config: cada like/dislike re-embebe el mismo
+// context. Cache key = hash simple del input.
+const _voyageCache = new Map(); // key → { vec, ts }
+const VOYAGE_CACHE_TTL_MS = 60 * 60 * 1000;
+const VOYAGE_CACHE_MAX    = 200;
+function _voyageCacheKey(text, inputType) {
+  // Hash simple djb2 (suficiente para detectar duplicados exactos)
+  let h = 5381;
+  const s = `${inputType}::${text}`;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return String(h);
+}
+
 /**
  * Embed a single string with Voyage.
  * @param {string} text
@@ -15,6 +30,11 @@ const VOYAGE_MODEL = "voyage-3"; // 1024 dims, $0.06/M tokens
  */
 export async function voyageEmbed(text, inputType = "query") {
   if (!text || typeof text !== "string") return null;
+  const cacheKey = _voyageCacheKey(text, inputType);
+  const cached = _voyageCache.get(cacheKey);
+  if (cached && (Date.now() - cached.ts) < VOYAGE_CACHE_TTL_MS) {
+    return cached.vec;
+  }
   try {
     const res = await callProxy("voyage", "/v1/embeddings", {
       method: "POST",
@@ -29,7 +49,16 @@ export async function voyageEmbed(text, inputType = "query") {
       return null;
     }
     const vec = res.data?.data?.[0]?.embedding;
-    return Array.isArray(vec) ? vec : null;
+    if (Array.isArray(vec)) {
+      // Eviction simple: si el Map está lleno, borrar la entry más vieja
+      if (_voyageCache.size >= VOYAGE_CACHE_MAX) {
+        const firstKey = _voyageCache.keys().next().value;
+        _voyageCache.delete(firstKey);
+      }
+      _voyageCache.set(cacheKey, { vec, ts: Date.now() });
+      return vec;
+    }
+    return null;
   } catch (e) {
     console.warn("[Voyage] embed exception:", e.message);
     return null;

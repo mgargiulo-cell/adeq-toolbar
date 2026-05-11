@@ -5994,6 +5994,22 @@ function renderProspectCard(r) {
     ? `<span style="font-size:10px;font-weight:700;color:#fff;background:${scoreBg};border-radius:4px;padding:1px 5px;flex-shrink:0">${score}</span>`
     : "";
 
+  // Lead temperature indicator — señal at-a-glance del potencial.
+  // 🔥 HOT  : traffic >= 1M OR (score >= 60 AND email)
+  // ☀️ WARM : traffic >= 400K AND email AND (adNetworks OR score >= 40)
+  // ❄️ COLD : todo lo demás (sin email + low traffic)
+  const _trafficN = parseInt(r.traffic || 0, 10);
+  const _hasEmail = hasEmail;
+  const _hasAdNet = adNetworks.length > 0;
+  let tempBadge = "";
+  if (_trafficN >= 1_000_000 || (score >= 60 && _hasEmail)) {
+    tempBadge = `<span title="🔥 HOT lead — alta probabilidad de cierre" style="font-size:11px;flex-shrink:0">🔥</span>`;
+  } else if (_trafficN >= 400_000 && _hasEmail && (_hasAdNet || score >= 40)) {
+    tempBadge = `<span title="☀️ WARM lead — vale el outreach" style="font-size:11px;flex-shrink:0">☀️</span>`;
+  } else if (!_hasEmail && _trafficN < 400_000) {
+    tempBadge = `<span title="❄️ COLD lead — sin email y bajo tráfico, evaluá si vale el esfuerzo" style="font-size:11px;flex-shrink:0;opacity:0.7">❄️</span>`;
+  }
+
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
       <input type="radio" name="email_${r.id}" value="${esc(e)}" ${i === 0 ? "checked" : ""} class="pcard-email-radio" />
@@ -6070,6 +6086,7 @@ function renderProspectCard(r) {
             ${esc(r.domain)} ↗
           </a>
           ${scoreBadge}
+          ${tempBadge}
         </div>
         ${titleRow}
         <div style="font-size:10px;color:var(--text-muted);margin-top:3px;display:flex;flex-wrap:wrap;gap:4px">
@@ -6986,6 +7003,21 @@ async function initProspectsTab() {
   document.getElementById("btn-bulk-clear")?.addEventListener("click", () => {
     document.querySelectorAll(".pcard-bulk-cbx:checked").forEach(c => { c.checked = false; });
     updateBulkBar();
+  });
+  document.getElementById("btn-bulk-open")?.addEventListener("click", () => {
+    const checked = [...document.querySelectorAll(".pcard-bulk-cbx:checked")];
+    if (checked.length === 0) return;
+    const HARD_CAP = 30;
+    if (checked.length > HARD_CAP) {
+      if (!confirm(`Vas a abrir ${checked.length} pestañas. Cap defensivo es ${HARD_CAP}. ¿Continuar igual?`)) return;
+    }
+    const domains = checked
+      .map(c => c.closest(".pcard")?.dataset?.domain)
+      .filter(Boolean);
+    domains.forEach((domain, i) => {
+      setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);
+    });
+    showToast(`🪟 Abriendo ${domains.length} pestañas...`, "info");
   });
   document.getElementById("btn-bulk-reject")?.addEventListener("click", async () => {
     const checked = [...document.querySelectorAll(".pcard-bulk-cbx:checked")];
