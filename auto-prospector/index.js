@@ -526,51 +526,55 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
 }
 
 // ── Bulk refresh de leads sin traffic ───────────────────────
-// Job lazy: cada loop iteration, si toolbar_config.agent_refresh_empty_leads=true,
-// pickea 1 lead con traffic=0 o null y lo re-fetchea. Cache 90d ayuda a no quemar
-// RapidAPI. Cuando ya no quedan leads vacíos, auto-apaga el flag.
+// Job: cada loop iteration, si toolbar_config.agent_refresh_empty_leads=true,
+// pickea hasta REFRESH_BATCH leads con traffic=0/null y los re-fetchea en
+// paralelo. Cache 90d ayuda a no quemar RapidAPI. Cuando ya no quedan,
+// auto-apaga el flag.
+const REFRESH_EMPTY_BATCH = 10;
 async function refreshOneEmptyLead(token, cfg) {
   const flag = cfg.agent_refresh_empty_leads === "true";
   if (!flag) return;
   const rapidapi_key = cfg.rapidapi_key;
   if (!rapidapi_key) return;
 
-  // Buscar 1 lead con traffic=0 o null, pending, ordenado por created_at
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(traffic.eq.0,traffic.is.null)&select=id,domain&order=created_at.asc&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(traffic.eq.0,traffic.is.null)&select=id,domain&order=created_at.asc&limit=${REFRESH_EMPTY_BATCH}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     if (!Array.isArray(rows) || rows.length === 0) {
-      // No quedan leads vacíos → auto-apagar flag
       log("✅ Refresh empty leads: completado, no quedan leads sin traffic. Apagando flag.");
       await setConfigValue(token, "agent_refresh_empty_leads", "false");
       return;
     }
-    const lead = rows[0];
-    log(`🔄 Refresh empty: ${lead.domain} (id ${lead.id})`);
-    const data = await getTrafficData(lead.domain, rapidapi_key);
-    const newVisits = data?.visits || 0;
-    const newGeo = data?.topCountry || "";
-    if (newVisits > 0 || newGeo) {
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-        method: "PATCH",
-        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({ traffic: newVisits, geo: newGeo || undefined }),
-      });
-      log(`  ✅ ${lead.domain} → traffic=${newVisits}, geo=${newGeo || "?"}`);
-    } else {
-      // Marcar como refreshed-empty para no re-intentarlo eternamente (traffic=-1 sentinel)
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-        method: "PATCH",
-        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({ traffic: -1 }),
-      });
-      log(`  ⚠️ ${lead.domain} → sin traffic disponible (marcado como -1)`);
-    }
+    log(`🔄 Refresh empty batch: ${rows.length} leads`);
+    await Promise.all(rows.map(async (lead) => {
+      try {
+        const data = await getTrafficData(lead.domain, rapidapi_key);
+        const newVisits = data?.visits || 0;
+        const newGeo = data?.topCountry || "";
+        if (newVisits > 0 || newGeo) {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ traffic: newVisits, geo: newGeo || undefined }),
+          });
+          log(`  ✅ ${lead.domain} → traffic=${newVisits}, geo=${newGeo || "?"}`);
+        } else {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ traffic: -1 }),
+          });
+          log(`  ⚠️ ${lead.domain} → sin traffic (marcado -1)`);
+        }
+      } catch (e) {
+        log(`  ⚠️ ${lead.domain} refresh err: ${e.message}`);
+      }
+    }));
   } catch (e) {
-    log(`⚠️ refreshOneEmptyLead error: ${e.message}`);
+    log(`⚠️ refreshEmptyBatch error: ${e.message}`);
   }
 }
 
