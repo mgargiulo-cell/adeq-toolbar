@@ -5573,8 +5573,13 @@ function renderProspectCard(r) {
   // Resolver idioma sincronicamente al render — evita que aparezca "🌐 —"
   // mientras carga el cache de drafts. Default a EN si no hay matcheo.
   const _initLang = (() => {
+    // 1) language ya viene del worker
     const dl = (r.language || "").toLowerCase().split("-")[0];
     if (LANG_FLAG[dl]) return dl;
+    // 2) geo como código ISO (AR/MX/BR) — caso más común desde el worker
+    const geoUp = (r.geo || "").trim().toUpperCase();
+    if (GEO_TO_LANG[geoUp] && LANG_FLAG[GEO_TO_LANG[geoUp]]) return GEO_TO_LANG[geoUp];
+    // 3) geo como label ("Argentina", "México")
     const geoText = (r.geo || "").trim().toLowerCase();
     for (const [code, label] of Object.entries(GEO_LABEL)) {
       if (label.toLowerCase() === geoText) {
@@ -5582,6 +5587,10 @@ function renderProspectCard(r) {
         if (LANG_FLAG[lang]) return lang;
       }
     }
+    // 4) TLD del dominio (.com.ar / .mx / .br / .it / .pt) — fallback obvio
+    const tldLang = detectLangFromDomain(r.domain || "");
+    if (LANG_FLAG[tldLang]) return tldLang;
+    // 5) default
     return "en";
   })();
   // Pre-render de los 5 chips de banderas — visibles desde el primer paint
@@ -5603,8 +5612,10 @@ function renderProspectCard(r) {
   // ignorando quién está realmente trabajando el lead.
   const owner       = state.mediaBuyer || defaultOwnerForLang(r.language);
   const status      = defaultStatusForOwner(owner);
-  const langIdx     = LANG_TO_IDX[r.language] || "0";
-  const langName    = LANG_NAMES_PRO[r.language] || r.language || "—";
+  // langIdx para el select de Monday — usa _initLang (con fallback TLD/geo)
+  // en lugar de r.language crudo, que muchas veces viene vacío del worker.
+  const langIdx     = LANG_TO_IDX[_initLang] || LANG_TO_IDX[r.language] || "0";
+  const langName    = LANG_NAMES_PRO[_initLang] || LANG_NAMES_PRO[r.language] || r.language || "—";
   const adNetworks  = Array.isArray(r.ad_networks) ? r.ad_networks : [];
   const subjects    = Array.isArray(r.pitch_subjects) ? r.pitch_subjects : [];
 
@@ -5726,11 +5737,11 @@ function renderProspectCard(r) {
         <div class="sub-title-row">
           <span class="sub-title">🤖 Pitch with Claude</span>
           <select class="category-select pcard-pitch-language" title="Email language" style="font-size:11px;padding:2px 4px">
-            <option value="en">English</option>
-            <option value="es">Spanish</option>
-            <option value="it">Italian</option>
-            <option value="pt">Portuguese</option>
-            <option value="ar">Arabic</option>
+            <option value="en" ${_initLang === "en" ? "selected" : ""}>English</option>
+            <option value="es" ${_initLang === "es" ? "selected" : ""}>Spanish</option>
+            <option value="it" ${_initLang === "it" ? "selected" : ""}>Italian</option>
+            <option value="pt" ${_initLang === "pt" ? "selected" : ""}>Portuguese</option>
+            <option value="ar" ${_initLang === "ar" ? "selected" : ""}>Arabic</option>
           </select>
           <select class="category-select pcard-pitch-category" title="Site category" style="font-size:11px;padding:2px 4px">
             <option value="">Auto category</option>
