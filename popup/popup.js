@@ -4739,6 +4739,129 @@ async function initCsvQueue() {
     clearAll.style.display = "none";
     document.getElementById("btn-csv-show-clear-all").style.display = "";
   });
+
+  // ── sellers.json import ─────────────────────────────────────
+  await initSellersJsonImport(refreshAll);
+}
+
+// Cap absoluto compartido por TODOS los imports en la cola pending.
+// Si pending >= MAX_QUEUE_PENDING, no se aceptan más uploads hasta que el
+// worker procese.
+const MAX_QUEUE_PENDING = 300;
+
+async function initSellersJsonImport(refreshAll) {
+  const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson } = await import("../modules/sellersJson.js");
+  const sel        = document.getElementById("sellers-company-select");
+  const urlEl      = document.getElementById("sellers-company-url");
+  const capInput   = document.getElementById("sellers-cap-input");
+  const fetchBtn   = document.getElementById("btn-sellers-fetch");
+  const resEl      = document.getElementById("sellers-result");
+  const editBtn    = document.getElementById("btn-sellers-edit");
+  const modal      = document.getElementById("sellers-edit-modal");
+  const modalClose = document.getElementById("btn-sellers-edit-close");
+  const modalSave  = document.getElementById("btn-sellers-edit-save");
+  const modalReset = document.getElementById("btn-sellers-edit-reset");
+  const modalArea  = document.getElementById("sellers-edit-textarea");
+  const modalStat  = document.getElementById("sellers-edit-status");
+  if (!sel || !fetchBtn) return;
+
+  // Persistir lista en chrome.storage.local. Cada user puede tener su lista
+  // (no es un setting compartido del equipo).
+  const STORAGE_KEY = "sellers_companies_v1";
+  const loadList = async () => {
+    const { [STORAGE_KEY]: stored } = await chrome.storage.local.get(STORAGE_KEY);
+    return Array.isArray(stored) && stored.length ? stored : DEFAULT_SELLERS_COMPANIES;
+  };
+  const saveList = async (list) => chrome.storage.local.set({ [STORAGE_KEY]: list });
+
+  const renderSelect = async () => {
+    const list = await loadList();
+    sel.innerHTML = list.map((c, i) => `<option value="${i}">${c.name}</option>`).join("");
+    const cur = list[0];
+    if (cur && urlEl) urlEl.textContent = cur.url;
+    sel.dataset._list = JSON.stringify(list);
+  };
+  await renderSelect();
+
+  sel.addEventListener("change", () => {
+    const list = JSON.parse(sel.dataset._list || "[]");
+    const cur  = list[parseInt(sel.value, 10)];
+    if (cur && urlEl) urlEl.textContent = cur.url;
+  });
+
+  // Edit modal
+  editBtn?.addEventListener("click", async () => {
+    const list = await loadList();
+    modalArea.value = list.map(c => `${c.name} | ${c.url}`).join("\n");
+    modalStat.textContent = "";
+    modal.style.display = "flex";
+  });
+  modalClose?.addEventListener("click", () => { modal.style.display = "none"; });
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
+  modalReset?.addEventListener("click", () => {
+    if (!confirm("Restaurar lista por defecto? Se pierde lo editado.")) return;
+    modalArea.value = DEFAULT_SELLERS_COMPANIES.map(c => `${c.name} | ${c.url}`).join("\n");
+  });
+  modalSave?.addEventListener("click", async () => {
+    const lines = (modalArea.value || "").split("\n").map(l => l.trim()).filter(Boolean);
+    const parsed = [];
+    const errors = [];
+    lines.forEach((line, i) => {
+      const m = line.match(/^(.+?)\s*\|\s*(https?:\/\/\S+)$/);
+      if (!m) { errors.push(`Línea ${i + 1}: formato inválido`); return; }
+      const url = m[2];
+      if (!url.includes("sellers.json")) errors.push(`Línea ${i + 1}: la URL debería terminar en /sellers.json`);
+      parsed.push({ name: m[1].trim(), url });
+    });
+    if (parsed.length === 0) { modalStat.style.color = "#dc2626"; modalStat.textContent = "❌ Sin entries válidos."; return; }
+    await saveList(parsed);
+    await renderSelect();
+    modalStat.style.color = errors.length ? "#d97706" : "#16a34a";
+    modalStat.textContent = errors.length
+      ? `⚠️ Guardado ${parsed.length} con avisos: ${errors.slice(0, 2).join("; ")}`
+      : `✅ Guardado ${parsed.length} empresa(s).`;
+    setTimeout(() => { modal.style.display = "none"; }, 1500);
+  });
+
+  // Fetch + queue
+  fetchBtn.addEventListener("click", async () => {
+    const list = JSON.parse(sel.dataset._list || "[]");
+    const company = list[parseInt(sel.value, 10)];
+    if (!company) return;
+    const cap = Math.max(1, Math.min(300, parseInt(capInput.value, 10) || 100));
+
+    // Pre-check: queue pending capacity
+    const stats = await import("../modules/supabase.js").then(m => m.getCsvQueueStats(state.accessToken));
+    const pendingNow = stats?.pending || 0;
+    const space     = MAX_QUEUE_PENDING - pendingNow;
+    if (space <= 0) {
+      resEl.innerHTML = `<span style="color:#dc2626">❌ Queue llena: ${pendingNow}/${MAX_QUEUE_PENDING} pending. Esperá que el worker procese antes de cargar más.</span>`;
+      return;
+    }
+    const allowed = Math.min(cap, space);
+
+    fetchBtn.disabled = true;
+    resEl.innerHTML = `⏳ Fetching ${company.url}...`;
+    try {
+      const domains = await fetchSellersJson(company.url);
+      if (domains.length === 0) {
+        resEl.innerHTML = `<span style="color:#d97706">⚠️ No se encontraron PUBLISHER en sellers.json.</span>`;
+        return;
+      }
+      const slice = domains.slice(0, allowed);
+      const skipped = domains.length - slice.length;
+      const { uploadCsvDomains } = await import("../modules/supabase.js");
+      const result = await uploadCsvDomains(slice, state.loginEmail, state.accessToken, "sellers_json");
+      const ins = result?.inserted || 0;
+      const dup = slice.length - ins;
+      resEl.innerHTML = `<span style="color:#16a34a">✅ ${company.name}: ${ins} encolados${dup > 0 ? ` (${dup} duplicados ya en cola)` : ""}${skipped > 0 ? `. ${skipped} no encolados (cap ${allowed} de ${domains.length} totales).` : `.`}</span>`;
+      await refreshAll?.();
+    } catch (e) {
+      resEl.innerHTML = `<span style="color:#dc2626">❌ Error: ${esc(e.message || String(e))}</span>`;
+    } finally {
+      fetchBtn.disabled = false;
+    }
+  });
 }
 
 // ── Autopilot toggle + target ─────────────────────────────────

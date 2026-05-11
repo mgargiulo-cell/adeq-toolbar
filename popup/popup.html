@@ -852,6 +852,44 @@
   </section>
 
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+       SECCIÓN ADICIONAL — Import sellers.json
+       (extrae publishers de competidores que publican su inventory)
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+  <div class="import-section-label" style="margin-top:20px">②.b  IMPORT FROM sellers.json</div>
+  <section class="card">
+    <div class="card-title">📋 Import publishers from sellers.json</div>
+    <p class="import-desc">Each ad-tech company publishes a public <code>/sellers.json</code> with all the publishers they monetize. Pick a company → fetch → queue all publisher domains for analysis. Cap: <strong>300 pending in queue</strong> (compartido entre todos los imports).</p>
+
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+      <select id="sellers-company-select" class="form-select" style="flex:1;font-size:11px"></select>
+      <button id="btn-sellers-edit" class="btn btn-secondary btn-sm" style="font-size:11px;padding:3px 8px" title="Editar lista de empresas">✏️ Edit</button>
+    </div>
+    <div id="sellers-company-url" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;word-break:break-all">—</div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input id="sellers-cap-input" type="number" min="1" max="300" value="100" class="form-input" style="width:80px;font-size:11px" title="Máximo de dominios a encolar de este sellers.json (cap defensivo). El cap absoluto de la queue es 300 totales pending." />
+      <button id="btn-sellers-fetch" class="btn btn-primary btn-sm" style="flex:1;font-size:11px">📥 Fetch and queue</button>
+    </div>
+    <div id="sellers-result" class="push-result" style="min-height:16px;font-size:11px;margin-top:6px"></div>
+
+    <!-- Modal edit (hidden por default) -->
+    <div id="sellers-edit-modal" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(15,23,42,0.7);backdrop-filter:blur(2px);align-items:center;justify-content:center">
+      <div style="background:#fff;width:90%;max-width:480px;border-radius:8px;padding:14px;max-height:80vh;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <strong style="font-size:13px">📋 Edit sellers.json companies</strong>
+          <button id="btn-sellers-edit-close" class="btn btn-secondary btn-sm" style="font-size:11px">✕</button>
+        </div>
+        <p style="font-size:10px;color:#64748b;margin-bottom:8px">Una empresa por línea. Formato: <code>Name | https://url/sellers.json</code></p>
+        <textarea id="sellers-edit-textarea" class="form-input" style="width:100%;height:280px;font-family:monospace;font-size:10px;line-height:1.4" placeholder="Embi Media | https://embi-media.com/sellers.json&#10;Teads | https://teads.tv/sellers.json"></textarea>
+        <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
+          <button id="btn-sellers-edit-reset" class="btn btn-secondary btn-sm" style="font-size:11px" title="Restaurar lista por defecto">↺ Reset to defaults</button>
+          <button id="btn-sellers-edit-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save</button>
+        </div>
+        <div id="sellers-edit-status" style="font-size:10px;color:#16a34a;margin-top:6px;min-height:14px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
        SECCIÓN 3/3 — Monday URL Auto Prospector
        (busca en Monday items ya existentes en Ciclo Finalizado)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
