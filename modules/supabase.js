@@ -375,7 +375,7 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
   const userClause   = userFilter   ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}&order=score.desc,created_at.desc&limit=100&select=${cols}`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}&order=score.desc,created_at.desc&limit=300&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];

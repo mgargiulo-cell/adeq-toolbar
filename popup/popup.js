@@ -6061,20 +6061,23 @@ async function loadProspectsTab() {
     return;
   }
 
-  // Shuffle de la lista para que NO aparezcan agrupados por tanda del worker
-  // (autopilot tiende a procesar bloques de un mismo geo/categoría seguidos).
-  // Mix natural ayuda a que el MB vea variedad en cada refresh.
-  // Fisher-Yates shuffle.
+  // Mix puro al azar PER-MB: cada navegador hace shuffle propio + sample 100.
+  // Si el pool tiene >100, cada MB ve subset distinto (no solo orden).
+  // Si tiene <=100, ven los mismos pero en orden distinto.
+  // Resultado: Maxi puede tener 'eldeportivo.com' arriba mientras Diego no
+  // lo ve para nada → paralelización natural sin colisiones.
+  const VISIBLE_CAP = 100;
   const shuffled = [...rows];
   for (let i = shuffled.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
-  listEl.innerHTML = shuffled.map(r => renderProspectCard(r)).join("");
+  const sample = shuffled.slice(0, VISIBLE_CAP);
+  listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
 
   listEl.querySelectorAll(".pcard").forEach(card => {
     const id   = parseInt(card.dataset.id);
-    const data = shuffled.find(r => r.id === id);
+    const data = sample.find(r => r.id === id);
     if (data) initProspectCard(card, data);
   });
 }
