@@ -1783,10 +1783,10 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
 
     const item = await getNextCsvItem(token, blockedUsers);
     if (!item) {
-      log("  (cola vacía) — apagando csv_queue_enabled automáticamente");
-      // Auto-pausa: el toggle de la UI se apaga solo cuando no hay más items.
-      // El user lo vuelve a prender cuando sube un nuevo CSV.
-      await setConfigValue(token, "csv_queue_enabled", "false");
+      // Cola vacía pero NO apagamos el toggle. AUTO IMPORT queda ON todo el día
+      // — cuando alguien sube nuevos items, el worker los procesa al instante.
+      // El user controla manual el ON/OFF (o el idle exit del worker después
+      // de IDLE_EXIT_MS sin trabajo apaga el container, pero el toggle queda).
       break;
     }
 
