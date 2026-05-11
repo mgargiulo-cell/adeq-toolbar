@@ -402,6 +402,13 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
 // Si llegado, callers (Apollo en popup) deben skipear y caer a scraping.
 export const APOLLO_MONTHLY_HARD_CAP = 2400;
 
+// Caps de la cola de procesamiento (csv_queue):
+// - pending: max 200 items esperando ser procesados por el worker
+// - waiting_pool: max 300 items en hold (se promueven a pending cuando libera)
+// - review_queue (Prospects) NO tiene cap — puede crecer indefinido (es mejor tener variedad)
+export const CSV_QUEUE_HARD_CAP = 200;
+export const WAITLIST_HARD_CAP  = 300;
+
 export async function getApolloMonthlyUsage(accessToken) {
   if (!accessToken) return { used: 0, limit: APOLLO_MONTHLY_HARD_CAP, remaining: APOLLO_MONTHLY_HARD_CAP };
   const url = CONFIG.SUPABASE_URL;
@@ -920,13 +927,32 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!Array.isArray(domains) || domains.length === 0) return { inserted: 0 };
 
+  // Pre-check: cuántos espacio tenemos en la cola pending (max 200)
+  // Los primeros N entran como "pending", el resto como "waiting_pool".
+  let pendingNow = 0;
+  try {
+    const r = await fetch(
+      `${url}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = r.headers.get("content-range") || r.headers.get("Content-Range") || "";
+    const m = range.match(/\/(\d+)$/);
+    pendingNow = m ? parseInt(m[1]) : 0;
+  } catch {}
+  const slotsLeft = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
+
   // Batch de 500 (límite seguro de Supabase REST)
   const BATCH = 500;
-  let inserted = 0;
+  let inserted = 0, intoPending = 0, intoWaiting = 0;
+  let consumed = 0; // cuántos ya asigné (para distribuir entre pending y waiting_pool)
   for (let i = 0; i < domains.length; i += BATCH) {
-    const slice = domains.slice(i, i + BATCH).map(d => ({
-      domain: d, status: "pending", uploaded_by: userEmail, source,
-    }));
+    const slice = domains.slice(i, i + BATCH).map(d => {
+      const goesIntoPending = consumed < slotsLeft;
+      consumed++;
+      const status = goesIntoPending ? "pending" : "waiting_pool";
+      if (goesIntoPending) intoPending++; else intoWaiting++;
+      return { domain: d, status, uploaded_by: userEmail, source };
+    });
     try {
       const res = await fetch(`${url}/rest/v1/toolbar_csv_queue`, {
         method: "POST",
@@ -945,8 +971,11 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
       console.warn("uploadCsvDomains batch failed:", e.message);
     }
   }
-  return { inserted, attempted: domains.length };
+  return { inserted, attempted: domains.length, intoPending, intoWaiting };
 }
+
+// Re-export for callers
+export const CSV_QUEUE_HARD_CAP_EXPORT = CSV_QUEUE_HARD_CAP;
 
 // Clear prospects: deletes rows where (created_by=user) OR rows with NULL/empty created_by (legacy).
 // Returns { ok, deleted, status }.

@@ -431,15 +431,17 @@ async function bumpStat(token, userEmail, reason, n = 1) {
   } catch {} // best-effort, never block the loop
 }
 
-// Cap absoluto del pool review_queue.pending. Cuando se alcanza, los workers
-// (autopilot + csv) pausan inserciones — los items quedan en csv_queue como
-// "waiting_pool" hasta que se libere espacio (alguien procesa/rechaza/manda).
-const REVIEW_QUEUE_HARD_CAP = 200;
+// Cap absoluto de la COLA DE PROCESAMIENTO (csv_queue.pending).
+// Cuando se alcanza, los nuevos imports van a "waiting_pool" (max 300).
+// El worker promueve waiting_pool → pending automáticamente cuando se libera
+// espacio (al procesar items y bajar el count de pending).
+const CSV_QUEUE_HARD_CAP = 200;
+const WAITLIST_HARD_CAP  = 300;
 
-async function getReviewQueuePendingCountServer(token) {
+async function getCsvQueuePendingCountServer(token) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("content-range") || res.headers.get("Content-Range") || "";
@@ -448,12 +450,12 @@ async function getReviewQueuePendingCountServer(token) {
   } catch { return 0; }
 }
 
-// Promueve items csv_queue.status="waiting_pool" → "pending" si hay espacio.
-// Se llama al inicio de cada loop iteration.
+// Promueve items csv_queue.status="waiting_pool" → "pending" si hay espacio
+// en la cola de procesamiento (csv_queue.pending < 200).
 async function promoteWaitlist(token) {
   try {
-    const pendingCount = await getReviewQueuePendingCountServer(token);
-    const slots = REVIEW_QUEUE_HARD_CAP - pendingCount;
+    const pendingCount = await getCsvQueuePendingCountServer(token);
+    const slots = CSV_QUEUE_HARD_CAP - pendingCount;
     if (slots <= 0) return 0;
     // Trae hasta `slots` items waiting_pool, los promueve a pending (FIFO)
     const res = await fetch(
@@ -469,7 +471,7 @@ async function promoteWaitlist(token) {
       headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
       body: JSON.stringify({ status: "pending" }),
     });
-    log(`📤 Promote: ${items.length} csv_queue items waitlist → pending (review queue tenía ${pendingCount}/${REVIEW_QUEUE_HARD_CAP})`);
+    log(`📤 Promote: ${items.length} csv_queue items waitlist → pending (csv pending=${pendingCount}/${CSV_QUEUE_HARD_CAP})`);
     return items.length;
   } catch (e) {
     log(`⚠️ promoteWaitlist error: ${e.message}`);
@@ -1767,20 +1769,9 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const _rapidMonthStart = rapidMonth.usedThisMonth;
 
   while (processed < maxItems) {
-    // Pre-check cap review_queue: si está al tope, marcar próximos items
-    // como waiting_pool y parar este ciclo. promoteWaitlist los re-promueve cuando se libere.
-    const pendingNow = await getReviewQueuePendingCountServer(token);
-    if (pendingNow >= REVIEW_QUEUE_HARD_CAP) {
-      log(`⏸ Pool review_queue lleno (${pendingNow}/${REVIEW_QUEUE_HARD_CAP}) — pausando csv worker, items quedan en waitlist`);
-      // Mover items pending → waiting_pool para que no se queden trabados (sin pasar por processing)
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending`, {
-        method: "PATCH",
-        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({ status: "waiting_pool" }),
-      }).catch(() => {});
-      break;
-    }
-
+    // No hay pre-check de cap acá — el cap (200) se aplica al SUBIR items
+    // (popup pre-check + promoteWaitlist en main loop). Si llegamos acá,
+    // hay items para procesar normalmente.
     const item = await getNextCsvItem(token, blockedUsers);
     if (!item) {
       // Cola vacía pero NO apagamos el toggle. AUTO IMPORT queda ON todo el día
@@ -2343,13 +2334,6 @@ async function runSession(token, cfg, sessionStart) {
     if (newFromSimilar > 0) log(`  🔗 +${newFromSimilar} sitios similares`);
 
     if (adNetworks.length > 0) log(`  📡 Ad networks: ${adNetworks.join(", ")}`);
-
-    // Pre-check cap review_queue. Si está al tope, autopilot pausa esta sesión.
-    const _pendingNow = await getReviewQueuePendingCountServer(token);
-    if (_pendingNow >= REVIEW_QUEUE_HARD_CAP) {
-      log(`⏸ Pool review_queue lleno (${_pendingNow}/${REVIEW_QUEUE_HARD_CAP}) — autopilot pausa, espera que MBs procesen`);
-      break;
-    }
 
     const saveOk = await saveToReviewQueue(token, {
       domain,

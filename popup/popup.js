@@ -642,7 +642,88 @@ async function _writeAgentConfig(updates) {
   }
 }
 
+// Categorías populares en publishers — para chips selector del Focus
+const AGENT_CATEGORIES = [
+  "news", "sports", "entertainment", "finance", "technology",
+  "health", "lifestyle", "travel", "gambling", "automotive",
+  "food", "real estate", "education", "gaming", "music",
+  "fashion", "politics", "weather", "science", "shopping",
+];
+
+// Render chips selector. State: 0=ignored, 1=priority (verde), 2=excluded (rojo).
+// onChange recibe ({priority: [...], excluded: [...]}). Persiste en hidden inputs.
+function _renderGeoChips() {
+  const wrap = document.getElementById("agent-focus-geos-chips");
+  if (!wrap) return;
+  // Estado actual desde hidden inputs (CSV format)
+  const priInput = document.getElementById("agent-focus-geos-priority");
+  const excInput = document.getElementById("agent-focus-geos-excluded");
+  const priSet = new Set((priInput.value || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
+  const excSet = new Set((excInput.value || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
+
+  // Lista ordenada por nombre español
+  const entries = Object.entries(GEO_LABEL).sort((a, b) => a[1].localeCompare(b[1]));
+  wrap.innerHTML = entries.map(([code, name]) => {
+    const isPri = priSet.has(code);
+    const isExc = excSet.has(code);
+    const bg = isPri ? "#16a34a" : isExc ? "#dc2626" : "#334155";
+    const ico = isPri ? "✓" : isExc ? "✕" : "";
+    return `<button type="button" class="agent-geo-chip" data-code="${code}" style="background:${bg};color:#fff;border:none;border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;font-weight:600">${ico} ${name}</button>`;
+  }).join("");
+
+  wrap.querySelectorAll(".agent-geo-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const code = btn.dataset.code;
+      // Cycle: ignored → priority → excluded → ignored
+      if (priSet.has(code)) { priSet.delete(code); excSet.add(code); }
+      else if (excSet.has(code)) { excSet.delete(code); }
+      else { priSet.add(code); }
+      priInput.value = [...priSet].join(",");
+      excInput.value = [...excSet].join(",");
+      _renderGeoChips(); // re-render
+    });
+  });
+}
+
+function _renderCategoryChips() {
+  const wrap = document.getElementById("agent-focus-categories-chips");
+  if (!wrap) return;
+  const input = document.getElementById("agent-focus-categories");
+  const selected = new Set((input.value || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+
+  wrap.innerHTML = AGENT_CATEGORIES.map(cat => {
+    const isOn = selected.has(cat);
+    const bg = isOn ? "#16a34a" : "#334155";
+    const ico = isOn ? "✓ " : "";
+    return `<button type="button" class="agent-cat-chip" data-cat="${cat}" style="background:${bg};color:#fff;border:none;border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;font-weight:600">${ico}${cat}</button>`;
+  }).join("");
+
+  wrap.querySelectorAll(".agent-cat-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const cat = btn.dataset.cat;
+      if (selected.has(cat)) selected.delete(cat); else selected.add(cat);
+      input.value = [...selected].join(",");
+      _renderCategoryChips();
+    });
+  });
+}
+
+// Populate hour selects (0-23)
+function _populateHourSelects() {
+  ["agent-cfg-active-start", "agent-cfg-active-end"].forEach(id => {
+    const sel = document.getElementById(id);
+    if (!sel || sel.options.length > 0) return;
+    for (let h = 0; h < 24; h++) {
+      const opt = document.createElement("option");
+      opt.value = String(h);
+      opt.textContent = `${String(h).padStart(2, "0")}:00`;
+      sel.appendChild(opt);
+    }
+  });
+}
+
 async function loadAdminAgent() {
+  _populateHourSelects();
   const cfg = await _readAgentConfig();
   let users = [];
   try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
@@ -4797,12 +4878,13 @@ async function initCsvQueue() {
       getCsvQueueStats(state.accessToken),
       import("../modules/supabase.js").then(m => m.getReviewQueuePendingCount(state.accessToken)).catch(() => 0),
     ]);
-    const inFlight = (stats.pending || 0) + (stats.processing || 0);
+    const csvPending    = stats.pending || 0;
+    const csvProcessing = stats.processing || 0;
     const waitlistCount = stats.waiting_pool || 0;
     statsEl.innerHTML = `
-      <div style="margin-bottom:4px"><strong>📋 Pool Prospects:</strong> ${reviewPending}/200 pending</div>
-      <div style="margin-bottom:4px"><strong>⚙️ Procesando:</strong> ${inFlight} en cola del worker</div>
-      <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/300 esperando turno (entran cuando se libera el pool)</div>
+      <div style="margin-bottom:4px"><strong>⚙️ Cola de procesamiento:</strong> ${csvPending}/${CSV_PENDING_CAP} pending${csvProcessing ? ` + ${csvProcessing} processing` : ""}</div>
+      <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/${WAITLIST_CAP} esperando turno (auto-promueve cuando libera)</div>
+      <div style="margin-bottom:4px"><strong>📋 Prospects (sin cap):</strong> ${reviewPending} leads ya enriquecidos</div>
       <div style="font-size:9px;color:var(--text-muted);margin-top:4px">
         Total histórico: ${stats.total} · ✅ Done: ${stats.done} · ❌ Error: ${stats.error} · ⏭ Skipped: ${stats.skipped}
       </div>
@@ -4939,11 +5021,13 @@ async function initCsvQueue() {
         uploadRes.className = "push-result error";
         return;
       }
-      // Pre-check waitlist global
+      // Pre-check capacity: csv pending (max 200) + waitlist (max 300) = 500 total
       const _stats = await getCsvQueueStats(state.accessToken);
-      const _inFlight = (_stats?.pending || 0) + (_stats?.waiting_pool || 0);
-      if (_inFlight + unique.length > WAITLIST_CAP) {
-        uploadRes.innerHTML = `❌ <strong>Waitlist llena:</strong> ya hay ${_inFlight}/${WAITLIST_CAP} en espera. No se puede agregar ${unique.length} más. Esperá que el equipo procese.`;
+      const _pending = _stats?.pending || 0;
+      const _waiting = _stats?.waiting_pool || 0;
+      const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 500
+      if (_pending + _waiting + unique.length > _capacityTotal) {
+        uploadRes.innerHTML = `❌ <strong>Sistema saturado:</strong> ya hay ${_pending}/${CSV_PENDING_CAP} procesando + ${_waiting}/${WAITLIST_CAP} en espera. No se puede agregar ${unique.length} más. Esperá que el worker procese.`;
         uploadRes.className = "push-result error";
         return;
       }
@@ -5032,12 +5116,14 @@ async function initCsvQueue() {
 //   - QUEUE: 75 dominios por tirada (igual que Monday/CSV)
 //   - OPEN TABS: 30 pestañas por click (memory + popup blocker)
 //   - QUEUE PENDING TOTAL: 300 (compartido entre todos los imports)
-// Caps acordados con user 2026-05-11:
-// - Por tirada (cualquier import): 50
-// - Tope de espera (waitlist) global: 300 — si excede, error
-// - Tope review_queue.pending: 200 (manejado por worker, mostrado en stats)
+// Caps de la cola (acordados con user 2026-05-11):
+// - csv_queue.pending: 200 (cola de procesamiento del worker)
+// - csv_queue.waiting_pool: 300 (en hold hasta que pending baje)
+// - review_queue (Prospects): SIN CAP (más leads = más variedad para los MBs)
+// - Por tirada de import: 50
 const SELLERS_QUEUE_CAP_PER_RUN = 50;
 const SELLERS_OPEN_TABS_CAP     = 30;
+const CSV_PENDING_CAP           = 200;
 const WAITLIST_CAP              = 300;
 
 async function initSellersJsonImport(refreshAll) {
@@ -5126,10 +5212,12 @@ async function initSellersJsonImport(refreshAll) {
 
     // Pre-check: waitlist (csv_queue pending + waiting_pool) capacity
     const stats = await import("../modules/supabase.js").then(m => m.getCsvQueueStats(state.accessToken));
-    const inFlight = (stats?.pending || 0) + (stats?.waiting_pool || 0);
-    const space    = WAITLIST_CAP - inFlight;
+    const _csvPending = stats?.pending || 0;
+    const _csvWaiting = stats?.waiting_pool || 0;
+    const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 500
+    const space = _capacityTotal - _csvPending - _csvWaiting;
     if (space <= 0) {
-      resEl.innerHTML = `<span style="color:#dc2626">❌ Waitlist llena: ${inFlight}/${WAITLIST_CAP}. Esperá que el equipo procese antes de cargar más.</span>`;
+      resEl.innerHTML = `<span style="color:#dc2626">❌ Sistema saturado: ${_csvPending}/${CSV_PENDING_CAP} procesando + ${_csvWaiting}/${WAITLIST_CAP} esperando. Esperá que el worker procese antes de cargar más.</span>`;
       return;
     }
     const allowed = Math.min(cap, space);
