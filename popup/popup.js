@@ -1066,8 +1066,25 @@ function renderAdminLiveFeed(rows) {
 
 // ── Global toast helper para errores que antes iban silenciosos a console.
 //    Reemplaza el patrón console.warn() puro por un aviso visible al user.
-function showToast(message, kind = "info", durationMs = 4000) {
+// Cierra cualquier modal visible al presionar Escape — UX estándar.
+// Se setea una sola vez al cargar.
+if (typeof window !== "undefined" && !window._modalEscWired) {
+  window._modalEscWired = true;
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    document.querySelectorAll(".modal").forEach(m => {
+      if (m.style.display && m.style.display !== "none") m.style.display = "none";
+    });
+  });
+}
+
+function showToast(message, kind = "info", durationMs) {
   if (!message) return;
+  // Default: 6s para info/ok, 8s para warn/error (más texto, hay que poder leer)
+  if (durationMs == null) durationMs = (kind === "error" || kind === "warn") ? 8000 : 6000;
+  // Anti-overlap: si hay > 3 toasts visibles, retirar el más viejo antes de agregar
+  const existing = document.querySelectorAll(".global-toast");
+  if (existing.length >= 3) existing[0].remove();
   const t = document.createElement("div");
   t.className = `global-toast ${kind}`;
   t.textContent = message;
@@ -1929,7 +1946,13 @@ async function runTrafficCheck() {
     // Si SimilarWeb falló (state.traffic === 0), preservamos lo prefilled desde Monday
     // o lo que el usuario haya tipeado manualmente.
     const pvDisplay = document.getElementById("form-pv-display");
-    if (pvDisplay && state.traffic) pvDisplay.value = formatTraffic(state.traffic);
+    // No pisar el input si el user lo está tipeando (focused) o si ya tiene
+    // un valor manual — preserva la edición y evita pérdida de focus mid-typing.
+    if (pvDisplay && state.traffic
+        && document.activeElement !== pvDisplay
+        && !pvDisplay.value) {
+      pvDisplay.value = formatTraffic(state.traffic);
+    }
 
     // Top 3 países con banderas — chips secundarios SOLO si el % es significativo (>1%)
     // y con tooltip claro. El % es "share del tráfico mundial del sitio".
@@ -3620,6 +3643,11 @@ async function initKeywords() {
 }
 
 function startKwRotation() {
+  // Cleanup de timers previos — evita leak si initKeywords corre múltiples veces
+  if (window._kwTimers) {
+    clearInterval(window._kwTimers.rotTimer);
+    clearInterval(window._kwTimers.tickTimer);
+  }
   kwNextRotation = Date.now() + KW_ROTATION_MS;
   updateRotationTimer();
   const rotTimer  = setInterval(() => {
@@ -4403,7 +4431,7 @@ function applyUserFromAuth(auth) {
   const name  = AUTHORIZED[email] || auth?.name || "";
 
   if (!name) {
-    console.error("[auth] No se pudo determinar el usuario logueado. Email:", email);
+    console.error("[auth] No se pudo determinar el usuario logueado.");
     // Forzar re-login: borra auth y recarga
     chrome.storage.local.remove("auth").then(() => window.location.reload());
     return;
