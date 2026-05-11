@@ -6329,13 +6329,13 @@ function initProspectCard(card, data) {
 }
 
 function getSelectedEmail(card) {
-  // Prioridad: 1) campo "Email" de Monday data (auto-completado pero editable)
-  //            2) input manual
-  //            3) chip seleccionado en la lista
-  const monday  = card.querySelector(".pcard-email-monday")?.value?.trim();
-  if (monday && monday.includes("@")) return monday;
+  // Prioridad: el INPUT MANUAL siempre gana — es el override explícito del user.
+  // Después: el campo Monday (que se sincroniza con el chip seleccionado),
+  // después chip seleccionado, después radio.
   const manual  = card.querySelector(".pcard-email-manual")?.value?.trim();
   if (manual && manual.includes("@")) return manual;
+  const monday  = card.querySelector(".pcard-email-monday")?.value?.trim();
+  if (monday && monday.includes("@")) return monday;
   const selected = card.querySelector(".pcard-email-list .email-chip.selected");
   if (selected?.dataset.email) return selected.dataset.email;
   const radio   = card.querySelector(".pcard-email-radio:checked");
