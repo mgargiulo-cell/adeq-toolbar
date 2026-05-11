@@ -26,7 +26,8 @@ const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
 const DOMAIN_DELAY_MS  = 2500;
-const MIN_TRAFFIC      = 400_000;  // pageViews mínimos (visits × pagesPerVisit) — debajo de esto el dominio se descarta sin enriquecer. (User 2026-05-08: filtro fijo +400K)
+const MIN_TRAFFIC      = 400_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
+const REVIEW_QUEUE_MIN_TRAFFIC = 350_000; // Floor absoluto en review_queue. Items debajo se auto-borran (no acumulan basura).
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
@@ -1755,6 +1756,15 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
   }
+  // Filtro 350K: si tenemos traffic conocido y es bajo, no insertar al pool.
+  // Si visits=0 (sin data), igual lo dejamos pasar — el agente lo enriquece después.
+  if (visits > 0 && visits < REVIEW_QUEUE_MIN_TRAFFIC) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: `traffic ${visits} below min ${REVIEW_QUEUE_MIN_TRAFFIC}`,
+    });
+    log(`  ⏭ ${domain} — traffic ${visits} < ${REVIEW_QUEUE_MIN_TRAFFIC} (no entra a review_queue)`);
+    return;
+  }
   const category = pageContent?.category || "";
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
@@ -3055,6 +3065,23 @@ async function runAgentCycle(token, allFlags) {
             domain, action: "skipped", reason: "no_email_after_enrichment",
             details: { traffic: leadTraffic, geo: leadGeo },
           });
+          continue;
+        }
+
+        // Floor 350K: si después del enrichment descubrimos que el lead tiene
+        // traffic CONOCIDO menor a 350K → no vale la pena procesarlo, lo BORRAMOS
+        // del review_queue para que no acumule basura. Solo aplica a leads con
+        // traffic > 0 (los que tienen 0/null seguirán esperando enrichment).
+        if (leadTraffic > 0 && leadTraffic < REVIEW_QUEUE_MIN_TRAFFIC) {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "DELETE",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+          }).catch(() => {});
+          await logAgentAction(token, userEmail, {
+            domain, action: "skipped", reason: "below_min_traffic_deleted",
+            details: { traffic: leadTraffic, min: REVIEW_QUEUE_MIN_TRAFFIC },
+          });
+          log(`  🗑 ${domain}: traffic ${leadTraffic} < ${REVIEW_QUEUE_MIN_TRAFFIC} → DELETE`);
           continue;
         }
 
