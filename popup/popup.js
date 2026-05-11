@@ -1023,22 +1023,41 @@ async function loadAdminActivity() {
   document.getElementById("stat-monday").textContent    = monday.toLocaleString();
   document.getElementById("stat-500k-up").textContent   = above500k.toLocaleString();
 
-  // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial
-  // para que las funciones de render no necesiten saber del origen.
-  const queueAsHist = queueRes.map(q => ({
-    domain:       q.domain,
-    media_buyer:  q.created_by || "",
-    page_views:   q.traffic || 0,
-    raw_visits:   q.traffic || 0,
-    is_new:       true,
-    date:         q.created_at,
-    created_at:   q.created_at,
-    geo:          q.geo,
-    category:     q.category,
-    source:       q.source || "autopilot",
-    status:       q.status,
-    score:        q.score,
-  }));
+  // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial.
+  // CADA review_queue row genera 1 row para el created_by (descubrió/importó) Y
+  // 1 row adicional para el validated_by (procesó). Así la "actividad" de cada MB
+  // refleja TODO lo que hizo, no solo lo que descubrió.
+  const queueAsHist = [];
+  queueRes.forEach(q => {
+    const baseRow = {
+      domain:       q.domain,
+      page_views:   q.traffic || 0,
+      raw_visits:   q.traffic || 0,
+      is_new:       true,
+      date:         q.created_at,
+      created_at:   q.created_at,
+      geo:          q.geo,
+      category:     q.category,
+      source:       q.source || "autopilot",
+      status:       q.status,
+      score:        q.score,
+    };
+    // Row 1: para el creador (quien lo metió al pool)
+    if (q.created_by) {
+      queueAsHist.push({ ...baseRow, media_buyer: q.created_by });
+    }
+    // Row 2: para el validador (quien lo procesó/mando mail). Filtra agentes y "agent:..."
+    // Solo cuenta MBs humanos en el comparador. El agente tiene su propia columna.
+    if (q.validated_by && !q.validated_by.startsWith("agent:") && q.validated_by !== q.created_by) {
+      queueAsHist.push({
+        ...baseRow,
+        media_buyer: q.validated_by,
+        date: q.validated_at || q.created_at,
+        created_at: q.validated_at || q.created_at,
+        source: "validated", // marca que esta row representa la VALIDACIÓN, no la creación
+      });
+    }
+  });
   const combined = [...histRes, ...queueAsHist];
 
   // Chart por día
