@@ -36,6 +36,27 @@ export const DEFAULT_SELLERS_COMPANIES = [
   { name: "Spacefoot (277 pubs)",       url: "https://spacefoot.com/sellers.json" },
   { name: "360Playvid (213 pubs)",      url: "https://360playvid.com/sellers.json" },
   { name: "Seznam (115 pubs)",          url: "https://www.seznam.cz/sellers.json" },
+  // ── SSPs / Ad exchanges descubiertos (well-known.dev + top SSP lists) ──
+  // Estos son los GIGANTES — Improve Digital tiene ~20K publishers, casi
+  // toda la web europea pasa por ahí.
+  { name: "Improve Digital (19537 pubs)", url: "https://improvedigital.com/sellers.json" },
+  { name: "TripleLift (3788 pubs)",       url: "https://triplelift.com/sellers.json" },
+  { name: "PubMatic (3393 pubs)",         url: "https://pubmatic.com/sellers.json" },
+  { name: "OpenX (2827 pubs)",            url: "https://openx.com/sellers.json" },
+  { name: "Sharethrough (2722 pubs)",     url: "https://sharethrough.com/sellers.json" },
+  { name: "Setupad (1878 pubs)",          url: "https://setupad.com/sellers.json" },
+  { name: "Index Exchange (1695 pubs)",   url: "https://www.indexexchange.com/sellers.json" },
+  { name: "Rubicon Project (1468 pubs)",  url: "https://rubiconproject.com/sellers.json" },
+  { name: "Smart AdServer (1331 pubs)",   url: "https://smartadserver.com/sellers.json" },
+  { name: "LKQD (1329 pubs)",             url: "https://lkqd.com/sellers.json" },
+  { name: "GumGum (464 pubs)",            url: "https://gumgum.com/sellers.json" },
+  { name: "Adform (308 pubs)",            url: "https://adform.com/sellers.json" },
+  { name: "OneTag (307 pubs)",            url: "https://onetag.com/sellers.json" },
+  { name: "Kargo (302 pubs)",             url: "https://kargo.com/sellers.json" },
+  { name: "EMX Digital (167 pubs)",       url: "https://emxdigital.com/sellers.json" },
+  { name: "Undertone (139 pubs)",         url: "https://undertone.com/sellers.json" },
+  { name: "Yieldlab (70 pubs)",           url: "https://yieldlab.net/sellers.json" },
+  { name: "Contextweb (26 pubs)",         url: "https://contextweb.com/sellers.json" },
 ];
 
 // Check si los dominios ya fueron procesados antes (csv_queue + review_queue + historial).
@@ -108,4 +129,84 @@ function normalizeDomain(d) {
     .replace(/^www\./, "")
     .replace(/\/.*$/, "")
     .trim();
+}
+
+// Parsea el ads.txt de un sitio y devuelve dominios únicos de ad systems.
+// Formato ads.txt: "domain.com, accountId, RELATIONSHIP, certAuthority"
+// Útil para descubrir nuevas empresas con sellers.json.
+export async function fetchAdsTxtSystems(siteUrl) {
+  const url = (() => {
+    try { return new URL("/ads.txt", siteUrl).href; } catch { return null; }
+  })();
+  if (!url) throw new Error("URL inválida");
+  const res = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} en ${url}`);
+  const text = await res.text();
+  // HTML check (404 page que devuelve 200)
+  if (/^\s*<!doctype|<html/i.test(text.trim())) {
+    throw new Error("Respuesta no es ads.txt (parece HTML 404)");
+  }
+  const systems = new Set();
+  text.split("\n").forEach(line => {
+    const clean = line.split("#")[0].trim();
+    if (!clean) return;
+    const parts = clean.split(",").map(s => s.trim());
+    if (parts.length < 3) return;
+    const domain = normalizeDomain(parts[0]);
+    // Skip subdomain-style ads.txt (CNAME/subdomain= que no son ad systems)
+    if (!domain || /^(subdomain|contact|cname)/i.test(domain)) return;
+    systems.add(domain);
+  });
+  return [...systems].sort();
+}
+
+// Probe en paralelo: para cada dominio ad-system, prueba si /sellers.json existe
+// y devuelve {domain, url, pubs}. Skip los que fallan.
+// Concurrency limitada para no quemar la red (8 simultáneos).
+export async function probeSellersJson(domains, onProgress) {
+  const results = [];
+  const CONCURRENCY = 8;
+  let completed = 0;
+  const probe = async (domain) => {
+    const tryUrls = [
+      `https://${domain}/sellers.json`,
+      `https://www.${domain}/sellers.json`,
+    ];
+    for (const url of tryUrls) {
+      try {
+        const res = await fetch(url, {
+          method: "GET", redirect: "follow",
+          signal: AbortSignal.timeout(8000),
+          headers: { "Accept": "application/json" },
+        });
+        if (!res.ok) continue;
+        const text = await res.text();
+        if (/^\s*<!doctype|<html/i.test(text.trim())) continue;
+        let data;
+        try { data = JSON.parse(text); } catch { continue; }
+        const pubs = (data?.sellers || []).filter(s => (s.seller_type || "").toUpperCase() === "PUBLISHER").length;
+        if (pubs > 0) return { domain, url: res.url || url, pubs };
+      } catch {}
+    }
+    return null;
+  };
+  // Worker pool
+  const queue = [...domains];
+  const workers = Array(Math.min(CONCURRENCY, queue.length)).fill(0).map(async () => {
+    while (queue.length > 0) {
+      const domain = queue.shift();
+      if (!domain) break;
+      const r = await probe(domain);
+      completed++;
+      if (onProgress) onProgress(completed, domains.length, r);
+      if (r) results.push(r);
+    }
+  });
+  await Promise.all(workers);
+  results.sort((a, b) => b.pubs - a.pubs);
+  return results;
 }
