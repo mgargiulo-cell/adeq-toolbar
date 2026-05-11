@@ -780,6 +780,10 @@ async function loadAdminAgent() {
   setVal("agent-focus-daily",  focus.daily_override, 0);
   setVal("agent-focus-weekly", focus.weekly_target,  0);
 
+  // Render chips de GEOs y Categorías (lee de los hidden inputs llenados arriba)
+  _renderGeoChips();
+  _renderCategoryChips();
+
   // Stats hoy
   await _refreshAgentStats(myEmail);
   await _refreshAgentFeed();
