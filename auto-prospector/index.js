@@ -8,6 +8,7 @@
 // ============================================================
 
 import fetch from "node-fetch";
+import { pickRandomTemplate, fillTemplate, pickPitchSource } from "./templates.js";
 
 const SUPABASE_URL              = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY         = process.env.SUPABASE_ANON_KEY;
@@ -2489,6 +2490,42 @@ Write the prospecting email. Return JSON only.`;
   return parsed;
 }
 
+// ── Email scoring + verify ──────────────────────────────────
+// Garantiza que solo mandamos a emails decentes. 3 niveles:
+//   🟢 green  : SMTP OK + no garbage + no genérico → manda
+//   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
+//   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
+const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster)@/i;
+const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy)/i;
+const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
+
+async function scoreEmail(email) {
+  if (!email || typeof email !== "string" || !email.includes("@")) {
+    return { color: "red", reason: "invalid_format" };
+  }
+  const lower = email.toLowerCase().trim();
+  if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) {
+    return { color: "red", reason: "garbage_address" };
+  }
+  // SMTP verify via eva.pingutil (free, no auth)
+  try {
+    const res = await fetch(`https://api.eva.pingutil.com/email?email=${encodeURIComponent(lower)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const valid = data?.status === "success" && data?.data?.valid_syntax === true;
+      const deliverable = data?.data?.deliverable === true;
+      const isDisposable = data?.data?.disposable === true;
+      if (isDisposable) return { color: "red", reason: "disposable" };
+      if (!valid)        return { color: "red", reason: "invalid_syntax_smtp" };
+      if (!deliverable)  return { color: "red", reason: "undeliverable_smtp" };
+    }
+  } catch {} // si pingutil falla, seguimos con el check local
+  if (GENERIC_LOCAL.test(lower)) return { color: "yellow", reason: "generic_address" };
+  return { color: "green", reason: "ok" };
+}
+
 // Self-check Claude: verifica que el pitch no contradiga datos de input.
 // Bajo costo (max 100 tokens). Si detecta inconsistencia, return false.
 async function selfCheckPitch(token, pitch, ctx) {
@@ -2786,9 +2823,12 @@ async function runAgentCycle(token, allFlags) {
       categoryClause = `&category=in.(${encodeURIComponent(inList)})`;
     }
 
-    // Pull candidates con focus aplicado
+    // Pull candidates: solo filtro de tráfico (mínimo absoluto) + focus.
+    // El score se usa SOLO para ordenar (los más prometedores primero).
+    // No filtramos por score porque la lógica del score puede cambiar y
+    // no queremos perder leads buenos por una heurística inestable.
     const queueRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}&score=gte.${aCfg.thresholdScore}${geoClause}${categoryClause}&select=*&order=score.desc&limit=${batchSize * 3}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&order=score.desc.nullslast,created_at.desc&limit=${batchSize * 3}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const candidates = await queueRes.json();
@@ -2808,33 +2848,56 @@ async function runAgentCycle(token, allFlags) {
       if (processed >= batchSize) break;
       const domain = lead.domain;
       const emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
-      const email  = emails.find(e => e && /\@/.test(e) && !/^(abuse|whois|postmaster|noreply|no-reply|admin@nic|ayuda@nic)/i.test(e));
+      // Pickear el primer email candidato (cualquiera con @). El scoring real es abajo.
+      const email = emails.find(e => e && /\@/.test(e));
 
-      // Quality gates pre-Claude
       if (!email) {
-        await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "no_valid_email" });
+        await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "no_email_at_all" });
         continue;
       }
 
       try {
-        // 1. Generar pitch con Claude
-        const pitch = await generatePitchAgent(token, {
-          domain, traffic: lead.traffic, geo: lead.geo, language: lead.language || "en",
-          category: lead.category, contactName: lead.contact_name,
-          adNetworks: lead.ad_networks,
-        });
-
-        // 2. Self-check pitch (heurísticas rápidas)
-        const check = await selfCheckPitch(token, pitch.body, {
-          domain, adsTxtExists: false, adNetworks: lead.ad_networks,
-        });
-        if (!check.ok) {
+        // 1. EMAIL SCORE — verifica antes de gastar Claude/template
+        // 🔴 red = skip, 🟡 yellow = manda igual (es lo mejor que hay), 🟢 green = ideal
+        const emailScore = await scoreEmail(email);
+        if (emailScore.color === "red") {
           await logAgentAction(token, userEmail, {
-            domain, action: "skipped", reason: `quality_${check.reason}`,
-            pitch_subject: pitch.subjects?.[0],
-            details: { pitch_body_preview: pitch.body.substring(0, 200) },
+            domain, action: "skipped",
+            reason: `email_red_${emailScore.reason}`,
+            details: { email },
           });
           continue;
+        }
+
+        // 2. Decidir source: 80% template, 20% Claude (configurable via agent_claude_percent)
+        const claudePercent = parseInt(cfg.agent_claude_percent || "20", 10);
+        const source = pickPitchSource(claudePercent);
+        let pitch;
+        if (source === "claude") {
+          // Variedad estilística — A/B test futuro
+          pitch = await generatePitchAgent(token, {
+            domain, traffic: lead.traffic, geo: lead.geo, language: lead.language || "en",
+            category: lead.category, contactName: lead.contact_name,
+            adNetworks: lead.ad_networks,
+          });
+          // Self-check anti-alucinación solo cuando viene de Claude (templates están baked clean)
+          const check = await selfCheckPitch(token, pitch.body, {
+            domain, adsTxtExists: false, adNetworks: lead.ad_networks,
+          });
+          if (!check.ok) {
+            await logAgentAction(token, userEmail, {
+              domain, action: "skipped", reason: `quality_${check.reason}`,
+              pitch_subject: pitch.subjects?.[0],
+              details: { source, pitch_body_preview: pitch.body.substring(0, 200) },
+            });
+            continue;
+          }
+        } else {
+          // Template (80% de los casos) — sin costo Claude
+          const tpl = pickRandomTemplate(lead.language);
+          pitch = fillTemplate(tpl, {
+            domain, geo: lead.geo, traffic: lead.traffic,
+          });
         }
 
         // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──
@@ -2894,7 +2957,14 @@ async function runAgentCycle(token, allFlags) {
             domain, action: "sent", reason: "ok",
             pitch_subject: subject,
             monday_item_id: mondayItemId,
-            details: { email, traffic: lead.traffic, geo: lead.geo, language: lead.language },
+            details: {
+              email,
+              email_score: emailScore.color,
+              source,                  // "template" | "claude" — para A/B futuro
+              traffic: lead.traffic,
+              geo: lead.geo,
+              language: lead.language,
+            },
           });
         }
 

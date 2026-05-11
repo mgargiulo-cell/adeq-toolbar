@@ -6220,7 +6220,8 @@ function renderProspectCard(r) {
             return `<span title="Origen del item: ${esc(email)}" style="font-size:9px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 5px;flex-shrink:0">👤 ${esc(name)}</span>`;
           })()}
           <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
-             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;word-break:break-all;line-height:1.3"
+             title="${esc(r.domain)}">
             ${esc(r.domain)} ↗
           </a>
           ${scoreBadge}
