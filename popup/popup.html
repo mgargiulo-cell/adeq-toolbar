@@ -80,6 +80,7 @@
     <span class="admin-panel-title">🛡️ Admin Panel</span>
     <div class="admin-panel-tabs">
       <button class="admin-tab-btn active" data-admin-tab="activity">📊 Activity</button>
+      <button class="admin-tab-btn" data-admin-tab="agent">🤖 Agent</button>
       <button class="admin-tab-btn" data-admin-tab="limits">⚙️ Limits</button>
       <button class="admin-tab-btn" data-admin-tab="blocklist">🚫 Blocklist</button>
     </div>
@@ -117,6 +118,57 @@
 
     <div class="admin-section-title">📋 Resumen narrativo (para 1:1s)</div>
     <div id="admin-mb-summaries" class="admin-mb-summaries"></div>
+  </div>
+
+  <!-- Tab: 🤖 Agent — autonomous MB only for admin -->
+  <div id="admin-tab-agent" class="admin-tab-content">
+    <div style="background:#1e293b;border:1px solid #fbbf24;border-radius:8px;padding:10px 12px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div>
+          <div style="font-weight:700;color:#fbbf24;font-size:13px">🤖 AI Agent MB</div>
+          <div style="font-size:10px;color:#94a3b8;margin-top:2px">Procesa la review_queue automáticamente: pitch Claude → push Monday → send Gmail.</div>
+        </div>
+        <label class="toggle-switch" title="Activar / desactivar el agente">
+          <input id="agent-toggle" type="checkbox" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div id="agent-toggle-status" style="font-size:11px;color:#cbd5e1;line-height:1.6"></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
+      <div class="stat-card"><div class="stat-num" id="agent-stat-sent">--</div><div class="stat-label">Enviados hoy</div></div>
+      <div class="stat-card"><div class="stat-num" id="agent-stat-skipped">--</div><div class="stat-label">Skipped 24h</div></div>
+      <div class="stat-card"><div class="stat-num" id="agent-stat-failed">--</div><div class="stat-label">Failed 24h</div></div>
+      <div class="stat-card"><div class="stat-num" id="agent-stat-cap">20</div><div class="stat-label">Cap diario</div></div>
+    </div>
+
+    <div class="admin-section-title">⚙️ Thresholds</div>
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
+      <div style="display:grid;grid-template-columns:1fr 80px;gap:6px;align-items:center;font-size:11px;color:#cbd5e1">
+        <label for="agent-cfg-traffic">Min tráfico (visits)</label>
+        <input id="agent-cfg-traffic" class="form-input" type="number" min="100000" step="50000" value="500000" style="font-size:11px;padding:3px 6px" />
+
+        <label for="agent-cfg-score">Min score (worker autopilot)</label>
+        <input id="agent-cfg-score" class="form-input" type="number" min="0" max="100" value="40" style="font-size:11px;padding:3px 6px" />
+
+        <label for="agent-cfg-max">Max envíos / día</label>
+        <input id="agent-cfg-max" class="form-input" type="number" min="1" max="100" value="20" style="font-size:11px;padding:3px 6px" />
+
+        <label for="agent-cfg-quiet-start">Quiet hours start (0-23, BA)</label>
+        <input id="agent-cfg-quiet-start" class="form-input" type="number" min="0" max="23" value="22" style="font-size:11px;padding:3px 6px" />
+
+        <label for="agent-cfg-quiet-end">Quiet hours end (0-23, BA)</label>
+        <input id="agent-cfg-quiet-end" class="form-input" type="number" min="0" max="23" value="7" style="font-size:11px;padding:3px 6px" />
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
+        <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save thresholds</button>
+        <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px" title="Pausa el agent por 1 hora (kill switch manual)">⏸ Pause 1h</button>
+      </div>
+    </div>
+
+    <div class="admin-section-title">📋 Last 50 actions</div>
+    <div id="agent-actions-feed" style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:10px;max-height:280px;overflow-y:auto;font-family:ui-monospace,monospace">Loading...</div>
   </div>
 
   <!-- Tab: Limits -->

@@ -302,14 +302,23 @@ async function getConfig(token) {
 async function getActiveFlags(token) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,csv_queue_enabled)&select=key,value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,csv_queue_enabled,agent_enabled_users,agent_paused_until)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     const map = {};
-    rows.forEach(r => { map[r.key] = r.value === "true"; });
-    return { autopilot: !!map.auto_prospecting_enabled, csvQueue: !!map.csv_queue_enabled };
-  } catch { return { autopilot: false, csvQueue: false }; }
+    rows.forEach(r => { map[r.key] = r.value; });
+    let agentUsers = [];
+    try { agentUsers = JSON.parse(map.agent_enabled_users || "[]"); } catch {}
+    const pausedUntil = map.agent_paused_until ? new Date(map.agent_paused_until).getTime() : 0;
+    const agentActive = agentUsers.length > 0 && Date.now() > pausedUntil;
+    return {
+      autopilot: map.auto_prospecting_enabled === "true",
+      csvQueue:  map.csv_queue_enabled === "true",
+      agent:     agentActive,
+      agentUsers,
+    };
+  } catch { return { autopilot: false, csvQueue: false, agent: false, agentUsers: [] }; }
 }
 
 async function isAutopilotEnabled(token) {
@@ -2283,6 +2292,482 @@ async function runSession(token, cfg, sessionStart) {
   await flushAutopilotStats(token, true).catch(() => {});
 }
 
+// ════════════════════════════════════════════════════════════════
+// 🤖 AGENT MB — Auto end-to-end prospecting (push Monday + send Gmail)
+// Activado solo para users en toolbar_config.agent_enabled_users (JSON array).
+// Procesa review_queue → quality gates → Claude pitch → Monday push → Gmail send.
+// Simula 100% el workflow del MB humano.
+// ════════════════════════════════════════════════════════════════
+
+const AGENT_DEFAULTS = {
+  threshold_traffic:    500_000,
+  threshold_score:      40,
+  max_per_day:          20,
+  quiet_hours_start:    22,        // 22hs
+  quiet_hours_end:      7,         // 7am
+  quiet_timezone:       "America/Argentina/Buenos_Aires",
+  cycle_interval_sec:   300,       // 5 min entre ciclos
+  per_cycle_limit:      3,         // max 3 leads procesados por ciclo (rate limit Gmail-friendly)
+  monday_board_id:      1420268379,
+};
+
+function _agentCfg(cfg) {
+  const get = (key, dflt) => {
+    const v = cfg[`agent_${key}`];
+    if (v == null || v === "") return dflt;
+    if (typeof dflt === "number") return parseInt(v, 10) || dflt;
+    return v;
+  };
+  return {
+    thresholdTraffic: get("threshold_traffic", AGENT_DEFAULTS.threshold_traffic),
+    thresholdScore:   get("threshold_score",   AGENT_DEFAULTS.threshold_score),
+    maxPerDay:        get("max_per_day",       AGENT_DEFAULTS.max_per_day),
+    quietStart:       get("quiet_hours_start", AGENT_DEFAULTS.quiet_hours_start),
+    quietEnd:         get("quiet_hours_end",   AGENT_DEFAULTS.quiet_hours_end),
+    perCycleLimit:    get("per_cycle_limit",   AGENT_DEFAULTS.per_cycle_limit),
+  };
+}
+
+function _isQuietHour(quietStart, quietEnd) {
+  // Hora local Buenos Aires (GMT-3)
+  const now = new Date();
+  const hourBA = (now.getUTCHours() - 3 + 24) % 24;
+  if (quietStart < quietEnd) return hourBA >= quietStart && hourBA < quietEnd;
+  // wrap: 22→7
+  return hourBA >= quietStart || hourBA < quietEnd;
+}
+
+async function logAgentAction(token, userEmail, payload) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({ user_email: userEmail, ...payload }),
+    });
+  } catch (e) {
+    log(`⚠️ logAgentAction failed: ${e.message}`);
+  }
+}
+
+// Cuenta de envíos del agent en las últimas 24h (cap diario)
+async function getAgentDailyCount(token, userEmail) {
+  try {
+    const cutoff = new Date(Date.now() - 24 * 3600_000).toISOString();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${cutoff}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("content-range") || "";
+    const m = range.match(/\/(\d+)$/);
+    return m ? parseInt(m[1]) : 0;
+  } catch { return 0; }
+}
+
+// Kill switch: si en la última hora hay > N fails consecutivos, auto-pausa 1h.
+async function checkAgentKillSwitch(token, userEmail, cfg) {
+  try {
+    const cutoff = new Date(Date.now() - 3600_000).toISOString();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&created_at=gte.${cutoff}&select=action,reason&order=created_at.desc&limit=20`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length < 5) return false;
+    const fails = rows.filter(r => r.action === "failed").length;
+    const total = rows.length;
+    const failRate = fails / total;
+    if (failRate > 0.5) {
+      const pauseUntil = new Date(Date.now() + 3600_000).toISOString();
+      await setConfigValue(token, "agent_paused_until", pauseUntil);
+      log(`🚨 KILL SWITCH AGENT: fail rate ${Math.round(failRate*100)}% (${fails}/${total}) — pausado 1h hasta ${pauseUntil}`);
+      await logAgentAction(token, userEmail, {
+        domain: "(system)", action: "kill_switch", reason: `fail_rate_${Math.round(failRate*100)}_pct`,
+        details: { fails, total, paused_until: pauseUntil },
+      });
+      return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+// ── Claude pitch generation server-side (calls Anthropic via Edge proxy) ──
+async function generatePitchAgent(token, ctx) {
+  const { domain, traffic, geo, language, category, contactName, adNetworks } = ctx;
+  // Llamada al Edge Function api-proxy (route 'anthropic') — misma infra que popup.
+  // System prompt simple — sin RAG por ahora (Phase 2). Voz Diego baked in la podemos
+  // sumar después leyéndola de toolbar_user_prompts.
+  const langName = ({ es:"Spanish", en:"English", pt:"Portuguese", it:"Italian", ar:"Arabic" })[language] || "English";
+  const trafficStr = traffic >= 1_000_000 ? `${Math.round(traffic/1_000_000)}M` : `${Math.round(traffic/1_000)}K`;
+
+  const systemMsg = `You are a senior Ad Ops consultant at ADEQ Media writing a cold outreach email to a publisher.
+TONE: friendly, conversational, no corporate jargon. Short paragraphs.
+ALWAYS mention: revshare 80/20 in publisher's favor, no exclusivity, no minimum commitment, results-based.
+NEVER mention specific months/dates. NEVER claim absence of ads.txt/tech unless input data confirms it.
+NEVER add a sign-off, signature or farewell — end with a specific question.
+LANGUAGE: write the ENTIRE email in ${langName}. Do not mix languages.
+
+Return JSON: { "body": string, "subjects": [3 subject lines, 6-10 words each] }`;
+
+  const userMsg = `Site: ${domain}
+Monthly traffic: ${trafficStr} visits
+Geo: ${geo || "unknown"}
+Category: ${category || "unknown"}
+Ad networks detected: ${(adNetworks || []).join(", ") || "none"}
+Contact: ${contactName || "(unknown)"}
+
+Write the prospecting email. Return JSON only.`;
+
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+    method: "POST",
+    headers: {
+      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      provider: "anthropic",
+      path: "/v1/messages",
+      method: "POST",
+      body: {
+        model: "claude-sonnet-4-5",
+        max_tokens: 1024,
+        system: systemMsg,
+        messages: [{ role: "user", content: userMsg }],
+      },
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`Claude HTTP ${res.status}`);
+  const data = await res.json();
+  const text = data?.content?.[0]?.text || "";
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error("Claude response no contiene JSON");
+  const parsed = JSON.parse(jsonMatch[0]);
+  if (!parsed.body || !Array.isArray(parsed.subjects) || parsed.subjects.length === 0) {
+    throw new Error("Claude response shape inválido");
+  }
+  return parsed;
+}
+
+// Self-check Claude: verifica que el pitch no contradiga datos de input.
+// Bajo costo (max 100 tokens). Si detecta inconsistencia, return false.
+async function selfCheckPitch(token, pitch, ctx) {
+  const { domain, adsTxtExists, adNetworks } = ctx;
+  if (!pitch || pitch.length < 30) return { ok: false, reason: "pitch_too_short" };
+  // Heurística rápida sin Claude: detectar contradicciones obvias.
+  const lower = pitch.toLowerCase();
+  if (adsTxtExists && /no.{1,10}(tienen|hay|tiene|tienes|have).{1,10}ads\.txt/i.test(pitch)) {
+    return { ok: false, reason: "claims_no_ads_txt_but_has" };
+  }
+  if (adNetworks?.length > 0 && /no.{1,10}(detect|veo|see).{1,20}(monetiz|ad.{1,5}network|ad.{1,5}stack)/i.test(pitch)) {
+    return { ok: false, reason: "claims_no_ads_but_has_networks" };
+  }
+  // Detectar meses hardcoded
+  const months = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre","january","february","march","april","may","june","july","august","september","october","november","december"];
+  if (months.some(m => lower.includes(m))) {
+    return { ok: false, reason: "mentions_specific_month" };
+  }
+  return { ok: true };
+}
+
+// ── Gmail server-side via Google Service Account (Domain-Wide Delegation) ──
+// El admin de Google Workspace configura una vez:
+//   1. Crea service account en Google Cloud Console
+//   2. Genera JSON key, lo guarda en Railway env GOOGLE_SERVICE_ACCOUNT_JSON
+//   3. En Workspace admin: Security → API Controls → Domain-Wide Delegation
+//      whitelist el client ID del SA con scope https://www.googleapis.com/auth/gmail.send
+// Después: el worker firma JWT con la private key del SA, intercambia por access
+// token "impersonating" cualquier user del workspace (mgargiulo@adeqmedia.com),
+// y manda Gmail como ese user.
+
+import { createSign } from "node:crypto";
+
+let _saCredentials = null;
+function getServiceAccount() {
+  if (_saCredentials) return _saCredentials;
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!raw) return null;
+  try { _saCredentials = JSON.parse(raw); return _saCredentials; }
+  catch { return null; }
+}
+
+const _accessTokenCache = new Map(); // userEmail → { token, expiresAt }
+async function getGmailAccessToken(impersonateUser) {
+  const cached = _accessTokenCache.get(impersonateUser);
+  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
+
+  const sa = getServiceAccount();
+  if (!sa) throw new Error("no_service_account_configured");
+
+  // Build JWT for OAuth 2.0 Service Account flow
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss:   sa.client_email,
+    sub:   impersonateUser,
+    scope: "https://www.googleapis.com/auth/gmail.send",
+    aud:   "https://oauth2.googleapis.com/token",
+    iat:   now,
+    exp:   now + 3600,
+  };
+  const b64url = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const unsigned = `${b64url(header)}.${b64url(payload)}`;
+  const sign = createSign("RSA-SHA256");
+  sign.update(unsigned);
+  const signature = sign.sign(sa.private_key, "base64url");
+  const jwt = `${unsigned}.${signature}`;
+
+  // Exchange JWT for access token
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion:  jwt,
+    }),
+  });
+  if (!tokenRes.ok) {
+    const err = await tokenRes.text();
+    throw new Error(`gmail_oauth_failed: ${tokenRes.status} ${err.slice(0,300)}`);
+  }
+  const data = await tokenRes.json();
+  if (!data.access_token) throw new Error("no_access_token_in_response");
+  _accessTokenCache.set(impersonateUser, {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in * 1000),
+  });
+  return data.access_token;
+}
+
+async function sendGmailServer(_token, userEmail, { to, subject, body }) {
+  const accessToken = await getGmailAccessToken(userEmail);
+  // Build RFC 2047 encoded MIME
+  const subjectEncoded = /^[\x20-\x7E]*$/.test(subject)
+    ? subject
+    : `=?UTF-8?B?${Buffer.from(subject, "utf-8").toString("base64")}?=`;
+  const lines = [
+    `To: ${to}`,
+    `From: ${userEmail}`,
+    `Subject: ${subjectEncoded}`,
+    "Content-Type: text/plain; charset=utf-8",
+    "MIME-Version: 1.0",
+    "",
+    body,
+  ].join("\r\n");
+  const raw = Buffer.from(lines, "utf-8").toString("base64")
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+  const sendRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ raw }),
+  });
+  if (!sendRes.ok) {
+    const errText = await sendRes.text();
+    throw new Error(`gmail_send_failed: ${sendRes.status} ${errText.slice(0,200)}`);
+  }
+  return await sendRes.json();
+}
+
+// ── Push to Monday (server-side) ──
+async function pushToMondayServer(monday_api_key, payload, boardId) {
+  // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
+  // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
+  const cols = {
+    [MONDAY_COL_TRAFFIC]:   { url: { url: `https://www.${payload.domain}`, text: payload.domain }, text: payload.traffic_text || "" },
+    [MONDAY_COL_GEO]:       { label: payload.geo || "" },
+    [MONDAY_COL_EMAIL]:     { email: payload.email, text: payload.email },
+    [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
+    [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
+    [MONDAY_COL_ESTADO]:    { index: 7 }, // 7 = "Mail No Enviado" (se actualiza después si manda OK)
+    [MONDAY_COL_OWNER]:     { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] },
+    [MONDAY_COL_PITCH]:     payload.pitch_body || "",
+  };
+  const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
+    create_item (board_id: $board, item_name: $name, column_values: $cols) { id }
+  }`;
+  const res = await fetch("https://api.monday.com/v2", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": monday_api_key, "API-Version": "2024-01" },
+    body: JSON.stringify({
+      query,
+      variables: { board: boardId, name: payload.domain, cols: JSON.stringify(cols) },
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`Monday HTTP ${res.status}`);
+  const data = await res.json();
+  if (data?.errors) throw new Error(`Monday errors: ${JSON.stringify(data.errors).slice(0,200)}`);
+  return data?.data?.create_item?.id || null;
+}
+
+// Constantes de columnas Monday — mismas que usa el popup
+const MONDAY_COL_TRAFFIC = "link";
+const MONDAY_COL_GEO     = "label";
+const MONDAY_COL_EMAIL   = "email";
+const MONDAY_COL_DATE    = "date_1";
+const MONDAY_COL_IDIOMA  = "status5";
+const MONDAY_COL_ESTADO  = "deal_stage";
+const MONDAY_COL_OWNER   = "person";
+const MONDAY_COL_PITCH   = "long_text";
+
+// Update Monday item estado (después de enviar mail)
+async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
+  const cols = JSON.stringify({ [MONDAY_COL_ESTADO]: { index: estadoIdx } });
+  const query = `mutation ($board: ID!, $item: ID!, $cols: JSON!) {
+    change_multiple_column_values (board_id: $board, item_id: $item, column_values: $cols) { id }
+  }`;
+  try {
+    await fetch("https://api.monday.com/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": monday_api_key, "API-Version": "2024-01" },
+      body: JSON.stringify({ query, variables: { board: boardId, item: itemId, cols } }),
+    });
+  } catch {}
+}
+
+// ── runAgentCycle: el corazón del agent ──
+// Por cada user habilitado, procesa hasta perCycleLimit leads del review_queue
+// que cumplan los thresholds. Para cada uno: pitch → quality gate → push Monday → send Gmail.
+async function runAgentCycle(token, allFlags) {
+  const cfg = await getConfig(token);
+  const aCfg = _agentCfg(cfg);
+  const monday_api_key_default = cfg.monday_api_key || "";
+
+  // Quiet hours
+  if (_isQuietHour(aCfg.quietStart, aCfg.quietEnd)) {
+    return; // silencioso
+  }
+
+  for (const userEmail of allFlags.agentUsers) {
+    // Kill switch check
+    if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
+    // Daily cap
+    const sentToday = await getAgentDailyCount(token, userEmail);
+    if (sentToday >= aCfg.maxPerDay) {
+      log(`🤖 Agent ${userEmail}: cap diario ${aCfg.maxPerDay} alcanzado (${sentToday})`);
+      continue;
+    }
+    const remaining = aCfg.maxPerDay - sentToday;
+    const batchSize = Math.min(aCfg.perCycleLimit, remaining);
+
+    // Pull candidates: pending + traffic + score thresholds, NO ya en sendtrack reciente
+    const queueRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}&score=gte.${aCfg.thresholdScore}&select=*&order=score.desc&limit=${batchSize * 3}`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const candidates = await queueRes.json();
+    if (!Array.isArray(candidates) || candidates.length === 0) continue;
+
+    // Filtrar dominios ya enviados en últimos 30 días (sendtrack)
+    const cutoff30 = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+    const trackRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${cutoff30}&select=domain&limit=500`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const recentSent = new Set((await trackRes.json() || []).map(r => (r.domain || "").toLowerCase()));
+    const fresh = candidates.filter(c => !recentSent.has((c.domain || "").toLowerCase()));
+
+    let processed = 0;
+    for (const lead of fresh) {
+      if (processed >= batchSize) break;
+      const domain = lead.domain;
+      const emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
+      const email  = emails.find(e => e && /\@/.test(e) && !/^(abuse|whois|postmaster|noreply|no-reply|admin@nic|ayuda@nic)/i.test(e));
+
+      // Quality gates pre-Claude
+      if (!email) {
+        await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "no_valid_email" });
+        continue;
+      }
+
+      try {
+        // 1. Generar pitch con Claude
+        const pitch = await generatePitchAgent(token, {
+          domain, traffic: lead.traffic, geo: lead.geo, language: lead.language || "en",
+          category: lead.category, contactName: lead.contact_name,
+          adNetworks: lead.ad_networks,
+        });
+
+        // 2. Self-check pitch (heurísticas rápidas)
+        const check = await selfCheckPitch(token, pitch.body, {
+          domain, adsTxtExists: false, adNetworks: lead.ad_networks,
+        });
+        if (!check.ok) {
+          await logAgentAction(token, userEmail, {
+            domain, action: "skipped", reason: `quality_${check.reason}`,
+            pitch_subject: pitch.subjects?.[0],
+            details: { pitch_body_preview: pitch.body.substring(0, 200) },
+          });
+          continue;
+        }
+
+        // 3. Push to Monday (CREATE — agent solo crea cuando manda, igual que MB humano)
+        const mondayUserId = (cfg[`monday_user_id_${userEmail.toLowerCase()}`] || "").trim();
+        const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || monday_api_key_default).trim();
+        if (!mondayApiKey) {
+          await logAgentAction(token, userEmail, { domain, action: "failed", reason: "no_monday_api_key" });
+          continue;
+        }
+        const mondayItemId = await pushToMondayServer(mondayApiKey, {
+          domain, email, geo: lead.geo, traffic_text: `${Math.round(lead.traffic/1000)}K`,
+          pitch_body: pitch.body, idioma_idx: ({ en:0, es:1, it:2, pt:3, ar:6 })[lead.language] ?? 0,
+          monday_user_id: mondayUserId,
+        }, AGENT_DEFAULTS.monday_board_id);
+
+        // 4. Send Gmail
+        const subject = pitch.subjects[0];
+        await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body });
+
+        // 5. Update Monday estado a "Propuesta Vigente (T)" (idx 3) post-envío
+        if (mondayItemId) {
+          await updateMondayEstado(mondayApiKey, mondayItemId, AGENT_DEFAULTS.monday_board_id, 3);
+        }
+
+        // 6. Track en sendtrack para no re-enviar
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({ domain, send_date: new Date().toISOString().split("T")[0], email, pitch: pitch.body.substring(0, 1000) }),
+        });
+
+        // 7. Marcar el review_queue item como validated_by agent
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "validated", validated_by: `agent:${userEmail}`, validated_at: new Date().toISOString() }),
+        });
+
+        // 8. Log success
+        await logAgentAction(token, userEmail, {
+          domain, action: "sent", reason: "ok",
+          pitch_subject: subject,
+          monday_item_id: mondayItemId,
+          details: { email, traffic: lead.traffic, geo: lead.geo, language: lead.language },
+        });
+
+        log(`🤖 Agent ${userEmail}: SENT to ${email} for ${domain} (subj: "${subject.substring(0,50)}")`);
+        processed++;
+        // Delay entre envíos para no parecer bot
+        await sleep(15000 + Math.random() * 10000);
+
+      } catch (err) {
+        await logAgentAction(token, userEmail, {
+          domain, action: "failed", reason: err.message?.substring(0, 200) || "unknown",
+          details: { error: String(err).substring(0, 500) },
+        });
+        log(`🤖 Agent ${userEmail}: FAILED ${domain}: ${err.message}`);
+        // Errores hard (no_refresh_token, monday key) → don't keep trying same cycle
+        if (/no_refresh_token|no_monday_api_key|oauth_refresh_failed/.test(err.message || "")) break;
+      }
+    }
+  }
+}
+
 // ── Loop principal ────────────────────────────────────────────
 
 async function main() {
@@ -2321,9 +2806,18 @@ async function main() {
       // Heartbeat — cliente lee esto para mostrar si Railway está vivo
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
 
-      // Poll liviano — lee autopilot + csv_queue flags
+      // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);
-      if (!flags.autopilot && !flags.csvQueue) {
+
+      // 🤖 AGENT: si hay users con agent enabled, correr ciclo cada loop iteration.
+      // Es independiente del autopilot/csv_queue — el agent procesa lo que ya está
+      // en review_queue (lo que el autopilot u otros flows trajeron).
+      if (flags.agent) {
+        try { await runAgentCycle(token, flags); }
+        catch (e) { log(`⚠️ runAgentCycle error: ${e.message}`); }
+      }
+
+      if (!flags.autopilot && !flags.csvQueue && !flags.agent) {
         // Auto-exit si llevamos > IDLE_EXIT_MS sin trabajo (Railway corta billing)
         if (Date.now() - idleSince >= IDLE_EXIT_MS) {
           log(`💤 Idle ${Math.round(IDLE_EXIT_MS / 60000)} min — exiting. Railway re-arranca cuando se prenda autopilot/csv desde el toolbar.`);

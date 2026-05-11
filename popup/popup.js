@@ -391,8 +391,9 @@ function initAdminPanel() {
       document.querySelectorAll(".admin-tab-content").forEach(c => {
         c.classList.toggle("active", c.id === `admin-tab-${tab}`);
       });
-      if (tab === "activity") loadAdminActivity();
-      if (tab === "limits")   loadAdminLimits();
+      if (tab === "activity")  loadAdminActivity();
+      if (tab === "agent")     loadAdminAgent();
+      if (tab === "limits")    loadAdminLimits();
       if (tab === "blocklist") loadAdminBlocklist();
     });
   });
@@ -407,6 +408,10 @@ function initAdminPanel() {
   document.getElementById("admin-blocklist-csv")?.addEventListener("change", handleBlocklistCsvUpload);
   // Wire reset cache button
   document.getElementById("admin-reset-cache-btn")?.addEventListener("click", resetTrafficCacheAboveThreshold);
+  // Wire agent
+  document.getElementById("agent-toggle")?.addEventListener("change", toggleAgent);
+  document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
+  document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
 
   loadAdminActivity();
 }
@@ -591,6 +596,158 @@ async function saveLimitRow(row) {
 }
 
 // ── Blocklist tab ──────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// 🤖 ADMIN AGENT TAB
+// ════════════════════════════════════════════════════════════════
+
+async function _readAgentConfig() {
+  // Lee toolbar_config keys que empiezan con agent_
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_threshold_score,agent_max_per_day,agent_quiet_hours_start,agent_quiet_hours_end,agent_paused_until)&select=key,value`,
+      { headers }
+    );
+    const rows = await res.json();
+    const cfg = {};
+    rows.forEach(r => { cfg[r.key] = r.value; });
+    return cfg;
+  } catch { return {}; }
+}
+
+async function _writeAgentConfig(updates) {
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" };
+  // upsert per key
+  const promises = Object.entries(updates).map(([key, value]) =>
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
+      method: "POST", headers, body: JSON.stringify({ key, value: String(value) }),
+    })
+  );
+  await Promise.all(promises);
+}
+
+async function loadAdminAgent() {
+  const cfg = await _readAgentConfig();
+  let users = [];
+  try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+  const myEmail = (state.loginEmail || "").toLowerCase();
+  const enabled = users.map(u => u.toLowerCase()).includes(myEmail);
+
+  // Toggle state
+  const toggle = document.getElementById("agent-toggle");
+  if (toggle) toggle.checked = enabled;
+
+  // Status text
+  const statusEl = document.getElementById("agent-toggle-status");
+  if (statusEl) {
+    const pausedUntil = cfg.agent_paused_until ? new Date(cfg.agent_paused_until) : null;
+    const isPaused = pausedUntil && pausedUntil > new Date();
+    if (isPaused) {
+      const minLeft = Math.round((pausedUntil - Date.now()) / 60000);
+      statusEl.innerHTML = `⏸ <strong style="color:#f87171">Pausado por ${minLeft}min</strong> (kill switch o pause manual)`;
+    } else if (enabled) {
+      statusEl.innerHTML = `🟢 <strong style="color:#34d399">Activo</strong>. Procesa cada ~5min. Mandando como <strong>${esc(myEmail)}</strong>.`;
+    } else {
+      statusEl.innerHTML = `⚪ Inactivo. Activá el toggle para que el worker arranque.`;
+    }
+  }
+
+  // Inputs de threshold
+  const setVal = (id, v, dflt) => { const el = document.getElementById(id); if (el) el.value = v || dflt; };
+  setVal("agent-cfg-traffic",     cfg.agent_threshold_traffic, 500000);
+  setVal("agent-cfg-score",       cfg.agent_threshold_score,    40);
+  setVal("agent-cfg-max",         cfg.agent_max_per_day,        20);
+  setVal("agent-cfg-quiet-start", cfg.agent_quiet_hours_start,  22);
+  setVal("agent-cfg-quiet-end",   cfg.agent_quiet_hours_end,     7);
+  document.getElementById("agent-stat-cap").textContent = cfg.agent_max_per_day || "20";
+
+  // Stats hoy
+  await _refreshAgentStats(myEmail);
+  await _refreshAgentFeed();
+}
+
+async function _refreshAgentStats(userEmail) {
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+  const cutoff24 = new Date(Date.now() - 24 * 3600_000).toISOString();
+  const startToday = new Date(); startToday.setHours(0,0,0,0);
+  try {
+    const [sentRes, skipRes, failRes] = await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${startToday.toISOString()}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.skipped&created_at=gte.${cutoff24}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.failed&created_at=gte.${cutoff24}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+    ]);
+    const parseCount = (res) => { const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/); return m ? parseInt(m[1]) : 0; };
+    document.getElementById("agent-stat-sent").textContent    = parseCount(sentRes);
+    document.getElementById("agent-stat-skipped").textContent = parseCount(skipRes);
+    document.getElementById("agent-stat-failed").textContent  = parseCount(failRes);
+  } catch {}
+}
+
+async function _refreshAgentFeed() {
+  const wrap = document.getElementById("agent-actions-feed");
+  if (!wrap) return;
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?select=*&order=created_at.desc&limit=50`,
+      { headers }
+    );
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">Sin actividad aún. Activá el toggle para arrancar.</div>'; return; }
+    const icons = { sent: "✅", skipped: "⏭", failed: "❌", kill_switch: "🚨" };
+    wrap.innerHTML = rows.map(r => {
+      const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
+      const icon = icons[r.action] || "·";
+      const reasonStr = r.reason ? `<span style="color:#94a3b8"> · ${esc(r.reason)}</span>` : "";
+      const subjectStr = r.pitch_subject ? `<br/><span style="color:#cbd5e1;margin-left:18px;font-style:italic">"${esc(r.pitch_subject.substring(0, 60))}"</span>` : "";
+      const colorMap = { sent: "#34d399", skipped: "#fbbf24", failed: "#f87171", kill_switch: "#ef4444" };
+      const color = colorMap[r.action] || "#cbd5e1";
+      return `<div style="padding:3px 0;border-bottom:1px solid #334155">
+        <span style="color:${color}">${icon}</span>
+        <span style="color:#94a3b8;font-size:9px">[${esc(time)}]</span>
+        <strong style="color:#e2e8f0">${esc(r.domain)}</strong>${reasonStr}
+        ${subjectStr}
+      </div>`;
+    }).join("");
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:#f87171">Error: ${esc(e.message || String(e))}</div>`;
+  }
+}
+
+async function toggleAgent(e) {
+  const enabled = e.target.checked;
+  const myEmail = (state.loginEmail || "").toLowerCase();
+  const cfg = await _readAgentConfig();
+  let users = [];
+  try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+  users = users.map(u => u.toLowerCase()).filter(u => u !== myEmail);
+  if (enabled) users.push(myEmail);
+  await _writeAgentConfig({ agent_enabled_users: JSON.stringify(users) });
+  await loadAdminAgent();
+  showToast(enabled ? "🟢 Agent activado" : "⚪ Agent desactivado", "info");
+}
+
+async function saveAgentThresholds() {
+  const updates = {
+    agent_threshold_traffic: parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 500000,
+    agent_threshold_score:   parseInt(document.getElementById("agent-cfg-score").value, 10) || 40,
+    agent_max_per_day:       parseInt(document.getElementById("agent-cfg-max").value, 10) || 20,
+    agent_quiet_hours_start: parseInt(document.getElementById("agent-cfg-quiet-start").value, 10) || 22,
+    agent_quiet_hours_end:   parseInt(document.getElementById("agent-cfg-quiet-end").value, 10) || 7,
+  };
+  await _writeAgentConfig(updates);
+  showToast("✅ Thresholds guardados", "info");
+  await loadAdminAgent();
+}
+
+async function pauseAgent1h() {
+  if (!confirm("Pausar el agent durante 1 hora?")) return;
+  const pauseUntil = new Date(Date.now() + 3600_000).toISOString();
+  await _writeAgentConfig({ agent_paused_until: pauseUntil });
+  showToast("⏸ Agent pausado 1h", "warn");
+  await loadAdminAgent();
+}
+
 async function loadAdminBlocklist() {
   const ta = document.getElementById("admin-blocklist-text");
   const status = document.getElementById("admin-blocklist-status");
