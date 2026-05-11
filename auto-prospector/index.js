@@ -3133,14 +3133,6 @@ async function main() {
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);
 
-      // 🤖 AGENT: si hay users con agent enabled, correr ciclo cada loop iteration.
-      // Es independiente del autopilot/csv_queue — el agent procesa lo que ya está
-      // en review_queue (lo que el autopilot u otros flows trajeron).
-      if (flags.agent) {
-        try { await runAgentCycle(token, flags); }
-        catch (e) { log(`⚠️ runAgentCycle error: ${e.message}`); }
-      }
-
       if (!flags.autopilot && !flags.csvQueue && !flags.agent) {
         // Auto-exit si llevamos > IDLE_EXIT_MS sin trabajo (Railway corta billing)
         if (Date.now() - idleSince >= IDLE_EXIT_MS) {
@@ -3152,21 +3144,34 @@ async function main() {
       }
       idleSince = Date.now(); // hay trabajo → reset contador idle
 
-      // CSV queue — procesar primero si está activa y hay items
-      // (NO es mutuamente exclusivo con el autopilot; si CSV no tiene items, sigue a autopilot)
+      // ── PARALELIZACIÓN ──────────────────────────────────────
+      // Agent + CSV queue son INDEPENDIENTES (Gmail send vs RapidAPI/Apollo
+      // enrich). Los corremos en paralelo para que el agent no espere.
+      // Autopilot también es independiente pero es loop largo (sesión 20min)
+      // — lo dejamos secuencial debajo por simplicidad.
+      const cfgShared = (flags.csvQueue || flags.agent) ? await getConfig(token) : null;
+      const parallelTasks = [];
       let csvProcessed = 0;
       if (flags.csvQueue) {
-        const cfgCsv = await getConfig(token);
-        csvProcessed = await runCsvQueue(token, cfgCsv, 5); // batch micro para que agent + autopilot se intercalen entre tandas
-        if (csvProcessed > 0) {
-          // Hubo trabajo — volver al loop rápido (próxima iteración sigue con CSV o pasa a autopilot)
-          await sleep(POLL_INTERVAL_MS);
-          continue;
-        }
-        // No había items pending → cae a autopilot si está prendido
+        parallelTasks.push(
+          runCsvQueue(token, cfgShared, 5).then(n => { csvProcessed = n; }).catch(e => log(`⚠️ runCsvQueue: ${e.message}`))
+        );
+      }
+      if (flags.agent) {
+        parallelTasks.push(
+          runAgentCycle(token, flags).catch(e => log(`⚠️ runAgentCycle: ${e.message}`))
+        );
+      }
+      if (parallelTasks.length > 0) {
+        await Promise.all(parallelTasks);
+      }
+      // Si csv hubo trabajo, no caemos a autopilot — próximo loop sigue csv
+      if (csvProcessed > 0) {
+        await sleep(POLL_INTERVAL_MS);
+        continue;
       }
 
-      // Autopilot (sólo si está prendido)
+      // Autopilot (sólo si está prendido) — secuencial porque las sesiones son largas
       if (!flags.autopilot) {
         await sleep(POLL_INTERVAL_MS);
         continue;
