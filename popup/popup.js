@@ -988,9 +988,24 @@ async function loadAdminActivity() {
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${from}&send_date=lte.${to}&select=domain,send_date`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${from}&day=lte.${to}${usageUserClause}&select=*`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetchUsageStats(state.accessToken, { from, to, userEmail: userFilter }),
-    // toolbar_review_queue — prospects agregados por autopilot + CSV + Monday refresh.
-    // Esta es la fuente real del trabajo del worker (historial NO refleja autopilot).
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${from}&created_at=lte.${to}T23:59:59${queueUserClause}&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    // toolbar_review_queue — DOS queries para capturar TODA la actividad:
+    // 1) Rows CREADOS en el rango (descubrimientos/imports del periodo)
+    // 2) Rows VALIDADOS en el rango (procesados desde Prospects en el periodo)
+    // Ej: Diego valida hoy un lead creado la semana pasada → si no lo traemos
+    // por validated_at, no contamos esa acción de Diego.
+    // Combinamos los 2 arrays + dedupe por id en el aggregator más abajo.
+    Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${from}&created_at=lte.${to}T23:59:59${queueUserClause}&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at,id&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?validated_at=gte.${from}&validated_at=lte.${to}T23:59:59&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at,id&order=validated_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    ]).then(([byCreate, byValidate]) => {
+      // Dedupe por id (un row puede aparecer en ambos arrays)
+      const seen = new Set();
+      const merged = [];
+      [...byCreate, ...byValidate].forEach(r => {
+        if (!seen.has(r.id)) { seen.add(r.id); merged.push(r); }
+      });
+      return merged;
+    }),
     // toolbar_agent_actions — el agente cuenta como "MB" más en el comparador.
     // Filtramos action=sent (los exitosos) en el período.
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${from}&created_at=lte.${to}T23:59:59&select=domain,user_email,pitch_subject,details,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
