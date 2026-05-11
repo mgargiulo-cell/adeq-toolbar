@@ -312,7 +312,13 @@ async function getActiveFlags(token) {
     rows.forEach(r => { map[r.key] = r.value; });
     let agentUsers = [];
     try { agentUsers = JSON.parse(map.agent_enabled_users || "[]"); } catch {}
-    const pausedUntil = map.agent_paused_until ? new Date(map.agent_paused_until).getTime() : 0;
+    // Parse defensivo: si agent_paused_until es "" o invalid date, tratar como 0.
+    // Bug previo: new Date("").getTime() = NaN → Date.now() > NaN = false → agent INACTIVE
+    let pausedUntil = 0;
+    if (map.agent_paused_until && map.agent_paused_until.trim()) {
+      const parsed = new Date(map.agent_paused_until).getTime();
+      if (!isNaN(parsed)) pausedUntil = parsed;
+    }
     const agentActive = agentUsers.length > 0 && Date.now() > pausedUntil;
     return {
       autopilot: map.auto_prospecting_enabled === "true",
