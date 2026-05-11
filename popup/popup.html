@@ -145,21 +145,41 @@
 
     <div class="admin-section-title">⚙️ Thresholds</div>
     <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
-      <div style="display:grid;grid-template-columns:1fr 80px;gap:6px;align-items:center;font-size:11px;color:#cbd5e1">
-        <label for="agent-cfg-traffic">Min tráfico (visits)</label>
-        <input id="agent-cfg-traffic" class="form-input" type="number" min="100000" step="50000" value="500000" style="font-size:11px;padding:3px 6px" />
+      <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;font-size:11px;color:#cbd5e1">
+        <label for="agent-cfg-traffic">Min tráfico</label>
+        <select id="agent-cfg-traffic" class="form-select" style="font-size:11px;padding:3px 6px">
+          <option value="1">Sin filtro</option>
+          <option value="100000">≥ 100K visits</option>
+          <option value="250000">≥ 250K visits</option>
+          <option value="500000" selected>≥ 500K visits (default)</option>
+          <option value="1000000">≥ 1M visits</option>
+          <option value="2000000">≥ 2M visits</option>
+          <option value="5000000">≥ 5M visits</option>
+        </select>
 
-        <label for="agent-cfg-score">Min score (worker autopilot)</label>
-        <input id="agent-cfg-score" class="form-input" type="number" min="0" max="100" value="40" style="font-size:11px;padding:3px 6px" />
+        <label for="agent-cfg-score">Min score</label>
+        <select id="agent-cfg-score" class="form-select" style="font-size:11px;padding:3px 6px">
+          <option value="0">Sin filtro</option>
+          <option value="20">≥ 20 (low)</option>
+          <option value="40" selected>≥ 40 (medium)</option>
+          <option value="60">≥ 60 (high)</option>
+          <option value="80">≥ 80 (top)</option>
+        </select>
 
         <label for="agent-cfg-max">Max envíos / día</label>
-        <input id="agent-cfg-max" class="form-input" type="number" min="1" max="100" value="20" style="font-size:11px;padding:3px 6px" />
+        <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:3px 6px">
+          <option value="5">5/día (test)</option>
+          <option value="10">10/día</option>
+          <option value="20" selected>20/día (default)</option>
+          <option value="30">30/día</option>
+          <option value="50">50/día</option>
+        </select>
 
-        <label for="agent-cfg-active-start">Active hours START (0-23, hora España)</label>
-        <input id="agent-cfg-active-start" class="form-input" type="number" min="0" max="23" value="9" style="font-size:11px;padding:3px 6px" />
+        <label for="agent-cfg-active-start">Hora START (España)</label>
+        <select id="agent-cfg-active-start" class="form-select" style="font-size:11px;padding:3px 6px"></select>
 
-        <label for="agent-cfg-active-end">Active hours END (0-23, hora España)</label>
-        <input id="agent-cfg-active-end" class="form-input" type="number" min="0" max="23" value="20" style="font-size:11px;padding:3px 6px" />
+        <label for="agent-cfg-active-end">Hora END (España)</label>
+        <select id="agent-cfg-active-end" class="form-select" style="font-size:11px;padding:3px 6px"></select>
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
         <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save thresholds</button>
@@ -169,29 +189,42 @@
 
     <div class="admin-section-title">🎯 Focus de la semana</div>
     <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
-      <p style="font-size:10px;color:#94a3b8;margin:0 0 6px">Indicale en qué enfocarse. Si está vacío usa los thresholds de arriba sin filtros adicionales.</p>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;color:#cbd5e1">
+      <p style="font-size:10px;color:#94a3b8;margin:0 0 8px">Click en chips para alternar. <span style="color:#34d399">Verde</span>=PRIORITY, <span style="color:#f87171">Rojo</span>=EXCLUDED, gris=ignorar.</p>
+
+      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">🌍 GEOs</div>
+      <div id="agent-focus-geos-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;max-height:140px;overflow-y:auto"></div>
+
+      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 Categorías PRIORITY</div>
+      <div id="agent-focus-categories-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px;color:#cbd5e1;margin-top:8px">
         <div>
-          <label style="display:block;margin-bottom:2px">GEOs PRIORITY (códigos ISO, separados por coma)</label>
-          <input id="agent-focus-geos-priority" class="form-input" placeholder="ES,MX,AR,CL" style="font-size:11px;padding:3px 6px;width:100%" />
+          <label style="display:block;margin-bottom:2px">Override DAILY</label>
+          <select id="agent-focus-daily" class="form-select" style="font-size:11px;padding:3px 6px;width:100%">
+            <option value="0" selected>Usar default (20)</option>
+            <option value="5">5/día</option>
+            <option value="10">10/día</option>
+            <option value="30">30/día</option>
+            <option value="50">50/día</option>
+          </select>
         </div>
         <div>
-          <label style="display:block;margin-bottom:2px">GEOs EXCLUDED</label>
-          <input id="agent-focus-geos-excluded" class="form-input" placeholder="CN,RU" style="font-size:11px;padding:3px 6px;width:100%" />
-        </div>
-        <div style="grid-column:1/-1">
-          <label style="display:block;margin-bottom:2px">Categorías PRIORITY (lowercase, separadas por coma)</label>
-          <input id="agent-focus-categories" class="form-input" placeholder="news,sports,entertainment" style="font-size:11px;padding:3px 6px;width:100%" />
-        </div>
-        <div>
-          <label style="display:block;margin-bottom:2px">Override DAILY (0 = usar default)</label>
-          <input id="agent-focus-daily" class="form-input" type="number" min="0" value="0" style="font-size:11px;padding:3px 6px;width:100%" />
-        </div>
-        <div>
-          <label style="display:block;margin-bottom:2px">Target SEMANAL (0 = sin límite)</label>
-          <input id="agent-focus-weekly" class="form-input" type="number" min="0" value="0" placeholder="ej: 100" style="font-size:11px;padding:3px 6px;width:100%" />
+          <label style="display:block;margin-bottom:2px">Target SEMANAL</label>
+          <select id="agent-focus-weekly" class="form-select" style="font-size:11px;padding:3px 6px;width:100%">
+            <option value="0" selected>Sin límite</option>
+            <option value="50">50/semana</option>
+            <option value="100">100/semana</option>
+            <option value="200">200/semana</option>
+            <option value="500">500/semana</option>
+          </select>
         </div>
       </div>
+
+      <!-- Hidden inputs para mantener compatibilidad con _writeAgentConfig -->
+      <input type="hidden" id="agent-focus-geos-priority" />
+      <input type="hidden" id="agent-focus-geos-excluded" />
+      <input type="hidden" id="agent-focus-categories" />
+
       <div style="display:flex;justify-content:flex-end;margin-top:8px">
         <button id="agent-focus-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save focus</button>
       </div>
@@ -870,10 +903,11 @@
     </div>
     <!-- Filter presets — atajos de un click para combos comunes -->
     <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
-      <button class="prospects-preset btn btn-sm" data-preset="mine7" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📅 Mis 7 días</button>
-      <button class="prospects-preset btn btn-sm" data-preset="all-today" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📌 Hoy (todos)</button>
-      <button class="prospects-preset btn btn-sm" data-preset="all-time" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">∞ All</button>
-      <button class="prospects-preset btn btn-sm" data-preset="autopilot-only" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🤖 Solo Autopilot</button>
+      <button class="prospects-preset btn btn-sm" data-source="" style="font-size:10px;padding:2px 7px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">∞ All</button>
+      <button class="prospects-preset btn btn-sm" data-source="sellers_json" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📋 JSON</button>
+      <button class="prospects-preset btn btn-sm" data-source="monday_refresh" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔄 Monday</button>
+      <button class="prospects-preset btn btn-sm" data-source="csv" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📥 CSV</button>
+      <button class="prospects-preset btn btn-sm" data-source="autopilot" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🤖 Autopilot</button>
     </div>
     <div id="prospects-stats" style="font-size:11px;color:var(--text-muted);margin-bottom:6px"></div>
     <!-- Bulk action bar — solo visible cuando hay > 0 cards seleccionadas -->
@@ -884,14 +918,11 @@
       <button id="btn-bulk-reject" class="btn btn-sm" style="background:#dc2626;color:#fff;padding:3px 8px;font-size:11px" title="Rechazar seleccionados">❌ Reject</button>
       <button id="btn-bulk-clear"  class="btn btn-sm" style="background:#475569;color:#fff;padding:3px 8px;font-size:11px" title="Limpiar selección">Clear</button>
     </div>
-    <div>
-      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:3px">
-        <span>Daily validated</span>
-        <span><b id="prospects-daily-count">0</b> / 50</span>
-      </div>
-      <div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden">
-        <div id="prospects-daily-fill" style="height:100%;background:#3b82f6;border-radius:2px;width:0%;transition:width 0.3s"></div>
-      </div>
+    <!-- Daily validated bar removed: el cap diario es DAILY_SEND_CAP (30/día)
+         y se muestra inline en el statsEl: "enviaste X/30 hoy desde Prospects" -->
+    <div style="display:none">
+      <span id="prospects-daily-count">0</span>
+      <span id="prospects-daily-fill"></span>
     </div>
   </section>
 

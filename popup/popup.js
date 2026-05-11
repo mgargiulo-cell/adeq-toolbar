@@ -6228,12 +6228,11 @@ async function loadProspectsTab() {
     return;
   }
 
-  // ── Cap diario por OUTPUT desde PROSPECTS: 20 envios/día per MB ──
+  // ── Cap diario por OUTPUT desde PROSPECTS: 30 envios/día per MB ──
   // Solo cuenta validations procesadas desde Prospects (validated_by = MB).
   // Envíos manuales desde Analysis NO cuentan acá — el MB puede seguir
-  // mandando desde ahí libremente. Esto fuerza al MB a equilibrar entre
-  // procesar la cola Y prospectar manual.
-  const DAILY_SEND_CAP = 20;
+  // mandando desde ahí libremente.
+  const DAILY_SEND_CAP = 30;
   const sentFromProspects = dailyCount; // ya viene de getDailyValidationCount arriba
 
   if (sentFromProspects >= DAILY_SEND_CAP) {
@@ -6251,20 +6250,55 @@ async function loadProspectsTab() {
     return;
   }
 
-  // Bajo el cap → mostrar leads. Mix puro al azar (refresh = nuevo shuffle).
-  // No hay cap de visualización — el MB puede pickear con libertad entre
-  // todo el pool hasta llegar al cap de envío.
+  // ── Sample 100 random ROTANDO cada 30 minutos por MB ──
+  // Cada slot de 30 min, cada MB recibe 100 random distintos. Refrescar la
+  // toolbar dentro del slot devuelve EL MISMO sample (no se mueve).
+  // Cuando entra el próximo slot (30 min), nuevo shuffle automático.
+  // Persistido en chrome.storage.local con key que incluye el slot.
   const VISIBLE_CAP = 100;
-  const shuffled = [...rows];
-  for (let i = shuffled.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  const SLOT_MIN    = 30; // rotar cada 30 minutos
+  const slotIdx     = Math.floor(Date.now() / (SLOT_MIN * 60 * 1000));
+  const userKey     = (state.loginEmail || "anon").toLowerCase();
+  const slotKey     = `_prospects_slot_${userKey}_${slotIdx}`;
+
+  let assignedIds = [];
+  try {
+    const stored = await chrome.storage.local.get(slotKey);
+    if (stored?.[slotKey] && Array.isArray(stored[slotKey])) {
+      assignedIds = stored[slotKey];
+    }
+  } catch {}
+
+  if (assignedIds.length === 0) {
+    // Nuevo slot — shuffle + slice 100 + persistir
+    const shuffled = [...rows];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    assignedIds = shuffled.slice(0, VISIBLE_CAP).map(r => r.id);
+    await chrome.storage.local.set({ [slotKey]: assignedIds }).catch(() => {});
+    // Cleanup slots viejos del mismo user
+    try {
+      const all = await chrome.storage.local.get(null);
+      const stale = Object.keys(all).filter(k => k.startsWith(`_prospects_slot_${userKey}_`) && k !== slotKey);
+      if (stale.length > 0) await chrome.storage.local.remove(stale);
+    } catch {}
   }
-  const sample = shuffled.slice(0, VISIBLE_CAP);
+
+  // Filtrar: solo los que SIGUEN en pending (algunos pudieron ser contactados por otro MB)
+  // Mantener el orden del shuffle original (assignedIds está ordenado al azar ya).
+  const idSet = new Set(assignedIds);
+  const idOrder = new Map(assignedIds.map((id, i) => [id, i]));
+  const sample = rows
+    .filter(r => idSet.has(r.id))
+    .sort((a, b) => idOrder.get(a.id) - idOrder.get(b.id));
+
   listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
   if (statsEl) {
     const remaining = DAILY_SEND_CAP - sentFromProspects;
-    statsEl.innerHTML = `<strong>${sample.length}</strong> leads disponibles · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy desde Prospects (te quedan ${remaining})`;
+    const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
+    statsEl.innerHTML = `<strong>${sample.length}</strong> leads en tu lote · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${remaining}) · 🔄 nuevo lote en ${minsLeft}min`;
   }
 
   listEl.querySelectorAll(".pcard").forEach(card => {
@@ -7290,42 +7324,27 @@ async function initProspectsTab() {
     chrome.storage.local.set({ _prospectsUserFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
-  // ── Filter presets: combos rápidos de un click ──────────
+  // ── Filter presets por SOURCE: filtrar leads según de dónde vinieron ─────
   document.querySelectorAll(".prospects-preset").forEach(btn => {
     btn.addEventListener("click", async () => {
-      const preset = btn.dataset.preset;
-      const dateEl   = document.getElementById("prospects-date-filter");
+      const source = btn.dataset.source || "";
       const sourceEl = document.getElementById("prospects-source-filter");
-      const userEl   = document.getElementById("prospects-user-filter");
-      const myEmail  = (state.loginEmail || "").toLowerCase();
-      switch (preset) {
-        case "mine7":
-          if (dateEl)   dateEl.value   = "last7";
-          if (sourceEl) sourceEl.value = "";
-          if (userEl)   userEl.value   = TEAM_EMAILS.find(e => e.toLowerCase() === myEmail) || "";
-          break;
-        case "all-today":
-          if (dateEl)   dateEl.value   = "today";
-          if (sourceEl) sourceEl.value = "";
-          if (userEl)   userEl.value   = "";
-          break;
-        case "all-time":
-          if (dateEl)   dateEl.value   = "";
-          if (sourceEl) sourceEl.value = "";
-          if (userEl)   userEl.value   = "";
-          break;
-        case "autopilot-only":
-          if (dateEl)   dateEl.value   = "last7";
-          if (sourceEl) sourceEl.value = "autopilot";
-          if (userEl)   userEl.value   = "";
-          break;
-      }
-      // Persistir + recargar
-      chrome.storage.local.set({
-        _prospectsDateFilter:   dateEl?.value || "",
-        _prospectsSourceFilter: sourceEl?.value || "",
-        _prospectsUserFilter:   userEl?.value || "",
-      }).catch(() => {});
+      if (sourceEl) sourceEl.value = source;
+      chrome.storage.local.set({ _prospectsSourceFilter: source }).catch(() => {});
+      // Highlight visual del preset activo
+      document.querySelectorAll(".prospects-preset").forEach(b => {
+        if (b.dataset.source === source) {
+          b.style.background = "#0ea5e9";
+          b.style.color = "#fff";
+          b.style.border = "none";
+          b.style.fontWeight = "600";
+        } else {
+          b.style.background = "#1e293b";
+          b.style.color = "#cbd5e1";
+          b.style.border = "1px solid #334155";
+          b.style.fontWeight = "400";
+        }
+      });
       await loadProspectsTab();
     });
   });

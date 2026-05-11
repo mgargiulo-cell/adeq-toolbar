@@ -1789,10 +1789,21 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     // hay items para procesar normalmente.
     const item = await getNextCsvItem(token, blockedUsers);
     if (!item) {
-      // Cola vacía pero NO apagamos el toggle. AUTO IMPORT queda ON todo el día
-      // — cuando alguien sube nuevos items, el worker los procesa al instante.
-      // El user controla manual el ON/OFF (o el idle exit del worker después
-      // de IDLE_EXIT_MS sin trabajo apaga el container, pero el toggle queda).
+      // Cola vacía. Verificar si TAMBIÉN waitlist está vacía (entonces no hay
+      // nada en absoluto). Si es así, apagar el toggle para ahorrar Railway
+      // compute. El user lo prende manual cuando suba nuevos imports.
+      try {
+        const wlRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+        );
+        const wlRange = wlRes.headers.get("content-range") || "";
+        const wlCount = parseInt(wlRange.split("/")[1] || "0", 10);
+        if (wlCount === 0) {
+          log("  (cola vacía + waitlist vacía) — apagando csv_queue_enabled para ahorrar Railway");
+          await setConfigValue(token, "csv_queue_enabled", "false");
+        }
+      } catch {}
       break;
     }
 
