@@ -6061,51 +6061,48 @@ async function loadProspectsTab() {
     return;
   }
 
-  // ── Cap diario de visibilidad: 20 leads random per MB ──
-  // Cada día el MB recibe asignados 20 leads random del pool. Esos quedan
-  // guardados en chrome.storage.local (key: _daily_pool_<email>_<YYYY-MM-DD>).
-  // Si ya se asignaron, se respeta esa selección — no se re-randomiza al refrescar.
-  // Si alguno fue procesado/contactado por otro MB, se descarta de la lista
-  // visible (pero NO se reemplaza — el cap diario sigue siendo 20).
-  const DAILY_CAP = 20;
-  const today = new Date().toISOString().split("T")[0];
-  const userKey = (state.loginEmail || "anon").toLowerCase();
-  const storageKey = `_daily_pool_${userKey}_${today}`;
-  let assignedIds = [];
-  try {
-    const stored = await chrome.storage.local.get(storageKey);
-    if (stored?.[storageKey] && Array.isArray(stored[storageKey])) {
-      assignedIds = stored[storageKey];
-    }
-  } catch {}
+  // ── Cap diario por OUTPUT: 20 mails enviados/día per MB ──
+  // El MB puede ver INFINITAS URLs en Prospects (refresh ilimitado, mix random).
+  // Cuando llega a 20 mails enviados HOY (sumando Prospects + Analysis), la
+  // pestaña Prospects se vacía con un mensaje "ya completaste tu día".
+  // Cuenta de toolbar_api_usage._emails_sent (incrementUserDailyCounter ya lo
+  // suma cada vez que sendEmail OK retorna).
+  const DAILY_SEND_CAP = 20;
+  const usage = await getUserDailyUsage(state.accessToken, state.loginEmail);
+  const sentToday = usage.emails || 0;
 
-  if (assignedIds.length === 0) {
-    // Primera apertura del día: shuffle + slice 20 + persistir
-    const shuffled = [...rows];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    assignedIds = shuffled.slice(0, DAILY_CAP).map(r => r.id);
-    await chrome.storage.local.set({ [storageKey]: assignedIds }).catch(() => {});
+  if (sentToday >= DAILY_SEND_CAP) {
+    listEl.innerHTML = `
+      <div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:18px;border-radius:8px;text-align:center;margin:8px">
+        <div style="font-size:20px;margin-bottom:8px">🎉</div>
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px">¡Llegaste a tu objetivo del día!</div>
+        <div style="font-size:11px;line-height:1.5">
+          Enviaste <strong>${sentToday}/${DAILY_SEND_CAP}</strong> mails hoy.<br/>
+          Volvé mañana para nuevos leads del pool.
+        </div>
+        <div style="font-size:10px;color:#064e3b;opacity:0.7;margin-top:8px">
+          Hasta entonces, podés ver tus envíos en Monday.
+        </div>
+      </div>
+    `;
+    if (statsEl) statsEl.textContent = `🎉 ${sentToday}/${DAILY_SEND_CAP} enviados hoy — objetivo cumplido`;
+    return;
   }
 
-  // Filtrar: solo mostramos los IDs asignados que SIGUEN en el pool pending
-  const idSet = new Set(assignedIds);
-  const sample = rows.filter(r => idSet.has(r.id));
-  // Limpiar storage de días anteriores (housekeeping — solo guardamos hoy)
-  try {
-    const all = await chrome.storage.local.get(null);
-    const stale = Object.keys(all).filter(k => k.startsWith(`_daily_pool_${userKey}_`) && k !== storageKey);
-    if (stale.length > 0) await chrome.storage.local.remove(stale);
-  } catch {}
-
+  // Bajo el cap → mostrar leads. Mix puro al azar (refresh = nuevo shuffle).
+  // No hay cap de visualización — el MB puede pickear con libertad entre
+  // todo el pool hasta llegar al cap de envío.
+  const VISIBLE_CAP = 100;
+  const shuffled = [...rows];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  const sample = shuffled.slice(0, VISIBLE_CAP);
   listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
-  // Mostrar contador en stats
   if (statsEl) {
-    const remaining = sample.length;
-    const consumed  = DAILY_CAP - remaining;
-    statsEl.innerHTML = `${remaining} pending de tu pool diario (${consumed}/${DAILY_CAP} ya procesados o contactados por otro MB)`;
+    const remaining = DAILY_SEND_CAP - sentToday;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> leads disponibles · enviaste <strong>${sentToday}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${remaining})`;
   }
 
   listEl.querySelectorAll(".pcard").forEach(card => {
