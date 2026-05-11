@@ -728,8 +728,6 @@ async function loadAdminActivity() {
   document.getElementById("stat-emails").textContent    = emails.toLocaleString();
   document.getElementById("stat-monday").textContent    = monday.toLocaleString();
   document.getElementById("stat-500k-up").textContent   = above500k.toLocaleString();
-  document.getElementById("stat-500k-down").textContent = below500k.toLocaleString();
-  document.getElementById("stat-autopilot").textContent = apTimeStr;
 
   // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial
   // para que las funciones de render no necesiten saber del origen.
@@ -752,25 +750,137 @@ async function loadAdminActivity() {
   // Chart por día
   renderAdminChart(combined, from, to);
 
-  // RapidAPI hits por día
-  renderRapidApiChart(usageRes, from, to);
-
-  // Leaderboard + funnel
-  renderAdminLeaderboard(combined, usageRes);
-  renderAdminFunnel({ sites, emails, monday });
+  // Comparador de Media Buyers — at-a-glance side-by-side
+  renderAdminComparator(combined, usageRes, sessionsRes);
 
   // Resumen narrativo por MB (cards con tips para 1:1)
   renderAdminMBSummaries(combined, usageRes, sessionsRes);
+}
 
-  // Per-user breakdown
-  renderAdminByUser(combined, usageRes);
+// ── Helper compartido: agrega métricas por user (usado por Comparator + Summaries) ──
+function _aggregateByUser(historial, usage, sessions) {
+  const byUser = new Map();
+  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), {
+    sites: 0, autopilotSites: 0, manualSites: 0,
+    geos: {}, categories: {},
+    above500k: 0, below500k: 0,
+    emails: 0, monday: 0, claude: 0,
+    apSec: 0, popupSec: 0,
+  }));
+  const ensure = (u) => {
+    if (!byUser.has(u)) byUser.set(u, {
+      sites: 0, autopilotSites: 0, manualSites: 0,
+      geos: {}, categories: {},
+      above500k: 0, below500k: 0,
+      emails: 0, monday: 0, claude: 0,
+      apSec: 0, popupSec: 0,
+    });
+    return byUser.get(u);
+  };
+  historial.forEach(h => {
+    const u = (h.media_buyer || h.user_email || h.created_by || "unknown").toLowerCase();
+    const o = ensure(u);
+    o.sites++;
+    if (h.source === "autopilot") o.autopilotSites++; else o.manualSites++;
+    const g = (h.geo || "").trim();
+    if (g) o.geos[g] = (o.geos[g] || 0) + 1;
+    const c = (h.category || "").trim();
+    if (c) o.categories[c] = (o.categories[c] || 0) + 1;
+    const traffic = parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
+    if (traffic >= 500000) o.above500k++;
+    else if (traffic > 0)  o.below500k++;
+  });
+  usage.forEach(r => {
+    const o = ensure((r.user_email || "unknown").toLowerCase());
+    o.emails += parseInt(r.by_provider?._emails_sent  || 0, 10);
+    o.monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
+    o.claude += parseInt(r.by_provider?.anthropic     || 0, 10);
+  });
+  sessions.forEach(s => {
+    const o = ensure((s.user_email || "unknown").toLowerCase());
+    if (s.kind === "autopilot") o.apSec   += s.duration_sec || 0;
+    if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
+  });
+  return byUser;
+}
 
-  // Live feed (últimas 30) — orden combinado por fecha
-  const feedRows = combined
-    .filter(r => r.created_at)
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-    .slice(0, 30);
-  renderAdminLiveFeed(feedRows);
+// ── Comparador horizontal: tabla con métricas en filas, MBs en columnas ──
+// Pensado para "ver de un vistazo quién está produciendo y quién no".
+function renderAdminComparator(historial, usage, sessions) {
+  const wrap = document.getElementById("admin-mb-comparator");
+  if (!wrap) return;
+  const byUser = _aggregateByUser(historial, usage, sessions);
+  // Solo TEAM_EMAILS (3 MBs). Outsiders van solo al Resumen narrativo.
+  const mbs = TEAM_EMAILS.map(e => e.toLowerCase()).map(u => ({ user: u, ...byUser.get(u) }));
+  const shortName = (e) => ({
+    "mgargiulo@adeqmedia.com": "Maxi",
+    "dhorovitz@adeqmedia.com": "Diego",
+    "sales@adeqmedia.com":     "Agus",
+  })[e] || e.split("@")[0];
+
+  const fmtTime = (sec) => sec >= 3600 ? `${Math.floor(sec/3600)}h${Math.round((sec%3600)/60)}m` : `${Math.round(sec/60)}m`;
+  const topKey  = (obj) => Object.entries(obj).sort((a,b) => b[1]-a[1])[0]?.[0] || "—";
+  const pctConv = (mb) => mb.sites > 0 ? Math.round((mb.monday / mb.sites) * 100) : 0;
+
+  // Definición de filas: { label, group, get(mb) → value, fmt(value) → display, isBest higher/lower, colorFn(value) → class }
+  const groups = [
+    {
+      title: "VOLUMEN",
+      rows: [
+        { label: "Sitios analizados",  get: m => m.sites,  fmt: v => v.toLocaleString() },
+        { label: "Manual / Autopilot", get: m => m.manualSites + m.autopilotSites, fmt: (_, m) => `${m.manualSites} / ${m.autopilotSites}` },
+        { label: "Tiempo Autopilot",   get: m => m.apSec,  fmt: v => fmtTime(v) },
+      ],
+    },
+    {
+      title: "CALIDAD",
+      rows: [
+        { label: "% +500K visits", get: m => m.sites ? Math.round((m.above500k / m.sites) * 100) : 0, fmt: v => `${v}%` },
+        { label: "Top GEO",        get: m => Object.values(m.geos).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.geos), noBar: true },
+        { label: "Top Categoría",  get: m => Object.values(m.categories).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.categories), noBar: true },
+      ],
+    },
+    {
+      title: "OUTREACH",
+      rows: [
+        { label: "Emails enviados",   get: m => m.emails, fmt: v => v.toLocaleString() },
+        { label: "Pushes Monday",     get: m => m.monday, fmt: v => v.toLocaleString() },
+        { label: "Conv. push/site",   get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
+      ],
+    },
+    {
+      title: "EFICIENCIA",
+      rows: [
+        { label: "Pitches Claude", get: m => m.claude, fmt: v => v.toLocaleString() },
+        { label: "Mails / Push",   get: m => m.monday ? Math.round((m.emails / m.monday) * 10) / 10 : 0, fmt: v => v ? v.toFixed(1) : "—" },
+      ],
+    },
+  ];
+
+  const html = [];
+  html.push(`<div class="mbc-row mbc-header"><div class="mbc-cell mbc-row-label">Métrica</div>${mbs.map(m => `<div class="mbc-cell"><strong>${shortName(m.user)}</strong></div>`).join("")}</div>`);
+  groups.forEach(g => {
+    html.push(`<div class="mbc-group-sep">${g.title}</div>`);
+    g.rows.forEach(row => {
+      const values = mbs.map(m => row.get(m));
+      const max = Math.max(1, ...values);
+      const bestIdx = values.indexOf(Math.max(...values));
+      html.push(`<div class="mbc-row"><div class="mbc-cell mbc-row-label">${esc(row.label)}</div>`);
+      mbs.forEach((m, i) => {
+        const v = values[i];
+        const display = row.fmt(v, m);
+        const isBest = v === values[bestIdx] && v > 0 && !row.noBar;
+        const colorCls = row.color ? ` mbc-${row.color(v)}` : "";
+        const barW = row.noBar ? 0 : Math.round((v / max) * 100);
+        html.push(`<div class="mbc-cell${isBest ? " mbc-best" : ""}${colorCls}">
+          ${barW > 0 ? `<div class="mbc-bar" style="--w:${barW}%"></div>` : ""}
+          <span class="mbc-val">${esc(String(display))}</span>
+        </div>`);
+      });
+      html.push(`</div>`);
+    });
+  });
+  wrap.innerHTML = html.join("");
 }
 
 // ── Resumen narrativo por MB ──────────────────────────────
@@ -880,61 +990,6 @@ function renderAdminMBSummaries(historial, usage, sessions) {
   });
 }
 
-function renderAdminLeaderboard(historial, usage) {
-  const wrap = document.getElementById("admin-leaderboard");
-  if (!wrap) return;
-  // Score = pushes a Monday (más relevante que solo análisis).
-  // Pre-seed con TEAM_EMAILS para que el equipo aparezca aunque tenga 0 pushes.
-  const byUser = new Map();
-  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), { monday: 0, emails: 0 }));
-  usage.forEach(r => {
-    const u = (r.user_email || "unknown").toLowerCase();
-    const monday = parseInt(r.by_provider?._monday_pushes || 0, 10);
-    const emails = parseInt(r.by_provider?._emails_sent || 0, 10);
-    if (!byUser.has(u)) byUser.set(u, { monday: 0, emails: 0 });
-    byUser.get(u).monday += monday;
-    byUser.get(u).emails += emails;
-  });
-  const ranked = [...byUser.entries()].sort((a, b) => b[1].monday - a[1].monday);
-  const medals = ["gold", "silver", "bronze"];
-  wrap.innerHTML = "";
-  ranked.forEach(([u, s], i) => {
-    const row = document.createElement("div");
-    row.className = "leaderboard-row";
-    const medal = i < 3 ? `<span class="leaderboard-rank ${medals[i]}">${["🥇", "🥈", "🥉"][i]}</span>` : `<span class="leaderboard-rank">${i + 1}</span>`;
-    row.innerHTML = `
-      ${medal}
-      <span style="flex:1;font-weight:600">${esc(u)}</span>
-      <span style="color:#94a3b8;font-size:10px">${s.monday} push · ${s.emails} mail</span>
-    `;
-    wrap.appendChild(row);
-  });
-}
-
-function renderAdminFunnel({ sites, emails, monday }) {
-  const wrap = document.getElementById("admin-funnel");
-  if (!wrap) return;
-  if (!sites) { wrap.innerHTML = '<div class="admin-help">Sin datos en este período.</div>'; return; }
-  const steps = [
-    { label: "Sites analizados", count: sites },
-    { label: "Emails enviados",  count: emails },
-    { label: "Pushes Monday",    count: monday },
-  ];
-  const max = Math.max(1, sites);
-  wrap.innerHTML = steps.map(s => {
-    const pct = ((s.count / max) * 100).toFixed(0);
-    const conv = sites > 0 ? ((s.count / sites) * 100).toFixed(0) : 0;
-    const w = Math.max(8, (s.count / max) * 100);
-    return `
-      <div class="funnel-step">
-        <span class="funnel-label">${esc(s.label)}</span>
-        <div class="funnel-bar" style="width:${w}%">${s.count.toLocaleString()}</div>
-        <span class="funnel-pct">${conv}% del top</span>
-      </div>
-    `;
-  }).join("");
-}
-
 let _userFilterPopulated = false;
 async function populateUserFilter() {
   if (_userFilterPopulated) return;
@@ -1010,104 +1065,6 @@ function renderAdminChart(historial, from, to) {
       ctx.fillStyle = "#94a3b8";
       ctx.fillText(day.slice(5), x + barW / 2, h - 6);
     }
-  });
-}
-
-function renderRapidApiChart(usage, from, to) {
-  const canvas = document.getElementById("admin-rapidapi-chart");
-  const totalEl = document.getElementById("admin-rapidapi-total");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  // Buckets por día — sumar by_provider.rapidapi de cada row
-  const days = [];
-  const start = new Date(from); const end = new Date(to);
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    days.push(d.toISOString().slice(0, 10));
-  }
-  const counts = days.map(day => {
-    return usage
-      .filter(r => r.day === day)
-      .reduce((acc, r) => acc + parseInt(r.by_provider?.rapidapi || 0, 10), 0);
-  });
-  const total = counts.reduce((a, b) => a + b, 0);
-  const max = Math.max(1, ...counts);
-  if (totalEl) totalEl.textContent = `Total período: ${total.toLocaleString()} hits`;
-  // Dibujar
-  const W = canvas.width = canvas.offsetWidth * 2;
-  const H = canvas.height = 360;
-  ctx.scale(2, 2);
-  const w = W / 2; const h = H / 2;
-  ctx.clearRect(0, 0, w, h);
-  const barW = (w - 40) / days.length;
-  ctx.font = "10px -apple-system, sans-serif";
-  ctx.textAlign = "center";
-  days.forEach((day, i) => {
-    const x = 20 + i * barW;
-    const barHeight = (counts[i] / max) * (h - 40);
-    ctx.fillStyle = "#fbbf24";
-    ctx.fillRect(x + 1, h - 20 - barHeight, barW - 2, barHeight);
-    if (counts[i] > 0) {
-      ctx.fillStyle = "#e2e8f0";
-      ctx.fillText(counts[i].toLocaleString(), x + barW / 2, h - 22 - barHeight);
-    }
-    const showLabel = days.length <= 14 || i % Math.ceil(days.length / 14) === 0;
-    if (showLabel) {
-      ctx.fillStyle = "#94a3b8";
-      ctx.fillText(day.slice(5), x + barW / 2, h - 6);
-    }
-  });
-}
-
-function renderAdminByUser(historial, usage) {
-  const wrap = document.getElementById("admin-by-user");
-  if (!wrap) return;
-  // Pre-seed con TEAM_EMAILS para que el equipo aparezca aunque tenga 0 actividad.
-  const byUser = new Map();
-  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), { sites: 0, autopilot: 0, emails: 0, monday: 0 }));
-  historial.forEach(h => {
-    const u = (h.media_buyer || h.user_email || h.created_by || "unknown").toLowerCase();
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0, emails: 0, monday: 0 });
-    byUser.get(u).sites++;
-    if (h.source === "autopilot") byUser.get(u).autopilot++;
-  });
-  usage.forEach(r => {
-    const u = (r.user_email || "unknown").toLowerCase();
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0, emails: 0, monday: 0 });
-    byUser.get(u).emails += parseInt(r.by_provider?._emails_sent || 0, 10);
-    byUser.get(u).monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
-  });
-  wrap.innerHTML = "";
-  [...byUser.entries()].sort((a, b) => b[1].sites - a[1].sites).forEach(([u, s]) => {
-    const row = document.createElement("div");
-    row.className = "admin-by-user-row";
-    row.innerHTML = `
-      <span class="user">${esc(u)}</span>
-      <span class="nums">${s.sites} sites · ${s.emails || 0} mails · ${s.monday || 0} monday · ${s.autopilot} AP</span>
-    `;
-    wrap.appendChild(row);
-  });
-}
-
-function renderAdminLiveFeed(rows) {
-  const wrap = document.getElementById("admin-live-feed");
-  if (!wrap) return;
-  if (!rows.length) { wrap.innerHTML = '<div class="admin-help">Sin actividad reciente.</div>'; return; }
-  wrap.innerHTML = "";
-  rows.forEach(r => {
-    const ts = r.created_at || r.date || r.fecha;
-    const time = ts ? new Date(ts).toLocaleString() : "";
-    const row = document.createElement("div");
-    row.className = "admin-feed-row";
-    const trafficNum = r.page_views || r.raw_visits || r.traffic;
-    const traffic = trafficNum ? `· ${parseInt(trafficNum).toLocaleString()} visits` : "";
-    const who = r.media_buyer || r.user_email || r.created_by || "?";
-    const tag = r.source === "autopilot" ? " 🤖" : r.source === "csv" ? " 📥" : r.source === "monday_refresh" ? " 🔄" : "";
-    row.innerHTML = `
-      <span style="font-weight:600">${esc(who)}${tag}</span>
-      <span style="color:#94a3b8">→ ${esc(r.dominio || r.domain || "?")} ${esc(traffic)}</span>
-      <span style="color:#64748b;font-size:9px">${esc(time)}</span>
-    `;
-    wrap.appendChild(row);
   });
 }
 
