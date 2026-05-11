@@ -8,6 +8,7 @@
 
 import { CONFIG }    from "../config.js";
 import { callProxy } from "./apiProxy.js";
+import { getApolloCache, saveApolloCache } from "./supabase.js";
 
 const IGNORE_DOMAINS = [
   "example.com","domain.com","yoursite.com","sentry.io",
@@ -285,6 +286,21 @@ async function apolloDomainSearch(domain, apiKey) {
 export async function findDecisionMakerViaApollo(domain) {
   const cleanDomain = domain.replace(/^www\./, "");
 
+  // ── Cache check (TTL 7d) — evita pagar Apollo 2× para el mismo dominio ──
+  // Worker autopilot y popup escriben/leen la misma cache.
+  let _accessToken = null;
+  try {
+    const { auth } = await chrome.storage.local.get("auth");
+    _accessToken = auth?.accessToken || null;
+    if (_accessToken) {
+      const cached = await getApolloCache(cleanDomain, _accessToken);
+      if (cached) {
+        console.log(`[Apollo] cache HIT ${cleanDomain} (saved ~$0.05 API)`);
+        return cached;
+      }
+    }
+  } catch {}
+
   // ── Paso 1: Gemini con Google Search → nombre del decisor ────
   let firstName = "", lastName = "", title = "", linkedin = "";
 
@@ -334,7 +350,7 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
     note = `${diag.valid.length} valid · ${diag.rawCount - diag.valid.length} locked/other`;
   }
 
-  return {
+  const result = {
     name:     primary?.name     || (firstName ? `${firstName} ${lastName}`.trim() : ""),
     email:    primary?.email    || null,
     title:    primary?.title    || title,
@@ -343,6 +359,10 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
     note,
     diag,
   };
+  // Persistir en cache (TTL 7d) — el siguiente lookup en 7 días es gratis,
+  // sin importar si vino del worker o del popup.
+  if (_accessToken) saveApolloCache(cleanDomain, result, _accessToken).catch(() => {});
+  return result;
 }
 
 /**

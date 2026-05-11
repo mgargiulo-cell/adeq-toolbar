@@ -806,6 +806,47 @@ export async function saveSendDate(domain, { sendDate, pitch, email }) {
 
 // ── CSV Queue — batch de dominios a procesar por el auto-prospector ───
 // source: "csv" (External URLs) o "monday" (Monday URL Auto Prospector)
+// ── Apollo cache (TTL 7 días) ───────────────────────────────
+// Evita pagar Apollo 2× para el mismo dominio (worker + popup comparten).
+const APOLLO_CACHE_TTL_DAYS = 7;
+
+export async function getApolloCache(domain, accessToken) {
+  if (!domain || !accessToken) return null;
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const d   = (domain || "").toLowerCase().replace(/^www\./, "").trim();
+  if (!d) return null;
+  try {
+    const cutoff = new Date(Date.now() - APOLLO_CACHE_TTL_DAYS * 86_400_000).toISOString();
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_apollo_cache?domain=eq.${encodeURIComponent(d)}&fetched_at=gte.${cutoff}&select=data&limit=1`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows?.[0]?.data || null;
+  } catch { return null; }
+}
+
+export async function saveApolloCache(domain, data, accessToken) {
+  if (!domain || !accessToken || !data) return;
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  const d   = (domain || "").toLowerCase().replace(/^www\./, "").trim();
+  if (!d) return;
+  try {
+    await fetch(`${url}/rest/v1/toolbar_apollo_cache`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({ domain: d, data, fetched_at: new Date().toISOString() }),
+    });
+  } catch {}
+}
+
 export async function uploadCsvDomains(domains, userEmail, accessToken, source = "csv") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;

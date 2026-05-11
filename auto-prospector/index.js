@@ -1009,10 +1009,56 @@ async function saveSimilarSitesCacheServer(domain, sites) {
 
 const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
 
-async function findAllEmails(domain, apolloApiKey) {
-  if (!apolloApiKey) return [];
-  const emails = [];
+// Apollo cache (TTL 7d) en Supabase — compartido con popup.
+// Saves cost: si worker o popup ya lo procesaron en los últimos 7d, esta call cuesta 0.
+const APOLLO_CACHE_TTL_DAYS = 7;
+async function getApolloCacheServer(token, domain) {
+  const d = (domain || "").toLowerCase().replace(/^www\./, "");
+  if (!d) return null;
+  try {
+    const cutoff = new Date(Date.now() - APOLLO_CACHE_TTL_DAYS * 86_400_000).toISOString();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_apollo_cache?domain=eq.${encodeURIComponent(d)}&fetched_at=gte.${cutoff}&select=data&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows?.[0]?.data || null;
+  } catch { return null; }
+}
+async function saveApolloCacheServer(token, domain, data) {
+  const d = (domain || "").toLowerCase().replace(/^www\./, "");
+  if (!d || !data) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_apollo_cache`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({ domain: d, data, fetched_at: new Date().toISOString() }),
+    });
+  } catch {}
+}
 
+async function findAllEmails(domain, apolloApiKey, token = null) {
+  if (!apolloApiKey) return [];
+  // Cache check: si popup o worker ya pegó Apollo en los últimos 7d, retornar lo cacheado.
+  // Cache puede tener shape worker {emails:[...]} o popup {email, people:[...]}.
+  if (token) {
+    const cached = await getApolloCacheServer(token, domain);
+    if (cached) {
+      if (Array.isArray(cached.emails)) return cached.emails;
+      if (Array.isArray(cached.people)) {
+        const goods = cached.people.filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status)).map(p => p.email);
+        if (goods.length) return [...new Set(goods)];
+      }
+      if (cached.email) return [cached.email];
+    }
+  }
+
+  const emails = [];
   // /v1/people/match was deprecated — now /v1/mixed_people/search is ALSO deprecated.
   // Current endpoint: /v1/mixed_people/api_search (per Apollo docs 2026-04)
   try {
@@ -1036,7 +1082,10 @@ async function findAllEmails(domain, apolloApiKey) {
     }
   } catch {}
 
-  return [...new Set(emails)];
+  const unique = [...new Set(emails)];
+  // Cache write — gratis para el siguiente lookup en 7d
+  if (token) saveApolloCacheServer(token, domain, { emails: unique, source: "worker" }).catch(() => {});
+  return unique;
 }
 
 // ── Email scraping fallback (server-side HTTP) ────────────────
@@ -1573,7 +1622,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
 
   const [apolloEmails, scraperEmails] = await Promise.all([
     canUseApollo
-      ? findAllEmails(domain, apollo_api_key).then(r => { apolloCallsThisSessionRef.count += 2; return r; })
+      ? findAllEmails(domain, apollo_api_key, token).then(r => { apolloCallsThisSessionRef.count += 2; return r; })
       : Promise.resolve([]),
     scrapeEmailsForDomain(domain),
   ]);
@@ -2169,7 +2218,7 @@ async function runSession(token, cfg, sessionStart) {
 
     const [apolloEmails, scraperEmails, similarSites] = await Promise.all([
       canUseApollo
-        ? findAllEmails(domain, apollo_api_key).then(r => { apolloCallsThisSession += 2; return r; })
+        ? findAllEmails(domain, apollo_api_key, token).then(r => { apolloCallsThisSession += 2; return r; })
         : Promise.resolve([]),
       scrapeEmailsForDomain(domain),
       findSimilarSites(domain, rapidapi_key),
