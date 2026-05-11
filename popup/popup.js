@@ -5753,10 +5753,11 @@ function renderProspectCard(r) {
     : "";
 
   return `
-  <div class="pcard" data-id="${r.id}" data-source="${esc(r.source || 'autopilot')}" data-monday-id="${r.monday_item_id || ''}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;margin:0 8px 8px;overflow:hidden">
+  <div class="pcard" data-id="${r.id}" data-domain="${esc(r.domain)}" data-source="${esc(r.source || 'autopilot')}" data-monday-id="${r.monday_item_id || ''}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;margin:0 8px 8px;overflow:hidden">
 
     <!-- Summary row -->
     <div style="display:flex;align-items:center;gap:6px;padding:8px 10px">
+      <input type="checkbox" class="pcard-bulk-cbx" data-id="${r.id}" title="Seleccionar para bulk action" style="margin:0;cursor:pointer;flex-shrink:0" />
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:center;gap:5px">
           ${(() => {
@@ -6641,9 +6642,50 @@ async function initProspectsTab() {
     chrome.storage.local.set({ _prospectsUserFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
-  // Clear all de Prospects ELIMINADO — el botón borraba TODA la cola compartida
-  // del equipo (autopilot + Monday + manual). Riesgo demasiado alto. Si en algún
-  // momento hace falta limpiar, el admin lo hace desde Supabase SQL Editor.
+  // ── Bulk actions: checkbox selection + reject masivo ──────────
+  // Validate masivo NO se ofrece: cada lead requiere chequear email/pitch/tráfico
+  // antes de enviar. Reject sí porque es seguro y el caso más común (descartar
+  // lotes de baja calidad de un golpe).
+  const bulkBar     = document.getElementById("prospects-bulk-bar");
+  const bulkCount   = document.getElementById("prospects-bulk-count");
+  const updateBulkBar = () => {
+    const checked = document.querySelectorAll(".pcard-bulk-cbx:checked");
+    if (!bulkBar || !bulkCount) return;
+    if (checked.length > 0) {
+      bulkBar.style.display = "flex";
+      bulkCount.textContent = `${checked.length} selected`;
+    } else {
+      bulkBar.style.display = "none";
+    }
+  };
+  // Listener delegado en prospects-list — sobrevive a re-renders.
+  document.getElementById("prospects-list")?.addEventListener("change", (e) => {
+    if (e.target?.classList?.contains("pcard-bulk-cbx")) updateBulkBar();
+  });
+  document.getElementById("btn-bulk-clear")?.addEventListener("click", () => {
+    document.querySelectorAll(".pcard-bulk-cbx:checked").forEach(c => { c.checked = false; });
+    updateBulkBar();
+  });
+  document.getElementById("btn-bulk-reject")?.addEventListener("click", async () => {
+    const checked = [...document.querySelectorAll(".pcard-bulk-cbx:checked")];
+    if (checked.length === 0) return;
+    if (!confirm(`Rechazar ${checked.length} prospects? Esto los marca como permanentemente bloqueados.`)) return;
+    const ids = checked.map(c => parseInt(c.dataset.id, 10)).filter(Boolean);
+    showToast(`⏳ Rechazando ${ids.length} prospects...`, "info");
+    let ok = 0, fail = 0;
+    for (const id of ids) {
+      const card = document.querySelector(`.pcard[data-id="${id}"]`);
+      const domain = card?.dataset?.domain || "";
+      try {
+        await rejectReviewItem(state.accessToken, id, domain);
+        card?.remove();
+        ok++;
+      } catch { fail++; }
+    }
+    showToast(`✅ Rechazados ${ok}${fail > 0 ? ` (${fail} fallaron)` : ""}.`, fail > 0 ? "warn" : "info");
+    updateBulkBar();
+    refreshProspectsStats();
+  });
 
   // Auto-refresh: si autopilot o csv_queue ON, recargar lista cada 30s
   // para que prospects de Railway aparezcan progresivamente sin click manual.
