@@ -6196,14 +6196,17 @@ function renderProspectCard(r) {
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:center;gap:5px">
           ${(() => {
+            // Source badge minimal: solo el icono en cuadradito chico, libera espacio
+            // para el nombre del MB y la URL del dominio. El label completo queda en title.
             const src = r.source || "autopilot";
             const badges = {
-              autopilot:      ["🤖", "Auto",    "#6366f1"],
-              csv:            ["📥", "CSV",     "#0ea5e9"],
-              monday_refresh: ["🔄", "Refresh", "#f59e0b"],
+              autopilot:      ["🤖", "Auto",            "#6366f1"],
+              csv:            ["📥", "CSV import",      "#0ea5e9"],
+              monday_refresh: ["🔄", "Monday refresh",  "#f59e0b"],
+              sellers_json:   ["📋", "sellers.json",    "#8b5cf6"],
             };
             const [icon, label, color] = badges[src] || badges.autopilot;
-            return `<span title="Origen: ${label}" style="font-size:9px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 5px;flex-shrink:0">${icon} ${label}</span>`;
+            return `<span title="Origen: ${label}" style="font-size:11px;background:${color};border-radius:3px;padding:1px 4px;line-height:1;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:18px;height:16px">${icon}</span>`;
           })()}
           ${(() => {
             // Badge del usuario que generó el item (autopilot o import). Mapea
