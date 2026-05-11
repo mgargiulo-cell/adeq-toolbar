@@ -414,6 +414,7 @@ function initAdminPanel() {
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
   document.getElementById("agent-refresh-toggle")?.addEventListener("click", toggleRefreshEmptyLeads);
+  document.getElementById("admin-export-comparator-csv")?.addEventListener("click", exportComparatorCsv);
   document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
   loadAdminActivity();
@@ -876,6 +877,57 @@ async function saveAgentFocus() {
   await _writeAgentConfig({ agent_focus_config: JSON.stringify(focus) });
   showToast("✅ Focus de la semana guardado", "info");
   await loadAdminAgent();
+}
+
+// Exporta el comparador horizontal del admin como CSV.
+// Lee el DOM ya renderizado (contiene los datos del periodo + filtros aplicados).
+function exportComparatorCsv() {
+  const wrap = document.getElementById("admin-mb-comparator");
+  if (!wrap) { showToast("❌ Comparador no cargado", "error"); return; }
+  const rows = [];
+  // Iterar las filas del grid: cada label + 4 celdas (3 MBs + Agent)
+  const cells = wrap.querySelectorAll(".mbc-cell, .mbc-group-sep, .mbc-row-label");
+  let currentRow = [];
+  let isHeader = true;
+  let groupTitle = "";
+
+  // Approach simple: iterar children y agrupar por filas
+  const allChildren = [...wrap.children];
+  let i = 0;
+  while (i < allChildren.length) {
+    const node = allChildren[i];
+    if (node.classList.contains("mbc-row")) {
+      const cellsInRow = [...node.querySelectorAll(".mbc-cell")];
+      const rowVals = cellsInRow.map(c => (c.querySelector(".mbc-val")?.textContent || c.textContent || "").trim());
+      // Si es header, prepend "Métrica"
+      if (node.classList.contains("mbc-header")) {
+        rows.push(rowVals.map(v => `"${v.replace(/"/g, '""')}"`).join(","));
+      } else {
+        // Las row labels normales: primera celda es la métrica
+        rows.push((groupTitle ? `[${groupTitle}] ` : "") + rowVals.map(v => `"${v.replace(/"/g, '""')}"`).join(","));
+      }
+    } else if (node.classList.contains("mbc-group-sep")) {
+      groupTitle = (node.textContent || "").trim();
+    }
+    i++;
+  }
+
+  if (rows.length === 0) { showToast("❌ No hay datos para exportar", "error"); return; }
+
+  // Filtros aplicados al título del archivo
+  const period = document.getElementById("admin-filter-period")?.value || "";
+  const userF = document.getElementById("admin-filter-user")?.value || "all";
+  const today = new Date().toISOString().split("T")[0];
+  const filename = `adeq-comparador-${period}-${userF.replace(/[^a-z0-9]/gi, "_")}-${today}.csv`;
+
+  const csv = "﻿" + rows.join("\n"); // BOM UTF-8 para Excel
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
+  showToast(`✅ CSV descargado: ${filename}`, "info");
 }
 
 async function toggleRefreshEmptyLeads() {
