@@ -518,6 +518,55 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
   return true;
 }
 
+// ── Bulk refresh de leads sin traffic ───────────────────────
+// Job lazy: cada loop iteration, si toolbar_config.agent_refresh_empty_leads=true,
+// pickea 1 lead con traffic=0 o null y lo re-fetchea. Cache 90d ayuda a no quemar
+// RapidAPI. Cuando ya no quedan leads vacíos, auto-apaga el flag.
+async function refreshOneEmptyLead(token, cfg) {
+  const flag = cfg.agent_refresh_empty_leads === "true";
+  if (!flag) return;
+  const rapidapi_key = cfg.rapidapi_key;
+  if (!rapidapi_key) return;
+
+  // Buscar 1 lead con traffic=0 o null, pending, ordenado por created_at
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(traffic.eq.0,traffic.is.null)&select=id,domain&order=created_at.asc&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      // No quedan leads vacíos → auto-apagar flag
+      log("✅ Refresh empty leads: completado, no quedan leads sin traffic. Apagando flag.");
+      await setConfigValue(token, "agent_refresh_empty_leads", "false");
+      return;
+    }
+    const lead = rows[0];
+    log(`🔄 Refresh empty: ${lead.domain} (id ${lead.id})`);
+    const data = await getTrafficData(lead.domain, rapidapi_key);
+    const newVisits = data?.visits || 0;
+    const newGeo = data?.topCountry || "";
+    if (newVisits > 0 || newGeo) {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+        method: "PATCH",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ traffic: newVisits, geo: newGeo || undefined }),
+      });
+      log(`  ✅ ${lead.domain} → traffic=${newVisits}, geo=${newGeo || "?"}`);
+    } else {
+      // Marcar como refreshed-empty para no re-intentarlo eternamente (traffic=-1 sentinel)
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+        method: "PATCH",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ traffic: -1 }),
+      });
+      log(`  ⚠️ ${lead.domain} → sin traffic disponible (marcado como -1)`);
+    }
+  } catch (e) {
+    log(`⚠️ refreshOneEmptyLead error: ${e.message}`);
+  }
+}
+
 // ── Stats en vivo del autopilot, persistidas a toolbar_config ─────
 // Los popups de los MBs leen estas keys cada 30s y muestran el progreso.
 let _autopilotStatsLocal = { processed: 0, added: 0, filtered: 0, lastDomain: "", lastUpdate: 0, sessionUser: "" };
@@ -3177,6 +3226,13 @@ async function main() {
       // Cada loop iteration lo intenta — items "preparados" por MBs entran
       // automáticamente cuando se libera lugar.
       try { await promoteWaitlist(token); } catch (e) { log(`⚠️ promoteWaitlist: ${e.message}`); }
+
+      // Refresh job: si admin activó agent_refresh_empty_leads, procesar 1
+      // lead vacío por ciclo (cache 90d ahorra hits si ya analizado).
+      try {
+        const cfgRefresh = await getConfig(token);
+        await refreshOneEmptyLead(token, cfgRefresh);
+      } catch (e) { log(`⚠️ refreshOneEmptyLead: ${e.message}`); }
 
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);

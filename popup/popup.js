@@ -413,6 +413,7 @@ function initAdminPanel() {
   document.getElementById("agent-toggle")?.addEventListener("change", toggleAgent);
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
+  document.getElementById("agent-refresh-toggle")?.addEventListener("click", toggleRefreshEmptyLeads);
   document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
   loadAdminActivity();
@@ -871,6 +872,28 @@ async function saveAgentFocus() {
   await _writeAgentConfig({ agent_focus_config: JSON.stringify(focus) });
   showToast("✅ Focus de la semana guardado", "info");
   await loadAdminAgent();
+}
+
+async function toggleRefreshEmptyLeads() {
+  // Lee estado actual + lo invierte
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_refresh_empty_leads&select=value`,
+      { headers }
+    );
+    const rows = await res.json();
+    const current = rows?.[0]?.value === "true";
+    const newVal = !current;
+    await _writeAgentConfig({ agent_refresh_empty_leads: String(newVal) });
+    showToast(newVal ? "🔄 Refresh activado — el worker procesa 1 lead/ciclo" : "⏸ Refresh desactivado", "info");
+    const statusEl = document.getElementById("agent-refresh-status");
+    if (statusEl) statusEl.textContent = `Refresh leads sin traffic: ${newVal ? "🟢 ON" : "⚪ OFF"}`;
+    const btnEl = document.getElementById("agent-refresh-toggle");
+    if (btnEl) btnEl.textContent = newVal ? "⏸ Pausar refresh" : "🔄 Activar refresh";
+  } catch (e) {
+    showToast("❌ Error: " + e.message, "error");
+  }
 }
 
 async function pauseAgent1h() {
