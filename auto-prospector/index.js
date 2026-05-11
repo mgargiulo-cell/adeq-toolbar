@@ -2680,7 +2680,7 @@ Write the prospecting email. Return JSON only.`;
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
 const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster)@/i;
-const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy)/i;
+const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy/i;
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
 async function scoreEmail(email) {
@@ -3063,7 +3063,9 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // 1b. Si NO hay email decente, dispara Apollo (cache 7d)
-        const hasGoodEmail = emails.some(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e));
+        const hasGoodEmail = emails.some(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
+        // También filtrar emails garbage del array antes de elegir destino
+        emails = emails.filter(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
         if (!hasGoodEmail && cfg.apollo_api_key) {
           try {
             const apolloEmails = await findAllEmails(domain, cfg.apollo_api_key, token);
