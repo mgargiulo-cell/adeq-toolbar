@@ -686,21 +686,36 @@ async function loadAdminActivity() {
 
   // Fetch en paralelo: historial + sendtrack + api_usage
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-  const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
+  // toolbar_historial usa media_buyer (NO user_email) — antes el filtro era erróneo y devolvía 0.
+  const histUserClause   = userFilter ? `&media_buyer=eq.${encodeURIComponent(userFilter)}` : "";
+  const queueUserClause  = userFilter ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
+  const usageUserClause  = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
 
-  const [histRes, trackRes, usageRes, sessionsRes] = await Promise.all([
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?fecha=gte.${from}&fecha=lte.${to}T23:59:59${userClause}&select=*&order=fecha.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+  const [histRes, trackRes, usageRes, sessionsRes, queueRes] = await Promise.all([
+    // toolbar_historial — sites analizados manualmente desde toolbar.
+    // Filtro por created_at (timestamp confiable) en vez de date (string DD/MM/YYYY).
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${from}&created_at=lte.${to}T23:59:59${histUserClause}&select=*&order=created_at.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${from}&send_date=lte.${to}&select=domain,send_date`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${from}&day=lte.${to}${userClause}&select=*`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${from}&day=lte.${to}${usageUserClause}&select=*`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetchUsageStats(state.accessToken, { from, to, userEmail: userFilter }),
+    // toolbar_review_queue — prospects agregados por autopilot + CSV + Monday refresh.
+    // Esta es la fuente real del trabajo del worker (historial NO refleja autopilot).
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${from}&created_at=lte.${to}T23:59:59${queueUserClause}&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
   ]);
 
-  // Agregar stats
-  const sites = histRes.length;
-  const emails = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
-  const monday = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
-  const above500k = histRes.filter(h => (parseInt(h.traffic || 0, 10) >= 500000)).length;
-  const below500k = histRes.filter(h => (parseInt(h.traffic || 0, 10) < 500000)).length;
+  // ── Métricas ────────────────────────────────────────────────
+  // sites = analyses manuales (historial) + prospects agregados por worker (review_queue, dedup por domain).
+  const histDomains    = new Set(histRes.map(h => (h.domain || "").toLowerCase()).filter(Boolean));
+  const queueDomains   = new Set(queueRes.map(q => (q.domain || "").toLowerCase()).filter(Boolean));
+  const allDomains     = new Set([...histDomains, ...queueDomains]);
+  const sites          = allDomains.size;
+  const emails         = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
+  const monday         = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
+  // toolbar_historial usa page_views/raw_visits (no 'traffic'). Combinar histórico + review_queue para tráfico.
+  const trafficOf      = (h) => parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
+  const allRows        = [...histRes, ...queueRes];
+  const above500k      = allRows.filter(h => trafficOf(h) >= 500000).length;
+  const below500k      = allRows.filter(h => { const t = trafficOf(h); return t > 0 && t < 500000; }).length;
   // Tiempo REAL de autopilot (sumar duration_sec de sesiones kind=autopilot)
   const apSec = sessionsRes
     .filter(s => s.kind === "autopilot" && s.duration_sec)
@@ -716,24 +731,46 @@ async function loadAdminActivity() {
   document.getElementById("stat-500k-down").textContent = below500k.toLocaleString();
   document.getElementById("stat-autopilot").textContent = apTimeStr;
 
+  // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial
+  // para que las funciones de render no necesiten saber del origen.
+  const queueAsHist = queueRes.map(q => ({
+    domain:       q.domain,
+    media_buyer:  q.created_by || "",
+    page_views:   q.traffic || 0,
+    raw_visits:   q.traffic || 0,
+    is_new:       true,
+    date:         q.created_at,
+    created_at:   q.created_at,
+    geo:          q.geo,
+    category:     q.category,
+    source:       q.source || "autopilot",
+    status:       q.status,
+    score:        q.score,
+  }));
+  const combined = [...histRes, ...queueAsHist];
+
   // Chart por día
-  renderAdminChart(histRes, from, to);
+  renderAdminChart(combined, from, to);
 
   // RapidAPI hits por día
   renderRapidApiChart(usageRes, from, to);
 
   // Leaderboard + funnel
-  renderAdminLeaderboard(histRes, usageRes);
+  renderAdminLeaderboard(combined, usageRes);
   renderAdminFunnel({ sites, emails, monday });
 
   // Resumen narrativo por MB (cards con tips para 1:1)
-  renderAdminMBSummaries(histRes, usageRes, sessionsRes);
+  renderAdminMBSummaries(combined, usageRes, sessionsRes);
 
   // Per-user breakdown
-  renderAdminByUser(histRes, usageRes);
+  renderAdminByUser(combined, usageRes);
 
-  // Live feed (últimas 30)
-  renderAdminLiveFeed(histRes.slice(0, 30));
+  // Live feed (últimas 30) — orden combinado por fecha
+  const feedRows = combined
+    .filter(r => r.created_at)
+    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+    .slice(0, 30);
+  renderAdminLiveFeed(feedRows);
 }
 
 // ── Resumen narrativo por MB ──────────────────────────────
@@ -750,7 +787,8 @@ function renderAdminMBSummaries(historial, usage, sessions) {
     apSec: 0, popupSec: 0,
   }));
   historial.forEach(h => {
-    const u = (h.user_email || h.created_by || "unknown").toLowerCase();
+    // Compatibilidad: toolbar_historial usa media_buyer; review_queue usa created_by; api_usage usa user_email.
+    const u = (h.media_buyer || h.user_email || h.created_by || "unknown").toLowerCase();
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     o.sites++;
@@ -759,7 +797,8 @@ function renderAdminMBSummaries(historial, usage, sessions) {
     if (g) o.geos[g] = (o.geos[g] || 0) + 1;
     const c = (h.category || "").trim();
     if (c) o.categories[c] = (o.categories[c] || 0) + 1;
-    const traffic = parseInt(h.traffic || 0, 10);
+    // Tráfico puede venir como page_views (historial) | raw_visits (historial) | traffic (review_queue)
+    const traffic = parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
     if (traffic >= 500000) o.above500k++;
     else if (traffic > 0)  o.below500k++;
   });
@@ -938,7 +977,11 @@ function renderAdminChart(historial, from, to) {
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
     days.push(d.toISOString().slice(0, 10));
   }
-  const counts = days.map(day => historial.filter(h => (h.fecha || "").startsWith(day)).length);
+  // historial puede tener `created_at` (preferido), `date`, o `fecha` (legacy). Match por prefijo YYYY-MM-DD.
+  const counts = days.map(day => historial.filter(h => {
+    const ts = (h.created_at || h.date || h.fecha || "").toString();
+    return ts.startsWith(day);
+  }).length);
   const max = Math.max(1, ...counts);
 
   // Dibujar
@@ -1022,7 +1065,7 @@ function renderAdminByUser(historial, usage) {
   const byUser = new Map();
   TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), { sites: 0, autopilot: 0, emails: 0, monday: 0 }));
   historial.forEach(h => {
-    const u = (h.user_email || h.created_by || "unknown").toLowerCase();
+    const u = (h.media_buyer || h.user_email || h.created_by || "unknown").toLowerCase();
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilot: 0, emails: 0, monday: 0 });
     byUser.get(u).sites++;
     if (h.source === "autopilot") byUser.get(u).autopilot++;
@@ -1051,12 +1094,16 @@ function renderAdminLiveFeed(rows) {
   if (!rows.length) { wrap.innerHTML = '<div class="admin-help">Sin actividad reciente.</div>'; return; }
   wrap.innerHTML = "";
   rows.forEach(r => {
-    const time = r.fecha ? new Date(r.fecha).toLocaleString() : "";
+    const ts = r.created_at || r.date || r.fecha;
+    const time = ts ? new Date(ts).toLocaleString() : "";
     const row = document.createElement("div");
     row.className = "admin-feed-row";
-    const traffic = r.traffic ? `· ${parseInt(r.traffic).toLocaleString()} visits` : "";
+    const trafficNum = r.page_views || r.raw_visits || r.traffic;
+    const traffic = trafficNum ? `· ${parseInt(trafficNum).toLocaleString()} visits` : "";
+    const who = r.media_buyer || r.user_email || r.created_by || "?";
+    const tag = r.source === "autopilot" ? " 🤖" : r.source === "csv" ? " 📥" : r.source === "monday_refresh" ? " 🔄" : "";
     row.innerHTML = `
-      <span style="font-weight:600">${esc(r.user_email || r.created_by || "?")}</span>
+      <span style="font-weight:600">${esc(who)}${tag}</span>
       <span style="color:#94a3b8">→ ${esc(r.dominio || r.domain || "?")} ${esc(traffic)}</span>
       <span style="color:#64748b;font-size:9px">${esc(time)}</span>
     `;
