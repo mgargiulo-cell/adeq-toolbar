@@ -5932,6 +5932,27 @@ function initProspectCard(card, data) {
       } else {
         lockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
       }
+      // Auto-fetch tráfico si la card no lo tiene — usa cache 90d → 0 hits
+      // si ya fue analizado por cualquier MB. Solo gasta hit si es dominio fresh.
+      if (!data.traffic && !card.dataset._trafficFetched) {
+        card.dataset._trafficFetched = "1";
+        const trafficInput = card.querySelector(".pcard-traffic");
+        if (trafficInput && !trafficInput.value) {
+          trafficInput.placeholder = "⏳ Buscando tráfico…";
+          getTraffic(data.domain).then(t => {
+            const v = t?.pageViews || t?.rawVisits || 0;
+            if (v > 0) {
+              data.traffic = v;
+              trafficInput.value = formatTraffic(v);
+              trafficInput.placeholder = "ej: 500K, 1.2M, 3500000";
+            } else {
+              trafficInput.placeholder = "Sin data — completá manual";
+            }
+          }).catch(() => {
+            trafficInput.placeholder = "Error — completá manual";
+          });
+        }
+      }
     } else if (!open && data.domain) {
       // Al cerrar, liberar el lock SI somos el dueño
       unlockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
