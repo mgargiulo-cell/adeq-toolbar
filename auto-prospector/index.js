@@ -2679,8 +2679,8 @@ Write the prospecting email. Return JSON only.`;
 //   🟢 green  : SMTP OK + no garbage + no genérico → manda
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
-const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster)@/i;
-const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy/i;
+const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|security|domain-abuse|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints)@/i;
+const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|enom\.|networksolutions|tucows/i;
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
 async function scoreEmail(email) {
@@ -2900,7 +2900,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_EMAIL]:     { email: payload.email, text: payload.email },
     [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
     [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
-    [MONDAY_COL_ESTADO]:    { index: 7 }, // 7 = "Mail No Enviado" (se actualiza después si manda OK)
+    [MONDAY_COL_ESTADO]:    { label: "Mail No Enviado" }, // create_labels_if_missing lo crea si no existe
     [MONDAY_COL_OWNER]:     { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] },
     [MONDAY_COL_PITCH]:     payload.pitch_body || "",
   };
