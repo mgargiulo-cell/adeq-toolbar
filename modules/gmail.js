@@ -165,7 +165,10 @@ export async function sendEmail({ to, subject, body, expectedFrom }) {
       }
     }
 
-    const raw = buildRaw({ to, subject, body });
+    // Fetch user's default Gmail signature (HTML) — se appendea automáticamente
+    // al body para que llegue con el formato real (logo, links, cargo, etc).
+    const signatureHtml = await getGmailSignatureHtml(token);
+    const raw = buildRaw({ to, subject, body, signatureHtml });
 
     let res = await fetch("https://www.googleapis.com/gmail/v1/users/me/messages/send", {
       method:  "POST",
@@ -245,20 +248,81 @@ function encodeHeaderUtf8(value) {
   return `=?UTF-8?B?${btoa(binary)}?=`;
 }
 
-function buildRaw({ to, subject, body }) {
-  const lines = [
-    `To: ${to}`,
-    `Subject: ${encodeHeaderUtf8(subject)}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "MIME-Version: 1.0",
-    "",
-    body,
-  ].join("\r\n");
+// Convierte un body de texto plano a HTML preservando line breaks.
+// Escapa HTML chars para evitar XSS si el pitch contiene <script>, etc.
+function textToHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\r\n/g, "\n")
+    .split("\n\n")
+    .map(p => `<p>${p.replace(/\n/g, "<br/>")}</p>`)
+    .join("\n");
+}
 
-  const bytes  = new TextEncoder().encode(lines);
+// Build raw MIME multipart/alternative (text/plain + text/html con signature).
+// Si signatureHtml está vacío, fallback a text/plain solo (legacy behavior).
+function buildRaw({ to, subject, body, signatureHtml = "" }) {
+  let mime;
+  if (signatureHtml && signatureHtml.trim()) {
+    // Multipart: clientes texto-only ven plain, clientes modernos ven HTML con signature.
+    const boundary = `----=adeq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,10)}`;
+    const plainBody = body; // sin signature en text/plain (Gmail web igual la aplica si responden)
+    const htmlBody  = `${textToHtml(body)}\n<br/>\n${signatureHtml}`;
+    mime = [
+      `To: ${to}`,
+      `Subject: ${encodeHeaderUtf8(subject)}`,
+      "MIME-Version: 1.0",
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/plain; charset=utf-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      plainBody,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/html; charset=utf-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      htmlBody,
+      "",
+      `--${boundary}--`,
+    ].join("\r\n");
+  } else {
+    // Fallback sin signature: text/plain solo
+    mime = [
+      `To: ${to}`,
+      `Subject: ${encodeHeaderUtf8(subject)}`,
+      "Content-Type: text/plain; charset=utf-8",
+      "MIME-Version: 1.0",
+      "",
+      body,
+    ].join("\r\n");
+  }
+
+  const bytes  = new TextEncoder().encode(mime);
   const binary = String.fromCharCode(...bytes);
   return btoa(binary)
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
+}
+
+// Fetch del HTML signature default del user. Cache en memoria por sesión.
+let _cachedSignatureHtml = null;
+async function getGmailSignatureHtml(token) {
+  if (_cachedSignatureHtml !== null) return _cachedSignatureHtml;
+  try {
+    const res = await fetch(
+      "https://www.googleapis.com/gmail/v1/users/me/settings/sendAs",
+      { headers: { "Authorization": `Bearer ${token}` } }
+    );
+    if (!res.ok) return "";
+    const data = await res.json();
+    const primary = data.sendAs?.find(s => s.isDefault) || data.sendAs?.[0];
+    _cachedSignatureHtml = primary?.signature || "";
+    return _cachedSignatureHtml;
+  } catch { return ""; }
 }

@@ -2579,22 +2579,82 @@ async function getGmailAccessToken(impersonateUser) {
   return data.access_token;
 }
 
+// Cache de signature HTML por user (TTL 1h) — evita refetch en cada send
+const _signatureCache = new Map();
+const SIG_TTL_MS = 60 * 60 * 1000;
+async function getGmailSignatureHtmlServer(userEmail) {
+  const cached = _signatureCache.get(userEmail);
+  if (cached && Date.now() - cached.ts < SIG_TTL_MS) return cached.html;
+  try {
+    const accessToken = await getGmailAccessToken(userEmail);
+    const res = await fetch(
+      "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs",
+      { headers: { "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return "";
+    const data = await res.json();
+    const primary = data.sendAs?.find(s => s.isDefault) || data.sendAs?.[0];
+    const html = primary?.signature || "";
+    _signatureCache.set(userEmail, { html, ts: Date.now() });
+    return html;
+  } catch { return ""; }
+}
+
+function _textToHtmlServer(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\r\n/g, "\n")
+    .split("\n\n")
+    .map(p => `<p>${p.replace(/\n/g, "<br/>")}</p>`)
+    .join("\n");
+}
+
 async function sendGmailServer(_token, userEmail, { to, subject, body }) {
   const accessToken = await getGmailAccessToken(userEmail);
-  // Build RFC 2047 encoded MIME
+  const signatureHtml = await getGmailSignatureHtmlServer(userEmail);
+
+  // Subject RFC 2047 encoded para soportar acentos (ej. "monetización")
   const subjectEncoded = /^[\x20-\x7E]*$/.test(subject)
     ? subject
     : `=?UTF-8?B?${Buffer.from(subject, "utf-8").toString("base64")}?=`;
-  const lines = [
-    `To: ${to}`,
-    `From: ${userEmail}`,
-    `Subject: ${subjectEncoded}`,
-    "Content-Type: text/plain; charset=utf-8",
-    "MIME-Version: 1.0",
-    "",
-    body,
-  ].join("\r\n");
-  const raw = Buffer.from(lines, "utf-8").toString("base64")
+
+  let mime;
+  if (signatureHtml && signatureHtml.trim()) {
+    // Multipart: text + HTML con signature default del user
+    const boundary = `----=adeq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,10)}`;
+    const htmlBody = `${_textToHtmlServer(body)}\n<br/>\n${signatureHtml}`;
+    mime = [
+      `To: ${to}`,
+      `From: ${userEmail}`,
+      `Subject: ${subjectEncoded}`,
+      "MIME-Version: 1.0",
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/plain; charset=utf-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      body,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/html; charset=utf-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      htmlBody,
+      "",
+      `--${boundary}--`,
+    ].join("\r\n");
+  } else {
+    // Sin signature → text/plain (legacy)
+    mime = [
+      `To: ${to}`, `From: ${userEmail}`, `Subject: ${subjectEncoded}`,
+      "Content-Type: text/plain; charset=utf-8", "MIME-Version: 1.0", "",
+      body,
+    ].join("\r\n");
+  }
+  const raw = Buffer.from(mime, "utf-8").toString("base64")
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
   const sendRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
