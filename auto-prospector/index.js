@@ -3034,8 +3034,8 @@ async function runAgentCycle(token, allFlags) {
       if (processed >= batchSize) break;
       const domain = lead.domain;
       let emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
-      let leadTraffic = leadTraffic || 0;
-      let leadGeo = leadGeo || "";
+      let leadTraffic = lead.traffic || 0;
+      let leadGeo = lead.geo || "";
 
       try {
         // ── ENRICHMENT ON-THE-FLY (igual que el botón Data del MB humano) ──
