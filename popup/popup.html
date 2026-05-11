@@ -155,15 +155,45 @@
         <label for="agent-cfg-max">Max envíos / día</label>
         <input id="agent-cfg-max" class="form-input" type="number" min="1" max="100" value="20" style="font-size:11px;padding:3px 6px" />
 
-        <label for="agent-cfg-quiet-start">Quiet hours start (0-23, BA)</label>
-        <input id="agent-cfg-quiet-start" class="form-input" type="number" min="0" max="23" value="22" style="font-size:11px;padding:3px 6px" />
+        <label for="agent-cfg-active-start">Active hours START (0-23, hora España)</label>
+        <input id="agent-cfg-active-start" class="form-input" type="number" min="0" max="23" value="9" style="font-size:11px;padding:3px 6px" />
 
-        <label for="agent-cfg-quiet-end">Quiet hours end (0-23, BA)</label>
-        <input id="agent-cfg-quiet-end" class="form-input" type="number" min="0" max="23" value="7" style="font-size:11px;padding:3px 6px" />
+        <label for="agent-cfg-active-end">Active hours END (0-23, hora España)</label>
+        <input id="agent-cfg-active-end" class="form-input" type="number" min="0" max="23" value="20" style="font-size:11px;padding:3px 6px" />
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
         <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save thresholds</button>
         <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px" title="Pausa el agent por 1 hora (kill switch manual)">⏸ Pause 1h</button>
+      </div>
+    </div>
+
+    <div class="admin-section-title">🎯 Focus de la semana</div>
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
+      <p style="font-size:10px;color:#94a3b8;margin:0 0 6px">Indicale en qué enfocarse. Si está vacío usa los thresholds de arriba sin filtros adicionales.</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;color:#cbd5e1">
+        <div>
+          <label style="display:block;margin-bottom:2px">GEOs PRIORITY (códigos ISO, separados por coma)</label>
+          <input id="agent-focus-geos-priority" class="form-input" placeholder="ES,MX,AR,CL" style="font-size:11px;padding:3px 6px;width:100%" />
+        </div>
+        <div>
+          <label style="display:block;margin-bottom:2px">GEOs EXCLUDED</label>
+          <input id="agent-focus-geos-excluded" class="form-input" placeholder="CN,RU" style="font-size:11px;padding:3px 6px;width:100%" />
+        </div>
+        <div style="grid-column:1/-1">
+          <label style="display:block;margin-bottom:2px">Categorías PRIORITY (lowercase, separadas por coma)</label>
+          <input id="agent-focus-categories" class="form-input" placeholder="news,sports,entertainment" style="font-size:11px;padding:3px 6px;width:100%" />
+        </div>
+        <div>
+          <label style="display:block;margin-bottom:2px">Override DAILY (0 = usar default)</label>
+          <input id="agent-focus-daily" class="form-input" type="number" min="0" value="0" style="font-size:11px;padding:3px 6px;width:100%" />
+        </div>
+        <div>
+          <label style="display:block;margin-bottom:2px">Target SEMANAL (0 = sin límite)</label>
+          <input id="agent-focus-weekly" class="form-input" type="number" min="0" value="0" placeholder="ej: 100" style="font-size:11px;padding:3px 6px;width:100%" />
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-top:8px">
+        <button id="agent-focus-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save focus</button>
       </div>
     </div>
 

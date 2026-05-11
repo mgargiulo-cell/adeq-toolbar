@@ -412,6 +412,7 @@ function initAdminPanel() {
   document.getElementById("agent-toggle")?.addEventListener("change", toggleAgent);
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
+  document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
   loadAdminActivity();
 }
@@ -605,7 +606,7 @@ async function _readAgentConfig() {
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   try {
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_threshold_score,agent_max_per_day,agent_quiet_hours_start,agent_quiet_hours_end,agent_paused_until)&select=key,value`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_threshold_score,agent_max_per_day,agent_active_hours_start,agent_active_hours_end,agent_paused_until,agent_focus_config)&select=key,value`,
       { headers }
     );
     const rows = await res.json();
@@ -637,29 +638,50 @@ async function loadAdminAgent() {
   const toggle = document.getElementById("agent-toggle");
   if (toggle) toggle.checked = enabled;
 
-  // Status text
+  // Status text — incluye chequeo auto-on/off por hora España
   const statusEl = document.getElementById("agent-toggle-status");
   if (statusEl) {
     const pausedUntil = cfg.agent_paused_until ? new Date(cfg.agent_paused_until) : null;
     const isPaused = pausedUntil && pausedUntil > new Date();
+    const startH = parseInt(cfg.agent_active_hours_start || "9", 10);
+    const endH   = parseInt(cfg.agent_active_hours_end   || "20", 10);
+    // Calcular hora actual España
+    let spainH = 0;
+    try {
+      const fmt = new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Madrid", hour: "numeric", hour12: false });
+      spainH = parseInt(fmt.format(new Date()), 10);
+    } catch {}
+    const inActiveWindow = startH < endH ? (spainH >= startH && spainH < endH) : (spainH >= startH || spainH < endH);
     if (isPaused) {
       const minLeft = Math.round((pausedUntil - Date.now()) / 60000);
       statusEl.innerHTML = `⏸ <strong style="color:#f87171">Pausado por ${minLeft}min</strong> (kill switch o pause manual)`;
-    } else if (enabled) {
-      statusEl.innerHTML = `🟢 <strong style="color:#34d399">Activo</strong>. Procesa cada ~5min. Mandando como <strong>${esc(myEmail)}</strong>.`;
+    } else if (enabled && !inActiveWindow) {
+      statusEl.innerHTML = `🌙 Master ON, pero <strong style="color:#fbbf24">FUERA de horario activo</strong> (${startH}h-${endH}h España). Auto-resume cuando entre el horario. Hora España actual: <strong>${spainH}h</strong>.`;
+    } else if (enabled && inActiveWindow) {
+      statusEl.innerHTML = `🟢 <strong style="color:#34d399">Activo</strong>. Procesa cada ~5min. Mandando como <strong>${esc(myEmail)}</strong>. Horario activo: ${startH}h-${endH}h España.`;
     } else {
-      statusEl.innerHTML = `⚪ Inactivo. Activá el toggle para que el worker arranque.`;
+      statusEl.innerHTML = `⚪ Inactivo. Activá el toggle (master switch) para que arranque automático en horario activo.`;
     }
   }
 
   // Inputs de threshold
   const setVal = (id, v, dflt) => { const el = document.getElementById(id); if (el) el.value = v || dflt; };
-  setVal("agent-cfg-traffic",     cfg.agent_threshold_traffic, 500000);
-  setVal("agent-cfg-score",       cfg.agent_threshold_score,    40);
-  setVal("agent-cfg-max",         cfg.agent_max_per_day,        20);
-  setVal("agent-cfg-quiet-start", cfg.agent_quiet_hours_start,  22);
-  setVal("agent-cfg-quiet-end",   cfg.agent_quiet_hours_end,     7);
+  setVal("agent-cfg-traffic",      cfg.agent_threshold_traffic,  500000);
+  setVal("agent-cfg-score",        cfg.agent_threshold_score,     40);
+  setVal("agent-cfg-max",          cfg.agent_max_per_day,         20);
+  setVal("agent-cfg-active-start", cfg.agent_active_hours_start,   9);
+  setVal("agent-cfg-active-end",   cfg.agent_active_hours_end,    20);
   document.getElementById("agent-stat-cap").textContent = cfg.agent_max_per_day || "20";
+
+  // Focus config (JSON)
+  let focus = { geos_priority: [], geos_excluded: [], categories_priority: [], weekly_target: 0, daily_override: 0 };
+  try { focus = { ...focus, ...JSON.parse(cfg.agent_focus_config || "{}") }; } catch {}
+  const setStr = (id, v) => { const el = document.getElementById(id); if (el) el.value = (Array.isArray(v) ? v : []).join(","); };
+  setStr("agent-focus-geos-priority",  focus.geos_priority);
+  setStr("agent-focus-geos-excluded",  focus.geos_excluded);
+  setStr("agent-focus-categories",     focus.categories_priority);
+  setVal("agent-focus-daily",  focus.daily_override, 0);
+  setVal("agent-focus-weekly", focus.weekly_target,  0);
 
   // Stats hoy
   await _refreshAgentStats(myEmail);
@@ -729,14 +751,29 @@ async function toggleAgent(e) {
 
 async function saveAgentThresholds() {
   const updates = {
-    agent_threshold_traffic: parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 500000,
-    agent_threshold_score:   parseInt(document.getElementById("agent-cfg-score").value, 10) || 40,
-    agent_max_per_day:       parseInt(document.getElementById("agent-cfg-max").value, 10) || 20,
-    agent_quiet_hours_start: parseInt(document.getElementById("agent-cfg-quiet-start").value, 10) || 22,
-    agent_quiet_hours_end:   parseInt(document.getElementById("agent-cfg-quiet-end").value, 10) || 7,
+    agent_threshold_traffic:  parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 500000,
+    agent_threshold_score:    parseInt(document.getElementById("agent-cfg-score").value, 10) || 40,
+    agent_max_per_day:        parseInt(document.getElementById("agent-cfg-max").value, 10) || 20,
+    agent_active_hours_start: parseInt(document.getElementById("agent-cfg-active-start").value, 10) || 9,
+    agent_active_hours_end:   parseInt(document.getElementById("agent-cfg-active-end").value, 10) || 20,
   };
   await _writeAgentConfig(updates);
   showToast("✅ Thresholds guardados", "info");
+  await loadAdminAgent();
+}
+
+async function saveAgentFocus() {
+  const parseList = (id) => (document.getElementById(id).value || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const focus = {
+    geos_priority:       parseList("agent-focus-geos-priority").map(s => s.toUpperCase()),
+    geos_excluded:       parseList("agent-focus-geos-excluded").map(s => s.toUpperCase()),
+    categories_priority: parseList("agent-focus-categories").map(s => s.toLowerCase()),
+    daily_override:      parseInt(document.getElementById("agent-focus-daily").value, 10) || 0,
+    weekly_target:       parseInt(document.getElementById("agent-focus-weekly").value, 10) || 0,
+  };
+  await _writeAgentConfig({ agent_focus_config: JSON.stringify(focus) });
+  showToast("✅ Focus de la semana guardado", "info");
   await loadAdminAgent();
 }
 

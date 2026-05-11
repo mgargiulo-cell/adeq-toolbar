@@ -2303,9 +2303,9 @@ const AGENT_DEFAULTS = {
   threshold_traffic:    500_000,
   threshold_score:      40,
   max_per_day:          20,
-  quiet_hours_start:    22,        // 22hs
-  quiet_hours_end:      7,         // 7am
-  quiet_timezone:       "America/Argentina/Buenos_Aires",
+  active_hours_start:   9,         // 9am España (CET/CEST)
+  active_hours_end:     20,        // 20hs España
+  active_timezone:      "Europe/Madrid",
   cycle_interval_sec:   300,       // 5 min entre ciclos
   per_cycle_limit:      3,         // max 3 leads procesados por ciclo (rate limit Gmail-friendly)
   monday_board_id:      1420268379,
@@ -2318,23 +2318,45 @@ function _agentCfg(cfg) {
     if (typeof dflt === "number") return parseInt(v, 10) || dflt;
     return v;
   };
+  let focus = { geosPriority: [], geosExcluded: [], categoriesPriority: [], weeklyTarget: 0, dailyOverride: 0 };
+  try {
+    const raw = cfg.agent_focus_config;
+    if (raw) {
+      const f = JSON.parse(raw);
+      focus = {
+        geosPriority:       Array.isArray(f.geos_priority) ? f.geos_priority.map(s => String(s).toUpperCase().trim()).filter(Boolean) : [],
+        geosExcluded:       Array.isArray(f.geos_excluded) ? f.geos_excluded.map(s => String(s).toUpperCase().trim()).filter(Boolean) : [],
+        categoriesPriority: Array.isArray(f.categories_priority) ? f.categories_priority.map(s => String(s).toLowerCase().trim()).filter(Boolean) : [],
+        weeklyTarget:       parseInt(f.weekly_target, 10) || 0,
+        dailyOverride:      parseInt(f.daily_override, 10) || 0,
+      };
+    }
+  } catch {}
   return {
-    thresholdTraffic: get("threshold_traffic", AGENT_DEFAULTS.threshold_traffic),
-    thresholdScore:   get("threshold_score",   AGENT_DEFAULTS.threshold_score),
-    maxPerDay:        get("max_per_day",       AGENT_DEFAULTS.max_per_day),
-    quietStart:       get("quiet_hours_start", AGENT_DEFAULTS.quiet_hours_start),
-    quietEnd:         get("quiet_hours_end",   AGENT_DEFAULTS.quiet_hours_end),
-    perCycleLimit:    get("per_cycle_limit",   AGENT_DEFAULTS.per_cycle_limit),
+    thresholdTraffic: get("threshold_traffic",    AGENT_DEFAULTS.threshold_traffic),
+    thresholdScore:   get("threshold_score",      AGENT_DEFAULTS.threshold_score),
+    maxPerDay:        focus.dailyOverride || get("max_per_day", AGENT_DEFAULTS.max_per_day),
+    activeStart:      get("active_hours_start",   AGENT_DEFAULTS.active_hours_start),
+    activeEnd:        get("active_hours_end",     AGENT_DEFAULTS.active_hours_end),
+    perCycleLimit:    get("per_cycle_limit",      AGENT_DEFAULTS.per_cycle_limit),
+    focus,
   };
 }
 
-function _isQuietHour(quietStart, quietEnd) {
-  // Hora local Buenos Aires (GMT-3)
-  const now = new Date();
-  const hourBA = (now.getUTCHours() - 3 + 24) % 24;
-  if (quietStart < quietEnd) return hourBA >= quietStart && hourBA < quietEnd;
-  // wrap: 22→7
-  return hourBA >= quietStart || hourBA < quietEnd;
+// Hora actual España vía Intl (maneja CET/CEST automático).
+function _spainHour() {
+  const fmt = new Intl.DateTimeFormat("es-ES", {
+    timeZone: "Europe/Madrid", hour: "numeric", hour12: false,
+  });
+  return parseInt(fmt.format(new Date()), 10);
+}
+
+// Devuelve true si AHORA estamos FUERA de las active hours (9-20 España).
+function _isOutsideActiveHours(activeStart, activeEnd) {
+  const h = _spainHour();
+  if (activeStart < activeEnd) return h < activeStart || h >= activeEnd;
+  // wrap (raro pero soportado): si start > end (ej. 20-9 → trabaja noche)
+  return h < activeStart && h >= activeEnd;
 }
 
 async function logAgentAction(token, userEmail, payload) {
@@ -2352,6 +2374,20 @@ async function logAgentAction(token, userEmail, payload) {
   } catch (e) {
     log(`⚠️ logAgentAction failed: ${e.message}`);
   }
+}
+
+// Cuenta de envíos del agent en últimos 7 días (weekly target)
+async function getAgentWeeklyCount(token, userEmail) {
+  try {
+    const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${cutoff}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("content-range") || "";
+    const m = range.match(/\/(\d+)$/);
+    return m ? parseInt(m[1]) : 0;
+  } catch { return 0; }
 }
 
 // Cuenta de envíos del agent en las últimas 24h (cap diario)
@@ -2638,8 +2674,8 @@ async function runAgentCycle(token, allFlags) {
   const aCfg = _agentCfg(cfg);
   const monday_api_key_default = cfg.monday_api_key || "";
 
-  // Quiet hours
-  if (_isQuietHour(aCfg.quietStart, aCfg.quietEnd)) {
+  // Active hours check — fuera de 9-20 España no manda nada (ni Monday, ni mail)
+  if (_isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd)) {
     return; // silencioso
   }
 
@@ -2652,12 +2688,37 @@ async function runAgentCycle(token, allFlags) {
       log(`🤖 Agent ${userEmail}: cap diario ${aCfg.maxPerDay} alcanzado (${sentToday})`);
       continue;
     }
+    // Weekly target (si configurado): cuenta sent en últimos 7 días
+    if (aCfg.focus.weeklyTarget > 0) {
+      const sentWeek = await getAgentWeeklyCount(token, userEmail);
+      if (sentWeek >= aCfg.focus.weeklyTarget) {
+        log(`🤖 Agent ${userEmail}: weekly target ${aCfg.focus.weeklyTarget} alcanzado (${sentWeek})`);
+        continue;
+      }
+    }
     const remaining = aCfg.maxPerDay - sentToday;
     const batchSize = Math.min(aCfg.perCycleLimit, remaining);
 
-    // Pull candidates: pending + traffic + score thresholds, NO ya en sendtrack reciente
+    // Aplicar focus filtros al query
+    const focus = aCfg.focus;
+    let geoClause = "";
+    if (focus.geosPriority.length > 0) {
+      // Postgrest: geo=in.(AR,MX,...) — case insensitive imatch via OR
+      const inList = focus.geosPriority.map(g => `"${g}"`).join(",");
+      geoClause = `&geo=in.(${encodeURIComponent(inList)})`;
+    } else if (focus.geosExcluded.length > 0) {
+      const inList = focus.geosExcluded.map(g => `"${g}"`).join(",");
+      geoClause = `&geo=not.in.(${encodeURIComponent(inList)})`;
+    }
+    let categoryClause = "";
+    if (focus.categoriesPriority.length > 0) {
+      const inList = focus.categoriesPriority.map(c => `"${c}"`).join(",");
+      categoryClause = `&category=in.(${encodeURIComponent(inList)})`;
+    }
+
+    // Pull candidates con focus aplicado
     const queueRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}&score=gte.${aCfg.thresholdScore}&select=*&order=score.desc&limit=${batchSize * 3}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}&score=gte.${aCfg.thresholdScore}${geoClause}${categoryClause}&select=*&order=score.desc&limit=${batchSize * 3}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const candidates = await queueRes.json();
