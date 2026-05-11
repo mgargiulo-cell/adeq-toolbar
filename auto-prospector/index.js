@@ -3013,7 +3013,11 @@ async function runAgentCycle(token, allFlags) {
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const candidates = await queueRes.json();
-    if (!Array.isArray(candidates) || candidates.length === 0) continue;
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      log(`🤖 Agent ${userEmail}: 0 candidatos (threshold=${aCfg.thresholdTraffic}, geos=${focus.geosPriority.join(",")||"all"}, cat=${focus.categoriesPriority.join(",")||"all"})`);
+      continue;
+    }
+    log(`🤖 Agent ${userEmail}: ${candidates.length} candidatos, batch=${batchSize}`);
 
     // No filtramos por sendtrack acá — la regla real es:
     // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
