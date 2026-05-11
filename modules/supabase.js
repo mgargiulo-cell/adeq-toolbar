@@ -1138,6 +1138,10 @@ export async function setCsvQueueEnabled(enabled, accessToken, userEmail = "") {
       });
       await upsert("csv_queue_session_user", userEmail);
       await upsert("csv_queue_session_start", new Date().toISOString());
+      // Force-restart del worker Railway. Setea timestamp; worker en su próximo
+      // loop lo lee y hace process.exit(0). Railway re-arranca container limpio.
+      // Garantiza que no quede en estado raro post-toggle.
+      await upsert("worker_force_restart_at", new Date().toISOString());
     } else if (!enabled) {
       // Al apagar, limpiar el lock
       await fetch(`${url}/rest/v1/toolbar_config?key=eq.csv_queue_session_user`, {

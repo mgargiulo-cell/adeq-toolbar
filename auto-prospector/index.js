@@ -3089,6 +3089,10 @@ async function runAgentCycle(token, allFlags) {
 
 // ── Loop principal ────────────────────────────────────────────
 
+// Timestamp del arranque del proceso — usado para detectar force-restart triggers
+// que llegaron DESPUÉS del start (vs ya consumidos en runs previos).
+const _processStartedAt = Date.now();
+
 async function main() {
   log("ADEQ Auto-Prospector v3 iniciado.");
 
@@ -3124,6 +3128,22 @@ async function main() {
 
       // Heartbeat — cliente lee esto para mostrar si Railway está vivo
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
+
+      // Force restart triggered desde popup (al prender csv toggle). El popup
+      // setea worker_force_restart_at = ISO timestamp. Si es POSTERIOR al inicio
+      // de este proceso, exit(0) → Railway re-arranca container limpio.
+      try {
+        const fres = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.worker_force_restart_at&select=value`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        const rows = await fres.json();
+        const ts = rows?.[0]?.value;
+        if (ts && new Date(ts).getTime() > _processStartedAt) {
+          log(`🔄 Force restart triggered at ${ts} — exiting for clean restart`);
+          process.exit(0);
+        }
+      } catch {}
 
       // Promueve items waiting_pool → pending si hay espacio en review_queue.
       // Cada loop iteration lo intenta — items "preparados" por MBs entran
