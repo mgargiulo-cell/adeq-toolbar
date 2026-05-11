@@ -2497,7 +2497,10 @@ function _agentCfg(cfg) {
   const get = (key, dflt) => {
     const v = cfg[`agent_${key}`];
     if (v == null || v === "") return dflt;
-    if (typeof dflt === "number") return parseInt(v, 10) || dflt;
+    if (typeof dflt === "number") {
+      const n = parseInt(v, 10);
+      return Number.isFinite(n) ? n : dflt; // ← 0 es válido (no caer al default)
+    }
     return v;
   };
   let focus = { geosPriority: [], geosExcluded: [], categoriesPriority: [], weeklyTarget: 0, dailyOverride: 0 };
