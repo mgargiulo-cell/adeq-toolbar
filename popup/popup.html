@@ -940,7 +940,7 @@
     </div>
     <div id="sellers-company-url" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;word-break:break-all">—</div>
     <div style="display:flex;gap:6px;align-items:center">
-      <input id="sellers-cap-input" type="number" min="1" max="75" value="50" class="form-input" style="width:70px;font-size:11px" title="Cap por tirada: hasta 75 para Queue, hasta 30 para Open tabs. Si ponés más, se ajusta automáticamente." />
+      <input id="sellers-cap-input" type="number" min="1" max="50" value="50" class="form-input" style="width:70px;font-size:11px" title="Cap por tirada: hasta 50 para Queue, hasta 30 para Open tabs. Si ponés más, se ajusta automáticamente." />
       <button id="btn-sellers-fetch" class="btn btn-primary btn-sm" style="flex:1;font-size:11px" title="Encolar en csv_queue para que el worker los procese (auto)">📥 Queue</button>
       <button id="btn-sellers-open" class="btn btn-secondary btn-sm" style="flex:1;font-size:11px" title="Abrir cada dominio en una pestaña nueva — para prospectar manual desde toolbar Analysis">🪟 Open tabs</button>
     </div>
@@ -988,10 +988,10 @@
       </select>
       <!-- Limit input REMOVIDO. Cap fijo 75 por tirada (decisión user 2026-05-08).
            El cap diario sigue en 300 (acumulado de varias tiradas). -->
-      <input id="refresh-limit" type="hidden" value="75" />
+      <input id="refresh-limit" type="hidden" value="50" />
     </div>
-    <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Each search brings up to <strong>75 domains</strong> (per-batch cap). Daily cap: 300/user.</div>
-    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday (max 75)</button>
+    <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Each search brings up to <strong>50 domains</strong> (per-batch cap). Daily cap: 300/user. Waitlist global: 300.</div>
+    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday (max 50)</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
   </section>
 

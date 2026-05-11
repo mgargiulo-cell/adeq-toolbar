@@ -4752,11 +4752,19 @@ async function initCsvQueue() {
 
   const refreshStats = async () => {
     statsEl.textContent = "Loading...";
-    const stats = await getCsvQueueStats(state.accessToken);
+    const [stats, reviewPending] = await Promise.all([
+      getCsvQueueStats(state.accessToken),
+      import("../modules/supabase.js").then(m => m.getReviewQueuePendingCount(state.accessToken)).catch(() => 0),
+    ]);
+    const inFlight = (stats.pending || 0) + (stats.processing || 0);
+    const waitlistCount = stats.waiting_pool || 0;
     statsEl.innerHTML = `
-      Total: <strong>${stats.total}</strong><br>
-      ⏳ Pending: <strong>${stats.pending}</strong> · 🔄 Processing: <strong>${stats.processing}</strong><br>
-      ✅ Done: <strong>${stats.done}</strong> · ❌ Error: <strong>${stats.error}</strong> · ⏭ Skipped: <strong>${stats.skipped}</strong>
+      <div style="margin-bottom:4px"><strong>📋 Pool Prospects:</strong> ${reviewPending}/200 pending</div>
+      <div style="margin-bottom:4px"><strong>⚙️ Procesando:</strong> ${inFlight} en cola del worker</div>
+      <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/300 esperando turno (entran cuando se libera el pool)</div>
+      <div style="font-size:9px;color:var(--text-muted);margin-top:4px">
+        Total histórico: ${stats.total} · ✅ Done: ${stats.done} · ❌ Error: ${stats.error} · ⏭ Skipped: ${stats.skipped}
+      </div>
     `;
   };
 
@@ -4883,11 +4891,18 @@ async function initCsvQueue() {
       // Dedupe
       const unique = [...new Set(domains)];
 
-      // ERROR si pasa el límite por tirada (75). Decisión user 2026-05-08:
-      // no permitir uploads de más de 75 por vez. Si tienen un CSV grande,
-      // que lo dividan en archivos de hasta 75 dominios cada uno.
-      if (unique.length > 75) {
-        uploadRes.innerHTML = `❌ <strong>Too many domains:</strong> ${unique.length} found. Per-batch limit is <strong>75 domains</strong>. Split your CSV into smaller files (max 75 each) and upload them separately. Daily cap stays at 300/user.`;
+      // Cap por tirada actualizado a 50 (decisión user 2026-05-11). Pre-check
+      // de waitlist global (300) se hace en el worker; acá solo el cap por tirada.
+      if (unique.length > 50) {
+        uploadRes.innerHTML = `❌ <strong>Too many domains:</strong> ${unique.length} found. Per-batch limit is <strong>50 domains</strong>. Split your CSV into smaller files (max 50 each).`;
+        uploadRes.className = "push-result error";
+        return;
+      }
+      // Pre-check waitlist global
+      const _stats = await getCsvQueueStats(state.accessToken);
+      const _inFlight = (_stats?.pending || 0) + (_stats?.waiting_pool || 0);
+      if (_inFlight + unique.length > WAITLIST_CAP) {
+        uploadRes.innerHTML = `❌ <strong>Waitlist llena:</strong> ya hay ${_inFlight}/${WAITLIST_CAP} en espera. No se puede agregar ${unique.length} más. Esperá que el equipo procese.`;
         uploadRes.className = "push-result error";
         return;
       }
@@ -4976,9 +4991,13 @@ async function initCsvQueue() {
 //   - QUEUE: 75 dominios por tirada (igual que Monday/CSV)
 //   - OPEN TABS: 30 pestañas por click (memory + popup blocker)
 //   - QUEUE PENDING TOTAL: 300 (compartido entre todos los imports)
-const SELLERS_QUEUE_CAP_PER_RUN = 75;
+// Caps acordados con user 2026-05-11:
+// - Por tirada (cualquier import): 50
+// - Tope de espera (waitlist) global: 300 — si excede, error
+// - Tope review_queue.pending: 200 (manejado por worker, mostrado en stats)
+const SELLERS_QUEUE_CAP_PER_RUN = 50;
 const SELLERS_OPEN_TABS_CAP     = 30;
-const MAX_QUEUE_PENDING         = 300;
+const WAITLIST_CAP              = 300;
 
 async function initSellersJsonImport(refreshAll) {
   const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson, findKnownDomains } = await import("../modules/sellersJson.js");
@@ -5064,12 +5083,12 @@ async function initSellersJsonImport(refreshAll) {
     const cap = Math.max(1, Math.min(SELLERS_QUEUE_CAP_PER_RUN, userCap));
     if (userCap > SELLERS_QUEUE_CAP_PER_RUN) capInput.value = String(cap);
 
-    // Pre-check: queue pending capacity
+    // Pre-check: waitlist (csv_queue pending + waiting_pool) capacity
     const stats = await import("../modules/supabase.js").then(m => m.getCsvQueueStats(state.accessToken));
-    const pendingNow = stats?.pending || 0;
-    const space     = MAX_QUEUE_PENDING - pendingNow;
+    const inFlight = (stats?.pending || 0) + (stats?.waiting_pool || 0);
+    const space    = WAITLIST_CAP - inFlight;
     if (space <= 0) {
-      resEl.innerHTML = `<span style="color:#dc2626">❌ Queue llena: ${pendingNow}/${MAX_QUEUE_PENDING} pending. Esperá que el worker procese antes de cargar más.</span>`;
+      resEl.innerHTML = `<span style="color:#dc2626">❌ Waitlist llena: ${inFlight}/${WAITLIST_CAP}. Esperá que el equipo procese antes de cargar más.</span>`;
       return;
     }
     const allowed = Math.min(cap, space);

@@ -398,6 +398,26 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
+// Cuenta de items pending en review_queue (la "cola de Prospects").
+// Cap absoluto del pool: 200. Si se alcanza, no se aceptan más imports
+// hasta que el equipo procese. Defensa contra cola gigante.
+export const REVIEW_QUEUE_HARD_CAP = 200;
+
+export async function getReviewQueuePendingCount(accessToken) {
+  if (!accessToken) return 0;
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending&select=id`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("content-range") || res.headers.get("Content-Range") || "";
+    const m = range.match(/\/(\d+)$/);
+    return m ? parseInt(m[1]) : 0;
+  } catch { return 0; }
+}
+
 // Marca COMO VALIDATED todos los items pending de este dominio en review_queue.
 // Se llama cuando un MB manda mail manual desde Analysis (o el agent procesa).
 // Asegura que el lead desaparezca inmediato de la cola de Prospects, sin importar
@@ -1011,7 +1031,7 @@ export async function getCsvQueueHistory(accessToken, limit = 30, sourceFilter =
 export async function getCsvQueueStats(accessToken) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const stats = { total: 0, pending: 0, processing: 0, done: 0, error: 0, skipped: 0 };
+  const stats = { total: 0, pending: 0, processing: 0, done: 0, error: 0, skipped: 0, waiting_pool: 0 };
   try {
     // Usamos HEAD + Prefer: count=exact para obtener totales por status
     const statuses = Object.keys(stats).filter(k => k !== "total");
