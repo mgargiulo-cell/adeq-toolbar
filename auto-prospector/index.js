@@ -2923,7 +2923,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_EMAIL]:     { email: payload.email, text: payload.email },
     [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
     [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
-    [MONDAY_COL_ESTADO]:    { label: "Mail No Enviado" }, // create_labels_if_missing lo crea si no existe
+    [MONDAY_COL_ESTADO]:    { label: "Propuesta Vigente (T)" }, // (T) = Toolbar/agente automático
     [MONDAY_COL_OWNER]:     { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] },
     [MONDAY_COL_PITCH]:     payload.pitch_body || "",
   };
