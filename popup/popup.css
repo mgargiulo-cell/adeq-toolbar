@@ -1217,9 +1217,9 @@ input.form-pv-display { font-weight: 700; }
 }
 /* ── Comparador horizontal de Media Buyers ── */
 .admin-mb-comparator {
-  display: grid; grid-template-columns: 130px repeat(3, 1fr);
+  display: grid; grid-template-columns: 110px repeat(4, 1fr);
   gap: 1px; background: #334155; border-radius: 6px; overflow: hidden;
-  margin-bottom: 12px; font-size: 11px;
+  margin-bottom: 12px; font-size: 10px;
 }
 .mbc-row { display: contents; }
 .mbc-cell {

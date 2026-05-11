@@ -2933,14 +2933,10 @@ async function runAgentCycle(token, allFlags) {
     const candidates = await queueRes.json();
     if (!Array.isArray(candidates) || candidates.length === 0) continue;
 
-    // Filtrar dominios ya enviados en últimos 30 días (sendtrack)
-    const cutoff30 = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
-    const trackRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${cutoff30}&select=domain&limit=500`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    const recentSent = new Set((await trackRes.json() || []).map(r => (r.domain || "").toLowerCase()));
-    const fresh = candidates.filter(c => !recentSent.has((c.domain || "").toLowerCase()));
+    // No filtramos por sendtrack acá — la regla real es:
+    // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
+    // Eso lo chequeamos PER LEAD abajo (más fresco que cachear sendtrack).
+    const fresh = candidates;
 
     let processed = 0;
     for (const lead of fresh) {
@@ -2956,6 +2952,12 @@ async function runAgentCycle(token, allFlags) {
       }
 
       try {
+        // NOTA: NO chequeamos Monday acá. Los filtros upstream (autopilot,
+        // CSV, Monday refresh) ya bloquean dominios en estado activo. Una
+        // vez que el agente procesa un lead, lo marca status=validated y
+        // no se vuelve a leer. Re-procesar requeriría que alguien cree un
+        // nuevo row, lo cual upstream ya bloquea. Ahorro 1 Monday call/lead.
+
         // 1. EMAIL SCORE — verifica antes de gastar Claude/template
         // 🔴 red = skip, 🟡 yellow = manda igual (es lo mejor que hay), 🟢 green = ideal
         const emailScore = await scoreEmail(email);

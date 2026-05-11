@@ -886,7 +886,7 @@ async function loadAdminActivity() {
   const queueUserClause  = userFilter ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
   const usageUserClause  = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
 
-  const [histRes, trackRes, usageRes, sessionsRes, queueRes] = await Promise.all([
+  const [histRes, trackRes, usageRes, sessionsRes, queueRes, agentActions] = await Promise.all([
     // toolbar_historial — sites analizados manualmente desde toolbar.
     // Filtro por created_at (timestamp confiable) en vez de date (string DD/MM/YYYY).
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${from}&created_at=lte.${to}T23:59:59${histUserClause}&select=*&order=created_at.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
@@ -896,7 +896,11 @@ async function loadAdminActivity() {
     // toolbar_review_queue — prospects agregados por autopilot + CSV + Monday refresh.
     // Esta es la fuente real del trabajo del worker (historial NO refleja autopilot).
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${from}&created_at=lte.${to}T23:59:59${queueUserClause}&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    // toolbar_agent_actions — el agente cuenta como "MB" más en el comparador.
+    // Filtramos action=sent (los exitosos) en el período.
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${from}&created_at=lte.${to}T23:59:59&select=domain,user_email,pitch_subject,details,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
   ]);
+
 
   // ── Métricas ────────────────────────────────────────────────
   // sites = analyses manuales (historial) + prospects agregados por worker (review_queue, dedup por domain).
@@ -945,8 +949,8 @@ async function loadAdminActivity() {
   // Chart por día
   renderAdminChart(combined, from, to);
 
-  // Comparador de Media Buyers — at-a-glance side-by-side
-  renderAdminComparator(combined, usageRes, sessionsRes);
+  // Comparador de Media Buyers — at-a-glance side-by-side (agente incluído como columna extra)
+  renderAdminComparator(combined, usageRes, sessionsRes, agentActions);
 
   // Resumen narrativo por MB (cards con tips para 1:1)
   renderAdminMBSummaries(combined, usageRes, sessionsRes);
@@ -1001,16 +1005,39 @@ function _aggregateByUser(historial, usage, sessions) {
 
 // ── Comparador horizontal: tabla con métricas en filas, MBs en columnas ──
 // Pensado para "ver de un vistazo quién está produciendo y quién no".
-function renderAdminComparator(historial, usage, sessions) {
+function renderAdminComparator(historial, usage, sessions, agentActions = []) {
   const wrap = document.getElementById("admin-mb-comparator");
   if (!wrap) return;
   const byUser = _aggregateByUser(historial, usage, sessions);
-  // Solo TEAM_EMAILS (3 MBs). Outsiders van solo al Resumen narrativo.
+  // Agregar AGENTE como un "MB" más — agrega métricas de agent_actions sent.
+  const agentBucket = {
+    sites: agentActions.length,
+    autopilotSites: agentActions.length, manualSites: 0,
+    geos: {}, categories: {},
+    above500k: 0, below500k: 0,
+    emails: agentActions.length,
+    monday: agentActions.filter(a => a.details?.monday_item_id || true).length, // todos los sent llegan a Monday
+    claude: agentActions.filter(a => a.details?.source === "claude").length,
+    apSec: 0, popupSec: 0,
+    isAgent: true,
+  };
+  agentActions.forEach(a => {
+    const g = (a.details?.geo || "").trim();
+    if (g) agentBucket.geos[g] = (agentBucket.geos[g] || 0) + 1;
+    const t = parseInt(a.details?.traffic || 0, 10);
+    if (t >= 500000) agentBucket.above500k++;
+    else if (t > 0)  agentBucket.below500k++;
+  });
+
+  // Columnas: 3 MBs + 1 columna Agent (si hay actividad o no, siempre se muestra)
   const mbs = TEAM_EMAILS.map(e => e.toLowerCase()).map(u => ({ user: u, ...byUser.get(u) }));
+  mbs.push({ user: "agent", ...agentBucket });
+
   const shortName = (e) => ({
     "mgargiulo@adeqmedia.com": "Maxi",
     "dhorovitz@adeqmedia.com": "Diego",
     "sales@adeqmedia.com":     "Agus",
+    "agent":                   "🤖 Agent",
   })[e] || e.split("@")[0];
 
   const fmtTime = (sec) => sec >= 3600 ? `${Math.floor(sec/3600)}h${Math.round((sec%3600)/60)}m` : `${Math.round(sec/60)}m`;
