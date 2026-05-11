@@ -8,7 +8,7 @@
 
 import { CONFIG }    from "../config.js";
 import { callProxy } from "./apiProxy.js";
-import { getApolloCache, saveApolloCache } from "./supabase.js";
+import { getApolloCache, saveApolloCache, getApolloMonthlyUsage } from "./supabase.js";
 
 const IGNORE_DOMAINS = [
   "example.com","domain.com","yoursite.com","sentry.io",
@@ -300,6 +300,24 @@ export async function findDecisionMakerViaApollo(domain) {
       }
     }
   } catch {}
+
+  // ── Apollo cap mensual (plan 2,500; cap 2,400 con margen 100) ──
+  // Si llegado, NO llamamos Apollo — fallback al scraping que ya corre paralelo.
+  // Toda la toolbar comparte el mismo cap (worker + popup).
+  if (_accessToken) {
+    try {
+      const monthly = await getApolloMonthlyUsage(_accessToken);
+      if (monthly.remaining <= 0) {
+        console.warn(`[Apollo] cap MENSUAL alcanzado (${monthly.used}/${monthly.limit}) — fallback a scraping`);
+        return {
+          name: "", email: null, title: "", linkedin: "",
+          people: [],
+          note: `Apollo llegó al límite mensual de la toolbar (${monthly.used}/${monthly.limit}). Usando scraping como fuente alternativa.`,
+          diag: { capped: true, monthly },
+        };
+      }
+    } catch {}
+  }
 
   // ── Paso 1: Gemini con Google Search → nombre del decisor ────
   let firstName = "", lastName = "", title = "", linkedin = "";

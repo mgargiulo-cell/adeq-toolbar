@@ -615,10 +615,14 @@ async function getUserLimits(token, userEmail) {
   } catch { return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null }; }
 }
 
+// Cap MENSUAL Apollo (plan = 2,500 credits/mes; cap conservador 2,400 con margen 100).
+// Si llega → fallback a scraping/page-emails (no rompe flujos, solo no usa Apollo).
+const APOLLO_MONTHLY_HARD_CAP = 2400;
+
 async function getApolloUsageToday(token) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_daily_limit)&select=key,value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_daily_limit,apollo_calls_month,apollo_calls_month_period,apollo_monthly_limit)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
@@ -629,11 +633,17 @@ async function getApolloUsageToday(token) {
     const storedDate  = map.apollo_calls_date  || "";
     const storedCount = parseInt(map.apollo_calls_today || "0", 10);
     const limit       = parseInt(map.apollo_daily_limit || "150", 10);
-
-    // Si cambió el día, el contador empieza de cero
     const usedToday = storedDate === today ? storedCount : 0;
-    return { usedToday, limit, today };
-  } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10) }; }
+
+    // Mensual — alineado con billing cycle 6→6 (igual que RapidAPI)
+    const period       = _billingCyclePeriod();
+    const storedPeriod = map.apollo_calls_month_period || "";
+    const storedMonth  = parseInt(map.apollo_calls_month || "0", 10);
+    const monthLimit   = parseInt(map.apollo_monthly_limit || String(APOLLO_MONTHLY_HARD_CAP), 10);
+    const usedThisMonth = storedPeriod === period ? storedMonth : 0;
+
+    return { usedToday, limit, today, usedThisMonth, monthLimit, period };
+  } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10), usedThisMonth: 0, monthLimit: APOLLO_MONTHLY_HARD_CAP, period: "" }; }
 }
 
 // ── Hard cap MENSUAL de RapidAPI ────────────────────────────────────
@@ -738,9 +748,9 @@ async function saveRapidApiUsage(token, callsThisSession, today) {
 async function saveApolloUsage(token, callsThisSession, today) {
   if (callsThisSession === 0) return;
   try {
-    // Leer valor actual primero (otra sesión pudo haber corrido en paralelo)
+    // Leer counters actuales (otra sesión pudo haber corrido en paralelo)
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date)&select=key,value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_calls_month,apollo_calls_month_period)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
@@ -750,6 +760,14 @@ async function saveApolloUsage(token, callsThisSession, today) {
     const storedDate  = map.apollo_calls_date || "";
     const storedCount = storedDate === today ? parseInt(map.apollo_calls_today || "0", 10) : 0;
     const newCount    = storedCount + callsThisSession;
+
+    // Mensual: ciclo 6→6 igual que RapidAPI
+    const period         = _billingCyclePeriod();
+    const storedPeriod   = map.apollo_calls_month_period || "";
+    const storedMonth    = storedPeriod === period ? parseInt(map.apollo_calls_month || "0", 10) : 0;
+    const newMonth       = storedMonth + callsThisSession;
+    await setConfigValue(token, "apollo_calls_month",        String(newMonth));
+    await setConfigValue(token, "apollo_calls_month_period", period);
 
     await setConfigValue(token, "apollo_calls_today", String(newCount));
     await setConfigValue(token, "apollo_calls_date",  today);
@@ -1675,10 +1693,14 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
 
-  // 2. Emails — Apollo si visits >= 500K, scraping siempre como fallback
+  // 2. Emails — Apollo si visits >= 500K, scraping siempre como fallback.
+  // Doble cap: diario (150) + mensual (2400 del plan). Si llega cualquiera,
+  // skip Apollo y usa solo scraping. Cero impacto al flow (igual hay emails).
+  const apolloMonthRemaining = (apolloUsage.monthLimit ?? APOLLO_MONTHLY_HARD_CAP) - (apolloUsage.usedThisMonth ?? 0);
   const canUseApollo = apollo_api_key
     && visits >= 500_000
-    && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit;
+    && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
+    && apolloMonthRemaining > 0;
 
   const [apolloEmails, scraperEmails] = await Promise.all([
     canUseApollo
@@ -2285,9 +2307,15 @@ async function runSession(token, cfg, sessionStart) {
 
     // Paso 2: emails + pitch + sitios similares en paralelo
     // Apollo solo si quedan créditos disponibles hoy
-    const canUseApollo = apollo_api_key && (apolloUsage.usedToday + apolloCallsThisSession) < apolloUsage.limit;
+    const apolloMonthRem = (apolloUsage.monthLimit ?? APOLLO_MONTHLY_HARD_CAP) - (apolloUsage.usedThisMonth ?? 0);
+    const canUseApollo = apollo_api_key
+      && (apolloUsage.usedToday + apolloCallsThisSession) < apolloUsage.limit
+      && apolloMonthRem > 0;
     if (!canUseApollo && apollo_api_key) {
-      log(`  ⚠️ Límite Apollo alcanzado (${apolloUsage.limit}/día) — sin búsqueda de email`);
+      const reason = apolloMonthRem <= 0
+        ? `cap MENSUAL alcanzado (${apolloUsage.usedThisMonth}/${apolloUsage.monthLimit}) — fallback a scraping`
+        : `límite diario (${apolloUsage.limit}/día) alcanzado`;
+      log(`  ⚠️ Apollo skip: ${reason}`);
     }
 
     const [apolloEmails, scraperEmails, similarSites] = await Promise.all([

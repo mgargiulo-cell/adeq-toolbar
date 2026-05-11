@@ -398,6 +398,35 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
+// Apollo monthly cap (plan = 2,500; cap conservador 2,400 con margen 100).
+// Si llegado, callers (Apollo en popup) deben skipear y caer a scraping.
+export const APOLLO_MONTHLY_HARD_CAP = 2400;
+
+export async function getApolloMonthlyUsage(accessToken) {
+  if (!accessToken) return { used: 0, limit: APOLLO_MONTHLY_HARD_CAP, remaining: APOLLO_MONTHLY_HARD_CAP };
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  // Billing cycle 6→6 (igual que RapidAPI). Calcula período actual.
+  const now = new Date();
+  let year = now.getFullYear(), month = now.getMonth() + 1;
+  if (now.getDate() < 6) { month -= 1; if (month === 0) { month = 12; year -= 1; } }
+  const period = `${year}-${String(month).padStart(2, "0")}-06`;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_calls_month_period,apollo_monthly_limit)&select=key,value`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    const rows = await res.json();
+    const map = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+    const storedPeriod = map.apollo_calls_month_period || "";
+    const storedCount  = parseInt(map.apollo_calls_month || "0", 10);
+    const limit        = parseInt(map.apollo_monthly_limit || String(APOLLO_MONTHLY_HARD_CAP), 10);
+    const used = storedPeriod === period ? storedCount : 0;
+    return { used, limit, remaining: Math.max(0, limit - used), period };
+  } catch { return { used: 0, limit: APOLLO_MONTHLY_HARD_CAP, remaining: APOLLO_MONTHLY_HARD_CAP }; }
+}
+
 // Cuenta de items pending en review_queue (la "cola de Prospects").
 // Cap absoluto del pool: 200. Si se alcanza, no se aceptan más imports
 // hasta que el equipo procese. Defensa contra cola gigante.
