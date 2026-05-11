@@ -2954,8 +2954,10 @@ async function runAgentCycle(token, allFlags) {
 
   // Active hours check — fuera de 9-20 España no manda nada (ni Monday, ni mail)
   if (_isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd)) {
-    return; // silencioso
+    log(`🤖 Agent: fuera de horario España (h=${_spainHour()}, activo=${aCfg.activeStart}-${aCfg.activeEnd})`);
+    return;
   }
+  log(`🤖 Agent: ciclo iniciando (users=${allFlags.agentUsers.length}, threshold=${aCfg.thresholdTraffic}, maxPerDay=${aCfg.maxPerDay})`);
 
   // Whitelist HARDCODED de users autorizados a usar el agent.
   // Defense-in-depth: aunque alguien cambie agent_enabled_users en config,
@@ -3327,6 +3329,9 @@ async function main() {
 
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);
+      if (iterCount === 1 || iterCount % 10 === 0) {
+        log(`🚦 flags: autopilot=${flags.autopilot} csv=${flags.csvQueue} agent=${flags.agent} (users=${flags.agentUsers.length})`);
+      }
 
       if (!flags.autopilot && !flags.csvQueue && !flags.agent) {
         // Auto-exit si llevamos > IDLE_EXIT_MS sin trabajo (Railway corta billing)
