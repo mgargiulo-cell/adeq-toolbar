@@ -6061,31 +6061,26 @@ async function loadProspectsTab() {
     return;
   }
 
-  // ── Cap diario por OUTPUT: 20 mails enviados/día per MB ──
-  // El MB puede ver INFINITAS URLs en Prospects (refresh ilimitado, mix random).
-  // Cuando llega a 20 mails enviados HOY (sumando Prospects + Analysis), la
-  // pestaña Prospects se vacía con un mensaje "ya completaste tu día".
-  // Cuenta de toolbar_api_usage._emails_sent (incrementUserDailyCounter ya lo
-  // suma cada vez que sendEmail OK retorna).
+  // ── Cap diario por OUTPUT desde PROSPECTS: 20 envios/día per MB ──
+  // Solo cuenta validations procesadas desde Prospects (validated_by = MB).
+  // Envíos manuales desde Analysis NO cuentan acá — el MB puede seguir
+  // mandando desde ahí libremente. Esto fuerza al MB a equilibrar entre
+  // procesar la cola Y prospectar manual.
   const DAILY_SEND_CAP = 20;
-  const usage = await getUserDailyUsage(state.accessToken, state.loginEmail);
-  const sentToday = usage.emails || 0;
+  const sentFromProspects = dailyCount; // ya viene de getDailyValidationCount arriba
 
-  if (sentToday >= DAILY_SEND_CAP) {
+  if (sentFromProspects >= DAILY_SEND_CAP) {
     listEl.innerHTML = `
       <div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:18px;border-radius:8px;text-align:center;margin:8px">
         <div style="font-size:20px;margin-bottom:8px">🎉</div>
         <div style="font-size:14px;font-weight:700;margin-bottom:6px">¡Llegaste a tu objetivo del día!</div>
         <div style="font-size:11px;line-height:1.5">
-          Enviaste <strong>${sentToday}/${DAILY_SEND_CAP}</strong> mails hoy.<br/>
-          Volvé mañana para nuevos leads del pool.
-        </div>
-        <div style="font-size:10px;color:#064e3b;opacity:0.7;margin-top:8px">
-          Hasta entonces, podés ver tus envíos en Monday.
+          Enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> mails hoy de Prospects.<br/>
+          Continuá ahora realizando envíos desde Analytics Tab.
         </div>
       </div>
     `;
-    if (statsEl) statsEl.textContent = `🎉 ${sentToday}/${DAILY_SEND_CAP} enviados hoy — objetivo cumplido`;
+    if (statsEl) statsEl.textContent = `🎉 ${sentFromProspects}/${DAILY_SEND_CAP} de Prospects — seguí en Analytics`;
     return;
   }
 
