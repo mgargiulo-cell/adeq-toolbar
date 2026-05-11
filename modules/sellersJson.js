@@ -101,19 +101,27 @@ export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candid
 // Fetch sellers.json + extrae solo los PUBLISHER (skip INTERMEDIARY/BOTH del owner).
 // Retorna lista de dominios deduplicados y normalizados.
 export async function fetchSellersJson(url) {
-  const res = await fetch(url, {
-    method: "GET",
-    redirect: "follow",
-    signal: AbortSignal.timeout(15000),
-    headers: { "Accept": "application/json" },
-  });
+  // SIN headers Accept — algunos servidores rechazan preflight CORS si lo mandamos.
+  // Timeout 30s para sellers.json grandes (Truvid 689KB, Vidoomy 592KB).
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (e) {
+    // Errores de red comunes: TypeError "Failed to fetch" (CORS), DNS, timeout.
+    throw new Error(`Network error: ${e.message || e.name}. ${e.name === "TimeoutError" ? "Timeout 30s." : "Posible CORS/DNS/SSL — el servidor puede estar bloqueando fetch desde extensions."}`);
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); }
-  catch { throw new Error(`Response no es JSON válido (¿bloqueado por CORS o HTML 404?)`); }
+  catch { throw new Error(`Response no es JSON válido (¿HTML 404 o respuesta binaria?)`); }
   const sellers = Array.isArray(data?.sellers) ? data.sellers : [];
-  // Solo PUBLISHER — INTERMEDIARY/BOTH son el dueño del archivo o brokers.
+  // Filtro flexible: acepta PUBLISHER en cualquier capitalización ("Publisher", "publisher").
+  // INTERMEDIARY/BOTH del owner se descartan.
   const domains = sellers
     .filter(s => (s.seller_type || "").toUpperCase() === "PUBLISHER")
     .map(s => normalizeDomain(s.domain || ""))

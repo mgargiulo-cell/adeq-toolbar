@@ -858,25 +858,11 @@
     </div>
     <div id="sellers-company-url" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;word-break:break-all">—</div>
     <div style="display:flex;gap:6px;align-items:center">
-      <input id="sellers-cap-input" type="number" min="1" max="300" value="100" class="form-input" style="width:70px;font-size:11px" title="Máximo de dominios a procesar de este sellers.json. El cap absoluto de la queue es 300 totales pending." />
+      <input id="sellers-cap-input" type="number" min="1" max="75" value="50" class="form-input" style="width:70px;font-size:11px" title="Cap por tirada: hasta 75 para Queue, hasta 30 para Open tabs. Si ponés más, se ajusta automáticamente." />
       <button id="btn-sellers-fetch" class="btn btn-primary btn-sm" style="flex:1;font-size:11px" title="Encolar en csv_queue para que el worker los procese (auto)">📥 Queue</button>
       <button id="btn-sellers-open" class="btn btn-secondary btn-sm" style="flex:1;font-size:11px" title="Abrir cada dominio en una pestaña nueva — para prospectar manual desde toolbar Analysis">🪟 Open tabs</button>
     </div>
     <div id="sellers-result" class="push-result" style="min-height:16px;font-size:11px;margin-top:6px"></div>
-
-    <!-- ── Discover: extraer empresas desde ads.txt ── -->
-    <details style="margin-top:12px;font-size:11px">
-      <summary style="cursor:pointer;color:#6366f1;font-weight:600">🔍 Discover new sellers.json from a site's ads.txt</summary>
-      <div style="margin-top:8px;padding:8px;background:var(--bg);border-radius:6px">
-        <p style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Pegá una URL (ej. <code>https://www.ole.com.ar</code>). Lee su <code>/ads.txt</code>, extrae todos los ad systems listados y prueba cuáles tienen <code>sellers.json</code>. Los que respondan se muestran abajo con un botón para agregar a tu lista.</p>
-        <div style="display:flex;gap:6px;align-items:center">
-          <input id="sellers-discover-url" class="form-input" type="text" placeholder="https://www.ole.com.ar" style="flex:1;font-size:11px" />
-          <button id="btn-sellers-discover" class="btn btn-secondary btn-sm" style="font-size:11px">🔍 Discover</button>
-        </div>
-        <div id="sellers-discover-progress" style="font-size:10px;color:var(--text-muted);margin-top:6px;min-height:14px"></div>
-        <div id="sellers-discover-results" style="font-size:11px;margin-top:6px;max-height:240px;overflow-y:auto"></div>
-      </div>
-    </details>
 
     <!-- Modal edit (hidden por default) -->
     <div id="sellers-edit-modal" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(15,23,42,0.7);backdrop-filter:blur(2px);align-items:center;justify-content:center">

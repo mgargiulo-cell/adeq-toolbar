@@ -4771,14 +4771,16 @@ async function initCsvQueue() {
   await initSellersJsonImport(refreshAll);
 }
 
-// Cap absoluto compartido por TODOS los imports en la cola pending.
-// Si pending >= MAX_QUEUE_PENDING, no se aceptan más uploads hasta que el
-// worker procese.
-const MAX_QUEUE_PENDING = 300;
+// Caps de sellers.json import:
+//   - QUEUE: 75 dominios por tirada (igual que Monday/CSV)
+//   - OPEN TABS: 30 pestañas por click (memory + popup blocker)
+//   - QUEUE PENDING TOTAL: 300 (compartido entre todos los imports)
+const SELLERS_QUEUE_CAP_PER_RUN = 75;
+const SELLERS_OPEN_TABS_CAP     = 30;
+const MAX_QUEUE_PENDING         = 300;
 
 async function initSellersJsonImport(refreshAll) {
-  const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson, findKnownDomains,
-          fetchAdsTxtSystems, probeSellersJson } = await import("../modules/sellersJson.js");
+  const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson, findKnownDomains } = await import("../modules/sellersJson.js");
   const sel        = document.getElementById("sellers-company-select");
   const urlEl      = document.getElementById("sellers-company-url");
   const capInput   = document.getElementById("sellers-cap-input");
@@ -4856,7 +4858,10 @@ async function initSellersJsonImport(refreshAll) {
     const list = JSON.parse(sel.dataset._list || "[]");
     const company = list[parseInt(sel.value, 10)];
     if (!company) return;
-    const cap = Math.max(1, Math.min(300, parseInt(capInput.value, 10) || 100));
+    // Cap auto-clamped: si user pone más de 75, lo bajamos a 75
+    const userCap = parseInt(capInput.value, 10) || SELLERS_QUEUE_CAP_PER_RUN;
+    const cap = Math.max(1, Math.min(SELLERS_QUEUE_CAP_PER_RUN, userCap));
+    if (userCap > SELLERS_QUEUE_CAP_PER_RUN) capInput.value = String(cap);
 
     // Pre-check: queue pending capacity
     const stats = await import("../modules/supabase.js").then(m => m.getCsvQueueStats(state.accessToken));
@@ -4915,7 +4920,10 @@ async function initSellersJsonImport(refreshAll) {
     const list = JSON.parse(sel.dataset._list || "[]");
     const company = list[parseInt(sel.value, 10)];
     if (!company) return;
-    const cap = Math.max(1, Math.min(50, parseInt(capInput.value, 10) || 100));
+    // Cap auto-clamped a 30 para Open tabs (más que eso es kamikaze para Chrome)
+    const userCap = parseInt(capInput.value, 10) || SELLERS_OPEN_TABS_CAP;
+    const cap = Math.max(1, Math.min(SELLERS_OPEN_TABS_CAP, userCap));
+    if (userCap > SELLERS_OPEN_TABS_CAP) capInput.value = String(cap);
     const openBtn = document.getElementById("btn-sellers-open");
     openBtn.disabled = true;
     resEl.innerHTML = `⏳ Fetching ${company.url}...`;
@@ -4932,11 +4940,8 @@ async function initSellersJsonImport(refreshAll) {
         resEl.innerHTML = `<span style="color:#d97706">⚠️ Todos ya conocidos por el sistema.</span>`;
         return;
       }
-      // Hard cap defensivo: max 50 tabs por click. Más que eso es kamikaze
-      // para Chrome (memory + popup blocker).
-      const HARD_TAB_CAP = 50;
-      const N = Math.min(cap, HARD_TAB_CAP, fresh.length);
-      if (!confirm(`Abrir ${N} pestañas en el navegador?\n\nFound: ${domains.length} | Frescos: ${fresh.length} | Cap: ${HARD_TAB_CAP}/click`)) {
+      const N = Math.min(cap, fresh.length);
+      if (!confirm(`Abrir ${N} pestañas en el navegador?\n\nFound: ${domains.length} | Frescos: ${fresh.length} | Cap: ${SELLERS_OPEN_TABS_CAP}/click`)) {
         return;
       }
       const slice = fresh.slice(0, N);
@@ -4945,7 +4950,7 @@ async function initSellersJsonImport(refreshAll) {
         setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);
       });
       const left = fresh.length - N;
-      resEl.innerHTML = `<span style="color:#16a34a">✅ ${N} pestañas abiertas${left > 0 ? `. ${left} frescos sin abrir (cap ${HARD_TAB_CAP}/click + tu cap input).` : "."}</span>`;
+      resEl.innerHTML = `<span style="color:#16a34a">✅ ${N} pestañas abiertas${left > 0 ? `. ${left} frescos sin abrir (cap ${SELLERS_OPEN_TABS_CAP}/click).` : "."}</span>`;
     } catch (e) {
       resEl.innerHTML = `<span style="color:#dc2626">❌ Error: ${esc(e.message || String(e))}</span>`;
     } finally {
@@ -4953,73 +4958,9 @@ async function initSellersJsonImport(refreshAll) {
     }
   });
 
-  // ── Discover: extrae empresas del ads.txt de un sitio + prueba sellers.json ──
-  document.getElementById("btn-sellers-discover")?.addEventListener("click", async () => {
-    const urlInput = document.getElementById("sellers-discover-url");
-    const progEl   = document.getElementById("sellers-discover-progress");
-    const resWrap  = document.getElementById("sellers-discover-results");
-    const btn      = document.getElementById("btn-sellers-discover");
-    const inputUrl = (urlInput.value || "").trim();
-    if (!inputUrl) { progEl.textContent = "❌ Pegá una URL primero."; return; }
-    btn.disabled = true;
-    progEl.textContent = `⏳ Fetching ads.txt de ${inputUrl}...`;
-    resWrap.innerHTML = "";
-    try {
-      const systems = await fetchAdsTxtSystems(inputUrl);
-      if (systems.length === 0) {
-        progEl.innerHTML = `<span style="color:#d97706">⚠️ ads.txt vacío o sin entries válidas.</span>`;
-        return;
-      }
-      progEl.textContent = `🔍 ${systems.length} ad systems en ads.txt — probando sellers.json (paralelo, ~30-60s)...`;
-      // Excluir los que ya están en la lista guardada (re-leo por si cambió)
-      const currentList = await loadList();
-      const existing = new Set(currentList.map(c => {
-        try { return new URL(c.url).hostname.replace(/^www\./, "").toLowerCase(); }
-        catch { return ""; }
-      }).filter(Boolean));
-      const candidates = systems.filter(d => !existing.has(d.toLowerCase()));
-      let foundCount = 0;
-      const found = await probeSellersJson(candidates, (done, total, result) => {
-        if (result) foundCount++;
-        progEl.textContent = `🔍 Probing ${done}/${total}... encontrados ${foundCount}`;
-      });
-      if (found.length === 0) {
-        progEl.innerHTML = `<span style="color:#d97706">⚠️ Ninguna empresa nueva con sellers.json válido (${systems.length} probadas).</span>`;
-        return;
-      }
-      progEl.innerHTML = `<span style="color:#16a34a">✅ Encontradas <strong>${found.length} nuevas empresas</strong> con sellers.json (${systems.length} probadas).</span>`;
-      // Render lista con checkboxes para agregar
-      let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><label><input type="checkbox" id="sellers-discover-all" checked /> Select all</label><button id="btn-sellers-discover-add" class="btn btn-primary btn-sm" style="font-size:11px;padding:3px 8px">➕ Add selected to my list</button></div>`;
-      html += found.map(f => `
-        <div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)">
-          <input type="checkbox" class="sellers-discover-cbx" data-url="${esc(f.url)}" data-name="${esc(f.domain)}" checked />
-          <span style="flex:1;font-size:11px"><strong>${esc(f.domain)}</strong> · ${f.pubs} pubs</span>
-        </div>
-      `).join("");
-      resWrap.innerHTML = html;
-      document.getElementById("sellers-discover-all")?.addEventListener("change", (e) => {
-        document.querySelectorAll(".sellers-discover-cbx").forEach(c => { c.checked = e.target.checked; });
-      });
-      document.getElementById("btn-sellers-discover-add")?.addEventListener("click", async () => {
-        const checked = [...document.querySelectorAll(".sellers-discover-cbx:checked")];
-        if (checked.length === 0) return;
-        const newOnes = checked.map(c => ({
-          name: `${c.dataset.name} (discovered)`,
-          url:  c.dataset.url,
-        }));
-        const updated = await loadList();
-        const merged = [...updated, ...newOnes];
-        await saveList(merged);
-        await renderSelect();
-        progEl.innerHTML = `<span style="color:#16a34a">✅ Agregadas ${newOnes.length} a tu lista. Aparecen en el dropdown arriba.</span>`;
-        resWrap.innerHTML = "";
-      });
-    } catch (e) {
-      progEl.innerHTML = `<span style="color:#dc2626">❌ Error: ${esc(e.message || String(e))}</span>`;
-    } finally {
-      btn.disabled = false;
-    }
-  });
+  // Discover REMOVIDO — feature poco útil por user request 2026-05-11.
+  // probeSellersJson + fetchAdsTxtSystems siguen exportadas en sellersJson.js
+  // por si en futuro se reactivan.
 }
 
 // ── Autopilot toggle + target ─────────────────────────────────
