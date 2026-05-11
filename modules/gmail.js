@@ -235,10 +235,20 @@ export function appendClosingIfMissing(body, lang = "es") {
 
 // ── Internal helpers ──────────────────────────────────────────
 
+// RFC 2047 encoded-word para headers con caracteres no-ASCII.
+// Sin esto Gmail interpreta el subject como ISO-8859-1 → mojibake (ej "monetizaciÃƒÂ³n").
+function encodeHeaderUtf8(value) {
+  const str = String(value || "");
+  if (/^[\x20-\x7E]*$/.test(str)) return str; // ASCII puro: no encoding needed
+  const bytes  = new TextEncoder().encode(str);
+  const binary = String.fromCharCode(...bytes);
+  return `=?UTF-8?B?${btoa(binary)}?=`;
+}
+
 function buildRaw({ to, subject, body }) {
   const lines = [
     `To: ${to}`,
-    `Subject: ${subject}`,
+    `Subject: ${encodeHeaderUtf8(subject)}`,
     "Content-Type: text/plain; charset=utf-8",
     "MIME-Version: 1.0",
     "",
