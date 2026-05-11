@@ -7195,8 +7195,44 @@ async function initProspectsTab() {
     refreshProspectsStats();
   });
 
-  // Auto-refresh: si autopilot o csv_queue ON, recargar lista cada 30s
-  // para que prospects de Railway aparezcan progresivamente sin click manual.
+  // Soft refresh agresivo cada 8s: chequea si algún lead que tenemos en pantalla
+  // ya fue contactado por otro MB (status != pending) y lo quita inmediatamente
+  // del DOM sin re-render full (sin flicker). Cross-MB realtime feel.
+  setInterval(async () => {
+    if (document.visibilityState === "hidden") return;
+    const tab = document.getElementById("tab-prospects");
+    if (!tab?.classList.contains("active")) return;
+    const cards = document.querySelectorAll(".pcard[data-id]");
+    if (cards.length === 0) return;
+    const visibleIds = [...cards].map(c => parseInt(c.dataset.id, 10)).filter(Boolean);
+    if (visibleIds.length === 0) return;
+    try {
+      // Pregunta: cuáles de los IDs que veo siguen en status=pending?
+      const idList = visibleIds.join(",");
+      const res = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${idList})&status=eq.pending&select=id`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+      );
+      if (!res.ok) return;
+      const stillPending = new Set((await res.json()).map(r => r.id));
+      // Las que YA NO están pending → otro MB (o el agent) las contactó → fade-out
+      visibleIds.forEach(id => {
+        if (!stillPending.has(id)) {
+          const card = document.querySelector(`.pcard[data-id="${id}"]`);
+          if (card) {
+            card.style.transition = "opacity 0.3s, max-height 0.3s, padding 0.3s, margin 0.3s";
+            card.style.opacity = "0.2";
+            card.style.maxHeight = "30px";
+            card.style.overflow = "hidden";
+            setTimeout(() => { card.remove(); refreshProspectsStats(); }, 350);
+          }
+        }
+      });
+    } catch {}
+  }, 8_000);
+
+  // Reload full cada 30s para traer leads NUEVOS del autopilot/csv/sellers.
+  // Más espaciado porque es más caro (re-render todas las cards).
   setInterval(async () => {
     if (document.visibilityState === "hidden") return;
     const tab = document.getElementById("tab-prospects");
