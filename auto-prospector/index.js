@@ -3264,8 +3264,12 @@ async function main() {
   }
 
   let idleSince = Date.now();
+  log("📍 Entrando al main loop...");
+  let iterCount = 0;
 
   while (true) {
+    iterCount++;
+    if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
     try {
       if (Date.now() > tokenExpiry) {
         try {
