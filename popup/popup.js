@@ -619,13 +619,27 @@ async function _readAgentConfig() {
 
 async function _writeAgentConfig(updates) {
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" };
-  // upsert per key
-  const promises = Object.entries(updates).map(([key, value]) =>
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
-      method: "POST", headers, body: JSON.stringify({ key, value: String(value) }),
-    })
-  );
-  await Promise.all(promises);
+  // upsert per key — chequea res.ok para detectar fallas RLS (401/403)
+  const results = await Promise.all(Object.entries(updates).map(async ([key, value]) => {
+    try {
+      const res = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
+        method: "POST", headers, body: JSON.stringify({ key, value: String(value) }),
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        return { key, ok: false, status: res.status, err: errText.substring(0, 200) };
+      }
+      return { key, ok: true };
+    } catch (e) {
+      return { key, ok: false, err: e.message };
+    }
+  }));
+  const failed = results.filter(r => !r.ok);
+  if (failed.length > 0) {
+    const msg = failed.map(f => `${f.key}: ${f.status || ""} ${f.err || ""}`).join("\n");
+    showToast(`❌ Error guardando agent config (RLS?): ${msg}`, "error", 12000);
+    throw new Error(msg);
+  }
 }
 
 async function loadAdminAgent() {
@@ -6142,8 +6156,8 @@ async function loadProspectsTab() {
   const sample = shuffled.slice(0, VISIBLE_CAP);
   listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
   if (statsEl) {
-    const remaining = DAILY_SEND_CAP - sentToday;
-    statsEl.innerHTML = `<strong>${sample.length}</strong> leads disponibles · enviaste <strong>${sentToday}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${remaining})`;
+    const remaining = DAILY_SEND_CAP - sentFromProspects;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> leads disponibles · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy desde Prospects (te quedan ${remaining})`;
   }
 
   listEl.querySelectorAll(".pcard").forEach(card => {
