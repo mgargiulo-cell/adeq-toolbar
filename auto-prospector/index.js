@@ -3801,6 +3801,7 @@ Write the prospecting email. Return JSON only.`;
 const _GL_LOCAL_PARTS = [
   // Sysadmin / mail infra (sin lectura humana real)
   "abuse","admin","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
+  "trustandsafety","trust-?and-?safety","trust-?safety","safety","safety-?team","trust-?ops",
   "whois","registrant","registry","registrar","domain-?ops","domain-?abuse","ndomains",
   "noreply","no-reply","donotreply","do-not-reply","do_not_reply","autoreply","auto-?reply","mailer-?daemon","mta","mailserver","mail-?server","mta-?admin",
   "bounce","bounced","mailer",
@@ -4049,12 +4050,14 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   return score;
 }
 const GARBAGE_DOMAIN_PATTERN = new RegExp([
-  // Subdominios de admin/whois/abuse
-  "(^|\\.)(?:nic|whois|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel)\\.",
+  // Subdominios de admin/whois/abuse/support
+  "(^|\\.)(?:nic|whois|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel|support|trustandsafety)\\.",
+  // Cloud providers - support/abuse desks (NO son publishers)
+  "(^|\\.)(?:aws|amazonaws|cloudfront|googlecloud|azure|microsoft|cloudflare|fastly)\\.com",
   // Privacy/proxy services
-  "domainsbyproxy\\.com|whoisguard|whoisprivacy|whoisprotect|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|protect-?service|protectedmail|panelregister",
+  "domainsbyproxy\\.com|whoisguard|whoisprivacy|whoisprotect|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|protect-?service|protectedmail|protecteddomainservices|panelregister|identity-?protect",
   // Registrars (B2B abuse desks)
-  "dropped\\.|internetx\\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\\.net|key-systems|1api\\.net|netim\\.com|psi-usa|nameshield|epag\\.de|eurodns|realtimeregister|tld-box|enom\\.|networksolutions|tucows|porkbun\\.com|namecheap.*proxy|hostgator|bluehost|godaddyguard",
+  "dropped\\.|internetx\\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\\.net|key-systems|1api\\.net|netim\\.com|psi-usa|nameshield|epag\\.de|eurodns|realtimeregister|tld-box|enom\\.|networksolutions|tucows|porkbun\\.com|namecheap.*proxy|hostgator|bluehost|godaddyguard|hostafrica|dominio.*\\.com\\.|dominios?[a-z]+\\.ec|dominios?[a-z]+\\.com",
   // GDPR masking
   "gdpr-?masked?|gdpr-?mask\\.com|gdpr-?protect|data-?protected|registrant-?private|domains[-._]?by[-._]?proxy|registry-?proxy",
   // Disposable/temp emails
