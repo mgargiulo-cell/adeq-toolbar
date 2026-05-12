@@ -86,7 +86,9 @@ export async function pushToMonday(data) {
   const { domain, traffic, email, geo, estado, fecha, idioma, ejecutivo, loginEmail } = data;
 
   const safe     = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
-  const itemName = domain.startsWith("www.") ? domain : `www.${domain}`;
+  // Normaliza: quita protocolo/trailing slash, fuerza www. prefix
+  const cleaned  = String(domain || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  const itemName = cleaned.startsWith("www.") ? cleaned : `www.${cleaned}`;
 
   const personId = resolveMondayPerson(ejecutivo, loginEmail);
 

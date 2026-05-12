@@ -4603,6 +4603,27 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
 }
 
 // ── Push to Monday (server-side) ──
+// Asegura que el dominio empiece con "www." al pushear a Monday.
+// - quita protocolo (http(s)://)
+// - quita trailing slash
+// - si ya tiene www. → no duplica
+// - si es subdomain (ej. blog.foo.com) → NO agrega www (sería www.blog.foo.com, raro)
+function _ensureWwwPrefix(domain) {
+  if (!domain) return "";
+  let d = String(domain).trim().toLowerCase();
+  d = d.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  if (d.startsWith("www.")) return d;
+  // Si ya tiene 3+ niveles (ej. m.foo.com, blog.foo.com), no forzamos www.
+  const parts = d.split(".");
+  if (parts.length > 2) {
+    // Excepción: si el subdominio es ccSLD (.com.ar, .co.uk), sí agregamos www.
+    const last2 = parts.slice(-2).join(".");
+    if (MULTI_PART_TLDS && MULTI_PART_TLDS.has(last2)) return "www." + d;
+    return d;
+  }
+  return "www." + d;
+}
+
 async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
   // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
@@ -4616,6 +4637,9 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
   // GEO normalizado a label español sin tildes.
   // Tráfico formateado: 540K / 2.3M (no raw 548091).
   const geoNormalized = normalizeMondayGeo(payload.geo);
+  // Monday item_name DEBE empezar con www. — regla de la cuenta para que el
+  // hipervínculo funcione siempre. Si ya viene con www. o protocolo, no duplica.
+  const itemName = _ensureWwwPrefix(payload.domain);
   const cols = {
     [MONDAY_COL_TRAFFIC]: payload.traffic_text || "",
     [MONDAY_COL_GEO]:     geoNormalized,
@@ -4635,7 +4659,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     headers: { "Content-Type": "application/json", "Authorization": monday_api_key, "API-Version": "2024-01" },
     body: JSON.stringify({
       query,
-      variables: { board: boardId, name: payload.domain, cols: JSON.stringify(cols) },
+      variables: { board: boardId, name: itemName, cols: JSON.stringify(cols) },
     }),
     signal: AbortSignal.timeout(15000),
   });
