@@ -246,7 +246,38 @@
 
   <!-- Tab: Limits -->
   <div id="admin-tab-limits" class="admin-tab-content">
-    <p class="admin-help">Configurá límites por usuario. Los caps se cuentan dentro del límite global de 40k.</p>
+
+    <!-- Caps GLOBAL — safety net por encima de los per-user -->
+    <div class="admin-section-title" style="margin-top:0">🛡️ Caps globales (safety net)</div>
+    <p class="admin-help">
+      Tope diario para TODA la organización (suma de todos los MBs + agente).
+      Si se alcanza, pausa hasta el próximo día operativo (Lun-Vie España).
+      Existe para proteger RapidAPI mensual (40K hits) y Railway billing si hay un bug
+      o si el equipo entero satura el sistema.
+    </p>
+    <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;margin-bottom:14px">
+      <span style="font-size:12px;color:var(--text)">📦 <strong>CSV queue</strong> (auto-import + Monday URL upload)</span>
+      <input id="admin-csv-daily-cap" type="number" class="form-input" min="0" step="50" placeholder="1000" style="width:90px;font-size:11px" />
+      <span style="font-size:10px;color:#94a3b8">dom/día</span>
+
+      <span style="font-size:12px;color:var(--text)">🤖 <strong>Autopilot</strong> (descubrimiento automático)</span>
+      <input id="admin-autopilot-daily-cap" type="number" class="form-input" min="0" step="50" placeholder="300" style="width:90px;font-size:11px" />
+      <span style="font-size:10px;color:#94a3b8">dom/día</span>
+
+      <button id="admin-global-caps-save" class="btn btn-sm btn-primary" style="grid-column:1/-1">💾 Guardar caps globales</button>
+    </div>
+    <div id="admin-global-caps-status" class="admin-help" style="margin-bottom:14px;font-size:10px"></div>
+
+    <hr style="border:none;border-top:1px solid #334155;margin:14px 0" />
+
+    <!-- Caps PER-USER -->
+    <div class="admin-section-title" style="margin-top:0">👤 Caps por usuario</div>
+    <p class="admin-help" style="line-height:1.6">
+      Por cada MB del equipo: cuántos hits a RapidAPI puede gastar/mes,
+      cuántos minutos puede correr autopilot por sesión y cuántos prospectos
+      máx puede agregar por día. <strong>AP on/off</strong> habilita o
+      deshabilita el autopilot para ese user (independiente del agente).
+    </p>
     <div id="admin-limits-list" class="admin-limits-list"></div>
     <button id="admin-add-user-limit" class="btn btn-sm btn-primary">+ Agregar usuario</button>
   </div>

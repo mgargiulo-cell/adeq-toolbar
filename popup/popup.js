@@ -404,6 +404,7 @@ function initAdminPanel() {
   document.getElementById("admin-refresh-stats")?.addEventListener("click", loadAdminActivity);
   // Wire limits
   document.getElementById("admin-add-user-limit")?.addEventListener("click", () => addAdminLimitRow());
+  document.getElementById("admin-global-caps-save")?.addEventListener("click", saveAdminGlobalCaps);
   // Wire blocklist
   document.getElementById("admin-blocklist-save")?.addEventListener("click", saveAdminBlocklist);
   document.getElementById("admin-blocklist-csv")?.addEventListener("change", handleBlocklistCsvUpload);
@@ -479,7 +480,75 @@ async function resetTrafficCacheAboveThreshold() {
 }
 
 // ── Limits tab ─────────────────────────────────────────────
+async function loadAdminGlobalCaps() {
+  const csvEl = document.getElementById("admin-csv-daily-cap");
+  const apEl  = document.getElementById("admin-autopilot-daily-cap");
+  const stEl  = document.getElementById("admin-global-caps-status");
+  if (!csvEl || !apEl) return;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(csv_queue_daily_cap,autopilot_daily_cap_global,csv_daily_count,csv_daily_count_date,autopilot_daily_count,autopilot_daily_count_date)&select=key,value`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (res.ok) {
+      const rows = await res.json();
+      const map = {};
+      rows.forEach(r => { map[r.key] = r.value; });
+      csvEl.value = map.csv_queue_daily_cap || "1000";
+      apEl.value  = map.autopilot_daily_cap_global || "300";
+      // Mostrar progreso de hoy si counter está al día
+      const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
+      const today = fmt.format(new Date());
+      const csvCount = map.csv_daily_count_date === today ? parseInt(map.csv_daily_count || "0", 10) : 0;
+      const apCount  = map.autopilot_daily_count_date === today ? parseInt(map.autopilot_daily_count || "0", 10) : 0;
+      const csvCap = parseInt(csvEl.value, 10);
+      const apCap  = parseInt(apEl.value, 10);
+      stEl.textContent = `Hoy procesado: 📦 CSV ${csvCount}/${csvCap} (${Math.round(csvCount/csvCap*100)}%) · 🤖 Autopilot ${apCount}/${apCap} (${Math.round(apCount/apCap*100)}%)`;
+    }
+  } catch (e) { stEl.textContent = `Error: ${e.message}`; }
+}
+
+async function saveAdminGlobalCaps() {
+  const csvEl = document.getElementById("admin-csv-daily-cap");
+  const apEl  = document.getElementById("admin-autopilot-daily-cap");
+  const stEl  = document.getElementById("admin-global-caps-status");
+  const btn   = document.getElementById("admin-global-caps-save");
+  if (!csvEl || !apEl) return;
+  const csv = parseInt(csvEl.value, 10) || 1000;
+  const ap  = parseInt(apEl.value, 10)  || 300;
+  if (csv < 50 || csv > 10000) { stEl.textContent = "❌ CSV cap debe estar entre 50 y 10000"; return; }
+  if (ap  < 50 || ap  > 5000)  { stEl.textContent = "❌ Autopilot cap debe estar entre 50 y 5000"; return; }
+  if (btn) { btn.disabled = true; btn.textContent = "Guardando..."; }
+  try {
+    const headers = {
+      "apikey": CONFIG.SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${state.accessToken}`,
+      "Content-Type": "application/json",
+      "Prefer": "resolution=merge-duplicates,return=minimal",
+    };
+    await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
+        method: "POST", headers,
+        body: JSON.stringify([{ key: "csv_queue_daily_cap", value: String(csv) }]),
+      }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
+        method: "POST", headers,
+        body: JSON.stringify([{ key: "autopilot_daily_cap_global", value: String(ap) }]),
+      }),
+    ]);
+    stEl.textContent = `✅ Guardado: CSV ${csv}/día · Autopilot ${ap}/día`;
+    setTimeout(() => loadAdminGlobalCaps(), 500);
+  } catch (e) {
+    stEl.textContent = `❌ Error: ${e.message}`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "💾 Guardar caps globales"; }
+  }
+}
+
 async function loadAdminLimits() {
+  // Caps globales primero (sección nueva)
+  loadAdminGlobalCaps().catch(() => {});
+
   const list = document.getElementById("admin-limits-list");
   if (!list) return;
   list.innerHTML = '<div class="admin-help">Cargando...</div>';
@@ -492,12 +561,12 @@ async function loadAdminLimits() {
   header.style.border = "none";
   header.style.padding = "0 4px";
   header.innerHTML = `
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px">Email</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">API/mes</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP min/sesión</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP prosp/día</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">AP on</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">Save</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px" title="Email del media buyer">Usuario</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Cap mensual de hits a RapidAPI website-insights (vacío = sin cap individual, usa el global de 40K)">RapidAPI/mes</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Duración máxima de UNA sesión de autopilot, en minutos">Sesión max</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Cantidad máxima de prospectos que este usuario puede agregar al pool por día (autopilot + CSV)">Prospects/día</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Habilita/deshabilita el autopilot para este user (independiente del agente IA)">Autopilot</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">Guardar</span>
     <span></span>
   `;
   list.appendChild(header);
