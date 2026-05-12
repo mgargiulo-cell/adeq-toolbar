@@ -2371,17 +2371,54 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
   }
-  // ── REGLA ESTRICTA (2026-05-12): solo entran al pool URLs con traffic CONFIRMADO ≥ 350K ──
-  // - traffic < 350K → skip (no entra)
-  // - traffic = 0 / null / error → skip + retry-able en csv_queue
-  // - traffic ≥ 350K → entra al pool
-  // Esto evita falsos positivos en Prospects (URLs sin data o bajo el threshold).
+  // ── REGLA ESTRICTA + BACKOFF EXPONENCIAL ──
+  // - traffic < 400K → skip (no entra)
+  // - traffic = 0 / null / error → after 3 failed attempts, FREEZE 15d/30d/60d
+  // - traffic ≥ 400K → entra al pool
   if (!visits || visits <= 0) {
-    // Sin data — marcar para retry en próximo iter (no acumula basura en review_queue)
+    // Tracking de intentos via error_message (no requiere schema change)
+    const prevAttempts = parseInt((item.error_message || "").match(/attempt_(\d+)/)?.[1] || "0", 10);
+    const newAttempt = prevAttempts + 1;
+    if (newAttempt >= 3) {
+      // 3 fails → freeze. Backoff: 15d primera vez, 30d segunda, 60d tercera+
+      try {
+        const existing = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?domain=eq.${encodeURIComponent(domain)}&select=attempt_count`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        const rows = await existing.json();
+        const prevFreeze = Array.isArray(rows) && rows[0] ? parseInt(rows[0].attempt_count || 1, 10) : 0;
+        const days = prevFreeze === 0 ? 15 : prevFreeze === 1 ? 30 : 60;
+        const frozenUntil = new Date(Date.now() + days * 86400_000).toISOString();
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+          method: "POST",
+          headers: {
+            "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+            "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+          },
+          body: JSON.stringify({
+            domain, frozen_until: frozenUntil,
+            attempt_count: prevFreeze + 1,
+            last_error: "no_traffic_data_after_3_attempts",
+            source, uploaded_by: item.uploaded_by || "",
+            updated_at: new Date().toISOString(),
+          }),
+        });
+        await markCsvItem(token, item.id, "frozen", {
+          error_message: `frozen_until_${frozenUntil} (${days}d backoff)`,
+        });
+        log(`  🧊 ${domain} — FREEZE ${days}d después de 3 intentos. unfreeze: ${frozenUntil.split("T")[0]}`);
+      } catch (e) {
+        await markCsvItem(token, item.id, "skipped", { error_message: `freeze_failed: ${e.message}` });
+        log(`  ⚠️ ${domain} freeze err: ${e.message}`);
+      }
+      return;
+    }
+    // Aún hay intentos — marcar pending con counter incrementado
     await markCsvItem(token, item.id, "pending", {
-      error_message: `no_traffic_data — retry next iter`,
+      error_message: `no_traffic_data — attempt_${newAttempt}/3`,
     });
-    log(`  ⏸ ${domain} — sin traffic (RapidAPI null/error). Marcado pending para retry.`);
+    log(`  ⏸ ${domain} — sin traffic (intento ${newAttempt}/3). Retry próximo iter.`);
     return;
   }
   if (visits < REVIEW_QUEUE_MIN_TRAFFIC) {
@@ -4861,6 +4898,43 @@ async function main() {
   while (true) {
     iterCount++;
     if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
+
+    // ── Unfreezer cada 60 iters (~25min) ──
+    // Mueve toolbar_frozen_leads.frozen_until ≤ now() de vuelta a csv_queue.pending
+    if (iterCount % 60 === 0) {
+      try {
+        const now = new Date().toISOString();
+        const res = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?frozen_until=lte.${encodeURIComponent(now)}&select=domain,source,uploaded_by,attempt_count&limit=20`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        const rows = await res.json();
+        if (Array.isArray(rows) && rows.length) {
+          for (const row of rows) {
+            // Re-encolar en csv_queue.pending
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+              method: "POST",
+              headers: {
+                "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+                "Content-Type": "application/json", "Prefer": "return=minimal",
+              },
+              body: JSON.stringify({
+                domain: row.domain, status: "pending",
+                source: row.source || "frozen_retry",
+                uploaded_by: row.uploaded_by || "",
+                error_message: `unfrozen_retry_attempt_${(row.attempt_count || 1) + 1}`,
+              }),
+            }).catch(() => {});
+            // Borrar de frozen — si vuelve a fallar 3 veces, se re-congela con backoff mayor
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?domain=eq.${encodeURIComponent(row.domain)}`, {
+              method: "DELETE",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+            }).catch(() => {});
+          }
+          log(`🧊 Unfreezer: ${rows.length} leads liberados de frozen → re-encolados en csv_queue`);
+        }
+      } catch (e) { log(`⚠️ unfreezer: ${e.message}`); }
+    }
 
     // ── Cleanup periódico cada 30 iters ──
     // 1. Borrar leads pending con traffic > 0 AND < 350K (basura que el agente
