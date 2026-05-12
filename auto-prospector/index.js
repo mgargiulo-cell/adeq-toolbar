@@ -693,13 +693,16 @@ async function backfillMissingFields(token, cfg) {
         }
         // 2) Language (usar pageContent si lo trajimos, sino fallback geo/tld)
         if (!lead.language || lead.language === "") {
-          const det = detectLanguageRobust({
+          const det = await detectLanguageRobust({
             htmlLang:   pageContent?.htmlLang,
             ogLocale:   pageContent?.ogLocale,
+            hreflang:   pageContent?.hreflang,
+            jsonLdLang: pageContent?.jsonLdLang,
+            pathLang:   pageContent?.pathLang,
             textSample: pageContent?.textSample,
             geo:        lead.geo,
             domain:     lead.domain,
-          });
+          }, { token });
           patch.language = det.lang;
           lead.language = det.lang;
         }
@@ -1576,13 +1579,27 @@ async function fetchPageContent(domain) {
     else if (/receta|cocina|comida|food|cook|gastronom/.test(textForCategory))                                                              category = "food";
     else if (/negocio|business|emprend|startup|marketing|seo|empresa/.test(textForCategory))                                                category = "business";
 
-    // Extraer señales de idioma del HTML para detección robusta downstream
+    // Extraer señales de idioma del HTML para detección robusta downstream.
+    // Capturamos MULTIPLES señales — más es mejor para cross-validation.
     const htmlLang = (html.match(/<html[^>]+lang=["']([a-z]{2})/i) || [])[1] || "";
     const ogLocale = (html.match(/<meta[^>]+property=["']og:locale["'][^>]+content=["']([a-z]{2})/i) || [])[1] || "";
-    // Sample de texto para análisis heurístico (sin tags, primeras 4K chars)
-    const textSample = (title + " " + desc + " " + html.replace(/<[^>]+>/g, " ").substring(0, 4000)).toLowerCase();
+    // hreflang — sitios multi-idioma lo declaran. Tomamos el "x-default" o el primero.
+    const hreflangs = [...html.matchAll(/<link[^>]+rel=["']alternate["'][^>]+hreflang=["']([a-z]{2})/gi)].map(m => m[1].toLowerCase());
+    const hreflang = hreflangs[0] || "";
+    // JSON-LD schema.org — muchas news/articles ponen inLanguage
+    const jsonLdLang = (html.match(/"inLanguage"\s*:\s*"([a-z]{2})/i) || [])[1] || "";
+    // URL path pattern: /es/, /pt-BR/, /it_IT/
+    const pathLang = (domain.match(/\/(es|pt|it|en|ar|fr|de)([\-_][a-z]{2})?\//i) || [])[1] || "";
+    // Sample de texto AMPLIO (10K chars) para análisis heurístico fuerte
+    const textSample = (title + " " + desc + " " + html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 10000)).toLowerCase();
 
-    return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks, category, htmlLang, ogLocale, textSample };
+    return {
+      title: title.slice(0, 100),
+      description: desc.slice(0, 280),
+      adNetworks, category,
+      htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
+      textSample,
+    };
   } catch { return null; }
 }
 
@@ -1620,14 +1637,18 @@ const GEO_TO_LANG_AGENT = {
 };
 
 function _detectLangFromText(text) {
-  if (!text || text.length < 30) return null;
+  if (!text || text.length < 30) return { lang: null, confidence: "none", scores: {} };
   const t = text.toLowerCase();
-  if (/[؀-ۿ]/.test(text)) return "ar";
+  // Caracteres únicos = señal fuerte
+  if (/[؀-ۿ]/.test(text)) return { lang: "ar", confidence: "high", scores: { ar: 999 } };
+  // Stopwords + palabras frecuentes — listas EXTENDIDAS para mayor precisión
   const markers = {
-    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|nuestra|nuestro|hola|gracias|hace|noticias|últimas|videos)\b/g,
-    pt: /\b(que|nao|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|ola|obrigad|dele|dela|voce|notícias|notícia|últimas|últim)\b/g,
-    it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perche|sopra|grazie|nostra|nostro|ciao|notizie|ultim)\b/g,
-    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks|news|latest|videos)\b/g,
+    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|también|nuestra|nuestro|hola|gracias|hace|noticias|últimas|video|videos|fútbol|política|economía|deportes|mundo|inicio|contacto|sobre[\s-]?nosotros|aviso|legal|política[\s-]?de[\s-]?privacidad|términos|condiciones|últim|hoy|ayer|mañana|años|días|nuevo|nueva|gran|millones)\b/g,
+    pt: /\b(que|não|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|olá|obrigad|dele|dela|você|notícias|notícia|últimas|últim|esportes|política|economia|cidade|brasileir|portuguesa|português|política[\s-]?de[\s-]?privacidade|termos|condições|hoje|ontem|amanhã|anos|dias|nova|grande|milhões)\b/g,
+    it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perché|sopra|grazie|nostra|nostro|ciao|notizie|ultim|sport|politica|economia|città|italiano|italiana|chi[\s-]?siamo|contatti|privacy|termini|condizioni|oggi|ieri|domani|anni|giorni|nuovo|nuova|grande|milioni)\b/g,
+    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks|news|latest|video|videos|football|politics|economy|sports|world|home|contact|about[\s-]?us|privacy|terms|conditions|today|yesterday|tomorrow|years|days|new|great|millions)\b/g,
+    fr: /\b(que|les|des|pour|avec|une|sur|cette|cet|mais|quand|où|comme|parce|notre|votre|bonjour|merci|nouvelles|aujourd'hui|hier|demain)\b/g,
+    de: /\b(der|die|das|und|für|mit|ein|eine|nicht|auch|aber|wenn|wo|wie|weil|über|unsere|unser|hallo|danke|nachrichten|heute|gestern|morgen)\b/g,
   };
   const scores = {};
   let total = 0;
@@ -1636,47 +1657,149 @@ function _detectLangFromText(text) {
     scores[lang] = m ? m.length : 0;
     total += scores[lang];
   }
-  if (/[ñáéíóúü¿¡]/.test(text)) scores.es += 5;
-  if (/[ãõçàáâ]/.test(text))    scores.pt += 5;
-  if (/[àèéìòù]/.test(text))    scores.it += 5;
-  if (total < 3) return null;
+  // Bonus por caracteres únicos (señal muy fuerte)
+  if (/[ñáéíóúü¿¡]/.test(text)) scores.es = (scores.es || 0) + 8;
+  if (/[ãõçàáâ]/.test(text))    scores.pt = (scores.pt || 0) + 8;
+  if (/[àèéìòù]/.test(text))    scores.it = (scores.it || 0) + 5;
+  if (/[äöüß]/.test(text))      scores.de = (scores.de || 0) + 5;
+  if (total < 5) return { lang: null, confidence: "low", scores };
   const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  if (sorted[0][1] >= sorted[1][1] + 2) return sorted[0][0];
-  return null;
+  const top = sorted[0];
+  const second = sorted[1] || ["", 0];
+  const gap = top[1] - second[1];
+  // High = gap >= 8 (claro ganador). Medium = gap 3-7. Low = ambiguo.
+  const conf = gap >= 8 ? "high" : gap >= 3 ? "medium" : "low";
+  return { lang: top[0], confidence: conf, scores, gap };
 }
 
-// Función principal — devuelve { lang, source, confidence } siempre.
-// confidence: "high" (html/og/text strong), "medium" (text weak/geo), "low" (tld/default).
-function detectLanguageRobust({ htmlLang, ogLocale, textSample, geo, domain }) {
-  // 1) <html lang="..."> — máxima confianza si está
-  const hl = (htmlLang || "").toLowerCase().split("-")[0];
-  if (SUPPORTED_AGENT_LANGS.has(hl)) return { lang: hl, source: "html_lang", confidence: "high" };
+// Cache de detección por dominio — evita re-pagar Claude/re-fetchear HTML
+const _domainLangCache = new Map();
+const DOMAIN_LANG_CACHE_MAX = 1000;
 
-  // 2) og:locale (es_AR, pt_BR…)
+// Árbitro Claude Haiku — clasificación final cuando heurística es ambigua.
+// Cost: ~$0.0005 por call. Cached por dominio.
+async function _claudeLangArbiter(token, domain, sample) {
+  if (!sample || sample.length < 30) return null;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "anthropic",
+        path: "/v1/messages",
+        method: "POST",
+        body: {
+          model: "claude-haiku-4-5",
+          max_tokens: 30,
+          system: "You classify the language of website text. Respond ONLY with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). No explanation.",
+          messages: [{ role: "user", content: `Domain: ${domain}\nSample (first 600 chars):\n${sample.substring(0, 600)}` }],
+        },
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = (data?.content?.[0]?.text || "").trim().toLowerCase();
+    const m = text.match(/^([a-z]{2})/);
+    return m && SUPPORTED_AGENT_LANGS.has(m[1]) ? m[1] : null;
+  } catch { return null; }
+}
+
+// Sistema de VOTACIÓN — recolecta todos los signals, weighta, decide.
+// El text heuristic es la fuente más confiable (lo que el publisher REALMENTE escribió),
+// aunque html lang diga otra cosa (sitios mal-declarados son comunes).
+// Si la votación es ambigua y tenemos token, llamamos a Claude Haiku como árbitro.
+async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, pathLang, textSample, geo, domain }, opts = {}) {
+  const { token = null, allowClaudeArbiter = true } = opts;
+  const cleanDomain = (domain || "").replace(/^www\./, "").toLowerCase();
+
+  // Cache hit por dominio (memoria proceso)
+  if (cleanDomain && _domainLangCache.has(cleanDomain)) {
+    return _domainLangCache.get(cleanDomain);
+  }
+
+  // Recolectar votos: cada signal aporta peso al lang detectado.
+  const votes = {}; // lang → puntaje
+  const reasons = [];
+  const addVote = (lang, weight, source) => {
+    if (!lang || !SUPPORTED_AGENT_LANGS.has(lang)) return;
+    votes[lang] = (votes[lang] || 0) + weight;
+    reasons.push(`${source}:${lang}+${weight}`);
+  };
+
+  // 1) Texto heurístico (más confiable — lo que el publisher escribió)
+  const textRes = _detectLangFromText(textSample || "");
+  if (textRes.lang) {
+    const weight = textRes.confidence === "high" ? 10 : textRes.confidence === "medium" ? 6 : 3;
+    addVote(textRes.lang, weight, `text(${textRes.confidence})`);
+  }
+
+  // 2) hreflang del primer link alternate (alta confianza si existe)
+  const hl = (hreflang || "").toLowerCase().split("-")[0];
+  if (SUPPORTED_AGENT_LANGS.has(hl)) addVote(hl, 8, "hreflang");
+
+  // 3) JSON-LD inLanguage (alta confianza si presente)
+  const jl = (jsonLdLang || "").toLowerCase().split("-")[0];
+  if (SUPPORTED_AGENT_LANGS.has(jl)) addVote(jl, 8, "jsonld");
+
+  // 4) URL path /es/ /pt-BR/ (cuando aparece, muy confiable)
+  const pl = (pathLang || "").toLowerCase().split(/[-_]/)[0];
+  if (SUPPORTED_AGENT_LANGS.has(pl)) addVote(pl, 7, "url");
+
+  // 5) <html lang> — peso medio (sitios mal-declarados son comunes)
+  const hl2 = (htmlLang || "").toLowerCase().split("-")[0];
+  if (SUPPORTED_AGENT_LANGS.has(hl2)) addVote(hl2, 5, "html_lang");
+
+  // 6) og:locale — peso medio
   const og = (ogLocale || "").toLowerCase().split(/[-_]/)[0];
-  if (SUPPORTED_AGENT_LANGS.has(og)) return { lang: og, source: "og_locale", confidence: "high" };
+  if (SUPPORTED_AGENT_LANGS.has(og)) addVote(og, 5, "og");
 
-  // 3) Análisis heurístico del texto real
-  const fromText = _detectLangFromText(textSample || "");
-  if (fromText && SUPPORTED_AGENT_LANGS.has(fromText)) {
-    return { lang: fromText, source: "text_heuristic", confidence: "high" };
-  }
-
-  // 4) GEO → idioma
+  // 7) GEO → idioma — peso bajo (RapidAPI a veces devuelve geo wrong)
   const geoLang = GEO_TO_LANG_AGENT[geo] || GEO_TO_LANG_AGENT[(geo || "").trim()];
-  if (geoLang && SUPPORTED_AGENT_LANGS.has(geoLang)) {
-    return { lang: geoLang, source: "geo", confidence: "medium" };
-  }
+  if (geoLang && SUPPORTED_AGENT_LANGS.has(geoLang)) addVote(geoLang, 3, "geo");
 
-  // 5) TLD del dominio
-  const tld = (domain || "").split(".").pop()?.toLowerCase() || "";
+  // 8) TLD — peso bajo (.com domina, poco discriminativo)
+  const tld = cleanDomain.split(".").pop() || "";
   const tldLang = TLD_TO_LANG_AGENT[tld];
-  if (tldLang && SUPPORTED_AGENT_LANGS.has(tldLang)) {
-    return { lang: tldLang, source: "tld", confidence: "low" };
+  if (tldLang && SUPPORTED_AGENT_LANGS.has(tldLang)) addVote(tldLang, 2, "tld");
+
+  // ── Decisión ────────────────────────────────────────────────
+  const sorted = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+  let result;
+  if (sorted.length === 0) {
+    result = { lang: "en", source: "default", confidence: "low", reasons: ["no_signals"] };
+  } else {
+    const winner = sorted[0];
+    const runnerUp = sorted[1] || ["", 0];
+    const margin = winner[1] - runnerUp[1];
+    // Confianza: si winner score >= 10 Y margen >= 5 → high. Si margen < 3 → low (ambiguo).
+    const confidence = winner[1] >= 10 && margin >= 5 ? "high" : margin >= 3 ? "medium" : "low";
+
+    // Si confianza baja Y tenemos token + sample → Claude Haiku decide
+    if (confidence === "low" && allowClaudeArbiter && token && textSample) {
+      const claudeAns = await _claudeLangArbiter(token, cleanDomain, textSample);
+      if (claudeAns) {
+        result = { lang: claudeAns, source: "claude_arbiter", confidence: "high", reasons: [...reasons, `claude:${claudeAns}`] };
+      } else {
+        result = { lang: winner[0], source: "voting", confidence, reasons };
+      }
+    } else {
+      result = { lang: winner[0], source: "voting", confidence, reasons };
+    }
   }
 
-  // 6) Default seguro
-  return { lang: "en", source: "default", confidence: "low" };
+  // Cache result
+  if (cleanDomain) {
+    if (_domainLangCache.size >= DOMAIN_LANG_CACHE_MAX) {
+      const firstKey = _domainLangCache.keys().next().value;
+      _domainLangCache.delete(firstKey);
+    }
+    _domainLangCache.set(cleanDomain, result);
+  }
+  return result;
 }
 
 // ── Blocklist para autopilot — evita dominios que no son targets válidos ───
@@ -2098,15 +2221,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const pageTitle = pageContent?.title || "";
 
   // ── Detección de IDIOMA al insertar — robusta vía detectLanguageRobust ──
-  // Antes se hardcodeaba language="" y popup default era "en" → mails en inglés
-  // a sitios en castellano. Ahora detectamos al guardar.
-  const langDet = detectLanguageRobust({
+  const langDet = await detectLanguageRobust({
     htmlLang:   pageContent?.htmlLang,
     ogLocale:   pageContent?.ogLocale,
+    hreflang:   pageContent?.hreflang,
+    jsonLdLang: pageContent?.jsonLdLang,
+    pathLang:   pageContent?.pathLang,
     textSample: pageContent?.textSample,
     geo:        topCountry,
     domain,
-  });
+  }, { token });
   const detectedLang = langDet.lang;
 
   // 2. Emails — Apollo si visits >= 500K, scraping siempre como fallback.
@@ -2693,14 +2817,17 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
 
-    // Detectar idioma robustamente (html/og/text/geo/tld → fallback "en")
-    const _autopilotLangDet = detectLanguageRobust({
+    // Detectar idioma robustamente (text + html + hreflang + jsonLd + url + geo + tld + Claude arbiter)
+    const _autopilotLangDet = await detectLanguageRobust({
       htmlLang:   pageContent?.htmlLang,
       ogLocale:   pageContent?.ogLocale,
+      hreflang:   pageContent?.hreflang,
+      jsonLdLang: pageContent?.jsonLdLang,
+      pathLang:   pageContent?.pathLang,
       textSample: pageContent?.textSample,
       geo:        topCountry,
       domain,
-    });
+    }, { token });
     const language    = _autopilotLangDet.lang;
     const category    = pageContent?.category || "";
     const contactName = "";
@@ -4036,7 +4163,7 @@ async function runAgentCycle(token, allFlags) {
         let _pageContent = null;
         // Hint barato basado en TLD + GEO. Si dice "es/pt/it/ar" pero
         // lead.language dice "en", hay desacuerdo → forzamos re-detect.
-        const _hintDet = detectLanguageRobust({ geo: leadGeo, domain });
+        const _hintDet = await detectLanguageRobust({ geo: leadGeo, domain }, { allowClaudeArbiter: false });
         const _hintDisagrees = _hintDet.lang !== "en"
           && _hintDet.lang !== leadLanguage
           && SUPPORTED_AGENT_LANGS.has(_hintDet.lang);
@@ -4046,15 +4173,18 @@ async function runAgentCycle(token, allFlags) {
         if (needLangFetch) {
           _pageContent = await fetchPageContent(domain).catch(() => null);
           if (_pageContent) {
-            const det = detectLanguageRobust({
-              htmlLang: _pageContent.htmlLang,
-              ogLocale: _pageContent.ogLocale,
+            const det = await detectLanguageRobust({
+              htmlLang:   _pageContent.htmlLang,
+              ogLocale:   _pageContent.ogLocale,
+              hreflang:   _pageContent.hreflang,
+              jsonLdLang: _pageContent.jsonLdLang,
+              pathLang:   _pageContent.pathLang,
               textSample: _pageContent.textSample,
               geo: leadGeo,
               domain,
-            });
+            }, { token });
             leadLanguage = det.lang;
-            log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence})`);
+            log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence}) [${det.reasons?.join(",")||""}]`);
             // Persistir para futuros runs
             fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
               method: "PATCH",
@@ -4063,7 +4193,7 @@ async function runAgentCycle(token, allFlags) {
             }).catch(() => {});
           } else {
             // No pudimos fetchear página → fallback GEO/TLD
-            const det = detectLanguageRobust({ geo: leadGeo, domain });
+            const det = await detectLanguageRobust({ geo: leadGeo, domain }, { allowClaudeArbiter: false });
             leadLanguage = det.lang;
             log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence}, sin html)`);
           }
