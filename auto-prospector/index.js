@@ -268,6 +268,12 @@ async function loadDomainPool() {
     }
     domainPool = domains;
     log(`Pool cargado: ${domains.length.toLocaleString()} dominios disponibles.`);
+    // Memory snapshot — para detectar OOM ANTES que Railway mate al worker
+    try {
+      const m = process.memoryUsage();
+      const mb = (b) => Math.round(b / 1024 / 1024);
+      log(`💾 Memoria post-pool: rss=${mb(m.rss)}MB, heapUsed=${mb(m.heapUsed)}MB, heapTotal=${mb(m.heapTotal)}MB, external=${mb(m.external)}MB`);
+    } catch {}
   } catch (err) {
     log(`⚠️ Error descargando pool: ${err.message} — se reintentará en la próxima sesión.`);
     domainPool = []; // evitar retry inmediato; se reseteará al reiniciar
@@ -1313,7 +1319,10 @@ async function getTrafficData(domain, rapidApiKey) {
     // Log diagnóstico si el shape de la API cambió y no extrajimos visits
     if (!visits) {
       const sampleKeys = Object.keys(data || {}).slice(0, 8).join(",");
-      log(`  ⚠️ getTrafficData ${domain}: response OK pero sin visits. Top-level keys: [${sampleKeys}]. Posible cambio de shape de la API.`);
+      // Dump del shape REAL de Visits + Traffic para debug
+      const visitsShape = JSON.stringify(data.Visits ?? null).substring(0, 300);
+      const trafficVisitsShape = JSON.stringify(data.Traffic?.Visits ?? null).substring(0, 300);
+      log(`  ⚠️ getTrafficData ${domain}: sin visits. keys=[${sampleKeys}] | data.Visits=${visitsShape} | data.Traffic.Visits=${trafficVisitsShape}`);
     }
 
     // Pages per visit del nuevo shape (Traffic.Engagement.PagesPerVisit) o legacy (PagePerVisit)
@@ -2282,7 +2291,18 @@ function scoreCandidate({ visits, category, topCountry, contactName, emails, pag
 
 function cleanDomain(str) {
   return (str || "").toLowerCase()
-    .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").trim();
+    .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "")
+    // Strip annotations comunes: " (r)", " (refresh)", " (m)", " - foo", "[bar]", etc.
+    .replace(/\s+[\(\[\-].*$/, "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+// Validador estricto: domain debe tener formato xxx.tld válido.
+function _isValidDomainFormat(d) {
+  if (!d) return false;
+  // No espacios, no paréntesis, no caracteres raros, debe tener al menos un punto
+  return /^[a-z0-9][a-z0-9\-\.]*\.[a-z]{2,}$/i.test(d) && !/\s|[\(\)\[\]]/.test(d);
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -2673,14 +2693,24 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const _csvSessionStart = Date.now();
   const CSV_SESSION_LIMIT_MS = 20 * 60 * 1000;
 
+  let _csvKillCheckIter = 0;
   while (processed < maxItems) {
     // Hard timeout 20min — apagar y salir aunque queden items pendientes.
-    // Próximo loop iter del worker lo re-prende si csv_queue_enabled sigue true,
-    // pero el toggle ya está OFF acá → user debe re-prenderlo manualmente.
     if (Date.now() - _csvSessionStart >= CSV_SESSION_LIMIT_MS) {
       log(`⏱ CSV queue: 20min hard cap alcanzado — auto-apagando (procesados: ${processed}). Re-prender manual si querés seguir.`);
       await setConfigValue(token, "csv_queue_enabled", "false");
       break;
+    }
+    // Re-check del flag cada 5 items — si el user apagó el toggle, paramos YA.
+    // Antes solo se chequeaba al inicio → bug "queue OFF pero sigue procesando".
+    if (++_csvKillCheckIter % 5 === 0) {
+      try {
+        const fresh = await getConfig(token);
+        if (String(fresh.csv_queue_enabled || "").toLowerCase() !== "true") {
+          log(`🛑 CSV queue: flag apagado por user — deteniendo (procesados: ${processed})`);
+          break;
+        }
+      } catch {}
     }
     // No hay pre-check de cap acá — el cap (200) se aplica al SUBIR items
     // (popup pre-check + promoteWaitlist en main loop). Si llegamos acá,
@@ -5395,7 +5425,20 @@ async function main() {
 
   while (true) {
     iterCount++;
-    if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
+    if (iterCount === 1 || iterCount % 10 === 0) {
+      log(`📍 Loop iter #${iterCount}`);
+      // Memory check cada 10 iters — si rss > 700MB log WARN para detectar OOM
+      try {
+        const m = process.memoryUsage();
+        const rssMB = Math.round(m.rss / 1024 / 1024);
+        const heapMB = Math.round(m.heapUsed / 1024 / 1024);
+        if (rssMB > 700) {
+          log(`⚠️ MEMORIA ALTA iter #${iterCount}: rss=${rssMB}MB, heap=${heapMB}MB — riesgo OOM`);
+        } else if (iterCount % 30 === 0) {
+          log(`💾 Mem iter #${iterCount}: rss=${rssMB}MB, heap=${heapMB}MB`);
+        }
+      } catch {}
+    }
 
     // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
