@@ -493,6 +493,12 @@ function initAdminPanel() {
   document.getElementById("agent-toggle")?.addEventListener("change", toggleAgent);
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
+  document.getElementById("agent-unpause")?.addEventListener("click", async () => {
+    if (!confirm("Resume agent now? This clears any pause (manual or kill switch).")) return;
+    await _writeAgentConfig({ agent_paused_until: "" });
+    if (typeof showToast === "function") showToast("▶ Agent resumed", "ok", 3000);
+    await loadAdminAgent();
+  });
   document.getElementById("agent-refresh-toggle")?.addEventListener("click", toggleRefreshEmptyLeads);
   document.getElementById("agent-feed-export-csv")?.addEventListener("click", _exportAgentFeedCsv);
   document.getElementById("admin-export-comparator-csv")?.addEventListener("click", exportComparatorCsv);

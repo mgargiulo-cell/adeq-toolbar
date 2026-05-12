@@ -5085,14 +5085,25 @@ const _processStartedAt = Date.now();
 process.on("unhandledRejection", (reason, p) => {
   try {
     log(`⚠️ UnhandledRejection: ${reason?.message || reason}`);
+    if (reason?.stack) log(reason.stack.split("\n").slice(0, 6).join("\n"));
     console.error("[unhandledRejection]", reason);
   } catch {}
 });
 process.on("uncaughtException", (err) => {
   try {
     log(`⚠️ UncaughtException: ${err?.message || err}`);
+    if (err?.stack) log(err.stack.split("\n").slice(0, 6).join("\n"));
     console.error("[uncaughtException]", err);
   } catch {}
+});
+// SIGTERM (Railway restart o redeploy) — loggear claro para distinguir de crash real
+process.on("SIGTERM", () => {
+  log("🛑 SIGTERM recibido — Railway está reiniciando el container. Worker exit gracefully.");
+  setTimeout(() => process.exit(0), 1500);
+});
+process.on("SIGINT", () => {
+  log("🛑 SIGINT recibido — exit gracefully.");
+  setTimeout(() => process.exit(0), 500);
 });
 
 async function main() {
