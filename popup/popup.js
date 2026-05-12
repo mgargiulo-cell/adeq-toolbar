@@ -1725,6 +1725,55 @@ function renderRapidApiFooterCounter({ used, limit, period } = {}) {
 }
 
 // Apollo monthly counter — sumado de todos los MBs vía toolbar_config.apollo_calls_month
+// Version check — compara la versión local del manifest con la versión en GitHub.
+// Click → re-check. Auto-check al cargar. Verde = al día, rojo = update available.
+async function checkExtensionVersion() {
+  const el = document.getElementById("version-badge");
+  if (!el) return;
+  const localVer = chrome.runtime.getManifest().version;
+  el.textContent = `v${localVer} ⏳`;
+  el.style.background = "rgba(148,163,184,0.15)";
+  el.style.color = "#94a3b8";
+  try {
+    const res = await fetch("https://raw.githubusercontent.com/mgargiulo-cell/adeq-toolbar/main/manifest.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const remote = await res.json();
+    const remoteVer = remote.version || "0.0.0";
+    const cmp = _semverCompare(localVer, remoteVer);
+    if (cmp >= 0) {
+      el.textContent = `v${localVer} ✓`;
+      el.style.background = "rgba(52,211,153,0.15)";
+      el.style.color = "#34d399";
+      el.title = `Latest version installed (v${localVer})`;
+    } else {
+      el.textContent = `v${localVer} 🔴 update`;
+      el.style.background = "rgba(239,68,68,0.15)";
+      el.style.color = "#f87171";
+      el.title = `Update available! v${remoteVer} on GitHub. Download new ZIP and reload.`;
+      // Toast solo la primera vez por sesión
+      if (!window._versionUpdateToastShown) {
+        window._versionUpdateToastShown = true;
+        if (typeof showToast === "function") showToast(`🔴 Update available: v${remoteVer} (you have v${localVer})`, "warn", 8000);
+      }
+    }
+  } catch (e) {
+    el.textContent = `v${localVer} ?`;
+    el.style.background = "rgba(251,191,36,0.15)";
+    el.style.color = "#fbbf24";
+    el.title = `Could not check GitHub: ${e.message}`;
+  }
+}
+function _semverCompare(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
 async function refreshApolloFooterCounter() {
   const el = document.getElementById("apollo-monthly-counter");
   if (!el || !state.accessToken) return;
@@ -1995,8 +2044,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
   refreshUsage();
   refreshApolloFooterCounter();
+  checkExtensionVersion();
   setInterval(refreshUsage, 60_000);
   setInterval(refreshApolloFooterCounter, 60_000);
+  // Re-check version cada 30 min en background
+  setInterval(checkExtensionVersion, 30 * 60_000);
+  document.getElementById("version-badge")?.addEventListener("click", checkExtensionVersion);
 
   // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
   const scheduleRefresh = () => {
