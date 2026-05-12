@@ -4661,11 +4661,16 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // Re-pickear el MEJOR email después del enrichment (rankEmail sync, NO la async scoreEmail)
-        const ranked = emails
-          .map(e => ({ email: e, score: rankEmail(e, domain, lead.category) }))
-          .filter(x => x.score >= 0)
-          .sort((a, b) => b.score - a.score);
+        const _rankedAll = emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) }));
+        const ranked = _rankedAll.filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
         let email = ranked[0]?.email;
+        // Log diagnóstico — ver qué pasó con cada candidate
+        if (emails.length > 0) {
+          const summary = _rankedAll.slice(0, 5).map(x => `${x.email}=${x.score}`).join(", ");
+          log(`  🔢 ${domain}: ${emails.length} emails → rankings: ${summary}`);
+        } else {
+          log(`  ⚠️ ${domain}: emails array vacío después del enrichment`);
+        }
 
         // ── 2do pass Claude para emails ambiguos ──
         // Si el top score < 50 (no claramente verde) Y hay ≥2 candidatos,
@@ -4686,9 +4691,10 @@ async function runAgentCycle(token, allFlags) {
           log(`  ✉️ ${domain}: pickeado ${email} (score=${ranked[0].score}) de ${ranked.length} candidatos`);
         }
         if (!email) {
+          log(`  ⏭ ${domain}: SKIP — no_email_after_enrichment (emails encontrados: ${emails.length})`);
           await logAgentAction(token, userEmail, {
             domain, action: "skipped", reason: "no_email_after_enrichment",
-            details: { traffic: leadTraffic, geo: leadGeo },
+            details: { traffic: leadTraffic, geo: leadGeo, emails_count: emails.length },
           });
           continue;
         }
@@ -4716,6 +4722,7 @@ async function runAgentCycle(token, allFlags) {
         // 🔴 red = skip, 🟡 yellow = manda igual, 🟢 green = ideal
         const emailScore = await scoreEmail(email);
         if (emailScore.color === "red") {
+          log(`  ⏭ ${domain}: SKIP — email red (${email}: ${emailScore.reason})`);
           await logAgentAction(token, userEmail, {
             domain, action: "skipped",
             reason: `email_red_${emailScore.reason}`,
@@ -4723,6 +4730,7 @@ async function runAgentCycle(token, allFlags) {
           });
           continue;
         }
+        log(`  📧 ${domain}: email_score=${emailScore.color} → ${email}`);
 
         // 2. Decidir source: 80% template, 20% Claude (configurable via agent_claude_percent)
         const claudePercent = parseInt(cfg.agent_claude_percent || "20", 10);
