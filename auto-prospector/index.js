@@ -1904,6 +1904,18 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
 
+  // ── Detección de IDIOMA al insertar — robusta vía detectLanguageRobust ──
+  // Antes se hardcodeaba language="" y popup default era "en" → mails en inglés
+  // a sitios en castellano. Ahora detectamos al guardar.
+  const langDet = detectLanguageRobust({
+    htmlLang:   pageContent?.htmlLang,
+    ogLocale:   pageContent?.ogLocale,
+    textSample: pageContent?.textSample,
+    geo:        topCountry,
+    domain,
+  });
+  const detectedLang = langDet.lang;
+
   // 2. Emails — Apollo si visits >= 500K, scraping siempre como fallback.
   // Doble cap: diario (150) + mensual (2400 del plan). Si llega cualquiera,
   // skip Apollo y usa solo scraping. Cero impacto al flow (igual hay emails).
@@ -1928,7 +1940,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       domain,
       traffic:        visits || 0,
       geo:            topCountry || "",
-      language:       "",
+      language:       detectedLang,
       category,
       contactName:    "",
       emails,
@@ -2456,7 +2468,15 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
 
-    const language    = "";
+    // Detectar idioma robustamente (html/og/text/geo/tld → fallback "en")
+    const _autopilotLangDet = detectLanguageRobust({
+      htmlLang:   pageContent?.htmlLang,
+      ogLocale:   pageContent?.ogLocale,
+      textSample: pageContent?.textSample,
+      geo:        topCountry,
+      domain,
+    });
+    const language    = _autopilotLangDet.lang;
     const category    = pageContent?.category || "";
     const contactName = "";
     const adNetworks  = pageContent?.adNetworks || [];
