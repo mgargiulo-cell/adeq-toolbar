@@ -4726,6 +4726,41 @@ async function runAgentCycle(token, allFlags) {
             domain, action: "skipped", reason: "no_email_after_enrichment",
             details: { traffic: leadTraffic, geo: leadGeo, emails_count: emails.length },
           });
+          // Contar fails consecutivos hoy para este dominio — después de 3 → FREEZE
+          // (sacar del pool de pending para que el agente no lo re-pickee infinito)
+          try {
+            const cutoffTodaySpain = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
+            cutoffTodaySpain.setHours(0, 0, 0, 0);
+            const cntRes = await fetch(
+              `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=eq.no_email_after_enrichment&domain=eq.${encodeURIComponent(domain)}&created_at=gte.${cutoffTodaySpain.toISOString()}&select=id`,
+              { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+            );
+            const range = cntRes.headers.get("content-range") || "";
+            const failsToday = parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+            if (failsToday >= 3) {
+              // Mark lead as 'frozen' so agent query (status=pending) lo excluye.
+              // Y agregalo a toolbar_frozen_leads para retry en 15d.
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+                method: "PATCH",
+                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+                body: JSON.stringify({ status: "frozen" }),
+              }).catch(() => {});
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+                method: "POST",
+                headers: {
+                  "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+                  "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                body: JSON.stringify({
+                  domain, frozen_until: new Date(Date.now() + 15 * 86400_000).toISOString(),
+                  attempt_count: 1, last_error: "no_email_3_attempts",
+                  source: "agent", uploaded_by: userEmail,
+                  updated_at: new Date().toISOString(),
+                }),
+              }).catch(() => {});
+              log(`  🧊 ${domain}: 3 fails sin email → FREEZE 15d`);
+            }
+          } catch {}
           continue;
         }
 
