@@ -1391,7 +1391,7 @@ async function loadAdminActivity() {
   renderAdminComparator(combined, usageRes, sessionsRes, agentActions);
 
   // Resumen narrativo por MB (cards con tips para 1:1)
-  renderAdminMBSummaries(combined, usageRes, sessionsRes);
+  renderAdminMBSummaries(combined, usageRes, sessionsRes, agentActions);
 }
 
 // ── Helper compartido: agrega métricas por user (usado por Comparator + Summaries) ──
@@ -1576,7 +1576,7 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
 // ── Resumen narrativo por MB ──────────────────────────────
 // Genera cards con frases en lenguaje natural sobre la actividad de cada MB.
 // Pensado para que el admin lea durante un 1:1 ("mirá tu resumen").
-function renderAdminMBSummaries(historial, usage, sessions) {
+function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
   const wrap = document.getElementById("admin-mb-summaries");
   if (!wrap) return;
   // Agrupar todo por usuario
@@ -1588,7 +1588,7 @@ function renderAdminMBSummaries(historial, usage, sessions) {
   }));
   historial.forEach(h => {
     // Compatibilidad: toolbar_historial usa media_buyer; review_queue usa created_by; api_usage usa user_email.
-    const u = (h.media_buyer || h.user_email || h.created_by || "unknown").toLowerCase();
+    const u = _normalizeUserKey(h.media_buyer || h.user_email || h.created_by);
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     o.sites++;
@@ -1603,7 +1603,7 @@ function renderAdminMBSummaries(historial, usage, sessions) {
     else if (traffic > 0)  o.below500k++;
   });
   usage.forEach(r => {
-    const u = (r.user_email || "unknown").toLowerCase();
+    const u = _normalizeUserKey(r.user_email);
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     o.emails += parseInt(r.by_provider?._emails_sent || 0, 10);
@@ -1611,11 +1611,20 @@ function renderAdminMBSummaries(historial, usage, sessions) {
     o.claude += parseInt(r.by_provider?.anthropic || 0, 10);
   });
   sessions.forEach(s => {
-    const u = (s.user_email || "unknown").toLowerCase();
+    const u = _normalizeUserKey(s.user_email);
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     if (s.kind === "autopilot") o.apSec += s.duration_sec || 0;
     if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
+  });
+  // Agent actions — sumar emails (sent) + monday (monday_ok) por user
+  agentActions.forEach(a => {
+    const u = _normalizeUserKey(a.user_email);
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    const o = byUser.get(u);
+    if (a.action === "sent")      o.emails++;
+    if (a.action === "monday_ok") o.monday++;
+    if (a.details?.source === "claude") o.claude++;
   });
 
   wrap.innerHTML = "";
