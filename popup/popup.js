@@ -4812,7 +4812,7 @@ async function startCascade() {
   const CASCADE_LIMIT = 50;
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días)
-  statusEl.textContent = "Querying Monday...";
+  statusEl.textContent = "Step 1/2: checking Monday for other MBs' active domains...";
   const boardIndex = await getMondayBoardIndex();
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - 45);
@@ -7084,7 +7084,7 @@ function initProspectCard(card, data) {
     card.dataset._trafficFetched = "1";
     const trafficInput = card.querySelector(".pcard-traffic");
     if (!trafficInput || trafficInput.value) return;
-    trafficInput.placeholder = "⏳ Buscando tráfico…";
+    trafficInput.placeholder = "⏳ Fetching traffic…";
     getTraffic(data.domain).then(t => {
       const v = t?.pageViews || t?.rawVisits || 0;
       // Guard: card pudo haberse re-renderizado por enrich antes del timeout.
