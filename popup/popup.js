@@ -895,7 +895,7 @@ async function _refreshAgentFeed() {
       { headers }
     );
     if (!res.ok) {
-      wrap.innerHTML = `<div style="color:#f87171">Error HTTP ${res.status} — verificá RLS de toolbar_agent_actions</div>`;
+      wrap.innerHTML = `<div style="color:#f87171">HTTP ${res.status} — check toolbar_agent_actions RLS</div>`;
       return;
     }
     const rows = await res.json();
@@ -2629,7 +2629,7 @@ async function runTrafficCheck(opts = {}) {
         .slice(0, 3);
       if (chips.length) {
         countriesEl.innerHTML = chips.map(c => {
-          const tip = `${esc(c.name || c.code)} — ${c.pct}% del tráfico del sitio viene de acá`;
+          const tip = `${esc(c.name || c.code)} — ${c.pct}% of site traffic comes from here`;
           return `<span class="country-flag-chip" data-code="${esc(c.code)}" title="${tip}">${countryFlag(c.code)} ${c.pct}%</span>`;
         }).join("");
       } else {
@@ -3018,7 +3018,7 @@ function _verifyClass(result) {
 
 function _verifyTooltip(result) {
   if (!result) return "Verificando…";
-  const status = result.valid ? "✔ Válido" : "✖ Inválido";
+  const status = result.valid ? "✔ Valid" : "✖ Invalid";
   const reason = result.reason || "";
   const tags   = (result.tags || []).join(", ");
   const src    = result.deepSource === "eva" ? "[SMTP confirmado]"
@@ -3124,7 +3124,7 @@ function renderEmailList(emails) {
       html += `<div class="email-chips-hidden" style="display:none">`;
       hidden.forEach(email => { html += chipFor(email); });
       html += `</div>`;
-      html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:var(--adeq-blue);cursor:pointer;padding:4px 0;text-decoration:underline">+ ver ${hidden.length} más…</button>`;
+      html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:var(--adeq-blue);cursor:pointer;padding:4px 0;text-decoration:underline">+ show ${hidden.length} more…</button>`;
     }
   }
 
@@ -3245,7 +3245,7 @@ function renderApolloPeople(resultEl, result) {
   const visibleRows = people.slice(0, PREVIEW_COUNT).map(renderRow).join("");
   const hiddenRows  = people.slice(PREVIEW_COUNT).map(renderRow).join("");
   const showMoreBtn = people.length > PREVIEW_COUNT
-    ? `<button class="apollo-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline;width:100%;text-align:left">+ ver ${people.length - PREVIEW_COUNT} más…</button>`
+    ? `<button class="apollo-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline;width:100%;text-align:left">+ show ${people.length - PREVIEW_COUNT} more…</button>`
     : "";
 
   resultEl.innerHTML = `
@@ -3368,7 +3368,7 @@ async function _restorePitchDraft() {
       return;
     }
     ta.value = draft.body;
-    showToast(`📝 Draft restaurado para ${state.domain} (${Math.round((Date.now() - draft.ts) / 60000)}m atrás)`, "info");
+    showToast(`📝 Draft restored for ${state.domain} (${Math.round((Date.now() - draft.ts) / 60000)}m ago)`, "info");
   } catch {}
 }
 
@@ -3593,8 +3593,8 @@ async function bindButtons() {
     // Pedir razón opcional — entra al embedding para que el RAG aprenda QUÉ evitar.
     // Vacío = sin comentario, igual marca dislike.
     const reason = prompt(
-      "👎 ¿Qué falló? (opcional — ayuda a la IA a evitar ese error en el futuro)\n\n" +
-      "Ejemplos: 'inventó un mes', 'dijo que no tiene ads.txt cuando sí tiene', 'tono muy formal', 'muy largo'",
+      "👎 What failed? (optional — helps the AI avoid this in future)\n\n" +
+      "Examples: 'invented a month', 'said no ads.txt when site has it', 'too formal', 'too long'",
       ""
     );
     await saveDislikePitch(pitch);
@@ -3741,7 +3741,7 @@ async function bindButtons() {
     // para evitar que se actualice un item sin haber re-mandado el pitch.
     if (!state.emailSentInSession) {
       const action = state.duplicate?.found ? "update" : "push";
-      const msg = `❌ Mandá el email primero (botón Send via Gmail) antes de hacer ${action} en Monday.`;
+      const msg = `❌ Send the email first (Send via Gmail button) before ${action} in Monday.`;
       res.textContent = msg; res.className = "push-result error";
       document.getElementById("btn-send-gmail")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -7168,7 +7168,7 @@ function initProspectCard(card, data) {
     let html = visible.map(chipFor).join("");
     if (hidden.length > 0) {
       html += `<div class="email-chips-hidden" style="display:none">${hidden.map(chipFor).join("")}</div>`;
-      html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline">+ ver ${hidden.length} más…</button>`;
+      html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline">+ show ${hidden.length} more…</button>`;
     }
     listEl.innerHTML = html;
 

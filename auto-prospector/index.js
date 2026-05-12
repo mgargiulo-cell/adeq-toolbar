@@ -3773,21 +3773,41 @@ async function scoreEmail(email) {
 // Self-check Claude: verifica que el pitch no contradiga datos de input.
 // Bajo costo (max 100 tokens). Si detecta inconsistencia, return false.
 async function selfCheckPitch(token, pitch, ctx) {
-  const { domain, adsTxtExists, adNetworks } = ctx;
+  const { domain, adsTxtExists, adNetworks, subjects } = ctx;
   if (!pitch || pitch.length < 30) return { ok: false, reason: "pitch_too_short" };
   // Heurística rápida sin Claude: detectar contradicciones obvias.
-  const lower = pitch.toLowerCase();
-  if (adsTxtExists && /no.{1,10}(tienen|hay|tiene|tienes|have).{1,10}ads\.txt/i.test(pitch)) {
-    return { ok: false, reason: "claims_no_ads_txt_but_has" };
+
+  // 1. Claim de ausencia de ads.txt (siempre prohibido salvo confirmación explícita)
+  if (/no.{1,15}(tienen|hay|tiene|tienes|have).{1,15}ads\.txt/i.test(pitch)) {
+    if (adsTxtExists !== false) return { ok: false, reason: "claims_no_ads_txt" };
   }
-  if (adNetworks?.length > 0 && /no.{1,10}(detect|veo|see).{1,20}(monetiz|ad.{1,5}network|ad.{1,5}stack)/i.test(pitch)) {
-    return { ok: false, reason: "claims_no_ads_but_has_networks" };
+  // 2. Claim de ausencia de monetización
+  if (/no.{1,15}(detect|veo|see|tienen|tiene|have).{1,25}(monetiz|ad.{1,5}network|ad.{1,5}stack|ningún.{1,10}sistema)/i.test(pitch)) {
+    if (!(adNetworks?.length === 0)) return { ok: false, reason: "claims_no_ads_but_has_or_unknown" };
   }
-  // Detectar meses hardcoded — usar word boundary para evitar matches dentro de
-  // palabras (ej "mayo" en "mayoría", "may" en "maybe"/"mayor"/"essay")
+  // 3. Meses hardcoded
   const months = /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
-  if (months.test(pitch)) {
-    return { ok: false, reason: "mentions_specific_month" };
+  if (months.test(pitch)) return { ok: false, reason: "mentions_specific_month" };
+  // 4. Firma con nombre propio del equipo
+  if (/\b(diego|max|maxi|maximiliano|agus|agustina)\s*$/im.test(pitch)) {
+    return { ok: false, reason: "signed_with_personal_name" };
+  }
+  // 5. Frases prohibidas corporate-speak
+  const banned = /\b(win[\s-]?win|sinerg|apalanc|ecosistema|estimad[oa]\b|sr\.|sra\.)\b/i;
+  if (banned.test(pitch)) return { ok: false, reason: "corporate_speak_phrase" };
+  // 6. Length: 50-180 palabras (mail inicial corto)
+  const wordCount = pitch.split(/\s+/).filter(Boolean).length;
+  if (wordCount > 200) return { ok: false, reason: `too_long_${wordCount}_words` };
+  // 7. Subjects validation (cuando vienen)
+  if (Array.isArray(subjects)) {
+    for (const s of subjects) {
+      if (!s) continue;
+      const subjWords = s.split(/\s+/).filter(Boolean).length;
+      if (subjWords > 10) return { ok: false, reason: `subject_too_long_${subjWords}_words` };
+      if (/URGENT|!!!|RE:\s*RE:|OPORTUNIDAD/i.test(s)) {
+        return { ok: false, reason: "subject_spam_pattern" };
+      }
+    }
   }
   return { ok: true };
 }
@@ -3971,7 +3991,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
     [MONDAY_COL_ESTADO]:    { label: "Propuesta Vigente (T)" },
     ...(payload.monday_user_id ? { [MONDAY_COL_OWNER]: { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] } } : {}),
-    [MONDAY_COL_PITCH]:     payload.pitch_body ? `PITCH IA:\n${payload.pitch_body}` : "",
+    // NO incluir Comentarios — el user no quiere el pitch en ese campo.
   };
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
     create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: true) { id }
@@ -4324,9 +4344,11 @@ async function runAgentCycle(token, allFlags) {
             adNetworks: lead.ad_networks,
             userEmail, // para RAG retrieval — feedback del propio MB
           });
-          // Self-check anti-alucinación solo cuando viene de Claude (templates están baked clean)
+          // Self-check anti-alucinación solo cuando viene de Claude (templates baked clean).
+          // Pasamos undefined para adsTxtExists (= unknown) y subjects para validar largo.
           const check = await selfCheckPitch(token, pitch.body, {
-            domain, adsTxtExists: false, adNetworks: lead.ad_networks,
+            domain, adsTxtExists: undefined, adNetworks: lead.ad_networks,
+            subjects: pitch.subjects,
           });
           if (!check.ok) {
             await logAgentAction(token, userEmail, {
