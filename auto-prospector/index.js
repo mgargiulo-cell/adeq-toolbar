@@ -973,10 +973,33 @@ async function getTrafficData(domain, rapidApiKey) {
     }
 
     // ── Adaptador del shape nuevo de website-insights ──────────
-    // Visits ahora es {YYYY-MM-DD: n} → tomar el más reciente.
-    if (data.Traffic?.Visits && typeof data.Traffic.Visits === "object" && !Array.isArray(data.Traffic.Visits)) {
-      const dates = Object.keys(data.Traffic.Visits).sort().reverse();
-      if (dates.length) data.Visits = parseFloat(data.Traffic.Visits[dates[0]]) || 0;
+    // Visits puede venir como: object {YYYY-MM-DD: n}, array [{date,value}],
+    // number directo, o string "1.2M". Cubrimos todos los casos.
+    const tv = data.Traffic?.Visits;
+    if (tv != null) {
+      if (typeof tv === "number") {
+        data.Visits = tv;
+      } else if (typeof tv === "string") {
+        // string puede ser "1234567" o "1.2M". parseHumanNumber para formatos.
+        const m = tv.match(/^([\d.]+)\s*([KMB]?)/i);
+        if (m) {
+          const n = parseFloat(m[1]) || 0;
+          const mult = ({ K:1e3, M:1e6, B:1e9 })[m[2]?.toUpperCase()] || 1;
+          data.Visits = n * mult;
+        }
+      } else if (Array.isArray(tv) && tv.length) {
+        // array [{date,value}] o [{Date,Value}] o [{d,v}] — tomar más reciente
+        const sorted = [...tv].sort((a, b) => {
+          const da = a.date || a.Date || a.d || "";
+          const db = b.date || b.Date || b.d || "";
+          return db.localeCompare(da);
+        });
+        const first = sorted[0];
+        data.Visits = parseFloat(first?.value || first?.Value || first?.v || 0) || 0;
+      } else if (typeof tv === "object") {
+        const dates = Object.keys(tv).sort().reverse();
+        if (dates.length) data.Visits = parseFloat(tv[dates[0]]) || 0;
+      }
     }
     // TopCountries: convertir TopCountryShares {US: 0.7, ...} → array {CountryCode, Share}
     if (data.Traffic?.TopCountryShares && typeof data.Traffic.TopCountryShares === "object" && !Array.isArray(data.Traffic.TopCountryShares)) {
@@ -2541,7 +2564,9 @@ function _isOutsideActiveHours(activeStart, activeEnd) {
   const h = _spainHour();
   if (activeStart < activeEnd) return h < activeStart || h >= activeEnd;
   // wrap (raro pero soportado): si start > end (ej. 20-9 → trabaja noche)
+  // Activo cuando h>=start O h<end. Fuera de rango: h<start && h>=end.
   return h < activeStart && h >= activeEnd;
+  // (mantenido — si activeStart=activeEnd → siempre fuera, deseable como kill switch)
 }
 
 async function logAgentAction(token, userEmail, payload) {
@@ -2575,12 +2600,27 @@ async function getAgentWeeklyCount(token, userEmail) {
   } catch { return 0; }
 }
 
-// Cuenta de envíos del agent en las últimas 24h (cap diario)
+// Cuenta de envíos del agent en el día calendario España (no 24h móvil).
+// Cambio: antes era 24h rolling — eso permitía "13/10" si los envíos se
+// distribuían en torno a la medianoche. Ahora es estricto día calendario
+// España: 00:00 → 23:59 reset.
 async function getAgentDailyCount(token, userEmail) {
   try {
-    const cutoff = new Date(Date.now() - 24 * 3600_000).toISOString();
+    // Calcular medianoche España de HOY.
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit"
+    });
+    const todaySpain = fmt.format(new Date()); // "YYYY-MM-DD"
+    // Madrid timezone offset (CEST = +02 verano, CET = +01 invierno)
+    // Construimos el ISO de medianoche Madrid → UTC. Aproximación: usar
+    // toLocaleString para verificar offset actual.
+    const probe = new Date(`${todaySpain}T00:00:00`);
+    const madridStr = probe.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
+    const utcStr = probe.toLocaleString("en-US", { timeZone: "UTC" });
+    const offsetMs = new Date(madridStr).getTime() - new Date(utcStr).getTime();
+    const cutoffUtc = new Date(probe.getTime() - offsetMs).toISOString();
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${cutoff}&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${cutoffUtc}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("content-range") || "";
@@ -2679,31 +2719,40 @@ Write the prospecting email. Return JSON only.`;
 //   🟢 green  : SMTP OK + no garbage + no genérico → manda
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
-const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|security|domain-abuse|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints)@/i;
+const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|security|domain-abuse|domain|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|gdpr|dpo)@/i;
 
-// Score email por probabilidad de ser un buen contacto. Más alto = mejor.
-// Garbage ya filtrado antes de llegar acá.
-function scoreEmail(email, siteDomain) {
-  if (!email || !email.includes("@")) return -1;
-  const [local, dom] = email.toLowerCase().split("@");
+// Rank email por probabilidad de ser un buen contacto B2B. Más alto = mejor.
+// Sync, sin red. Llamado desde runAgentCycle para elegir el mejor del array.
+// (No confundir con scoreEmail() async que hace SMTP verify y devuelve color/red).
+function rankEmail(email, siteDomain) {
+  if (!email || typeof email !== "string" || !email.includes("@")) return -1;
+  const lower = email.toLowerCase();
+  if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
+  const [local, dom] = lower.split("@");
+  if (!local || !dom) return -1;
   let score = 0;
   // Roles comerciales / editoriales (target ideal de outreach)
   if (/^(marketing|comercial|business|partnerships|partner|ads|advertising|publicidad|monetiza|ventas|sales|bd|director|gerente|manager|jefe|head)/.test(local)) score += 80;
-  if (/^(editor|redacao|redaccion|redazione|writer|periodista|journalist)/.test(local)) score += 60;
+  else if (/^(editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press)/.test(local)) score += 60;
   // Nombre personal (first.last o first_last) muy probable persona real
-  if (/^[a-z]+[._-][a-z]+/.test(local)) score += 70;
-  // Solo nombre corto sin dots — puede ser persona o role genérico
-  else if (/^[a-z]{3,15}$/.test(local)) score += 30;
+  else if (/^[a-z]+[._-][a-z]{2,}$/.test(local)) score += 70;
+  // Pattern firstinitial+lastname (jperez@, mgarcia@) — común corp
+  else if (/^[a-z][a-z]{4,15}$/.test(local) && local.length >= 5) score += 50;
   // Roles genéricos OK pero menos efectivos
-  if (/^(info|contact|contacto|hello|hi|hola|support|soporte)$/.test(local)) score += 20;
+  else if (/^(info|contact|contacto|hello|hi|hola|support|soporte|mail|email)$/.test(local)) score += 20;
+  // Penalizar dígitos largos en local (típico de listas viejas)
+  if (/\d{3,}/.test(local)) score -= 40;
+  // Penalizar local muy corto/largo (probables alias/auto-gen)
+  if (local.length < 3) score -= 30;
+  if (local.length > 30) score -= 30;
   // Dominio del sitio matchea (no proxy random)
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
-  if (dom === cleanSite || dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom)) score += 30;
+  if (cleanSite && (dom === cleanSite || dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom))) score += 30;
   // Email free webmail = penalizar (no es corporativo)
   if (/^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex)\./.test(dom)) score -= 30;
   return score;
 }
-const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|enom\.|networksolutions|tucows/i;
+const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\.net|key-systems|1api\.net|netim\.com|psi-usa|nameshield|epag\.de|eurodns|realtimeregister|tld-box|enom\.|networksolutions|tucows|porkbun\.com|namecheap.*proxy/i;
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
 async function scoreEmail(email) {
@@ -2746,9 +2795,10 @@ async function selfCheckPitch(token, pitch, ctx) {
   if (adNetworks?.length > 0 && /no.{1,10}(detect|veo|see).{1,20}(monetiz|ad.{1,5}network|ad.{1,5}stack)/i.test(pitch)) {
     return { ok: false, reason: "claims_no_ads_but_has_networks" };
   }
-  // Detectar meses hardcoded
-  const months = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre","january","february","march","april","may","june","july","august","september","october","november","december"];
-  if (months.some(m => lower.includes(m))) {
+  // Detectar meses hardcoded — usar word boundary para evitar matches dentro de
+  // palabras (ej "mayo" en "mayoría", "may" en "maybe"/"mayor"/"essay")
+  const months = /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre|january|february|march|april|may|june|july|august|september|october|november|december)\b/i;
+  if (months.test(pitch)) {
     return { ok: false, reason: "mentions_specific_month" };
   }
   return { ok: true };
@@ -2924,7 +2974,8 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
     [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
     [MONDAY_COL_ESTADO]:    { label: "Propuesta Vigente (T)" }, // (T) = Toolbar/agente automático
-    [MONDAY_COL_OWNER]:     { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] },
+    // OWNER: solo incluir si tenemos user_id. Vacío rompe el create_item.
+    ...(payload.monday_user_id ? { [MONDAY_COL_OWNER]: { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] } } : {}),
     [MONDAY_COL_PITCH]:     payload.pitch_body || "",
   };
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
@@ -3105,14 +3156,14 @@ async function runAgentCycle(token, allFlags) {
           } catch (e) { log(`  ⚠️ on-the-fly Apollo ${domain}: ${e.message}`); }
         }
 
-        // Re-pickear el MEJOR email después del enrichment (score-based, no first-match)
-        const scored = emails
-          .map(e => ({ email: e, score: scoreEmail(e, domain) }))
+        // Re-pickear el MEJOR email después del enrichment (rankEmail sync, NO la async scoreEmail)
+        const ranked = emails
+          .map(e => ({ email: e, score: rankEmail(e, domain) }))
           .filter(x => x.score >= 0)
           .sort((a, b) => b.score - a.score);
-        const email = scored[0]?.email;
-        if (email && scored.length > 1) {
-          log(`  ✉️ ${domain}: pickeado ${email} (score=${scored[0].score}) de ${scored.length} candidatos`);
+        const email = ranked[0]?.email;
+        if (email && ranked.length > 1) {
+          log(`  ✉️ ${domain}: pickeado ${email} (score=${ranked[0].score}) de ${ranked.length} candidatos`);
         }
         if (!email) {
           await logAgentAction(token, userEmail, {
@@ -3197,6 +3248,17 @@ async function runAgentCycle(token, allFlags) {
 
         // 4. Send Gmail PRIMERO — si falla, no toca Monday
         const subject = pitch.subjects[0];
+
+        // RESERVA en counter ANTES del send. Si Railway crashea entre send y log,
+        // el counter ya tiene el slot reservado → próximo arranque no over-sends.
+        // Si el send falla, lo marcamos como "failed" y la reserva queda como
+        // false-positive (under-send by 1). Preferimos under que over.
+        await logAgentAction(token, userEmail, {
+          domain, action: "sent", reason: "reserved_pre_send",
+          pitch_subject: subject,
+          details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language },
+        });
+
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body });
 
         // 5. Push to Monday CON estado correcto desde el inicio (Propuesta Vigente T = idx 3)
@@ -3213,8 +3275,9 @@ async function runAgentCycle(token, allFlags) {
           // Loggeamos como sent_no_monday para que admin pueda crear el item manual.
           // No es crítico — el lead recibió el pitch, solo falta tracking en CRM.
           log(`⚠️ Agent ${userEmail}: Gmail OK pero Monday falló para ${domain}: ${mondayErr.message}`);
+          // NO duplicar action='sent' — ya quedó reservado pre-send.
           await logAgentAction(token, userEmail, {
-            domain, action: "sent", reason: "sent_but_monday_failed",
+            domain, action: "monday_failed", reason: "monday_push_error",
             pitch_subject: subject,
             details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language, monday_error: mondayErr.message?.substring(0, 200) },
           });
@@ -3235,16 +3298,16 @@ async function runAgentCycle(token, allFlags) {
           body: JSON.stringify({ status: "validated", validated_by: `agent:${userEmail}`, validated_at: new Date().toISOString() }),
         });
 
-        // 8. Log success completo (solo si Monday también OK; si falló ya logueamos arriba)
+        // 8. Log success completo de Monday (NO duplica action='sent', solo confirma Monday OK)
         if (mondayItemId) {
           await logAgentAction(token, userEmail, {
-            domain, action: "sent", reason: "ok",
+            domain, action: "monday_ok", reason: "ok",
             pitch_subject: subject,
             monday_item_id: mondayItemId,
             details: {
               email,
               email_score: emailScore.color,
-              source,                  // "template" | "claude" — para A/B futuro
+              source,
               traffic: leadTraffic,
               geo: leadGeo,
               language: lead.language,
