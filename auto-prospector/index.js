@@ -199,6 +199,25 @@ const MONDAY_GEO_LABELS = {
   TW:"Taiwan", HK:"Hong Kong", PK:"Pakistan", BD:"Bangladesh",
 };
 
+// Formatea visits para Monday "Paginas Vistas" (texto7):
+// - >= 1M → "N.NM" (548091 → "0.5M" no, mejor 548091 → "540K")
+// - 1K-999K → redondeado a 10K más cercano → "NNK" (548091 → "540K", 184500 → "180K")
+// - < 1K → as-is
+function formatTrafficForMonday(visits) {
+  const n = parseInt(visits, 10);
+  if (!n || n <= 0) return "";
+  if (n >= 1_000_000) {
+    // 1 decimal: 2,345,678 → "2.3M", 5,700,000 → "5.7M"
+    return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
+  }
+  if (n >= 1_000) {
+    // Redondeo a 10K más cercano hacia abajo: 548091 → 540K, 184500 → 180K
+    const rounded = Math.floor(n / 10_000) * 10_000;
+    return Math.round(rounded / 1000) + "K";
+  }
+  return String(n);
+}
+
 // Normaliza cualquier input geo a label válido para Monday (texto6).
 // Acepta: ISO code (PY), nombre inglés (Brazil), nombre español con tildes (México).
 // Devuelve "" si no podemos confirmar — mejor vacío que inventar.
@@ -600,7 +619,7 @@ async function promoteWaitlist(token) {
   }
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, contactPhone, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
   // Esta función solo INSERTA y devuelve boolean.
@@ -618,6 +637,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
       language:       language       || "",
       category:       category       || "",
       contact_name:   contactName    || "",
+      contact_phone:  contactPhone   || "",
       emails:         emails         || [],
       pitch:          pitch          || "",
       pitch_subject:  pitchSubject   || "",
@@ -1549,12 +1569,14 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
   // 3. ¿Verified gratis?
   const verified = people.find(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status));
   if (verified) {
+    const phone = _extractApolloPhone(verified);
     const result = {
       email: verified.email,
       contact_name: `${verified.first_name||""} ${verified.last_name||""}`.trim(),
+      phone,
       source: "free_verified",
     };
-    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, source: "worker_free" }).catch(() => {});
+    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source: "worker_free" }).catch(() => {});
     return result;
   }
 
@@ -1586,15 +1608,32 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     if (!person?.email) return null;
     // Bump apollo_calls_month +1 (este endpoint cuesta 1 credit)
     bumpApolloUnlocks(token, 1).catch(() => {});
-    log(`  💎 Apollo unlock ${domain} → ${person.email} (1 credit)`);
+    const phone = _extractApolloPhone(person);
+    log(`  💎 Apollo unlock ${domain} → ${person.email}${phone ? " 📞" : ""} (1 credit)`);
     const result = {
       email: person.email,
       contact_name: `${person.first_name||""} ${person.last_name||""}`.trim(),
+      phone,
       source: "unlocked",
     };
-    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, source: "worker_unlocked" }).catch(() => {});
+    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source: "worker_unlocked" }).catch(() => {});
     return result;
   } catch { return null; }
+}
+
+// Extrae el primer teléfono útil de un objeto Apollo person.
+// Apollo devuelve phone_numbers, sanitized_phone, mobile_phone, work_direct_phone, etc.
+function _extractApolloPhone(person) {
+  if (!person) return "";
+  const candidates = [
+    person.sanitized_phone,
+    person.phone,
+    person.mobile_phone,
+    person.work_direct_phone,
+    person.home_phone,
+    Array.isArray(person.phone_numbers) ? person.phone_numbers[0]?.sanitized_number || person.phone_numbers[0]?.raw_number : null,
+  ].filter(Boolean);
+  return (candidates[0] || "").toString().trim();
 }
 
 // Increment Apollo monthly counter (reusa apollo_calls_month).
@@ -2463,6 +2502,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     scrapeEmailsForDomain(domain),
   ]);
   const apolloContactName = apolloRes?.contact_name || "";
+  const apolloPhone       = apolloRes?.phone || "";
   const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
   // Apollo va PRIMERO en el array (rankEmail prefiere personal > scraping anyway)
   const rawEmails = [...new Set([...apolloEmail, ...scraperEmails])];
@@ -2482,6 +2522,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       language:       detectedLang,
       category,
       contactName:    apolloContactName,
+      contactPhone:   apolloPhone,
       emails,
       pitch:          "",
       pitchSubject:   "",
@@ -3125,6 +3166,7 @@ async function runSession(token, cfg, sessionStart) {
       findSimilarSites(domain, rapidapi_key),
     ]);
     const apolloContactNameAuto = apolloRes?.contact_name || "";
+    const apolloPhoneAuto       = apolloRes?.phone || "";
     const apolloEmailAuto = apolloRes?.email ? [apolloRes.email] : [];
     const rawEmailsAuto = [...new Set([...apolloEmailAuto, ...scraperEmails])];
     const emails = await validateEmailsBatch(rawEmailsAuto);
@@ -3156,6 +3198,7 @@ async function runSession(token, cfg, sessionStart) {
       language,
       category,
       contactName:   apolloContactNameAuto || contactName,
+      contactPhone:  apolloPhoneAuto,
       emails,
       pitch:         "",
       pitchSubject:  "",
@@ -4307,20 +4350,26 @@ async function sendGmailServer(_token, userEmail, { to, subject, body }) {
 async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
   // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
-  // Shapes según config.js: geo/trafico/comentarios = text, no objetos.
-  // email = { email, text }. status (estado/idioma) = { index } o { label }.
-  // person = { personsAndTeams }. date = { date }.
-  // GEO normalizado a label español sin tildes (texto6 acepta solo esos valores).
+  // Shapes según config.js MONDAY_COLUMNS:
+  // - text columns (texto6/texto7) = string crudo
+  // - email = { email, text }
+  // - phone = { phone, countryShortName }
+  // - status/dropdown (estado/idioma) = { label } o { index }
+  // - person = { personsAndTeams }
+  // - date = { date }
+  // GEO normalizado a label español sin tildes.
+  // Tráfico formateado: 540K / 2.3M (no raw 548091).
   const geoNormalized = normalizeMondayGeo(payload.geo);
   const cols = {
-    [MONDAY_COL_TRAFFIC]:   payload.traffic_text || "",
-    [MONDAY_COL_GEO]:       geoNormalized,
-    [MONDAY_COL_EMAIL]:     { email: payload.email, text: payload.email },
-    [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
-    [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
-    [MONDAY_COL_ESTADO]:    { label: "Propuesta Vigente (T)" },
+    [MONDAY_COL_TRAFFIC]: payload.traffic_text || "",
+    [MONDAY_COL_GEO]:     geoNormalized,
+    [MONDAY_COL_EMAIL]:   { email: payload.email, text: payload.email },
+    [MONDAY_COL_DATE]:    { date: new Date().toISOString().split("T")[0] },
+    [MONDAY_COL_IDIOMA]:  { index: payload.idioma_idx || 0 },
+    [MONDAY_COL_ESTADO]:  { label: "Propuesta Vigente (T)" },
     ...(payload.monday_user_id ? { [MONDAY_COL_OWNER]: { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] } } : {}),
-    // NO incluir Comentarios — el user no quiere el pitch en ese campo.
+    ...(payload.phone ? { [MONDAY_COL_PHONE]: { phone: String(payload.phone), countryShortName: "" } } : {}),
+    // NO incluir Comentarios — el user no quiere el pitch ahí.
   };
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
     create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: true) { id }
@@ -4350,6 +4399,7 @@ const MONDAY_COL_IDIOMA  = "estado_12";       // Idioma (status/dropdown)
 const MONDAY_COL_ESTADO  = "deal_stage";      // Estado (status/dropdown)
 const MONDAY_COL_OWNER   = "deal_owner";      // Ejecutivo (person)
 const MONDAY_COL_PITCH   = "texto";           // Comentarios (text)
+const MONDAY_COL_PHONE   = "tel_fono_1";      // Telefono (phone column)
 
 // Update Monday item estado (después de enviar mail)
 async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
@@ -4778,7 +4828,8 @@ async function runAgentCycle(token, allFlags) {
         let mondayItemId = null;
         try {
           mondayItemId = await pushToMondayServer(mondayApiKey, {
-            domain, email, geo: leadGeo, traffic_text: String(leadTraffic || ""),
+            domain, email, geo: leadGeo, traffic_text: formatTrafficForMonday(leadTraffic),
+            phone: lead.contact_phone || "",
             pitch_body: pitch.body, idioma_idx: ({ en:0, es:1, it:2, pt:3, ar:6 })[lead.language] ?? 0,
             monday_user_id: mondayUserId,
             estado_idx: 3, // Propuesta Vigente (T)
