@@ -883,25 +883,37 @@ async function _refreshAgentFeed() {
   if (!wrap) return;
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   try {
+    // SOLO acciones reales del agente: sent / failed / skipped / monday_failed / monday_ok
+    // (excluimos 'reserved' que es solo audit trail interno y duplica con 'sent').
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?select=*&order=created_at.desc&limit=50`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,failed,skipped,monday_failed,monday_ok,kill_switch)&select=*&order=created_at.desc&limit=50`,
       { headers }
     );
+    if (!res.ok) {
+      wrap.innerHTML = `<div style="color:#f87171">Error HTTP ${res.status} — verificá RLS de toolbar_agent_actions</div>`;
+      return;
+    }
     const rows = await res.json();
     if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">No activity yet. Toggle ON to start.</div>'; return; }
-    const icons = { sent: "✅", skipped: "⏭", failed: "❌", kill_switch: "🚨" };
+    // Guardar para el botón CSV
+    window._lastAgentFeedRows = rows;
+    const icons = { sent: "✅", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨" };
+    const colorMap = { sent: "#34d399", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
       const icon = icons[r.action] || "·";
-      const reasonStr = r.reason ? `<span style="color:#94a3b8"> · ${esc(r.reason)}</span>` : "";
-      const subjectStr = r.pitch_subject ? `<br/><span style="color:#cbd5e1;margin-left:18px;font-style:italic">"${esc(r.pitch_subject.substring(0, 60))}"</span>` : "";
-      const colorMap = { sent: "#34d399", skipped: "#fbbf24", failed: "#f87171", kill_switch: "#ef4444" };
       const color = colorMap[r.action] || "#cbd5e1";
-      return `<div style="padding:3px 0;border-bottom:1px solid #334155">
+      const email = r.details?.email || "";
+      const userShort = (r.user_email || "").split("@")[0];
+      const reasonStr = r.reason ? `<span style="color:#94a3b8"> · ${esc(r.reason)}</span>` : "";
+      const emailStr = email ? `<br/><span style="color:#60a5fa;margin-left:18px;font-size:10px">→ ${esc(email)}</span>` : "";
+      const subjectStr = r.pitch_subject ? `<br/><span style="color:#cbd5e1;margin-left:18px;font-style:italic;font-size:10px">"${esc(r.pitch_subject.substring(0, 70))}"</span>` : "";
+      return `<div style="padding:5px 0;border-bottom:1px solid #334155">
         <span style="color:${color}">${icon}</span>
         <span style="color:#94a3b8;font-size:9px">[${esc(time)}]</span>
+        <span style="color:#a78bfa;font-size:9px">${esc(userShort)}</span>
         <strong style="color:#e2e8f0">${esc(r.domain)}</strong>${reasonStr}
-        ${subjectStr}
+        ${emailStr}${subjectStr}
       </div>`;
     }).join("");
   } catch (e) {
@@ -1236,6 +1248,22 @@ async function loadAdminActivity() {
 }
 
 // ── Helper compartido: agrega métricas por user (usado por Comparator + Summaries) ──
+// Normaliza display names → emails (h.media_buyer="Diego" → "dhorovitz@adeqmedia.com")
+const NAME_TO_EMAIL = {
+  "diego":     "dhorovitz@adeqmedia.com",
+  "agus":      "sales@adeqmedia.com",
+  "agustina":  "sales@adeqmedia.com",
+  "max":       "mgargiulo@adeqmedia.com",
+  "maxi":      "mgargiulo@adeqmedia.com",
+  "maximiliano": "mgargiulo@adeqmedia.com",
+};
+function _normalizeUserKey(raw) {
+  if (!raw) return "unknown";
+  const lower = String(raw).toLowerCase().trim();
+  if (lower.includes("@")) return lower; // ya es email
+  return NAME_TO_EMAIL[lower] || lower; // mappeo o fallback al nombre
+}
+
 function _aggregateByUser(historial, usage, sessions) {
   const byUser = new Map();
   TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), {
@@ -1256,7 +1284,9 @@ function _aggregateByUser(historial, usage, sessions) {
     return byUser.get(u);
   };
   historial.forEach(h => {
-    const u = (h.media_buyer || h.user_email || h.created_by || "unknown").toLowerCase();
+    // Preferir user_email (siempre email) sobre media_buyer (display name).
+    // Antes: media_buyer="Diego" pisaba a user_email → duplicaba con sessions.
+    const u = _normalizeUserKey(h.user_email || h.created_by || h.media_buyer);
     const o = ensure(u);
     o.sites++;
     if (h.source === "autopilot") o.autopilotSites++; else o.manualSites++;
@@ -1269,13 +1299,13 @@ function _aggregateByUser(historial, usage, sessions) {
     else if (traffic > 0)  o.below500k++;
   });
   usage.forEach(r => {
-    const o = ensure((r.user_email || "unknown").toLowerCase());
+    const o = ensure(_normalizeUserKey(r.user_email));
     o.emails += parseInt(r.by_provider?._emails_sent  || 0, 10);
     o.monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
     o.claude += parseInt(r.by_provider?.anthropic     || 0, 10);
   });
   sessions.forEach(s => {
-    const o = ensure((s.user_email || "unknown").toLowerCase());
+    const o = ensure(_normalizeUserKey(s.user_email));
     if (s.kind === "autopilot") o.apSec   += s.duration_sec || 0;
     if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
   });

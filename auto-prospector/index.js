@@ -4314,6 +4314,7 @@ async function runAgentCycle(token, allFlags) {
         // 2. Decidir source: 80% template, 20% Claude (configurable via agent_claude_percent)
         const claudePercent = parseInt(cfg.agent_claude_percent || "20", 10);
         const source = pickPitchSource(claudePercent);
+        log(`  🎲 ${domain}: source=${source} (claudePct=${claudePercent}) lang=${lead.language}`);
         let pitch;
         if (source === "claude") {
           // Variedad estilística — A/B test futuro
