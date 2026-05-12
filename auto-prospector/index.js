@@ -581,6 +581,107 @@ async function refreshOneEmptyLead(token, cfg) {
   }
 }
 
+// ── Backfill missing fields ────────────────────────────────────
+// Job: si toolbar_config.agent_backfill_missing=true, busca leads pending con
+// language/contact_name/category/title/ad_networks/score vacíos y los completa
+// usando fetchPageContent + Apollo + detectLanguageRobust + scoreWebsite.
+// Cache 90d traffic + 7d Apollo → mayoría son hits gratis.
+const BACKFILL_BATCH = 5;
+async function backfillMissingFields(token, cfg) {
+  const flag = cfg.agent_backfill_missing === "true";
+  if (!flag) return;
+  const apollo_api_key = cfg.apollo_api_key;
+
+  try {
+    // Buscar leads pending con AL MENOS 1 campo crítico vacío
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(language.is.null,language.eq.,contact_name.is.null,contact_name.eq.,category.is.null,category.eq.,page_title.is.null,page_title.eq.,score.eq.0,score.is.null)&select=id,domain,traffic,geo,language,category,page_title,ad_networks,emails,contact_name,score,status&order=created_at.asc&limit=${BACKFILL_BATCH}`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      log("✅ Backfill missing: completado, no quedan leads incompletos. Apagando flag.");
+      await setConfigValue(token, "agent_backfill_missing", "false");
+      return;
+    }
+    log(`🔧 Backfill missing batch: ${rows.length} leads`);
+
+    await Promise.all(rows.map(async (lead) => {
+      try {
+        const patch = {};
+        // 1) Page content (title, ad_networks, category, htmlLang, ogLocale, textSample)
+        const needsPage = !lead.category || !lead.page_title || !lead.ad_networks || (Array.isArray(lead.ad_networks) && lead.ad_networks.length === 0);
+        let pageContent = null;
+        if (needsPage) {
+          pageContent = await fetchPageContent(lead.domain).catch(() => null);
+          if (pageContent) {
+            if (!lead.page_title && pageContent.title) { patch.page_title = pageContent.title; lead.page_title = pageContent.title; }
+            if (!lead.category && pageContent.category) { patch.category = pageContent.category; lead.category = pageContent.category; }
+            if ((!lead.ad_networks || lead.ad_networks.length === 0) && pageContent.adNetworks?.length) {
+              patch.ad_networks = pageContent.adNetworks;
+              lead.ad_networks = pageContent.adNetworks;
+            }
+          }
+        }
+        // 2) Language (usar pageContent si lo trajimos, sino fallback geo/tld)
+        if (!lead.language || lead.language === "") {
+          const det = detectLanguageRobust({
+            htmlLang:   pageContent?.htmlLang,
+            ogLocale:   pageContent?.ogLocale,
+            textSample: pageContent?.textSample,
+            geo:        lead.geo,
+            domain:     lead.domain,
+          });
+          patch.language = det.lang;
+          lead.language = det.lang;
+        }
+        // 3) Contact name (Apollo cache 7d → gratis si ya existió)
+        if ((!lead.contact_name || lead.contact_name === "") && apollo_api_key) {
+          try {
+            const apolloEmails = await findAllEmails(lead.domain, apollo_api_key, token);
+            const name = apolloEmails && apolloEmails.contact_name;
+            if (name) { patch.contact_name = name; lead.contact_name = name; }
+            // Si trajo emails nuevos que no estaban, sumarlos
+            if (Array.isArray(apolloEmails) && apolloEmails.length > 0) {
+              const existing = new Set((lead.emails || []).filter(Boolean));
+              const newEmails = apolloEmails.filter(e => !existing.has(e));
+              if (newEmails.length) {
+                patch.emails = [...new Set([...apolloEmails, ...(lead.emails || [])])];
+                lead.emails = patch.emails;
+              }
+            }
+          } catch {}
+        }
+        // 4) Score (sync, sin API)
+        if (!lead.score || lead.score === 0) {
+          const sw = scoreWebsite(lead);
+          if (sw.score < 0) {
+            // gate hit (geo/cat blocked) — marcar como rejected
+            patch.status = "rejected";
+            patch.validated_by = "agent:backfill";
+            patch.validated_at = new Date().toISOString();
+            log(`  ❌ ${lead.domain}: rejected (${sw.reasons.join(",")})`);
+          } else {
+            patch.score = sw.score;
+            log(`  ⭐ ${lead.domain}: ${sw.stars}★ score=${sw.score} lang=${lead.language}`);
+          }
+        }
+        if (Object.keys(patch).length > 0) {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify(patch),
+          });
+        }
+      } catch (e) {
+        log(`  ⚠️ ${lead.domain} backfill err: ${e.message}`);
+      }
+    }));
+  } catch (e) {
+    log(`⚠️ backfillMissingFields error: ${e.message}`);
+  }
+}
+
 // ── Stats en vivo del autopilot, persistidas a toolbar_config ─────
 // Los popups de los MBs leen estas keys cada 30s y muestran el progreso.
 let _autopilotStatsLocal = { processed: 0, added: 0, filtered: 0, lastDomain: "", lastUpdate: 0, sessionUser: "" };
@@ -3926,7 +4027,10 @@ async function main() {
       try {
         const cfgRefresh = await getConfig(token);
         await refreshOneEmptyLead(token, cfgRefresh);
-      } catch (e) { log(`⚠️ refreshOneEmptyLead: ${e.message}`); }
+        // Backfill missing fields (language/contact_name/category/score) — corre
+        // en paralelo lógico con refresh de tráfico. Ambos terminan rápido (paralelo).
+        await backfillMissingFields(token, cfgRefresh);
+      } catch (e) { log(`⚠️ refresh+backfill: ${e.message}`); }
 
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);
