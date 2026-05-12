@@ -1753,35 +1753,69 @@ async function refreshApolloFooterCounter() {
   } catch {}
 }
 
-function _showApolloWarningBanner({ used, limit, period, pct }) {
+// Estado in-memory para combinar SW + Apollo en un solo banner.
+// Cada provider reporta su {pct, used, limit, period}; el banner muestra el más crítico.
+const _capState = { sw: null, apollo: null };
+function _refreshCombinedCapBanner() {
   const banner = document.getElementById("rapidapi-cap-banner");
   const title  = document.getElementById("cap-banner-title");
   const detail = document.getElementById("cap-banner-detail");
   const icon   = document.getElementById("cap-banner-icon");
   if (!banner || !title) return;
-  // Solo mostrar si SW no está mostrando alerta (no pisar)
-  if (banner.style.display === "flex" && /SimilarWeb|RapidAPI/.test(title.textContent)) return;
-  banner.classList.remove("cap-warning","cap-danger","cap-reached");
-  if (pct >= 100)      { banner.classList.add("cap-reached"); icon.textContent = "⛔"; title.textContent = "Apollo cap reached — unlocks paused"; }
-  else if (pct >= 75)  { banner.classList.add("cap-danger");  icon.textContent = "⚠️"; title.textContent = `Apollo at ${pct.toFixed(0)}% of monthly cap`; }
-  detail.textContent = ` — ${used} of ${limit} unlocks in ${period}. Heads up.`;
+
+  // Pick el provider con mayor pct (entre los que pasan threshold 75%)
+  const candidates = [];
+  if (_capState.sw     && _capState.sw.pct     >= 75) candidates.push({ name: "SimilarWeb", ..._capState.sw });
+  if (_capState.apollo && _capState.apollo.pct >= 75) candidates.push({ name: "Apollo",     ..._capState.apollo });
+  if (candidates.length === 0) { banner.style.display = "none"; return; }
+
+  candidates.sort((a, b) => b.pct - a.pct);
+  const top = candidates[0];
+  const others = candidates.slice(1);
+
+  banner.classList.remove("cap-warning", "cap-danger", "cap-reached");
+  if (top.pct >= 100)     { banner.classList.add("cap-reached"); icon.textContent = "⛔"; }
+  else if (top.pct >= 90) { banner.classList.add("cap-danger");  icon.textContent = "⚠️"; }
+  else                    { banner.classList.add("cap-warning"); icon.textContent = "⚠️"; }
+
+  const reached = top.pct >= 100;
+  title.textContent = reached
+    ? `${top.name} cap reached — paused`
+    : `${top.name} at ${top.pct.toFixed(0)}% of monthly cap`;
+  let detailText = ` — ${top.used.toLocaleString()} / ${top.limit.toLocaleString()} in ${top.period}.`;
+  if (others.length) {
+    detailText += ` (also ${others.map(o => `${o.name} ${o.pct.toFixed(0)}%`).join(", ")})`;
+  }
+  detail.textContent = detailText;
   banner.style.display = "flex";
+}
+
+function _showApolloWarningBanner({ used, limit, period, pct }) {
+  _capState.apollo = { used, limit, period, pct };
+  _refreshCombinedCapBanner();
 }
 
 // ---- RapidAPI monthly usage banner (3 niveles: 50% / 80% / 100%) ----
 function renderRapidApiUsageBanner({ used, limit, period, scope } = {}) {
   const banner = document.getElementById("rapidapi-cap-banner");
+  if (!banner || used == null || limit == null) return;
+  const pct = limit > 0 ? (used / limit) * 100 : 0;
+
+  // Update shared state — el banner combinado decide qué mostrar
+  _capState.sw = { used, limit, period: period || new Date().toISOString().slice(0, 7), pct, scope };
+  // Si pct < 50% para SW, lo limpiamos para que Apollo solo se muestre
+  if (pct < 50) _capState.sw = null;
+  _refreshCombinedCapBanner();
+  // Caída temprana — el resto era código viejo que pisaba el banner combinado
+  return;
+
+  // (legacy unreachable — mantenemos por si necesitamos rollback)
+  // eslint-disable-next-line no-unreachable
   const icon   = document.getElementById("cap-banner-icon");
   const title  = document.getElementById("cap-banner-title");
   const detail = document.getElementById("cap-banner-detail");
-  if (!banner || used == null || limit == null) return;
-
-  const pct = limit > 0 ? (used / limit) * 100 : 0;
   banner.classList.remove("cap-warning", "cap-danger", "cap-reached");
-
-  // < 50% → no mostrar nada
   if (pct < 50) { banner.style.display = "none"; return; }
-
   banner.style.display = "flex";
   const usedStr  = used.toLocaleString();
   const limitStr = limit.toLocaleString();
@@ -5394,7 +5428,7 @@ async function initCsvQueue() {
     const st = await import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => null);
     if (st && st.enabled && st.sessionUser
         && st.sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()) {
-      alert(`🔒 ${st.sessionUser} prendió Auto Import. Solo ese usuario puede apagarlo.`);
+      alert(`🔒 ${st.sessionUser} turned on Auto Import. Only that user can turn it off.`);
       enabledCbx.checked = true; // forzar a quedar visualmente ON
       return;
     }
@@ -5613,7 +5647,7 @@ async function initSellersJsonImport(refreshAll) {
       if (!url.includes("sellers.json")) errors.push(`Línea ${i + 1}: la URL debería terminar en /sellers.json`);
       parsed.push({ name: m[1].trim(), url });
     });
-    if (parsed.length === 0) { modalStat.style.color = "#dc2626"; modalStat.textContent = "❌ Sin entries válidos."; return; }
+    if (parsed.length === 0) { modalStat.style.color = "#dc2626"; modalStat.textContent = "❌ No valid entries."; return; }
     await saveList(parsed);
     await renderSelect();
     modalStat.style.color = errors.length ? "#d97706" : "#16a34a";
@@ -5640,7 +5674,7 @@ async function initSellersJsonImport(refreshAll) {
     const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 500
     const space = _capacityTotal - _csvPending - _csvWaiting;
     if (space <= 0) {
-      resEl.innerHTML = `<span style="color:#dc2626">❌ Sistema saturado: ${_csvPending}/${CSV_PENDING_CAP} procesando + ${_csvWaiting}/${WAITLIST_CAP} esperando. Esperá que el worker procese antes de cargar más.</span>`;
+      resEl.innerHTML = `<span style="color:#dc2626">❌ System saturated: ${_csvPending}/${CSV_PENDING_CAP} processing + ${_csvWaiting}/${WAITLIST_CAP} waiting. Wait for worker before adding more.</span>`;
       return;
     }
     const allowed = Math.min(cap, space);
@@ -5717,12 +5751,12 @@ async function initSellersJsonImport(refreshAll) {
         return;
       }
       const slice = fresh.slice(0, N);
-      resEl.innerHTML = `🪟 Abriendo ${N} pestañas (delay 400ms para que Chrome no las bloquee)...`;
+      resEl.innerHTML = `🪟 Opening ${N} tabs (400ms delay so Chrome doesn't block them)...`;
       slice.forEach((domain, i) => {
         setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);
       });
       const left = fresh.length - N;
-      resEl.innerHTML = `<span style="color:#16a34a">✅ ${N} pestañas abiertas${left > 0 ? `. ${left} frescos sin abrir (cap ${SELLERS_OPEN_TABS_CAP}/click).` : "."}</span>`;
+      resEl.innerHTML = `<span style="color:#16a34a">✅ ${N} tabs opened${left > 0 ? `. ${left} fresh ones not opened (cap ${SELLERS_OPEN_TABS_CAP}/click).` : "."}</span>`;
     } catch (e) {
       resEl.innerHTML = `<span style="color:#dc2626">❌ Error: ${esc(e.message || String(e))}</span>`;
     } finally {
@@ -5889,7 +5923,7 @@ function renderDraftChips(containerEl, { activeId = null, preferredLang = null, 
   if (!containerEl) return;
   const all = _draftsState.all || [];
   if (all.length === 0) {
-    containerEl.innerHTML = `<div class="draft-chips-empty">Sin borradores. Creá uno desde 📝 (header).</div>`;
+    containerEl.innerHTML = `<div class="draft-chips-empty">No drafts. Create one from 📝 (header).</div>`;
     return;
   }
   // Ordenar: idioma preferido primero (por priority), después el resto agrupado por idioma
@@ -6058,7 +6092,7 @@ function initPitchDrafts() {
   const renderList = (drafts) => {
     lastDrafts = drafts;
     if (drafts.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">Sin borradores. Creá el primero abajo.</div>';
+      listEl.innerHTML = '<div style="color:var(--text-muted);font-style:italic;padding:8px">No drafts. Create the first one below.</div>';
       return;
     }
     // Agrupar por idioma para que se vea más prolijo
@@ -6194,7 +6228,7 @@ function renderRailwayDeadBanner({ heartbeatAt, autopilotEnabled, csvEnabled }) 
   }
   const ageLabel = ageMs === Infinity ? "nunca" : (ageMs > 3600_000 ? `${Math.round(ageMs/3600_000)}h` : `${Math.round(ageMs/60_000)}m`);
   const which = [autopilotEnabled && "Autopilot", csvEnabled && "Auto Import"].filter(Boolean).join(" + ");
-  el.textContent = `⚠️ ${which} ON pero Railway no responde hace ${ageLabel}. Apagá y volvé a prender el toggle, o revisá Railway dashboard.`;
+  el.textContent = `⚠️ ${which} ON but Railway hasn't responded in ${ageLabel}. Toggle OFF and ON, or check Railway dashboard.`;
 }
 
 async function pollRailwayDeadBanner() {
@@ -6342,7 +6376,7 @@ async function initAutopilot() {
           && cur.heartbeatAt && (Date.now() - cur.heartbeatAt.getTime()) < 120_000) {
         const elapsed = cur.sessionStart ? Math.round((Date.now() - cur.sessionStart.getTime()) / 60000) : 0;
         const remaining = Math.max(0, 60 - elapsed);
-        alert(`🔒 ${cur.sessionUser} ya tiene Autopilot corriendo (hace ${elapsed} min · termina en ~${remaining} min).\n\nNo se puede prender 2 autopilots a la vez. Esperá a que termine o pedile que lo apague.`);
+        alert(`🔒 ${cur.sessionUser} already has Autopilot running (started ${elapsed} min ago · ends in ~${remaining} min).\n\nCannot run 2 autopilots at once. Wait for it to finish or ask them to turn it off.`);
         return;
       }
       // Turn on
@@ -6650,7 +6684,7 @@ async function loadProspectsTab() {
         </div>
       </div>
     `;
-    if (statsEl) statsEl.textContent = `🎉 ${sentFromProspects}/${DAILY_SEND_CAP} de Prospects — seguí en Analytics`;
+    if (statsEl) statsEl.textContent = `🎉 ${sentFromProspects}/${DAILY_SEND_CAP} from Prospects — keep going in Analytics`;
     return;
   }
 
@@ -6807,7 +6841,7 @@ function renderProspectCard(r) {
   } else if (_trafficN >= 400_000 && _hasEmail && (_hasAdNet || score >= 40)) {
     tempBadge = `<span title="☀️ WARM lead — vale el outreach" style="font-size:11px;flex-shrink:0">☀️</span>`;
   } else if (!_hasEmail && _trafficN < 400_000) {
-    tempBadge = `<span title="❄️ COLD lead — sin email y bajo tráfico, evaluá si vale el esfuerzo" style="font-size:11px;flex-shrink:0;opacity:0.7">❄️</span>`;
+    tempBadge = `<span title="❄️ COLD lead — no email + low traffic, evaluate if worth the effort" style="font-size:11px;flex-shrink:0;opacity:0.7">❄️</span>`;
   }
 
   const emailOptions = emails.map((e, i) => `
@@ -6904,7 +6938,7 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
-        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Re-fetch tráfico + emails Apollo (igual que Analysis). Útil si los datos guardados parecen incompletos." style="padding:3px 7px;font-size:10px">🔍 Data</button>
+        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Re-fetch traffic + Apollo emails (same as Analysis). Useful if saved data looks incomplete." style="padding:3px 7px;font-size:10px">🔍 Data</button>
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -6989,7 +7023,7 @@ function renderProspectCard(r) {
             <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
           </div>
         </div>
-        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Borrador del idioma se autocarga acá...">${esc(r.pitch || "")}</textarea>
+        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Language draft auto-loads here...">${esc(r.pitch || "")}</textarea>
 
         <div class="pitch-actions" style="margin-top:6px">
           <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate Pitch" : "✨ Generate Pitch"}</button>
@@ -7014,7 +7048,7 @@ function renderProspectCard(r) {
         <label class="form-label">Date</label>
         <input type="text" class="form-input pcard-date" value="${toDisplayDate(new Date().toISOString().split("T")[0])}" placeholder="DD/MM/YYYY" maxlength="10" style="font-size:11px;padding:4px 7px" title="Auto-completada con hoy — editable" />
         <label class="form-label">Traffic</label>
-        <input type="text" class="form-input pcard-traffic" value="${esc(r.traffic ? formatTraffic(r.traffic) : "")}" placeholder="ej: 500K, 1.2M, 3500000" style="font-size:11px;padding:4px 7px" title="Editable — si SimilarWeb no devolvió, completá manualmente. Acepta '500K', '1.2M' o número crudo." />
+        <input type="text" class="form-input pcard-traffic" value="${esc(r.traffic ? formatTraffic(r.traffic) : "")}" placeholder="e.g. 500K, 1.2M, 3500000" style="font-size:11px;padding:4px 7px" title="Editable — fill manually if SimilarWeb didn't return data. Accepts '500K', '1.2M' or raw number." />
       </div>
 
       <!-- Action buttons in panel -->
@@ -7023,7 +7057,7 @@ function renderProspectCard(r) {
         <button type="button" class="pcard-like-btn" title="👍 Like — autopilot prioriza este tipo de lead" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👍</button>
         <button type="button" class="pcard-dislike-btn" title="👎 Dislike — el agente evita este tipo + el RAG aprende del feedback" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👎</button>
       </div>
-      <textarea class="pcard-dislike-reason" placeholder="¿Qué falló en este lead/pitch? (opcional, ayuda al RAG)" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
+      <textarea class="pcard-dislike-reason" placeholder="What failed in this lead/pitch? (optional, helps RAG)" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
       <div class="pcard-result" style="min-height:14px;font-size:11px;margin-top:5px;color:#16a34a"></div>
     </div>
 
@@ -7153,7 +7187,7 @@ function initProspectCard(card, data) {
         card.replaceWith(newCard);
         initProspectCard(newCard, data);
       } else {
-        btn.textContent = "Sin más data";
+        btn.textContent = "No more data";
         setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Data"; }, 2000);
       }
     } catch (err) {
@@ -7175,7 +7209,7 @@ function initProspectCard(card, data) {
       const lock = await getActiveProspectLock(state.accessToken, data.domain);
       if (lock && lock.locked_by.toLowerCase() !== (state.loginEmail || "").toLowerCase()) {
         const minLeft = Math.max(0, Math.round((new Date(lock.expires_at) - Date.now()) / 60000));
-        showToast(`🔒 ${lock.locked_by} está revisando este prospecto (${minLeft} min). Coordiná antes de pushear.`, "warn", 6000);
+        showToast(`🔒 ${lock.locked_by} is reviewing this prospect (${minLeft} min). Coordinate before pushing.`, "warn", 6000);
       } else {
         lockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
       }
@@ -7889,7 +7923,7 @@ async function initProspectsTab() {
     domains.forEach((domain, i) => {
       setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);
     });
-    showToast(`🪟 Abriendo ${domains.length} pestañas...`, "info");
+    showToast(`🪟 Opening ${domains.length} tabs...`, "info");
   });
   document.getElementById("btn-bulk-reject")?.addEventListener("click", async () => {
     const checked = [...document.querySelectorAll(".pcard-bulk-cbx:checked")];
