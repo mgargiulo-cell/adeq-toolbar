@@ -398,10 +398,10 @@ function initAdminPanel() {
       if (tab === "blocklist") loadAdminBlocklist();
     });
   });
-  // Wire activity filters
-  document.getElementById("admin-filter-period")?.addEventListener("change", loadAdminActivity);
-  document.getElementById("admin-filter-user")?.addEventListener("change", loadAdminActivity);
-  document.getElementById("admin-refresh-stats")?.addEventListener("click", loadAdminActivity);
+  // Wire activity filters — refresh stats + agent feed (que usa el mismo filtro user)
+  document.getElementById("admin-filter-period")?.addEventListener("change", () => { loadAdminActivity(); _refreshAgentFeed(); });
+  document.getElementById("admin-filter-user")?.addEventListener("change",   () => { loadAdminActivity(); _refreshAgentFeed(); });
+  document.getElementById("admin-refresh-stats")?.addEventListener("click",  () => { loadAdminActivity(); _refreshAgentFeed(); });
   // Wire limits
   document.getElementById("admin-add-user-limit")?.addEventListener("click", () => addAdminLimitRow());
   document.getElementById("admin-global-caps-save")?.addEventListener("click", saveAdminGlobalCaps);
@@ -415,6 +415,7 @@ function initAdminPanel() {
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
   document.getElementById("agent-refresh-toggle")?.addEventListener("click", toggleRefreshEmptyLeads);
+  document.getElementById("agent-feed-export-csv")?.addEventListener("click", _exportAgentFeedCsv);
   document.getElementById("admin-export-comparator-csv")?.addEventListener("click", exportComparatorCsv);
   document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
@@ -883,10 +884,14 @@ async function _refreshAgentFeed() {
   if (!wrap) return;
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   try {
+    // Filtro por user opcional: si el admin filtró por user en Activity tab,
+    // respetamos ese filtro acá también. Default = todos los agentes.
+    const userFilter = (document.getElementById("admin-filter-user")?.value || "").trim();
+    const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
     // SOLO acciones reales del agente: sent / failed / skipped / monday_failed / monday_ok
     // (excluimos 'reserved' que es solo audit trail interno y duplica con 'sent').
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,failed,skipped,monday_failed,monday_ok,kill_switch)&select=*&order=created_at.desc&limit=50`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,failed,skipped,monday_failed,monday_ok,kill_switch)${userClause}&select=*&order=created_at.desc&limit=50`,
       { headers }
     );
     if (!res.ok) {
@@ -919,6 +924,39 @@ async function _refreshAgentFeed() {
   } catch (e) {
     wrap.innerHTML = `<div style="color:#f87171">Error: ${esc(e.message || String(e))}</div>`;
   }
+}
+
+function _exportAgentFeedCsv() {
+  const rows = window._lastAgentFeedRows || [];
+  if (rows.length === 0) { alert("No actions loaded yet."); return; }
+  const csvCell = (v) => {
+    if (v == null) return "";
+    const s = String(v).replace(/"/g, '""');
+    return `"${s}"`;
+  };
+  const headers = ["created_at", "user_email", "domain", "action", "reason", "email_to", "pitch_subject", "traffic", "geo", "language"];
+  const lines = [headers.join(",")];
+  rows.forEach(r => {
+    lines.push([
+      csvCell(r.created_at),
+      csvCell(r.user_email),
+      csvCell(r.domain),
+      csvCell(r.action),
+      csvCell(r.reason),
+      csvCell(r.details?.email),
+      csvCell(r.pitch_subject),
+      csvCell(r.details?.traffic),
+      csvCell(r.details?.geo),
+      csvCell(r.details?.language),
+    ].join(","));
+  });
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url;
+  a.download = `agent_actions_${new Date().toISOString().split("T")[0]}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function toggleAgent(e) {
