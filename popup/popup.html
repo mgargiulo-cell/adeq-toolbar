@@ -50,14 +50,11 @@
 
 <!-- HEADER -->
 <header class="header">
-  <div class="logo">
+  <div class="logo" title="Triple-click for admin">
     <img src="../icons/adeq-logo.png" alt="ADEQ" class="header-logo-img" onerror="this.style.display='none'" />
-    <span class="logo-text">ADEQ</span>
-    <span class="logo-sub">TOOLBAR</span>
   </div>
+  <div id="site-url" class="site-url-pill">loading...</div>
   <div class="header-right">
-    <div id="site-url" class="site-url">loading...</div>
-    <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab" aria-label="Re-analyze current tab">↻</button>
     <button id="btn-history-open" class="icon-btn" title="History" aria-label="Open history">🕐</button>
     <button id="btn-pitch-draft" class="icon-btn" title="Pitch drafts" aria-label="Open drafts">📝</button>
     <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
@@ -405,7 +402,10 @@
 
   <!-- CARD 1: TRAFFIC -->
   <section class="card">
-    <div class="card-title"><span class="icon">📊</span> Monthly Traffic</div>
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span><span class="icon">📊</span> Monthly Traffic</span>
+      <button id="btn-refresh" class="btn-refresh-pill" title="Re-analyze current tab — fetches fresh data">↻ REFRESH</button>
+    </div>
     <div class="traffic-row">
       <div id="traffic-result" class="metric loading">--</div>
       <div id="traffic-unit" class="traffic-unit">pages/mo</div>

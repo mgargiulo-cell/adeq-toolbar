@@ -347,7 +347,7 @@ function wireAdminViewToggle() {
   if (!logo || logo._adminWired) return;
   logo._adminWired = true;
   logo.style.cursor = "pointer";
-  logo.title = "Triple-click para abrir Admin Panel";
+  logo.title = "Triple-click for admin";
 
   let clicks = 0; let timer = null;
   logo.addEventListener("click", () => {
@@ -1324,15 +1324,15 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
   // Definición de filas: { label, group, get(mb) → value, fmt(value) → display, isBest higher/lower, colorFn(value) → class }
   const groups = [
     {
-      title: "VOLUMEN",
+      title: "VOLUME",
       rows: [
-        { label: "Sitios analizados",  get: m => m.sites,  fmt: v => v.toLocaleString() },
-        { label: "Manual / Autopilot", get: m => m.manualSites + m.autopilotSites, fmt: (_, m) => `${m.manualSites} / ${m.autopilotSites}` },
-        { label: "Tiempo Autopilot",   get: m => m.apSec,  fmt: v => fmtTime(v) },
+        { label: "Sites analyzed",         get: m => m.sites, fmt: v => v.toLocaleString() },
+        { label: "Analysis / Prospects",   get: m => m.manualSites + m.autopilotSites, fmt: (_, m) => `${m.manualSites} / ${m.autopilotSites}`, _help: "Analysis = manual from Analysis tab. Prospects = picked from review_queue (autopilot/csv import)." },
+        { label: "Autopilot time",         get: m => m.apSec, fmt: v => fmtTime(v) },
       ],
     },
     {
-      title: "CALIDAD",
+      title: "QUALITY",
       rows: [
         { label: "% +500K visits", get: m => m.sites ? Math.round((m.above500k / m.sites) * 100) : 0, fmt: v => `${v}%` },
         { label: "Top GEO",        get: m => Object.values(m.geos).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.geos), noBar: true },
@@ -1342,15 +1342,15 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
     {
       title: "OUTREACH",
       rows: [
-        { label: "Emails enviados",   get: m => m.emails, fmt: v => v.toLocaleString() },
-        { label: "Pushes Monday",     get: m => m.monday, fmt: v => v.toLocaleString() },
-        { label: "Conv. push/site",   get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
+        { label: "Emails sent",        get: m => m.emails, fmt: v => v.toLocaleString() },
+        { label: "Monday pushes",      get: m => m.monday, fmt: v => v.toLocaleString() },
+        { label: "Conv. push/site",    get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
       ],
     },
     {
-      title: "EFICIENCIA",
+      title: "EFFICIENCY",
       rows: [
-        { label: "Pitches Claude", get: m => m.claude, fmt: v => v.toLocaleString() },
+        { label: "Claude pitches", get: m => m.claude, fmt: v => v.toLocaleString() },
         { label: "Mails / Push",   get: m => m.monday ? Math.round((m.emails / m.monday) * 10) / 10 : 0, fmt: v => v ? v.toFixed(1) : "—" },
       ],
     },
@@ -2333,11 +2333,20 @@ async function runDuplicateCheck() {
     state.duplicate = result;
 
     if (result.found) {
-      el.textContent = `⚠️ DUPLICADO · ${result.status} · ${result.ejecutivo || "—"}`;
+      el.textContent = `⚠️ DUPLICATE · ${result.status} · ${result.ejecutivo || "—"}`;
       el.className   = "status-badge duplicate";
       state.mondayItemId = result.itemId;
       fillMondayFormFromDuplicate(result);
       document.getElementById("btn-push-monday").textContent = "🔄 Update in Monday";
+
+      // Si es duplicado re-prospectable (Ciclo Finalizado / Mail No Enviado),
+      // los datos en Monday pueden tener meses → forzar refresh de tráfico.
+      // Esto sobreescribe el cache 90d y trae fresh de RapidAPI.
+      const reprospectable = /ciclo\s*finalizado|mail\s*no\s*enviado/i.test(result.status || "");
+      if (reprospectable) {
+        console.log(`[Duplicate] reprospectable status (${result.status}) → forzando refresh de tráfico`);
+        runTrafficCheck({ forceRefresh: true }).catch(() => {});
+      }
     } else {
       el.textContent = "✅ Nuevo prospecto";
       el.className   = "status-badge new";
@@ -2461,7 +2470,8 @@ function enrichTrafficWithPageSignals(trafficData) {
   return trafficData;
 }
 
-async function runTrafficCheck() {
+async function runTrafficCheck(opts = {}) {
+  const { forceRefresh = false } = opts;
   const metricEl    = document.getElementById("traffic-result");
   const unitEl      = document.getElementById("traffic-unit");
   const breakdownEl = document.getElementById("traffic-breakdown");
@@ -2469,13 +2479,13 @@ async function runTrafficCheck() {
   const filterEl    = document.getElementById("traffic-filter");
 
   try {
-    // Caché de sesión primero — mismo dominio, distinta subpágina
-    const sess = await getSessionCache(state.domain);
+    // Caché de sesión primero — mismo dominio, distinta subpágina (salvo forceRefresh)
+    const sess = forceRefresh ? null : await getSessionCache(state.domain);
     let data;
     if (sess?.trafficData) {
       data = { ...sess.trafficData, fromCache: true, cachedDaysAgo: sess.trafficData.cachedDaysAgo ?? 0 };
     } else {
-      data = await getTraffic(state.domain);
+      data = await getTraffic(state.domain, { forceRefresh });
     }
     if (!data) {
       metricEl.textContent = "No data"; metricEl.className = "metric";
@@ -4111,10 +4121,24 @@ async function openSettings() {
   if (promptSection) promptSection.style.display = isAdmin ? "" : "none";
   if (isAdmin) {
     const promptEl = document.getElementById("settings-custom-prompt");
-    if (promptEl) promptEl.value = state.customPrompt || "";
     const statusEl = document.getElementById("custom-prompt-status");
+    if (promptEl) {
+      // Re-fetch del DB cada vez que se abre el modal para mostrar la versión vigente
+      // (no la baked). Si el user actualizó vía SQL externo, lo refleja al instante.
+      try {
+        const fresh = await getCustomPrompt(state.accessToken, GLOBAL_PROMPT_KEY);
+        if (fresh && fresh.trim()) {
+          state.customPrompt = fresh;
+          promptEl.value = fresh;
+        } else {
+          promptEl.value = state.customPrompt || "";
+        }
+      } catch {
+        promptEl.value = state.customPrompt || "";
+      }
+    }
     if (statusEl) statusEl.textContent = state.customPrompt
-      ? `${state.customPrompt.length} chars saved (GLOBAL — afecta a todo el equipo)`
+      ? `${state.customPrompt.length} chars saved (GLOBAL — affects the whole team)`
       : "empty";
   }
 

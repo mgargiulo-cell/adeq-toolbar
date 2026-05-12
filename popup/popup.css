@@ -229,7 +229,8 @@ a:hover { text-decoration: underline; }
   flex-shrink: 0;
   box-shadow: 0 1px 0 rgba(0,0,0,0.04);
 }
-.logo         { display: flex; align-items: center; gap: var(--sp-2); }
+.logo         { display: flex; align-items: center; cursor: pointer; flex-shrink: 0; }
+.logo .header-logo-img { height: 28px; width: 28px; }
 .logo-text    { font-size: var(--fs-xl); font-weight: 900; color: #38bdf8; letter-spacing: 3px; }
 .logo-sub     {
   font-size: var(--fs-xs); font-weight: 700; color: #34d399;
@@ -238,7 +239,44 @@ a:hover { text-decoration: underline; }
   border: 1px solid rgba(52,211,153,0.25);
   padding: 2px 7px; border-radius: var(--r-sm);
 }
-.header-right { display: flex; align-items: center; gap: var(--sp-2); }
+.header-right { display: flex; align-items: center; gap: var(--sp-2); flex-shrink: 0; }
+
+/* URL pill — central, button-styled, current analyzed URL */
+.site-url-pill {
+  flex: 1;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: #38bdf8;
+  background: rgba(56,189,248,0.10);
+  border: 1px solid rgba(56,189,248,0.30);
+  padding: 6px 14px;
+  border-radius: var(--r-pill);
+  margin: 0 var(--sp-3);
+  text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: all var(--t-fast);
+  cursor: default;
+  letter-spacing: 0.2px;
+}
+.site-url-pill:hover { background: rgba(56,189,248,0.16); border-color: rgba(56,189,248,0.45); }
+
+/* REFRESH button — green pill, prominent, in card title */
+.btn-refresh-pill {
+  background: #16a34a;
+  color: #fff;
+  border: none;
+  border-radius: var(--r-pill);
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all var(--t-fast);
+  box-shadow: 0 1px 3px rgba(22,163,74,0.3);
+}
+.btn-refresh-pill:hover { background: #15803d; box-shadow: 0 2px 6px rgba(22,163,74,0.5); }
+.btn-refresh-pill:active { transform: translateY(1px); }
+.btn-refresh-pill:disabled { background: #94a3b8; cursor: not-allowed; box-shadow: none; }
 
 /* Banner de uso mensual de RapidAPI — 3 niveles: warning / danger / reached */
 .cap-banner {

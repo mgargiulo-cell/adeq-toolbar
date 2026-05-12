@@ -270,7 +270,8 @@ function estimatePagesPerVisit(category) {
 }
 
 // ── getTraffic ────────────────────────────────────────────────
-export async function getTraffic(domain) {
+export async function getTraffic(domain, opts = {}) {
+  const { forceRefresh = false } = opts;
   const cleanDomain = domain
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
@@ -283,8 +284,8 @@ export async function getTraffic(domain) {
     return { visits: 0, pagesPerVisit: null, pageViews: 0, monthly: 0, rawVisits: 0, noPageViewData: true, ppvSource: null, estimatedPages: false, category: "", topCountries: [], blocked: true, blockedReason: block.reason };
   }
 
-  // Caché primero (90 días)
-  const cached = await getTrafficCache(cleanDomain);
+  // Caché primero (90 días) — salvo forceRefresh
+  const cached = forceRefresh ? null : await getTrafficCache(cleanDomain);
   if (cached) {
     // Si el caché no tiene geo, inferir por TLD (sin gastar API)
     if (!cached.topCountries?.length) {
