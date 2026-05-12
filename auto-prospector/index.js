@@ -2109,18 +2109,38 @@ const MULTI_PART_TLDS = new Set([
   "com.ar","com.br","com.mx","com.co","com.pe","com.uy","com.ec","com.ve","com.bo",
   "com.es","com.au","com.cn","com.tw","com.hk","com.sg","com.my","com.tr","com.eg",
   "com.sa","com.ng","com.za","com.ph","com.vn","com.pk","com.gt","com.do","com.pa",
-  "com.gh","com.ke","com.uy",
+  "com.gh","com.ke","com.uy","com.bd","com.np","com.lk","com.kh","com.kw","com.qa",
+  "com.lb","com.jo","com.om","com.ye","com.ly","com.tn","com.dz",
   "co.uk","co.za","co.in","co.kr","co.jp","co.il","co.nz","co.id","co.cr","co.ve",
+  "co.th","co.ke","co.tz","co.ug","co.zw","co.ma","co.ao",
   // organization
   "org.uk","org.ar","org.br","org.mx","org.au","org.za","org.es","org.in","org.pl",
+  "org.cn","org.tw","org.kr","org.jp","org.tr","org.sg","org.my","org.ph","org.vn",
+  "org.pk","org.bd","org.np","org.lk","org.eg","org.sa","org.ae","org.il",
   // government — todos los .gov.X conocidos
   "gov.ar","gov.br","gov.mx","gov.co","gov.pe","gov.cl","gov.uy","gov.ec","gov.ve",
   "gov.bo","gov.au","gov.in","gov.uk","gov.za","gov.eg","gov.sa","gov.ng",
+  "gov.cn","gov.tw","gov.kr","gov.jp","gov.sg","gov.my","gov.ph","gov.vn","gov.pk",
+  "gov.bd","gov.np","gov.lk","gov.tr","gov.ae","gov.il","gov.tn","gov.ma",
   // academic
-  "ac.uk","ac.in","ac.za","ac.jp","ac.kr","ac.nz","edu.ar","edu.br","edu.mx",
-  "edu.co","edu.pe","edu.uy","edu.au","edu.in","edu.eg",
+  "ac.uk","ac.in","ac.za","ac.jp","ac.kr","ac.nz","ac.th","ac.id","ac.cn","ac.tw",
+  "ac.ir","ac.ae","ac.il","ac.bd","ac.lk","ac.np","ac.tz","ac.ke",
+  "edu.ar","edu.br","edu.mx","edu.co","edu.pe","edu.uy","edu.au","edu.in","edu.eg",
+  "edu.cn","edu.tw","edu.hk","edu.sg","edu.my","edu.ph","edu.vn","edu.pk","edu.bd",
+  "edu.np","edu.lk","edu.tr","edu.sa","edu.ae","edu.jo","edu.lb",
   // network/info per country
-  "net.ar","net.br","net.mx","net.au","net.in",
+  "net.ar","net.br","net.mx","net.au","net.in","net.cn","net.tw","net.kr","net.jp",
+  "net.sg","net.my","net.ph","net.vn","net.pk","net.bd","net.np","net.lk","net.eg",
+  "net.sa","net.ae","net.tr",
+  // .jp specific second-level (not just co.jp)
+  "or.jp","ne.jp","ad.jp","ed.jp","gr.jp","lg.jp","go.jp",
+  // .kr specific
+  "or.kr","ne.kr","go.kr","re.kr","pe.kr","es.kr","sc.kr","hs.kr","ms.kr",
+  // .cn specific
+  "ah.cn","bj.cn","cq.cn","fj.cn","gd.cn","gs.cn","gz.cn","gx.cn","ha.cn","hb.cn",
+  "he.cn","hi.cn","hk.cn","hl.cn","hn.cn","jl.cn","js.cn","jx.cn","ln.cn","mo.cn",
+  "nm.cn","nx.cn","qh.cn","sc.cn","sd.cn","sh.cn","sn.cn","sx.cn","tj.cn","tw.cn",
+  "xj.cn","xz.cn","yn.cn","zj.cn",
 ]);
 function coreDomain(domain) {
   if (!domain) return "";
