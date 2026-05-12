@@ -3647,9 +3647,9 @@ Write the prospecting email. Return JSON only.`;
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
 // LOCAL part patterns (antes del @): roles que nunca son decision-makers B2B.
-const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|operations|security|domain-?abuse|domain|domains|domain-?ops|domain-?operations|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|private|gdpr|dpo|hosting|host|cdn|cloudflare|proxy|piracy|pirate|antipiracy|takedown)@/i;
+const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|operations|security|domain-?abuse|domain|domains|domain-?ops|domain-?operations|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|private|gdpr|gdpr-?mask|gdpr-?masking|dpo|hosting|host|cdn|cloudflare|proxy|piracy|pirate|antipiracy|takedown)@/i;
 // Cualquier ocurrencia de estas palabras en el local-part también descarta
-const GARBAGE_LOCAL_CONTAINS = /(abuse|domain[-._]?ops|domain[-._]?operations|domain[-._]?abuse|hosting|cloudflare|cloudfront|proxy|piracy|pirate|takedown|whois)/i;
+const GARBAGE_LOCAL_CONTAINS = /(abuse|domain[-._]?ops|domain[-._]?operations|domain[-._]?abuse|hosting|cloudflare|cloudfront|proxy|piracy|pirate|takedown|whois|gdpr|masked?)/i;
 
 // ── Website composite scoring ──────────────────────────────
 // Score 0-100 por lead, con gates duros (return -1 = descartar).
@@ -3812,7 +3812,7 @@ function rankEmail(email, siteDomain) {
   if (/^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex)\./.test(dom)) score -= 30;
   return score;
 }
-const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\.net|key-systems|1api\.net|netim\.com|psi-usa|nameshield|epag\.de|eurodns|realtimeregister|tld-box|enom\.|networksolutions|tucows|porkbun\.com|namecheap.*proxy/i;
+const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\.net|key-systems|1api\.net|netim\.com|psi-usa|nameshield|epag\.de|eurodns|realtimeregister|tld-box|enom\.|networksolutions|tucows|porkbun\.com|namecheap.*proxy|gdpr-?masked?|gdpr-?mask\.com|data-protected|registrant-?private|domains[-._]?by[-._]?proxy|whoisprotect|protect-?service/i;
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
 // Filtra emails invalidos / sin MX antes de mostrarlos al MB o al agente.
