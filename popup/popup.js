@@ -7562,19 +7562,38 @@ function initProspectCard(card, data) {
         manualEmailEl.dataset.userEdited = "1";
       });
     }
+    // MULTI-SELECT: click toggle. Si 2+ chips quedan seleccionados, el push
+    // crea N items en Monday (uno por contacto, item_name con sufijo "— local")
+    // y envía N mails en paralelo. Necesario porque Monday tiene automation
+    // por columna email (follow-up + reply detection) que se rompe si se cambia.
+    const _syncSelectedToInput = () => {
+      const selected = [...listEl.querySelectorAll(".email-chip.selected")].map(c => c.dataset.email);
+      if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1" && selected[0]) {
+        mondayEmailEl.value = selected[0];
+      }
+      let badge = card.querySelector(".pcard-multi-badge");
+      if (selected.length > 1) {
+        if (!badge) {
+          badge = document.createElement("div");
+          badge.className = "pcard-multi-badge";
+          badge.style.cssText = "font-size:10px;color:#0369a1;font-weight:700;margin-top:6px;padding:4px 8px;background:#dbeafe;border-radius:4px;display:inline-block";
+          listEl.parentElement.insertBefore(badge, listEl.nextSibling);
+        }
+        badge.textContent = `📨 ${selected.length} contactos seleccionados — crea ${selected.length} items en Monday (uno por persona, sufijo en nombre)`;
+      } else if (badge) {
+        badge.remove();
+      }
+    };
+
     listEl.querySelectorAll(".email-chip").forEach(chip => {
       chip.addEventListener("click", () => {
-        listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
-        chip.classList.add("selected");
-        // Solo pisar si el user no escribió manualmente (data flag)
-        if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1") {
-          mondayEmailEl.value = chip.dataset.email;
-        }
+        chip.classList.toggle("selected");
+        _syncSelectedToInput();
       });
     });
-    // Pre-seleccionar el primero (Apollo)
     const first = listEl.querySelector(".email-chip");
     if (first) first.classList.add("selected");
+    _syncSelectedToInput();
 
     // Auto-verify en background — pinta colores
     autoVerifyEmailChips(listEl).catch(e => console.warn("[pcard autoVerify]", e));

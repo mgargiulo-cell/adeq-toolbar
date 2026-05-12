@@ -3491,6 +3491,283 @@ async function pickDbDraft(token, userEmail, language) {
   };
 }
 
+// ════════════════════════════════════════════════════════════════
+// 🔄 RE-ENGAGEMENT — INACTIVE hasta agent_reengagement_enabled=true
+// ════════════════════════════════════════════════════════════════
+//
+// Lógica: detectar emails enviados por el agente que NO se abrieron en N días
+// y reenviar al siguiente contacto del array de emails del lead. Update Monday
+// item email column para que la app de reply-detection del user mire el nuevo.
+//
+// Reglas (configurables via toolbar_config):
+//   agent_reengagement_enabled       (default false — KILL SWITCH)
+//   agent_reengagement_wait_days     (default 5)
+//   agent_reengagement_max_attempts  (default 3)
+//
+// NUNCA dispara si:
+//   - El email original ABRIÓ (open_rate pixel hit) → vio el mail, no responder
+//     es decisión humana. Mandar a colega sería invasivo.
+//   - El item Monday pasó a "Negociación" (alguien respondió por la app externa).
+//   - El dominio recibió mail en los últimos 5d (anti-spam intra-dominio).
+//   - Ya se hicieron N attempts (default 3) — entonces freeze 60d.
+
+// 1. Query: encontrar SENTs sin opens y sin re_sents recientes
+async function findUnopenedSends(token, waitDays = 5) {
+  try {
+    const cutoff = new Date(Date.now() - waitDays * 86400_000).toISOString();
+    // Buscar agent_actions sent del último mes que ya tienen >= waitDays
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=lt.${cutoff}&created_at=gte.${new Date(Date.now() - 30 * 86400_000).toISOString()}&select=id,domain,user_email,details,created_at&order=created_at.asc&limit=200`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return [];
+    const sends = await res.json();
+    if (!Array.isArray(sends) || sends.length === 0) return [];
+
+    // Para cada send, verificar: ¿tiene open_rate hit? ¿tiene re_sent ya?
+    const candidates = [];
+    for (const s of sends) {
+      // Check opens — si abrió, NO re-engaging (mandó al lead, decidió no responder)
+      const opensRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_email_opens?agent_action_id=eq.${s.id}&select=id&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      const opens = opensRes.ok ? await opensRes.json() : [];
+      if (Array.isArray(opens) && opens.length > 0) continue; // abrió → skip
+
+      // Check re_sent — ya intentamos re-engaging este envío?
+      const reSentRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.re_sent&domain=eq.${encodeURIComponent(s.domain)}&select=id&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      const reSents = reSentRes.ok ? await reSentRes.json() : [];
+      if (Array.isArray(reSents) && reSents.length > 0) continue; // ya re-engagéd
+
+      candidates.push(s);
+    }
+    return candidates;
+  } catch (e) {
+    log(`⚠️ findUnopenedSends error: ${e.message}`);
+    return [];
+  }
+}
+
+// 2. Para un dominio, contar cuántos sends totales (incluyendo re_sent) hubo
+async function countAttemptsForDomain(token, domain) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?domain=eq.${encodeURIComponent(domain)}&action=in.(sent,re_sent)&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("content-range") || "";
+    return parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch { return 0; }
+}
+
+// 3. Pickea el siguiente email candidato (B/C/D) del array del review_queue.
+// Excluye: el email original A, bounced, y los que ya fueron usados en re_sent.
+async function pickNextEmailCandidate(token, domain, excludeEmails = []) {
+  try {
+    // 3.a Lee review_queue para ese dominio
+    const rqRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,emails,language,category,contact_name,contact_phone,monday_item_id&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rq = await rqRes.json();
+    if (!Array.isArray(rq) || rq.length === 0) return null;
+    const lead = rq[0];
+    const emails = Array.isArray(lead.emails) ? lead.emails : [];
+
+    // 3.b Excluir bounced
+    await loadBouncedEmails(token);
+    const filtered = emails.filter(e => {
+      if (!e || excludeEmails.includes(e.toLowerCase())) return false;
+      if (isBouncedSync(e)) return false;
+      const score = rankEmail(e, domain, lead.category || "");
+      return score >= 0;
+    });
+    if (!filtered.length) return null;
+    return { email: filtered[0], lead };
+  } catch (e) {
+    log(`⚠️ pickNextEmailCandidate ${domain}: ${e.message}`);
+    return null;
+  }
+}
+
+// 4. Update Monday item email column al nuevo email B.
+async function updateMondayItemEmail(monday_api_key, itemId, boardId, newEmail) {
+  if (!itemId || !newEmail) return false;
+  const cols = JSON.stringify({ [MONDAY_COL_EMAIL]: { email: newEmail, text: newEmail } });
+  const query = `mutation ($board: ID!, $item: ID!, $cols: JSON!) {
+    change_multiple_column_values (board_id: $board, item_id: $item, column_values: $cols) { id }
+  }`;
+  try {
+    const res = await fetch("https://api.monday.com/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": monday_api_key, "API-Version": "2024-01" },
+      body: JSON.stringify({ query, variables: { board: boardId, item: itemId, cols } }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return !data?.errors;
+  } catch { return false; }
+}
+
+// 5. Main re-engagement cycle — corre del main loop cada 60 iters.
+// SOLO se ejecuta si agent_reengagement_enabled=true en toolbar_config.
+async function runReengagementCycle(token) {
+  try {
+    const cfg = await getConfig(token);
+    const enabled = String(cfg.agent_reengagement_enabled || "").toLowerCase() === "true";
+    if (!enabled) return; // KILL SWITCH
+
+    const waitDays    = parseInt(cfg.agent_reengagement_wait_days || "5", 10);
+    const maxAttempts = parseInt(cfg.agent_reengagement_max_attempts || "3", 10);
+
+    log(`🔄 Re-engagement cycle: buscando sends sin opens >= ${waitDays}d...`);
+    const candidates = await findUnopenedSends(token, waitDays);
+    if (!candidates.length) {
+      log(`🔄 Re-engagement: 0 candidatos`);
+      return;
+    }
+    log(`🔄 Re-engagement: ${candidates.length} candidatos a procesar`);
+
+    for (const orig of candidates) {
+      const domain = orig.domain;
+      const userEmail = orig.user_email;
+      const originalEmail = (orig.details?.email || "").toLowerCase();
+
+      // Cap de attempts
+      const attempts = await countAttemptsForDomain(token, domain);
+      if (attempts >= maxAttempts) {
+        log(`  🧊 ${domain}: ${attempts} attempts sin opens — freeze 60d`);
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({
+            domain, frozen_until: new Date(Date.now() + 60 * 86400_000).toISOString(),
+            attempt_count: attempts, last_error: `re_engagement_max_attempts_${maxAttempts}_no_opens`,
+            source: "agent_reengagement", uploaded_by: userEmail, updated_at: new Date().toISOString(),
+          }),
+        }).catch(() => {});
+        await logAgentAction(token, userEmail, {
+          domain, action: "skipped", reason: "reengagement_max_attempts_reached",
+          details: { attempts, max: maxAttempts },
+        });
+        continue;
+      }
+
+      // Pickear siguiente email
+      const exclude = [originalEmail];
+      const next = await pickNextEmailCandidate(token, domain, exclude);
+      if (!next) {
+        log(`  ⏭ ${domain}: sin emails alternativos disponibles`);
+        await logAgentAction(token, userEmail, {
+          domain, action: "skipped", reason: "reengagement_no_alt_email",
+          details: { tried: originalEmail },
+        });
+        continue;
+      }
+      const { email: newEmail, lead } = next;
+
+      // Pickear template variante distinta (cache 5min)
+      let pitch = null;
+      try {
+        const dbDraft = await pickDbDraft(token, userEmail, lead.language || "en");
+        if (dbDraft) {
+          pitch = fillTemplate(dbDraft, { domain, geo: "", traffic: 0 });
+        } else {
+          const tpl = pickRandomTemplate(lead.language || "en");
+          pitch = fillTemplate(tpl, { domain, geo: "", traffic: 0 });
+        }
+      } catch (e) {
+        log(`  ⚠️ ${domain}: pitch error ${e.message} — skip`);
+        continue;
+      }
+      const subject = pitch.subjects?.[0] || `Pregunta sobre ${domain}`;
+
+      // Pre-flight: bounced + sendtrack 30d
+      try {
+        const cutoff30 = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+        const stRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff30}&select=email&limit=10`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        const sentRows = await stRes.json();
+        const sentEmails = (Array.isArray(sentRows) ? sentRows : []).map(r => (r.email || "").toLowerCase());
+        if (sentEmails.includes(newEmail.toLowerCase())) {
+          log(`  ⏭ ${domain}: ${newEmail} ya recibió mail en 30d — skip`);
+          continue;
+        }
+      } catch {}
+
+      // Reservar slot agent_actions ANTES del send (anti-crash)
+      let reservedId = null;
+      try {
+        const reserveRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=representation" },
+          body: JSON.stringify({
+            user_email: userEmail, domain, action: "reserved",
+            pitch_subject: subject,
+            details: { email: newEmail, source: "reengagement", original_email: originalEmail, attempt: attempts + 1, language: lead.language },
+          }),
+        });
+        const reserved = await reserveRes.json();
+        reservedId = reserved?.[0]?.id || null;
+      } catch {}
+
+      // Send Gmail
+      try {
+        await sendGmailServer(token, userEmail, { to: newEmail, subject, body: pitch.body, agentActionId: reservedId });
+      } catch (err) {
+        log(`  ❌ ${domain} re-engagement send fail: ${err.message}`);
+        if (reservedId) {
+          fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ action: "failed_reserved", reason: "reengagement_send_failed" }),
+          }).catch(() => {});
+        }
+        continue;
+      }
+
+      // Confirmar action=re_sent
+      if (reservedId) {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ action: "re_sent" }),
+        });
+      }
+
+      // Update Monday item email column
+      const mondayItemId = lead.monday_item_id;
+      const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || cfg.monday_api_key || "").trim();
+      if (mondayItemId && mondayApiKey) {
+        const ok = await updateMondayItemEmail(mondayApiKey, mondayItemId, AGENT_DEFAULTS.monday_board_id, newEmail);
+        log(`  ${ok ? "✅" : "⚠️"} ${domain}: Monday email column ${ok ? "actualizado" : "FAIL"} → ${newEmail}`);
+      }
+
+      // Sendtrack
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
+        method: "POST",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ domain, send_date: new Date().toISOString().split("T")[0], email: newEmail, pitch: pitch.body.substring(0, 1000) }),
+      }).catch(() => {});
+
+      log(`🔄 Re-engagement: ${domain} — ${originalEmail} sin opens ${waitDays}d, enviado a ${newEmail} (attempt ${attempts + 1}/${maxAttempts})`);
+
+      // Anti-rate limit Monday + Gmail
+      await sleep(2000);
+    }
+  } catch (e) {
+    log(`⚠️ runReengagementCycle error: ${e.message}`);
+  }
+}
+// ════════════════════════════════════════════════════════════════
+
 async function logAgentAction(token, userEmail, payload) {
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
@@ -5513,6 +5790,13 @@ async function main() {
       }
     } catch {}
 
+
+    // ── Re-engagement cada 60 iters (~25min) — INACTIVE por default ──
+    // Solo corre si toolbar_config.agent_reengagement_enabled='true'.
+    // Sin esto la función early-returns sin tocar nada.
+    if (iterCount % 60 === 0) {
+      runReengagementCycle(token).catch(e => log(`⚠️ reengagement: ${e.message}`));
+    }
 
     // ── Unfreezer cada 60 iters (~25min) ──
     // Mueve toolbar_frozen_leads.frozen_until ≤ now() de vuelta a csv_queue.pending
