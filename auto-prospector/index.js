@@ -2656,14 +2656,14 @@ async function checkAgentKillSwitch(token, userEmail, cfg) {
   } catch { return false; }
 }
 
-// Cache de la voz Diego — vive por la lifetime del proceso (1 fetch al boot)
-let _diegoVoiceCache = null;
-let _diegoVoiceCacheAt = 0;
-const DIEGO_VOICE_TTL = 30 * 60 * 1000; // refresh cada 30min
+// Cache del estilo ADEQ — vive por la lifetime del proceso (refresh cada 30min)
+let _adeqStyleCache = null;
+let _adeqStyleCacheAt = 0;
+const ADEQ_STYLE_TTL = 30 * 60 * 1000;
 
-const DIEGO_VOICE_FALLBACK = `# IDENTIDAD
-Sos Claude operando como redactor de emails comerciales de ADEQ Media. Escribís en
-nombre de Diego Horovitz (Publishers Relations TL).
+const ADEQ_STYLE_FALLBACK = `# IDENTIDAD
+Sos Claude operando como redactor de emails comerciales de ADEQ Media — escribís en
+nombre del equipo de Publishers Relations.
 NO sos un asistente neutral. Sos un vendedor B2B AdTech con voz humana, conversacional,
 auto-conciente del spam que reciben los publishers. El mail debe PARECER escrito en
 2 minutos por una persona apurada — no por un equipo de marketing.
@@ -2680,13 +2680,14 @@ Slider/corner video: CPM fijo USD 1, mencionar SOLO si pidieron más.
 SIEMPRE: revshare 80/20 a favor del publisher, sin exclusividad, sin permanencia mínima.
 
 # REGLAS DURAS
+- NO mencionar nombres propios del equipo ADEQ — el mail va sin firma personal
 - NO mencionar meses, fechas o datos no provistos
 - NO firma, NO despedida — terminar en pregunta concreta
 - NO mencionar ausencia de ads.txt salvo que el input lo confirme`;
 
-async function _getDiegoVoice(token) {
+async function _getAdeqStyle(token) {
   const now = Date.now();
-  if (_diegoVoiceCache && (now - _diegoVoiceCacheAt) < DIEGO_VOICE_TTL) return _diegoVoiceCache;
+  if (_adeqStyleCache && (now - _adeqStyleCacheAt) < ADEQ_STYLE_TTL) return _adeqStyleCache;
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_user_prompts?user_email=eq.__global__&select=prompt`,
@@ -2696,15 +2697,15 @@ async function _getDiegoVoice(token) {
       const rows = await res.json();
       const prompt = rows?.[0]?.prompt;
       if (prompt && prompt.length > 100) {
-        _diegoVoiceCache = prompt;
-        _diegoVoiceCacheAt = now;
+        _adeqStyleCache = prompt;
+        _adeqStyleCacheAt = now;
         return prompt;
       }
     }
   } catch {}
-  _diegoVoiceCache = DIEGO_VOICE_FALLBACK;
-  _diegoVoiceCacheAt = now;
-  return DIEGO_VOICE_FALLBACK;
+  _adeqStyleCache = ADEQ_STYLE_FALLBACK;
+  _adeqStyleCacheAt = now;
+  return ADEQ_STYLE_FALLBACK;
 }
 
 // ── Claude pitch generation server-side (calls Anthropic via Edge proxy) ──
@@ -2713,17 +2714,21 @@ async function generatePitchAgent(token, ctx) {
   const langName = ({ es:"Spanish", en:"English", pt:"Portuguese", it:"Italian", ar:"Arabic" })[language] || "English";
   const trafficStr = traffic >= 1_000_000 ? `${Math.round(traffic/1_000_000)}M` : `${Math.round(traffic/1_000)}K`;
 
-  // Voz Diego desde DB (toolbar_user_prompts user_email='__global__'), fallback a baked
-  const diegoVoice = await _getDiegoVoice(token);
+  // Estilo ADEQ desde DB (toolbar_user_prompts user_email='__global__'), fallback a baked
+  const adeqStyle = await _getAdeqStyle(token);
 
-  const systemMsg = `${diegoVoice}
+  const systemMsg = `${adeqStyle}
 
-# OUTPUT REQUIREMENTS
+# OUTPUT REQUIREMENTS — MAIL INICIAL CORTO Y SIMPLE
+Este es el PRIMER mail al publisher: NO sobre-analizar, NO largo, NO armado.
+Debe parecer escrito en 90 segundos entre dos llamadas.
+
 LANGUAGE: write the ENTIRE email in ${langName}. Do not mix languages.
-RETURN JSON ONLY: { "body": string, "subjects": [3 subject lines, 6-10 words each in ${langName}] }
-- body: 80-160 words máximo, párrafos cortos (1-2 líneas)
-- subjects: variantes A/B/C — algo personal con el dominio del sitio
-- NO incluir firma ni nombre al final del body`;
+RETURN JSON ONLY: { "body": string, "subjects": [3 subject lines, 4-8 words each in ${langName}] }
+- body: 50-100 palabras MÁXIMO. 2-3 párrafos chiquitos (1-2 líneas c/u). Nada más.
+- subjects: variantes A/B/C cortas — usar el dominio del sitio en al menos 1
+- NO incluir firma, nombre propio, ni despedida formal al final del body
+- Cerrar con UNA pregunta concreta sobre charlar/probar`;
 
   const userMsg = `Site: ${domain}
 Monthly traffic: ${trafficStr} visits
