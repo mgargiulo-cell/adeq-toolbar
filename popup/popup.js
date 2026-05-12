@@ -6937,17 +6937,23 @@ function initProspectCard(card, data) {
     trafficInput.placeholder = "⏳ Buscando tráfico…";
     getTraffic(data.domain).then(t => {
       const v = t?.pageViews || t?.rawVisits || 0;
+      // Guard: card pudo haberse re-renderizado por enrich antes del timeout.
+      // isConnected es true si sigue en el DOM, false si fue reemplazada.
+      if (!card.isConnected) return;
       if (v > 0) {
         data.traffic = v;
         if (!trafficInput.value) trafficInput.value = formatTraffic(v);
-        trafficInput.placeholder = "ej: 500K, 1.2M, 3500000";
+        trafficInput.placeholder = "e.g. 500K, 1.2M, 3500000";
       } else {
-        trafficInput.placeholder = "Sin data — completá manual";
+        trafficInput.placeholder = "No data — fill manually";
       }
-    }).catch(() => { trafficInput.placeholder = "Error — completá manual"; });
+    }).catch(() => { if (card.isConnected) trafficInput.placeholder = "Error — fill manually"; });
   }
-  // Si la card ya viene sin tráfico, intentamos en background (no bloquea)
-  if (!data.traffic) setTimeout(autoFetchTraffic, 500);
+  // Si la card ya viene sin tráfico, intentamos en background (no bloquea).
+  // Guardo el handle así si la card es reemplazada, podemos cancelar.
+  if (!data.traffic) {
+    card._autoFetchTimer = setTimeout(autoFetchTraffic, 500);
+  }
 
   // Domain link → open tab
   card.querySelector(".pcard-domain-link")?.addEventListener("click", e => {

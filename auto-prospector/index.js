@@ -716,7 +716,12 @@ async function backfillMissingFields(token, cfg) {
               if (newEmails.length) {
                 const merged = [...new Set([...apolloEmails, ...(lead.emails || [])])];
                 const validated = await validateEmailsBatch(merged);
-                if (validated.length !== (lead.emails || []).length) {
+                // Compara contenido (set), no length — length puede coincidir si
+                // validateEmailsBatch quita N basura y agrega N nuevos.
+                const oldSet = new Set((lead.emails || []).filter(Boolean));
+                const newSet = new Set(validated);
+                const sameContent = oldSet.size === newSet.size && [...oldSet].every(e => newSet.has(e));
+                if (!sameContent) {
                   patch.emails = validated;
                   lead.emails = validated;
                 }
@@ -3665,6 +3670,7 @@ function getServiceAccount() {
 }
 
 const _accessTokenCache = new Map(); // userEmail → { token, expiresAt }
+const ACCESS_TOKEN_CACHE_MAX = 50; // worker rara vez impersona >50 users distintos
 async function getGmailAccessToken(impersonateUser) {
   const cached = _accessTokenCache.get(impersonateUser);
   if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
@@ -3705,6 +3711,10 @@ async function getGmailAccessToken(impersonateUser) {
   }
   const data = await tokenRes.json();
   if (!data.access_token) throw new Error("no_access_token_in_response");
+  if (_accessTokenCache.size >= ACCESS_TOKEN_CACHE_MAX) {
+    const firstKey = _accessTokenCache.keys().next().value;
+    _accessTokenCache.delete(firstKey);
+  }
   _accessTokenCache.set(impersonateUser, {
     token: data.access_token,
     expiresAt: Date.now() + (data.expires_in * 1000),
@@ -3881,11 +3891,13 @@ async function runAgentCycle(token, allFlags) {
   }
   log(`🤖 Agent: ciclo iniciando (users=${allFlags.agentUsers.length}, threshold=${aCfg.thresholdTraffic}, maxPerDay=${aCfg.maxPerDay})`);
 
-  // Whitelist HARDCODED de users autorizados a usar el agent.
-  // Defense-in-depth: aunque alguien cambie agent_enabled_users en config,
-  // el worker solo procesa users de esta lista. Para agregar un user:
-  // editar este Set + UI + RLS policy.
-  const AGENT_WHITELIST = new Set(["mgargiulo@adeqmedia.com"]);
+  // Whitelist de users autorizados a usar el agent (defense-in-depth).
+  // Lee toolbar_config.agent_whitelist (CSV) y fallback hardcoded a admin.
+  // Para agregar un user nuevo sin redeploy:
+  //   update toolbar_config set value='mgargiulo@adeqmedia.com,otro@adeqmedia.com'
+  //   where key='agent_whitelist';
+  const whitelistRaw = (cfg.agent_whitelist || "mgargiulo@adeqmedia.com").trim();
+  const AGENT_WHITELIST = new Set(whitelistRaw.split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
 
   for (const userEmail of allFlags.agentUsers) {
     if (!AGENT_WHITELIST.has((userEmail || "").toLowerCase())) {
