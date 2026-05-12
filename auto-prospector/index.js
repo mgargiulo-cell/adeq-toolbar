@@ -598,7 +598,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
 // pickea hasta REFRESH_BATCH leads con traffic=0/null y los re-fetchea en
 // paralelo. Cache 90d ayuda a no quemar RapidAPI. Cuando ya no quedan,
 // auto-apaga el flag.
-const REFRESH_EMPTY_BATCH = 3;
+const REFRESH_EMPTY_BATCH = 10;
 async function refreshOneEmptyLead(token, cfg) {
   const flag = cfg.agent_refresh_empty_leads === "true";
   if (!flag) return;
