@@ -1690,14 +1690,14 @@ function extractEmailsFromHtml(html) {
 }
 
 async function scrapeEmailsForDomain(domain) {
-  // Acta como un media buyer: trae emails de TODAS las fuentes en paralelo,
-  // no early-exit. El caller filtra/ranks. Más cobertura > velocidad.
+  // Trae emails de varias fuentes con concurrencia limitada (5 a la vez).
+  // Trade-off: cobertura razonable sin saturar memoria/conexiones del worker.
   const emails = new Set();
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
   const ua = { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" };
 
-  const tryFetch = async (url, timeout = 6000) => {
+  const tryFetch = async (url, timeout = 5000) => {
     try {
       const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(timeout) });
       if (!r.ok) return;
@@ -1705,34 +1705,28 @@ async function scrapeEmailsForDomain(domain) {
     } catch {}
   };
 
-  // Todas las fuentes en paralelo (gratis):
-  await Promise.all([
-    // 1. website.informer.com
-    tryFetch(`https://website.informer.com/${cleanDomain}`, 7000),
-    // 2. who.is WHOIS
-    tryFetch(`https://who.is/whois/${cleanDomain}`, 7000),
-    // 3. Home page (a veces tiene info@ visible)
-    tryFetch(base, 6000),
-    // 4. Contact / about pages típicas
-    tryFetch(`${base}/contact`, 4000),
-    tryFetch(`${base}/contact-us`, 4000),
-    tryFetch(`${base}/contacto`, 4000),
-    tryFetch(`${base}/about`, 4000),
-    tryFetch(`${base}/about-us`, 4000),
-    tryFetch(`${base}/advertise`, 4000),
-    tryFetch(`${base}/advertising`, 4000),
-    tryFetch(`${base}/publicidad`, 4000),
-    tryFetch(`${base}/anunciantes`, 4000),
-    tryFetch(`${base}/equipe`, 4000),
-    tryFetch(`${base}/equipo`, 4000),
-    tryFetch(`${base}/team`, 4000),
-    tryFetch(`${base}/staff`, 4000),
-    tryFetch(`${base}/redaccion`, 4000),
-    tryFetch(`${base}/redacao`, 4000),
-    // 5. Footer page common: /aviso-legal, /legal — donde está el contacto legal
-    tryFetch(`${base}/aviso-legal`, 4000),
-    tryFetch(`${base}/legal`, 4000),
-  ]);
+  // Top 10 paths más probables (eliminado redundancia, agrupado por idioma)
+  const targets = [
+    `https://website.informer.com/${cleanDomain}`,
+    `https://who.is/whois/${cleanDomain}`,
+    base,
+    `${base}/contact`,
+    `${base}/contacto`,
+    `${base}/about`,
+    `${base}/team`,
+    `${base}/equipo`,
+    `${base}/advertise`,
+    `${base}/publicidad`,
+  ];
+
+  // Procesar en chunks de 5 para no saturar
+  const CONCURRENT = 5;
+  for (let i = 0; i < targets.length; i += CONCURRENT) {
+    const chunk = targets.slice(i, i + CONCURRENT);
+    await Promise.all(chunk.map(url => tryFetch(url, url.includes("informer") || url.includes("who.is") ? 6000 : 4000)));
+    // Si ya tenemos emails, frenar early — no necesitamos más
+    if (emails.size >= 5) break;
+  }
 
   return [...emails];
 }
@@ -1931,8 +1925,10 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
   const { token = null, allowClaudeArbiter = true } = opts;
   const cleanDomain = (domain || "").replace(/^www\./, "").toLowerCase();
 
-  // Cache hit por dominio (memoria proceso)
-  if (cleanDomain && _domainLangCache.has(cleanDomain)) {
+  // Cache hit SOLO si tenemos textSample (= invocación con datos completos).
+  // Si solo tenemos geo/domain (hint cheap), no cache para no envenenar.
+  const hasFullData = !!textSample;
+  if (cleanDomain && hasFullData && _domainLangCache.has(cleanDomain)) {
     return _domainLangCache.get(cleanDomain);
   }
 
@@ -2006,8 +2002,8 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
     }
   }
 
-  // Cache result
-  if (cleanDomain) {
+  // Cache SOLO si fue invocación con full data (textSample) — no las heuristics chea
+  if (cleanDomain && hasFullData) {
     if (_domainLangCache.size >= DOMAIN_LANG_CACHE_MAX) {
       const firstKey = _domainLangCache.keys().next().value;
       _domainLangCache.delete(firstKey);
