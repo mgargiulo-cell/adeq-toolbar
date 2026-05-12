@@ -2618,12 +2618,8 @@ function initTabs() {
     });
   });
 
-  // Banner global Railway muerto — corre siempre que el popup esté abierto.
-  // Solo aparece cuando autopilot/csv_queue ON + heartbeat > 5min stale.
-  pollRailwayDeadBanner();
-  setInterval(() => {
-    if (document.visibilityState !== "hidden") pollRailwayDeadBanner();
-  }, 30_000);
+  // Banner Railway muerto — REMOVIDO. Generaba falsos positivos cuando el worker
+  // estaba OK pero la columna heartbeat no se updateaba a tiempo. User pidió quitarlo.
 }
 
 // ============================================================
