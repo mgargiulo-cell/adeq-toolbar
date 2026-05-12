@@ -2025,6 +2025,49 @@ function detectLangFromDomain(domain) {
   return TLD_TO_LANG[tld] || "";
 }
 
+// ── Re-fetch ligero del HTML de un dominio (para Prospects card "🔍 Data") ──
+// Trae title, language (html lang + heurística), ad_networks. NO ejecuta JS.
+// Usado para que Prospects pueda re-analizar leads igual que Analysis sin tab abierta.
+async function _fetchPageMetaForProspect(domain) {
+  if (!domain) return null;
+  try {
+    const url = /^https?:\/\//.test(domain) ? domain : `https://${domain}`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; ADEQbot/1.0)" },
+      signal: AbortSignal.timeout(8000),
+      redirect: "follow",
+      mode: "cors",
+    }).catch(() => null);
+    if (!res || !res.ok) return null;
+    const html = await res.text();
+    const title = (html.match(/<title[^>]*>([^<]{1,200})<\/title>/i) || [])[1]?.trim() || "";
+    const htmlLang = (html.match(/<html[^>]+lang=["']([a-z]{2})/i) || [])[1] || "";
+    const ogLocale = (html.match(/<meta[^>]+property=["']og:locale["'][^>]+content=["']([a-z]{2})/i) || [])[1] || "";
+    // Adnets (mismo set que el worker)
+    const ADN = [
+      ["Sparteo", /sparteo\.com/i], ["Seedtag", /seedtag\.com/i], ["Taboola", /taboola/i],
+      ["Missena", /missena\.com/i], ["Viads", /viads\.com|viads\.io/i], ["MGID", /mgid\.com/i],
+      ["Clever Advertising", /clever-advertising|cleveradvertising/i], ["Vidoomy", /vidoomy\.com/i],
+      ["Vidverto", /vidverto\.com/i], ["Ezoic", /ezoic\.com|ezojs\.com|ez\.ai/i],
+      ["Clickio", /clickio\.com|clickio\.net/i], ["Optad360", /optad360\.com/i],
+      ["Snigel", /snigel\.com/i],
+    ];
+    const adNetworks = ADN.filter(([_, re]) => re.test(html)).map(([n]) => n);
+    // Lang resolution: html → og → text heuristic → tld
+    let language = (htmlLang || ogLocale || "").toLowerCase().split(/[-_]/)[0];
+    if (!["es","en","it","pt","ar"].includes(language)) {
+      const sample = (title + " " + html.replace(/<[^>]+>/g, " ").substring(0, 3000)).toLowerCase();
+      if (/[؀-ۿ]/.test(html)) language = "ar";
+      else if (/[ñáéíóúü¿¡]|noticias|últimas|fútbol|política|economía/.test(sample)) language = "es";
+      else if (/[ãõçàáâ]|notícias|esportes|cidade/.test(sample)) language = "pt";
+      else if (/[àèéìòù]|notizie|sport|città/.test(sample)) language = "it";
+      else language = detectLangFromDomain(domain) || "en";
+    }
+    return { title: title.substring(0, 180), language, adNetworks };
+  } catch { return null; }
+}
+
 function runAutoFill() {
   const dup    = state.duplicate;
   const isNew  = !dup?.found;
@@ -6771,28 +6814,65 @@ function initProspectCard(card, data) {
     // los emails guardados son garbage o desactualizados.
     btn.disabled = true; btn.textContent = "⏳ ...";
     try {
-      // Optimización: si ya tiene tráfico, NO llamar getTraffic. Si ya tiene
-      // emails, NO llamar Apollo. Solo disparamos lo que falta.
-      const [traffic, apollo] = await Promise.all([
-        hasTrafficAlready ? Promise.resolve(null) : getTraffic(data.domain).catch(() => null),
-        hasEmailsAlready  ? Promise.resolve(null) : findDecisionMakerViaApollo(data.domain).catch(() => null),
+      // RE-FETCH COMPLETO — siempre dispara los 3 fetchers en paralelo, igual
+      // que Analysis. Apollo cache 7d + RapidAPI cache 90d hacen que sea barato
+      // (gratis si ya estaba cacheado). Trae: traffic, geo (top country),
+      // pages_per_visit, category, ad_networks (del HTML), title, language.
+      const [traffic, apollo, pageMeta] = await Promise.all([
+        getTraffic(data.domain).catch(() => null),
+        findDecisionMakerViaApollo(data.domain).catch(() => null),
+        _fetchPageMetaForProspect(data.domain).catch(() => null),
       ]);
-      // Update local state + UI
       let updated = false;
+      const dbPatch = {};
+      // Traffic + GEO + pages_per_visit + category from getTraffic
       if (traffic && (traffic.pageViews || traffic.rawVisits)) {
         const newTraffic = traffic.pageViews || traffic.rawVisits;
-        data.traffic = newTraffic;
-        const trafficSpan = card.querySelector(".pcard-summary-row span");
-        // Re-render entera la card con la data actualizada (más simple que parchear DOM)
-        updated = true;
+        if (data.traffic !== newTraffic) { data.traffic = newTraffic; dbPatch.traffic = newTraffic; updated = true; }
+        const topCountry = traffic.topCountries?.[0];
+        if (topCountry?.name && data.geo !== topCountry.name) {
+          data.geo = topCountry.name; dbPatch.geo = topCountry.name; updated = true;
+        }
+        if (traffic.category && data.category !== traffic.category) {
+          data.category = traffic.category; dbPatch.category = traffic.category; updated = true;
+        }
       }
+      // Apollo emails + contact name
       if (apollo?.email && !data.emails?.includes(apollo.email)) {
         data.emails = [apollo.email, ...(data.emails || [])];
-        if (apollo.first_name) data.contact_name = `${apollo.first_name} ${apollo.last_name || ""}`.trim();
+        dbPatch.emails = data.emails;
+        if (apollo.first_name) {
+          data.contact_name = `${apollo.first_name} ${apollo.last_name || ""}`.trim();
+          dbPatch.contact_name = data.contact_name;
+        }
         updated = true;
       }
+      // Page meta: title, language, ad_networks
+      if (pageMeta) {
+        if (pageMeta.title && data.page_title !== pageMeta.title) {
+          data.page_title = pageMeta.title; dbPatch.page_title = pageMeta.title; updated = true;
+        }
+        if (pageMeta.language && data.language !== pageMeta.language) {
+          data.language = pageMeta.language; dbPatch.language = pageMeta.language; updated = true;
+        }
+        if (pageMeta.adNetworks?.length && JSON.stringify(data.ad_networks||[]) !== JSON.stringify(pageMeta.adNetworks)) {
+          data.ad_networks = pageMeta.adNetworks; dbPatch.ad_networks = pageMeta.adNetworks; updated = true;
+        }
+      }
+      // Persist to DB so other MBs see updated data
+      if (Object.keys(dbPatch).length > 0 && state.accessToken) {
+        fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${data.id}`, {
+          method: "PATCH",
+          headers: {
+            "apikey": CONFIG.SUPABASE_ANON_KEY,
+            "Authorization": `Bearer ${state.accessToken}`,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+          },
+          body: JSON.stringify(dbPatch),
+        }).catch(() => {});
+      }
       if (updated) {
-        // Re-render esta card en su lugar
         const newHtml = renderProspectCard(data);
         const tmp = document.createElement("div");
         tmp.innerHTML = newHtml;
