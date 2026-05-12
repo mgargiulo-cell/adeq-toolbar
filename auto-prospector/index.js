@@ -3396,7 +3396,10 @@ Write the prospecting email. Return JSON only.`;
 //   🟢 green  : SMTP OK + no garbage + no genérico → manda
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
-const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|security|domain-abuse|domain|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|gdpr|dpo)@/i;
+// LOCAL part patterns (antes del @): roles que nunca son decision-makers B2B.
+const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|operations|security|domain-?abuse|domain|domains|domain-?ops|domain-?operations|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|private|gdpr|dpo|hosting|host|cdn|cloudflare|proxy|piracy|pirate|antipiracy|takedown)@/i;
+// Cualquier ocurrencia de estas palabras en el local-part también descarta
+const GARBAGE_LOCAL_CONTAINS = /(abuse|domain[-._]?ops|domain[-._]?operations|domain[-._]?abuse|hosting|cloudflare|cloudfront|proxy|piracy|pirate|takedown|whois)/i;
 
 // ── Website composite scoring ──────────────────────────────
 // Score 0-100 por lead, con gates duros (return -1 = descartar).
@@ -3529,7 +3532,15 @@ function rankEmail(email, siteDomain) {
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
+  if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1; // abuse/domain/proxy/hosting/etc
   let score = 0;
+  // Cross-domain penalty fuerte: si el email es de otro dominio que no matchea
+  // el sitio prospectado (ej. cavok.com.br → marcio@nunes.inf.br), penalizar -50.
+  // Apollo a veces devuelve emails de empresas relacionadas que no son útiles.
+  const cleanSiteEarly = (siteDomain || "").replace(/^www\./, "");
+  if (cleanSiteEarly && dom !== cleanSiteEarly && !dom.endsWith("." + cleanSiteEarly) && !cleanSiteEarly.endsWith("." + dom)) {
+    score -= 50;
+  }
   // Roles comerciales / editoriales (target ideal de outreach)
   if (/^(marketing|comercial|business|partnerships|partner|ads|advertising|publicidad|monetiza|ventas|sales|bd|director|gerente|manager|jefe|head)/.test(local)) score += 80;
   else if (/^(editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press)/.test(local)) score += 60;
@@ -3564,6 +3575,8 @@ async function validateEmailsBatch(emails) {
     if (!e || typeof e !== "string" || !e.includes("@")) continue;
     const lower = e.toLowerCase().trim();
     if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) continue;
+    const local = lower.split("@")[0];
+    if (GARBAGE_LOCAL_CONTAINS.test(local)) continue; // domain.operations@x.com etc
     const dom = lower.split("@")[1];
     const ok = await _hasMxRecords(dom);
     if (ok) out.push(lower);
@@ -3602,6 +3615,10 @@ async function scoreEmail(email) {
   const lower = email.toLowerCase().trim();
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) {
     return { color: "red", reason: "garbage_address" };
+  }
+  const localPart = lower.split("@")[0];
+  if (GARBAGE_LOCAL_CONTAINS.test(localPart)) {
+    return { color: "red", reason: "garbage_local_contains" };
   }
   // 1) MX records check (gratis vía Cloudflare DoH) — descarta dominios sin mail server
   const dom = lower.split("@")[1];
@@ -3816,16 +3833,18 @@ async function sendGmailServer(_token, userEmail, { to, subject, body }) {
 async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
   // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
+  // Shapes según config.js: geo/trafico/comentarios = text, no objetos.
+  // email = { email, text }. status (estado/idioma) = { index } o { label }.
+  // person = { personsAndTeams }. date = { date }.
   const cols = {
-    [MONDAY_COL_TRAFFIC]:   { url: { url: `https://www.${payload.domain}`, text: payload.domain }, text: payload.traffic_text || "" },
-    [MONDAY_COL_GEO]:       { label: payload.geo || "" },
+    [MONDAY_COL_TRAFFIC]:   payload.traffic_text || "",
+    [MONDAY_COL_GEO]:       payload.geo || "",
     [MONDAY_COL_EMAIL]:     { email: payload.email, text: payload.email },
     [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
     [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
-    [MONDAY_COL_ESTADO]:    { label: "Propuesta Vigente (T)" }, // (T) = Toolbar/agente automático
-    // OWNER: solo incluir si tenemos user_id. Vacío rompe el create_item.
+    [MONDAY_COL_ESTADO]:    { label: "Propuesta Vigente (T)" },
     ...(payload.monday_user_id ? { [MONDAY_COL_OWNER]: { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] } } : {}),
-    [MONDAY_COL_PITCH]:     payload.pitch_body || "",
+    [MONDAY_COL_PITCH]:     payload.pitch_body ? `PITCH IA:\n${payload.pitch_body}` : "",
   };
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
     create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: true) { id }
@@ -3845,15 +3864,16 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
   return data?.data?.create_item?.id || null;
 }
 
-// Constantes de columnas Monday — mismas que usa el popup
-const MONDAY_COL_TRAFFIC = "link";
-const MONDAY_COL_GEO     = "label";
-const MONDAY_COL_EMAIL   = "email";
-const MONDAY_COL_DATE    = "date_1";
-const MONDAY_COL_IDIOMA  = "status5";
-const MONDAY_COL_ESTADO  = "deal_stage";
-const MONDAY_COL_OWNER   = "person";
-const MONDAY_COL_PITCH   = "long_text";
+// Constantes de columnas Monday — DEBE matchear config.js MONDAY_COLUMNS
+// del popup, sino los pushes quedan vacíos en el board real.
+const MONDAY_COL_TRAFFIC = "texto7";          // Paginas Vistas (text)
+const MONDAY_COL_GEO     = "texto6";          // Top Geo (text)
+const MONDAY_COL_EMAIL   = "email_mm2edcd3";  // Email (email column type)
+const MONDAY_COL_DATE    = "deal_close_date"; // Fecha Contacto (date)
+const MONDAY_COL_IDIOMA  = "estado_12";       // Idioma (status/dropdown)
+const MONDAY_COL_ESTADO  = "deal_stage";      // Estado (status/dropdown)
+const MONDAY_COL_OWNER   = "deal_owner";      // Ejecutivo (person)
+const MONDAY_COL_PITCH   = "texto";           // Comentarios (text)
 
 // Update Monday item estado (después de enviar mail)
 async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
@@ -4010,11 +4030,19 @@ async function runAgentCycle(token, allFlags) {
 
       try {
         // ── DETECCIÓN ROBUSTA DE IDIOMA (CRÍTICO) ──
-        // El mail DEBE estar en el idioma del sitio. Si lead.language ya está
-        // y es soportado, lo re-validamos contra HTML. Si no, fetcheamos.
+        // El mail DEBE estar en el idioma del sitio. Cross-check obligatorio:
+        // si lead.language="en" pero el TLD/GEO sugiere otro idioma → re-detectar.
         // Mail en idioma equivocado quema el dominio para siempre.
         let _pageContent = null;
-        const needLangFetch = !leadLanguage || !SUPPORTED_AGENT_LANGS.has(leadLanguage);
+        // Hint barato basado en TLD + GEO. Si dice "es/pt/it/ar" pero
+        // lead.language dice "en", hay desacuerdo → forzamos re-detect.
+        const _hintDet = detectLanguageRobust({ geo: leadGeo, domain });
+        const _hintDisagrees = _hintDet.lang !== "en"
+          && _hintDet.lang !== leadLanguage
+          && SUPPORTED_AGENT_LANGS.has(_hintDet.lang);
+        const needLangFetch = !leadLanguage
+          || !SUPPORTED_AGENT_LANGS.has(leadLanguage)
+          || _hintDisagrees;
         if (needLangFetch) {
           _pageContent = await fetchPageContent(domain).catch(() => null);
           if (_pageContent) {
@@ -4259,7 +4287,7 @@ async function runAgentCycle(token, allFlags) {
         let mondayItemId = null;
         try {
           mondayItemId = await pushToMondayServer(mondayApiKey, {
-            domain, email, geo: leadGeo, traffic_text: `${Math.round(leadTraffic/1000)}K`,
+            domain, email, geo: leadGeo, traffic_text: String(leadTraffic || ""),
             pitch_body: pitch.body, idioma_idx: ({ en:0, es:1, it:2, pt:3, ar:6 })[lead.language] ?? 0,
             monday_user_id: mondayUserId,
             estado_idx: 3, // Propuesta Vigente (T)
