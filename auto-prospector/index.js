@@ -1690,42 +1690,63 @@ function extractEmailsFromHtml(html) {
 }
 
 async function scrapeEmailsForDomain(domain) {
-  // Trae emails de varias fuentes con concurrencia limitada (5 a la vez).
-  // Trade-off: cobertura razonable sin saturar memoria/conexiones del worker.
+  // Trae emails de muchas fuentes con concurrencia limitada (4 a la vez).
+  // Usa User-Agent real (Chrome) para evitar anti-bot blocks comunes.
   const emails = new Set();
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
-  const ua = { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" };
+  // Chrome real para evitar bloqueos por User-Agent de bot
+  const uaChrome = { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" };
+  const uaMobile = { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" };
 
-  const tryFetch = async (url, timeout = 5000) => {
+  const tryFetch = async (url, timeout = 5000, mobile = false) => {
     try {
-      const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(timeout) });
+      const r = await fetch(url, { headers: mobile ? uaMobile : uaChrome, signal: AbortSignal.timeout(timeout) });
       if (!r.ok) return;
-      extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
+      const html = await r.text();
+      // 1) regex emails en HTML general
+      extractEmailsFromHtml(html).forEach(e => emails.add(e));
+      // 2) explicit mailto: hrefs (raramente missed pero a veces hay solo ahí)
+      const mailtoMatches = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
+      for (const m of mailtoMatches) {
+        const clean = m[1].toLowerCase().split("?")[0];
+        if (clean.includes("@")) emails.add(clean);
+      }
     } catch {}
   };
 
-  // Top 10 paths más probables (eliminado redundancia, agrupado por idioma)
-  const targets = [
+  // 20 paths potenciales — sites de news/blogs típicos tienen variantes diversas
+  const paths = [
+    "", // home
+    "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos", "/contacto-nos",
+    "/about", "/about-us", "/aboutus", "/sobre", "/sobre-nosotros", "/quienes-somos",
+    "/team", "/equipo", "/equipe", "/staff", "/nosotros",
+    "/advertise", "/advertising", "/publicidad", "/publicidade", "/anunciantes", "/anunciar",
+    "/redaccion", "/redacao", "/editorial", "/noticias",
+    "/aviso-legal", "/legal", "/impressum", "/politica-privacidad", "/privacy",
+    "/footer", "/site-map", "/sitemap",
+  ];
+  const internalTargets = paths.map(p => `${base}${p}`);
+
+  // Fuentes externas (WHOIS / informer) — pueden estar bloqueadas por rate limit
+  const externalTargets = [
     `https://website.informer.com/${cleanDomain}`,
     `https://who.is/whois/${cleanDomain}`,
-    base,
-    `${base}/contact`,
-    `${base}/contacto`,
-    `${base}/about`,
-    `${base}/team`,
-    `${base}/equipo`,
-    `${base}/advertise`,
-    `${base}/publicidad`,
   ];
 
-  // Procesar en chunks de 5 para no saturar
-  const CONCURRENT = 5;
-  for (let i = 0; i < targets.length; i += CONCURRENT) {
-    const chunk = targets.slice(i, i + CONCURRENT);
-    await Promise.all(chunk.map(url => tryFetch(url, url.includes("informer") || url.includes("who.is") ? 6000 : 4000)));
-    // Si ya tenemos emails, frenar early — no necesitamos más
-    if (emails.size >= 5) break;
+  // Procesar en chunks de 4 — concurrencia limitada para no saturar Railway
+  const CONCURRENT = 4;
+  const all = [...internalTargets, ...externalTargets];
+  for (let i = 0; i < all.length; i += CONCURRENT) {
+    const chunk = all.slice(i, i + CONCURRENT);
+    await Promise.all(chunk.map(url => tryFetch(url, url.match(/informer|who\.is/) ? 6000 : 4000)));
+    // Early-stop si ya tenemos varios emails buenos (no garbage)
+    if (emails.size >= 10) break;
+  }
+
+  // Última chance — si NADA encontrado, probar mobile UA en home (algunos sites cambian)
+  if (emails.size === 0) {
+    await tryFetch(base, 5000, true);
   }
 
   return [...emails];
