@@ -27,7 +27,7 @@ const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
 const DOMAIN_DELAY_MS  = 2500;
 const MIN_TRAFFIC      = 400_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
-const REVIEW_QUEUE_MIN_TRAFFIC = 350_000; // Floor absoluto en review_queue. Items debajo se auto-borran (no acumulan basura).
+const REVIEW_QUEUE_MIN_TRAFFIC = 400_000; // Floor absoluto en review_queue. Items debajo se auto-borran (no acumulan basura).
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
@@ -2325,9 +2325,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
   }
-  // Filtro 350K: si tenemos traffic conocido y es bajo, no insertar al pool.
-  // Si visits=0 (sin data), igual lo dejamos pasar — el agente lo enriquece después.
-  if (visits > 0 && visits < REVIEW_QUEUE_MIN_TRAFFIC) {
+  // ── REGLA ESTRICTA (2026-05-12): solo entran al pool URLs con traffic CONFIRMADO ≥ 350K ──
+  // - traffic < 350K → skip (no entra)
+  // - traffic = 0 / null / error → skip + retry-able en csv_queue
+  // - traffic ≥ 350K → entra al pool
+  // Esto evita falsos positivos en Prospects (URLs sin data o bajo el threshold).
+  if (!visits || visits <= 0) {
+    // Sin data — marcar para retry en próximo iter (no acumula basura en review_queue)
+    await markCsvItem(token, item.id, "pending", {
+      error_message: `no_traffic_data — retry next iter`,
+    });
+    log(`  ⏸ ${domain} — sin traffic (RapidAPI null/error). Marcado pending para retry.`);
+    return;
+  }
+  if (visits < REVIEW_QUEUE_MIN_TRAFFIC) {
     await markCsvItem(token, item.id, "skipped", {
       error_message: `traffic ${visits} below min ${REVIEW_QUEUE_MIN_TRAFFIC}`,
     });
