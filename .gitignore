@@ -2,6 +2,8 @@ node_modules/
 auto-prospector/node_modules/
 .DS_Store
 *.zip
+!adeq-toolbar-chrome.zip
+!adeq-toolbar-mbs.zip
 *.pem
 supabase/.temp/
 supabase/.branches/
