@@ -4803,6 +4803,36 @@ async function main() {
     iterCount++;
     if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
 
+    // ── Cleanup periódico cada 30 iters ──
+    // 1. Borrar leads pending con traffic > 0 AND < 350K (basura que el agente
+    //    nunca pickearía pero acumulan en cola).
+    // 2. Resetear traffic=-1 (sentinel old) → 0 para que refresh los re-intente.
+    if (iterCount % 30 === 0) {
+      try {
+        // Reset -1 → 0 (re-eligible for refresh)
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=eq.-1`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ traffic: 0 }),
+        }).catch(() => {});
+        // Delete sub-threshold (0 < traffic < min)
+        const delRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`, {
+          method: "GET",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
+        });
+        const range = delRes.headers.get("content-range") || "";
+        const m = range.match(/\/(\d+)$/);
+        const subCount = m ? parseInt(m[1]) : 0;
+        if (subCount > 0) {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}`, {
+            method: "DELETE",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "return=minimal" },
+          }).catch(() => {});
+          log(`🗑 Cleanup: ${subCount} leads pending con traffic < ${REVIEW_QUEUE_MIN_TRAFFIC} eliminados`);
+        }
+      } catch (e) { log(`⚠️ cleanup: ${e.message}`); }
+    }
+
     // Flush incremental del counter RapidAPI cada 10 iters — captura hits del
     // backfill / refresh (que no son parte de runCsvQueue/autopilot).
     if (iterCount % 10 === 0 && _rapidGlobalCounter > _persistedRapidHits) {
