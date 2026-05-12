@@ -2656,23 +2656,74 @@ async function checkAgentKillSwitch(token, userEmail, cfg) {
   } catch { return false; }
 }
 
+// Cache de la voz Diego — vive por la lifetime del proceso (1 fetch al boot)
+let _diegoVoiceCache = null;
+let _diegoVoiceCacheAt = 0;
+const DIEGO_VOICE_TTL = 30 * 60 * 1000; // refresh cada 30min
+
+const DIEGO_VOICE_FALLBACK = `# IDENTIDAD
+Sos Claude operando como redactor de emails comerciales de ADEQ Media. Escribís en
+nombre de Diego Horovitz (Publishers Relations TL).
+NO sos un asistente neutral. Sos un vendedor B2B AdTech con voz humana, conversacional,
+auto-conciente del spam que reciben los publishers. El mail debe PARECER escrito en
+2 minutos por una persona apurada — no por un equipo de marketing.
+
+# CONTEXTO DESTINATARIO
+El publisher recibe 10-20 emails al día de gente vendiéndole monetización. Está cansado.
+La AUTO-CONCIENCIA del spam es un anzuelo poderoso ("se que te llegan muchos mails",
+"intento ser breve").
+
+# PRODUCTO
+Header bidding interno: ~8 demandas competitivas → uplift 25-30% sumado al stack actual.
+Video instream: CPM 1.5-2.5 USD, +50% fillrate. NO mencionar CPM excepto en VIDEO.
+Slider/corner video: CPM fijo USD 1, mencionar SOLO si pidieron más.
+SIEMPRE: revshare 80/20 a favor del publisher, sin exclusividad, sin permanencia mínima.
+
+# REGLAS DURAS
+- NO mencionar meses, fechas o datos no provistos
+- NO firma, NO despedida — terminar en pregunta concreta
+- NO mencionar ausencia de ads.txt salvo que el input lo confirme`;
+
+async function _getDiegoVoice(token) {
+  const now = Date.now();
+  if (_diegoVoiceCache && (now - _diegoVoiceCacheAt) < DIEGO_VOICE_TTL) return _diegoVoiceCache;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_user_prompts?user_email=eq.__global__&select=prompt`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (res.ok) {
+      const rows = await res.json();
+      const prompt = rows?.[0]?.prompt;
+      if (prompt && prompt.length > 100) {
+        _diegoVoiceCache = prompt;
+        _diegoVoiceCacheAt = now;
+        return prompt;
+      }
+    }
+  } catch {}
+  _diegoVoiceCache = DIEGO_VOICE_FALLBACK;
+  _diegoVoiceCacheAt = now;
+  return DIEGO_VOICE_FALLBACK;
+}
+
 // ── Claude pitch generation server-side (calls Anthropic via Edge proxy) ──
 async function generatePitchAgent(token, ctx) {
   const { domain, traffic, geo, language, category, contactName, adNetworks } = ctx;
-  // Llamada al Edge Function api-proxy (route 'anthropic') — misma infra que popup.
-  // System prompt simple — sin RAG por ahora (Phase 2). Voz Diego baked in la podemos
-  // sumar después leyéndola de toolbar_user_prompts.
   const langName = ({ es:"Spanish", en:"English", pt:"Portuguese", it:"Italian", ar:"Arabic" })[language] || "English";
   const trafficStr = traffic >= 1_000_000 ? `${Math.round(traffic/1_000_000)}M` : `${Math.round(traffic/1_000)}K`;
 
-  const systemMsg = `You are a senior Ad Ops consultant at ADEQ Media writing a cold outreach email to a publisher.
-TONE: friendly, conversational, no corporate jargon. Short paragraphs.
-ALWAYS mention: revshare 80/20 in publisher's favor, no exclusivity, no minimum commitment, results-based.
-NEVER mention specific months/dates. NEVER claim absence of ads.txt/tech unless input data confirms it.
-NEVER add a sign-off, signature or farewell — end with a specific question.
-LANGUAGE: write the ENTIRE email in ${langName}. Do not mix languages.
+  // Voz Diego desde DB (toolbar_user_prompts user_email='__global__'), fallback a baked
+  const diegoVoice = await _getDiegoVoice(token);
 
-Return JSON: { "body": string, "subjects": [3 subject lines, 6-10 words each] }`;
+  const systemMsg = `${diegoVoice}
+
+# OUTPUT REQUIREMENTS
+LANGUAGE: write the ENTIRE email in ${langName}. Do not mix languages.
+RETURN JSON ONLY: { "body": string, "subjects": [3 subject lines, 6-10 words each in ${langName}] }
+- body: 80-160 words máximo, párrafos cortos (1-2 líneas)
+- subjects: variantes A/B/C — algo personal con el dominio del sitio
+- NO incluir firma ni nombre al final del body`;
 
   const userMsg = `Site: ${domain}
 Monthly traffic: ${trafficStr} visits
