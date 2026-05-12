@@ -3794,38 +3794,35 @@ Write the prospecting email. Return JSON only.`;
 // LOCAL part patterns (antes del @): roles que nunca son decision-makers B2B.
 // Lista exhaustiva — ampliada 2026-05-12 por feedback de envíos reales.
 // Construido como string concat para mantener legibilidad.
+// REGLA: solo bloqueamos emails que NINGÚN humano lee (mailer-daemon, abuse, etc).
+// Customer support (info@, contact@, support@) NO se bloquea — algunos publishers
+// usan esos como único contacto. Esos van como "yellow" (mandar pero baja confianza)
+// vía rankEmail score bajo, no descarte total.
 const _GL_LOCAL_PARTS = [
-  // Sysadmin / mail infra
-  "abuse","admin","administrator","adm","administracao","administracion","root","sudo","webmaster","wm","hostmaster","postmaster","nobody","null",
-  "whois","registrant","registry","registrar","domain","domains","domain-?ops","domain-?operations","domain-?admin","domain-?manager","domain-?abuse","ndomains",
-  "noreply","no-reply","donotreply","do-not-reply","do_not_reply","reply-?to","reply","autoreply","auto-?reply","mailer-?daemon","mta","mailserver","mail-?server","smtp","mta-?admin","mailadmin","listadmin","list-?admin","listserv",
-  "bounce","bounced","return","returns","reject","rejected",
-  "cert","cert-?admin","csirt","soc","noc","sysadmin","sys-?admin","ops","operations","netops","infrastructure","infra",
-  "security","security-?team","secops","sec-?ops","info-?sec","infosec","cyber","cybersec",
-  "spam","antispam","anti-?spam","fraud","antifraud","scam","phishing","abusedesk","abuse-?report",
-  "legal","legal-?team","copyright","dmca","takedown","trademark","complaint","complaints","grievance",
-  // Privacy / GDPR
-  "gdpr","gdpr-?mask","gdpr-?masking","gdpr-?desk","dpo","data-?protection","privacy","privacy-?team","privacy-?desk","private","confidential","hidden","anonymous","anon","undisclosed","masked","masking",
-  // Billing / finance
-  "billing","invoice","invoices","invoicing","account","accounts","accounting","finance","finanzas","finanzen","payment","payments","pagamento","pago","pagos","payable","payables","treasury",
-  // Hosting / CDN
-  "hosting","host","hosts","cdn","cloudflare","cloudfront","akamai","fastly","incapsula","sucuri","wpengine",
-  "proxy","piracy","pirate","antipiracy","anti-?piracy",
-  "dns","dns-?admin","ssl","ssl-?admin","tls","cert-?manager",
-  // HR
-  "career","careers","job","jobs","recruit","recruiting","recruitment","hr","hire","hiring","talent","cv","resume","empleo","empleos","trabajo","trabajos","vagas",
-  // Marketing automation
-  "unsubscribe","opt-?out","optout","removeme","remove-?me","stop",
-  // Customer service (no decision-makers)
-  "service","services","customer-?service","customer-?support","support","soporte","atencion","atencion-?cliente","atendimento","sac","helpdesk","help-?desk","help","ayuda",
-  // Donations
-  "donate","donation","donations","donativo","colaboracion","patrocin",
-  // Monitoring / system
-  "notification","notifications","alert","alerts","alarm","alarms","monitoring","monitor","status","incident","incidents",
-  // Dev/test
-  "test","testing","tests","dev","developer","developers","devs","qa","staging","sandbox","demo","sample","example","fake","temp","temporary","throwaway",
-  "feedback","suggestions","sugerencias","sugestoes",
-  "default","generic","placeholder",
+  // Sysadmin / mail infra (sin lectura humana real)
+  "abuse","admin","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
+  "whois","registrant","registry","registrar","domain-?ops","domain-?abuse","ndomains",
+  "noreply","no-reply","donotreply","do-not-reply","do_not_reply","autoreply","auto-?reply","mailer-?daemon","mta","mailserver","mail-?server","mta-?admin",
+  "bounce","bounced","mailer",
+  "cert","cert-?admin","csirt","soc","noc","sysadmin","sys-?admin","netops","cert-?manager",
+  "spam","antispam","fraud","antifraud","phishing","abusedesk","abuse-?report",
+  "legal","copyright","dmca","takedown","trademark",
+  // Privacy / GDPR (proxies de WHOIS)
+  "gdpr","gdpr-?mask","gdpr-?masking","gdpr-?desk","dpo","data-?protection","privacy","masked","masking","anonymous","anon","undisclosed",
+  // Billing / finance (no compran ads)
+  "billing","invoice","invoices","invoicing","accounting","finance","payable","payables","treasury",
+  // Hosting / CDN (infraestructura)
+  "hosting","cdn","cloudflare","cloudfront","akamai","fastly","incapsula","sucuri",
+  "piracy","pirate","antipiracy","anti-?piracy",
+  "dns","dns-?admin","ssl-?admin",
+  // HR (no son decision-makers comerciales)
+  "careers?","jobs?","recruit","recruiting","recruitment","hire","hiring","talent",
+  // Marketing automation opt-out
+  "unsubscribe","opt-?out","optout","removeme","remove-?me",
+  // Dev/test fakes
+  "test","testing","dev","developer","staging","sandbox","example","fake","throwaway",
+  // Monitoring
+  "monitoring","alerts?","incident","incidents",
 ];
 const GARBAGE_LOCAL = new RegExp("^(?:" + _GL_LOCAL_PARTS.join("|") + ")@", "i");
 // Cualquier ocurrencia dentro del local-part también descarta (catches "domain.operations@x.com")
