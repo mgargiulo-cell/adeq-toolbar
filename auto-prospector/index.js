@@ -1255,8 +1255,15 @@ async function getTrafficData(domain, rapidApiKey) {
 
     // ── Adaptador del shape nuevo de website-insights ──────────
     // Visits puede venir como: object {YYYY-MM-DD: n}, array [{date,value}],
-    // number directo, o string "1.2M". Cubrimos todos los casos.
-    const tv = data.Traffic?.Visits;
+    // number directo, o string "1.2M". Y puede estar en data.Traffic.Visits
+    // O directamente en data.Visits (shape v3 que apareció 2026-05-12).
+    let tv = data.Traffic?.Visits;
+    if (tv == null) tv = data.Visits;
+    // Si Visits viene como objeto/array crudo, limpiamos data.Visits para
+    // re-procesarlo abajo (sino el `data?.Visits` final lo lee como objeto).
+    if (tv != null && typeof tv !== "number" && typeof tv !== "string") {
+      data.Visits = null;
+    }
     if (tv != null) {
       if (typeof tv === "number") {
         data.Visits = tv;
@@ -1283,10 +1290,20 @@ async function getTrafficData(domain, rapidApiKey) {
       }
     }
     // TopCountries: convertir TopCountryShares {US: 0.7, ...} → array {CountryCode, Share}
-    if (data.Traffic?.TopCountryShares && typeof data.Traffic.TopCountryShares === "object" && !Array.isArray(data.Traffic.TopCountryShares)) {
-      data.TopCountries = Object.entries(data.Traffic.TopCountryShares)
+    // Buscamos en orden: data.Traffic.TopCountryShares, data.TopCountryShares,
+    // data.TopCountries (top-level shape v3 que ya viene como array OK).
+    const tcRaw = data.Traffic?.TopCountryShares || data.TopCountryShares;
+    if (tcRaw && typeof tcRaw === "object" && !Array.isArray(tcRaw)) {
+      data.TopCountries = Object.entries(tcRaw)
         .map(([code, share]) => ({ CountryCode: code, Share: parseFloat(share) || 0 }))
         .sort((a, b) => b.Share - a.Share);
+    }
+    // Si data.TopCountries ya viene como array (shape v3), normalizamos shape.
+    if (Array.isArray(data.TopCountries)) {
+      data.TopCountries = data.TopCountries.map(c => ({
+        CountryCode: c?.CountryCode || c?.countryCode || c?.Country || c?.country || c?.code || "",
+        Share:       parseFloat(c?.Share || c?.share || c?.value || 0) || 0,
+      })).filter(c => c.CountryCode);
     }
     // Category bajo WebsiteDetails
     if (data.WebsiteDetails?.Category && !data.Category) data.Category = data.WebsiteDetails.Category;
