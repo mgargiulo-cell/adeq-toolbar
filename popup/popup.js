@@ -5505,12 +5505,9 @@ async function initCsvQueue() {
     const csvProcessing = stats.processing || 0;
     const waitlistCount = stats.waiting_pool || 0;
     statsEl.innerHTML = `
-      <div style="margin-bottom:4px"><strong>⚙️ Cola de procesamiento:</strong> ${csvPending}/${CSV_PENDING_CAP} pending${csvProcessing ? ` + ${csvProcessing} processing` : ""}</div>
-      <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/${WAITLIST_CAP} esperando turno (auto-promueve cuando libera)</div>
-      <div style="margin-bottom:4px"><strong>📋 Prospects (sin cap):</strong> ${reviewPending} leads ya enriquecidos</div>
-      <div style="font-size:9px;color:var(--text-muted);margin-top:4px">
-        Total histórico: ${stats.total} · ✅ Done: ${stats.done} · ❌ Error: ${stats.error} · ⏭ Skipped: ${stats.skipped}
-      </div>
+      <div style="margin-bottom:4px"><strong>⚙️ Processing queue:</strong> ${csvPending}/${CSV_PENDING_CAP} pending${csvProcessing ? ` + ${csvProcessing} processing` : ""}</div>
+      <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/${WAITLIST_CAP} waiting (auto-promotes when freed)</div>
+      <div style="margin-bottom:4px"><strong>📋 Prospects (To Review):</strong> ${reviewPending} enriched leads ready</div>
     `;
   };
 
