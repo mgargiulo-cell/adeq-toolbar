@@ -3053,6 +3053,55 @@ Si ninguno encaja al vertical, OMITIR referencia (no inventar).
 - Mencionar el dominio al menos 1 vez en el cuerpo
 - Si dudás, terminar más corto que más largo`;
 
+// 2do pass Claude para elegir el mejor email entre ambiguos. Devuelve el email
+// elegido o null. Cache 30d en toolbar_config para no re-pagar Claude por el
+// mismo dominio. Solo se llama si rankEmail dio scores ambiguos.
+const _claudePickCache = new Map();
+async function claudePickBestEmail(token, { domain, category, emails }) {
+  if (!Array.isArray(emails) || emails.length < 2) return emails[0] || null;
+  const cacheKey = `${domain}:${emails.sort().join(",")}`;
+  if (_claudePickCache.has(cacheKey)) return _claudePickCache.get(cacheKey);
+
+  const userMsg = `Site: ${domain}
+Category: ${category || "unknown"}
+Emails candidatos:
+${emails.map((e, i) => `${i + 1}. ${e}`).join("\n")}
+
+¿Cuál tiene MÁS probabilidad de ser un decision-maker B2B comercial (publisher/founder/marketing/business dev) que respondería a un cold email sobre monetización publicitaria?
+Devolveme JSON: { "email": "<el email exacto>", "reason": "<5 palabras>" }`;
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "anthropic",
+        path: "/v1/messages",
+        method: "POST",
+        body: {
+          model: "claude-haiku-4-5", // Haiku 4.5 = mucho más barato que Sonnet, suficiente para este pick
+          max_tokens: 100,
+          system: "Sos un experto en B2B AdTech sales. Elegís emails para outreach.",
+          messages: [{ role: "user", content: userMsg }],
+        },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = data?.content?.[0]?.text || "";
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    const parsed = JSON.parse(m[0]);
+    const picked = parsed?.email && emails.includes(parsed.email) ? parsed.email : null;
+    if (picked) _claudePickCache.set(cacheKey, picked);
+    return picked;
+  } catch { return null; }
+}
+
 async function _getAdeqStyle(token) {
   const now = Date.now();
   if (_adeqStyleCache && (now - _adeqStyleCacheAt) < ADEQ_STYLE_TTL) return _adeqStyleCache;
@@ -3824,8 +3873,24 @@ async function runAgentCycle(token, allFlags) {
           .map(e => ({ email: e, score: rankEmail(e, domain) }))
           .filter(x => x.score >= 0)
           .sort((a, b) => b.score - a.score);
-        const email = ranked[0]?.email;
-        if (email && ranked.length > 1) {
+        let email = ranked[0]?.email;
+
+        // ── 2do pass Claude para emails ambiguos ──
+        // Si el top score < 50 (no claramente verde) Y hay ≥2 candidatos,
+        // pedimos a Claude que elija el más probable decision-maker B2B.
+        // Costo: ~$0.005 por pick. Toggle vía agent_claude_email_pick=true.
+        if (cfg.agent_claude_email_pick === "true" && ranked.length >= 2 && ranked[0].score < 50) {
+          try {
+            const top = ranked.slice(0, 5).map(r => r.email);
+            const picked = await claudePickBestEmail(token, {
+              domain, category: lead.category || "", emails: top,
+            });
+            if (picked && top.includes(picked)) {
+              email = picked;
+              log(`  🤖 ${domain}: Claude pickeó ${picked} (de ambiguos: ${top.join(",")})`);
+            }
+          } catch (e) { log(`  ⚠️ Claude pick ${domain}: ${e.message}`); }
+        } else if (email && ranked.length > 1) {
           log(`  ✉️ ${domain}: pickeado ${email} (score=${ranked[0].score}) de ${ranked.length} candidatos`);
         }
         if (!email) {
