@@ -4551,9 +4551,28 @@ async function main() {
   log("📍 Entrando al main loop...");
   let iterCount = 0;
 
+  // Tracker de hits ya persistidos — para flush incremental en backfill / refresh
+  // (sin esperar el end-of-session de runCsvQueue).
+  let _persistedRapidHits = 0;
+
   while (true) {
     iterCount++;
     if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
+
+    // Flush incremental del counter RapidAPI cada 10 iters — captura hits del
+    // backfill / refresh (que no son parte de runCsvQueue/autopilot).
+    if (iterCount % 10 === 0 && _rapidGlobalCounter > _persistedRapidHits) {
+      const delta = _rapidGlobalCounter - _persistedRapidHits;
+      const today = new Date().toISOString().split("T")[0];
+      const period = _billingCyclePeriod();
+      try {
+        await saveRapidApiUsage(token, delta, today);
+        await saveRapidApiMonthlyUsage(token, delta, period);
+        _persistedRapidHits = _rapidGlobalCounter;
+        log(`💾 Persisted +${delta} RapidAPI hits (total session: ${_rapidGlobalCounter})`);
+      } catch (e) { log(`⚠️ flush rapidapi: ${e.message}`); }
+    }
+
     try {
       if (Date.now() > tokenExpiry) {
         try {
