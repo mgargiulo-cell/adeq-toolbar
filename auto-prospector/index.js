@@ -159,6 +159,9 @@ let domainPool = null;
 const COUNTRY_CODES = {
   US:"United States", MX:"Mexico", AR:"Argentina", CO:"Colombia", BR:"Brazil",
   CL:"Chile", ES:"Spain", PE:"Peru", EC:"Ecuador", VE:"Venezuela", UY:"Uruguay",
+  PY:"Paraguay", BO:"Bolivia", DO:"Dominican Republic", CR:"Costa Rica",
+  PA:"Panama", GT:"Guatemala", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
+  CU:"Cuba", PR:"Puerto Rico",
   GB:"United Kingdom", FR:"France", DE:"Germany", IT:"Italy", PT:"Portugal",
   CA:"Canada", AU:"Australia", JP:"Japan", KR:"South Korea", IN:"India",
   VN:"Vietnam", TH:"Thailand", ID:"Indonesia", PH:"Philippines", TR:"Turkey",
@@ -168,6 +171,10 @@ const COUNTRY_CODES = {
   DK:"Denmark", FI:"Finland", IL:"Israel", SG:"Singapore", CN:"China",
   MY:"Malaysia", GR:"Greece", HU:"Hungary", CZ:"Czech Republic", RO:"Romania",
   TW:"Taiwan", HK:"Hong Kong", PK:"Pakistan",
+  BG:"Bulgaria", HR:"Croatia", SI:"Slovenia", RS:"Serbia", IE:"Ireland",
+  BD:"Bangladesh", LK:"Sri Lanka", KE:"Kenya", DZ:"Algeria", TN:"Tunisia",
+  JO:"Jordan", LB:"Lebanon", IQ:"Iraq", KW:"Kuwait", QA:"Qatar", OM:"Oman",
+  YE:"Yemen", LY:"Libya", SN:"Senegal", CI:"Ivory Coast", GH:"Ghana",
 };
 
 // Reverse lookup: country name → ISO code (for Cloudflare Radar API)
@@ -3408,10 +3415,17 @@ async function getAgentDailyCount(token, userEmail) {
       `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,reserved)&created_at=gte.${cutoffUtc}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
+    if (!res.ok) {
+      log(`⚠️ getAgentDailyCount HTTP ${res.status} — fail-closed (asume cap alcanzado)`);
+      return Infinity; // fail-closed: si no podemos contar, NO mandamos
+    }
     const range = res.headers.get("content-range") || "";
     const m = range.match(/\/(\d+)$/);
     return m ? parseInt(m[1]) : 0;
-  } catch { return 0; }
+  } catch (e) {
+    log(`⚠️ getAgentDailyCount error: ${e.message} — fail-closed`);
+    return Infinity;
+  }
 }
 
 // Kill switch: si en la última hora hay > N fails consecutivos, auto-pausa 1h.
@@ -4094,8 +4108,11 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   return score;
 }
 const GARBAGE_DOMAIN_PATTERN = new RegExp([
-  // Keywords amplias en cualquier parte del dominio (gdpr-mask-anything.com, etc)
-  "gdpr|aws|amazonaws|amazonses|cloudfront|cloudflare|fastly|akamai|protect|whois",
+  // Keywords del dominio — anclados a inicio o tras @/. para evitar matches
+  // dentro de palabras (lawscope.com NO debe matchear "aws", paws.com tampoco).
+  "(^|[.@])(?:gdpr|aws|amazonaws|amazonses|cloudfront|cloudflare|fastly|akamai|whois)(?=[.-])",
+  // GDPR/protect domains (más laxo — solo si es claramente un proxy)
+  "(^|[.@])(?:protect|protected|gdpr-?protect|protect-?service)\\.",
   // Subdominios o dominios raíz de admin/whois/abuse/support (también después de @)
   "(^|[.@])(?:nic|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel|trustandsafety)\\.",
   // Cloud providers - support/abuse desks (NO son publishers)
@@ -4908,6 +4925,8 @@ async function runAgentCycle(token, allFlags) {
         // 4. Send Gmail PRIMERO — si falla, no toca Monday
         const subject = pitch.subjects[0];
 
+        // Hoist para que el catch pueda PATCHearlo a failed_reserved si el send rompe
+        let reservedId = null;
         // ── SENDTRACK 30d GUARD (último filtro antes del send) ──
         // Aunque upstream filtre, defense-in-depth: chequeamos si el dominio
         // recibió mail en los últimos 30 días por CUALQUIER MB (humano o agente).
@@ -4948,7 +4967,7 @@ async function runAgentCycle(token, allFlags) {
             details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language },
           }),
         }).catch(() => null);
-        const reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id;
+        reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id || null;
 
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body });
 
@@ -5025,6 +5044,19 @@ async function runAgentCycle(token, allFlags) {
         await sleep(15000 + Math.random() * 10000);
 
       } catch (err) {
+        // CRITICAL: si el send falló, el slot reservado pre-send queda contado
+        // como "consumed" en el cap diario aunque NO se mandó nada. Lo
+        // PATCHeamos a 'failed' para que getAgentDailyCount lo descarte.
+        if (reservedId) {
+          fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+            method: "PATCH",
+            headers: {
+              "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+              "Content-Type": "application/json", "Prefer": "return=minimal",
+            },
+            body: JSON.stringify({ action: "failed_reserved", reason: "send_failed_revert_slot" }),
+          }).catch(() => {});
+        }
         await logAgentAction(token, userEmail, {
           domain, action: "failed", reason: err.message?.substring(0, 200) || "unknown",
           details: { error: String(err).substring(0, 500) },

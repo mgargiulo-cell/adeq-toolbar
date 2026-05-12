@@ -5592,7 +5592,9 @@ async function initCsvQueue() {
     if (enabledCbx.checked) {
       try {
         const ap = await getAutopilotState(state.accessToken);
-        const apActive = ap?.enabled && ap?.heartbeatAt && (Date.now() - ap.heartbeatAt.getTime()) < 120_000;
+        // No usar heartbeat staleness — el heartbeat no se update durante la
+        // sesión interna de autopilot (loop sync ~20min). Confiamos en `enabled`.
+        const apActive = !!ap?.enabled;
         if (apActive) {
           const owner = ap.sessionUser ? ap.sessionUser.split("@")[0] : "someone";
           const elapsed = ap.sessionStart ? Math.round((Date.now() - ap.sessionStart.getTime()) / 60000) : 0;
