@@ -220,28 +220,31 @@ function setupAutoRefreshOnUrlChange() {
     if (!newUrl || newUrl.startsWith("chrome://") || newUrl.startsWith("about:")) return;
     const newDomain = extractDomain(newUrl);
     if (!newDomain || newDomain === _autoRefreshLastDomain) return;
+
+    // RESET INMEDIATO — no esperar 3s. Evita mostrar data mezclada de URL vieja.
+    _autoRefreshLastDomain = newDomain;
+    state.tabId  = tabId;
+    state.url    = newUrl;
+    state.domain = newDomain;
+    const siteEl = document.getElementById("site-url");
+    if (siteEl) siteEl.textContent = newDomain;
+    const seedEl = document.getElementById("cascade-seed");
+    if (seedEl) seedEl.value = newDomain;
+    // Limpieza COMPLETA del estado + UI ANTES de re-analizar
+    resetAnalysisUI();
+
+    // Debounce solo 800ms — espera a que la URL termine de estabilizarse
+    // (Chrome dispara onUpdated varias veces durante el load), luego re-analiza.
     clearTimeout(_autoRefreshTimer);
     _autoRefreshTimer = setTimeout(async () => {
-      // Re-confirmar que la tab activa sigue siendo esta URL (si el user navegó otra vez, esperamos)
       try {
         const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (!active || active.id !== tabId) return; // user cambió de tab
-        if (extractDomain(active.url) !== newDomain) return; // URL cambió de nuevo
-        _autoRefreshLastDomain = newDomain;
-        // Re-trigger analysis sobre la nueva URL
-        state.tabId  = active.id;
-        state.url    = active.url;
-        state.domain = newDomain;
-        const siteEl = document.getElementById("site-url");
-        if (siteEl) siteEl.textContent = newDomain;
-        const seedEl = document.getElementById("cascade-seed");
-        if (seedEl) seedEl.value = newDomain;
-        // Limpiar resultados previos antes de re-analizar
-        resetAnalysisUI();
-        // Re-correr el flujo de análisis
+        if (!active || active.id !== tabId) return;
+        if (extractDomain(active.url) !== newDomain) return;
+        // Re-correr análisis
         runAnalysisPipeline();
       } catch (e) { console.warn("[auto-refresh] failed:", e.message); }
-    }, 3000);
+    }, 800);
   };
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
