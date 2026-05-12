@@ -3847,10 +3847,12 @@ const _GL_LOCAL_PARTS = [
   "monitoring","alerts?","incident","incidents",
 ];
 const GARBAGE_LOCAL = new RegExp("^(?:" + _GL_LOCAL_PARTS.join("|") + ")@", "i");
-// Cualquier ocurrencia dentro del local-part también descarta (catches "domain.operations@x.com")
+// Cualquier ocurrencia dentro del local-part también descarta. Captura variantes
+// nuevas tipo "trustandsafety", "gdpr-mask-2025", "protect-domain", etc.
 const GARBAGE_LOCAL_CONTAINS = new RegExp([
   "abuse","domain[-._]?(?:ops|operations|abuse|admin|manager|owner)","hosting","cloudflare","cloudfront","akamai","fastly",
-  "proxy","piracy","pirate","takedown","whois","gdpr","masked?","masking","anonymized?",
+  "proxy","piracy","pirate","takedown","whois","gdpr","masked?","masking","anonymized?","protect",
+  "trust[-._]?and[-._]?safety","trust[-._]?safety","safety[-._]?team",
   "unsubscribe","opt[-._]?out","removeme",
   "mailer[-._]?daemon","noreply","no[-._]?reply","donotreply","autoreply",
   "dpo","data[-._]?protection",
@@ -4060,6 +4062,9 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // Local muy corto (<3) o muy largo (>30) = sospechoso
   if (local.length < 3) score -= 30;
   if (local.length > 30) score -= 25;
+  // Soft penalty para palabras con flavor spam (real estate, sales, etc).
+  // No descarta — baja prioridad para que ganen otros candidatos si los hay.
+  if (/property|sale|offer|click|freemium|promo|bonus/.test(local)) score -= 15;
   // Free webmail = penalizar pero NO descartar (un MB humano puede mandar)
   if (isFreeWebmail) score -= 20; // antes -35, ahora -20 para que webmail con persona real sobreviva
 
@@ -4074,8 +4079,10 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   return score;
 }
 const GARBAGE_DOMAIN_PATTERN = new RegExp([
+  // Keywords amplias en cualquier parte del dominio (gdpr-mask-anything.com, etc)
+  "gdpr|aws|amazonaws|amazonses|cloudfront|cloudflare|fastly|akamai|protect|whois",
   // Subdominios de admin/whois/abuse/support
-  "(^|\\.)(?:nic|whois|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel|support|trustandsafety)\\.",
+  "(^|\\.)(?:nic|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel|support|trustandsafety)\\.",
   // Cloud providers - support/abuse desks (NO son publishers)
   "(^|\\.)(?:aws|amazonaws|cloudfront|googlecloud|azure|microsoft|cloudflare|fastly)\\.com",
   // Privacy/proxy services
