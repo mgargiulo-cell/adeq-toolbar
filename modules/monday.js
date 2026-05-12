@@ -83,18 +83,17 @@ function resolveMondayPerson(ejecutivo, loginEmail) {
 }
 
 export async function pushToMonday(data) {
-  const { domain, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo, loginEmail } = data;
-  const comentario = pitch ? `PITCH IA:\n${pitch}` : "";
+  const { domain, traffic, email, geo, estado, fecha, idioma, ejecutivo, loginEmail } = data;
 
   const safe     = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
   const itemName = domain.startsWith("www.") ? domain : `www.${domain}`;
 
   const personId = resolveMondayPerson(ejecutivo, loginEmail);
 
+  // Comentarios: NO se incluye pitch — decisión user 2026-05-12 (igual que agente).
   const columnValues = {
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
-    [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
     ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
     ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
@@ -114,17 +113,15 @@ export async function pushToMonday(data) {
   return result?.create_item;
 }
 
-export async function updateMonday({ itemId, traffic, email, geo, pitch, estado, fecha, idioma, ejecutivo, loginEmail }) {
-  const comentario = pitch ? `PITCH IA:\n${pitch}` : "";
-
+export async function updateMonday({ itemId, traffic, email, geo, estado, fecha, idioma, ejecutivo, loginEmail }) {
   const safe = (str) => (str || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 
   const personId = resolveMondayPerson(ejecutivo, loginEmail);
 
+  // Comentarios: NO se incluye pitch — decisión user 2026-05-12.
   const columnValues = {
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
-    [CONFIG.MONDAY_COLUMNS.comentarios]:   safe(comentario),
     ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
     ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
     ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
