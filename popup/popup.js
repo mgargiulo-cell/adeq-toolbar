@@ -4708,9 +4708,11 @@ async function startCascade() {
     const [a, b] = val.split(":");
     return [a === "" || a == null ? 0 : Number(a), b === "" || b == null ? Infinity : Number(b)];
   };
-  const [tMin, tMax] = parseRange(document.getElementById("cascade-min-traffic").value);
-  const [rMin, rMax] = parseRange(document.getElementById("cascade-max-rank").value);
-  const langFilter = document.getElementById("cascade-language").value;
+  // Filters opcionales — la sección de filtros está oculta (display:none) desde
+  // el cleanup 2026-05-08, así que estos elementos pueden no existir.
+  const [tMin, tMax] = parseRange(document.getElementById("cascade-min-traffic")?.value || "");
+  const [rMin, rMax] = parseRange(document.getElementById("cascade-max-rank")?.value    || "");
+  const langFilter = document.getElementById("cascade-language")?.value || "";
 
   btn.disabled = true; btn.textContent = "⏳";
   cascadeResults = []; cascadeRawResults = []; cascadeSelected = new Set(); cascadeBlockedExecSet = new Set();
