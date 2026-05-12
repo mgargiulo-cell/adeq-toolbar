@@ -175,6 +175,52 @@ const COUNTRY_NAME_TO_CODE = Object.fromEntries(
   Object.entries(COUNTRY_CODES).map(([code, name]) => [name, code])
 );
 
+// ── Monday GEO label canonical (Spanish, no accents, first cap) ──
+// El campo texto6 "Top Geo" en Monday espera nombres en español SIN tildes.
+// Mapeo desde ISO code O nombre inglés → label Monday válido.
+// Si no encontramos match → return "" (no insertar valor inventado).
+const MONDAY_GEO_LABELS = {
+  US:"Estados Unidos", MX:"Mexico", AR:"Argentina", CO:"Colombia", BR:"Brasil",
+  CL:"Chile", ES:"Espana", PE:"Peru", EC:"Ecuador", VE:"Venezuela", UY:"Uruguay",
+  PY:"Paraguay", BO:"Bolivia", DO:"Republica Dominicana", CR:"Costa Rica",
+  PA:"Panama", GT:"Guatemala", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
+  CU:"Cuba", PR:"Puerto Rico",
+  GB:"Reino Unido", FR:"Francia", DE:"Alemania", IT:"Italia", PT:"Portugal",
+  CA:"Canada", AU:"Australia", NZ:"Nueva Zelanda",
+  JP:"Japon", KR:"Corea del Sur", IN:"India",
+  VN:"Vietnam", TH:"Tailandia", ID:"Indonesia", PH:"Filipinas", TR:"Turquia",
+  SA:"Arabia Saudita", AE:"Emiratos Arabes", EG:"Egipto", MA:"Marruecos",
+  ZA:"Sudafrica", NG:"Nigeria", KE:"Kenia", GH:"Ghana", ET:"Etiopia",
+  RU:"Rusia", UA:"Ucrania", PL:"Polonia",
+  NL:"Paises Bajos", BE:"Belgica", SE:"Suecia", CH:"Suiza", AT:"Austria",
+  NO:"Noruega", DK:"Dinamarca", FI:"Finlandia", IE:"Irlanda", LU:"Luxemburgo",
+  IL:"Israel", SG:"Singapur", CN:"China",
+  MY:"Malasia", GR:"Grecia", HU:"Hungria", CZ:"Republica Checa", RO:"Rumania",
+  TW:"Taiwan", HK:"Hong Kong", PK:"Pakistan", BD:"Bangladesh",
+};
+
+// Normaliza cualquier input geo a label válido para Monday (texto6).
+// Acepta: ISO code (PY), nombre inglés (Brazil), nombre español con tildes (México).
+// Devuelve "" si no podemos confirmar — mejor vacío que inventar.
+function normalizeMondayGeo(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  if (!s) return "";
+  // 1. ISO code directo (2 letras uppercase)
+  const upper = s.toUpperCase();
+  if (MONDAY_GEO_LABELS[upper]) return MONDAY_GEO_LABELS[upper];
+  // 2. Nombre inglés conocido — convertir vía COUNTRY_NAME_TO_CODE
+  const fromEnglish = COUNTRY_NAME_TO_CODE[s];
+  if (fromEnglish && MONDAY_GEO_LABELS[fromEnglish]) return MONDAY_GEO_LABELS[fromEnglish];
+  // 3. Nombre español con tildes — strip y match contra labels existentes
+  const stripped = s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  for (const [code, label] of Object.entries(MONDAY_GEO_LABELS)) {
+    if (label.toLowerCase() === stripped) return label;
+  }
+  // 4. No match → vacío (no inventar)
+  return "";
+}
+
 // ── Domain pool (Majestic Million) ───────────────────────────
 
 async function loadDomainPool() {
@@ -4227,9 +4273,11 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Shapes según config.js: geo/trafico/comentarios = text, no objetos.
   // email = { email, text }. status (estado/idioma) = { index } o { label }.
   // person = { personsAndTeams }. date = { date }.
+  // GEO normalizado a label español sin tildes (texto6 acepta solo esos valores).
+  const geoNormalized = normalizeMondayGeo(payload.geo);
   const cols = {
     [MONDAY_COL_TRAFFIC]:   payload.traffic_text || "",
-    [MONDAY_COL_GEO]:       payload.geo || "",
+    [MONDAY_COL_GEO]:       geoNormalized,
     [MONDAY_COL_EMAIL]:     { email: payload.email, text: payload.email },
     [MONDAY_COL_DATE]:      { date: new Date().toISOString().split("T")[0] },
     [MONDAY_COL_IDIOMA]:    { index: payload.idioma_idx || 0 },
