@@ -3456,6 +3456,41 @@ function _isOutsideActiveHours(activeStart, activeEnd) {
   // (mantenido — si activeStart=activeEnd → siempre fuera, deseable como kill switch)
 }
 
+// Pickea un draft del MB desde toolbar_pitch_drafts para el idioma del lead.
+// Prefiere drafts del user_email impersonado; cae a is_default=true si no hay
+// custom. Devuelve { body, subjects } compatible con fillTemplate, o null si
+// no encuentra ningún draft (caller cae a templates.js baked).
+const _draftsCache = new Map(); // key: `${userEmail}|${lang}` → { drafts, ts }
+const DRAFTS_CACHE_TTL = 5 * 60 * 1000; // 5 min — drafts cambian rara vez
+
+async function pickDbDraft(token, userEmail, language) {
+  const lang = (language || "en").toLowerCase().slice(0, 2);
+  const cacheKey = `${userEmail}|${lang}`;
+  let cached = _draftsCache.get(cacheKey);
+  if (!cached || Date.now() - cached.ts > DRAFTS_CACHE_TTL) {
+    // Fetch: drafts del user impersonado + defaults globales para ese lang
+    const url = `${SUPABASE_URL}/rest/v1/toolbar_pitch_drafts?language=eq.${encodeURIComponent(lang)}&or=(user_email.eq.${encodeURIComponent(userEmail)},is_default.eq.true)&select=name,subject,body,is_default,priority&order=priority.asc,is_default.desc`;
+    const res = await fetch(url, {
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+    });
+    if (!res.ok) {
+      _draftsCache.set(cacheKey, { drafts: [], ts: Date.now() });
+      return null;
+    }
+    const rows = await res.json();
+    cached = { drafts: Array.isArray(rows) ? rows : [], ts: Date.now() };
+    _draftsCache.set(cacheKey, cached);
+  }
+  const drafts = cached.drafts;
+  if (!drafts.length) return null;
+  // Pickear random — todos los drafts del MB+defaults son válidos
+  const pick = drafts[Math.floor(Math.random() * drafts.length)];
+  return {
+    body: pick.body || "",
+    subjects: pick.subject ? [pick.subject] : ["Pregunta sobre {{domain}}"],
+  };
+}
+
 async function logAgentAction(token, userEmail, payload) {
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
@@ -5163,11 +5198,23 @@ async function runAgentCycle(token, allFlags) {
             continue;
           }
         } else {
-          // Template (80% de los casos) — sin costo Claude
-          const tpl = pickRandomTemplate(lead.language);
-          pitch = fillTemplate(tpl, {
-            domain, geo: leadGeo, traffic: leadTraffic,
-          });
+          // Template (80% de los casos) — sin costo Claude.
+          // Prioridad 1: drafts del user en Supabase (toolbar_pitch_drafts) para
+          // ese idioma. Prioridad 2: fallback a templates.js baked.
+          let dbDraft = null;
+          try {
+            dbDraft = await pickDbDraft(token, userEmail, lead.language);
+          } catch (e) { log(`  ⚠️ pickDbDraft ${domain}: ${e.message}`); }
+          if (dbDraft) {
+            pitch = fillTemplate(dbDraft, {
+              domain, geo: leadGeo, traffic: leadTraffic,
+            });
+          } else {
+            const tpl = pickRandomTemplate(lead.language);
+            pitch = fillTemplate(tpl, {
+              domain, geo: leadGeo, traffic: leadTraffic,
+            });
+          }
         }
 
         // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──

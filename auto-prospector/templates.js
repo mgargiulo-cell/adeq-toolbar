@@ -12,72 +12,41 @@
 
 const TEMPLATES = {
   // ── ESPAÑOL ────────────────────────────────────────────────
+  // Estilo casual conversacional — drafts aprobados por el user 2026-05-12.
   es: [
     {
       subjects: [
-        "Una propuesta para potenciar la monetización de {{domain}}",
-        "Trabajando con sitios como {{domain}} en {{geo}}",
-        "Header bidding + video para {{domain}}",
-      ],
-      body: `Hola, ¿cómo estás?
-
-Tengo dos opciones con las que estamos obteniendo muy buenos resultados. Por un lado, gestionamos la demanda de display a través de un header bidding interno donde ponemos a competir 8 demandas distintas para sacar el mejor precio en cada anuncio. Por otro lado, video instream que se puede configurar para mostrar avances de otras notas cuando no hay publicidad — ayuda a recirculación de contenido.
-
-No tenemos cláusulas de exclusividad ni mínimos. Probás, si los resultados dan, seguimos.
-
-¿Te interesa que te muestre números concretos en una llamada corta?`,
-    },
-    {
-      subjects: [
-        "Buenos resultados con publishers de {{geo}}",
-        "Probar nuevas demandas en {{domain}}",
-        "Revshare 80/20 — sin compromisos",
-      ],
-      body: `Hola, espero que estés bien.
-
-Estamos sumando publishers en {{geo}} con muy buenos resultados, tanto en display como en video. Viendo {{domain}} creo que podemos replicar el mismo esquema y sacar un extra en monetización.
-
-Trabajamos con revshare 80-20 a favor del publisher y sin ataduras comerciales. Me gustaría que nos puedan evaluar en base a resultados.
-
-¿Qué te parece?`,
-    },
-    {
-      subjects: [
-        "{{domain}} + nuestro stack de demand",
-        "Cómo podemos sumar ingresos a {{domain}}",
-        "Probemos sin compromiso en {{domain}}",
-      ],
-      body: `Hola,
-
-Vengo del lado de la monetización y vi {{domain}}. Quería compartirte que estamos trabajando con un header bidding interno que pone a competir múltiples demand sources por cada impresión + opciones de video (instream y outstream) que se pueden integrar sin afectar la UX actual del sitio.
-
-Sin exclusividad, sin mínimos. Te paso números concretos si te interesa.
-
-¿Charlamos?`,
-    },
-    {
-      subjects: [
-        "Optimización de inventario en {{domain}}",
-        "Idea concreta para {{domain}}",
-        "Sumar demand a {{domain}}",
-      ],
-      body: `Hola, ¿cómo va?
-
-Estoy revisando sitios con audiencia en {{geo}} y noté que {{domain}} tiene un perfil que encaja bien con lo que estamos buscando. Podemos competir con la demanda actual sin reemplazar nada — corremos en paralelo y el publisher se queda con el mejor CPM por subasta.
-
-Sin períodos mínimos, revshare 80-20. ¿Te interesa probar?`,
-    },
-    {
-      subjects: [
         "Pregunta sobre {{domain}}",
-        "Probar formato video en {{domain}}",
-        "Demanda extra para {{domain}}",
+        "Quien maneja pautas en {{domain}}?",
+        "Contacto comercial de {{domain}}",
       ],
-      body: `Hola,
+      body: `Hola! Vi {{domain}} y queria preguntarte si sos vos quien maneja las pautas publicitarias del sitio, o si me podes pasar el contacto del que decide.
 
-¿Tenés video implementado en {{domain}}? Si no es así, podemos integrar un player instream que muestra publicidad cuando está disponible y avances de notas cuando no hay ad — sin afectar la lectura. Y si ya tenés video, podemos sumar demand competitiva.
+Soy de ADEQ Media, trabajamos con publishers monetizando inventario. Quiero ver si te puedo sumar algo.
 
-Trabajamos sin exclusividad. ¿Vemos números juntos?`,
+Cualquier cosa avisame.`,
+    },
+    {
+      subjects: [
+        "Video activo para {{domain}}",
+        "Campañas in-stream + out-stream para {{domain}}",
+        "Sumar video a {{domain}}",
+      ],
+      body: `Hola, te escribo de ADEQ Media. Tenemos campañas de video activas (in-stream y out-stream) que andan muy bien con sitios como {{domain}}.
+
+CPMs decentes, fill alto, sin pisarte la UX. Si te interesa te paso un breakdown rápido.
+
+Decime y te mando los detalles.`,
+    },
+    {
+      subjects: [
+        "Header bidding en {{domain}}?",
+        "Levantar eCPM en {{domain}} sin tocar la integración",
+        "Setup HB para {{domain}}",
+      ],
+      body: `Hola, soy de ADEQ. Vi que {{domain}} tiene buen tráfico y queria preguntarte si ya estás corriendo header bidding o si lo manejas todo via Google directo.
+
+Tenemos un setup que suele levantar 15-30% del eCPM sin tocar la integración actual. Si te quedan minutos te muestro como.`,
     },
   ],
 
@@ -85,69 +54,37 @@ Trabajamos sin exclusividad. ¿Vemos números juntos?`,
   en: [
     {
       subjects: [
-        "Header bidding + video for {{domain}}",
-        "A proposal to boost {{domain}} monetization",
-        "Working with publishers in {{geo}}",
+        "Quick question about {{domain}}",
+        "Who handles ads on {{domain}}?",
+        "Commercial contact for {{domain}}",
       ],
-      body: `Hi, how have you been?
+      body: `Hi! Saw {{domain}} and wanted to ask if you're the one handling ad partnerships, or if you can point me to whoever decides.
 
-I have two options that are performing really well right now. On one hand, we manage display demand through an internal header bidding setup where 8+ demand sources compete for each impression to get the best CPM. On the other, instream video that can be configured to show your own content previews when no ad is available — boosts recirculation.
+I'm with ADEQ Media, we work with publishers monetizing inventory. Want to see if I can add something on our end.
 
-No exclusivity, no minimum commitment. You test, if results show up, we keep going.
-
-Would a quick call to share concrete numbers make sense?`,
+Let me know either way.`,
     },
     {
       subjects: [
-        "{{geo}} publishers we're working with",
-        "Revshare 80/20 — no strings attached",
-        "Trying new demand on {{domain}}",
+        "Active video for {{domain}}",
+        "In-stream + out-stream campaigns for {{domain}}",
+        "Adding video to {{domain}}",
       ],
-      body: `Hi, hope you're well.
+      body: `Hi, this is ADEQ Media. We have video campaigns running (in-stream and out-stream) that are doing really well on sites like {{domain}}.
 
-We're onboarding publishers in {{geo}} with strong results in both display and video. Looking at {{domain}} I think we can replicate the same setup and add an extra layer of monetization.
+Decent CPMs, high fill, doesn't break UX. If you want I'll send a quick breakdown.
 
-We work on an 80/20 revshare in the publisher's favor, no commercial ties. Happy to be evaluated purely on results.
-
-What do you think?`,
+Let me know and I'll send the details.`,
     },
     {
       subjects: [
-        "Adding demand to {{domain}}",
-        "Quick idea for {{domain}}",
-        "{{domain}} + our demand stack",
+        "Header bidding on {{domain}}?",
+        "Lift eCPM on {{domain}} without touching integration",
+        "HB setup for {{domain}}",
       ],
-      body: `Hi,
+      body: `Hi, ADEQ here. Saw {{domain}} has solid traffic and wanted to ask if you're already running header bidding or handling everything through Google directly.
 
-I'm on the monetization side and came across {{domain}}. Wanted to share that we run an internal header bidding setup with multiple competing demand sources, plus video options (instream and outstream) that integrate without disrupting current UX.
-
-No exclusivity, no minimums. I can share concrete numbers if it's useful.
-
-Worth a chat?`,
-    },
-    {
-      subjects: [
-        "Question about {{domain}}",
-        "Trying video format on {{domain}}",
-        "Extra demand for {{domain}}",
-      ],
-      body: `Hi,
-
-Do you have video monetization on {{domain}}? If not, we can integrate an instream player that serves ads when available and shows your own content previews when no ad is up — non-intrusive. And if you already have video, we can add competing demand.
-
-We work without exclusivity. Want to see numbers together?`,
-    },
-    {
-      subjects: [
-        "Inventory optimization on {{domain}}",
-        "{{domain}} + our SSP stack",
-        "Test without commitment on {{domain}}",
-      ],
-      body: `Hi, how's it going?
-
-I've been looking at sites with audiences in {{geo}} and {{domain}} caught my attention — fits well with what we're targeting. We can compete with your current demand without replacing anything — we run in parallel and you keep the highest CPM per auction.
-
-No minimum commitment, 80/20 revshare. Interested in giving it a try?`,
+We have a setup that usually lifts eCPM 15-30% without touching the current integration. If you have a few minutes I'll show you how.`,
     },
   ],
 
