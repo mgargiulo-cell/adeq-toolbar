@@ -2651,7 +2651,19 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const _rapidStart      = rapidUsage.usedToday;
   const _rapidMonthStart = rapidMonth.usedThisMonth;
 
+  // Hard cap 20 min — defense en profundidad por si bug deja la cola corriendo
+  const _csvSessionStart = Date.now();
+  const CSV_SESSION_LIMIT_MS = 20 * 60 * 1000;
+
   while (processed < maxItems) {
+    // Hard timeout 20min — apagar y salir aunque queden items pendientes.
+    // Próximo loop iter del worker lo re-prende si csv_queue_enabled sigue true,
+    // pero el toggle ya está OFF acá → user debe re-prenderlo manualmente.
+    if (Date.now() - _csvSessionStart >= CSV_SESSION_LIMIT_MS) {
+      log(`⏱ CSV queue: 20min hard cap alcanzado — auto-apagando (procesados: ${processed}). Re-prender manual si querés seguir.`);
+      await setConfigValue(token, "csv_queue_enabled", "false");
+      break;
+    }
     // No hay pre-check de cap acá — el cap (200) se aplica al SUBIR items
     // (popup pre-check + promoteWaitlist en main loop). Si llegamos acá,
     // hay items para procesar normalmente.
@@ -2752,7 +2764,12 @@ async function runSession(token, cfg, sessionStart) {
     try {
       const userLimits = await getUserLimits(token, sessionUser);
       if (userLimits.autopilot_daily_prospects > 0) AUTOPILOT_DAILY_LIMIT = userLimits.autopilot_daily_prospects;
-      if (userLimits.autopilot_daily_minutes >= 5)  userSessionLimitMs    = userLimits.autopilot_daily_minutes * 60 * 1000;
+      // Hard cap a 20 min — el admin puede bajar pero NO superar el SESSION_LIMIT_MS.
+      // Evita loops infinitos por configuración mal seteada.
+      if (userLimits.autopilot_daily_minutes >= 5) {
+        const userMins = Math.min(userLimits.autopilot_daily_minutes, 20);
+        userSessionLimitMs = userMins * 60 * 1000;
+      }
       if (userLimits.autopilot_enabled === false) {
         log(`⛔ ${sessionUser} tiene autopilot DISABLED por el admin — sesión no arranca`);
         await setConfigValue(token, "auto_prospecting_enabled", "false");
