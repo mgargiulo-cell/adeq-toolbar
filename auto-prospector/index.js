@@ -1383,8 +1383,107 @@ async function fetchPageContent(domain) {
     else if (/receta|cocina|comida|food|cook|gastronom/.test(textForCategory))                                                              category = "food";
     else if (/negocio|business|emprend|startup|marketing|seo|empresa/.test(textForCategory))                                                category = "business";
 
-    return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks, category };
+    // Extraer señales de idioma del HTML para detección robusta downstream
+    const htmlLang = (html.match(/<html[^>]+lang=["']([a-z]{2})/i) || [])[1] || "";
+    const ogLocale = (html.match(/<meta[^>]+property=["']og:locale["'][^>]+content=["']([a-z]{2})/i) || [])[1] || "";
+    // Sample de texto para análisis heurístico (sin tags, primeras 4K chars)
+    const textSample = (title + " " + desc + " " + html.replace(/<[^>]+>/g, " ").substring(0, 4000)).toLowerCase();
+
+    return { title: title.slice(0, 100), description: desc.slice(0, 280), adNetworks, category, htmlLang, ogLocale, textSample };
   } catch { return null; }
+}
+
+// ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
+// Cascada: <html lang> → og:locale → texto heurístico → GEO → TLD → "en"
+// Solo retorna idiomas SOPORTADOS por templates: es/en/it/pt/ar.
+// Crítico: el agente debe acertar idioma SIEMPRE — un mail en idioma equivocado
+// quema el dominio para siempre.
+const SUPPORTED_AGENT_LANGS = new Set(["es", "en", "it", "pt", "ar"]);
+
+const TLD_TO_LANG_AGENT = {
+  ar:"es", mx:"es", co:"es", cl:"es", pe:"es", uy:"es", py:"es", bo:"es",
+  ec:"es", ve:"es", do:"es", cr:"es", pa:"es", gt:"es", hn:"es", sv:"es",
+  ni:"es", cu:"es", pr:"es", es:"es",
+  br:"pt", pt:"pt",
+  it:"it",
+  ae:"ar", sa:"ar", eg:"ar", ma:"ar",
+  com:"en", net:"en", org:"en", io:"en", uk:"en", us:"en", au:"en", nz:"en",
+};
+
+const GEO_TO_LANG_AGENT = {
+  Argentina:"es", Mexico:"es", Colombia:"es", Chile:"es", Peru:"es", Uruguay:"es",
+  Paraguay:"es", Bolivia:"es", Ecuador:"es", Venezuela:"es", "Dominican Republic":"es",
+  "Costa Rica":"es", Panama:"es", Guatemala:"es", Honduras:"es", "El Salvador":"es",
+  Nicaragua:"es", Cuba:"es", "Puerto Rico":"es", Spain:"es",
+  Brazil:"pt", Portugal:"pt",
+  Italy:"it", Switzerland:"it",
+  "United Arab Emirates":"ar", "Saudi Arabia":"ar", Egypt:"ar", Morocco:"ar",
+  AR:"es", MX:"es", CO:"es", CL:"es", PE:"es", UY:"es", PY:"es", BO:"es",
+  EC:"es", VE:"es", DO:"es", CR:"es", PA:"es", GT:"es", HN:"es", SV:"es",
+  NI:"es", CU:"es", PR:"es", ES:"es",
+  BR:"pt", PT:"pt",
+  IT:"it", CH:"it",
+  AE:"ar", SA:"ar", EG:"ar", MA:"ar",
+};
+
+function _detectLangFromText(text) {
+  if (!text || text.length < 30) return null;
+  const t = text.toLowerCase();
+  if (/[؀-ۿ]/.test(text)) return "ar";
+  const markers = {
+    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|nuestra|nuestro|hola|gracias|hace|noticias|últimas|videos)\b/g,
+    pt: /\b(que|nao|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|ola|obrigad|dele|dela|voce|notícias|notícia|últimas|últim)\b/g,
+    it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perche|sopra|grazie|nostra|nostro|ciao|notizie|ultim)\b/g,
+    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks|news|latest|videos)\b/g,
+  };
+  const scores = {};
+  let total = 0;
+  for (const [lang, re] of Object.entries(markers)) {
+    const m = t.match(re);
+    scores[lang] = m ? m.length : 0;
+    total += scores[lang];
+  }
+  if (/[ñáéíóúü¿¡]/.test(text)) scores.es += 5;
+  if (/[ãõçàáâ]/.test(text))    scores.pt += 5;
+  if (/[àèéìòù]/.test(text))    scores.it += 5;
+  if (total < 3) return null;
+  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  if (sorted[0][1] >= sorted[1][1] + 2) return sorted[0][0];
+  return null;
+}
+
+// Función principal — devuelve { lang, source, confidence } siempre.
+// confidence: "high" (html/og/text strong), "medium" (text weak/geo), "low" (tld/default).
+function detectLanguageRobust({ htmlLang, ogLocale, textSample, geo, domain }) {
+  // 1) <html lang="..."> — máxima confianza si está
+  const hl = (htmlLang || "").toLowerCase().split("-")[0];
+  if (SUPPORTED_AGENT_LANGS.has(hl)) return { lang: hl, source: "html_lang", confidence: "high" };
+
+  // 2) og:locale (es_AR, pt_BR…)
+  const og = (ogLocale || "").toLowerCase().split(/[-_]/)[0];
+  if (SUPPORTED_AGENT_LANGS.has(og)) return { lang: og, source: "og_locale", confidence: "high" };
+
+  // 3) Análisis heurístico del texto real
+  const fromText = _detectLangFromText(textSample || "");
+  if (fromText && SUPPORTED_AGENT_LANGS.has(fromText)) {
+    return { lang: fromText, source: "text_heuristic", confidence: "high" };
+  }
+
+  // 4) GEO → idioma
+  const geoLang = GEO_TO_LANG_AGENT[geo] || GEO_TO_LANG_AGENT[(geo || "").trim()];
+  if (geoLang && SUPPORTED_AGENT_LANGS.has(geoLang)) {
+    return { lang: geoLang, source: "geo", confidence: "medium" };
+  }
+
+  // 5) TLD del dominio
+  const tld = (domain || "").split(".").pop()?.toLowerCase() || "";
+  const tldLang = TLD_TO_LANG_AGENT[tld];
+  if (tldLang && SUPPORTED_AGENT_LANGS.has(tldLang)) {
+    return { lang: tldLang, source: "tld", confidence: "low" };
+  }
+
+  // 6) Default seguro
+  return { lang: "en", source: "default", confidence: "low" };
 }
 
 // ── Blocklist para autopilot — evita dominios que no son targets válidos ───
@@ -3327,8 +3426,44 @@ async function runAgentCycle(token, allFlags) {
       let emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
       let leadTraffic = lead.traffic || 0;
       let leadGeo = lead.geo || "";
+      let leadLanguage = (lead.language || "").toLowerCase().split("-")[0];
 
       try {
+        // ── DETECCIÓN ROBUSTA DE IDIOMA (CRÍTICO) ──
+        // El mail DEBE estar en el idioma del sitio. Si lead.language ya está
+        // y es soportado, lo re-validamos contra HTML. Si no, fetcheamos.
+        // Mail en idioma equivocado quema el dominio para siempre.
+        let _pageContent = null;
+        const needLangFetch = !leadLanguage || !SUPPORTED_AGENT_LANGS.has(leadLanguage);
+        if (needLangFetch) {
+          _pageContent = await fetchPageContent(domain).catch(() => null);
+          if (_pageContent) {
+            const det = detectLanguageRobust({
+              htmlLang: _pageContent.htmlLang,
+              ogLocale: _pageContent.ogLocale,
+              textSample: _pageContent.textSample,
+              geo: leadGeo,
+              domain,
+            });
+            leadLanguage = det.lang;
+            log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence})`);
+            // Persistir para futuros runs
+            fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ language: leadLanguage }),
+            }).catch(() => {});
+          } else {
+            // No pudimos fetchear página → fallback GEO/TLD
+            const det = detectLanguageRobust({ geo: leadGeo, domain });
+            leadLanguage = det.lang;
+            log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence}, sin html)`);
+          }
+        }
+        // Asegurar que llegue siempre algo soportado
+        if (!SUPPORTED_AGENT_LANGS.has(leadLanguage)) leadLanguage = "en";
+        lead.language = leadLanguage;
+
         // ── ENRICHMENT ON-THE-FLY (igual que el botón Data del MB humano) ──
         // Si falta data, intentamos traerla AHORA antes de descartar el lead.
         // Cache 90d (traffic) + 7d (Apollo) → la mayoría son hits gratis.
