@@ -505,6 +505,17 @@ function initAdminPanel() {
   document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
   loadAdminActivity();
+
+  // Auto-refresh cada 30s mientras el admin tiene un tab activo (evita stale data).
+  // Solo si el admin está visible en el DOM (panel admin abierto).
+  setInterval(() => {
+    const panelOpen = document.getElementById("admin-panel-overlay")?.style.display !== "none";
+    const docVisible = document.visibilityState !== "hidden";
+    if (!panelOpen || !docVisible) return;
+    const activeTab = document.querySelector(".admin-tab-btn.active")?.dataset.adminTab;
+    if (activeTab === "activity") { loadAdminActivity(); _refreshAgentFeed(); }
+    else if (activeTab === "agent") { _refreshAgentFeed(); }
+  }, 30_000);
 }
 
 async function resetTrafficCacheAboveThreshold() {
@@ -1327,8 +1338,20 @@ async function loadAdminActivity() {
   const queueDomains   = new Set(queueRes.map(q => (q.domain || "").toLowerCase()).filter(Boolean));
   const allDomains     = new Set([...histDomains, ...queueDomains]);
   const sites          = allDomains.size;
-  const emails         = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
-  const monday         = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
+  // Emails y Monday pushes — combinamos 3 fuentes para no perder datos:
+  // 1) api_usage._emails_sent / _monday_pushes (popup MB sends)
+  // 2) agent_actions.action='sent' / 'monday_ok' (agente automático)
+  // 3) historial rows con email (fallback si api_usage no se bumpeó por bug/version vieja)
+  const emailsFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
+  const mondayFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
+  const emailsFromAgent = agentActions.filter(a => a.action === "sent").length;
+  const mondayFromAgent = agentActions.filter(a => a.action === "monday_ok").length;
+  // Fallback historial: cada row es un push a Monday; si tiene email también es un send
+  const emailsFromHistorial = histRes.filter(h => h.email && /\@/.test(h.email)).length;
+  const mondayFromHistorial = histRes.length;
+  // Tomamos MAX entre usage-counter y historial-actual (lo que esté más alto refleja mejor la verdad)
+  const emails = Math.max(emailsFromUsage, emailsFromHistorial) + emailsFromAgent;
+  const monday = Math.max(mondayFromUsage, mondayFromHistorial) + mondayFromAgent;
   // toolbar_historial usa page_views/raw_visits (no 'traffic'). Combinar histórico + review_queue para tráfico.
   const trafficOf      = (h) => parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
   const allRows        = [...histRes, ...queueRes];
@@ -1443,8 +1466,6 @@ function _aggregateByUser(historial, usage, sessions) {
     return byUser.get(u);
   };
   historial.forEach(h => {
-    // Preferir user_email (siempre email) sobre media_buyer (display name).
-    // Antes: media_buyer="Diego" pisaba a user_email → duplicaba con sessions.
     const u = _normalizeUserKey(h.user_email || h.created_by || h.media_buyer);
     const o = ensure(u);
     o.sites++;
@@ -1456,12 +1477,19 @@ function _aggregateByUser(historial, usage, sessions) {
     const traffic = parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
     if (traffic >= 500000) o.above500k++;
     else if (traffic > 0)  o.below500k++;
+    // Cada row de historial es UN push a Monday del MB (siempre se crea al pushear).
+    // Y si tiene email guardado, también fue un envío.
+    o.monday++;
+    if (h.email && /\@/.test(h.email)) o.emails++;
   });
   usage.forEach(r => {
     const o = ensure(_normalizeUserKey(r.user_email));
-    o.emails += parseInt(r.by_provider?._emails_sent  || 0, 10);
-    o.monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
-    o.claude += parseInt(r.by_provider?.anthropic     || 0, 10);
+    // Tomamos MAX del usage-counter vs el ya contado de historial (no sumar — duplica).
+    const usageEmails = parseInt(r.by_provider?._emails_sent  || 0, 10);
+    const usageMonday = parseInt(r.by_provider?._monday_pushes || 0, 10);
+    if (usageEmails > o.emails) o.emails = usageEmails;
+    if (usageMonday > o.monday) o.monday = usageMonday;
+    o.claude += parseInt(r.by_provider?.anthropic || 0, 10);
   });
   sessions.forEach(s => {
     const o = ensure(_normalizeUserKey(s.user_email));
@@ -1587,7 +1615,6 @@ function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
     apSec: 0, popupSec: 0,
   }));
   historial.forEach(h => {
-    // Compatibilidad: toolbar_historial usa media_buyer; review_queue usa created_by; api_usage usa user_email.
     const u = _normalizeUserKey(h.media_buyer || h.user_email || h.created_by);
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
@@ -1597,17 +1624,22 @@ function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
     if (g) o.geos[g] = (o.geos[g] || 0) + 1;
     const c = (h.category || "").trim();
     if (c) o.categories[c] = (o.categories[c] || 0) + 1;
-    // Tráfico puede venir como page_views (historial) | raw_visits (historial) | traffic (review_queue)
     const traffic = parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
     if (traffic >= 500000) o.above500k++;
     else if (traffic > 0)  o.below500k++;
+    // Cada row historial = 1 push Monday + 1 send (si hay email)
+    o.monday++;
+    if (h.email && /\@/.test(h.email)) o.emails++;
   });
   usage.forEach(r => {
     const u = _normalizeUserKey(r.user_email);
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
-    o.emails += parseInt(r.by_provider?._emails_sent || 0, 10);
-    o.monday += parseInt(r.by_provider?._monday_pushes || 0, 10);
+    // MAX (no sumar — historial ya cuenta cada push y duplicaríamos)
+    const usageEmails = parseInt(r.by_provider?._emails_sent || 0, 10);
+    const usageMonday = parseInt(r.by_provider?._monday_pushes || 0, 10);
+    if (usageEmails > o.emails) o.emails = usageEmails;
+    if (usageMonday > o.monday) o.monday = usageMonday;
     o.claude += parseInt(r.by_provider?.anthropic || 0, 10);
   });
   sessions.forEach(s => {
