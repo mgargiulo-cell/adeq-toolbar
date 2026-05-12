@@ -664,7 +664,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
 // pickea hasta REFRESH_BATCH leads con traffic=0/null y los re-fetchea en
 // paralelo. Cache 90d ayuda a no quemar RapidAPI. Cuando ya no quedan,
 // auto-apaga el flag.
-const REFRESH_EMPTY_BATCH = 10;
+const REFRESH_EMPTY_BATCH = 3;
 async function refreshOneEmptyLead(token, cfg) {
   const flag = cfg.agent_refresh_empty_leads === "true";
   if (!flag) return;
@@ -4902,6 +4902,21 @@ async function runAgentCycle(token, allFlags) {
 // Timestamp del arranque del proceso — usado para detectar force-restart triggers
 // que llegaron DESPUÉS del start (vs ya consumidos en runs previos).
 const _processStartedAt = Date.now();
+
+// Capturar unhandled rejections — sin esto, una promesa async sin .catch()
+// crashea el process node entero (Node 15+ behavior). Loguear y seguir.
+process.on("unhandledRejection", (reason, p) => {
+  try {
+    log(`⚠️ UnhandledRejection: ${reason?.message || reason}`);
+    console.error("[unhandledRejection]", reason);
+  } catch {}
+});
+process.on("uncaughtException", (err) => {
+  try {
+    log(`⚠️ UncaughtException: ${err?.message || err}`);
+    console.error("[uncaughtException]", err);
+  } catch {}
+});
 
 async function main() {
   log("ADEQ Auto-Prospector v3 iniciado.");
