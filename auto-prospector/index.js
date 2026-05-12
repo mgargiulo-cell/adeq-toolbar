@@ -2723,7 +2723,7 @@ async function runSession(token, cfg, sessionStart) {
   const sessionUser    = cfg.auto_session_user || "";
 
   // Per-user limits configurables por el admin (toolbar_user_limits).
-  // Defaults: 75 prospectos/día y 60 min/sesión. Si el admin los cambió, los usa.
+  // Defaults: 75 prospectos/día y 20 min/sesión. Si el admin los cambió, los usa.
   let AUTOPILOT_DAILY_LIMIT = 300; // default 300/día/usuario; admin lo puede sobrescribir per-user
   let userSessionLimitMs    = SESSION_LIMIT_MS;
   if (sessionUser) {
@@ -3452,7 +3452,10 @@ async function checkAgentKillSwitch(token, userEmail, cfg) {
       return true;
     }
     return false;
-  } catch { return false; }
+  } catch (e) {
+    log(`⚠️ checkAgentKillSwitch error: ${e.message} — fail-closed (skip user este ciclo)`);
+    return true; // fail-closed: si no podemos chequear, NO seguir mandando
+  }
 }
 
 // Cache del estilo ADEQ — vive por la lifetime del proceso (refresh cada 30min)
@@ -3880,7 +3883,9 @@ const GARBAGE_LOCAL = new RegExp("^(?:" + _GL_LOCAL_PARTS.join("|") + ")@", "i")
 // nuevas tipo "trustandsafety", "gdpr-mask-2025", "protect-domain", etc.
 const GARBAGE_LOCAL_CONTAINS = new RegExp([
   "abuse","domain[-._]?(?:ops|operations|abuse|admin|manager|owner)","hosting","cloudflare","cloudfront","akamai","fastly",
-  "proxy","piracy","pirate","takedown","whois","gdpr","masked?","masking","anonymized?","protect",
+  "proxy","piracy","pirate","takedown","whois","gdpr","masked?","masking","anonymized?",
+  // "protect" anclado a word boundary para no kill "protected-content@" o "protector@editorial.com"
+  "(?:^|[._-])protect(?:ed|ion)?[-._]?(?:domain|service|service|email|mail|admin|service)?(?:$|[._-])",
   "trust[-._]?and[-._]?safety","trust[-._]?safety","safety[-._]?team",
   "unsubscribe","opt[-._]?out","removeme",
   "mailer[-._]?daemon","noreply","no[-._]?reply","donotreply","autoreply",
@@ -5124,6 +5129,25 @@ async function main() {
       log(`⚠️ Login fallido: ${err.message} — reintentando en 60s...`);
       await sleep(60_000);
     }
+  }
+
+  // Schema sanity check — si faltan columnas críticas, loggea bien fuerte
+  // para que admin corra la migración. NO bloquea boot (worker sigue corriendo
+  // por si solo un subset de features necesita la columna).
+  try {
+    const sanityRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=geos_all,contact_phone&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || _workerToken}` } }
+    );
+    if (!sanityRes.ok) {
+      const txt = await sanityRes.text().catch(() => "");
+      log(`🚨 SCHEMA CHECK FAIL: ${sanityRes.status} — ${txt.substring(0, 300)}`);
+      log(`🚨 CORRER MIGRACIÓN: sql/2026-05-12_geos_all_contact_phone.sql en Supabase`);
+    } else {
+      log("✅ Schema check OK (geos_all + contact_phone presentes)");
+    }
+  } catch (e) {
+    log(`⚠️ Schema check error: ${e.message}`);
   }
 
   let idleSince = Date.now();

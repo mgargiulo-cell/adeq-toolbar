@@ -465,11 +465,15 @@ function initAdminPanel() {
       if (tab === "limits")    loadAdminLimits();
       if (tab === "blocklist") loadAdminBlocklist();
     });
-    // Doble-click sobre el botón "Agent" → toggle test mode (bypass active hours + caps)
+    // Doble-click sobre el botón "Agent" → toggle test mode (bypass active hours + caps).
+    // Stop propagation para que el click handler NO corra dos veces antes del dblclick
+    // (sino loadAdminAgent() fetcha config stale antes del write).
     if (btn.dataset.adminTab === "agent") {
       btn.addEventListener("dblclick", async (e) => {
         e.preventDefault();
+        e.stopPropagation();
         await _toggleAgentTestMode();
+        await loadAdminAgent(); // re-fetch para que el render use el value nuevo
       });
     }
   });
@@ -619,7 +623,7 @@ async function saveAdminGlobalCaps() {
   } catch (e) {
     stEl.textContent = `❌ Error: ${e.message}`;
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "💾 Guardar caps globales"; }
+    if (btn) { btn.disabled = false; btn.textContent = "💾 Save global caps"; }
   }
 }
 
@@ -629,7 +633,7 @@ async function loadAdminLimits() {
 
   const list = document.getElementById("admin-limits-list");
   if (!list) return;
-  list.innerHTML = '<div class="admin-help">Cargando...</div>';
+  list.innerHTML = '<div class="admin-help">Loading…</div>';
   const limits = await fetchAllUserLimits(state.accessToken);
   list.innerHTML = "";
   // Header con labels de cada columna
@@ -639,7 +643,7 @@ async function loadAdminLimits() {
   header.style.border = "none";
   header.style.padding = "0 4px";
   header.innerHTML = `
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px" title="Email del media buyer">Usuario</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px" title="Media buyer email">User</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Monthly RapidAPI hits cap (empty = no per-user cap, falls back to global 40K)">RapidAPI/mo</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Max duration of ONE autopilot session, in minutes">Session max</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Max prospects this user can add to pool per day (autopilot + CSV)">Prospects/day</span>
@@ -686,7 +690,7 @@ function buildLimitRow(l, isNew = false) {
     <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 20}" placeholder="min" min="5" max="20" title="Max duration of ONE autopilot session, in minutes (hard cap: 20)" />
     <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Max prospects processed per day by this user in autopilot" />
     <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot ON/OFF">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
-    <button class="save-btn" title="Guardar cambios">💾</button>
+    <button class="save-btn" title="Save changes">💾</button>
     <button class="del-btn" title="Eliminar">×</button>
   `;
   // Click en Save → fuerza guardado + feedback visual
@@ -1184,7 +1188,7 @@ async function loadAdminBlocklist() {
   const ta = document.getElementById("admin-blocklist-text");
   const status = document.getElementById("admin-blocklist-status");
   if (!ta) return;
-  status.textContent = "Cargando...";
+  status.textContent = "Loading…";
   try {
     const { TOP_500_BLOCKED } = await import("../modules/blockedDomainsTop500.js");
     const res = await fetch(
@@ -1404,9 +1408,11 @@ function _normalizeUserKey(raw) {
   const lower = String(raw).toLowerCase().trim();
   if (lower.includes("@")) return lower; // ya es email
   if (NAME_TO_EMAIL[lower]) return NAME_TO_EMAIL[lower];
-  // Match parcial: si contiene alguna key conocida, mapear
+  // Match WORD-BOUNDARY (no substring): "max" no debe matchear "maximus", ni
+  // "diego" matchear "dieguito". Solo si la key aparece como palabra entera.
   for (const k of Object.keys(NAME_TO_EMAIL)) {
-    if (lower.includes(k)) return NAME_TO_EMAIL[k];
+    const re = new RegExp(`(^|\\W)${k}(\\W|$)`, "i");
+    if (re.test(lower)) return NAME_TO_EMAIL[k];
   }
   return lower;
 }
@@ -6479,7 +6485,7 @@ async function initAutopilot() {
   }, 15_000);
 
   // RULE: keep autopilot ON across side-panel reopens IF this user owns the
-  // active session and it hasn't exceeded its 60-min window. Force OFF only
+  // active session and it hasn't exceeded its 20-min window. Force OFF only
   // when the session expired or belongs to a different user.
   const sessionAgeMs = (sessionStart instanceof Date)
     ? Date.now() - sessionStart.getTime()
@@ -6835,7 +6841,7 @@ async function loadProspectsTab() {
   }
 
   updateProspectsDailyBar(dailyCount);
-  if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidates` : "No pending candidates";
+  if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidate${rows.length === 1 ? "" : "s"}` : "No pending candidates";
 
   if (!rows.length) {
     // Empty state inteligente: si hay actividad activa del worker, mostrar qué
@@ -8046,7 +8052,7 @@ async function refreshProspectsStats() {
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
   const remaining = listEl?.querySelectorAll(".pcard").length || 0;
-  if (statsEl) statsEl.textContent = remaining ? `${remaining} pending candidates` : "No pending candidates";
+  if (statsEl) statsEl.textContent = remaining ? `${remaining} pending candidate${remaining === 1 ? "" : "s"}` : "No pending candidates";
   if (!remaining && listEl) listEl.innerHTML = '<div class="cascade-empty">Queue empty — great work! 🎉</div>';
   const count = await getDailyValidationCount(state.accessToken, state.loginEmail);
   updateProspectsDailyBar(count);
