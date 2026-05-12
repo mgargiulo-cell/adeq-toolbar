@@ -2772,6 +2772,128 @@ Write the prospecting email. Return JSON only.`;
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
 const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|security|domain-abuse|domain|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|gdpr|dpo)@/i;
 
+// ── Website composite scoring ──────────────────────────────
+// Score 0-100 por lead, con gates duros (return -1 = descartar).
+// Basado en: GEO target ADEQ (LATAM/ES/EU prioritario, Tier1/UK/RU descarta),
+// Engagement (≥400K + datos completos), Categoría (adult/streaming descartan),
+// Ad networks (menos partners detectadas = más open), Idioma (ru/zh penaliza).
+
+const GEO_BUCKETS = {
+  // LATAM + España + paises hispanos = +30 (target principal ADEQ)
+  hi: new Set([
+    "AR","MX","CO","PE","CL","VE","EC","BO","PY","UY","GT","DO","HN","SV","NI","CR","PA","CU","PR","ES",
+    "Argentina","Mexico","Colombia","Peru","Chile","Venezuela","Ecuador","Bolivia","Paraguay","Uruguay",
+    "Guatemala","Dominican Republic","Honduras","El Salvador","Nicaragua","Costa Rica","Panama","Cuba",
+    "Puerto Rico","Spain"
+  ]),
+  // Europa continental sin UK/RU = +25
+  mid: new Set([
+    "DE","FR","IT","PT","NL","BE","PL","RO","CZ","SK","HU","BG","GR","SE","NO","DK","FI","IE","AT","CH","HR","SI","RS","UA",
+    "Germany","France","Italy","Portugal","Netherlands","Belgium","Poland","Romania","Czech Republic",
+    "Slovakia","Hungary","Bulgaria","Greece","Sweden","Norway","Denmark","Finland","Ireland","Austria",
+    "Switzerland","Croatia","Slovenia","Serbia","Ukraine"
+  ]),
+  // África = +15 (puede servir)
+  africa: new Set([
+    "NG","KE","ZA","EG","MA","DZ","TN","GH","ET","UG","TZ","SN","CM","CI","ZM","ZW","RW","MZ","AO",
+    "Nigeria","Kenya","South Africa","Egypt","Morocco","Algeria","Tunisia","Ghana","Ethiopia","Uganda",
+    "Tanzania","Senegal","Cameroon","Ivory Coast","Zambia","Zimbabwe","Rwanda","Mozambique","Angola"
+  ]),
+  // Asia (no India) = +5 baja conversión
+  asia: new Set([
+    "JP","KR","TH","VN","ID","MY","PH","TW","SG","BD","PK","LK","KH","MM","NP","HK","MN",
+    "Japan","South Korea","Thailand","Vietnam","Indonesia","Malaysia","Philippines","Taiwan","Singapore",
+    "Bangladesh","Pakistan","Sri Lanka","Cambodia","Myanmar","Nepal","Hong Kong","Mongolia"
+  ]),
+  // DESCARTE: Tier 1 + UK + Rusia (no encajan al portfolio actual ADEQ)
+  blocked: new Set([
+    "US","CA","AU","NZ","GB","UK","RU","BY","IL",
+    "United States","Canada","Australia","New Zealand","United Kingdom","Russia","Belarus","Israel"
+  ]),
+};
+
+function scoreGeo(geo) {
+  if (!geo) return 5; // sin geo conocido — neutro bajo
+  const g = geo.trim();
+  if (GEO_BUCKETS.blocked.has(g)) return -1000; // descarte total
+  if (GEO_BUCKETS.hi.has(g))      return 30;
+  if (GEO_BUCKETS.mid.has(g))     return 25;
+  if (GEO_BUCKETS.africa.has(g))  return 15;
+  if (GEO_BUCKETS.asia.has(g))    return 5;
+  return 10; // desconocido pero no blocked — neutro
+}
+
+// Categorías que descartan el lead (gate duro)
+const BLOCKED_CATEGORIES = new Set(["adult","streaming","gambling"]);
+
+// Ad networks ADEQ partner — si el sitio YA tiene muchas, hay menos espacio para nosotros
+const ADEQ_PARTNER_NETWORKS = new Set([
+  "Sparteo","Seedtag","Taboola","Missena","Viads","MGID","Clever Advertising","Vidoomy",
+  "Vidverto","Ezoic","Clickio","360Playvid","Truvid","Optad360","Embi Media","Snigel"
+]);
+
+// Idiomas que penalizan (Ruso/Chino fuera del portfolio)
+const PENALIZED_LANGS = new Set(["ru","zh","zh-cn","zh-tw","ja","ko"]);
+
+function scoreWebsite(lead) {
+  const reasons = [];
+  let score = 0;
+
+  // 1. GEO (máx 30, gate si Tier1/UK/RU)
+  const geoPts = scoreGeo(lead.geo);
+  if (geoPts < 0) return { score: -1, color: "red", reasons: [`geo_blocked:${lead.geo}`] };
+  score += geoPts;
+  reasons.push(`geo:${lead.geo || "?"}=${geoPts}`);
+
+  // 2. CATEGORÍA (gate duro adult/streaming)
+  const cat = (lead.category || "").toLowerCase();
+  if (BLOCKED_CATEGORIES.has(cat)) {
+    return { score: -1, color: "red", reasons: [`cat_blocked:${cat}`] };
+  }
+  if (cat && cat !== "other") { score += 5; reasons.push(`cat:${cat}=+5`); }
+
+  // 3. ENGAGEMENT — traffic ≥ 400K + datos completos
+  const tr = lead.traffic || 0;
+  if (tr >= 1_000_000)      { score += 25; reasons.push("traffic≥1M=+25"); }
+  else if (tr >= 500_000)   { score += 20; reasons.push("traffic≥500K=+20"); }
+  else if (tr >= 400_000)   { score += 15; reasons.push("traffic≥400K=+15"); }
+  else if (tr > 0)          { score += 5;  reasons.push(`traffic=${tr}=+5`); }
+  // datos completos = bonus por tener category + geo + emails parseados
+  let completeness = 0;
+  if (lead.category && lead.category !== "other") completeness++;
+  if (lead.geo)                                   completeness++;
+  if (lead.language)                              completeness++;
+  if (Array.isArray(lead.emails) && lead.emails.length) completeness++;
+  if (completeness >= 3) { score += 10; reasons.push(`complete=${completeness}=+10`); }
+  else if (completeness >= 2) { score += 5; reasons.push(`complete=${completeness}=+5`); }
+
+  // 4. AD NETWORKS — menos partners ADEQ detectadas = más open al pitch
+  const detected = Array.isArray(lead.ad_networks) ? lead.ad_networks : [];
+  const adeqDetected = detected.filter(n => ADEQ_PARTNER_NETWORKS.has(n));
+  if (adeqDetected.length === 0)      { score += 20; reasons.push("ad_open=+20"); }
+  else if (adeqDetected.length === 1) { score += 10; reasons.push(`ad:${adeqDetected.join(",")}=+10`); }
+  else if (adeqDetected.length === 2) { score += 0;  reasons.push(`ad:${adeqDetected.join(",")}=0`); }
+  else                                { score -= 10; reasons.push(`ad_saturado=-10`); }
+  // Seedtag específico = competidor directo (penaliza extra)
+  if (adeqDetected.includes("Seedtag")) { score -= 10; reasons.push("seedtag=-10"); }
+
+  // 5. IDIOMA (ru/zh/ja/ko penaliza)
+  const lang = (lead.language || "").toLowerCase();
+  if (PENALIZED_LANGS.has(lang)) { score -= 15; reasons.push(`lang:${lang}=-15`); }
+  else if (lang) { score += 5; reasons.push(`lang:${lang}=+5`); }
+
+  // Stars 1-5 (1=peor, 5=mejor) — mapping del score 0-100
+  let stars;
+  if      (score >= 80) stars = 5;
+  else if (score >= 60) stars = 4;
+  else if (score >= 40) stars = 3;
+  else if (score >= 20) stars = 2;
+  else                  stars = 1;
+  // Color buckets (compat con UI existente)
+  const color = stars >= 4 ? "green" : stars >= 3 ? "yellow" : "orange";
+  return { score, stars, color, reasons };
+}
+
 // Rank email por probabilidad de ser un buen contacto B2B. Más alto = mejor.
 // Sync, sin red. Llamado desde runAgentCycle para elegir el mejor del array.
 // (No confundir con scoreEmail() async que hace SMTP verify y devuelve color/red).
@@ -3142,17 +3264,56 @@ async function runAgentCycle(token, allFlags) {
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&order=score.desc.nullslast,created_at.desc&limit=${batchSize * 3}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
-    const candidates = await queueRes.json();
-    if (!Array.isArray(candidates) || candidates.length === 0) {
+    const candidatesRaw = await queueRes.json();
+    if (!Array.isArray(candidatesRaw) || candidatesRaw.length === 0) {
       log(`🤖 Agent ${userEmail}: 0 candidatos (threshold=${aCfg.thresholdTraffic}, geos=${focus.geosPriority.join(",")||"all"}, cat=${focus.categoriesPriority.join(",")||"all"})`);
       continue;
     }
-    log(`🤖 Agent ${userEmail}: ${candidates.length} candidatos, batch=${batchSize}`);
+
+    // ── COMPOSITE SCORING ─────────────────────────────────────
+    // scoreWebsite() devuelve {score, stars 1-5, color, reasons}.
+    // Filtramos los que cayeron en gates duros (geo blocked, adult/streaming).
+    // Persistimos el score a review_queue para que el popup muestre las stars.
+    const scored = [];
+    for (const c of candidatesRaw) {
+      const sw = scoreWebsite(c);
+      if (sw.score < 0) {
+        // Marcar como rejected — no entran al pool del MB humano tampoco
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${c.id}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ status: "rejected", validated_by: "agent:auto", validated_at: new Date().toISOString() }),
+        }).catch(() => {});
+        log(`  ❌ ${c.domain}: ${sw.reasons.join(", ")}`);
+        continue;
+      }
+      // Persistir score si cambió mucho (evita PATCH spam)
+      const oldScore = c.score || 0;
+      if (Math.abs(oldScore - sw.score) >= 5) {
+        fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${c.id}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ score: sw.score }),
+        }).catch(() => {});
+        c.score = sw.score;
+      }
+      scored.push({ ...c, _scoreData: sw });
+    }
+    if (scored.length === 0) {
+      log(`🤖 Agent ${userEmail}: todos los candidatos descartados por gates`);
+      continue;
+    }
+    // Ordenar por score desc (mejor stars primero), luego created_at desc
+    scored.sort((a, b) => {
+      if (b._scoreData.score !== a._scoreData.score) return b._scoreData.score - a._scoreData.score;
+      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    });
+    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos válidos (top: ${scored[0].domain} ${scored[0]._scoreData.stars}★ score=${scored[0]._scoreData.score})`);
 
     // No filtramos por sendtrack acá — la regla real es:
     // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
     // Eso lo chequeamos PER LEAD abajo (más fresco que cachear sendtrack).
-    const fresh = candidates;
+    const fresh = scored;
 
     let processed = 0;
     for (const lead of fresh) {

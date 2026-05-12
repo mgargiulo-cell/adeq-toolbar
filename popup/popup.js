@@ -6461,12 +6461,18 @@ function renderProspectCard(r) {
   const adNetworks  = Array.isArray(r.ad_networks) ? r.ad_networks : [];
   const subjects    = Array.isArray(r.pitch_subjects) ? r.pitch_subjects : [];
 
-  // Score badge color
+  // Score → stars 1-5 (1=peor, 5=mejor). Mismo mapping que scoreWebsite del worker.
   const score = r.score || 0;
-  const scoreBg = score >= 60 ? "#16a34a" : score >= 35 ? "#d97706" : "#6b7280";
-  const scoreBadge = score > 0
-    ? `<span style="font-size:10px;font-weight:700;color:#fff;background:${scoreBg};border-radius:4px;padding:1px 5px;flex-shrink:0">${score}</span>`
+  let stars = 0;
+  if      (score >= 80) stars = 5;
+  else if (score >= 60) stars = 4;
+  else if (score >= 40) stars = 3;
+  else if (score >= 20) stars = 2;
+  else if (score > 0)   stars = 1;
+  const starsHTML = stars > 0
+    ? `<span title="Score ${score}/100 (${stars}★)" style="font-size:11px;flex-shrink:0;letter-spacing:-1px">${"★".repeat(stars)}<span style="opacity:0.25">${"★".repeat(5-stars)}</span></span>`
     : "";
+  const scoreBadge = starsHTML;
 
   // Lead temperature indicator — señal at-a-glance del potencial.
   // 🔥 HOT  : traffic >= 1M OR (score >= 60 AND email)
