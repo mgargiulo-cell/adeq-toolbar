@@ -259,19 +259,29 @@ export async function callProxy(provider, path, opts = {}) {
       let data   = null;
       try { data = JSON.parse(text); } catch {}
 
-      // Incrementar contador mensual SOLO para rapidapi (cualquier status, sí o sí
-      // es 1 hit facturable — incluso 4xx/5xx cuentan en RapidAPI billing).
+      // Incrementar contador mensual (rapidapi y apollo cuentan separados).
+      // Bump atomic via RPC bump_api_counter — funciona desde popup/agente/worker.
+      const inc = 1 + attempt;
+      if (provider === "rapidapi" || provider === "apollo") {
+        // RPC en background, no bloquea
+        fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/bump_api_counter`, {
+          method: "POST",
+          headers: {
+            "apikey": CONFIG.SUPABASE_ANON_KEY,
+            "Authorization": `Bearer ${_sbAuthToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ provider, n: inc }),
+        }).catch(() => {});
+      }
+      // El resto solo aplica a rapidapi (UI cap banner, etc.)
       if (provider === "rapidapi" && _monthState) {
-        const inc = 1 + attempt;
-        _monthState.used    += inc; // sumar también los retries de 5xx que se ejecutaron
-        _userPersonalUsed   += inc; // counter personal del user (también facturable)
+        _monthState.used    += inc;
+        _userPersonalUsed   += inc;
         _monthState.dirty    = true;
         _hitsSinceFlush     += inc;
-        // Persistir async, sin bloquear
         flushMonthlyCounter().catch(() => {});
-        // Refresh UI footer inmediato en cada hit (no esperar polling 60s)
         try { _onRapidHitCb?.({ used: _monthState.used, limit: _monthState.limit, period: _monthState.period }); } catch {}
-        // Si cruzamos cap personal o global, alertar UI
         if (_userCapReached()) {
           try { _onCapReachedCb?.({ used: _userPersonalUsed, limit: _userPersonalCap, period: _monthState.period, scope: "user" }); } catch {}
         } else if (_capReached()) {

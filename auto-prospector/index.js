@@ -1142,6 +1142,28 @@ async function fetchMondayDomains(apiKey) {
 // cada retry de 429 es 1 request facturada por RapidAPI (incidente del 02/04
 // — overage de 400 USD por retries en cascada en día con vendor degradado).
 // 4xx también fail-fast.
+// Token global del worker — accesible desde funciones helper como rapidFetchWithRetry
+// que no recibe token explícito. Se actualiza en main loop al hacer login/refresh.
+let _workerToken = null;
+
+// Bump centralizado del counter via RPC atómico de Supabase.
+// Usable desde cualquier path (worker rapidapi, worker apollo, popup, etc.).
+// Race-safe: el RPC bump_api_counter usa upsert + cálculo en la DB.
+async function bumpApiCounterRPC(provider, n = 1) {
+  if (!n || n <= 0) return;
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/rpc/bump_api_counter`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${BACKEND_BEARER || _workerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ provider, n }),
+    });
+  } catch {}
+}
+
 async function rapidFetchWithRetry(url, headers, timeout = 8000) {
   let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1150,7 +1172,11 @@ async function rapidFetchWithRetry(url, headers, timeout = 8000) {
       if (_rapidCapReached) return { __error4xx: "daily_cap_reached" };
       _rapidGlobalCounter++;
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
-      if (res.ok) return await res.json();
+      if (res.ok) {
+        // Bump RPC atomic — fire-and-forget para no bloquear el response
+        bumpApiCounterRPC("rapidapi", 1);
+        return await res.json();
+      }
       // 4xx (incluido 429) = NO retry. Cada hit cuesta plata, no pagamos por error.
       // Devuelvo __error4xx para que el caller NO active fallback (mismo plan, mismo resultado).
       if (res.status >= 400 && res.status < 500) {
@@ -1638,22 +1664,8 @@ function _extractApolloPhone(person) {
 
 // Increment Apollo monthly counter (reusa apollo_calls_month).
 async function bumpApolloUnlocks(token, n = 1) {
-  if (!n || n <= 0 || !token) return;
-  try {
-    const period = _billingCyclePeriod();
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_calls_month_period)&select=key,value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    const rows = await res.json();
-    const map = {};
-    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
-    const sameMonth = (map.apollo_calls_month_period || "").slice(0, 7) === period.slice(0, 7);
-    const stored = sameMonth ? parseInt(map.apollo_calls_month || "0", 10) : 0;
-    const newCount = stored + n;
-    await setConfigValue(token, "apollo_calls_month", String(newCount));
-    await setConfigValue(token, "apollo_calls_month_period", period);
-  } catch {}
+  // Delegate al RPC atómico — no más read-modify-write race-prone.
+  await bumpApiCounterRPC("apollo", n);
 }
 
 // ── Email scraping fallback (server-side HTTP) ────────────────
@@ -4945,6 +4957,7 @@ async function main() {
   while (!token) {
     try {
       token = await supabaseLogin();
+      _workerToken = token; // expone para helpers globales (bumpApiCounterRPC)
       tokenExpiry = Date.now() + 55 * 60 * 1000;
       log("Login exitoso.");
     } catch (err) {
@@ -5050,6 +5063,7 @@ async function main() {
       if (Date.now() > tokenExpiry) {
         try {
           token = await supabaseLogin();
+          _workerToken = token;
           tokenExpiry = Date.now() + 55 * 60 * 1000;
           log("Token renovado.");
         } catch (err) {
