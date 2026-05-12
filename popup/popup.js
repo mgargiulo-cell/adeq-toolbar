@@ -2545,10 +2545,18 @@ async function runDuplicateCheck() {
       // Si es duplicado re-prospectable (Ciclo Finalizado / Mail No Enviado),
       // los datos en Monday pueden tener meses → forzar refresh de tráfico.
       // Esto sobreescribe el cache 90d y trae fresh de RapidAPI.
+      // Solo forzamos refresh si: (a) status reprospectable Y (b) el cache está viejo
+      // (>30d). Si el cache es reciente, lo respetamos para no quemar RapidAPI.
       const reprospectable = /ciclo\s*finalizado|mail\s*no\s*enviado/i.test(result.status || "");
       if (reprospectable) {
-        console.log(`[Duplicate] reprospectable status (${result.status}) → forzando refresh de tráfico`);
-        runTrafficCheck({ forceRefresh: true }).catch(() => {});
+        // Esperar a runTrafficCheck para ver si los datos vinieron de cache reciente.
+        // Si cache > 30d, re-fetch con forceRefresh.
+        setTimeout(() => {
+          if (state.trafficData?.fromCache && (state.trafficData?.cachedDaysAgo || 0) > 30) {
+            console.log(`[Duplicate] reprospectable + cache >30d → forzando refresh`);
+            runTrafficCheck({ forceRefresh: true }).catch(() => {});
+          }
+        }, 1500);
       }
     } else {
       el.textContent = "✅ Nuevo prospecto";
