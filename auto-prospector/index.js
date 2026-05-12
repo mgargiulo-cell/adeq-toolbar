@@ -909,21 +909,17 @@ async function getRapidApiUsageThisMonth(token) {
     const storedPer   = map.rapidapi_calls_month_period || "";
     const storedCount = parseInt(map.rapidapi_calls_month || "0", 10);
     const limit       = parseInt(map.rapidapi_monthly_limit || "40000", 10);
-    const usedThisMonth = storedPer === period ? storedCount : 0;
+    // Compat con formato viejo (YYYY-MM-06): comparar por YYYY-MM.
+    const sameMonth   = storedPer.slice(0, 7) === period.slice(0, 7);
+    const usedThisMonth = sameMonth ? storedCount : 0;
     return { usedThisMonth, limit, period };
   } catch { return { usedThisMonth: 0, limit: 40000, period: _billingCyclePeriod() }; }
 }
 
-// Período de facturación 6→6 (alineado al billing real de RapidAPI plan PRO).
+// Período mensual = MES CALENDARIO (decisión user 2026-05-12).
+// Reset automático día 1. Formato "YYYY-MM" matchea con popup apiProxy.
 function _billingCyclePeriod() {
-  const now = new Date();
-  const day = now.getDate();
-  const cycleStart = day >= 6
-    ? new Date(now.getFullYear(), now.getMonth(), 6)
-    : new Date(now.getFullYear(), now.getMonth() - 1, 6);
-  const yyyy = cycleStart.getFullYear();
-  const mm   = String(cycleStart.getMonth() + 1).padStart(2, "0");
-  return `${yyyy}-${mm}-06`;
+  return new Date().toISOString().slice(0, 7);
 }
 
 async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {
@@ -938,7 +934,9 @@ async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {
     if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
 
     const storedPer   = map.rapidapi_calls_month_period || "";
-    const storedCount = storedPer === period ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
+    // Compat YYYY-MM-06 vs YYYY-MM
+    const sameMonth   = storedPer.slice(0, 7) === period.slice(0, 7);
+    const storedCount = sameMonth ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
     const newCount    = storedCount + callsThisSession;
 
     await setConfigValue(token, "rapidapi_calls_month",        String(newCount));

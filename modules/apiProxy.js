@@ -34,20 +34,11 @@ let _hitsSinceFlush = 0;
 // Período de facturación: ciclo del 6 al 6 (NO calendario natural).
 // Si hoy es ≥ día 6 → período empieza este mes-6. Si es < día 6 → empezó el
 // mes pasado-6. Devuelve string "YYYY-MM-DD" del primer día del ciclo.
-// Decisión user 2026-05-08: el RapidAPI plan se factura el día 6, alinear cap
-// con la facturación real.
+// Decisión user 2026-05-12: contar por MES CALENDARIO (1 al último día,
+// regardless de mes corto/largo). Reset automático al día 1 del nuevo mes.
+// Formato "YYYY-MM" para que cualquier write con la misma key matchee.
 function currentPeriod() {
-  const now = new Date();
-  const day = now.getDate();
-  const y = now.getFullYear();
-  const m = now.getMonth(); // 0-indexed
-  const cycleStart = day >= 6
-    ? new Date(y, m, 6)
-    : new Date(y, m - 1, 6);
-  const yyyy = cycleStart.getFullYear();
-  const mm   = String(cycleStart.getMonth() + 1).padStart(2, "0");
-  const dd   = "06";
-  return `${yyyy}-${mm}-${dd}`;
+  return new Date().toISOString().slice(0, 7); // "2026-05"
 }
 
 async function _readConfigKeys(keys) {
@@ -94,7 +85,10 @@ async function loadMonthlyCounter() {
   ]);
   const period       = currentPeriod();
   const storedPeriod = map.rapidapi_calls_month_period || "";
-  const used         = storedPeriod === period ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
+  // Compatibilidad con formato viejo (YYYY-MM-06) — comparamos por primeros 7 chars (YYYY-MM).
+  // Así si la DB tiene "2026-05-06" y nosotros usamos "2026-05", se reconocen como mismo mes.
+  const sameMonth    = storedPeriod.slice(0, 7) === period.slice(0, 7);
+  const used         = sameMonth ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
   const limit        = parseInt(map.rapidapi_monthly_limit || String(DEFAULT_MONTHLY_LIMIT), 10);
   _monthState = { used, limit, period, dirty: false };
   return _monthState;
@@ -107,11 +101,13 @@ async function flushMonthlyCounter(force = false) {
   _monthLastSync   = now;
   _hitsSinceFlush  = 0;
   _monthState.dirty = false;
-  // Re-leer + sumar para no pisar lo que otro MB sumó en paralelo
+  // Re-leer + sumar para no pisar lo que otro MB sumó en paralelo.
+  // Compat con formato viejo: comparamos por YYYY-MM (slice 0,7).
   try {
     const map = await _readConfigKeys(["rapidapi_calls_month", "rapidapi_calls_month_period"]);
     const period   = currentPeriod();
-    const stored   = map.rapidapi_calls_month_period === period ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
+    const sameMonth = (map.rapidapi_calls_month_period || "").slice(0, 7) === period.slice(0, 7);
+    const stored   = sameMonth ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
     const newTotal = Math.max(stored, _monthState.used);
     await _writeConfigKey("rapidapi_calls_month", newTotal);
     await _writeConfigKey("rapidapi_calls_month_period", period);
