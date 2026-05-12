@@ -4096,10 +4096,10 @@ function rankEmail(email, siteDomain, leadCategory = "") {
 const GARBAGE_DOMAIN_PATTERN = new RegExp([
   // Keywords amplias en cualquier parte del dominio (gdpr-mask-anything.com, etc)
   "gdpr|aws|amazonaws|amazonses|cloudfront|cloudflare|fastly|akamai|protect|whois",
-  // Subdominios de admin/whois/abuse/support
-  "(^|\\.)(?:nic|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel|support|trustandsafety)\\.",
+  // Subdominios o dominios raíz de admin/whois/abuse/support (también después de @)
+  "(^|[.@])(?:nic|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel|trustandsafety)\\.",
   // Cloud providers - support/abuse desks (NO son publishers)
-  "(^|\\.)(?:aws|amazonaws|cloudfront|googlecloud|azure|microsoft|cloudflare|fastly)\\.com",
+  "(^|[.@])(?:aws|amazonaws|cloudfront|googlecloud|azure|microsoft|cloudflare|fastly)\\.com",
   // Privacy/proxy services
   "domainsbyproxy\\.com|whoisguard|whoisprivacy|whoisprotect|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|protect-?service|protectedmail|protecteddomainservices|panelregister|identity-?protect",
   // Registrars (B2B abuse desks)
