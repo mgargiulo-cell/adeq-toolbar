@@ -1593,40 +1593,49 @@ function extractEmailsFromHtml(html) {
 }
 
 async function scrapeEmailsForDomain(domain) {
+  // Acta como un media buyer: trae emails de TODAS las fuentes en paralelo,
+  // no early-exit. El caller filtra/ranks. Más cobertura > velocidad.
   const emails = new Set();
   const base   = `https://${domain}`;
+  const cleanDomain = domain.replace(/^www\./, "");
+  const ua = { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" };
 
-  // 1. website.informer.com
-  try {
-    const r = await fetch(`https://website.informer.com/${domain}`, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
-      signal: AbortSignal.timeout(7000),
-    });
-    if (r.ok) extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
-  } catch {}
-
-  if (emails.size > 0) return [...emails];
-
-  // 2. who.is WHOIS (registrant email)
-  try {
-    const cleanDomain = domain.replace(/^www\./, "");
-    const r = await fetch(`https://who.is/whois/${cleanDomain}`, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; bot)" },
-      signal: AbortSignal.timeout(7000),
-    });
-    if (r.ok) extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
-  } catch {}
-
-  if (emails.size > 0) return [...emails];
-
-  // 3. Contact pages
-  for (const path of ["/contact", "/contact-us", "/about", "/advertise", "/advertising"]) {
+  const tryFetch = async (url, timeout = 6000) => {
     try {
-      const r = await fetch(new URL(path, base).href, { signal: AbortSignal.timeout(4000) });
-      if (r.ok) extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
-      if (emails.size > 0) break;
+      const r = await fetch(url, { headers: ua, signal: AbortSignal.timeout(timeout) });
+      if (!r.ok) return;
+      extractEmailsFromHtml(await r.text()).forEach(e => emails.add(e));
     } catch {}
-  }
+  };
+
+  // Todas las fuentes en paralelo (gratis):
+  await Promise.all([
+    // 1. website.informer.com
+    tryFetch(`https://website.informer.com/${cleanDomain}`, 7000),
+    // 2. who.is WHOIS
+    tryFetch(`https://who.is/whois/${cleanDomain}`, 7000),
+    // 3. Home page (a veces tiene info@ visible)
+    tryFetch(base, 6000),
+    // 4. Contact / about pages típicas
+    tryFetch(`${base}/contact`, 4000),
+    tryFetch(`${base}/contact-us`, 4000),
+    tryFetch(`${base}/contacto`, 4000),
+    tryFetch(`${base}/about`, 4000),
+    tryFetch(`${base}/about-us`, 4000),
+    tryFetch(`${base}/advertise`, 4000),
+    tryFetch(`${base}/advertising`, 4000),
+    tryFetch(`${base}/publicidad`, 4000),
+    tryFetch(`${base}/anunciantes`, 4000),
+    tryFetch(`${base}/equipe`, 4000),
+    tryFetch(`${base}/equipo`, 4000),
+    tryFetch(`${base}/team`, 4000),
+    tryFetch(`${base}/staff`, 4000),
+    tryFetch(`${base}/redaccion`, 4000),
+    tryFetch(`${base}/redacao`, 4000),
+    // 5. Footer page common: /aviso-legal, /legal — donde está el contacto legal
+    tryFetch(`${base}/aviso-legal`, 4000),
+    tryFetch(`${base}/legal`, 4000),
+  ]);
 
   return [...emails];
 }
@@ -4360,25 +4369,34 @@ async function runAgentCycle(token, allFlags) {
           }
         }
 
-        // 1b. Si NO hay email decente, dispara Apollo (cache 7d)
+        // 1b. Si NO hay email decente, dispara enrichment AGRESIVO:
+        //     - findBestApolloEmail (free verified, o unlock 1 credit si traffic ≥ 500K)
+        //     - scrapeEmailsForDomain como fallback (gratis)
         const hasGoodEmail = emails.some(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
-        // También filtrar emails garbage del array antes de elegir destino
         emails = emails.filter(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
-        if (!hasGoodEmail && cfg.apollo_api_key) {
+        if (!hasGoodEmail) {
           try {
-            const apolloEmails = await findAllEmails(domain, cfg.apollo_api_key, token);
-            if (Array.isArray(apolloEmails) && apolloEmails.length > 0) {
-              const merged = [...new Set([...emails, ...apolloEmails])];
-              const validated = await validateEmailsBatch(merged);
+            const [apolloRes, scraped] = await Promise.all([
+              cfg.apollo_api_key
+                ? findBestApolloEmail(domain, cfg.apollo_api_key, token, { traffic: leadTraffic, allowUnlock: true })
+                : Promise.resolve(null),
+              scrapeEmailsForDomain(domain).catch(() => []),
+            ]);
+            const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
+            const merged = [...new Set([...apolloEmail, ...emails, ...scraped])];
+            const validated = await validateEmailsBatch(merged);
+            if (validated.length > emails.length) {
               emails = validated;
+              const patch = { emails: validated };
+              if (apolloRes?.contact_name && !lead.contact_name) patch.contact_name = apolloRes.contact_name;
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
                 method: "PATCH",
                 headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-                body: JSON.stringify({ emails: validated }),
+                body: JSON.stringify(patch),
               });
-              log(`  🔄 ${domain}: Apollo on-the-fly → ${validated.length} emails válidos (de ${merged.length} totales)`);
+              log(`  🔄 ${domain}: enrichment on-the-fly → ${validated.length} emails (apollo:${apolloRes?.source||"none"}, scraped:${scraped.length})`);
             }
-          } catch (e) { log(`  ⚠️ on-the-fly Apollo ${domain}: ${e.message}`); }
+          } catch (e) { log(`  ⚠️ on-the-fly enrich ${domain}: ${e.message}`); }
         }
 
         // Re-pickear el MEJOR email después del enrichment (rankEmail sync, NO la async scoreEmail)
