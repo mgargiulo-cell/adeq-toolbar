@@ -59,7 +59,7 @@
     <div id="site-url" class="site-url">loading...</div>
     <button id="btn-refresh" class="icon-btn" title="Re-analyze current tab" aria-label="Re-analyze current tab">↻</button>
     <button id="btn-history-open" class="icon-btn" title="History" aria-label="Open history">🕐</button>
-    <button id="btn-pitch-draft" class="icon-btn" title="Borradores de pitch" aria-label="Open drafts">📝</button>
+    <button id="btn-pitch-draft" class="icon-btn" title="Pitch drafts" aria-label="Open drafts">📝</button>
     <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
   </div>
 </header>
@@ -90,36 +90,36 @@
   <div id="admin-tab-activity" class="admin-tab-content active">
     <div class="admin-filters">
       <select id="admin-filter-period" class="form-select">
-        <option value="today">Hoy</option>
-        <option value="yesterday">Ayer</option>
-        <option value="last7" selected>Últimos 7 días</option>
-        <option value="this_month">Este mes</option>
-        <option value="last_month">Mes pasado</option>
-        <option value="last30">Últimos 30 días</option>
+        <option value="today">Today</option>
+        <option value="yesterday">Yesterday</option>
+        <option value="last7" selected>Last 7 days</option>
+        <option value="this_month">This month</option>
+        <option value="last_month">Last month</option>
+        <option value="last30">Last 30 days</option>
       </select>
       <select id="admin-filter-user" class="form-select">
-        <option value="">Todos los usuarios</option>
+        <option value="">All users</option>
       </select>
       <button id="admin-refresh-stats" class="btn btn-sm btn-primary">🔄</button>
     </div>
     <div id="admin-stats-summary" class="admin-stats-summary">
-      <div class="stat-card"><div class="stat-num" id="stat-sites">--</div><div class="stat-label">Sitios analizados</div></div>
-      <div class="stat-card"><div class="stat-num" id="stat-emails">--</div><div class="stat-label">Emails enviados</div></div>
-      <div class="stat-card"><div class="stat-num" id="stat-monday">--</div><div class="stat-label">Pushes Monday</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-sites">--</div><div class="stat-label">Sites analyzed</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-emails">--</div><div class="stat-label">Emails sent</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-monday">--</div><div class="stat-label">Monday pushes</div></div>
       <div class="stat-card"><div class="stat-num" id="stat-500k-up">--</div><div class="stat-label">+500K visits</div></div>
     </div>
     <div class="admin-chart-wrap">
-      <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">Sitios analizados por día</div>
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">Sites analyzed per day</div>
       <canvas id="admin-chart" width="540" height="180"></canvas>
     </div>
 
     <div class="admin-section-title" style="display:flex;align-items:center;justify-content:space-between">
-      <span>📊 Comparador de Media Buyers</span>
-      <button id="admin-export-comparator-csv" class="btn btn-sm" style="background:#10b981;color:#fff;border:none;border-radius:4px;padding:3px 10px;font-size:10px;cursor:pointer" title="Descargar comparador como CSV (con filtros aplicados)">📥 Exportar CSV</button>
+      <span>📊 Media Buyers Comparator</span>
+      <button id="admin-export-comparator-csv" class="btn btn-sm" style="background:#10b981;color:#fff;border:none;border-radius:4px;padding:3px 10px;font-size:10px;cursor:pointer" title="Download comparator as CSV (with filters applied)">📥 Export CSV</button>
     </div>
     <div id="admin-mb-comparator" class="admin-mb-comparator"></div>
 
-    <div class="admin-section-title">📋 Resumen narrativo (para 1:1s)</div>
+    <div class="admin-section-title">📋 Narrative summary (for 1:1s)</div>
     <div id="admin-mb-summaries" class="admin-mb-summaries"></div>
   </div>
 
@@ -129,7 +129,7 @@
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
         <div>
           <div style="font-weight:700;color:#fbbf24;font-size:13px">🤖 AI Agent MB</div>
-          <div style="font-size:10px;color:#94a3b8;margin-top:2px">Procesa la review_queue automáticamente: pitch Claude → push Monday → send Gmail.</div>
+          <div style="font-size:10px;color:#94a3b8;margin-top:2px">Auto-processes review_queue: Claude pitch → push Monday → send Gmail.</div>
         </div>
         <label class="toggle-switch" title="Activar / desactivar el agente">
           <input id="agent-toggle" type="checkbox" />
@@ -140,18 +140,18 @@
     </div>
 
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
-      <div class="stat-card"><div class="stat-num" id="agent-stat-sent">--</div><div class="stat-label">Enviados hoy</div></div>
+      <div class="stat-card"><div class="stat-num" id="agent-stat-sent">--</div><div class="stat-label">Sent today</div></div>
       <div class="stat-card"><div class="stat-num" id="agent-stat-skipped">--</div><div class="stat-label">Skipped 24h</div></div>
       <div class="stat-card"><div class="stat-num" id="agent-stat-failed">--</div><div class="stat-label">Failed 24h</div></div>
-      <div class="stat-card"><div class="stat-num" id="agent-stat-cap">20</div><div class="stat-label">Cap diario</div></div>
+      <div class="stat-card"><div class="stat-num" id="agent-stat-cap">20</div><div class="stat-label">Daily cap</div></div>
     </div>
 
     <div class="admin-section-title">⚙️ Thresholds</div>
     <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
       <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;font-size:11px;color:#cbd5e1">
-        <label for="agent-cfg-traffic">Min tráfico</label>
+        <label for="agent-cfg-traffic">Min traffic</label>
         <select id="agent-cfg-traffic" class="form-select" style="font-size:11px;padding:3px 6px">
-          <option value="1">Sin filtro</option>
+          <option value="1">No filter</option>
           <option value="100000">≥ 100K visits</option>
           <option value="250000">≥ 250K visits</option>
           <option value="500000" selected>≥ 500K visits (default)</option>
@@ -162,56 +162,56 @@
 
         <label for="agent-cfg-score">Min score</label>
         <select id="agent-cfg-score" class="form-select" style="font-size:11px;padding:3px 6px">
-          <option value="0">Sin filtro</option>
+          <option value="0">No filter</option>
           <option value="20">≥ 20 (low)</option>
           <option value="40" selected>≥ 40 (medium)</option>
           <option value="60">≥ 60 (high)</option>
           <option value="80">≥ 80 (top)</option>
         </select>
 
-        <label for="agent-cfg-max">Max envíos / día</label>
+        <label for="agent-cfg-max">Max sends / day</label>
         <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:3px 6px">
-          <option value="5">5/día (test)</option>
-          <option value="10">10/día</option>
-          <option value="20" selected>20/día (default)</option>
-          <option value="30">30/día</option>
-          <option value="50">50/día</option>
+          <option value="5">5/day (test)</option>
+          <option value="10">10/day</option>
+          <option value="20" selected>20/day (default)</option>
+          <option value="30">30/day</option>
+          <option value="50">50/day</option>
         </select>
 
-        <label for="agent-cfg-active-start">Hora START (España)</label>
+        <label for="agent-cfg-active-start">Active hour START (Spain)</label>
         <select id="agent-cfg-active-start" class="form-select" style="font-size:11px;padding:3px 6px"></select>
 
-        <label for="agent-cfg-active-end">Hora END (España)</label>
+        <label for="agent-cfg-active-end">Active hour END (Spain)</label>
         <select id="agent-cfg-active-end" class="form-select" style="font-size:11px;padding:3px 6px"></select>
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
         <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save thresholds</button>
-        <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px" title="Pausa el agent por 1 hora (kill switch manual)">⏸ Pause 1h</button>
+        <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px" title="Pause agent for 1 hour (manual kill switch)">⏸ Pause 1h</button>
       </div>
       <div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155">
-        <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">⚙️ Mantenimiento</div>
+        <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">⚙️ Maintenance</div>
         <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
-          <span style="font-size:11px;color:#cbd5e1" id="agent-refresh-status">Refresh leads sin traffic: ⚪ OFF</span>
-          <button id="agent-refresh-toggle" class="btn btn-sm" style="background:#0ea5e9;color:#fff;font-size:11px;padding:3px 10px" title="Activa el worker para que re-fetchee traffic+geo de los leads sin data. Procesa 1 por ciclo (cada ~20s). Cache 90d ahorra RapidAPI.">🔄 Activar refresh</button>
+          <span style="font-size:11px;color:#cbd5e1" id="agent-refresh-status">Refresh leads without traffic: ⚪ OFF</span>
+          <button id="agent-refresh-toggle" class="btn btn-sm" style="background:#0ea5e9;color:#fff;font-size:11px;padding:3px 10px" title="Re-fetches traffic+geo for leads without data. 90d cache saves RapidAPI.">🔄 Activate refresh</button>
         </div>
       </div>
     </div>
 
-    <div class="admin-section-title">🎯 Focus de la semana</div>
+    <div class="admin-section-title">🎯 Weekly focus</div>
     <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
-      <p style="font-size:10px;color:#94a3b8;margin:0 0 8px">Click en chips para alternar. <span style="color:#34d399">Verde</span>=PRIORITY, <span style="color:#f87171">Rojo</span>=EXCLUDED, gris=ignorar.</p>
+      <p style="font-size:10px;color:#94a3b8;margin:0 0 8px">Click chips to toggle. <span style="color:#34d399">Green</span>=PRIORITY, <span style="color:#f87171">Red</span>=EXCLUDED, gray=ignore.</p>
 
       <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">🌍 GEOs</div>
       <div id="agent-focus-geos-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;max-height:140px;overflow-y:auto"></div>
 
-      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 Categorías PRIORITY</div>
+      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 PRIORITY categories</div>
       <div id="agent-focus-categories-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px;color:#cbd5e1;margin-top:8px">
         <div>
           <label style="display:block;margin-bottom:2px">Override DAILY</label>
           <select id="agent-focus-daily" class="form-select" style="font-size:11px;padding:3px 6px;width:100%">
-            <option value="0" selected>Usar default (20)</option>
+            <option value="0" selected>Use default (20)</option>
             <option value="5">5/día</option>
             <option value="10">10/día</option>
             <option value="30">30/día</option>
@@ -219,13 +219,13 @@
           </select>
         </div>
         <div>
-          <label style="display:block;margin-bottom:2px">Target SEMANAL</label>
+          <label style="display:block;margin-bottom:2px">WEEKLY target</label>
           <select id="agent-focus-weekly" class="form-select" style="font-size:11px;padding:3px 6px;width:100%">
-            <option value="0" selected>Sin límite</option>
-            <option value="50">50/semana</option>
-            <option value="100">100/semana</option>
-            <option value="200">200/semana</option>
-            <option value="500">500/semana</option>
+            <option value="0" selected>No limit</option>
+            <option value="50">50/week</option>
+            <option value="100">100/week</option>
+            <option value="200">200/week</option>
+            <option value="500">500/week</option>
           </select>
         </div>
       </div>
@@ -247,56 +247,43 @@
   <!-- Tab: Limits -->
   <div id="admin-tab-limits" class="admin-tab-content">
 
-    <!-- Caps GLOBAL — safety net por encima de los per-user -->
-    <div class="admin-section-title" style="margin-top:0">🛡️ Caps globales (safety net)</div>
-    <p class="admin-help">
-      Tope diario para TODA la organización (suma de todos los MBs + agente).
-      Si se alcanza, pausa hasta el próximo día operativo (Lun-Vie España).
-      Existe para proteger RapidAPI mensual (40K hits) y Railway billing si hay un bug
-      o si el equipo entero satura el sistema.
-    </p>
-    <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;margin-bottom:14px">
-      <span style="font-size:12px;color:var(--text)">📦 <strong>CSV queue</strong> (auto-import + Monday URL upload)</span>
+    <div class="admin-section-title" style="margin-top:0">🛡️ Global daily caps</div>
+    <p class="admin-help">Pauses processing org-wide if reached. Resets next operating day (Mon-Fri Spain).</p>
+    <div style="display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;margin-bottom:10px">
+      <span style="font-size:12px">📦 <strong>CSV queue</strong></span>
       <input id="admin-csv-daily-cap" type="number" class="form-input" min="0" step="50" placeholder="1000" style="width:90px;font-size:11px" />
-      <span style="font-size:10px;color:#94a3b8">dom/día</span>
+      <span style="font-size:10px;color:#94a3b8">/day</span>
 
-      <span style="font-size:12px;color:var(--text)">🤖 <strong>Autopilot</strong> (descubrimiento automático)</span>
+      <span style="font-size:12px">🤖 <strong>Autopilot</strong></span>
       <input id="admin-autopilot-daily-cap" type="number" class="form-input" min="0" step="50" placeholder="300" style="width:90px;font-size:11px" />
-      <span style="font-size:10px;color:#94a3b8">dom/día</span>
+      <span style="font-size:10px;color:#94a3b8">/day</span>
 
-      <button id="admin-global-caps-save" class="btn btn-sm btn-primary" style="grid-column:1/-1">💾 Guardar caps globales</button>
+      <button id="admin-global-caps-save" class="btn btn-sm btn-primary" style="grid-column:1/-1">💾 Save</button>
     </div>
     <div id="admin-global-caps-status" class="admin-help" style="margin-bottom:14px;font-size:10px"></div>
 
     <hr style="border:none;border-top:1px solid #334155;margin:14px 0" />
 
-    <!-- Caps PER-USER -->
-    <div class="admin-section-title" style="margin-top:0">👤 Caps por usuario</div>
-    <p class="admin-help" style="line-height:1.6">
-      Por cada MB del equipo: cuántos hits a RapidAPI puede gastar/mes,
-      cuántos minutos puede correr autopilot por sesión y cuántos prospectos
-      máx puede agregar por día. <strong>AP on/off</strong> habilita o
-      deshabilita el autopilot para ese user (independiente del agente).
-    </p>
+    <div class="admin-section-title" style="margin-top:0">👤 Per-user limits</div>
     <div id="admin-limits-list" class="admin-limits-list"></div>
-    <button id="admin-add-user-limit" class="btn btn-sm btn-primary">+ Agregar usuario</button>
+    <button id="admin-add-user-limit" class="btn btn-sm btn-primary">+ Add user</button>
   </div>
 
   <!-- Tab: Blocklist -->
   <div id="admin-tab-blocklist" class="admin-tab-content">
-    <p class="admin-help">Dominios donde la toolbar NO va a gastar API. Subí un CSV con un dominio por línea o pegá una lista.</p>
+    <p class="admin-help">Domains the toolbar will skip (no API spend). Upload CSV or paste below.</p>
     <textarea id="admin-blocklist-text" class="form-input" rows="6" placeholder="google.com&#10;facebook.com&#10;amazon.com" style="font-family:ui-monospace,monospace;font-size:11px"></textarea>
     <div style="display:flex;gap:6px;margin-top:8px">
       <input id="admin-blocklist-csv" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
-      <button id="admin-blocklist-save" class="btn btn-sm btn-primary">💾 Guardar</button>
+      <button id="admin-blocklist-save" class="btn btn-sm btn-primary">💾 Save</button>
     </div>
     <div id="admin-blocklist-status" class="admin-help" style="margin-top:6px"></div>
 
     <hr style="border:none;border-top:1px solid #334155;margin:18px 0" />
-    <div class="admin-section-title" style="margin-top:0">🗑️ Cache de tráfico</div>
-    <p class="admin-help">Borra dominios cacheados con tráfico ≥ X. Útil después de cambiar de proveedor de API o cuando la data queda desactualizada.</p>
+    <div class="admin-section-title" style="margin-top:0">🗑️ Traffic cache</div>
+    <p class="admin-help">Clear cached domains above the threshold. Forces re-analysis (will spend API).</p>
     <div style="display:flex;gap:6px;align-items:center">
-      <span style="font-size:11px;color:#94a3b8">Borrar cache de sitios con visits ≥</span>
+      <span style="font-size:11px;color:#94a3b8">Clear cache for visits ≥</span>
       <input id="admin-reset-cache-threshold" type="number" class="form-input" value="400000" style="width:110px;font-size:11px" />
       <button id="admin-reset-cache-btn" class="btn btn-sm" style="background:#ef4444;color:white;border:none">🗑️ Reset</button>
     </div>
@@ -474,7 +461,7 @@
         </select>
 
         <label class="form-label">Traffic</label>
-        <input id="form-pv-display" class="form-input form-pv-display" type="text" placeholder="ej: 500K, 1.2M o número crudo" title="Editable — si SimilarWeb no devolvió, completá manualmente. Acepta '500K', '1.2M', '1,5M' o número crudo." />
+        <input id="form-pv-display" class="form-input form-pv-display" type="text" placeholder="e.g. 500K, 1.2M or raw number" title="Editable — fill manually if SimilarWeb didn't return data. Accepts '500K', '1.2M', '1,5M' or raw number." />
 
         <label class="form-label">Email</label>
         <input id="form-email" class="form-input" type="text" placeholder="email@site.com" />
@@ -579,7 +566,7 @@
       <!-- Asunto del email — separado visualmente del cuerpo -->
       <div class="pitch-subject-row">
         <label class="pitch-subject-label">📨 Asunto</label>
-        <input id="form-subject" class="form-input pitch-subject-input" type="text" placeholder="Asunto del email..." />
+        <input id="form-subject" class="form-input pitch-subject-input" type="text" placeholder="Email subject..." />
       </div>
 
       <!-- Toolbar: bandera+nombre del template (izq) | chips de idiomas + Limpiar (der) -->
@@ -595,7 +582,7 @@
           <button id="btn-pitch-clear" type="button" class="pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
         </div>
       </div>
-      <textarea id="pitch-text" class="pitch-textarea" placeholder="Borrador del idioma se autocarga acá..."></textarea>
+      <textarea id="pitch-text" class="pitch-textarea" placeholder="Language draft auto-loads here..."></textarea>
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">
         <button id="btn-generate-pitch" class="btn btn-primary btn-sm">✨ Generate Pitch</button>
@@ -638,7 +625,7 @@
       <span id="cascade-monday-arrow" style="font-size:11px;color:var(--text-muted)">▼</span>
     </div>
     <div id="cascade-monday-panel" style="margin-top:8px">
-      <p class="import-desc" style="font-size:11px;margin:0 0 8px 0;color:var(--text-muted)">Trae 15 URLs con <strong>Ciclo Finalizado</strong> filtradas por Geo/Idioma/Tráfico. Abre en tabs o encola para auto-prospector.</p>
+      <p class="import-desc" style="font-size:11px;margin:0 0 8px 0;color:var(--text-muted)">Fetches 15 URLs with <strong>Ciclo Finalizado</strong> filtered by Geo/Language/Traffic. Open in tabs or queue for auto-prospector.</p>
 
       <div class="import-filters">
         <div class="import-filter-row">
@@ -689,7 +676,7 @@
 
       <div style="display:flex; gap:8px; margin-top:10px">
         <button id="btn-import-go" class="btn btn-primary btn-sm" style="flex:1">🚀 Import 15 URLs</button>
-        <button id="btn-import-queue" class="btn btn-secondary btn-sm" style="flex:1" title="Encola para el auto-prospector en lugar de abrir tabs">📤 Send to Queue</button>
+        <button id="btn-import-queue" class="btn btn-secondary btn-sm" style="flex:1" title="Queue for auto-prospector instead of opening tabs">📤 Send to Queue</button>
       </div>
       <div id="import-result" class="push-result" style="margin-top:6px;min-height:14px;font-size:11px"></div>
       <div id="import-list" class="import-list" style="margin-top:6px"></div>
@@ -904,7 +891,7 @@
     <!-- Status live de la sesión actual de autopilot — se llena desde toolbar_config.auto_session_stats -->
     <div id="autopilot-live-stats" style="display:none;margin-top:6px;padding:6px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:6px;font-size:11px;color:#cbd5e1">
       <div style="display:flex;justify-content:space-between;align-items:center">
-        <span><strong style="color:#34d399">⚡ Procesando</strong> · <span id="ap-live-user" style="color:#94a3b8"></span></span>
+        <span><strong style="color:#34d399">⚡ Processing</strong> · <span id="ap-live-user" style="color:#94a3b8"></span></span>
         <span style="color:#64748b;font-size:10px" id="ap-live-age"></span>
       </div>
       <div style="margin-top:3px;display:flex;gap:10px;font-size:10.5px">
@@ -955,7 +942,7 @@
     <div id="prospects-bulk-bar" style="display:none;align-items:center;gap:6px;background:#1e293b;color:#fff;padding:6px 8px;border-radius:6px;margin-bottom:6px;font-size:11px">
       <span id="prospects-bulk-count" style="font-weight:700">0 selected</span>
       <span style="flex:1"></span>
-      <button id="btn-bulk-open"   class="btn btn-sm" style="background:#0ea5e9;color:#fff;padding:3px 8px;font-size:11px" title="Abrir cada dominio en una pestaña">🪟 Open tabs</button>
+      <button id="btn-bulk-open"   class="btn btn-sm" style="background:#0ea5e9;color:#fff;padding:3px 8px;font-size:11px" title="Open each domain in a tab">🪟 Open tabs</button>
       <button id="btn-bulk-reject" class="btn btn-sm" style="background:#dc2626;color:#fff;padding:3px 8px;font-size:11px" title="Rechazar seleccionados">❌ Reject</button>
       <button id="btn-bulk-clear"  class="btn btn-sm" style="background:#475569;color:#fff;padding:3px 8px;font-size:11px" title="Limpiar selección">Clear</button>
     </div>
@@ -1008,13 +995,13 @@
 
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
       <select id="sellers-company-select" class="form-select" style="flex:1;font-size:11px"></select>
-      <button id="btn-sellers-edit" class="btn btn-secondary btn-sm" style="font-size:11px;padding:3px 8px" title="Editar lista de empresas">✏️ Edit</button>
+      <button id="btn-sellers-edit" class="btn btn-secondary btn-sm" style="font-size:11px;padding:3px 8px" title="Edit company list">✏️ Edit</button>
     </div>
     <div id="sellers-company-url" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;word-break:break-all">—</div>
     <div style="display:flex;gap:6px;align-items:center">
-      <input id="sellers-cap-input" type="number" min="1" max="50" value="50" class="form-input" style="width:70px;font-size:11px" title="Cap por tirada: hasta 50 para Queue, hasta 30 para Open tabs. Si ponés más, se ajusta automáticamente." />
-      <button id="btn-sellers-fetch" class="btn btn-primary btn-sm" style="flex:1;font-size:11px" title="Encolar en csv_queue para que el worker los procese (auto)">📥 Queue</button>
-      <button id="btn-sellers-open" class="btn btn-secondary btn-sm" style="flex:1;font-size:11px" title="Abrir cada dominio en una pestaña nueva — para prospectar manual desde toolbar Analysis">🪟 Open tabs</button>
+      <input id="sellers-cap-input" type="number" min="1" max="50" value="50" class="form-input" style="width:70px;font-size:11px" title="Per-batch cap: up to 50 for Queue, up to 30 for Open tabs. Auto-adjusts if higher." />
+      <button id="btn-sellers-fetch" class="btn btn-primary btn-sm" style="flex:1;font-size:11px" title="Queue in csv_queue for worker to process (auto)">📥 Queue</button>
+      <button id="btn-sellers-open" class="btn btn-secondary btn-sm" style="flex:1;font-size:11px" title="Open each domain in a new tab — for manual prospecting from Analysis tab">🪟 Open tabs</button>
     </div>
     <div id="sellers-result" class="push-result" style="min-height:16px;font-size:11px;margin-top:6px"></div>
 
@@ -1025,10 +1012,10 @@
           <strong style="font-size:13px">📋 Edit sellers.json companies</strong>
           <button id="btn-sellers-edit-close" class="btn btn-secondary btn-sm" style="font-size:11px">✕</button>
         </div>
-        <p style="font-size:10px;color:#64748b;margin-bottom:8px">Una empresa por línea. Formato: <code>Name | https://url/sellers.json</code></p>
+        <p style="font-size:10px;color:#64748b;margin-bottom:8px">One company per line. Format: <code>Name | https://url/sellers.json</code></p>
         <textarea id="sellers-edit-textarea" class="form-input" style="width:100%;height:280px;font-family:monospace;font-size:10px;line-height:1.4" placeholder="Embi Media | https://embi-media.com/sellers.json&#10;Teads | https://teads.tv/sellers.json"></textarea>
         <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
-          <button id="btn-sellers-edit-reset" class="btn btn-secondary btn-sm" style="font-size:11px" title="Restaurar lista por defecto">↺ Reset to defaults</button>
+          <button id="btn-sellers-edit-reset" class="btn btn-secondary btn-sm" style="font-size:11px" title="Restore default list">↺ Reset to defaults</button>
           <button id="btn-sellers-edit-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save</button>
         </div>
         <div id="sellers-edit-status" style="font-size:10px;color:#16a34a;margin-top:6px;min-height:14px"></div>
@@ -1046,7 +1033,7 @@
     <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
 
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
-      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Debe matchear el valor exacto de la columna GEO en Monday.">
+      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Must match exact value of GEO column in Monday.">
         <option value="">Geo: Todos</option>
         <!-- Opciones rellenadas dinámicamente desde MONDAY_COUNTRIES -->
       </select>
@@ -1099,13 +1086,13 @@
         <button id="tab-history-monday" class="history-tab-btn" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid transparent;cursor:pointer">Monday</button>
         <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px;margin-left:auto">↻</button>
       </div>
-      <div id="csv-history-list" style="font-size:10px; max-height:220px; overflow-y:auto">Cargando...</div>
+      <div id="csv-history-list" style="font-size:10px; max-height:220px; overflow-y:auto">Loading...</div>
     </div>
 
     <div style="display:flex;gap:6px;margin-top:8px">
-      <button id="btn-csv-clear-processed" class="btn btn-secondary btn-sm" style="font-size:10px" title="Borra solo items ya procesados (done/error/skipped). Limpia el historial visual. Lo que se generó en Prospects queda intacto.">🧹 Clear processed</button>
+      <button id="btn-csv-clear-processed" class="btn btn-secondary btn-sm" style="font-size:10px" title="Deletes only processed items (done/error/skipped). Generated prospects remain intact.">🧹 Clear processed</button>
       <button id="btn-csv-show-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#94a3b8;border-color:#cbd5e1" title="Mostrar opción peligrosa de borrar TODO incluyendo cola pending">⋯</button>
-      <button id="btn-csv-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e;display:none" title="⚠️ Borra TODO incluyendo cola pending. NO uses esto si tenés items procesando.">🚨 Clear ALL (incluye pending)</button>
+      <button id="btn-csv-clear-all" class="btn btn-secondary btn-sm" style="font-size:10px;color:#e53e3e;border-color:#e53e3e;display:none" title="⚠️ Deletes EVERYTHING including pending queue. Do NOT use if items are processing.">🚨 Clear ALL (incl. pending)</button>
     </div>
   </section>
 </div>
@@ -1202,7 +1189,7 @@
       <div style="font-size:11px; font-weight:700; color:var(--text-muted); text-transform:uppercase; letter-spacing:.4px; margin-bottom:6px">
         <span id="drafts-form-mode">New draft</span>
       </div>
-      <input id="draft-name" type="text" class="form-input" placeholder="Nombre del borrador (ej: Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
+      <input id="draft-name" type="text" class="form-input" placeholder="Draft name (e.g. Cold outreach 2026)" style="margin-bottom:6px; font-size:12px" />
       <div style="display:flex; gap:6px; margin-bottom:6px">
         <select id="draft-language" class="form-select" style="flex:1; font-size:12px">
           <option value="es">🇪🇸 Spanish</option>
@@ -1219,8 +1206,8 @@
           <option value="5">⭐ 5</option>
         </select>
       </div>
-      <input id="draft-subject" type="text" class="form-input" placeholder="Asunto del email (opcional)" style="margin-bottom:6px; font-size:12px" />
-      <textarea id="draft-body" class="form-input" placeholder="Cuerpo del email — usá {{domain}} como placeholder." style="width:100%; min-height:240px; font-size:13px; font-family:inherit; line-height:1.5; padding:10px"></textarea>
+      <input id="draft-subject" type="text" class="form-input" placeholder="Email subject (optional)" style="margin-bottom:6px; font-size:12px" />
+      <textarea id="draft-body" class="form-input" placeholder="Email body — use {{domain}} as placeholder." style="width:100%; min-height:240px; font-size:13px; font-family:inherit; line-height:1.5; padding:10px"></textarea>
 
       <div style="display:flex; gap:6px; margin-top:8px">
         <button id="btn-draft-save" class="btn btn-primary btn-sm" style="flex:1">💾 Save</button>

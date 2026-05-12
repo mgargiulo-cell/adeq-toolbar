@@ -123,7 +123,7 @@ async function checkProspectLock() {
     const minutesLeft = Math.max(0, Math.round((new Date(lock.expires_at) - Date.now()) / 60_000));
     const warn = document.createElement("div");
     warn.className = "lock-warning";
-    warn.innerHTML = `🔒 ${esc(lock.locked_by)} está trabajando este prospecto (${minutesLeft} min restantes). Coordiná antes de pushear.`;
+    warn.innerHTML = `🔒 ${esc(lock.locked_by)} is working on this prospect (${minutesLeft} min left). Coordinate before pushing.`;
     el.parentElement?.insertBefore(warn, el.nextSibling);
   }
 }
@@ -141,7 +141,7 @@ function setupVacationToggle() {
       <input type="checkbox" id="vacation-checkbox" />
       En vacaciones / no asignar nuevos leads
     </label>
-    <input type="date" id="vacation-until" class="form-input" style="font-size:11px" placeholder="Hasta cuándo" />
+    <input type="date" id="vacation-until" class="form-input" style="font-size:11px" placeholder="Until when" />
     <div id="vacation-status" style="font-size:10px;color:#94a3b8;margin-top:4px"></div>
   `;
   settings.querySelector(".modal-content")?.appendChild(sec) || settings.appendChild(sec);
@@ -155,7 +155,7 @@ function setupVacationToggle() {
     if (s?.vacation_until) {
       cb.checked = true;
       until.value = s.vacation_until;
-      status.textContent = `Estás marcado como en vacaciones hasta ${s.vacation_until}.`;
+      status.textContent = `You are marked on vacation until ${s.vacation_until}.`;
     }
   }).catch(() => {});
 
@@ -305,7 +305,7 @@ function showPersonalQuotaBanner({ used, limit, pct }) {
   banner.style.display = "flex";
   banner.classList.add(pct >= 100 ? "cap-reached" : "cap-warning");
   document.getElementById("cap-banner-icon").textContent = pct >= 100 ? "⛔" : "⚠️";
-  document.getElementById("cap-banner-title").textContent = `Tu cap personal está al ${Math.round(pct)}%`;
+  document.getElementById("cap-banner-title").textContent = `Your personal cap is at ${Math.round(pct)}%`;
   document.getElementById("cap-banner-detail").textContent = ` — ${used.toLocaleString()} / ${limit.toLocaleString()} hits este mes.`;
 }
 
@@ -424,7 +424,7 @@ function initAdminPanel() {
 async function resetTrafficCacheAboveThreshold() {
   const threshold = parseInt(document.getElementById("admin-reset-cache-threshold").value, 10) || 400000;
   const status = document.getElementById("admin-reset-cache-status");
-  if (!confirm(`¿Borrar TODOS los dominios cacheados con visits ≥ ${threshold.toLocaleString()}?\n\nEsto fuerza al equipo a re-analizarlos (gastará API).`)) return;
+  if (!confirm(`Delete ALL cached domains with visits ≥ ${threshold.toLocaleString()}?\n\nThis forces the team to re-analyze them (will spend API).`)) return;
   status.textContent = "⏳ Borrando...";
   try {
     // Borrar via PostgREST con filtros sobre el JSONB.
@@ -469,7 +469,7 @@ async function resetTrafficCacheAboveThreshold() {
       );
       if (delRes.ok) deleted += chunk.length;
     }
-    status.textContent = `✅ ${deleted} dominios borrados de la cache compartida. El equipo los re-analizará en el próximo análisis.`;
+    status.textContent = `✅ ${deleted} domains cleared from shared cache. The team will re-analyze them next time.`;
     logAuditEvent(state.accessToken, {
       user_email: state.loginEmail, action: "reset_traffic_cache",
       details: { threshold, deleted, sample: domains.slice(0, 10) },
@@ -536,7 +536,7 @@ async function saveAdminGlobalCaps() {
         body: JSON.stringify([{ key: "autopilot_daily_cap_global", value: String(ap) }]),
       }),
     ]);
-    stEl.textContent = `✅ Guardado: CSV ${csv}/día · Autopilot ${ap}/día`;
+    stEl.textContent = `✅ Saved: CSV ${csv}/day · Autopilot ${ap}/day`;
     setTimeout(() => loadAdminGlobalCaps(), 500);
   } catch (e) {
     stEl.textContent = `❌ Error: ${e.message}`;
@@ -562,9 +562,9 @@ async function loadAdminLimits() {
   header.style.padding = "0 4px";
   header.innerHTML = `
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px" title="Email del media buyer">Usuario</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Cap mensual de hits a RapidAPI website-insights (vacío = sin cap individual, usa el global de 40K)">RapidAPI/mes</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Duración máxima de UNA sesión de autopilot, en minutos">Sesión max</span>
-    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Cantidad máxima de prospectos que este usuario puede agregar al pool por día (autopilot + CSV)">Prospects/día</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Monthly RapidAPI hits cap (empty = no per-user cap, falls back to global 40K)">RapidAPI/mo</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Max duration of ONE autopilot session, in minutes">Session max</span>
+    <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Max prospects this user can add to pool per day (autopilot + CSV)">Prospects/day</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center" title="Habilita/deshabilita el autopilot para este user (independiente del agente IA)">Autopilot</span>
     <span style="font-size:9px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.4px;text-align:center">Guardar</span>
     <span></span>
@@ -604,9 +604,9 @@ function buildLimitRow(l, isNew = false) {
   row.className = "admin-limit-row";
   row.innerHTML = `
     <input type="email" class="form-input lim-email" value="${esc(l.user_email)}" placeholder="user@adeqmedia.com" ${isNew ? "" : "readonly"} />
-    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API/mes" min="0" title="Cap mensual de RapidAPI hits para este usuario (vacío = sin cap individual)" />
-    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 60}" placeholder="min" min="5" max="240" title="Duración máxima de UNA sesión de autopilot, en minutos" />
-    <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Cantidad máxima de prospectos procesados por día por este usuario en autopilot" />
+    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API/mo" min="0" title="Monthly RapidAPI hits cap (empty = no per-user cap)" />
+    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 60}" placeholder="min" min="5" max="240" title="Max duration of ONE autopilot session, in minutes" />
+    <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Max prospects processed per day by this user in autopilot" />
     <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot ON/OFF">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
     <button class="save-btn" title="Guardar cambios">💾</button>
     <button class="del-btn" title="Eliminar">×</button>
@@ -629,7 +629,7 @@ function buildLimitRow(l, isNew = false) {
   // Delete
   row.querySelector(".del-btn").addEventListener("click", async () => {
     const email = row.querySelector(".lim-email").value;
-    if (email && confirm(`Eliminar límites de ${email}?`)) {
+    if (email && confirm(`Delete limits for ${email}?`)) {
       await deleteUserLimit(state.accessToken, email);
     }
     row.remove();
@@ -823,11 +823,11 @@ async function loadAdminAgent() {
       const minLeft = Math.round((pausedUntil - Date.now()) / 60000);
       statusEl.innerHTML = `⏸ <strong style="color:#f87171">Pausado por ${minLeft}min</strong> (kill switch o pause manual)`;
     } else if (enabled && !inActiveWindow) {
-      statusEl.innerHTML = `🌙 Master ON, pero <strong style="color:#fbbf24">FUERA de horario activo</strong> (${startH}h-${endH}h España). Auto-resume cuando entre el horario. Hora España actual: <strong>${spainH}h</strong>.`;
+      statusEl.innerHTML = `🌙 Master ON, but <strong style="color:#fbbf24">OUTSIDE active hours</strong> (${startH}h-${endH}h Spain). Auto-resumes when in window. Spain time now: <strong>${spainH}h</strong>.`;
     } else if (enabled && inActiveWindow) {
-      statusEl.innerHTML = `🟢 <strong style="color:#34d399">Activo</strong>. Procesa cada ~5min. Mandando como <strong>${esc(myEmail)}</strong>. Horario activo: ${startH}h-${endH}h España.`;
+      statusEl.innerHTML = `🟢 <strong style="color:#34d399">Active</strong>. Processes every ~5min. Sending as <strong>${esc(myEmail)}</strong>. Active hours: ${startH}h-${endH}h Spain.`;
     } else {
-      statusEl.innerHTML = `⚪ Inactivo. Activá el toggle (master switch) para que arranque automático en horario activo.`;
+      statusEl.innerHTML = `⚪ Inactive. Toggle ON (master switch) to auto-start during active hours.`;
     }
   }
 
@@ -886,7 +886,7 @@ async function _refreshAgentFeed() {
       { headers }
     );
     const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">Sin actividad aún. Activá el toggle para arrancar.</div>'; return; }
+    if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">No activity yet. Toggle ON to start.</div>'; return; }
     const icons = { sent: "✅", skipped: "⏭", failed: "❌", kill_switch: "🚨" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
@@ -1022,7 +1022,7 @@ async function toggleRefreshEmptyLeads() {
 }
 
 async function pauseAgent1h() {
-  if (!confirm("Pausar el agent durante 1 hora?")) return;
+  if (!confirm("Pause agent for 1 hour?")) return;
   const pauseUntil = new Date(Date.now() + 3600_000).toISOString();
   await _writeAgentConfig({ agent_paused_until: pauseUntil });
   showToast("⏸ Agent pausado 1h", "warn");
@@ -1056,7 +1056,7 @@ async function saveAdminBlocklist() {
   const domains = (ta.value || "")
     .split(/[\n,]/).map(d => d.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, ""))
     .filter(d => d && d.includes("."));
-  if (!domains.length) { status.textContent = "❌ Lista vacía."; return; }
+  if (!domains.length) { status.textContent = "❌ Empty list."; return; }
   status.textContent = "⏳ Guardando...";
   try {
     // Borrar todo y re-insertar (operación admin, no es alta frecuencia)
@@ -1336,7 +1336,7 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
       rows: [
         { label: "% +500K visits", get: m => m.sites ? Math.round((m.above500k / m.sites) * 100) : 0, fmt: v => `${v}%` },
         { label: "Top GEO",        get: m => Object.values(m.geos).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.geos), noBar: true },
-        { label: "Top Categoría",  get: m => Object.values(m.categories).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.categories), noBar: true },
+        { label: "Top Category",   get: m => Object.values(m.categories).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.categories), noBar: true },
       ],
     },
     {
@@ -1357,7 +1357,7 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
   ];
 
   const html = [];
-  html.push(`<div class="mbc-row mbc-header"><div class="mbc-cell mbc-row-label">Métrica</div>${mbs.map(m => `<div class="mbc-cell"><strong>${shortName(m.user)}</strong></div>`).join("")}</div>`);
+  html.push(`<div class="mbc-row mbc-header"><div class="mbc-cell mbc-row-label">Metric</div>${mbs.map(m => `<div class="mbc-cell"><strong>${shortName(m.user)}</strong></div>`).join("")}</div>`);
   groups.forEach(g => {
     html.push(`<div class="mbc-group-sep">${g.title}</div>`);
     g.rows.forEach(row => {
@@ -1462,16 +1462,16 @@ function renderAdminMBSummaries(historial, usage, sessions) {
     // Frases narrativas — solo las que tengan datos relevantes
     const lines = [];
     if (s.sites === 0) {
-      lines.push("Sin actividad registrada en este período.");
+      lines.push("No activity logged in this period.");
     } else {
-      lines.push(`Analizó <strong>${s.sites}</strong> sitios (${s.autopilotSites} via autopilot, ${s.sites - s.autopilotSites} manual).`);
-      if (topGeoArr.length) lines.push(`Foco geográfico: <strong>${topGeoStr}</strong>.`);
-      if (topCatArr.length) lines.push(`Categorías más analizadas: <strong>${topCatStr}</strong>.`);
+      lines.push(`Analyzed <strong>${s.sites}</strong> sites (${s.autopilotSites} via autopilot, ${s.sites - s.autopilotSites} manual).`);
+      if (topGeoArr.length) lines.push(`Geographic focus: <strong>${topGeoStr}</strong>.`);
+      if (topCatArr.length) lines.push(`Top analyzed categories: <strong>${topCatStr}</strong>.`);
       lines.push(`Calidad de leads: <strong>${s.above500k}</strong> sitios +500K vs <strong>${s.below500k}</strong> chicos.`);
       if (s.emails > 0 || s.monday > 0) {
         lines.push(`Outreach: <strong>${s.emails}</strong> emails enviados, <strong>${s.monday}</strong> pushes a Monday (conv: <strong>${convPct}%</strong>).`);
       } else {
-        lines.push(`⚠️ Cero emails enviados y cero pushes a Monday — analizó pero no avanzó leads.`);
+        lines.push(`⚠️ Zero emails sent and zero Monday pushes — analyzed but didn't advance leads.`);
       }
       if (s.apSec > 0)    lines.push(`Tiempo Autopilot ON: <strong>${apTimeStr}</strong>.`);
       if (s.popupSec > 0) lines.push(`Tiempo con toolbar abierta: <strong>${popupTimeStr}</strong>.`);
@@ -1679,18 +1679,18 @@ function renderRapidApiUsageBanner({ used, limit, period, scope } = {}) {
   if (pct >= 100) {
     banner.classList.add("cap-reached");
     icon.textContent  = "⛔";
-    title.textContent = `${scopeLabel}: límite mensual alcanzado`;
-    detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Las consultas de tráfico están pausadas hasta el próximo mes.`;
+    title.textContent = `${scopeLabel}: monthly limit reached`;
+    detail.textContent = ` — ${usedStr} / ${limitStr} in ${periodStr}. Traffic lookups paused until next month.`;
   } else if (pct >= 80) {
     banner.classList.add("cap-danger");
     icon.textContent  = "🔶";
-    title.textContent = `${scopeLabel} al ${Math.round(pct)}% — atención`;
+    title.textContent = `${scopeLabel} at ${Math.round(pct)}% — heads up`;
     detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Quedan pocas consultas; el autopilot puede cortarse pronto.`;
   } else {
     banner.classList.add("cap-warning");
     icon.textContent  = "⚠️";
     title.textContent = `${scopeLabel} al ${Math.round(pct)}%`;
-    detail.textContent = ` — ${usedStr} / ${limitStr} en ${periodStr}. Avisamos para que estés al tanto.`;
+    detail.textContent = ` — ${usedStr} / ${limitStr} in ${periodStr}. Heads up.`;
   }
 }
 
@@ -2502,7 +2502,7 @@ async function runTrafficCheck() {
     // Buscar primero en topCountries, fallback a la inferida desde page signals
     const topC = (data.topCountries || []).find(c => c.code) || null;
     const mainFlagHtml = topC
-      ? `<span class="main-country-flag" title="País principal de tráfico: ${esc(topC.name || topC.code)}" data-code="${esc(topC.code)}" style="font-size:18px;margin-left:6px;cursor:help">${countryFlag(topC.code)}</span>`
+      ? `<span class="main-country-flag" title="Top traffic country: ${esc(topC.name || topC.code)}" data-code="${esc(topC.code)}" style="font-size:18px;margin-left:6px;cursor:help">${countryFlag(topC.code)}</span>`
       : "";
 
     if (data.noPageViewData) {
@@ -3009,7 +3009,7 @@ function renderEmailList(emails) {
 
   if (!mondayEmail && suggested.length === 0) {
     resultEl.style.display = "block";
-    resultEl.textContent   = "Sin emails válidos — probá Apollo";
+    resultEl.textContent   = "No valid emails — try Apollo";
     resultEl.className     = "email-value";
     listEl.style.display   = "none";
     return;
@@ -3644,7 +3644,7 @@ async function bindButtons() {
     }
     // Guard #1: GEO obligatorio — Monday no debe recibir items sin país
     if (!geo) {
-      res.textContent = "❌ GEO obligatorio. Completá el campo GEO antes de enviar a Monday.";
+      res.textContent = "❌ GEO required. Fill the GEO field before pushing to Monday.";
       res.className = "push-result error";
       document.getElementById("form-geo")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -3652,7 +3652,7 @@ async function bindButtons() {
     // Guard #2: Páginas Vistas obligatorio — bloqueamos si traffic === 0
     const traffic = state.traffic || state.visits || 0;
     if (!traffic || traffic === 0) {
-      res.textContent = "❌ Páginas Vistas obligatorio. SimilarWeb no devolvió datos — completá manualmente o re-analizá.";
+      res.textContent = "❌ Page Views required. SimilarWeb returned no data — fill manually or re-analyze.";
       res.className = "push-result error";
       return;
     }
@@ -4153,7 +4153,7 @@ function bindCustomPromptHandlers() {
 
   clearBtn?.addEventListener("click", async () => {
     if (state.role !== "admin") return;
-    if (!confirm("¿Resetear al prompt baked-in (Diego's voice default)?")) return;
+    if (!confirm("Reset to baked-in prompt (ADEQ Style default)?")) return;
     const r = await setCustomPrompt(state.accessToken, GLOBAL_PROMPT_KEY, "");
     if (r.ok) {
       state.customPrompt = DIEGO_VOICE_PROMPT;
@@ -4358,7 +4358,7 @@ function renderKeywords(kws, search = "") {
     `<button class="kw-chip${k.db ? " kw-imported" : ""}" data-kw="${esc(k.kw)}">${esc(k.kw)}</button>`
   ).join("");
   if (kws.length > limit) {
-    el.innerHTML += `<span class="kw-empty" style="margin-top:4px">… y ${kws.length - limit} más. Refiná la búsqueda.</span>`;
+    el.innerHTML += `<span class="kw-empty" style="margin-top:4px">… and ${kws.length - limit} more. Refine search.</span>`;
   }
   el.querySelectorAll(".kw-chip").forEach(btn => {
     btn.addEventListener("click", () => searchGoogleForDomain(btn.dataset.kw));
@@ -4661,7 +4661,7 @@ function appendCascadeItem(site, container) {
   const visitsLabel = site.visits > 0 ? formatTraffic(site.visits) : "?";
   const grade = site.visits > 0
     ? (() => { const s = scoreProspect({ pageViews: site.visits, rawVisits: site.visits }); return `<span class="score-grade-sm" style="background:${s.color}" title="${s.label}">${s.grade}</span>`; })()
-    : `<span class="score-grade-sm" style="background:#94a3b8" title="Sin enriquecer — abrí el dominio para ver datos">?</span>`;
+    : `<span class="score-grade-sm" style="background:#94a3b8" title="Not enriched — open domain to see data">?</span>`;
 
   item.innerHTML = `
     <input type="checkbox" />
@@ -5252,7 +5252,7 @@ async function initCsvQueue() {
       const _waiting = _stats?.waiting_pool || 0;
       const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 500
       if (_pending + _waiting + unique.length > _capacityTotal) {
-        uploadRes.innerHTML = `❌ <strong>Sistema saturado:</strong> ya hay ${_pending}/${CSV_PENDING_CAP} procesando + ${_waiting}/${WAITLIST_CAP} en espera. No se puede agregar ${unique.length} más. Esperá que el worker procese.`;
+        uploadRes.innerHTML = `❌ <strong>System saturated:</strong> ${_pending}/${CSV_PENDING_CAP} processing + ${_waiting}/${WAITLIST_CAP} waiting. Cannot add ${unique.length} more. Wait for worker.`;
         uploadRes.className = "push-result error";
         return;
       }
@@ -5297,7 +5297,7 @@ async function initCsvQueue() {
       resultEl.textContent = `✅ ${up.inserted} added (${domains.length - up.inserted} already queued).`;
       // Si tu user ya alcanzó el límite diario, avisar
       if (up.inserted === 0 && domains.length > 0) {
-        resultEl.textContent += " Si llegaste al cap diario de 300, esperá hasta mañana o pedile al admin que lo suba.";
+        resultEl.textContent += " If you hit the 300/day cap, wait until tomorrow or ask admin to raise it.";
       }
       resultEl.className = "push-result ok";
       await refreshAll();
@@ -5310,7 +5310,7 @@ async function initCsvQueue() {
   });
 
   clearProc.addEventListener("click", async () => {
-    if (!confirm("¿Limpiar entries ya procesados (done/error/skipped)?\n\nNO afecta los prospectos generados ni la cola pending.")) return;
+    if (!confirm("Clear already-processed entries (done/error/skipped)?\n\nDoes NOT affect generated prospects or pending queue.")) return;
     await clearCsvQueue(state.accessToken, true);
     await refreshAll();
   });
@@ -5323,9 +5323,9 @@ async function initCsvQueue() {
 
   clearAll.addEventListener("click", async () => {
     // Doble confirmación: primero un confirm general, después escribir "BORRAR" para confirmar
-    if (!confirm("⚠️ Esto borra TODO de la cola de imports incluyendo items PENDING (en cola sin procesar).\n\nLos prospectos ya generados en Prospects NO se borran, solo la cola de input.\n\n¿Continuar?")) return;
-    const confirmText = prompt("Para confirmar, escribí BORRAR (en mayúsculas):");
-    if (confirmText !== "BORRAR") { alert("Cancelado."); return; }
+    if (!confirm("⚠️ This deletes EVERYTHING in the import queue including PENDING items.\n\nGenerated prospects in Prospects tab are NOT affected.\n\nContinue?")) return;
+    const confirmText = prompt("Type DELETE to confirm:");
+    if (confirmText !== "DELETE") { alert("Canceled."); return; }
     await clearCsvQueue(state.accessToken, false);
     await refreshStats();
     // Re-ocultar el botón ALL después de usarlo
@@ -5401,7 +5401,7 @@ async function initSellersJsonImport(refreshAll) {
   modalClose?.addEventListener("click", () => { modal.style.display = "none"; });
   modal.addEventListener("click", (e) => { if (e.target === modal) modal.style.display = "none"; });
   modalReset?.addEventListener("click", () => {
-    if (!confirm("Restaurar lista por defecto? Se pierde lo editado.")) return;
+    if (!confirm("Restore default list? Edits will be lost.")) return;
     modalArea.value = DEFAULT_SELLERS_COMPANIES.map(c => `${c.name} | ${c.url}`).join("\n");
   });
   modalSave?.addEventListener("click", async () => {
@@ -5515,7 +5515,7 @@ async function initSellersJsonImport(refreshAll) {
         return;
       }
       const N = Math.min(cap, fresh.length);
-      if (!confirm(`Abrir ${N} pestañas en el navegador?\n\nFound: ${domains.length} | Frescos: ${fresh.length} | Cap: ${SELLERS_OPEN_TABS_CAP}/click`)) {
+      if (!confirm(`Open ${N} tabs in browser?\n\nFound: ${domains.length} | Fresh: ${fresh.length} | Cap: ${SELLERS_OPEN_TABS_CAP}/click`)) {
         return;
       }
       const slice = fresh.slice(0, N);
@@ -5971,7 +5971,7 @@ function initPitchDrafts() {
 
   delBtn.addEventListener("click", async () => {
     if (!editingId) return;
-    if (!confirm("¿Borrar este borrador?")) return;
+    if (!confirm("Delete this draft?")) return;
     await deletePitchDraft(state.accessToken, editingId);
     clearForm();
     await load();
@@ -7677,7 +7677,7 @@ async function initProspectsTab() {
     if (checked.length === 0) return;
     const HARD_CAP = 30;
     if (checked.length > HARD_CAP) {
-      if (!confirm(`Vas a abrir ${checked.length} pestañas. Cap defensivo es ${HARD_CAP}. ¿Continuar igual?`)) return;
+      if (!confirm(`About to open ${checked.length} tabs. Defensive cap is ${HARD_CAP}. Continue anyway?`)) return;
     }
     const domains = checked
       .map(c => c.closest(".pcard")?.dataset?.domain)
@@ -7690,7 +7690,7 @@ async function initProspectsTab() {
   document.getElementById("btn-bulk-reject")?.addEventListener("click", async () => {
     const checked = [...document.querySelectorAll(".pcard-bulk-cbx:checked")];
     if (checked.length === 0) return;
-    if (!confirm(`Rechazar ${checked.length} prospects? Esto los marca como permanentemente bloqueados.`)) return;
+    if (!confirm(`Reject ${checked.length} prospects? They will be marked as permanently blocked.`)) return;
     const ids = checked.map(c => parseInt(c.dataset.id, 10)).filter(Boolean);
     showToast(`⏳ Rechazando ${ids.length} prospects...`, "info");
     let ok = 0, fail = 0;
