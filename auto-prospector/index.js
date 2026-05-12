@@ -4017,8 +4017,11 @@ function rankEmail(email, siteDomain, leadCategory = "") {
     if (dom === cleanSite) score += 40;
     else if (dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom)) score += 35;
     else if (isFreeWebmail) {
-      // Webmail personal — no penalizar cross-domain (es esperado)
-      // El webmail penalty -35 abajo ya cubre la baja confianza B2B
+      // Webmail cross-domain — penalty intermedio (-15). Es esperado que un
+      // contacto B2B use gmail personal, pero corporate email mismo-dominio
+      // sigue siendo MEJOR. Esto evita que un john.doe@gmail le gane a
+      // marketing@empresa.com.
+      score -= 15;
     } else {
       // Cross-domain a OTRO dominio corporativo — penalidad fuerte.
       score -= 50;
@@ -4124,17 +4127,18 @@ async function _hasMxRecords(domain) {
     _mxCache.delete(firstKey);
   }
   try {
-    // Cloudflare DNS-over-HTTPS (gratis, no rate-limit razonable)
     const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`, {
       headers: { "accept": "application/dns-json" },
       signal: AbortSignal.timeout(4000),
     });
-    if (!res.ok) { _mxCache.set(domain, true); return true; } // si DNS falla, asumimos válido
+    // BUG FIX: si DNS falla (network blip), NO cachear. Devolvemos true (asumimos
+    // válido por el momento) pero permitimos retry próxima vez sin estar atascados.
+    if (!res.ok) return true;
     const data = await res.json();
     const has = Array.isArray(data?.Answer) && data.Answer.length > 0;
     _mxCache.set(domain, has);
     return has;
-  } catch { _mxCache.set(domain, true); return true; }
+  } catch { return true; } // network err — assume valid, no cache
 }
 
 async function scoreEmail(email) {
@@ -4664,12 +4668,20 @@ async function runAgentCycle(token, allFlags) {
         emails = emails.filter(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
         if (!hasGoodEmail) {
           try {
-            const [apolloRes, scraped] = await Promise.all([
-              cfg.apollo_api_key
-                ? findBestApolloEmail(domain, cfg.apollo_api_key, token, { traffic: leadTraffic, allowUnlock: true })
-                : Promise.resolve(null),
-              scrapeEmailsForDomain(domain).catch(() => []),
-            ]);
+            // PASO 1: Scraping primero (gratis). Si encuentra email decente
+            // (rank score >= 50), saltar Apollo unlock para ahorrar credits.
+            const scraped = await scrapeEmailsForDomain(domain).catch(() => []);
+            const scrapedScores = scraped.map(e => rankEmail(e, domain, lead.category));
+            const bestScraped = Math.max(...scrapedScores, -100);
+            const skipApollo = bestScraped >= 50; // hay email scraped commercial-grade
+
+            // PASO 2: Apollo solo si NO encontramos email bueno scraping
+            let apolloRes = null;
+            if (!skipApollo && cfg.apollo_api_key) {
+              apolloRes = await findBestApolloEmail(domain, cfg.apollo_api_key, token, {
+                traffic: leadTraffic, allowUnlock: true,
+              });
+            }
             const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
             const merged = [...new Set([...apolloEmail, ...emails, ...scraped])];
             const validated = await validateEmailsBatch(merged);
@@ -4682,17 +4694,17 @@ async function runAgentCycle(token, allFlags) {
                 headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
                 body: JSON.stringify(patch),
               });
-              log(`  🔄 ${domain}: enrichment on-the-fly → ${validated.length} emails (apollo:${apolloRes?.source||"none"}, scraped:${scraped.length})`);
+              log(`  🔄 ${domain}: enrichment → ${validated.length} emails (scraped:${scraped.length}${skipApollo?" — Apollo SKIPPED (scraped suficiente)":`, apollo:${apolloRes?.source||"none"}`})`);
             }
           } catch (e) { log(`  ⚠️ on-the-fly enrich ${domain}: ${e.message}`); }
         }
 
         // Re-pickear el MEJOR email después del enrichment.
-        // Threshold relajado: aceptamos hasta score=-30. score=-1 (rankEmail
-        // hardgate) sigue descartado. Esto permite mandar a webmail+cross-domain
-        // si no hay nada mejor (mejor a alguien que a nadie).
+        // Threshold ESTRICTO: solo score >= 0 (positivo). Score negativo significa
+        // que las penalties superan los bonuses → es mejor NO mandar y dejar que
+        // el lead caiga a freeze que mandar a garbage (webmail cross-domain, etc.).
         const _rankedAll = emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) }));
-        const ranked = _rankedAll.filter(x => x.score > -50).sort((a, b) => b.score - a.score);
+        const ranked = _rankedAll.filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
         let email = ranked[0]?.email;
         // Log diagnóstico — ver qué pasó con cada candidate
         if (emails.length > 0) {
@@ -4783,17 +4795,34 @@ async function runAgentCycle(token, allFlags) {
 
         // NOTA: NO chequeamos Monday acá. Los filtros upstream ya lo cubren.
 
-        // 2. EMAIL SCORE — verifica antes de gastar Claude/template
-        // 🔴 red = skip, 🟡 yellow = manda igual, 🟢 green = ideal
-        const emailScore = await scoreEmail(email);
+        // 2. EMAIL SCORE — loopear sobre ranked hasta encontrar non-red.
+        // Recupera leads buenos donde el #1 estaba undeliverable pero el #2/#3 sí.
+        let emailScore = await scoreEmail(email);
+        let pickedRedReason = "";
         if (emailScore.color === "red") {
-          log(`  ⏭ ${domain}: SKIP — email red (${email}: ${emailScore.reason})`);
-          await logAgentAction(token, userEmail, {
-            domain, action: "skipped",
-            reason: `email_red_${emailScore.reason}`,
-            details: { email, traffic: leadTraffic },
-          });
-          continue;
+          pickedRedReason = emailScore.reason;
+          // Probar siguientes candidatos del ranking
+          let alternativeFound = false;
+          for (let i = 1; i < ranked.length; i++) {
+            const altEmail = ranked[i].email;
+            const altScore = await scoreEmail(altEmail);
+            if (altScore.color !== "red") {
+              log(`  🔁 ${domain}: top ${email} fue red (${pickedRedReason}), fallback a #${i+1} ${altEmail}`);
+              email = altEmail;
+              emailScore = altScore;
+              alternativeFound = true;
+              break;
+            }
+          }
+          if (!alternativeFound) {
+            log(`  ⏭ ${domain}: SKIP — todos los ${ranked.length} emails red (top: ${pickedRedReason})`);
+            await logAgentAction(token, userEmail, {
+              domain, action: "skipped",
+              reason: `email_red_${pickedRedReason}`,
+              details: { email, traffic: leadTraffic, ranked_count: ranked.length },
+            });
+            continue;
+          }
         }
         log(`  📧 ${domain}: email_score=${emailScore.color} → ${email}`);
 
