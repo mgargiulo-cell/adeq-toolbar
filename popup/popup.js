@@ -503,7 +503,9 @@ async function loadAdminGlobalCaps() {
       const apCount  = map.autopilot_daily_count_date === today ? parseInt(map.autopilot_daily_count || "0", 10) : 0;
       const csvCap = parseInt(csvEl.value, 10);
       const apCap  = parseInt(apEl.value, 10);
-      stEl.textContent = `Hoy procesado: 📦 CSV ${csvCount}/${csvCap} (${Math.round(csvCount/csvCap*100)}%) · 🤖 Autopilot ${apCount}/${apCap} (${Math.round(apCount/apCap*100)}%)`;
+      const csvPct = csvCap > 0 ? Math.round(csvCount / csvCap * 100) : 0;
+      const apPct  = apCap  > 0 ? Math.round(apCount  / apCap  * 100) : 0;
+      stEl.textContent = `Today processed: 📦 CSV ${csvCount}/${csvCap} (${csvPct}%) · 🤖 Autopilot ${apCount}/${apCap} (${apPct}%)`;
     }
   } catch (e) { stEl.textContent = `Error: ${e.message}`; }
 }
@@ -1593,7 +1595,7 @@ if (typeof window !== "undefined" && !window._modalEscWired) {
     let btn = null;
     if (key === "m" && !inField) btn = document.getElementById("btn-push-monday");
     else if (key === "e" && !inField) btn = document.getElementById("btn-send-gmail");
-    else if (key === "g" && !inField) btn = document.getElementById("btn-pitch-generate") || document.getElementById("btn-autopush-prepare");
+    else if (key === "g" && !inField) btn = document.getElementById("btn-generate-pitch") || document.getElementById("btn-autopush-prepare");
     if (btn && !btn.disabled) {
       e.preventDefault();
       btn.click();

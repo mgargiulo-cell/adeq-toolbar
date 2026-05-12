@@ -2965,8 +2965,11 @@ async function getAgentDailyCount(token, userEmail) {
     const utcStr = probe.toLocaleString("en-US", { timeZone: "UTC" });
     const offsetMs = new Date(madridStr).getTime() - new Date(utcStr).getTime();
     const cutoffUtc = new Date(probe.getTime() - offsetMs).toISOString();
+    // Cuenta tanto 'sent' (confirmado) como 'reserved' (pre-send) — la reserva
+    // protege contra crashes mid-send: si el worker reinicia entre reserve y
+    // confirmación, el slot queda apartado y el next iter no over-sends.
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${cutoffUtc}&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,reserved)&created_at=gte.${cutoffUtc}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("content-range") || "";
@@ -3237,10 +3240,15 @@ async function ragRetrieveExamplesAgent(token, userEmail, ctx) {
 // elegido o null. Cache 30d en toolbar_config para no re-pagar Claude por el
 // mismo dominio. Solo se llama si rankEmail dio scores ambiguos.
 const _claudePickCache = new Map();
+const CLAUDE_PICK_CACHE_MAX = 500;
 async function claudePickBestEmail(token, { domain, category, emails }) {
   if (!Array.isArray(emails) || emails.length < 2) return emails[0] || null;
   const cacheKey = `${domain}:${emails.sort().join(",")}`;
   if (_claudePickCache.has(cacheKey)) return _claudePickCache.get(cacheKey);
+  if (_claudePickCache.size >= CLAUDE_PICK_CACHE_MAX) {
+    const firstKey = _claudePickCache.keys().next().value;
+    _claudePickCache.delete(firstKey);
+  }
 
   const userMsg = `Site: ${domain}
 Category: ${category || "unknown"}
@@ -3558,12 +3566,16 @@ async function validateEmailsBatch(emails) {
   return [...new Set(out)];
 }
 
-// MX records cache — evita re-resolver el mismo dominio en el mismo proceso.
-// Los MX cambian rara vez, así que caché por proceso es suficiente.
+// MX records cache — LRU cap 500 dominios para evitar leak en worker 24/7.
 const _mxCache = new Map();
+const MX_CACHE_MAX = 500;
 async function _hasMxRecords(domain) {
   if (!domain) return false;
   if (_mxCache.has(domain)) return _mxCache.get(domain);
+  if (_mxCache.size >= MX_CACHE_MAX) {
+    const firstKey = _mxCache.keys().next().value;
+    _mxCache.delete(firstKey);
+  }
   try {
     // Cloudflare DNS-over-HTTPS (gratis, no rate-limit razonable)
     const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`, {
@@ -3852,6 +3864,12 @@ async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
 // Por cada user habilitado, procesa hasta perCycleLimit leads del review_queue
 // que cumplan los thresholds. Para cada uno: pitch → quality gate → push Monday → send Gmail.
 async function runAgentCycle(token, allFlags) {
+  // Pausa fin de semana — operativo solo Lun-Vie España (consistente con csv + autopilot)
+  if (_isWeekendSpain()) {
+    log(`🤖 Agent: fin de semana España — sin envíos`);
+    return;
+  }
+
   const cfg = await getConfig(token);
   const aCfg = _agentCfg(cfg);
   const monday_api_key_default = cfg.monday_api_key || "";
@@ -4194,13 +4212,36 @@ async function runAgentCycle(token, allFlags) {
 
         // RESERVA en counter ANTES del send. Si Railway crashea entre send y log,
         // el counter ya tiene el slot reservado → próximo arranque no over-sends.
-        await logAgentAction(token, userEmail, {
-          domain, action: "sent", reason: "reserved_pre_send",
-          pitch_subject: subject,
-          details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language },
-        });
+        // Usamos action='reserved' (no 'sent') para que getAgentDailyCount sume
+        // SOLO los confirmados. Tras send OK, hacemos PATCH a 'sent'. Si falla,
+        // el catch loggea 'failed' y el reserved queda como audit trail.
+        const reserveRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
+          method: "POST",
+          headers: {
+            "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+            "Content-Type": "application/json", "Prefer": "return=representation",
+          },
+          body: JSON.stringify({
+            user_email: userEmail, domain, action: "reserved",
+            pitch_subject: subject,
+            details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language },
+          }),
+        }).catch(() => null);
+        const reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id;
 
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body });
+
+        // PATCH reserved → sent ahora que confirmamos el envío
+        if (reservedId) {
+          fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+            method: "PATCH",
+            headers: {
+              "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+              "Content-Type": "application/json", "Prefer": "return=minimal",
+            },
+            body: JSON.stringify({ action: "sent" }),
+          }).catch(() => {});
+        }
 
         // 5. Push to Monday CON estado correcto desde el inicio (Propuesta Vigente T = idx 3)
         let mondayItemId = null;
