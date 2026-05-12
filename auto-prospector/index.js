@@ -3370,6 +3370,16 @@ function _spainHour() {
   return parseInt(fmt.format(new Date()), 10);
 }
 
+// 0=Sun, 1=Mon, ..., 6=Sat — en timezone Madrid (helper para logging)
+function _spainWeekday() {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Madrid", weekday: "short",
+  });
+  const map = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
+  return map[fmt.format(new Date())] ?? 0;
+}
+// _isWeekendSpain ya existe en línea 532
+
 // Devuelve true si AHORA estamos FUERA de las active hours (9-20 España).
 function _isOutsideActiveHours(activeStart, activeEnd) {
   const h = _spainHour();
@@ -4659,8 +4669,8 @@ async function runAgentCycle(token, allFlags) {
   const TEST_MODE = String(cfg.agent_test_mode || "").toLowerCase() === "true";
 
   // Active hours check — fuera de 9-20 España no manda nada (ni Monday, ni mail)
-  if (!TEST_MODE && _isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd)) {
-    log(`🤖 Agent: fuera de horario España (h=${_spainHour()}, activo=${aCfg.activeStart}-${aCfg.activeEnd})`);
+  if (!TEST_MODE && (_isWeekendSpain() || _isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd))) {
+    log(`🤖 Agent: fuera de horario laboral España (lun-vie ${aCfg.activeStart}-${aCfg.activeEnd}, hoy=${_spainWeekday()}, h=${_spainHour()})`);
     return;
   }
   if (TEST_MODE) log(`🧪 Agent TEST MODE ON — bypass active hours + daily cap + weekly target`);
@@ -5325,22 +5335,29 @@ async function main() {
     iterCount++;
     if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
 
-    // ── REGLA DE ORO: fuera de horario laboral España (9-20 CET/CEST) NADA corre ──
+    // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
-    // backfill, refresh, unfreezer. Worker queda dormido hasta que vuelva a estar
-    // en horario. Evita que algo quede prendido durante la noche (timezone Madrid).
-    // Override config: agent_test_mode=true bypasses para testing.
+    // backfill, refresh, unfreezer. Override: agent_test_mode=true bypasses para testing.
     try {
       const ghCfg = await getConfig(token);
       const ghTestMode = String(ghCfg.agent_test_mode || "").toLowerCase() === "true";
       const ghStart = parseInt(ghCfg.active_hours_start || "9", 10);
       const ghEnd   = parseInt(ghCfg.active_hours_end   || "20", 10);
-      if (!ghTestMode && _isOutsideActiveHours(ghStart, ghEnd)) {
-        if (iterCount === 1 || iterCount % 30 === 0) {
-          log(`💤 Fuera de horario España (h=${_spainHour()}, activo=${ghStart}-${ghEnd}) — todo el worker pausado`);
+      if (!ghTestMode) {
+        if (_isWeekendSpain()) {
+          if (iterCount === 1 || iterCount % 30 === 0) {
+            log(`💤 Fin de semana en España (weekday=${_spainWeekday()}) — worker dormido hasta lunes`);
+          }
+          await sleep(POLL_INTERVAL_MS);
+          continue;
         }
-        await sleep(POLL_INTERVAL_MS);
-        continue;
+        if (_isOutsideActiveHours(ghStart, ghEnd)) {
+          if (iterCount === 1 || iterCount % 30 === 0) {
+            log(`💤 Fuera de horario España (h=${_spainHour()}, activo=${ghStart}-${ghEnd}) — worker pausado`);
+          }
+          await sleep(POLL_INTERVAL_MS);
+          continue;
+        }
       }
     } catch {}
 
