@@ -683,7 +683,7 @@ function buildLimitRow(l, isNew = false) {
   row.innerHTML = `
     <input type="email" class="form-input lim-email" value="${esc(l.user_email)}" placeholder="user@adeqmedia.com" ${isNew ? "" : "readonly"} />
     <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API/mo" min="0" title="Monthly RapidAPI hits cap (empty = no per-user cap)" />
-    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 60}" placeholder="min" min="5" max="240" title="Max duration of ONE autopilot session, in minutes" />
+    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 20}" placeholder="min" min="5" max="20" title="Max duration of ONE autopilot session, in minutes (hard cap: 20)" />
     <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Max prospects processed per day by this user in autopilot" />
     <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot ON/OFF">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
     <button class="save-btn" title="Guardar cambios">💾</button>
@@ -730,7 +730,7 @@ async function saveLimitRow(row) {
     user_email:                email,
     autopilot_enabled:         row.querySelector(".lim-autopilot").classList.contains("toggle-yes"),
     monthly_api_cap:           parseInt(row.querySelector(".lim-monthly").value, 10) || null,
-    autopilot_daily_minutes:   isNaN(apMins) || apMins < 5 ? 60 : Math.min(apMins, 240),
+    autopilot_daily_minutes:   isNaN(apMins) || apMins < 5 ? 20 : Math.min(apMins, 20),
     autopilot_daily_prospects: isNaN(apProsp) || apProsp < 0 ? 75 : Math.min(apProsp, 500),
     // Caps de email/monday quedaron descontinuados por simplicidad; mando 999999 para que no bloqueen.
     daily_emails_cap:          999999,
@@ -5587,6 +5587,22 @@ async function initCsvQueue() {
   await refreshCsvMutex();
   if (enabledCbx.checked) startHeartbeat();
   enabledCbx.addEventListener("change", async () => {
+    // Pre-check: si autopilot está corriendo, queue queda bloqueado hasta que termine.
+    // El worker no chequea flags durante una sesión de autopilot (loop sync ~20min).
+    if (enabledCbx.checked) {
+      try {
+        const ap = await getAutopilotState(state.accessToken);
+        const apActive = ap?.enabled && ap?.heartbeatAt && (Date.now() - ap.heartbeatAt.getTime()) < 120_000;
+        if (apActive) {
+          const owner = ap.sessionUser ? ap.sessionUser.split("@")[0] : "someone";
+          const elapsed = ap.sessionStart ? Math.round((Date.now() - ap.sessionStart.getTime()) / 60000) : 0;
+          const remaining = Math.max(0, 20 - elapsed);
+          alert(`⏳ Autopilot is currently running (${owner}, ~${remaining} min left).\n\nQueue cannot start until autopilot finishes its session. Wait for it to end or turn autopilot OFF first.`);
+          enabledCbx.checked = false;
+          return;
+        }
+      } catch {}
+    }
     // Pre-check mutex antes de tocar
     const st = await import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => null);
     if (st && st.enabled && st.sessionUser
@@ -5933,7 +5949,7 @@ async function initSellersJsonImport(refreshAll) {
 }
 
 // ── Autopilot toggle + target ─────────────────────────────────
-const AUTOPILOT_DURATION_MS = 60 * 60 * 1000; // 1 hora max de sesión autopilot
+const AUTOPILOT_DURATION_MS = 20 * 60 * 1000; // 20 min max de sesión autopilot — alineado con worker SESSION_LIMIT_MS
 let _autopilotTimer = null;
 
 // ── Pitch Drafts: cache + helpers ─────────────────────────────
@@ -6538,7 +6554,7 @@ async function initAutopilot() {
           && cur.sessionUser.toLowerCase() !== (state.loginEmail || "").toLowerCase()
           && cur.heartbeatAt && (Date.now() - cur.heartbeatAt.getTime()) < 120_000) {
         const elapsed = cur.sessionStart ? Math.round((Date.now() - cur.sessionStart.getTime()) / 60000) : 0;
-        const remaining = Math.max(0, 60 - elapsed);
+        const remaining = Math.max(0, 20 - elapsed);
         alert(`🔒 ${cur.sessionUser} already has Autopilot running (started ${elapsed} min ago · ends in ~${remaining} min).\n\nCannot run 2 autopilots at once. Wait for it to finish or ask them to turn it off.`);
         return;
       }
