@@ -6413,7 +6413,9 @@ function updateProspectsDailyBar(count) {
 function renderProspectCard(r) {
   const trafficFmt  = r.traffic ? formatTraffic(r.traffic) : "Sin data";
   // Resolver idioma sincronicamente al render — evita que aparezca "🌐 —"
-  // mientras carga el cache de drafts. Default a EN si no hay matcheo.
+  // mientras carga el cache de drafts. Cascada robusta: lang→geo(ISO)→geo(label)→
+  // category words→title heuristic→TLD→default. Si NADA es claro y el sitio es .com,
+  // disparamos detección async vs el sitio (best-effort) que actualiza la card después.
   const _initLang = (() => {
     // 1) language ya viene del worker
     const dl = (r.language || "").toLowerCase().split("-")[0];
@@ -6429,10 +6431,18 @@ function renderProspectCard(r) {
         if (LANG_FLAG[lang]) return lang;
       }
     }
-    // 4) TLD del dominio (.com.ar / .mx / .br / .it / .pt) — fallback obvio
+    // 4) Heurística sobre title + category — palabras típicas por idioma
+    const sample = `${r.page_title || ""} ${r.category || ""} ${r.domain || ""}`.toLowerCase();
+    if (sample) {
+      if (/[ñáéíóúü¿¡]|noticias|últimas|video|fútbol|deport|política|economía|ciudad|provincia|país|noticia/.test(sample)) return "es";
+      if (/[ãõçàáâ]|notícias|notícia|últimas|últim|esportes|política|economia|cidade|brasileir/.test(sample)) return "pt";
+      if (/[àèéìòù]|notizie|ultim|sport|politica|economia|città/.test(sample)) return "it";
+      if (/[؀-ۿ]/.test(r.page_title || "")) return "ar";
+    }
+    // 5) TLD del dominio (.com.ar / .mx / .br / .it / .pt) — fallback obvio
     const tldLang = detectLangFromDomain(r.domain || "");
     if (LANG_FLAG[tldLang]) return tldLang;
-    // 5) default
+    // 6) default
     return "en";
   })();
   // Pre-render de los 5 chips de banderas — visibles desde el primer paint
@@ -6584,7 +6594,7 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
-        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Buscar tráfico + emails frescos (Apollo + scraper)" style="padding:3px 7px;font-size:10px" ${(r.traffic && hasEmail) ? "style='display:none'" : ""}>🔍 Data</button>
+        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Re-fetch tráfico + emails Apollo (igual que Analysis). Útil si los datos guardados parecen incompletos." style="padding:3px 7px;font-size:10px">🔍 Data</button>
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -6698,9 +6708,12 @@ function renderProspectCard(r) {
       </div>
 
       <!-- Action buttons in panel -->
-      <div style="display:flex;gap:6px;margin-top:10px">
+      <div style="display:flex;gap:6px;margin-top:10px;align-items:center">
         <button class="btn btn-success btn-sm pcard-validate-expanded" style="flex:1">✅ Push + Send Email</button>
+        <button type="button" class="pcard-like-btn" title="👍 Like — autopilot prioriza este tipo de lead" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👍</button>
+        <button type="button" class="pcard-dislike-btn" title="👎 Dislike — el agente evita este tipo + el RAG aprende del feedback" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👎</button>
       </div>
+      <textarea class="pcard-dislike-reason" placeholder="¿Qué falló en este lead/pitch? (opcional, ayuda al RAG)" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
       <div class="pcard-result" style="min-height:14px;font-size:11px;margin-top:5px;color:#16a34a"></div>
     </div>
 
@@ -6719,6 +6732,29 @@ function initProspectCard(card, data) {
     .filter(e => !isGarbageEmail(e))
     .filter((e, i, arr) => arr.indexOf(e) === i);
 
+  // Auto-fetch tráfico — antes solo corría on-expand. Ahora dispara también al
+  // renderizar (delayed un poco para no bloquear scroll inicial). Cache 90d
+  // hace que en la mayoría de los casos sea hit gratis (0 RapidAPI calls).
+  function autoFetchTraffic() {
+    if (card.dataset._trafficFetched) return;
+    card.dataset._trafficFetched = "1";
+    const trafficInput = card.querySelector(".pcard-traffic");
+    if (!trafficInput || trafficInput.value) return;
+    trafficInput.placeholder = "⏳ Buscando tráfico…";
+    getTraffic(data.domain).then(t => {
+      const v = t?.pageViews || t?.rawVisits || 0;
+      if (v > 0) {
+        data.traffic = v;
+        if (!trafficInput.value) trafficInput.value = formatTraffic(v);
+        trafficInput.placeholder = "ej: 500K, 1.2M, 3500000";
+      } else {
+        trafficInput.placeholder = "Sin data — completá manual";
+      }
+    }).catch(() => { trafficInput.placeholder = "Error — completá manual"; });
+  }
+  // Si la card ya viene sin tráfico, intentamos en background (no bloquea)
+  if (!data.traffic) setTimeout(autoFetchTraffic, 500);
+
   // Domain link → open tab
   card.querySelector(".pcard-domain-link")?.addEventListener("click", e => {
     e.preventDefault();
@@ -6728,23 +6764,11 @@ function initProspectCard(card, data) {
   // Enriquecer: tráfico fresco + Apollo si faltan datos
   card.querySelector(".pcard-enrich-btn")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
-    // Pre-check: si la card YA tiene tráfico Y emails, no gastar hits
     const hasTrafficAlready = !!(data.traffic && data.traffic > 0);
     const hasEmailsAlready  = Array.isArray(data.emails) && data.emails.filter(em => em && !isGarbageEmail(em)).length > 0;
-    if (hasTrafficAlready && hasEmailsAlready) {
-      btn.disabled = true;
-      btn.style.background = "#f1f5f9";
-      btn.style.color = "#64748b";
-      btn.textContent = "✅ Ya tiene datos";
-      btn.title = `Tráfico: ${data.traffic.toLocaleString()} · ${data.emails.length} email(s). Ya tiene todo lo importante — no se gasta hit.`;
-      setTimeout(() => {
-        btn.disabled = false;
-        btn.style.background = "";
-        btn.style.color = "";
-        btn.textContent = "🔍 Data";
-      }, 2500);
-      return;
-    }
+    // Permitir re-fetch siempre (Apollo cache 7d server-side hace que re-clicks
+    // sean gratis dentro de la semana). El user puede necesitar refrescar si
+    // los emails guardados son garbage o desactualizados.
     btn.disabled = true; btn.textContent = "⏳ ...";
     try {
       // Optimización: si ya tiene tráfico, NO llamar getTraffic. Si ya tiene
@@ -6805,23 +6829,7 @@ function initProspectCard(card, data) {
       // Auto-fetch tráfico si la card no lo tiene — usa cache 90d → 0 hits
       // si ya fue analizado por cualquier MB. Solo gasta hit si es dominio fresh.
       if (!data.traffic && !card.dataset._trafficFetched) {
-        card.dataset._trafficFetched = "1";
-        const trafficInput = card.querySelector(".pcard-traffic");
-        if (trafficInput && !trafficInput.value) {
-          trafficInput.placeholder = "⏳ Buscando tráfico…";
-          getTraffic(data.domain).then(t => {
-            const v = t?.pageViews || t?.rawVisits || 0;
-            if (v > 0) {
-              data.traffic = v;
-              trafficInput.value = formatTraffic(v);
-              trafficInput.placeholder = "ej: 500K, 1.2M, 3500000";
-            } else {
-              trafficInput.placeholder = "Sin data — completá manual";
-            }
-          }).catch(() => {
-            trafficInput.placeholder = "Error — completá manual";
-          });
-        }
+        autoFetchTraffic();
       }
     } else if (!open && data.domain) {
       // Al cerrar, liberar el lock SI somos el dueño
@@ -6865,13 +6873,29 @@ function initProspectCard(card, data) {
       if (block) { block.style.display = "block"; e.target.style.display = "none"; }
     });
 
-    // Click chip = seleccionar + sincronizar email a Monday data
+    // Click chip = seleccionar + sincronizar email a Monday data,
+    // PERO si el user ya tipeó algo manual en el input, NO pisar.
     const mondayEmailEl = card.querySelector(".pcard-email-monday");
+    const manualEmailEl = card.querySelector(".pcard-email-manual");
+    // Marcar el input Monday como "user-typed" cuando el user lo edita
+    if (mondayEmailEl) {
+      mondayEmailEl.addEventListener("input", () => {
+        mondayEmailEl.dataset.userEdited = "1";
+      });
+    }
+    if (manualEmailEl) {
+      manualEmailEl.addEventListener("input", () => {
+        manualEmailEl.dataset.userEdited = "1";
+      });
+    }
     listEl.querySelectorAll(".email-chip").forEach(chip => {
       chip.addEventListener("click", () => {
         listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
         chip.classList.add("selected");
-        if (mondayEmailEl) mondayEmailEl.value = chip.dataset.email;
+        // Solo pisar si el user no escribió manualmente (data flag)
+        if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1") {
+          mondayEmailEl.value = chip.dataset.email;
+        }
       });
     });
     // Pre-seleccionar el primero (Apollo)
@@ -7158,17 +7182,43 @@ function initProspectCard(card, data) {
     btn.title = "✓ Like saved — autopilot will prioritize similar patterns";
   });
 
-  // 👎 Dislike — el autopilot aprende a evitar categoría/geo/dominio
+  // 👎 Dislike — toggle textarea de razón. Al 2do click (con/sin texto) confirma
+  // el feedback al autopilot + manda el comentario al RAG (Voyage embed) para que
+  // futuros pitches eviten ese error.
   card.querySelector(".pcard-dislike-btn")?.addEventListener("click", async (e) => {
     e.stopPropagation();
     const btn = e.currentTarget;
+    const reasonEl = card.querySelector(".pcard-dislike-reason");
+    // Primer click: revelar textarea, segundo click: confirmar
+    if (reasonEl && reasonEl.style.display === "none") {
+      reasonEl.style.display = "block";
+      reasonEl.focus();
+      btn.title = "Click otra vez para confirmar (el comentario es opcional)";
+      btn.style.background = "#fef3c7";
+      btn.textContent = "👎✓";
+      return;
+    }
+    const reason = (reasonEl?.value || "").trim().substring(0, 500);
     btn.disabled = true; btn.textContent = "⏳";
-    await saveAutopilotFeedback(state.accessToken, {
-      user_email: state.loginEmail, domain: data.domain, action: "disliked",
-      category: data.category, geo: data.geo, ad_networks: data.ad_networks,
-    });
+    try {
+      // 1) Feedback al autopilot (categoría/geo/ad_networks)
+      await saveAutopilotFeedback(state.accessToken, {
+        user_email: state.loginEmail, domain: data.domain, action: "disliked",
+        category: data.category, geo: data.geo, ad_networks: data.ad_networks,
+        reason: reason || undefined,
+      });
+      // 2) RAG feedback con el pitch + razón (si tenemos pitch)
+      if (data.pitch && typeof ragSavePitchFeedback === "function") {
+        ragSavePitchFeedback("disliked", data.pitch, data.pitch_subject || "", {
+          domain: data.domain, category: data.category, geo: data.geo,
+          language: data.language || "", traffic: data.traffic || 0,
+          reason,
+        });
+      }
+    } catch (err) { console.warn("[dislike]", err); }
+    if (reasonEl) reasonEl.style.display = "none";
     btn.textContent = "👎"; btn.style.background = "#fee2e2"; btn.style.borderColor = "#fca5a5";
-    btn.title = "✓ Dislike saved — autopilot will avoid this type";
+    btn.title = `✓ Dislike${reason ? ` + razón guardada` : " guardado"} — el agente y RAG aprendieron`;
   });
 
   // Reject

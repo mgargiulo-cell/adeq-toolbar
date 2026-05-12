@@ -240,8 +240,26 @@ export function appendClosingIfMissing(body, lang = "es") {
 
 // RFC 2047 encoded-word para headers con caracteres no-ASCII.
 // Sin esto Gmail interpreta el subject como ISO-8859-1 → mojibake (ej "monetizaciÃƒÂ³n").
+// Defensive: si el input YA viene double-encoded (UTF-8 leído como Latin-1, ej.
+// "monetizaciÃ³n" en lugar de "monetización"), lo decodificamos antes de re-encodear.
+const MOJIBAKE_PATTERN = /Ã[\x80-\xBF]|Â[¡¿«»]|â€[œ]/;
+function _fixMojibake(str) {
+  if (!MOJIBAKE_PATTERN.test(str)) return str;
+  try {
+    // Trick clásico: char codes vienen como Latin-1 → reinterpret as UTF-8
+    const bytes = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 0xFF;
+    const decoded = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    // Solo reemplazar si la decodificación produjo un string razonable
+    // (más cortos en chars suele ser bueno; p.ej. "ó" pasa de 2 chars a 1)
+    if (decoded && decoded.length <= str.length && !MOJIBAKE_PATTERN.test(decoded)) return decoded;
+  } catch {}
+  return str;
+}
 function encodeHeaderUtf8(value) {
-  const str = String(value || "");
+  let str = String(value || "");
+  // Reparar mojibake antes de encodear
+  str = _fixMojibake(str);
   if (/^[\x20-\x7E]*$/.test(str)) return str; // ASCII puro: no encoding needed
   const bytes  = new TextEncoder().encode(str);
   const binary = String.fromCharCode(...bytes);

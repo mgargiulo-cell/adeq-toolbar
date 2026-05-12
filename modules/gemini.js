@@ -112,8 +112,9 @@ GENERAL RULES:
 - Every sentence must be complete. Never cut off mid-thought.
 - The email must read as a cohesive whole — not a list of disconnected facts.
 - Every email must feel freshly written — vary sentence structure, word choice, and angle.
-- NEVER mention specific month names (January/Enero/Febrero/March/Abril/etc.) or specific dates. Use generic phrases like "este trimestre", "estos próximos meses", "ahora", "in the coming weeks". Hardcoded months become outdated and look like spam.
-- NEVER claim absence of technical features (e.g. "no tienen ads.txt", "no veo header bidding") UNLESS the input data explicitly states "ads.txt: no ads.txt" or "Ad tech: no ad tech detected". If ads.txt or tech is present in the input data, do NOT contradict it.
+- NEVER mention specific month names (January/Enero/Febrero/March/Abril/Mayo/Junio/etc.) or specific dates. Use generic phrases like "este trimestre", "estos próximos meses", "ahora", "in the coming weeks". Hardcoded months become outdated and look like spam.
+- NEVER claim absence of technical features (e.g. "no tienen ads.txt", "no veo header bidding", "no tienen monetización"). The ONLY case where you can mention absence is when the input explicitly says "ads.txt confirmed absent" or "Ad tech: no ad tech detected (confirmed)". If the input says "unknown", "status unknown", or has no info → do NOT mention the topic AT ALL. Pick a different angle.
+- NEVER write subject lines longer than 8 words. Short subject = better open rate. Subjects MUST be simple — domain + 1 short phrase. Example good subjects: "Inventory en {domain}?", "Header bidding para {domain}", "Charlamos sobre {domain}?". Example BAD: "Optimización integral de tu inventario publicitario en {domain} para Q1".
 
 OUTPUT FORMAT:
 Return a JSON object with two fields:
@@ -150,8 +151,13 @@ export async function generatePitch(ctx) {
     ? `${Math.round(traffic / 1_000_000)}M`
     : `${Math.round(traffic / 1_000)}K`;
 
-  const techStr      = techStack?.length > 0 ? techStack.join(", ") : "no ad tech detected";
-  const adsTxtStr    = adsTxt?.exists ? `ads.txt present (${adsTxt.entries} entries)` : "no ads.txt";
+  // CRÍTICO: si no tenemos confirmación, NO afirmar ausencia. Claude tiende a
+  // pasar "no ads.txt" como hecho ("no tienen ads.txt") cuando el check falla.
+  // Pasamos "unknown" en ese caso, y prompt instruye a NO mencionar el topic.
+  const techStr   = techStack?.length > 0 ? techStack.join(", ") : "unknown (no detection ran)";
+  const adsTxtStr = adsTxt && typeof adsTxt.exists === "boolean"
+    ? (adsTxt.exists ? `ads.txt present (${adsTxt.entries || "?"} entries)` : "ads.txt confirmed absent")
+    : "ads.txt status unknown";
   const gapStr       = revenueGap?.percent > 0 ? `Estimated revenue gap: ${revenueGap.percent}% (~$${revenueGap.usd}/mo).` : "";
   const bannerStr    = banners ? `Ad formats detected: ${banners}.` : "";
   const categoryCtx  = getCategoryContext(category);
