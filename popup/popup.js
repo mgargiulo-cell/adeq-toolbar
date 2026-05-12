@@ -6807,6 +6807,42 @@ function updateProspectsDailyBar(count) {
   if (fillEl)  fillEl.style.background = count >= 50 ? "#e53e3e" : count >= 40 ? "#d97706" : "#3b82f6";
 }
 
+// Quick score lead — heurística sync para Prospects card cuando r.score=0.
+// Mismo mapping conceptual que worker scoreWebsite pero sin gates duros (todos visibles).
+function quickScoreLead(r) {
+  let s = 0;
+  // Traffic (max 30)
+  const tr = parseInt(r.traffic || 0, 10);
+  if (tr >= 1_000_000)      s += 30;
+  else if (tr >= 500_000)   s += 22;
+  else if (tr >= 350_000)   s += 18;
+  else if (tr >= 100_000)   s += 10;
+  else if (tr > 0)          s += 5;
+  // GEO bonus (max 20)
+  const geo = (r.geo || "").trim();
+  const HI_GEOS = new Set(["AR","MX","CO","CL","PE","UY","ES","PT","BR","Argentina","Mexico","Colombia","Chile","Peru","Uruguay","Spain","Portugal","Brazil"]);
+  const MID_GEOS = new Set(["IT","DE","FR","Italy","Germany","France","Italia","Alemania","Francia"]);
+  if (HI_GEOS.has(geo))       s += 20;
+  else if (MID_GEOS.has(geo)) s += 15;
+  else if (geo)               s += 5;
+  // Has email (max 25)
+  const emails = Array.isArray(r.emails) ? r.emails.filter(Boolean) : [];
+  if (emails.length >= 1) s += 15;
+  if (emails.length >= 2) s += 5;
+  if (r.contact_name) s += 5;
+  // Ad networks detected (max 10) — más es mejor (más open al outreach)
+  const ads = Array.isArray(r.ad_networks) ? r.ad_networks : [];
+  if (ads.length === 0) s += 10;       // virgin → ideal
+  else if (ads.length <= 2) s += 5;
+  // Category bonus (max 10) — news/sports/finance convierten mejor
+  const cat = (r.category || "").toLowerCase();
+  if (/news|sport|finance|business/.test(cat)) s += 10;
+  else if (cat && cat !== "other") s += 5;
+  // Language match supported (max 5)
+  if (r.language && /^(es|en|pt|it|ar)$/.test(r.language)) s += 5;
+  return Math.min(100, s);
+}
+
 function renderProspectCard(r) {
   const trafficFmt  = r.traffic ? formatTraffic(r.traffic) : "Sin data";
   // Resolver idioma sincronicamente al render — evita que aparezca "🌐 —"
@@ -6868,17 +6904,17 @@ function renderProspectCard(r) {
   const adNetworks  = Array.isArray(r.ad_networks) ? r.ad_networks : [];
   const subjects    = Array.isArray(r.pitch_subjects) ? r.pitch_subjects : [];
 
-  // Score → stars 1-5 (1=peor, 5=mejor). Mismo mapping que scoreWebsite del worker.
-  const score = r.score || 0;
-  let stars = 0;
+  // Score → stars 1-5 (1=peor, 5=mejor). Si no hay score persistido, computar
+  // live con quickScore para que TODOS los prospects muestren rating.
+  let score = r.score || 0;
+  if (!score) score = quickScoreLead(r);
+  let stars = 1; // default 1 (todos visibles)
   if      (score >= 80) stars = 5;
   else if (score >= 60) stars = 4;
   else if (score >= 40) stars = 3;
   else if (score >= 20) stars = 2;
-  else if (score > 0)   stars = 1;
-  const starsHTML = stars > 0
-    ? `<span title="Score ${score}/100 (${stars}★)" style="font-size:11px;flex-shrink:0;letter-spacing:-1px">${"★".repeat(stars)}<span style="opacity:0.25">${"★".repeat(5-stars)}</span></span>`
-    : "";
+  const colorByStars = stars >= 4 ? "#fbbf24" : stars >= 3 ? "#facc15" : "#94a3b8";
+  const starsHTML = `<span title="Score ${score}/100 (${stars}★)" style="font-size:12px;flex-shrink:0;letter-spacing:-1px;color:${colorByStars}">${"★".repeat(stars)}<span style="opacity:0.25">${"★".repeat(5-stars)}</span></span>`;
   const scoreBadge = starsHTML;
 
   // Lead temperature indicator — señal at-a-glance del potencial.

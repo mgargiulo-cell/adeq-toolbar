@@ -3647,9 +3647,50 @@ Write the prospecting email. Return JSON only.`;
 //   🟡 yellow : válido formato + genérico (info@/contact@/etc) → manda igual
 //   🔴 red    : bounce, garbage (whois@/abuse@/postmaster@), inválido → SKIP
 // LOCAL part patterns (antes del @): roles que nunca son decision-makers B2B.
-const GARBAGE_LOCAL = /^(abuse|admin|administrator|whois|postmaster|noreply|no-reply|donotreply|do-not-reply|bounce|mailer-daemon|root|hostmaster|nobody|webmaster|cert|csirt|soc|noc|ops|operations|security|domain-?abuse|domain|domains|domain-?ops|domain-?operations|dns|ssl|ndomains|registry|registrar|tech|technical|spam|fraud|legal|copyright|dmca|complaint|complaints|billing|accounts?|accounting|finance|info-?legal|privacy|private|gdpr|gdpr-?mask|gdpr-?masking|dpo|hosting|host|cdn|cloudflare|proxy|piracy|pirate|antipiracy|takedown)@/i;
-// Cualquier ocurrencia de estas palabras en el local-part también descarta
-const GARBAGE_LOCAL_CONTAINS = /(abuse|domain[-._]?ops|domain[-._]?operations|domain[-._]?abuse|hosting|cloudflare|cloudfront|proxy|piracy|pirate|takedown|whois|gdpr|masked?)/i;
+// Lista exhaustiva — ampliada 2026-05-12 por feedback de envíos reales.
+// Construido como string concat para mantener legibilidad.
+const _GL_LOCAL_PARTS = [
+  // Sysadmin / mail infra
+  "abuse","admin","administrator","adm","administracao","administracion","root","sudo","webmaster","wm","hostmaster","postmaster","nobody","null",
+  "whois","registrant","registry","registrar","domain","domains","domain-?ops","domain-?operations","domain-?admin","domain-?manager","domain-?abuse","ndomains",
+  "noreply","no-reply","donotreply","do-not-reply","do_not_reply","reply-?to","reply","autoreply","auto-?reply","mailer-?daemon","mta","mailserver","mail-?server","smtp","mta-?admin","mailadmin","listadmin","list-?admin","listserv",
+  "bounce","bounced","return","returns","reject","rejected",
+  "cert","cert-?admin","csirt","soc","noc","sysadmin","sys-?admin","ops","operations","netops","infrastructure","infra",
+  "security","security-?team","secops","sec-?ops","info-?sec","infosec","cyber","cybersec",
+  "spam","antispam","anti-?spam","fraud","antifraud","scam","phishing","abusedesk","abuse-?report",
+  "legal","legal-?team","copyright","dmca","takedown","trademark","complaint","complaints","grievance",
+  // Privacy / GDPR
+  "gdpr","gdpr-?mask","gdpr-?masking","gdpr-?desk","dpo","data-?protection","privacy","privacy-?team","privacy-?desk","private","confidential","hidden","anonymous","anon","undisclosed","masked","masking",
+  // Billing / finance
+  "billing","invoice","invoices","invoicing","account","accounts","accounting","finance","finanzas","finanzen","payment","payments","pagamento","pago","pagos","payable","payables","treasury",
+  // Hosting / CDN
+  "hosting","host","hosts","cdn","cloudflare","cloudfront","akamai","fastly","incapsula","sucuri","wpengine",
+  "proxy","piracy","pirate","antipiracy","anti-?piracy",
+  "dns","dns-?admin","ssl","ssl-?admin","tls","cert-?manager",
+  // HR
+  "career","careers","job","jobs","recruit","recruiting","recruitment","hr","hire","hiring","talent","cv","resume","empleo","empleos","trabajo","trabajos","vagas",
+  // Marketing automation
+  "unsubscribe","opt-?out","optout","removeme","remove-?me","stop",
+  // Customer service (no decision-makers)
+  "service","services","customer-?service","customer-?support","support","soporte","atencion","atencion-?cliente","atendimento","sac","helpdesk","help-?desk","help","ayuda",
+  // Donations
+  "donate","donation","donations","donativo","colaboracion","patrocin",
+  // Monitoring / system
+  "notification","notifications","alert","alerts","alarm","alarms","monitoring","monitor","status","incident","incidents",
+  // Dev/test
+  "test","testing","tests","dev","developer","developers","devs","qa","staging","sandbox","demo","sample","example","fake","temp","temporary","throwaway",
+  "feedback","suggestions","sugerencias","sugestoes",
+  "default","generic","placeholder",
+];
+const GARBAGE_LOCAL = new RegExp("^(?:" + _GL_LOCAL_PARTS.join("|") + ")@", "i");
+// Cualquier ocurrencia dentro del local-part también descarta (catches "domain.operations@x.com")
+const GARBAGE_LOCAL_CONTAINS = new RegExp([
+  "abuse","domain[-._]?(?:ops|operations|abuse|admin|manager|owner)","hosting","cloudflare","cloudfront","akamai","fastly",
+  "proxy","piracy","pirate","takedown","whois","gdpr","masked?","masking","anonymized?",
+  "unsubscribe","opt[-._]?out","removeme",
+  "mailer[-._]?daemon","noreply","no[-._]?reply","donotreply","autoreply",
+  "dpo","data[-._]?protection",
+].join("|"), "i");
 
 // ── Website composite scoring ──────────────────────────────
 // Score 0-100 por lead, con gates duros (return -1 = descartar).
@@ -3776,43 +3817,112 @@ function scoreWebsite(lead) {
 // Rank email por probabilidad de ser un buen contacto B2B. Más alto = mejor.
 // Sync, sin red. Llamado desde runAgentCycle para elegir el mejor del array.
 // (No confundir con scoreEmail() async que hace SMTP verify y devuelve color/red).
-function rankEmail(email, siteDomain) {
+// Categoría → roles ideales del local-part (un MB humano sabe esto intuitivamente)
+const CATEGORY_TARGET_ROLES = {
+  news:         /^(editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press|director|gerente)/,
+  sports:       /^(marketing|comercial|sponsorship|patrocin|publicidad|ads|director|gerente|jefe)/,
+  finance:      /^(marketing|comercial|business|partnerships|director|cmo|ceo)/,
+  entertainment:/^(marketing|comercial|publicidad|partnerships|brand|ads|director)/,
+  technology:   /^(marketing|partnerships|business|bd|growth|director)/,
+  health:       /^(marketing|comercial|director|gerente|jefe)/,
+  travel:       /^(marketing|comercial|partnerships|sales|business|director)/,
+  food:         /^(marketing|publicidad|comercial|chef|director|brand)/,
+  business:     /^(marketing|partnerships|business|bd|growth|director|cmo)/,
+  automotive:   /^(marketing|comercial|publicidad|sales|director|gerente)/,
+};
+
+function rankEmail(email, siteDomain, leadCategory = "") {
   if (!email || typeof email !== "string" || !email.includes("@")) return -1;
   const lower = email.toLowerCase();
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
-  if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1; // abuse/domain/proxy/hosting/etc
+  if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
+
+  // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
+  // Heurística: 6+ caracteres alfanuméricos sin vocales o con patrón random.
+  if (/^[a-z0-9]{8,}$/.test(local) && !/[aeiou]{2}/.test(local)) return -1;
+
   let score = 0;
-  // Cross-domain penalty fuerte: si el email es de otro dominio que no matchea
-  // el sitio prospectado (ej. cavok.com.br → marcio@nunes.inf.br), penalizar -50.
-  // Apollo a veces devuelve emails de empresas relacionadas que no son útiles.
-  const cleanSiteEarly = (siteDomain || "").replace(/^www\./, "");
-  if (cleanSiteEarly && dom !== cleanSiteEarly && !dom.endsWith("." + cleanSiteEarly) && !cleanSiteEarly.endsWith("." + dom)) {
-    score -= 50;
-  }
-  // Roles comerciales / editoriales (target ideal de outreach)
-  if (/^(marketing|comercial|business|partnerships|partner|ads|advertising|publicidad|monetiza|ventas|sales|bd|director|gerente|manager|jefe|head)/.test(local)) score += 80;
-  else if (/^(editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press)/.test(local)) score += 60;
-  // Nombre personal (first.last o first_last) muy probable persona real
-  else if (/^[a-z]+[._-][a-z]{2,}$/.test(local)) score += 70;
-  // Pattern firstinitial+lastname (jperez@, mgarcia@) — común corp
-  else if (/^[a-z][a-z]{4,15}$/.test(local) && local.length >= 5) score += 50;
-  // Roles genéricos OK pero menos efectivos
-  else if (/^(info|contact|contacto|hello|hi|hola|support|soporte|mail|email)$/.test(local)) score += 20;
-  // Penalizar dígitos largos en local (típico de listas viejas)
-  if (/\d{3,}/.test(local)) score -= 40;
-  // Penalizar local muy corto/largo (probables alias/auto-gen)
-  if (local.length < 3) score -= 30;
-  if (local.length > 30) score -= 30;
-  // Dominio del sitio matchea (no proxy random)
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
-  if (cleanSite && (dom === cleanSite || dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom))) score += 30;
-  // Email free webmail = penalizar (no es corporativo)
-  if (/^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex)\./.test(dom)) score -= 30;
+
+  // ── DOMAIN MATCH (peso 0-40) ──
+  // Email del MISMO dominio del sitio → señal MUY fuerte (es probablemente real)
+  if (cleanSite) {
+    if (dom === cleanSite) score += 40;
+    else if (dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom)) score += 35;
+    else {
+      // Cross-domain — penalidad fuerte. Apollo a veces devuelve empresas relacionadas
+      // (ej cavok.com.br → marcio@nunes.inf.br) que no responden por nuestro sitio.
+      score -= 50;
+    }
+  }
+
+  // ── ROLE QUALITY (peso -20 a +90) ──
+  // Roles comerciales = target ideal (decision-makers de monetización)
+  const COMMERCIAL = /^(marketing|comercial|business|partnerships?|partner|ads?|advertising|publicidad|monetiza|ventas|sales|bd|growth|director|gerente|manager|jefe|head|brand|sponsorship|patrocin)\b/;
+  const EDITORIAL  = /^(editor|editor-in-chief|chief-editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
+  const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
+
+  if (EXEC.test(local))           score += 90;       // CEO/founder = jackpot
+  else if (COMMERCIAL.test(local)) score += 80;
+  else if (EDITORIAL.test(local))  score += 60;
+  // Pattern firstname.lastname (juan.perez@x.com) = persona real
+  else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) score += 70;
+  // Pattern firstinitial+lastname (jperez@x.com, mgarcia@x.com) = común corp
+  else if (/^[a-z][a-z]{4,14}$/.test(local) && local.length >= 5 && /[aeiou]/.test(local)) score += 55;
+  // Single name (juan@x.com) — could be person or generic
+  else if (/^[a-z]{3,12}$/.test(local) && /[aeiou]/.test(local)) score += 30;
+  // Generics — OK pero baja conversión
+  else if (/^(info|contact|contacto|hello|hi|hola|support|soporte|mail|email|inbox)$/.test(local)) score += 20;
+
+  // ── CATEGORY-ROLE MATCH (peso 0-25) ──
+  // Si el sitio es "sports" y el email es marketing/comercial → bonus extra
+  // (un MB humano sabe que sports + comercial es golden)
+  const cat = (leadCategory || "").toLowerCase();
+  if (CATEGORY_TARGET_ROLES[cat] && CATEGORY_TARGET_ROLES[cat].test(local)) {
+    score += 25;
+  }
+
+  // ── PENALTIES ──
+  // Dígitos largos en local-part (3+) = lista vieja, automated
+  if (/\d{3,}/.test(local)) score -= 40;
+  // Local muy corto (<3) o muy largo (>30) = sospechoso
+  if (local.length < 3) score -= 30;
+  if (local.length > 30) score -= 25;
+  // Free webmail = penalizar (no corporativo)
+  if (/^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex|me)\./.test(dom)) score -= 35;
+
+  // ── LANGUAGE MATCH bonus ──
+  // Si el sitio es .br y el email tiene palabras pt (vendas, comercial) → +5
+  // Si .ar/.es/.mx y palabras es (ventas, comercial) → +5
+  // Pequeño extra que ayuda a desambiguar entre candidatos similares
+  const tld = cleanSite.split(".").pop();
+  if ((tld === "br" || tld === "pt") && /(vendas|comercial|publicidade|atendimento)/.test(local)) score += 5;
+  if (/^(ar|es|mx|cl|co|pe|uy)$/.test(tld) && /(ventas|comercial|publicidad|atencion)/.test(local)) score += 5;
+
   return score;
 }
-const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\.net|key-systems|1api\.net|netim\.com|psi-usa|nameshield|epag\.de|eurodns|realtimeregister|tld-box|enom\.|networksolutions|tucows|porkbun\.com|namecheap.*proxy|gdpr-?masked?|gdpr-?mask\.com|data-protected|registrant-?private|domains[-._]?by[-._]?proxy|whoisprotect|protect-?service/i;
+const GARBAGE_DOMAIN_PATTERN = new RegExp([
+  // Subdominios de admin/whois/abuse
+  "(^|\\.)(?:nic|whois|abuse|donuts|godaddy|cert|registry|registrar|hosting|host|hostingpanel)\\.",
+  // Privacy/proxy services
+  "domainsbyproxy\\.com|whoisguard|whoisprivacy|whoisprotect|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|protect-?service|protectedmail|panelregister",
+  // Registrars (B2B abuse desks)
+  "dropped\\.|internetx\\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\\.net|key-systems|1api\\.net|netim\\.com|psi-usa|nameshield|epag\\.de|eurodns|realtimeregister|tld-box|enom\\.|networksolutions|tucows|porkbun\\.com|namecheap.*proxy|hostgator|bluehost|godaddyguard",
+  // GDPR masking
+  "gdpr-?masked?|gdpr-?mask\\.com|gdpr-?protect|data-?protected|registrant-?private|domains[-._]?by[-._]?proxy|registry-?proxy",
+  // Disposable/temp emails
+  "mailinator|guerrillamail|tempmail|throwaway|trashmail|sharklasers|yopmail|10minutemail|disposable|fakeinbox|mailtrap",
+  // Transactional senders (no humans)
+  "mailgun\\.org|sendgrid\\.net|amazonses\\.com|postmarkapp\\.com|mandrillapp\\.com|sparkpostmail",
+  // Error trackers / sysmail
+  "sentry\\.io|bugsnag\\.com|errorception|raygun\\.io|rollbar\\.com",
+  // Mailing list managers
+  "list-server|listserv\\.|mailman\\.|maillists?\\.",
+  // Test / fake / local
+  "example\\.(?:com|org|net)|test\\.(?:com|org|net)|localhost|invalid|local",
+].join("|"), "i");
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
 // Filtra emails invalidos / sin MX antes de mostrarlos al MB o al agente.
@@ -4401,7 +4511,7 @@ async function runAgentCycle(token, allFlags) {
 
         // Re-pickear el MEJOR email después del enrichment (rankEmail sync, NO la async scoreEmail)
         const ranked = emails
-          .map(e => ({ email: e, score: rankEmail(e, domain) }))
+          .map(e => ({ email: e, score: rankEmail(e, domain, lead.category) }))
           .filter(x => x.score >= 0)
           .sort((a, b) => b.score - a.score);
         let email = ranked[0]?.email;
