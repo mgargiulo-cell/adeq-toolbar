@@ -1460,6 +1460,117 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
   return _attach(unique, firstContactName);
 }
 
+// ── findBestApolloEmail: estrategia balanceada para autoimport/autopilot ──
+// Devuelve 1 email max + contact_name. Lógica:
+//   1. Cache 7d hit → return (0 credits)
+//   2. Free search → si hay verified/likely → return (0 credits)
+//   3. Si traffic ≥ APOLLO_UNLOCK_MIN_TRAFFIC y cap < APOLLO_MONTHLY_HARD_CAP
+//      → unlock TOP 1 person via /v1/people/match (1 credit)
+//   4. Si no aplica unlock → return null (caller usa scraping fallback)
+const APOLLO_UNLOCK_MIN_TRAFFIC = 500_000;
+async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allowUnlock = true } = {}) {
+  if (!apolloKey || !domain) return null;
+
+  // 1. Cache 7d
+  if (token) {
+    const cached = await getApolloCacheServer(token, domain);
+    if (cached) {
+      const arr = Array.isArray(cached.emails) ? cached.emails : [];
+      if (arr.length) return { email: arr[0], contact_name: cached.contact_name || "", source: "cache" };
+      if (cached.email) return { email: cached.email, contact_name: cached.contact_name || "", source: "cache" };
+    }
+  }
+
+  // 2. Free search (no reveal — 0 credits)
+  let people = [];
+  try {
+    const res = await fetch("https://api.apollo.io/v1/mixed_people/api_search", {
+      method: "POST",
+      headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        q_organization_domains_list: [domain],
+        person_titles: ["CEO","founder","co-founder","owner","publisher","editor in chief","managing editor","director","head of digital","VP","marketing","commercial"],
+        per_page: 5, page: 1,
+      }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      people = Array.isArray(data?.people) ? data.people : [];
+    }
+  } catch { return null; }
+
+  // 3. ¿Verified gratis?
+  const verified = people.find(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status));
+  if (verified) {
+    const result = {
+      email: verified.email,
+      contact_name: `${verified.first_name||""} ${verified.last_name||""}`.trim(),
+      source: "free_verified",
+    };
+    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, source: "worker_free" }).catch(() => {});
+    return result;
+  }
+
+  // 4. ¿Vale la pena unlock? Solo si tráfico alto y allowUnlock y bajo cap mensual
+  if (!allowUnlock || traffic < APOLLO_UNLOCK_MIN_TRAFFIC) return null;
+
+  // Hard cap check: leer apollo_calls_month antes de gastar credit
+  try {
+    const usage = await getApolloUsageToday(token);
+    if ((usage.usedThisMonth || 0) >= APOLLO_MONTHLY_HARD_CAP) {
+      log(`  ⚠ Apollo cap ${APOLLO_MONTHLY_HARD_CAP} alcanzado (${usage.usedThisMonth}/${usage.monthLimit}) — skip unlock ${domain}`);
+      return null;
+    }
+  } catch {}
+
+  // 5. Unlock top 1
+  const target = people[0];
+  if (!target?.id) return null;
+  try {
+    const unlock = await fetch("https://api.apollo.io/v1/people/match", {
+      method: "POST",
+      headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ id: target.id, reveal_personal_emails: true }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!unlock.ok) return null;
+    const data = await unlock.json();
+    const person = data?.person;
+    if (!person?.email) return null;
+    // Bump apollo_calls_month +1 (este endpoint cuesta 1 credit)
+    bumpApolloUnlocks(token, 1).catch(() => {});
+    log(`  💎 Apollo unlock ${domain} → ${person.email} (1 credit)`);
+    const result = {
+      email: person.email,
+      contact_name: `${person.first_name||""} ${person.last_name||""}`.trim(),
+      source: "unlocked",
+    };
+    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, source: "worker_unlocked" }).catch(() => {});
+    return result;
+  } catch { return null; }
+}
+
+// Increment Apollo monthly counter (reusa apollo_calls_month).
+async function bumpApolloUnlocks(token, n = 1) {
+  if (!n || n <= 0 || !token) return;
+  try {
+    const period = _billingCyclePeriod();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_calls_month_period)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const rows = await res.json();
+    const map = {};
+    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+    const sameMonth = (map.apollo_calls_month_period || "").slice(0, 7) === period.slice(0, 7);
+    const stored = sameMonth ? parseInt(map.apollo_calls_month || "0", 10) : 0;
+    const newCount = stored + n;
+    await setConfigValue(token, "apollo_calls_month", String(newCount));
+    await setConfigValue(token, "apollo_calls_month_period", period);
+  } catch {}
+}
+
 // ── Email scraping fallback (server-side HTTP) ────────────────
 
 const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}(?=\s|$|[^a-zA-Z])/g;
@@ -2236,24 +2347,27 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // skip Apollo y usa solo scraping. Cero impacto al flow (igual hay emails).
   const apolloMonthRemaining = (apolloUsage.monthLimit ?? APOLLO_MONTHLY_HARD_CAP) - (apolloUsage.usedThisMonth ?? 0);
   const canUseApollo = apollo_api_key
-    && visits >= 500_000
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
     && apolloMonthRemaining > 0;
 
-  const [apolloEmails, scraperEmails] = await Promise.all([
+  // Apollo: 1 email max + maybe unlock si traffic ≥ 500K + cap < 2400.
+  // Scraping: siempre como fallback (gratis).
+  const [apolloRes, scraperEmails] = await Promise.all([
     canUseApollo
-      ? findAllEmails(domain, apollo_api_key, token).then(r => { apolloCallsThisSessionRef.count += 2; return r; })
-      : Promise.resolve([]),
+      ? findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+          .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
+      : Promise.resolve(null),
     scrapeEmailsForDomain(domain),
   ]);
-  const rawEmails = [...new Set([...apolloEmails, ...scraperEmails])];
-  // Filtrar emails con dominio sin MX records ANTES de guardar — evita que el
-  // MB o el agente elijan después un email que da bounce.
+  const apolloContactName = apolloRes?.contact_name || "";
+  const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
+  // Apollo va PRIMERO en el array (rankEmail prefiere personal > scraping anyway)
+  const rawEmails = [...new Set([...apolloEmail, ...scraperEmails])];
+  // Filtrar emails con dominio sin MX records ANTES de guardar
   const emails = await validateEmailsBatch(rawEmails);
   if (rawEmails.length !== emails.length) {
-    log(`  📧 ${domain}: ${rawEmails.length} → ${emails.length} emails (filtrados ${rawEmails.length - emails.length} sin MX/garbage)`);
+    log(`  📧 ${domain}: ${rawEmails.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
   }
-  const apolloContactName = (apolloEmails && apolloEmails.contact_name) || "";
 
   // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
   //    decida email + draft + push manualmente desde el tab Prospects.
@@ -2899,19 +3013,21 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ⚠️ Apollo skip: ${reason}`);
     }
 
-    const [apolloEmails, scraperEmails, similarSites] = await Promise.all([
+    const [apolloRes, scraperEmails, similarSites] = await Promise.all([
       canUseApollo
-        ? findAllEmails(domain, apollo_api_key, token).then(r => { apolloCallsThisSession += 2; return r; })
-        : Promise.resolve([]),
+        ? findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+            .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
+        : Promise.resolve(null),
       scrapeEmailsForDomain(domain),
       findSimilarSites(domain, rapidapi_key),
     ]);
-    const rawEmailsAuto = [...new Set([...apolloEmails, ...scraperEmails])];
+    const apolloContactNameAuto = apolloRes?.contact_name || "";
+    const apolloEmailAuto = apolloRes?.email ? [apolloRes.email] : [];
+    const rawEmailsAuto = [...new Set([...apolloEmailAuto, ...scraperEmails])];
     const emails = await validateEmailsBatch(rawEmailsAuto);
     if (rawEmailsAuto.length !== emails.length) {
-      log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (filtrados ${rawEmailsAuto.length - emails.length})`);
+      log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
     }
-    const apolloContactNameAuto = (apolloEmails && apolloEmails.contact_name) || "";
 
     // Score final con emails encontrados
     const scoreWithEmails = finalScore + (emails.length > 0 ? 10 : 0);

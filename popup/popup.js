@@ -1718,10 +1718,54 @@ function renderRapidApiFooterCounter({ used, limit, period } = {}) {
   const pct = limit > 0 ? (used / limit) * 100 : 0;
   el.classList.remove("usage-warning", "usage-danger", "usage-reached");
   if (pct >= 100)     el.classList.add("usage-reached");
-  else if (pct >= 80) el.classList.add("usage-danger");
+  else if (pct >= 75) el.classList.add("usage-danger");
   else if (pct >= 50) el.classList.add("usage-warning");
   el.textContent = `SW: ${used.toLocaleString()} / ${limit.toLocaleString()}`;
-  el.title = `SimilarWeb cycle (${period || "—"} → next 6th): ${used.toLocaleString()} hits of ${limit.toLocaleString()} (${pct.toFixed(1)}%). Shared across all team MBs. Compare with your RapidAPI dashboard.`;
+  el.title = `SimilarWeb this calendar month (${period || "—"}): ${used.toLocaleString()} of ${limit.toLocaleString()} (${pct.toFixed(1)}%). Shared across team. Hard stop at limit.`;
+}
+
+// Apollo monthly counter — sumado de todos los MBs vía toolbar_config.apollo_calls_month
+async function refreshApolloFooterCounter() {
+  const el = document.getElementById("apollo-monthly-counter");
+  if (!el || !state.accessToken) return;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_calls_month_period,apollo_monthly_limit)&select=key,value`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const map = {};
+    rows.forEach(r => { map[r.key] = r.value; });
+    const period = new Date().toISOString().slice(0, 7);
+    const sameMonth = (map.apollo_calls_month_period || "").slice(0, 7) === period;
+    const used = sameMonth ? parseInt(map.apollo_calls_month || "0", 10) : 0;
+    const limit = parseInt(map.apollo_monthly_limit || "2400", 10);
+    const pct = limit > 0 ? (used / limit) * 100 : 0;
+    el.classList.remove("usage-warning", "usage-danger", "usage-reached");
+    if (pct >= 100)     el.classList.add("usage-reached");
+    else if (pct >= 75) el.classList.add("usage-danger");
+    else if (pct >= 50) el.classList.add("usage-warning");
+    el.textContent = `Apollo: ${used.toLocaleString()} / ${limit.toLocaleString()}`;
+    el.title = `Apollo unlocks this month (${period}): ${used} of ${limit} (${pct.toFixed(1)}%). Stops at limit — fallback a scraping.`;
+    // Trigger banner si ≥75%
+    if (pct >= 75) _showApolloWarningBanner({ used, limit, period, pct });
+  } catch {}
+}
+
+function _showApolloWarningBanner({ used, limit, period, pct }) {
+  const banner = document.getElementById("rapidapi-cap-banner");
+  const title  = document.getElementById("cap-banner-title");
+  const detail = document.getElementById("cap-banner-detail");
+  const icon   = document.getElementById("cap-banner-icon");
+  if (!banner || !title) return;
+  // Solo mostrar si SW no está mostrando alerta (no pisar)
+  if (banner.style.display === "flex" && /SimilarWeb|RapidAPI/.test(title.textContent)) return;
+  banner.classList.remove("cap-warning","cap-danger","cap-reached");
+  if (pct >= 100)      { banner.classList.add("cap-reached"); icon.textContent = "⛔"; title.textContent = "Apollo cap reached — unlocks paused"; }
+  else if (pct >= 75)  { banner.classList.add("cap-danger");  icon.textContent = "⚠️"; title.textContent = `Apollo at ${pct.toFixed(0)}% of monthly cap`; }
+  detail.textContent = ` — ${used} of ${limit} unlocks in ${period}. Heads up.`;
+  banner.style.display = "flex";
 }
 
 // ---- RapidAPI monthly usage banner (3 niveles: 50% / 80% / 100%) ----
@@ -1916,7 +1960,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     getRapidApiMonthlyStatus().then(handleUsageUpdate).catch(() => {});
   };
   refreshUsage();
+  refreshApolloFooterCounter();
   setInterval(refreshUsage, 60_000);
+  setInterval(refreshApolloFooterCounter, 60_000);
 
   // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
   const scheduleRefresh = () => {
