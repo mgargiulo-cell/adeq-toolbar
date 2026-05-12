@@ -4472,12 +4472,14 @@ async function runAgentCycle(token, allFlags) {
   const cfg = await getConfig(token);
   const aCfg = _agentCfg(cfg);
   const monday_api_key_default = cfg.monday_api_key || "";
+  const TEST_MODE = String(cfg.agent_test_mode || "").toLowerCase() === "true";
 
   // Active hours check — fuera de 9-20 España no manda nada (ni Monday, ni mail)
-  if (_isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd)) {
+  if (!TEST_MODE && _isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd)) {
     log(`🤖 Agent: fuera de horario España (h=${_spainHour()}, activo=${aCfg.activeStart}-${aCfg.activeEnd})`);
     return;
   }
+  if (TEST_MODE) log(`🧪 Agent TEST MODE ON — bypass active hours + daily cap + weekly target`);
   log(`🤖 Agent: ciclo iniciando (users=${allFlags.agentUsers.length}, threshold=${aCfg.thresholdTraffic}, maxPerDay=${aCfg.maxPerDay})`);
 
   // Whitelist de users autorizados a usar el agent (defense-in-depth).
@@ -4497,19 +4499,19 @@ async function runAgentCycle(token, allFlags) {
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
     // Daily cap
     const sentToday = await getAgentDailyCount(token, userEmail);
-    if (sentToday >= aCfg.maxPerDay) {
+    if (!TEST_MODE && sentToday >= aCfg.maxPerDay) {
       log(`🤖 Agent ${userEmail}: cap diario ${aCfg.maxPerDay} alcanzado (${sentToday})`);
       continue;
     }
     // Weekly target (si configurado): cuenta sent en últimos 7 días
-    if (aCfg.focus.weeklyTarget > 0) {
+    if (!TEST_MODE && aCfg.focus.weeklyTarget > 0) {
       const sentWeek = await getAgentWeeklyCount(token, userEmail);
       if (sentWeek >= aCfg.focus.weeklyTarget) {
         log(`🤖 Agent ${userEmail}: weekly target ${aCfg.focus.weeklyTarget} alcanzado (${sentWeek})`);
         continue;
       }
     }
-    const remaining = aCfg.maxPerDay - sentToday;
+    const remaining = TEST_MODE ? aCfg.perCycleLimit : (aCfg.maxPerDay - sentToday);
     const batchSize = Math.min(aCfg.perCycleLimit, remaining);
 
     // Aplicar focus filtros al query
