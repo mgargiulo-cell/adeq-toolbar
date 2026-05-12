@@ -7494,6 +7494,17 @@ function initProspectCard(card, data) {
       if (!data.traffic && !card.dataset._trafficFetched) {
         autoFetchTraffic();
       }
+      // Auto-fetch emails si la card no tiene — dispara el mismo flow que el
+      // botón 🔍 Data (Apollo + scrape + page meta). Apollo cache 7d → barato.
+      const _emailsValid = Array.isArray(data.emails) && data.emails.filter(em => em && /\@/.test(em)).length > 0;
+      if (!_emailsValid && !card.dataset._emailsFetched) {
+        card.dataset._emailsFetched = "1";
+        const enrichBtn = card.querySelector(".pcard-enrich-btn");
+        if (enrichBtn) {
+          showToast("🔍 Buscando emails automáticamente…", "info", 3000);
+          enrichBtn.click();
+        }
+      }
     } else if (!open && data.domain) {
       // Al cerrar, liberar el lock SI somos el dueño
       unlockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
