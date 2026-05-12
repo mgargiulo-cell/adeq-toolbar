@@ -256,15 +256,80 @@ function setupAutoRefreshOnUrlChange() {
 }
 
 function resetAnalysisUI() {
-  // Limpiar los resultados visibles para evitar confundir al user con datos del dominio anterior
-  ["traffic-result", "traffic-breakdown", "traffic-countries", "traffic-category", "traffic-filter",
-   "duplicate-result", "email-result", "pitch-text", "form-pv-display"].forEach(id => {
+  // Limpieza COMPLETA al cambiar de tab/dominio — evita enviar mail con datos de URL vieja.
+  // 1) Resetear estado interno (state.X)
+  state.duplicate     = null;
+  state.mondayItemId  = null;
+  state.traffic       = 0;
+  state.visits        = 0;
+  state.pagesPerVisit = null;
+  state.trafficData   = null;
+  state.category      = "";
+  state.siteLanguage  = "";
+  state.siteOgLocale  = "";
+  state.pageTitle     = "";
+  state.pageDescription = "";
+  state.siteFooterText = "";
+  state.emails        = [];
+  state.apolloPeople  = [];
+  state.contactName   = "";
+  state.pitchSubject  = "";
+  state.pitchSubjects = [];
+  state.adsTxt        = null;
+  state.banners       = null;
+  state.techStack     = [];
+  state.revenueGap    = null;
+
+  // 2) Limpiar TODOS los elementos de UI (display + inputs + selects)
+  const textIds = [
+    "traffic-result", "traffic-breakdown", "traffic-countries", "traffic-category", "traffic-filter",
+    "duplicate-result", "email-result", "score-badge", "audit-result", "tech-stack-result",
+    "banner-result", "revenue-gap-result", "page-context-result", "similar-result",
+  ];
+  textIds.forEach(id => {
     const el = document.getElementById(id);
-    if (el) {
-      if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") el.value = "";
-      else el.textContent = "";
-    }
+    if (el) { el.textContent = ""; el.className = el.className.split(" ")[0]; }
   });
+
+  // 3) Limpiar inputs/textareas/selects de Monday + Pitch
+  const inputIds = [
+    "form-pv-display", "form-subject", "pitch-text",
+    "form-fecha", "form-telefono", "form-email-search",
+  ];
+  inputIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+
+  // 4) Resetear selects Monday a default
+  const selectDefaults = {
+    "form-geo":       "",
+    "form-idioma":    "",
+    "form-ejecutivo": state.mediaBuyer || "",
+    "form-status":    "",
+    "pitch-category": "",
+    "pitch-tone":     "informal",
+    "pitch-length":   "short",
+    "pitch-focus":    "analysis",
+    "pitch-opening":  "direct",
+  };
+  Object.entries(selectDefaults).forEach(([id, v]) => {
+    const el = document.getElementById(id);
+    if (el) el.value = v;
+  });
+
+  // 5) Resetear flags auto-push
+  autoPushReady.traffic = false;
+  autoPushReady.notDup  = false;
+  autoPushReady.email   = false;
+
+  // 6) Limpiar email options/radios del DOM (rendered cada análisis)
+  const emailListEl = document.getElementById("email-result");
+  if (emailListEl) emailListEl.innerHTML = "";
+
+  // 7) Reset botón push-monday a "Send" (no "Update")
+  const pushBtn = document.getElementById("btn-push-monday");
+  if (pushBtn) pushBtn.textContent = "🚀 Send to Monday";
 }
 
 async function forceRefreshAnalysis() {
