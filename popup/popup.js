@@ -923,7 +923,7 @@ async function loadAdminAgent() {
     const pausedUntil = cfg.agent_paused_until ? new Date(cfg.agent_paused_until) : null;
     const isPaused = pausedUntil && pausedUntil > new Date();
     const startH = parseInt(cfg.agent_active_hours_start || "9", 10);
-    const endH   = parseInt(cfg.agent_active_hours_end   || "20", 10);
+    const endH   = parseInt(cfg.agent_active_hours_end   || "23", 10);
     // Calcular hora actual España
     let spainH = 0;
     try {

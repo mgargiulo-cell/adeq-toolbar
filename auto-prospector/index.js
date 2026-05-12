@@ -2641,8 +2641,9 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     log(`⛔ Cap diario GLOBAL CSV alcanzado (${dailyGlobal.csvCount}/${dailyGlobal.csvCap}) — pausa hasta próximo día operativo.`);
     return 0;
   }
-  // Pausa fin de semana — operativo solo Lun-Vie España
-  if (_isWeekendSpain()) {
+  // Pausa fin de semana — operativo solo Lun-Vie España (override: test mode)
+  const _csvTestMode = String(cfg.agent_test_mode || "").toLowerCase() === "true";
+  if (!_csvTestMode && _isWeekendSpain()) {
     log(`⏸ Fin de semana España — CSV queue pausada hasta lunes.`);
     return 0;
   }
@@ -2800,8 +2801,9 @@ async function runSession(token, cfg, sessionStart) {
   }
   log(`Quota del día para ${sessionUser}: ${userTodayCount}/${AUTOPILOT_DAILY_LIMIT}`);
 
-  // GLOBAL safety net + weekend pause
-  if (_isWeekendSpain()) {
+  // GLOBAL safety net + weekend pause (override: agent_test_mode=true)
+  const _autoTestMode = String(cfg.agent_test_mode || "").toLowerCase() === "true";
+  if (!_autoTestMode && _isWeekendSpain()) {
     log(`⏸ Fin de semana España — autopilot pausado hasta lunes.`);
     return;
   }
@@ -3337,7 +3339,7 @@ const AGENT_DEFAULTS = {
   threshold_score:      40,
   max_per_day:          20,
   active_hours_start:   9,         // 9am España (CET/CEST)
-  active_hours_end:     20,        // 20hs España
+  active_hours_end:     23,        // 23hs España
   active_timezone:      "Europe/Madrid",
   cycle_interval_sec:   300,       // 5 min entre ciclos
   per_cycle_limit:      3,         // max 3 leads procesados por ciclo (rate limit Gmail-friendly)
@@ -4674,8 +4676,10 @@ async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
 // Por cada user habilitado, procesa hasta perCycleLimit leads del review_queue
 // que cumplan los thresholds. Para cada uno: pitch → quality gate → push Monday → send Gmail.
 async function runAgentCycle(token, allFlags) {
-  // Pausa fin de semana — operativo solo Lun-Vie España (consistente con csv + autopilot)
-  if (_isWeekendSpain()) {
+  // Pausa fin de semana — operativo solo Lun-Vie España (override: agent_test_mode=true)
+  const _agentEarlyCfg = await getConfig(token).catch(() => ({}));
+  const _agentTestModeEarly = String(_agentEarlyCfg.agent_test_mode || "").toLowerCase() === "true";
+  if (!_agentTestModeEarly && _isWeekendSpain()) {
     log(`🤖 Agent: fin de semana España — sin envíos`);
     return;
   }
@@ -5359,7 +5363,7 @@ async function main() {
       const ghCfg = await getConfig(token);
       const ghTestMode = String(ghCfg.agent_test_mode || "").toLowerCase() === "true";
       const ghStart = parseInt(ghCfg.active_hours_start || "9", 10);
-      const ghEnd   = parseInt(ghCfg.active_hours_end   || "20", 10);
+      const ghEnd   = parseInt(ghCfg.active_hours_end   || "23", 10);
       if (!ghTestMode) {
         if (_isWeekendSpain()) {
           if (iterCount === 1 || iterCount % 30 === 0) {
