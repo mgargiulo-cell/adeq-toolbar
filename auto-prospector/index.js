@@ -4276,7 +4276,7 @@ async function getGmailAccessToken(impersonateUser) {
   const payload = {
     iss:   sa.client_email,
     sub:   impersonateUser,
-    scope: "https://www.googleapis.com/auth/gmail.send",
+    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.settings.basic",
     aud:   "https://oauth2.googleapis.com/token",
     iat:   now,
     exp:   now + 3600,
