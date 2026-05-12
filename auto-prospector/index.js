@@ -641,13 +641,17 @@ async function backfillMissingFields(token, cfg) {
             const apolloEmails = await findAllEmails(lead.domain, apollo_api_key, token);
             const name = apolloEmails && apolloEmails.contact_name;
             if (name) { patch.contact_name = name; lead.contact_name = name; }
-            // Si trajo emails nuevos que no estaban, sumarlos
+            // Si trajo emails nuevos que no estaban, sumarlos (validados)
             if (Array.isArray(apolloEmails) && apolloEmails.length > 0) {
               const existing = new Set((lead.emails || []).filter(Boolean));
               const newEmails = apolloEmails.filter(e => !existing.has(e));
               if (newEmails.length) {
-                patch.emails = [...new Set([...apolloEmails, ...(lead.emails || [])])];
-                lead.emails = patch.emails;
+                const merged = [...new Set([...apolloEmails, ...(lead.emails || [])])];
+                const validated = await validateEmailsBatch(merged);
+                if (validated.length !== (lead.emails || []).length) {
+                  patch.emails = validated;
+                  lead.emails = validated;
+                }
               }
             }
           } catch {}
@@ -1482,9 +1486,12 @@ async function fetchPageContent(domain) {
     if (/snigel\.com/i.test(html))                                         adNetworks.push("Snigel");
 
     // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
+    // Adult/Streaming PRIMERO porque scoreWebsite los usa como gates duros (descarte total).
     const textForCategory = `${title} ${desc} ${domain}`.toLowerCase();
     let category = "other";
-    if      (/sport|futbol|futebol|soccer|football|nba|basket|tennis|béisbol|beisbol|liga|mlb|f1|motor|boxeo|boxing/.test(textForCategory)) category = "sports";
+    if      (/\b(porn|xxx|sex|adult|escort|fetish|hentai|onlyfans|pornhub|xvideos|xnxx|redtube|cam[\s-]?girl|webcam|nude|nudes|brazzer)\b|videos?xxx|sexo[\s-]?gratis|chicas[\s-]?desnudas/i.test(textForCategory)) category = "adult";
+    else if (/\b(streaming|stream[\s-]?online|cuevana|repelis|pelis24|pelisplus|gnula|magis[\s-]?tv|futbol[\s-]?en[\s-]?vivo|live[\s-]?stream|free[\s-]?movies|watch[\s-]?free|123movies|fmovies|putlocker|soap2day|netflix[\s-]?free|disney[\s-]?free|hbo[\s-]?free)\b|ver[\s-]?(peliculas|series|partidos|futbol)[\s-]?(online|gratis|en[\s-]?vivo)/i.test(textForCategory)) category = "streaming";
+    else if (/sport|futbol|futebol|soccer|football|nba|basket|tennis|béisbol|beisbol|liga|mlb|f1|motor|boxeo|boxing/.test(textForCategory)) category = "sports";
     else if (/noticia|news|diario|periódico|periodico|press|journalism|último|ultimo momento|actualidad/.test(textForCategory))            category = "news";
     else if (/finanz|banco|econom|invest|crypto|bolsa|stock|finance|mercad/.test(textForCategory))                                          category = "finance";
     else if (/cine|película|pelicula|movie|film|music|música|música|juego|game|entertain|espectácul|espectacul|farándula|farandula/.test(textForCategory)) category = "entertainment";
@@ -2044,7 +2051,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       : Promise.resolve([]),
     scrapeEmailsForDomain(domain),
   ]);
-  const emails = [...new Set([...apolloEmails, ...scraperEmails])];
+  const rawEmails = [...new Set([...apolloEmails, ...scraperEmails])];
+  // Filtrar emails con dominio sin MX records ANTES de guardar — evita que el
+  // MB o el agente elijan después un email que da bounce.
+  const emails = await validateEmailsBatch(rawEmails);
+  if (rawEmails.length !== emails.length) {
+    log(`  📧 ${domain}: ${rawEmails.length} → ${emails.length} emails (filtrados ${rawEmails.length - emails.length} sin MX/garbage)`);
+  }
   const apolloContactName = (apolloEmails && apolloEmails.contact_name) || "";
 
   // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
@@ -2670,7 +2683,11 @@ async function runSession(token, cfg, sessionStart) {
       scrapeEmailsForDomain(domain),
       findSimilarSites(domain, rapidapi_key),
     ]);
-    const emails = [...new Set([...apolloEmails, ...scraperEmails])];
+    const rawEmailsAuto = [...new Set([...apolloEmails, ...scraperEmails])];
+    const emails = await validateEmailsBatch(rawEmailsAuto);
+    if (rawEmailsAuto.length !== emails.length) {
+      log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (filtrados ${rawEmailsAuto.length - emails.length})`);
+    }
     const apolloContactNameAuto = (apolloEmails && apolloEmails.contact_name) || "";
 
     // Score final con emails encontrados
@@ -3284,6 +3301,43 @@ function rankEmail(email, siteDomain) {
 const GARBAGE_DOMAIN_PATTERN = /(^|\.)(nic\.|whois\.|abuse\.|donuts\.|godaddy|cert\.|registry\.|registrar\.)|domainsbyproxy\.com|whoisguard|whoisprivacy|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|dropped\.|internetx\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\.net|key-systems|1api\.net|netim\.com|psi-usa|nameshield|epag\.de|eurodns|realtimeregister|tld-box|enom\.|networksolutions|tucows|porkbun\.com|namecheap.*proxy/i;
 const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
+// Filtra emails invalidos / sin MX antes de mostrarlos al MB o al agente.
+// Llamado al INSERT en review_queue → previene mostrar/elegir emails que dan
+// bounce. Solo chequeos GRATIS: garbage regex + MX records (DoH Cloudflare).
+async function validateEmailsBatch(emails) {
+  if (!Array.isArray(emails) || emails.length === 0) return [];
+  const out = [];
+  for (const e of emails) {
+    if (!e || typeof e !== "string" || !e.includes("@")) continue;
+    const lower = e.toLowerCase().trim();
+    if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) continue;
+    const dom = lower.split("@")[1];
+    const ok = await _hasMxRecords(dom);
+    if (ok) out.push(lower);
+  }
+  return [...new Set(out)];
+}
+
+// MX records cache — evita re-resolver el mismo dominio en el mismo proceso.
+// Los MX cambian rara vez, así que caché por proceso es suficiente.
+const _mxCache = new Map();
+async function _hasMxRecords(domain) {
+  if (!domain) return false;
+  if (_mxCache.has(domain)) return _mxCache.get(domain);
+  try {
+    // Cloudflare DNS-over-HTTPS (gratis, no rate-limit razonable)
+    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`, {
+      headers: { "accept": "application/dns-json" },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) { _mxCache.set(domain, true); return true; } // si DNS falla, asumimos válido
+    const data = await res.json();
+    const has = Array.isArray(data?.Answer) && data.Answer.length > 0;
+    _mxCache.set(domain, has);
+    return has;
+  } catch { _mxCache.set(domain, true); return true; }
+}
+
 async function scoreEmail(email) {
   if (!email || typeof email !== "string" || !email.includes("@")) {
     return { color: "red", reason: "invalid_format" };
@@ -3292,7 +3346,11 @@ async function scoreEmail(email) {
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) {
     return { color: "red", reason: "garbage_address" };
   }
-  // SMTP verify via eva.pingutil (free, no auth)
+  // 1) MX records check (gratis vía Cloudflare DoH) — descarta dominios sin mail server
+  const dom = lower.split("@")[1];
+  const hasMX = await _hasMxRecords(dom);
+  if (!hasMX) return { color: "red", reason: "no_mx_records" };
+  // 2) SMTP verify via eva.pingutil (free, no auth) — best-effort
   try {
     const res = await fetch(`https://api.eva.pingutil.com/email?email=${encodeURIComponent(lower)}`, {
       signal: AbortSignal.timeout(8000),
@@ -3748,14 +3806,15 @@ async function runAgentCycle(token, allFlags) {
           try {
             const apolloEmails = await findAllEmails(domain, cfg.apollo_api_key, token);
             if (Array.isArray(apolloEmails) && apolloEmails.length > 0) {
-              const newEmails = [...new Set([...emails, ...apolloEmails])];
-              emails = newEmails;
+              const merged = [...new Set([...emails, ...apolloEmails])];
+              const validated = await validateEmailsBatch(merged);
+              emails = validated;
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
                 method: "PATCH",
                 headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-                body: JSON.stringify({ emails: newEmails }),
+                body: JSON.stringify({ emails: validated }),
               });
-              log(`  🔄 ${domain}: Apollo on-the-fly → +${apolloEmails.length} emails`);
+              log(`  🔄 ${domain}: Apollo on-the-fly → ${validated.length} emails válidos (de ${merged.length} totales)`);
             }
           } catch (e) { log(`  ⚠️ on-the-fly Apollo ${domain}: ${e.message}`); }
         }
@@ -3853,10 +3912,31 @@ async function runAgentCycle(token, allFlags) {
         // 4. Send Gmail PRIMERO — si falla, no toca Monday
         const subject = pitch.subjects[0];
 
+        // ── SENDTRACK 30d GUARD (último filtro antes del send) ──
+        // Aunque upstream filtre, defense-in-depth: chequeamos si el dominio
+        // recibió mail en los últimos 30 días por CUALQUIER MB (humano o agente).
+        // Cero costo (1 query Supabase con índice). Evita re-contactar.
+        try {
+          const cutoff = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+          const stRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff}&select=send_date,email&limit=1`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          );
+          if (stRes.ok) {
+            const sentRows = await stRes.json();
+            if (Array.isArray(sentRows) && sentRows.length > 0) {
+              log(`  ⏭ ${domain}: skip — ya contactado ${sentRows[0].send_date} (sendtrack 30d guard)`);
+              await logAgentAction(token, userEmail, {
+                domain, action: "skipped", reason: "sendtrack_30d",
+                details: { last_send: sentRows[0].send_date, last_email: sentRows[0].email },
+              });
+              continue;
+            }
+          }
+        } catch (e) { log(`  ⚠️ sendtrack guard ${domain}: ${e.message}`); }
+
         // RESERVA en counter ANTES del send. Si Railway crashea entre send y log,
         // el counter ya tiene el slot reservado → próximo arranque no over-sends.
-        // Si el send falla, lo marcamos como "failed" y la reserva queda como
-        // false-positive (under-send by 1). Preferimos under que over.
         await logAgentAction(token, userEmail, {
           domain, action: "sent", reason: "reserved_pre_send",
           pitch_subject: subject,
