@@ -696,7 +696,9 @@ async function refreshOneEmptyLead(token, cfg) {
         const data = await getTrafficData(lead.domain, rapidapi_key);
         const newVisits = data?.visits || 0;
         const newGeo = data?.topCountry || "";
-        if (newVisits > 0 || newGeo) {
+        // Solo consideramos resuelto si hay tráfico real (>0). Sin tráfico el WHERE
+        // del job lo vuelve a pickear y entra en loop. Geo solo no alcanza.
+        if (newVisits > 0) {
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
@@ -5322,6 +5324,26 @@ async function main() {
   while (true) {
     iterCount++;
     if (iterCount === 1 || iterCount % 10 === 0) log(`📍 Loop iter #${iterCount}`);
+
+    // ── REGLA DE ORO: fuera de horario laboral España (9-20 CET/CEST) NADA corre ──
+    // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
+    // backfill, refresh, unfreezer. Worker queda dormido hasta que vuelva a estar
+    // en horario. Evita que algo quede prendido durante la noche (timezone Madrid).
+    // Override config: agent_test_mode=true bypasses para testing.
+    try {
+      const ghCfg = await getConfig(token);
+      const ghTestMode = String(ghCfg.agent_test_mode || "").toLowerCase() === "true";
+      const ghStart = parseInt(ghCfg.active_hours_start || "9", 10);
+      const ghEnd   = parseInt(ghCfg.active_hours_end   || "20", 10);
+      if (!ghTestMode && _isOutsideActiveHours(ghStart, ghEnd)) {
+        if (iterCount === 1 || iterCount % 30 === 0) {
+          log(`💤 Fuera de horario España (h=${_spainHour()}, activo=${ghStart}-${ghEnd}) — todo el worker pausado`);
+        }
+        await sleep(POLL_INTERVAL_MS);
+        continue;
+      }
+    } catch {}
+
 
     // ── Unfreezer cada 60 iters (~25min) ──
     // Mueve toolbar_frozen_leads.frozen_until ≤ now() de vuelta a csv_queue.pending
