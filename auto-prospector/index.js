@@ -1225,21 +1225,30 @@ async function saveApolloCacheServer(token, domain, data) {
 
 async function findAllEmails(domain, apolloApiKey, token = null) {
   if (!apolloApiKey) return [];
+  // Helper: attach contact_name property al array (caller puede leer arr.contact_name).
+  // Mantiene compatibilidad — sites que solo iteran emails siguen funcionando.
+  const _attach = (arr, name) => { if (name) arr.contact_name = name; return arr; };
+
   // Cache check: si popup o worker ya pegó Apollo en los últimos 7d, retornar lo cacheado.
-  // Cache puede tener shape worker {emails:[...]} o popup {email, people:[...]}.
+  // Cache puede tener shape worker {emails, contact_name} o popup {email, people:[...]}.
   if (token) {
     const cached = await getApolloCacheServer(token, domain);
     if (cached) {
-      if (Array.isArray(cached.emails)) return cached.emails;
+      if (Array.isArray(cached.emails)) return _attach(cached.emails.slice(), cached.contact_name);
       if (Array.isArray(cached.people)) {
-        const goods = cached.people.filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status)).map(p => p.email);
-        if (goods.length) return [...new Set(goods)];
+        const goods = cached.people.filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status));
+        if (goods.length) {
+          const first = goods[0];
+          const name  = `${first.first_name || ""} ${first.last_name || ""}`.trim();
+          return _attach([...new Set(goods.map(p => p.email))], name);
+        }
       }
-      if (cached.email) return [cached.email];
+      if (cached.email) return _attach([cached.email], cached.contact_name);
     }
   }
 
   const emails = [];
+  let firstContactName = "";
   // /v1/people/match was deprecated — now /v1/mixed_people/search is ALSO deprecated.
   // Current endpoint: /v1/mixed_people/api_search (per Apollo docs 2026-04)
   try {
@@ -1258,15 +1267,18 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
       const data   = await res.json();
       const people = Array.isArray(data?.people) ? data.people : [];
       for (const p of people) {
-        if (p.email && APOLLO_GOOD_STATUSES.has(p.email_status)) emails.push(p.email);
+        if (p.email && APOLLO_GOOD_STATUSES.has(p.email_status)) {
+          emails.push(p.email);
+          if (!firstContactName) firstContactName = `${p.first_name || ""} ${p.last_name || ""}`.trim();
+        }
       }
     }
   } catch {}
 
   const unique = [...new Set(emails)];
-  // Cache write — gratis para el siguiente lookup en 7d
-  if (token) saveApolloCacheServer(token, domain, { emails: unique, source: "worker" }).catch(() => {});
-  return unique;
+  // Cache write — incluye contact_name para que próximos lookups lo levanten gratis
+  if (token) saveApolloCacheServer(token, domain, { emails: unique, contact_name: firstContactName, source: "worker" }).catch(() => {});
+  return _attach(unique, firstContactName);
 }
 
 // ── Email scraping fallback (server-side HTTP) ────────────────
@@ -1932,6 +1944,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     scrapeEmailsForDomain(domain),
   ]);
   const emails = [...new Set([...apolloEmails, ...scraperEmails])];
+  const apolloContactName = (apolloEmails && apolloEmails.contact_name) || "";
 
   // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
   //    decida email + draft + push manualmente desde el tab Prospects.
@@ -1942,7 +1955,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       geo:            topCountry || "",
       language:       detectedLang,
       category,
-      contactName:    "",
+      contactName:    apolloContactName,
       emails,
       pitch:          "",
       pitchSubject:   "",
@@ -2557,6 +2570,7 @@ async function runSession(token, cfg, sessionStart) {
       findSimilarSites(domain, rapidapi_key),
     ]);
     const emails = [...new Set([...apolloEmails, ...scraperEmails])];
+    const apolloContactNameAuto = (apolloEmails && apolloEmails.contact_name) || "";
 
     // Score final con emails encontrados
     const scoreWithEmails = finalScore + (emails.length > 0 ? 10 : 0);
@@ -2581,7 +2595,7 @@ async function runSession(token, cfg, sessionStart) {
       geo:           topCountry,
       language,
       category,
-      contactName,
+      contactName:   apolloContactNameAuto || contactName,
       emails,
       pitch:         "",
       pitchSubject:  "",
