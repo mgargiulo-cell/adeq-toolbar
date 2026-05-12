@@ -4182,9 +4182,65 @@ function bindCustomPromptHandlers() {
     if (r.ok) {
       state.customPrompt = DIEGO_VOICE_PROMPT;
       taEl.value = DIEGO_VOICE_PROMPT;
-      statusEl.textContent = "Reset al default";
+      statusEl.textContent = "Reset to default";
     }
   });
+
+  // ── Header 🧠 button: dedicated prompt modal — same logic, simpler UI ──
+  // Re-fetcha desde Supabase cada vez que se abre, así refleja edits via SQL.
+  const promptBtn   = document.getElementById("btn-prompt-open");
+  const promptModal = document.getElementById("prompt-modal");
+  const promptOver  = document.getElementById("prompt-modal-overlay");
+  const promptClose = document.getElementById("btn-prompt-close");
+  const promptSave  = document.getElementById("btn-prompt-save");
+  const promptReset = document.getElementById("btn-prompt-reset");
+  const promptEdit  = document.getElementById("prompt-editor");
+  const promptStat  = document.getElementById("prompt-status");
+  if (promptBtn && promptModal) {
+    promptBtn.addEventListener("click", async () => {
+      promptModal.style.display = "flex";
+      promptStat.textContent = "Loading from Supabase...";
+      promptEdit.value = "";
+      try {
+        const fresh = await getCustomPrompt(state.accessToken, GLOBAL_PROMPT_KEY);
+        if (fresh && fresh.trim()) {
+          promptEdit.value = fresh;
+          state.customPrompt = fresh;
+          promptStat.textContent = `${fresh.length} chars · loaded from Supabase (GLOBAL)`;
+        } else {
+          promptEdit.value = state.customPrompt || DIEGO_VOICE_PROMPT;
+          promptStat.textContent = `Empty in DB · using baked default (${(state.customPrompt || DIEGO_VOICE_PROMPT).length} chars)`;
+        }
+        // Read-only para non-admin
+        promptEdit.readOnly = state.role !== "admin";
+        promptSave.style.display = state.role === "admin" ? "" : "none";
+        promptReset.style.display = state.role === "admin" ? "" : "none";
+      } catch (e) {
+        promptStat.textContent = `Error loading: ${e.message}`;
+      }
+    });
+    [promptClose, promptOver].forEach(el => el?.addEventListener("click", () => { promptModal.style.display = "none"; }));
+    promptSave?.addEventListener("click", async () => {
+      if (state.role !== "admin") return;
+      const value = promptEdit.value.trim();
+      promptSave.disabled = true; promptSave.textContent = "⏳ Saving...";
+      const r = await setCustomPrompt(state.accessToken, GLOBAL_PROMPT_KEY, value);
+      promptSave.disabled = false; promptSave.textContent = "💾 Save to Supabase";
+      if (!r.ok) { promptStat.textContent = `❌ Save failed (${r.status || r.error})`; return; }
+      state.customPrompt = value;
+      promptStat.textContent = `✅ Saved · ${value.length} chars`;
+      logAuditEvent(state.accessToken, {
+        user_email: state.loginEmail, action: "edit_global_prompt",
+        details: { length: value.length, source: "header_button" },
+      });
+    });
+    promptReset?.addEventListener("click", async () => {
+      if (state.role !== "admin") return;
+      if (!confirm("Reset to baked-in default?")) return;
+      promptEdit.value = DIEGO_VOICE_PROMPT;
+      promptStat.textContent = `Reset shown — click Save to persist.`;
+    });
+  }
 }
 
 // Feedback visible en el panel de Gmail (ok / warn / error)

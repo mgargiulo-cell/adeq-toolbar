@@ -56,7 +56,8 @@
   <div id="site-url" class="site-url-pill">loading...</div>
   <div class="header-right">
     <button id="btn-history-open" class="icon-btn" title="History" aria-label="Open history">🕐</button>
-    <button id="btn-pitch-draft" class="icon-btn" title="Pitch drafts" aria-label="Open drafts">📝</button>
+    <button id="btn-pitch-draft" class="icon-btn" title="Pitch drafts (per-language email templates)" aria-label="Open drafts">📝</button>
+    <button id="btn-prompt-open" class="icon-btn" title="ADEQ Style Prompt — global Claude system prompt" aria-label="Edit Claude prompt">🧠</button>
     <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
   </div>
 </header>
@@ -1215,6 +1216,26 @@
         <button id="btn-draft-delete" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e;display:none">🗑</button>
       </div>
       <div id="draft-save-result" style="font-size:11px; margin-top:6px; min-height:14px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ADEQ Style Prompt modal — solo admin lo edita, todos pueden ver versión actual -->
+<div id="prompt-modal" class="modal" style="display:none">
+  <div class="modal-overlay" id="prompt-modal-overlay"></div>
+  <div class="modal-content" style="max-width:780px;width:95%;max-height:88vh;display:flex;flex-direction:column">
+    <div class="modal-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>🧠 ADEQ Style Prompt</span>
+      <button id="btn-prompt-close" class="icon-btn" aria-label="Close" title="Close" style="font-size:14px">✕</button>
+    </div>
+    <p style="font-size:11px;color:var(--text-muted);margin:6px 0 8px">
+      Global Claude prompt. Edited from here OR via SQL → both reflect each other in real time. Worker reads with 30min cache; popup re-fetches every open.
+    </p>
+    <textarea id="prompt-editor" style="flex:1;min-height:380px;width:100%;font-family:ui-monospace,monospace;font-size:11px;line-height:1.5;padding:10px;border:1px solid var(--border);border-radius:6px;resize:vertical" placeholder="Loading from Supabase..."></textarea>
+    <div style="display:flex;gap:6px;align-items:center;margin-top:10px">
+      <span id="prompt-status" style="flex:1;font-size:11px;color:var(--text-muted)"></span>
+      <button id="btn-prompt-reset" class="btn btn-secondary btn-sm" title="Reset to baked-in default" style="font-size:11px">↺ Reset</button>
+      <button id="btn-prompt-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save to Supabase</button>
     </div>
   </div>
 </div>
