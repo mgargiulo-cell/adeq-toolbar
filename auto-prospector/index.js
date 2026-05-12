@@ -3053,6 +3053,91 @@ Si ninguno encaja al vertical, OMITIR referencia (no inventar).
 - Mencionar el dominio al menos 1 vez en el cuerpo
 - Si dudás, terminar más corto que más largo`;
 
+// ── RAG con Voyage embeddings (worker-side) ──
+// Embed lead context con Voyage, busca top liked/disliked similares en
+// toolbar_pitch_feedback (RPC match_pitch_feedback). Inyecta como few-shot
+// en pitch generation. Cero costo si la tabla está vacía (skip).
+function _buildPitchContextWorker({ domain, category, geo, language, traffic }) {
+  const trafficStr = traffic
+    ? (traffic >= 1_000_000 ? `${Math.round(traffic / 1_000_000)}M` : `${Math.round(traffic / 1_000)}K`)
+    : "unknown";
+  return [
+    `Site: ${domain || "unknown"}`,
+    `Category: ${category || "unknown"}`,
+    `Geo: ${geo || "unknown"}`,
+    `Language: ${language || "unknown"}`,
+    `Traffic: ${trafficStr} visits/mo`,
+  ].join(" | ");
+}
+
+const _voyageWorkerCache = new Map();
+async function _voyageEmbedWorker(token, text) {
+  if (!text) return null;
+  if (_voyageWorkerCache.has(text)) return _voyageWorkerCache.get(text);
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "voyage",
+        path: "/v1/embeddings",
+        method: "POST",
+        body: { model: "voyage-3", input: [text], input_type: "query" },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const vec = data?.data?.[0]?.embedding;
+    if (Array.isArray(vec)) {
+      if (_voyageWorkerCache.size >= 200) {
+        const k = _voyageWorkerCache.keys().next().value;
+        _voyageWorkerCache.delete(k);
+      }
+      _voyageWorkerCache.set(text, vec);
+    }
+    return Array.isArray(vec) ? vec : null;
+  } catch { return null; }
+}
+
+async function ragRetrieveExamplesAgent(token, userEmail, ctx) {
+  try {
+    const ctxStr = _buildPitchContextWorker(ctx);
+    const embedding = await _voyageEmbedWorker(token, ctxStr);
+    if (!embedding) return { likes: [], dislikes: [] };
+    // RPC match_pitch_feedback (mismo que usa el popup)
+    const callRpc = async (action, count) => {
+      try {
+        const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/match_pitch_feedback`, {
+          method: "POST",
+          headers: {
+            "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            query_embedding: embedding,
+            match_user_email: userEmail,
+            match_action: action,
+            match_count: count,
+          }),
+          signal: AbortSignal.timeout(6000),
+        });
+        if (!res.ok) return [];
+        const rows = await res.json();
+        return Array.isArray(rows) ? rows : [];
+      } catch { return []; }
+    };
+    const [likes, dislikes] = await Promise.all([callRpc("liked", 3), callRpc("disliked", 2)]);
+    return {
+      likes: likes.map(r => r.pitch_body).filter(Boolean),
+      dislikes: dislikes.map(r => r.pitch_body).filter(Boolean),
+    };
+  } catch { return { likes: [], dislikes: [] }; }
+}
+
 // 2do pass Claude para elegir el mejor email entre ambiguos. Devuelve el email
 // elegido o null. Cache 30d en toolbar_config para no re-pagar Claude por el
 // mismo dominio. Solo se llama si rankEmail dio scores ambiguos.
@@ -3127,14 +3212,25 @@ async function _getAdeqStyle(token) {
 
 // ── Claude pitch generation server-side (calls Anthropic via Edge proxy) ──
 async function generatePitchAgent(token, ctx) {
-  const { domain, traffic, geo, language, category, contactName, adNetworks } = ctx;
+  const { domain, traffic, geo, language, category, contactName, adNetworks, userEmail } = ctx;
   const langName = ({ es:"Spanish", en:"English", pt:"Portuguese", it:"Italian", ar:"Arabic" })[language] || "English";
   const trafficStr = traffic >= 1_000_000 ? `${Math.round(traffic/1_000_000)}M` : `${Math.round(traffic/1_000)}K`;
 
   // Estilo ADEQ desde DB (toolbar_user_prompts user_email='__global__'), fallback a baked
   const adeqStyle = await _getAdeqStyle(token);
 
-  const systemMsg = `${adeqStyle}
+  // RAG few-shot: levantar pitches similares exitosos (liked) y los rechazados (disliked)
+  // del MB humano. Best-effort, si falla seguimos sin RAG.
+  const ragOwner = userEmail || "mgargiulo@adeqmedia.com";
+  const rag = await ragRetrieveExamplesAgent(token, ragOwner, { domain, category, geo, language, traffic });
+  const ragLikes = rag.likes.length > 0
+    ? `\n\n# EJEMPLOS DE EMAILS QUE FUNCIONARON (replicá el ESTILO, no el contenido):\n${rag.likes.map((p, i) => `Ejemplo ${i + 1}:\n"""${p.substring(0, 500)}"""`).join("\n\n")}`
+    : "";
+  const ragDislikes = rag.dislikes.length > 0
+    ? `\n\n# ESTILO A EVITAR (rechazados por el MB — NO escribir nada que se les parezca):\n${rag.dislikes.map((p, i) => `Rechazado ${i + 1}:\n"""${p.substring(0, 300)}"""`).join("\n\n")}`
+    : "";
+
+  const systemMsg = `${adeqStyle}${ragLikes}${ragDislikes}
 
 # OUTPUT REQUIREMENTS — MAIL INICIAL CORTO Y SIMPLE
 Este es el PRIMER mail al publisher: NO sobre-analizar, NO largo, NO armado.
@@ -3942,6 +4038,7 @@ async function runAgentCycle(token, allFlags) {
             domain, traffic: leadTraffic, geo: leadGeo, language: lead.language || "en",
             category: lead.category, contactName: lead.contact_name,
             adNetworks: lead.ad_networks,
+            userEmail, // para RAG retrieval — feedback del propio MB
           });
           // Self-check anti-alucinación solo cuando viene de Claude (templates están baked clean)
           const check = await selfCheckPitch(token, pitch.body, {
