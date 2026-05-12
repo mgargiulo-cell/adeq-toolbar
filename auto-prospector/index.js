@@ -444,6 +444,74 @@ async function bumpStat(token, userEmail, reason, n = 1) {
 // espacio (al procesar items y bajar el count de pending).
 const CSV_QUEUE_HARD_CAP = 200;
 const WAITLIST_HARD_CAP  = 300;
+// Cap diario GLOBAL — protege RapidAPI mensual (40K hits) + Railway billing.
+// 1000 csv_queue + 300 autopilot = 1300/día = ~39K/mes.
+// Configurable runtime: toolbar_config.csv_queue_daily_cap, autopilot_daily_cap_global
+const DEFAULT_CSV_DAILY_GLOBAL_CAP = 1000;
+const DEFAULT_AUTOPILOT_DAILY_GLOBAL_CAP = 300;
+
+// Counters in-process — se persisten al config para que sobrevivan restart
+let _csvDailyCounterDate = null;
+let _csvDailyCounter = 0;
+let _autopilotDailyCounterDate = null;
+let _autopilotDailyCounter = 0;
+
+// Devuelve true si HOY es sábado o domingo (España). Operativos Lun-Vie.
+function _isWeekendSpain() {
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", weekday: "short" });
+  const day = fmt.format(new Date()); // "Mon", "Tue", ..., "Sun"
+  return day === "Sat" || day === "Sun";
+}
+
+async function getDailyGlobalCounters(token) {
+  // Día actual España (calendario, no UTC)
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
+  const todaySpain = fmt.format(new Date());
+  // Reset si cambió el día calendario
+  if (_csvDailyCounterDate !== todaySpain) { _csvDailyCounterDate = todaySpain; _csvDailyCounter = 0; }
+  if (_autopilotDailyCounterDate !== todaySpain) { _autopilotDailyCounterDate = todaySpain; _autopilotDailyCounter = 0; }
+  // Cargar persisted counters de Supabase si vienen del mismo día
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(csv_daily_count,csv_daily_count_date,autopilot_daily_count,autopilot_daily_count_date,csv_queue_daily_cap,autopilot_daily_cap_global)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (res.ok) {
+      const rows = await res.json();
+      const map = {};
+      rows.forEach(r => { map[r.key] = r.value; });
+      if (map.csv_daily_count_date === todaySpain) _csvDailyCounter = Math.max(_csvDailyCounter, parseInt(map.csv_daily_count || "0", 10));
+      if (map.autopilot_daily_count_date === todaySpain) _autopilotDailyCounter = Math.max(_autopilotDailyCounter, parseInt(map.autopilot_daily_count || "0", 10));
+      return {
+        csvCount:        _csvDailyCounter,
+        csvCap:          parseInt(map.csv_queue_daily_cap || String(DEFAULT_CSV_DAILY_GLOBAL_CAP), 10),
+        autopilotCount:  _autopilotDailyCounter,
+        autopilotCap:    parseInt(map.autopilot_daily_cap_global || String(DEFAULT_AUTOPILOT_DAILY_GLOBAL_CAP), 10),
+        date:            todaySpain,
+      };
+    }
+  } catch {}
+  return {
+    csvCount: _csvDailyCounter, csvCap: DEFAULT_CSV_DAILY_GLOBAL_CAP,
+    autopilotCount: _autopilotDailyCounter, autopilotCap: DEFAULT_AUTOPILOT_DAILY_GLOBAL_CAP,
+    date: todaySpain,
+  };
+}
+
+async function bumpCsvDailyCounter(token, n = 1) {
+  _csvDailyCounter += n;
+  await Promise.all([
+    setConfigValue(token, "csv_daily_count",      String(_csvDailyCounter)),
+    setConfigValue(token, "csv_daily_count_date", _csvDailyCounterDate || ""),
+  ]);
+}
+async function bumpAutopilotDailyCounter(token, n = 1) {
+  _autopilotDailyCounter += n;
+  await Promise.all([
+    setConfigValue(token, "autopilot_daily_count",      String(_autopilotDailyCounter)),
+    setConfigValue(token, "autopilot_daily_count_date", _autopilotDailyCounterDate || ""),
+  ]);
+}
 
 async function getCsvQueuePendingCountServer(token) {
   try {
@@ -2082,6 +2150,8 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       mondayItemId,
     });
     await markCsvItem(token, item.id, "done", { monday_item_id: mondayItemId });
+    // Bump counter global diario (cap safety net 1000/día)
+    bumpCsvDailyCounter(token, 1).catch(() => {});
     const vstr = visits ? formatVisitsForMonday(visits) : "-";
     log(`  ✅ ${domain} → review_queue (source:${source}, visits:${vstr}, geo:${topCountry || "-"}, ${emails.length} email(s))`);
   } catch (e) {
@@ -2094,12 +2164,13 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const apolloUsage   = await getApolloUsageToday(token);
   const rapidUsage    = await getRapidApiUsageToday(token);
   const rapidMonth    = await getRapidApiUsageThisMonth(token);
+  const dailyGlobal   = await getDailyGlobalCounters(token);
   const callsRef      = { count: 0 };
   const blockedUsers  = new Set(); // usuarios que alcanzaron el límite diario
   const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
   let processed       = 0;
 
-  log(`▶ CSV queue start (apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} · rapidapi día: ${rapidUsage.usedToday}/${rapidUsage.limit} · mes: ${rapidMonth.usedThisMonth}/${rapidMonth.limit})`);
+  log(`▶ CSV queue start (apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} · rapidapi día: ${rapidUsage.usedToday}/${rapidUsage.limit} · mes: ${rapidMonth.usedThisMonth}/${rapidMonth.limit} · csv global hoy: ${dailyGlobal.csvCount}/${dailyGlobal.csvCap})`);
 
   // Hard cap MENSUAL — no procesar si pasamos el límite del mes
   if (rapidMonth.usedThisMonth >= rapidMonth.limit) {
@@ -2109,6 +2180,17 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // Hard cap DIARIO
   if (rapidUsage.usedToday >= rapidUsage.limit) {
     log(`⛔ Cap diario de RapidAPI alcanzado — CSV queue no arranca. Reset mañana.`);
+    return 0;
+  }
+  // Hard cap GLOBAL diario CSV (safety net — cap por encima del per-user para
+  // proteger RapidAPI/Railway si bug en agente o MBs sobre-prospectan)
+  if (dailyGlobal.csvCount >= dailyGlobal.csvCap) {
+    log(`⛔ Cap diario GLOBAL CSV alcanzado (${dailyGlobal.csvCount}/${dailyGlobal.csvCap}) — pausa hasta próximo día operativo.`);
+    return 0;
+  }
+  // Pausa fin de semana — operativo solo Lun-Vie España
+  if (_isWeekendSpain()) {
+    log(`⏸ Fin de semana España — CSV queue pausada hasta lunes.`);
     return 0;
   }
   _rapidGlobalCounter = 0;
@@ -2247,6 +2329,17 @@ async function runSession(token, cfg, sessionStart) {
     return;
   }
   log(`Quota del día para ${sessionUser}: ${userTodayCount}/${AUTOPILOT_DAILY_LIMIT}`);
+
+  // GLOBAL safety net + weekend pause
+  if (_isWeekendSpain()) {
+    log(`⏸ Fin de semana España — autopilot pausado hasta lunes.`);
+    return;
+  }
+  const _dailyGlobalAuto = await getDailyGlobalCounters(token);
+  if (_dailyGlobalAuto.autopilotCount >= _dailyGlobalAuto.autopilotCap) {
+    log(`⛔ Cap GLOBAL diario autopilot alcanzado (${_dailyGlobalAuto.autopilotCount}/${_dailyGlobalAuto.autopilotCap}) — sesión no arranca.`);
+    return;
+  }
 
   // Cargar feedback del user (learning)
   const feedback = await loadAutopilotFeedback(token, sessionUser);
@@ -2727,6 +2820,8 @@ async function runSession(token, cfg, sessionStart) {
       await markProcessed(token, [domain], "added_to_review");
       count++; added++;
       trackAutopilotEvent("added", domain);
+      // Bump counter global diario (cap safety net 300/día autopilot)
+      bumpAutopilotDailyCounter(token, 1).catch(() => {});
     } else {
       // Save falló — no marcar como added pero sí como processed para no re-evaluar
       await markProcessed(token, [domain], "save_failed");
