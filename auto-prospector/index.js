@@ -3375,6 +3375,124 @@ async function logAgentAction(token, userEmail, payload) {
   }
 }
 
+// ── BOUNCE DETECTION ────────────────────────────────────────
+// Cache local + 1 query a Supabase cuando se necesita refrescar (cada 5min).
+const _bouncedCache = { set: new Set(), ts: 0 };
+const BOUNCED_CACHE_TTL = 5 * 60 * 1000;
+
+async function loadBouncedEmails(token) {
+  if (Date.now() - _bouncedCache.ts < BOUNCED_CACHE_TTL) return _bouncedCache.set;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=10000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (res.ok) {
+      const rows = await res.json();
+      _bouncedCache.set = new Set((rows || []).map(r => (r.email || "").toLowerCase()));
+      _bouncedCache.ts = Date.now();
+    }
+  } catch {}
+  return _bouncedCache.set;
+}
+
+function isBouncedSync(email) {
+  return _bouncedCache.set.has((email || "").toLowerCase());
+}
+
+async function markEmailBounced(token, { email, reason, originalActionId, originalDomain }) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({
+        email: (email || "").toLowerCase(),
+        reason: (reason || "").substring(0, 300),
+        original_action_id: originalActionId || null,
+        original_domain: originalDomain || null,
+      }),
+    });
+    _bouncedCache.set.add((email || "").toLowerCase());
+    log(`  🚫 BOUNCED: ${email} (${reason || "unknown"}) — agregado al blocklist`);
+  } catch (e) {
+    log(`⚠️ markEmailBounced failed: ${e.message}`);
+  }
+}
+
+// Worker job: escanea INBOX por mailer-daemon en últimos 24h, parsea destinatario
+// que rebotó, persiste en toolbar_bounced_emails. Corre 1 vez por loop iter.
+async function scanBouncesForUser(token, userEmail) {
+  try {
+    const accessToken = await getGmailAccessToken(userEmail);
+    // Query Gmail: from:mailer-daemon OR from:postmaster, últimas 24h
+    const q = encodeURIComponent('from:(mailer-daemon@ OR postmaster@ OR noreply@) subject:(undelivered OR "delivery status" OR "returned mail" OR "failure notice") newer_than:1d');
+    const listRes = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,
+      { headers: { "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!listRes.ok) {
+      // 403 = scope readonly no autorizado en Workspace. Skip silencioso.
+      if (listRes.status !== 403) log(`⚠️ scanBounces list ${listRes.status}`);
+      return 0;
+    }
+    const list = await listRes.json();
+    const ids = (list.messages || []).map(m => m.id);
+    if (!ids.length) return 0;
+
+    let detected = 0;
+    for (const id of ids) {
+      try {
+        const msgRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+          { headers: { "Authorization": `Bearer ${accessToken}` } }
+        );
+        if (!msgRes.ok) continue;
+        const msg = await msgRes.json();
+        // Buscar el header X-Failed-Recipients o parsear body
+        const headers = msg.payload?.headers || [];
+        const failedHeader = headers.find(h => h.name?.toLowerCase() === "x-failed-recipients");
+        let failedEmails = [];
+        if (failedHeader?.value) {
+          failedEmails = failedHeader.value.split(",").map(e => e.trim().toLowerCase()).filter(Boolean);
+        } else {
+          // Fallback: extraer emails del body
+          const body = extractMessageText(msg.payload || {});
+          const emailMatches = body.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+          // Filtrar el email del propio user y de daemons
+          failedEmails = [...new Set(emailMatches
+            .map(e => e.toLowerCase())
+            .filter(e => !e.includes("mailer-daemon") && !e.includes("postmaster") && e !== userEmail.toLowerCase())
+          )].slice(0, 3); // top 3
+        }
+        for (const failed of failedEmails) {
+          if (!isBouncedSync(failed)) {
+            await markEmailBounced(token, { email: failed, reason: "smtp_bounce_detected", originalDomain: failed.split("@")[1] });
+            detected++;
+          }
+        }
+      } catch {}
+    }
+    if (detected) log(`🚫 scanBounces ${userEmail}: detectó ${detected} email(s) rebotados`);
+    return detected;
+  } catch (e) {
+    log(`⚠️ scanBounces error: ${e.message}`);
+    return 0;
+  }
+}
+
+function extractMessageText(payload) {
+  if (payload.body?.data) {
+    try { return Buffer.from(payload.body.data, "base64").toString("utf-8"); } catch { return ""; }
+  }
+  if (Array.isArray(payload.parts)) {
+    return payload.parts.map(p => extractMessageText(p)).join("\n");
+  }
+  return "";
+}
+
 // Cuenta de envíos del agent en últimos 7 días (weekly target)
 async function getAgentWeeklyCount(token, userEmail) {
   try {
@@ -4035,6 +4153,7 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   if (!email || typeof email !== "string" || !email.includes("@")) return -1;
   const lower = email.toLowerCase();
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
+  if (isBouncedSync(lower)) return -1; // hard reject: ya bounceó antes
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
@@ -4298,7 +4417,7 @@ async function getGmailAccessToken(impersonateUser) {
   const payload = {
     iss:   sa.client_email,
     sub:   impersonateUser,
-    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.settings.basic",
+    scope: "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.settings.basic https://www.googleapis.com/auth/gmail.readonly",
     aud:   "https://oauth2.googleapis.com/token",
     iat:   now,
     exp:   now + 3600,
@@ -4368,9 +4487,13 @@ function _textToHtmlServer(text) {
     .join("\n");
 }
 
-async function sendGmailServer(_token, userEmail, { to, subject, body }) {
+async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null }) {
   const accessToken = await getGmailAccessToken(userEmail);
   const signatureHtml = await getGmailSignatureHtmlServer(userEmail);
+  // Open-rate tracking pixel — solo si tenemos un agent_action_id (envíos del agente)
+  const trackingPixel = agentActionId
+    ? `<img src="${SUPABASE_URL}/functions/v1/track-open?aid=${agentActionId}" width="1" height="1" alt="" style="display:block;border:0;width:1px;height:1px"/>`
+    : "";
 
   // Subject RFC 2047 encoded para soportar acentos (ej. "monetización")
   const subjectEncoded = /^[\x20-\x7E]*$/.test(subject)
@@ -4378,10 +4501,12 @@ async function sendGmailServer(_token, userEmail, { to, subject, body }) {
     : `=?UTF-8?B?${Buffer.from(subject, "utf-8").toString("base64")}?=`;
 
   let mime;
-  if (signatureHtml && signatureHtml.trim()) {
+  // Forzar multipart si hay tracking pixel (necesita HTML), aunque no haya signature
+  const useMultipart = (signatureHtml && signatureHtml.trim()) || trackingPixel;
+  if (useMultipart) {
     // Multipart: text + HTML con signature default del user
     const boundary = `----=adeq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,10)}`;
-    const htmlBody = `${_textToHtmlServer(body)}\n<br/>\n${signatureHtml}`;
+    const htmlBody = `${_textToHtmlServer(body)}${signatureHtml ? "\n<br/>\n" + signatureHtml : ""}${trackingPixel ? "\n" + trackingPixel : ""}`;
     mime = [
       `To: ${to}`,
       `From: ${userEmail}`,
@@ -4519,6 +4644,9 @@ async function runAgentCycle(token, allFlags) {
   if (TEST_MODE) log(`🧪 Agent TEST MODE ON — bypass active hours + daily cap + weekly target`);
   log(`🤖 Agent: ciclo iniciando (users=${allFlags.agentUsers.length}, threshold=${aCfg.thresholdTraffic}, maxPerDay=${aCfg.maxPerDay})`);
 
+  // Refresh bounced cache + scan INBOX al inicio del ciclo
+  await loadBouncedEmails(token);
+
   // Whitelist de users autorizados a usar el agent (defense-in-depth).
   // Lee toolbar_config.agent_whitelist (CSV) y fallback hardcoded a admin.
   // Para agregar un user nuevo sin redeploy:
@@ -4532,6 +4660,8 @@ async function runAgentCycle(token, allFlags) {
       log(`🚫 Agent: user ${userEmail} no está en whitelist hardcoded — skip`);
       continue;
     }
+    // Bounce scan (Gmail INBOX) — fire-and-forget para que no atrase el ciclo
+    scanBouncesForUser(token, userEmail).catch(() => {});
     // Kill switch check
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
     // Daily cap
@@ -4974,7 +5104,7 @@ async function runAgentCycle(token, allFlags) {
         }).catch(() => null);
         reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id || null;
 
-        await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body });
+        await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId });
 
         // PATCH reserved → sent ahora que confirmamos el envío
         if (reservedId) {
