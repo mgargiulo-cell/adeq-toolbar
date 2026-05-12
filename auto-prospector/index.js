@@ -3990,12 +3990,15 @@ function rankEmail(email, siteDomain, leadCategory = "") {
 
   // ── DOMAIN MATCH (peso 0-40) ──
   // Email del MISMO dominio del sitio → señal MUY fuerte (es probablemente real)
+  const isFreeWebmail = /^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex|me)\./.test(dom);
   if (cleanSite) {
     if (dom === cleanSite) score += 40;
     else if (dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom)) score += 35;
-    else {
-      // Cross-domain — penalidad fuerte. Apollo a veces devuelve empresas relacionadas
-      // (ej cavok.com.br → marcio@nunes.inf.br) que no responden por nuestro sitio.
+    else if (isFreeWebmail) {
+      // Webmail personal — no penalizar cross-domain (es esperado)
+      // El webmail penalty -35 abajo ya cubre la baja confianza B2B
+    } else {
+      // Cross-domain a OTRO dominio corporativo — penalidad fuerte.
       score -= 50;
     }
   }
@@ -4032,8 +4035,8 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // Local muy corto (<3) o muy largo (>30) = sospechoso
   if (local.length < 3) score -= 30;
   if (local.length > 30) score -= 25;
-  // Free webmail = penalizar (no corporativo)
-  if (/^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex|me)\./.test(dom)) score -= 35;
+  // Free webmail = penalizar pero NO descartar (un MB humano puede mandar)
+  if (isFreeWebmail) score -= 20; // antes -35, ahora -20 para que webmail con persona real sobreviva
 
   // ── LANGUAGE MATCH bonus ──
   // Si el sitio es .br y el email tiene palabras pt (vendas, comercial) → +5
@@ -4660,9 +4663,12 @@ async function runAgentCycle(token, allFlags) {
           } catch (e) { log(`  ⚠️ on-the-fly enrich ${domain}: ${e.message}`); }
         }
 
-        // Re-pickear el MEJOR email después del enrichment (rankEmail sync, NO la async scoreEmail)
+        // Re-pickear el MEJOR email después del enrichment.
+        // Threshold relajado: aceptamos hasta score=-30. score=-1 (rankEmail
+        // hardgate) sigue descartado. Esto permite mandar a webmail+cross-domain
+        // si no hay nada mejor (mejor a alguien que a nadie).
         const _rankedAll = emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) }));
-        const ranked = _rankedAll.filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
+        const ranked = _rankedAll.filter(x => x.score > -50).sort((a, b) => b.score - a.score);
         let email = ranked[0]?.email;
         // Log diagnóstico — ver qué pasó con cada candidate
         if (emails.length > 0) {
