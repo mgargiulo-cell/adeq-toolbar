@@ -287,17 +287,29 @@ export async function setAutopilotEnabled(enabled, accessToken, userEmail = "") 
     "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json",
   };
   try {
+    // Mitigación de race: si 2 MBs toggle ON al mismo tiempo, el último PATCH
+    // gana el session_user. Hacemos read-after-write: si tras 400ms el dueño no
+    // soy yo, devolvemos false para que la UI haga rollback.
     await fetch(`${url}/rest/v1/toolbar_config?key=eq.auto_prospecting_enabled`, {
       method: "PATCH", headers,
       body: JSON.stringify({ value: enabled ? "true" : "false" }),
     });
-    // Al encender: guardar timestamp + user que inició
     if (enabled) {
       const sessionStart = new Date().toISOString();
       await upsertConfig(url, key, headers, "auto_session_start", sessionStart);
       if (userEmail) await upsertConfig(url, key, headers, "auto_session_user", userEmail);
+      // Verificación post-write — race detection
+      await new Promise(r => setTimeout(r, 400));
+      const verifyRes = await fetch(`${url}/rest/v1/toolbar_config?key=eq.auto_session_user&select=value`, { headers });
+      const verifyRows = await verifyRes.json().catch(() => []);
+      const winner = (verifyRows?.[0]?.value || "").toLowerCase();
+      if (userEmail && winner && winner !== userEmail.toLowerCase()) {
+        // Race perdida — otro MB clavó la sesión. NO desactivamos (lo hizo él).
+        return { ok: false, winner };
+      }
     }
-  } catch {}
+    return { ok: true };
+  } catch { return { ok: true }; /* swallow para no romper UI */ }
 }
 
 // ── Autopilot feedback (learning from user like/dislike) ────

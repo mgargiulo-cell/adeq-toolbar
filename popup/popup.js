@@ -6569,7 +6569,13 @@ async function initAutopilot() {
       // Turn on
       setAutopilotUI(btn, true);
       setAutopilotLockBadge(null);
-      await setAutopilotEnabled(true, state.accessToken, state.loginEmail);
+      const res = await setAutopilotEnabled(true, state.accessToken, state.loginEmail);
+      if (res && res.ok === false) {
+        // Race perdida — otro MB clavó la sesión <400ms antes
+        alert(`🔒 ${res.winner.split("@")[0]} just started Autopilot first (race condition). Try again in 20 min when their session ends.`);
+        setAutopilotUI(btn, false);
+        return;
+      }
       startAutopilotCountdown(btn, AUTOPILOT_DURATION_MS);
       startUsageSession(state.accessToken, state.loginEmail, "autopilot").catch(() => {});
     }
