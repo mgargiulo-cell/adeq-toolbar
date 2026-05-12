@@ -619,7 +619,7 @@ async function promoteWaitlist(token) {
   }
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, language, category, contactName, contactPhone, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactPhone, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
   // Esta función solo INSERTA y devuelve boolean.
@@ -634,6 +634,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, language, catego
       domain,
       traffic:        traffic ? Math.round(traffic) : 0,
       geo:            geo            || "",
+      geos_all:       Array.isArray(geosAll) && geosAll.length ? geosAll : null,
       language:       language       || "",
       category:       category       || "",
       contact_name:   contactName    || "",
@@ -1298,12 +1299,15 @@ async function getTrafficData(domain, rapidApiKey) {
     // el switch a website-insights, el GEO viene siempre inline en /all-insights.
     // Si no viene → el caller usa fallback gratis (TLD + Cloudflare Radar hint).
     let topCountry = null;
+    let topCountries3 = []; // ISO 2-letter codes top 3 (para filtro amplio del agente)
     const inlineList = data?.TopCountries || data?.Countries || data?.countries
                     || data?.topCountryShares || data?.CountryShares || [];
     if (Array.isArray(inlineList) && inlineList.length) {
-      const c    = inlineList[0];
-      const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
-      if (code) topCountry = COUNTRY_CODES[code] || code;
+      for (const c of inlineList.slice(0, 3)) {
+        const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
+        if (code) topCountries3.push(code);
+      }
+      if (topCountries3[0]) topCountry = COUNTRY_CODES[topCountries3[0]] || topCountries3[0];
     }
 
     // Guardar en cache compartida para próximas consultas (regla de oro 90 días)
@@ -1317,8 +1321,8 @@ async function getTrafficData(domain, rapidApiKey) {
         category:      data?.WebsiteDetails?.Category || data?.Category || "",
       }).catch(() => {});
     }
-    return { visits, pagesPerVisit, topCountry, error: null };
-  } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, error: e.message }; }
+    return { visits, pagesPerVisit, topCountry, topCountries3, error: null };
+  } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], error: e.message }; }
 }
 
 // Cache helpers de tráfico para el worker (acceso directo a Supabase).
@@ -2434,11 +2438,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     getTrafficData(domain, rapidapi_key),
     fetchPageContent(domain),
   ]);
-  let { visits, topCountry } = trafficData;
+  let { visits, topCountry, topCountries3 } = trafficData;
   if (!topCountry) {
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
   }
+  // ISO codes top3 para filtro amplio del agente (geos_all)
+  const _isoFromName = (name) => Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === name);
+  const geosAllIso = Array.isArray(topCountries3) && topCountries3.length
+    ? topCountries3
+    : (topCountry ? [_isoFromName(topCountry) || topCountry] : []);
   // ── REGLA ESTRICTA + BACKOFF EXPONENCIAL ──
   // - traffic < 400K → skip (no entra)
   // - traffic = 0 / null / error → after 3 failed attempts, FREEZE 15d/30d/60d
@@ -2548,6 +2557,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       domain,
       traffic:        visits || 0,
       geo:            topCountry || "",
+      geosAll:        geosAllIso,
       language:       detectedLang,
       category,
       contactName:    apolloContactName,
@@ -3022,7 +3032,11 @@ async function runSession(token, cfg, sessionStart) {
       fetchPageContent(domain),
     ]);
 
-    let { visits, pagesPerVisit, topCountry, error: rapidError } = trafficData;
+    let { visits, pagesPerVisit, topCountry, topCountries3, error: rapidError } = trafficData;
+    const _isoFromName2 = (name) => Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === name);
+    const geosAllIsoAuto = Array.isArray(topCountries3) && topCountries3.length
+      ? topCountries3
+      : (topCountry ? [_isoFromName2(topCountry) || topCountry] : []);
 
     // Si el RapidAPI devolvió error tras 3 retries, no descartar permanentemente
     if (rapidError) {
@@ -3224,6 +3238,7 @@ async function runSession(token, cfg, sessionStart) {
       domain,
       traffic:       visits,
       geo:           topCountry,
+      geosAll:       geosAllIsoAuto,
       language,
       category,
       contactName:   apolloContactNameAuto || contactName,
@@ -4514,15 +4529,24 @@ async function runAgentCycle(token, allFlags) {
     const remaining = TEST_MODE ? aCfg.perCycleLimit : (aCfg.maxPerDay - sentToday);
     const batchSize = Math.min(aCfg.perCycleLimit, remaining);
 
-    // Aplicar focus filtros al query
+    // Aplicar focus filtros al query.
+    // geos_priority son ISO 2-letter codes (AR, UY, ES...). Matchea contra
+    // `geos_all` (text[] con top 3 ISO codes) usando overlap. Fallback al
+    // campo legacy `geo` que guarda el country NAME (Argentina, Uruguay...)
+    // para rows pre-migración.
     const focus = aCfg.focus;
     let geoClause = "";
     if (focus.geosPriority.length > 0) {
-      // Postgrest: geo=in.(AR,MX,...) — case insensitive imatch via OR
-      const inList = focus.geosPriority.map(g => `"${g}"`).join(",");
-      geoClause = `&geo=in.(${encodeURIComponent(inList)})`;
+      const isoCodes = focus.geosPriority;
+      const names    = isoCodes.map(c => COUNTRY_CODES[c]).filter(Boolean);
+      const ovList   = `{${isoCodes.join(",")}}`;
+      const inList   = [...isoCodes, ...names].map(s => `"${s}"`).join(",");
+      // PostgREST OR: geos_all overlap ISO codes  OR  geo (legacy) in (codes ∪ names)
+      geoClause = `&or=(geos_all.ov.${encodeURIComponent(ovList)},geo.in.(${encodeURIComponent(inList)}))`;
     } else if (focus.geosExcluded.length > 0) {
-      const inList = focus.geosExcluded.map(g => `"${g}"`).join(",");
+      const isoCodes = focus.geosExcluded;
+      const names    = isoCodes.map(c => COUNTRY_CODES[c]).filter(Boolean);
+      const inList   = [...isoCodes, ...names].map(s => `"${s}"`).join(",");
       geoClause = `&geo=not.in.(${encodeURIComponent(inList)})`;
     }
     let categoryClause = "";

@@ -1388,17 +1388,27 @@ async function loadAdminActivity() {
 // Normaliza display names → emails (h.media_buyer="Diego" → "dhorovitz@adeqmedia.com")
 const NAME_TO_EMAIL = {
   "diego":     "dhorovitz@adeqmedia.com",
+  "dhorovitz": "dhorovitz@adeqmedia.com",
+  "dhorovits": "dhorovitz@adeqmedia.com",
   "agus":      "sales@adeqmedia.com",
   "agustina":  "sales@adeqmedia.com",
+  "sales":     "sales@adeqmedia.com",
   "max":       "mgargiulo@adeqmedia.com",
   "maxi":      "mgargiulo@adeqmedia.com",
   "maximiliano": "mgargiulo@adeqmedia.com",
+  "mgargiulo": "mgargiulo@adeqmedia.com",
+  "maximiliano gargiulo": "mgargiulo@adeqmedia.com",
 };
 function _normalizeUserKey(raw) {
   if (!raw) return "unknown";
   const lower = String(raw).toLowerCase().trim();
   if (lower.includes("@")) return lower; // ya es email
-  return NAME_TO_EMAIL[lower] || lower; // mappeo o fallback al nombre
+  if (NAME_TO_EMAIL[lower]) return NAME_TO_EMAIL[lower];
+  // Match parcial: si contiene alguna key conocida, mapear
+  for (const k of Object.keys(NAME_TO_EMAIL)) {
+    if (lower.includes(k)) return NAME_TO_EMAIL[k];
+  }
+  return lower;
 }
 
 function _aggregateByUser(historial, usage, sessions) {
