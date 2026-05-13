@@ -24,7 +24,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          setDomainGeo, getDomainGeo }                                                          from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
-import { markReviewQueueAsContacted } from "../modules/supabase.js";
+import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
@@ -282,6 +282,10 @@ function resetAnalysisUI() {
   state.banners       = null;
   state.techStack     = [];
   state.revenueGap    = null;
+  // Pitch / IA — quedaban con basura de la URL anterior
+  state.pitch              = "";
+  state.generatedPitches   = [];
+  state.decisionMakerName  = "";
 
   // 2) Limpiar TODOS los elementos de UI (display + inputs + selects)
   const textIds = [
@@ -298,7 +302,11 @@ function resetAnalysisUI() {
   const inputIds = [
     "form-pv-display", "form-subject", "pitch-text",
     "form-fecha", "form-telefono", "form-email-search",
+    "form-email-futuro",
   ];
+  // También limpiar el status text del email futuro
+  const futStatus = document.getElementById("email-futuro-status");
+  if (futStatus) { futStatus.textContent = ""; futStatus.style.color = ""; }
   inputIds.forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = "";
@@ -333,6 +341,29 @@ function resetAnalysisUI() {
   // 7) Reset botón push-monday a "Send" (no "Update")
   const pushBtn = document.getElementById("btn-push-monday");
   if (pushBtn) pushBtn.textContent = "🚀 Send to Monday";
+
+  // 8) Esconder pulgares/status del pitch (solo se muestran después de generar)
+  ["btn-pitch-like", "btn-pitch-dislike"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = "none";
+  });
+  const likeStatus = document.getElementById("pitch-like-status");
+  if (likeStatus) likeStatus.textContent = "";
+
+  // 9) Esconder subject chips (sugerencias de la URL anterior)
+  const subjChips = document.getElementById("pitch-subjects");
+  if (subjChips) { subjChips.style.display = "none"; subjChips.innerHTML = ""; }
+
+  // 10) Reset botón "Generar Pitch" si quedó en "Regenerar"
+  const genBtn = document.getElementById("btn-generate-pitch");
+  if (genBtn) { genBtn.textContent = "✨ Generar Pitch"; genBtn.disabled = false; }
+
+  // 11) Restaurar draft del pitch del NUEVO dominio (si existe).
+  //     Si no hay draft previo, el textarea queda vacío (ya se limpió arriba).
+  //     Free: chrome.storage.local, no toca APIs pagas.
+  if (typeof _restorePitchDraft === "function") {
+    setTimeout(() => _restorePitchDraft(), 50);
+  }
 }
 
 async function forceRefreshAnalysis() {
@@ -3315,6 +3346,59 @@ function _verifyClass(result) {
   return "verify-good";
 }
 
+// Grade A-E por email — diferencia calidad relativa entre emails válidos
+// para que no aparezcan todos en verde idéntico. Combina:
+//   - resultado de verify (SMTP confirmado vs solo DNS vs inválido)
+//   - tags (rol/catch-all/typo penalizan)
+//   - fuente (apollo > scrape > gemini > guessed)
+//   - formato (personal "nombre.apellido@" > rol "info@/contact@")
+function _emailGrade(email, result, source) {
+  if (!email || !email.includes("@")) return { grade: "E", label: "Inválido" };
+  let score = 50; // baseline
+  const tags = result?.tags || [];
+
+  // Verify result — el factor más fuerte
+  if (result) {
+    if (!result.valid) return { grade: "E", label: "SMTP rechazó" };
+    if (tags.includes("descartable") || tags.includes("descartable-remoto") ||
+        tags.includes("undeliverable") || tags.includes("typo") ||
+        tags.includes("sin-dns") || tags.includes("sin-mx") ||
+        tags.includes("spam") || tags.includes("proxy-whois")) {
+      return { grade: "E", label: "Descartable" };
+    }
+    if (result.deepSource === "eva") score += 25;       // SMTP remoto confirmó
+    else if (result.deepSource === "local-only") score += 5; // solo DNS local
+    if (tags.includes("rol"))                score -= 20;
+    if (tags.includes("catch-all"))          score -= 15;
+    if (tags.includes("catch-all-provider")) score -= 10;
+    if (tags.includes("tld-sospechoso"))     score -= 15;
+  } else {
+    // No verificado todavía — baseline pendiente
+    score = 40;
+  }
+
+  // Fuente
+  const src = (source || "").toLowerCase();
+  if (src === "apollo")  score += 15; // Apollo trae status verificado
+  else if (src === "scrape" || src === "scraping") score += 5;
+  else if (src === "gemini") score += 3;
+
+  // Formato — personal vs rol vs aleatorio
+  const local = email.split("@")[0].toLowerCase();
+  if (/^[a-z]+\.[a-z]+$/.test(local))      score += 10; // nombre.apellido
+  else if (/^[a-z]+[a-z]+$/.test(local) && local.length >= 6 && local.length <= 18) score += 5;
+  if (/^(info|contact|contacto|hello|hola|admin|sales|ventas|support|soporte|help|webmaster|noreply|no-reply)$/i.test(local)) {
+    score -= 15;
+  }
+
+  // Mapeo a grade
+  if (score >= 85) return { grade: "A", label: "Excelente" };
+  if (score >= 70) return { grade: "B", label: "Bueno" };
+  if (score >= 55) return { grade: "C", label: "Regular" };
+  if (score >= 40) return { grade: "D", label: "Bajo" };
+  return { grade: "E", label: "Descartable" };
+}
+
 function _verifyTooltip(result) {
   if (!result) return "Verificando…";
   const status = result.valid ? "✔ Valid" : "✖ Invalid";
@@ -3345,6 +3429,15 @@ async function autoVerifyEmailChips(listEl) {
     chip.classList.remove("verify-pending", "verify-good", "verify-warn", "verify-bad");
     chip.classList.add(cls);
     chip.title = _verifyTooltip(result);
+    // Refrescar grade A-E ahora que tenemos verify result
+    const src = state.emailSources.get(email) || "";
+    const g = _emailGrade(email, result, src);
+    const oldBadge = chip.querySelector(".email-grade");
+    if (oldBadge) {
+      oldBadge.textContent = g.grade;
+      oldBadge.className = `email-grade email-grade-${g.grade}`;
+      oldBadge.title = g.label;
+    }
     // Si era el chip seleccionado, sincronizar el badge global con el color
     const badge = document.getElementById("email-verify-badge");
     if (chip.classList.contains("selected") && badge) {
@@ -3406,7 +3499,13 @@ function renderEmailList(emails) {
     const srcBadge = src ? `<span class="email-src-badge">${esc(src)}</span>` : "";
     const cached = _emailVerifyCache.get(email);
     const verCls = cached ? _verifyClass(cached) : "verify-pending";
-    return `<div class="email-chip ${extraClass} ${verCls}" data-email="${esc(email)}" title="Verificando…">${esc(email)}${srcBadge}</div>`;
+    const g = _emailGrade(email, cached, src);
+    const gradeBadge = `<span class="email-grade email-grade-${g.grade}" title="${esc(g.label)}">${g.grade}</span>`;
+    // Botón circular "2" (rojo) a la derecha de todo — asigna este email
+    // al slot Email Futuro (envío auto a 11d). El click normal en el chip
+    // sigue siendo "asignar a slot 1 (envío ahora)".
+    const futureBtn = `<button type="button" class="email-future-btn" data-email-future="${esc(email)}" title="Asignar como Email Futuro (envío auto a 11d)">2</button>`;
+    return `<div class="email-chip ${extraClass} ${verCls}" data-email="${esc(email)}" title="Click = enviar ahora. 2 (rojo, derecha) = email futuro (11d)">${gradeBadge}${esc(email)}${srcBadge}${futureBtn}</div>`;
   };
 
   if (mondayEmail) {
@@ -3441,22 +3540,58 @@ function renderEmailList(emails) {
     });
   }
 
-  // Seleccionar el primero por defecto
-  const firstChip = listEl.querySelector(".email-chip");
-  if (firstChip) {
-    firstChip.classList.add("selected");
-    formEl.value = firstChip.dataset.email;
+  // Auto-selección: si el sitio es duplicado de Monday, NUNCA pre-seleccionamos
+  // el email viejo de Monday — siempre preferimos uno fresco de Apollo/scrape
+  // (que ya viene rankeado: ad ops > publicidad > marketing > online > dev).
+  // Si no hay ninguno fresco, recién ahí caemos al de Monday como fallback.
+  const preferredChip = listEl.querySelector(".email-chip:not(.monday)")
+                     || listEl.querySelector(".email-chip");
+  if (preferredChip) {
+    preferredChip.classList.add("selected");
+    formEl.value = preferredChip.dataset.email;
   }
 
-  // Click para seleccionar
+  // Click para seleccionar (slot 1 = email principal, envío ahora)
   listEl.querySelectorAll(".email-chip").forEach(chip => {
-    chip.addEventListener("click", () => {
+    chip.addEventListener("click", (ev) => {
+      // Si tocó el botón "→ 2", no procesar como click de slot 1
+      if (ev.target.classList.contains("email-future-btn")) return;
       listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
       chip.classList.add("selected");
       formEl.value = chip.dataset.email;
-      // Sincronizar badge con el resultado cacheado del chip seleccionado
       const cached = _emailVerifyCache.get(chip.dataset.email);
       _renderVerifyBadge(badge, cached);
+      // Si el mismo email estaba en slot 2, limpiar slot 2 (no puede estar en ambos)
+      const fut = document.getElementById("form-email-futuro");
+      if (fut && fut.value === chip.dataset.email) {
+        fut.value = "";
+        listEl.querySelectorAll(".email-chip.slot-future").forEach(c => c.classList.remove("slot-future"));
+      }
+    });
+  });
+
+  // Botón "→ 2" — asigna ese email al slot Email Futuro
+  listEl.querySelectorAll(".email-future-btn").forEach(btn => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const email = btn.dataset.emailFuture;
+      const fut   = document.getElementById("form-email-futuro");
+      if (!fut || !email) return;
+      // Si ya estaba en slot 1 (principal), liberarlo de ahí
+      if (formEl.value === email) formEl.value = "";
+      fut.value = email;
+      // Mark visual: limpiar slot-future previo y poner este chip
+      listEl.querySelectorAll(".email-chip.slot-future").forEach(c => c.classList.remove("slot-future"));
+      btn.closest(".email-chip")?.classList.add("slot-future");
+      // Si quedó vacío slot 1 → preseleccionar el siguiente no-futuro
+      if (!formEl.value) {
+        const next = listEl.querySelector(".email-chip:not(.slot-future):not(.monday)") || listEl.querySelector(".email-chip:not(.slot-future)");
+        if (next) {
+          listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+          next.classList.add("selected");
+          formEl.value = next.dataset.email;
+        }
+      }
     });
   });
 
@@ -4162,6 +4297,33 @@ async function bindButtons() {
     bodyToSend = appendClosingIfMissing(bodyToSend, lang);
     bodyToSend = gmailSig ? bodyToSend + "\n\n" + gmailSig : bodyToSend;
 
+    // ── Tracking pixel para detectar open (necesario para Email Futuro) ──
+    // Insertamos primero en toolbar_agent_actions para tener un id estable,
+    // después embedeamos el pixel apuntando a /functions/v1/track-open?aid=ID.
+    // Si la inserción falla, mandamos igual el email sin pixel (no bloqueante).
+    let trackingActionId = null;
+    try {
+      const tr = await createManualSendTracking(state.accessToken, {
+        user_email:    state.loginEmail,
+        domain:        state.domain,
+        email_to:      email,
+        pitch_subject: subject,
+        language:      lang,
+      });
+      if (tr.ok && tr.id) {
+        trackingActionId = tr.id;
+        const pixelUrl = `${CONFIG.SUPABASE_URL}/functions/v1/track-open?aid=${tr.id}`;
+        // Inyectamos al final del body, en línea aparte para que Gmail lo procese
+        // como HTML inline (1x1 transparent). Si el cliente envía text/plain, queda
+        // como string al final que tampoco molesta.
+        bodyToSend = `${bodyToSend}\n\n<img src="${pixelUrl}" width="1" height="1" alt="" style="display:none" />`;
+      } else {
+        console.warn("[tracking] manual send insert failed:", tr.status, tr.error);
+      }
+    } catch (e) {
+      console.warn("[tracking] exception:", e.message);
+    }
+
     btn.textContent = "⏳ Sending...";
     const result = await sendEmail({ to: email, subject, body: bodyToSend, expectedFrom: state.loginEmail });
 
@@ -4175,6 +4337,35 @@ async function bindButtons() {
       // Marcar review_queue items de este dominio como contactados — desaparecen
       // de Prospects inmediato (otros MBs no los van a re-contactar).
       markReviewQueueAsContacted(state.accessToken, state.domain, state.loginEmail).catch(() => {});
+
+      // ── Email Futuro — si el MB asignó un slot 2, encolar para +11d ────
+      const futureEmail = document.getElementById("form-email-futuro")?.value?.trim();
+      const futStatusEl = document.getElementById("email-futuro-status");
+      if (futureEmail && futureEmail !== email && futureEmail.includes("@")) {
+        const r = await queueReengagement(state.accessToken, {
+          domain:             state.domain,
+          monday_item_id:     state.mondayItemId,
+          mb_email:           state.loginEmail,
+          original_email:     email,
+          future_email:       futureEmail,
+          original_subject:   subject,
+          original_body:      bodyToSend,
+          tracking_action_id: trackingActionId, // pixel id para detectar opens
+        });
+        if (r.ok) {
+          if (futStatusEl) {
+            const d = new Date(r.scheduled_for);
+            futStatusEl.textContent = `✅ Email futuro encolado para ${d.toLocaleDateString()} (si no abren el primero)`;
+            futStatusEl.style.color = "#16a34a";
+          }
+        } else {
+          console.warn("[reengagement] queue failed:", r.status, r.error);
+          if (futStatusEl) {
+            futStatusEl.textContent = `⚠ No se pudo encolar el email futuro (${r.status || "err"})`;
+            futStatusEl.style.color = "#dc2626";
+          }
+        }
+      }
 
       // Update "From" label with the actual Gmail account used
       const fromEl = document.getElementById("gmail-from");
@@ -5030,22 +5221,30 @@ async function startCascade() {
 
   const CASCADE_LIMIT = 50;
 
-  // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días)
+  // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días).
+  // Si falla (timeout/401/red), seguimos igual con índice vacío — no bloqueamos al MB.
   statusEl.textContent = "Step 1/2: checking Monday for other MBs' active domains...";
-  const boardIndex = await getMondayBoardIndex();
-  const cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - 45);
-  const cutoffStr = cutoffDate.toISOString().split("T")[0];
-
+  const boardIndex = await Promise.race([
+    getMondayBoardIndex(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Monday lookup timeout 20s")), 20000)),
+  ]).catch((e) => {
+    console.warn("[cascade] Monday board index failed:", e.message);
+    statusEl.textContent = `⚠ Monday no respondió (${e.message}) — sigo sin filtro de ejecutivos`;
+    return new Map();
+  });
   let filteredCount = 0;
 
+  // Bloqueado SI: está en Monday Y tiene estado distinto a "Ciclo Finalizado".
+  // Razón: si está en ciclo activo (LIVE / Propuesta / En Negociación / Rebotado /
+  // Descartado / etc.) no se debe re-prospectar. Solo los "Ciclo Finalizado" son
+  // recyclables y aparecen en cascade aunque ya estén cargados en Monday.
   const isBlockedByExec = (domain) => {
     const clean = domain.replace(/^www\./, "").toLowerCase();
     const info  = boardIndex.get(clean);
-    if (!info) return false;
-    return info.ejecutivo &&
-           info.ejecutivo !== state.mediaBuyer &&
-           info.fecha     >= cutoffStr;
+    if (!info) return false;                         // no está en Monday → libre
+    const estado = (info.estado || "").trim();
+    if (!estado) return false;                       // sin estado → no bloquear
+    return estado.toLowerCase() !== "ciclo finalizado"; // bloquea todo lo demás
   };
 
   const passesFilters = (site) => {
@@ -7531,7 +7730,10 @@ function initProspectCard(card, data) {
     const chipFor = (e) => {
       const cached = _emailVerifyCache.get(e);
       const cls    = cached ? _verifyClass(cached) : "verify-pending";
-      return `<div class="email-chip ${cls}" data-email="${esc(e)}" title="Verificando…">${esc(e)}</div>`;
+      const src    = state.emailSources.get(e) || "";
+      const g      = _emailGrade(e, cached, src);
+      const gb     = `<span class="email-grade email-grade-${g.grade}" title="${esc(g.label)}">${g.grade}</span>`;
+      return `<div class="email-chip ${cls}" data-email="${esc(e)}" title="Verificando…">${gb}${esc(e)}</div>`;
     };
 
     let html = visible.map(chipFor).join("");

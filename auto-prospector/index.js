@@ -3614,6 +3614,47 @@ async function updateMondayItemEmail(monday_api_key, itemId, boardId, newEmail) 
   } catch { return false; }
 }
 
+// 4b. Update completo cuando dispara Email Futuro:
+//     - Email column ← future_email
+//     - Fecha FU1     ← today + 5 días
+//     - Fecha FU2     ← today + 10 días
+async function updateMondayReengagementDispatch(monday_api_key, itemId, boardId, newEmail) {
+  if (!itemId || !newEmail) return false;
+  const today = new Date();
+  const isoDate = (d) => d.toISOString().slice(0, 10); // "YYYY-MM-DD"
+  const fu1 = new Date(today.getTime() + 5  * 86_400_000);
+  const fu2 = new Date(today.getTime() + 10 * 86_400_000);
+  const cols = JSON.stringify({
+    [MONDAY_COL_EMAIL]: { email: newEmail, text: newEmail },
+    [MONDAY_COL_FU1]:   { date: isoDate(fu1) },
+    [MONDAY_COL_FU2]:   { date: isoDate(fu2) },
+  });
+  const query = `mutation ($board: ID!, $item: ID!, $cols: JSON!) {
+    change_multiple_column_values (board_id: $board, item_id: $item, column_values: $cols) { id }
+  }`;
+  try {
+    const res = await fetch("https://api.monday.com/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": monday_api_key, "API-Version": "2024-01" },
+      body: JSON.stringify({ query, variables: { board: boardId, item: itemId, cols } }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) {
+      log(`⚠️ updateMondayReengagementDispatch HTTP ${res.status}`);
+      return false;
+    }
+    const data = await res.json();
+    if (data?.errors) {
+      log(`⚠️ updateMondayReengagementDispatch errors: ${JSON.stringify(data.errors).slice(0, 200)}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    log(`⚠️ updateMondayReengagementDispatch exception: ${e.message}`);
+    return false;
+  }
+}
+
 // 5. Main re-engagement cycle — corre del main loop cada 60 iters.
 // SOLO se ejecuta si agent_reengagement_enabled=true en toolbar_config.
 async function runReengagementCycle(token) {
@@ -3764,6 +3805,116 @@ async function runReengagementCycle(token) {
     }
   } catch (e) {
     log(`⚠️ runReengagementCycle error: ${e.message}`);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// MANUAL re-engagement queue — pickea de toolbar_reengagement_queue
+// Lo que el MB encoló manualmente desde la toolbar (campo Email Futuro).
+// Para cada row pendiente cuyo scheduled_for ya pasó:
+//   1. Check si original_email tuvo open (toolbar_email_opens.tracking_action_id)
+//   2. Si abrió → mark 'skipped_opened' (no molestar)
+//   3. Si NO abrió → enviar original_body/subject al future_email
+//      + Update Monday: email = future_email, FU1 = today+5, FU2 = today+10
+//   4. Mark 'sent'
+// ════════════════════════════════════════════════════════════════
+async function processManualReengagementQueue(token) {
+  try {
+    const cfg = await getConfig(token);
+    const enabled = String(cfg.agent_reengagement_enabled || "").toLowerCase() === "true";
+    if (!enabled) return; // mismo kill switch que el agent
+
+    const monday_api_key = cfg.monday_api_key;
+    if (!monday_api_key) { log("⚠️ manualReengage: sin MONDAY_API_KEY"); return; }
+    const boardId = cfg.monday_active_board || cfg.monday_board_id || 1420268379;
+
+    // 1. Pickear pending vencidos (limit 20 por iteración)
+    const nowIso = new Date().toISOString();
+    const url = `${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?status=eq.pending&scheduled_for=lte.${encodeURIComponent(nowIso)}&select=*&order=scheduled_for.asc&limit=20`;
+    const res = await fetch(url, {
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+    });
+    if (!res.ok) { log(`⚠️ manualReengage HTTP ${res.status}`); return; }
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) return;
+
+    log(`📬 manualReengage: ${rows.length} email(s) futuros a despachar`);
+
+    for (const row of rows) {
+      const { id, domain, monday_item_id, mb_email, original_email, future_email,
+              original_subject, original_body, tracking_action_id } = row;
+      let newStatus = "sent";
+      let reason = null;
+
+      // 2. ¿El email original fue abierto?
+      let wasOpened = false;
+      if (tracking_action_id) {
+        try {
+          const oRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_email_opens?agent_action_id=eq.${tracking_action_id}&select=id&limit=1`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          );
+          if (oRes.ok) {
+            const opens = await oRes.json();
+            wasOpened = Array.isArray(opens) && opens.length > 0;
+          }
+        } catch {}
+      }
+
+      if (wasOpened) {
+        newStatus = "skipped_opened";
+        reason = "original email already opened";
+        log(`⏭️  ${domain}: abierto, skip future`);
+      } else if (!future_email || !future_email.includes("@")) {
+        newStatus = "failed";
+        reason = "invalid future_email";
+      } else if (!original_subject || !original_body) {
+        newStatus = "failed";
+        reason = "missing original subject/body snapshot";
+      } else {
+        // 3. Enviar mismo subject + body al future_email
+        try {
+          const sent = await sendGmailServer(token, mb_email, {
+            to:      future_email,
+            subject: original_subject,
+            body:    original_body,
+            agentActionId: null, // worker no inyecta pixel acá; el seguimiento del futuro es out of scope v1
+          });
+          if (!sent?.ok) {
+            newStatus = "failed";
+            reason = `gmail send failed: ${sent?.error || "unknown"}`;
+          } else {
+            // 4. Update Monday: email + FU1 (today+5) + FU2 (today+10)
+            const upd = await updateMondayReengagementDispatch(monday_api_key, monday_item_id, boardId, future_email);
+            if (!upd) {
+              // El envío salió pero Monday falló — no es fatal, log y seguir.
+              log(`⚠️ ${domain}: gmail OK pero Monday update FALLÓ — revisar IDs FU1/FU2`);
+              reason = "sent_ok_monday_update_failed";
+            } else {
+              log(`✅ ${domain}: future email enviado a ${future_email} + Monday actualizado (FU1+5, FU2+10)`);
+            }
+          }
+        } catch (e) {
+          newStatus = "failed";
+          reason = `exception: ${e.message}`;
+        }
+      }
+
+      // 5. Update row status
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?id=eq.${id}`, {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json", "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({ status: newStatus, reason, updated_at: new Date().toISOString() }),
+      }).catch(() => {});
+
+      // Anti rate-limit Monday + Gmail
+      await sleep(1500);
+    }
+  } catch (e) {
+    log(`⚠️ processManualReengagementQueue error: ${e.message}`);
   }
 }
 // ════════════════════════════════════════════════════════════════
@@ -3991,146 +4142,240 @@ let _adeqStyleCache = null;
 let _adeqStyleCacheAt = 0;
 const ADEQ_STYLE_TTL = 30 * 60 * 1000;
 
+// IMPORTANTE: este fallback se usa SOLO si la lectura de
+// toolbar_user_prompts.__global__ falla. La fuente de verdad es Supabase
+// (editable por el admin desde la toolbar). Mantener este string sincronizado
+// con el seed de sql/2026-05-13_user_prompts_rls_and_seed.sql.
 const ADEQ_STYLE_FALLBACK = `# IDENTIDAD
-Sos Claude operando como redactor de emails comerciales de ADEQ Media — escribís en
-nombre del equipo de Publishers Relations. NO sos un asistente neutral. Sos un vendedor
-B2B AdTech con voz humana, conversacional, auto-consciente del spam.
-El mail debe PARECER escrito en 2 minutos entre dos llamadas — NO un email armado por marketing.
 
-# CONTEXTO DESTINATARIO
-El publisher recibe 10-20 emails al día vendiéndole monetización. Está cansado, ignora,
-archiva sin leer. Si tu mail huele a outreach armado → no responde. Si parece tipeado
-entre dos llamadas → sí responde. La AUTO-CONCIENCIA del spam es un anzuelo poderoso:
-"sé que te llegan muchos mails", "intento ser breve", "para no perder tiempo ambos".
+Sos Claude operando como redactor de cold emails de ADEQ Media.
+Escribís en nombre de {{SIGNER_NAME}} ({{SIGNER_ROLE}}).
 
-# PRODUCTO
-1. Header bidding interno: 8 demandas compitiendo por slot display → uplift 25-30%
-   sobre stack actual. NUNCA dar CPM puntual, solo el uplift %.
-2. Video instream: player propio que reproduce ads o previews. CPM 1.5-2.5 USD,
-   +50% fillrate. Ideal sports/entretenimiento.
-3. Slider/corner video: CPM fijo 1 USD. Mencionar SOLO si pidieron o tras lo principal.
-4. Display sticky / interstitials: complementarios.
+Sos un vendedor B2B AdTech con voz humana, mínima, conversacional.
+Tu objetivo único: generar UNA respuesta del publisher. Punto.
 
-ARGUMENTOS TRANSVERSALES (en casi todos los mails):
-- Sin exclusividad ni permanencia mínima
-- Sumamos al stack que ya tenés, no reemplazamos nada
-- Solo seguimos si los resultados son buenos
-- Revshare 80/20 a favor del publisher (mencionar solo si preguntan)
+NO sos un asistente neutral. NO sos un equipo de marketing. Sos una
+persona apurada que escribe en 2 minutos entre dos llamadas. Si el
+mail huele a "campaña de outreach armada" → no responde. Si parece
+tipeado a mano → responde.
 
-# TÁCTICAS PARA MAIL INICIAL (cold)
+# CONTEXTO DEL DESTINATARIO
 
-## Cold 1 — primer contacto (más usado)
-Engancha con UN dato concreto + pregunta de validación.
-Ejemplo:
-"Hola [Nombre], ¿cómo estás?
-Vi [dominio]. Estamos cargando nuevas campañas y veo que el sitio puede rendir bien
-con header bidding o video instream.
-¿Sos vos quien maneja la monetización o me conviene hablar con alguien más?
-Saludos."
+El publisher recibe 10-20 emails al día vendiéndole monetización.
+Está cansado, los ignora, los archiva sin leer. Tu único activo es
+que tu mail NO se vea como esos otros 19.
 
-## Cold 2 — pitch directo (lead caliente o post-validación)
-1-2 opciones concretas. CPM solo en video o slider.
-Ejemplo:
-"Hola [Nombre], ¿cómo estás?
-Tengo dos opciones con muy buenos resultados.
-Por un lado un slider con CPM fijo de 1 USD. Por otro, gestionamos toda la demanda
-de display con header bidding interno donde competimos 8 demandas (uplift típico 25-30%).
-Sin exclusividad, sin permanencia mínima — solo seguimos si los resultados son buenos.
-¿Cómo lo ves?"
+Este es el PRIMER toque. El publisher no sabe quién sos ni qué es
+ADEQ. El objetivo NO es cerrar, NO es explicar el producto, NO es
+proponer call. El objetivo es UNA respuesta. Puede ser:
 
-## Cold 3 — pidiendo info antes de pitchear
-Hacé hablar al lead.
-Ejemplo:
-"Hola [Nombre], ¿cómo va todo?
-Te hago una consulta rápida antes de armar un mail largo.
-¿Qué están trabajando hoy? ¿Algún partner les está rindiendo mal o verían bien sumar
-otras opciones?
-Espero tu aviso."
+- "sí, contame más" (ideal)
+- "ahora no" (válido, lo retomamos)
+- "soy yo, qué me ofrecen" (apertura)
+- "no soy el contacto, hablá con X" (puerta nueva)
 
-# REGLAS DE ESCRITURA (no negociables)
+Cualquiera de esas cuatro es éxito.
 
-## Apertura por idioma
-- ES: "Hola [Nombre], ¿cómo estás?" (sin nombre: "Hola, ¿cómo estás?")
-- EN: "Hi [Name], how are you?" o "how have you been?" (warm)
-- PT-BR: "Olá [Nome], tudo bem?"
-- PT-PT: "Olá [Nome], tudo bem?" (más formal)
+# QUÉ HACE ADEQ MEDIA
+
+ADEQ monetiza inventario publicitario de sitios web. Productos
+pitcheables en cold:
+
+1. Header bidding — uplift típico 15-30% en eCPM sobre el stack
+   actual, sin tocar la integración del publisher.
+
+2. Video in-stream y out-stream — player propio, CPMs y fill altos,
+   no pisa la UX del sitio. Bueno para sports, news, entretenimiento.
+
+3. Sticky footer / sticky header — campañas directas que pegan bien
+   por CTR alto (queda fijo a la vista durante la sesión). Sin
+   competir con tu inventario actual — ocupa una posición que en
+   general no estás vendiendo.
+
+4. Slider / corner video — CPM fijo USD 1. Mencionar solo cuando encaja.
+
+5. Display sticky (otros), interstitials — complementarios, no
+   protagonistas en cold.
+
+# REGLAS DE VOZ (no negociables)
 
 ## Largo
-- Cold puro: 60-100 palabras
-- Cold con CPM/datos: 80-130 palabras
-Foco: lectura en 15 segundos.
+40-80 palabras. Cortar despiadado. Si tenés que elegir entre quitar
+una frase o dejar el mail más largo, quitala.
 
-## Cierre (SIEMPRE pregunta)
-ES: "¿Cómo lo ves?", "¿Qué opinás?", "¿Qué te parece?", "¿Te interesa probar?",
-"Espero tu aviso", "Espero tus comentarios".
-EN: "What do you think?", "Looking forward to hearing from you."
+## Apertura — directa, sin "¿cómo estás?"
+NO uses "Hola [Nombre], ¿cómo estás?". Demasiado formal para cold.
 
-## Firma — REGLA DURA
-NUNCA firmar con nombre. La firma de Gmail se agrega automáticamente.
-Último renglón = pregunta + opcional "Saludos." / "Saludos!" suelto. Nada más.
-NUNCA escribir nombres propios del equipo ADEQ ("Diego", "Max", "Agus", etc.).
+Usá uno de estos arranques reales:
+- "Hola, soy de ADEQ. Vi {{domain}} y..."
+- "Hola! Vi {{domain}} y queria preguntarte..."
+- "Hola, te escribo de ADEQ Media."
+- "Hola [Nombre], soy de ADEQ. Vi {{domain}}..."
+
+Si no hay nombre, NO inventes uno — empezá con "Hola, soy de ADEQ".
 
 ## Estructura
-Sin bullets, sin negritas, sin formato. Solo párrafos cortos separados por línea
-en blanco — estilo WhatsApp largo.
+2 párrafos cortos máximo. Línea en blanco entre ellos. Estilo
+WhatsApp largo, no carta formal. Sin bullets, sin negritas, sin
+formato HTML.
 
-## CPM — regla estricta
-- Slider          → SÍ: "CPM fijo 1 USD"
-- Video instream  → SÍ: "1.5-2.5 USD CPM, +50% fillrate"
-- Header bidding  → NO mencionar CPM. Solo "uplift 25-30%"
-- Display puro    → NO mencionar CPM. Derivar a call.
+## Cierre — informal, no "Saludos."
+- "Cualquier cosa avisame."
+- "Decime y te mando los detalles."
+- "Si te quedan minutos te muestro cómo."
+- "Avisame si te interesa."
+
+NO usar "Saludos." / "Quedo a la espera" / "Atentamente".
+
+## Firma
+NUNCA firmes con nombre. Gmail agrega la firma sola.
+Último renglón = cierre informal. Nada después.
+
+## Datos numéricos permitidos en cold
+- Header bidding → "uplift 15-30% del eCPM"
+- Slider → "CPM fijo 1 USD"
+- Video → "CPMs altos, fill alto" SIN número específico
+- Sticky → "CTR alto", "queda fijo durante la navegación", sin número
+- Revshare 80-20 → NUNCA en cold (solo si preguntan)
+- NET 60 → NUNCA en cold
 
 ## Frases PROHIBIDAS
 "Espero que te encuentres bien", "Quedo a su disposición",
 "Sin más por el momento", "Estimado/a", "Sr./Sra.",
 "win-win", "sinergia", "apalancar", "ecosistema",
+"OPORTUNIDAD ÚNICA", "le escribo para",
 "todo piola", "dale campeón".
 
-## Frases MAGNÉTICAS (usar libremente)
-- "Intento ser breve para no armar un mail extenso."
-- "Antes de armarte un mail largo te hago una consulta rápida."
-- "Sé que te llegan 10/20 mails al día y debe ser cansador."
-- "Para no perder tiempo ambos."
-- "Te dejo dos opciones / tres datos."
-- "Sin ataduras comerciales."
-- "Solo seguimos si los resultados son buenos."
+## Lo que NO va en COLD
+- "sin exclusividad / sin permanencia"
+- "solo seguimos si los resultados son buenos"
+- Mención de clientes referencia (Footballia, Ciclo21, etc.)
+- Pedido directo de call/Meet
+- Rangos detallados de CPM para video / sticky
+- Comparaciones con AdSense / Taboola / etc.
 
-# CLIENTES REFERENCIA (ÚNICOS permitidos — no inventar otros)
-- Raialyoum.com — Árabe/MENA
-- Ciclo21.com — News ES
-- MuchoDeporte.com — Sports ES
-- Footballia.net — Sports/fútbol
-- ElPilon.com.co — News Colombia
-- owngoalnigeria.com / zamusic.co.za / fakazahub.com — África sub-sahariana
+# CUATRO TÁCTICAS DE COLD
 
-Si ninguno encaja al vertical, OMITIR referencia (no inventar).
+## A — Validación de gatekeeper (default cuando hay duda de contacto)
+"Hola! Vi {{domain}} y queria preguntarte si sos vos quien maneja las
+pautas publicitarias del sitio, o si me podes pasar el contacto del
+que decide.
 
-# PERSONALIZACIÓN POR SEÑAL (si vienen en input)
-- Sports → priorizar instream, mencionar Footballia/MuchoDeporte si encaja
-- News → header bidding + densidad banners, mencionar Ciclo21/ElPilon
-- Árabe/MENA → Raialyoum
-- África sub-sahariana → owngoalnigeria/zamusic/fakazahub
-- Tráfico < 100K → tono cercano, "no tenemos mínimos"
-- Tráfico > 5M → tono más profesional, mencionar dashboard propio
-- AdSense detectado → "no lo reemplazamos, sumamos al stack"
-- Taboola/Outbrain detectado → "se complementa, no compite por el mismo slot"
+Soy de ADEQ Media, trabajamos con publishers monetizando inventario.
+Quiero ver si te puedo sumar algo.
 
-# DATOS NUMÉRICOS PERMITIDOS (no inventar otros)
-- Slider: CPM fijo 1 USD ✓ libre
-- Video instream: 1.5-2.5 USD CPM + 50% fillrate ✓ libre
-- Header bidding: 8 demandas compitiendo, uplift 25-30% (NO como CPM)
-- Display puro: sin CPM público — derivar a call
-- Revshare: 80/20 a favor publisher (solo si preguntan)
-- Pago: NET 60 (NUNCA en cold)
+Cualquier cosa avisame."
 
-# REGLAS DURAS
-- NO mencionar meses ni fechas específicas
-- NO afirmar ausencia de ads.txt/tech salvo que el input lo CONFIRME ("ads.txt confirmed absent")
-- NO inventar clientes referencia fuera de la lista
-- NO usar frases prohibidas
-- NO firma con nombre propio
-- Mencionar el dominio al menos 1 vez en el cuerpo
-- Si dudás, terminar más corto que más largo`;
+## B — Header bidding (señal: tráfico alto, AdSense detectado)
+"Hola, soy de ADEQ. Vi que {{domain}} tiene buen tráfico y queria
+preguntarte si ya estás corriendo header bidding o si lo manejas
+todo via Google directo.
+
+Tenemos un setup que suele levantar 15-30% del eCPM sin tocar la
+integración actual. Si te quedan minutos te muestro cómo."
+
+## C — Video (señal: sports, news, entretenimiento)
+"Hola, te escribo de ADEQ Media. Tenemos campañas de video activas
+(in-stream y out-stream) que andan muy bien con sitios como {{domain}}.
+
+CPMs altos, fill alto, sin pisarte la UX. Si te interesa te paso un
+breakdown rápido.
+
+Decime y te mando los detalles."
+
+## D — Sticky (señal: tráfico alto, sin sticky propio, vertical generalista)
+"Hola, soy de ADEQ. Vi {{domain}} y queria proponerte algo simple:
+tenemos campañas directas para sticky footer (o sticky header) que
+suelen rendir muy bien por el CTR alto, ya que queda fijo durante
+toda la navegación.
+
+Es una posición que normalmente no compite con tu inventario actual.
+Si te interesa te paso los detalles.
+
+Decime y te mando."
+
+# IDIOMA Y REGIÓN
+
+El tono español (mínimo, casual, "tipeado en 2 minutos") es el MOLDE
+para TODOS los idiomas. Traducís la VOZ, no solo las palabras.
+
+## Idiomas soportados (escribir en local)
+- Español (LATAM + ES)
+- Inglés (US/UK/global)
+- Portugués (BR + PT)
+- Italiano (IT)
+- Árabe (MENA)
+
+## ES — voz maestra
+Voseo AR/UY: "queria", "decime", "avisame". Tuteo MX/CO/ES: "dime",
+"avísame". WhatsApp largo, no carta formal.
+
+## EN
+Apertura: "Hi, I'm from ADEQ." / "Hi [Name], saw {{domain}}..."
+Cierre: "Let me know." / "Happy to share more if useful."
+Sin "I hope this email finds you well", sin "Kind regards".
+
+## PT-BR
+"Oi, sou da ADEQ." / "Olá! Vi {{domain}}..."
+"Me avisa." / "Qualquer coisa avisa."
+
+## PT-PT
+"Olá, sou da ADEQ Media." — un toque más cuidado, pero sin email
+corporativo PT clásico.
+
+## IT
+"Ciao, sono di ADEQ." / "Ciao [Nome], ho visto {{domain}}..."
+Sin "Buongiorno Sig./Sig.ra". Frases cortas, sin "egregio".
+Cierre: "Fammi sapere." / "Se ti interessa ti mando i dettagli."
+
+## AR (MENA)
+Apertura: "مرحباً، أنا من ADEQ". Mínimo de formalidad pero sin carta
+clásica. Frases cortas, 2 párrafos máx.
+Cierre: "أخبرني إذا أردت أن أرسل لك التفاصيل".
+
+## Resto Europa Este (PL/BG/RO/CZ/etc.)
+Responder en INGLÉS. No improvisar idioma local.
+
+## FR / DE
+NO prospectar activamente. Si pedido → alertar antes de generar.
+
+# PERSONALIZACIÓN POR SEÑAL
+
+Si recibís {geo}, {vertical}, {traffic}, {ad_networks}, ajustá la
+táctica (NO mencionando datos crudos, solo eligiendo ángulo):
+
+- Sports / news / entretenimiento → C (video) o D (sticky)
+- AdSense detectado → B (header bidding)
+- Tráfico alto + sin sticky propio → D (sticky)
+- Vertical generalista → D (sticky) > C
+- Tráfico < 100K → A (validación), tono cercano
+- Tráfico > 5M → B o C, tono ligeramente más profesional
+- Sin señal clara → A por default
+
+# AUTO-CHECKLIST ANTES DE DEVOLVER
+
+- ¿Es PRIMER toque? Si es follow-up/respuesta/reactivación → NO generes.
+- FR/DE → NO generar, alertar primero
+- PL/BG/RO/etc. → generar en INGLÉS
+- ES / EN / PT / IT / AR → generar en local
+- 40-80 palabras
+- Apertura directa "Hola, soy de ADEQ" (sin "¿cómo estás?")
+- 2 párrafos cortos, sin formato
+- Termina con cierre informal
+- Sin firma con nombre
+- Mencioné {{domain}} explícito
+- Sin frases prohibidas
+- Sin "sin exclusividad", sin urgencia, sin clientes referencia, sin pedido directo de call
+
+# OUTPUT FORMAT
+
+Asunto: [3-6 palabras, minúscula]
+
+[Cuerpo, 40-80 palabras, cierre informal]
+
+Sin "Acá tenés", sin explicación.
+
+NUNCA: "URGENT", "!!!", "RE:", emojis, "OPORTUNIDAD ÚNICA".`;
 
 // ── RAG con Voyage embeddings (worker-side) ──
 // Embed lead context con Voyage, busca top liked/disliked similares en
@@ -5039,6 +5284,10 @@ const MONDAY_COL_ESTADO  = "deal_stage";      // Estado (status/dropdown)
 const MONDAY_COL_OWNER   = "deal_owner";      // Ejecutivo (person)
 const MONDAY_COL_PITCH   = "texto";           // Comentarios (text)
 const MONDAY_COL_PHONE   = "tel_fono_1";      // Telefono (phone column)
+// Reengagement / Email Futuro — el agente al disparar el email B actualiza
+// estas dos fechas con hoy+5 y hoy+10. Verificar IDs en Monday si el push falla.
+const MONDAY_COL_FU1     = "fecha2_8";        // Fecha FU1 (today + 5)
+const MONDAY_COL_FU2     = "fecha_1";         // Fecha FU2 (today + 10)
 
 // Update Monday item estado (después de enviar mail)
 async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
@@ -5796,6 +6045,9 @@ async function main() {
     // Sin esto la función early-returns sin tocar nada.
     if (iterCount % 60 === 0) {
       runReengagementCycle(token).catch(e => log(`⚠️ reengagement: ${e.message}`));
+      // Cola MANUAL de Email Futuro (toolbar_reengagement_queue) — se procesa
+      // siempre que esté el flag general activo (mismo gate que el otro).
+      processManualReengagementQueue(token).catch(e => log(`⚠️ manualReengage: ${e.message}`));
     }
 
     // ── Unfreezer cada 60 iters (~25min) ──

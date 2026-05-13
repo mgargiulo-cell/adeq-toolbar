@@ -184,7 +184,24 @@ async function apolloSearchPage(domain, apiKey, withTitleFilter, page = 1) {
     contact_email_status: ["verified", "likely_to_engage", "guessed"],
   };
   if (withTitleFilter) {
-    body.person_titles = ["CEO","founder","co-founder","owner","publisher","editor","director","head","VP","manager","sales","marketing","business development"];
+    // Priorizamos titles relevantes a AdTech / monetización / publishing /
+    // dev / digital marketing. Apollo hace OR de toda la lista. El ranking
+    // posterior (rankApolloPerson) se encarga de priorizar adentro.
+    body.person_titles = [
+      // AdTech / monetización (lo más relevante para ADEQ)
+      "ad ops","adops","ad operations","ads","advertising","advertisement",
+      "monetization","monetisation","programmatic","yield","revenue",
+      "traffic","inventory","media buyer","media buying","media",
+      "publisher","publishing","publicidad","publicista","comercial",
+      // Digital / online / marketing
+      "digital","online","digital marketing","marketing","growth",
+      "audience","content","editorial","editor",
+      // Tech / dev (publishers chicos suelen tener al dev a cargo de ad stack)
+      "developer","web developer","webmaster","cto","tech lead","engineer",
+      // Decisor genérico (fallback)
+      "CEO","founder","co-founder","owner","director","head","VP","manager",
+      "business development","sales",
+    ];
   }
 
   const res = await callProxy("apollo", "/v1/mixed_people/api_search", { method: "POST", body });
@@ -210,6 +227,55 @@ async function apolloSearch(domain, apiKey, withTitleFilter) {
     if (lastPagination && lastPagination.has_next_page === false) break;
   }
   return { people: allPeople, pagination: lastPagination };
+}
+
+// Clasifica títulos en 3 buckets para que la UI siempre muestre PRIMERO
+// las áreas que ADEQ quiere atacar (publicidad / marketing / online /
+// programador), luego un fallback genérico, y descarta del todo lo que
+// no decide pauta (HR/legal/finance/support).
+//   - "core" → publicidad, marketing, digital/online, dev/tech, ad ops, programmatic
+//   - "fallback" → C-suite / manager / business dev sin contexto ad/digital
+//   - "drop" → HR, legal, finance, customer support
+// Devuelve { bucket: "core"|"fallback"|"drop", score: number }
+function _rankApolloTitle(title) {
+  const t = (title || "").toLowerCase();
+  if (!t) return { bucket: "fallback", score: 1 };
+
+  // Drop — gente que NUNCA decide pauta publicitaria
+  if (/\b(hr|human resources|recursos humanos|recruit|talent|payroll|legal|abogad|attorney|counsel|finance|finanzas|accountant|contabil|customer (support|service|success)|soporte|qa|quality assurance)\b/.test(t)) {
+    return { bucket: "drop", score: -100 };
+  }
+
+  // Core — las 4 áreas que el user pidió (publicidad, marketing, online, programador)
+  // + adjacentes obvios (ad ops, programmatic, content/editorial, traffic)
+  if (/\b(ad\s?ops|ad operations|adops|monetizat|monetisa|programmatic|yield|revenue (manager|director|lead|ops)|inventory|media (buyer|buying|director|manager))\b/.test(t)) {
+    return { bucket: "core", score: 100 };
+  }
+  if (/\b(publisher|publishing|publicidad|publicista|ads? (manager|director|lead|ops)|advertising|advertisement)\b/.test(t)) {
+    return { bucket: "core", score: 95 };
+  }
+  if (/\b(digital marketing|growth (lead|head|director|manager)|digital (director|manager|lead|head)|online (director|manager|lead))\b/.test(t)) {
+    return { bucket: "core", score: 90 };
+  }
+  if (/\b(marketing|digital|online|growth|audience|content|editorial|editor|traffic|comercial)\b/.test(t)) {
+    return { bucket: "core", score: 80 };
+  }
+  // Programador / dev / tech
+  if (/\b(cto|tech (lead|director|head)|web (developer|master)|webmaster|developer|engineer|programador|programmer)\b/.test(t)) {
+    return { bucket: "core", score: 70 };
+  }
+
+  // Fallback — C-suite y management genérico, solo se usa si no hay nadie de las áreas core
+  if (/\b(ceo|founder|co-founder|owner|president|managing director)\b/.test(t)) {
+    return { bucket: "fallback", score: 50 };
+  }
+  if (/\b(vp|vice president|director|head of|head)\b/.test(t)) {
+    return { bucket: "fallback", score: 30 };
+  }
+  if (/\b(manager|lead|business development|sales)\b/.test(t)) {
+    return { bucket: "fallback", score: 20 };
+  }
+  return { bucket: "fallback", score: 5 };
 }
 
 function mapApolloPerson(p) {
@@ -355,7 +421,19 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
 
   // ── Paso 2: Apollo mixed_people/search por dominio + títulos ──
   const diag = await apolloDomainSearch(cleanDomain, null);
-  const primary = diag.valid[0] || null;
+  // Clasificar válidos por bucket (core / fallback / drop) y ordenar:
+  //   1) SIEMPRE primero los del bucket "core" (publicidad/marketing/online/dev)
+  //   2) Después fallback (C-suite/manager) — solo se elige como primary si no hay core
+  //   3) "drop" se descarta del todo (HR/legal/finance/support nunca se sugieren)
+  const classified = diag.valid.map((p, i) => ({ p, ...(_rankApolloTitle(p.title)), idx: i }))
+    .filter(x => x.bucket !== "drop");
+  const core     = classified.filter(x => x.bucket === "core").sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+  const fallback = classified.filter(x => x.bucket === "fallback").sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+  // Core arriba de todo, fallback debajo. La UI renderiza en este orden.
+  diag.valid = [...core, ...fallback].map(x => x.p);
+  // Auto-pick: SOLO de las áreas relevantes. Si no hay core, no auto-revelamos
+  // un C-suite genérico — dejamos primary en null para que el user decida.
+  const primary = core.length > 0 ? core[0].p : null;
 
   let note = "";
   if (diag.httpError)               note = `Apollo API error: ${diag.httpError}`;

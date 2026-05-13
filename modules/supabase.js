@@ -224,6 +224,80 @@ export async function setCustomPrompt(accessToken, userEmail, value) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
+// ── Manual send tracking — inserta una fila en toolbar_agent_actions
+// ANTES de mandar el email, así obtenemos el id y lo embedeamos en un
+// pixel <img src="track-open?aid=ID"/> dentro del body. Cuando el
+// destinatario abre, la Edge Function track-open inserta en
+// toolbar_email_opens(agent_action_id=ID), y el worker de reengagement
+// puede detectar "no abierto" comparando ambas tablas.
+export async function createManualSendTracking(accessToken, payload) {
+  // payload: { user_email, domain, email_to, pitch_subject, language }
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !payload?.user_email) return { ok: false, error: "auth required" };
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_agent_actions`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json", "Prefer": "return=representation",
+      },
+      body: JSON.stringify({
+        user_email:    (payload.user_email || "").toLowerCase(),
+        domain:        (payload.domain || "").toLowerCase(),
+        action:        "sent",
+        email_to:      payload.email_to || null,
+        pitch_subject: payload.pitch_subject || null,
+        details:       { source: "toolbar_manual", language: payload.language || null },
+      }),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, status: res.status, error: txt.slice(0, 200) };
+    }
+    const rows = await res.json().catch(() => []);
+    const id = Array.isArray(rows) ? rows[0]?.id : rows?.id;
+    return { ok: true, id };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ── Email Futuro / Reengagement queue ─────────────────────────
+// Encola un email "futuro" para que el agente lo envíe a los 11d si el
+// primer email no fue abierto. Update Monday columns: email + FU1 + FU2.
+export async function queueReengagement(accessToken, payload) {
+  // payload: { domain, monday_item_id, mb_email, original_email, future_email }
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !payload?.future_email) return { ok: false, error: "missing data" };
+  const scheduled = new Date(Date.now() + 11 * 86_400_000).toISOString();
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_reengagement_queue`, {
+      method: "POST",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({
+        domain:           (payload.domain || "").toLowerCase(),
+        monday_item_id:   payload.monday_item_id || null,
+        mb_email:         (payload.mb_email || "").toLowerCase(),
+        original_email:   payload.original_email,
+        future_email:     payload.future_email,
+        original_subject: payload.original_subject || null,
+        original_body:    payload.original_body || null,
+        tracking_action_id: payload.tracking_action_id || null,
+        scheduled_for:    scheduled,
+        status:           "pending",
+      }),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, status: res.status, error: txt.slice(0, 200) };
+    }
+    return { ok: true, scheduled_for: scheduled };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 // Carga las API keys desde toolbar_config (requiere JWT de usuario autenticado)
 export async function fetchApiKeys(accessToken) {
   const url = CONFIG.SUPABASE_URL;

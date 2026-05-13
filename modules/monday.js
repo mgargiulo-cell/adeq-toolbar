@@ -6,20 +6,33 @@ import { CONFIG } from "../config.js";
 
 const MONDAY_API = "https://api.monday.com/v2";
 
-async function mondayRequest(query) {
-  const response = await fetch(MONDAY_API, {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "Authorization": CONFIG.MONDAY_API_KEY,
-      "API-Version":   "2024-01",
-    },
-    body: JSON.stringify({ query }),
-  });
-  if (!response.ok) throw new Error(`Monday API error: ${response.status}`);
-  const json = await response.json();
-  if (json.errors) throw new Error(json.errors[0]?.message || "Error en Monday API");
-  return json.data;
+async function mondayRequest(query, { timeoutMs = 15000 } = {}) {
+  if (!CONFIG.MONDAY_API_KEY) {
+    throw new Error("Monday API key no cargada (sesión expirada o sin permisos)");
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const response = await fetch(MONDAY_API, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": CONFIG.MONDAY_API_KEY,
+        "API-Version":   "2024-01",
+      },
+      body: JSON.stringify({ query }),
+      signal: ctrl.signal,
+    });
+    if (!response.ok) throw new Error(`Monday API error: ${response.status}`);
+    const json = await response.json();
+    if (json.errors) throw new Error(json.errors[0]?.message || "Error en Monday API");
+    return json.data;
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`Monday timeout (${timeoutMs}ms)`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function checkDuplicate(domain) {
@@ -168,7 +181,8 @@ export async function getMondayBoardIndex() {
           name
           column_values(ids: [
             "${CONFIG.MONDAY_COLUMNS.ejecutivo}",
-            "${CONFIG.MONDAY_COLUMNS.fecha_contacto}"
+            "${CONFIG.MONDAY_COLUMNS.fecha_contacto}",
+            "${CONFIG.MONDAY_COLUMNS.estado}"
           ]) { id text }
         }
       }
@@ -184,10 +198,12 @@ export async function getMondayBoardIndex() {
       index.set(cleanDomain(item.name), {
         ejecutivo: col(CONFIG.MONDAY_COLUMNS.ejecutivo),
         fecha:     col(CONFIG.MONDAY_COLUMNS.fecha_contacto),
+        estado:    col(CONFIG.MONDAY_COLUMNS.estado),
       });
     }
     return index;
-  } catch {
+  } catch (e) {
+    console.warn("[getMondayBoardIndex] failed:", e.message);
     return new Map();
   }
 }

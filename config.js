@@ -38,6 +38,11 @@ export const CONFIG = {
     comentarios:     "texto",
     email:           "email_mm2edcd3",   // email column (was text_mkrwahsz)
     telefono:        "tel_fono_1",
+    // Reengagement / Email Futuro — el agente actualiza estas dos al disparar
+    // el envío automático del email_futuro (today+5 y today+10).
+    // Verificar IDs en Monday si el push falla.
+    fecha_fu1:       "fecha2_8",          // Fecha FU1 (today + 5 días)
+    fecha_fu2:       "fecha_1",           // Fecha FU2 (today + 10 días)
   },
 
   // ── General ────────────────────────────────────────────────────

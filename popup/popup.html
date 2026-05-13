@@ -499,6 +499,16 @@
         <button id="btn-apollo" class="btn btn-secondary btn-sm">👤 Apollo</button>
       </div>
       <div id="apollo-result" class="apollo-result"></div>
+
+      <!-- Email Futuro — se envía solo a los 11 días si el primer email no se abrió -->
+      <div id="email-futuro-block" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--surface-3)">
+        <label class="form-label" for="form-email-futuro" style="display:flex;align-items:center;gap:6px;font-size:11px">
+          ⏱️ <span>Email Futuro</span>
+          <span style="font-size:10px;font-weight:500;color:var(--text-muted);font-style:italic">(opcional — envío auto a los 11d si no abrieron el primero)</span>
+        </label>
+        <input id="form-email-futuro" class="form-input" type="email" placeholder="email-alternativo@sitio.com" autocomplete="off" />
+        <div id="email-futuro-status" style="font-size:10px;color:var(--text-muted);margin-top:4px"></div>
+      </div>
     </div>
 
     <!-- Banner Detector -->

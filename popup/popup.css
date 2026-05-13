@@ -690,6 +690,48 @@ input.form-pv-display { font-weight: 700; }
 .email-chip.verify-warn    { border-left: 3px solid #f59e0b; background: #fffbeb; }
 .email-chip.verify-bad     { border-left: 3px solid #dc2626; background: #fef2f2; color: #7f1d1d; opacity: 0.75; }
 .email-chip.verify-bad.selected { background: #fee2e2; border-color: #dc2626; color: #7f1d1d; opacity: 1; }
+
+/* Email Grade A-E — calidad relativa por email (al lado del verde/amarillo/rojo de verify) */
+.email-grade {
+  display: inline-block; font-size: 10px; font-weight: 800;
+  width: 18px; height: 18px; line-height: 18px; text-align: center;
+  border-radius: 50%; margin-right: 6px; vertical-align: middle;
+  color: #fff; flex-shrink: 0;
+}
+.email-grade-A { background: #16a34a; }  /* verde fuerte */
+.email-grade-B { background: #65a30d; }  /* verde-oliva */
+.email-grade-C { background: #ca8a04; }  /* ámbar */
+.email-grade-D { background: #ea580c; }  /* naranja */
+.email-grade-E { background: #dc2626; }  /* rojo */
+
+/* Botón para asignar email al slot futuro (envío auto a 11d).
+   Default: discreto a la derecha. Al ser SELECCIONADO como slot 2,
+   muta a círculo rojo grande para que el MB sepa que "ese es el 2". */
+.email-future-btn {
+  margin-left: auto; padding: 2px 7px; font-size: 10px; font-weight: 700;
+  background: #f3f4f6; color: #6b7280; border: 1px solid #d1d5db;
+  border-radius: 4px; cursor: pointer; flex-shrink: 0;
+  order: 999; /* asegura que quede a la derecha del todo */
+}
+.email-future-btn:hover { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
+
+/* Estado SELECCIONADO como slot 2 — círculo rojo prominente, derecha del todo */
+.email-chip.slot-future {
+  border-left-color: #dc2626 !important;
+  background: linear-gradient(90deg, #fef2f2 0%, transparent 100%) !important;
+}
+.email-chip.slot-future .email-future-btn {
+  width: 22px; height: 22px; padding: 0;
+  border-radius: 50%;
+  background: #dc2626; color: #fff; border: 2px solid #b91c1c;
+  font-size: 12px; font-weight: 800; line-height: 18px;
+  box-shadow: 0 1px 3px rgba(220, 38, 38, 0.4);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.email-chip.slot-future .email-future-btn:hover {
+  background: #b91c1c; transform: scale(1.05);
+}
+
 .email-src-badge {
   font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
   margin-left: 5px; padding: 1px 5px; border-radius: 3px;
