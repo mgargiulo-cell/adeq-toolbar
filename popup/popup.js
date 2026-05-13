@@ -2739,9 +2739,11 @@ function initTabs() {
       if (tabEl) tabEl.classList.add("active");
 
       // ── PASO 2: yield al browser para repaint ANTES del trabajo ──
-      // requestAnimationFrame + setTimeout(0) garantiza que el browser
-      // pinta los class changes antes que arranque el await pesado.
-      await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+      // BUG FIX 2026-05-13: rAF no dispara cuando side panel queda hidden
+      // → await colgaba para siempre → clicks acumulados → freeze total.
+      // Ahora usamos setTimeout(20) puro: yields al browser sin depender
+      // de visibility state.
+      await new Promise(resolve => setTimeout(resolve, 20));
 
       // ── PASO 3: Lazy load async (puede tardar pero la UI ya respondió)
       if (!loadedTabs.has(tabId)) {
