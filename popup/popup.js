@@ -1014,14 +1014,20 @@ async function loadAdminAgent() {
 }
 
 async function _refreshAgentStats(userEmail) {
+  // Bug fix 2026-05-13: counter contaba solo action='sent'. Ahora cuenta
+  // todas las variantes de send (sent + re_sent + bounce_retry_sent +
+  // monday_ok legacy) y normaliza email a lowercase para case-mismatch.
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   const cutoff24 = new Date(Date.now() - 24 * 3600_000).toISOString();
   const startToday = new Date(); startToday.setHours(0,0,0,0);
+  const emailLower = (userEmail || "").toLowerCase();
+  const userClause = `user_email=eq.${encodeURIComponent(emailLower)}`;
+  const sentActions = "action=in.(sent,re_sent,bounce_retry_sent,monday_ok)";
   try {
     const [sentRes, skipRes, failRes] = await Promise.all([
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${startToday.toISOString()}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.skipped&created_at=gte.${cutoff24}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.failed&created_at=gte.${cutoff24}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause}&${sentActions}&created_at=gte.${startToday.toISOString()}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause}&action=eq.skipped&created_at=gte.${cutoff24}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause}&action=in.(failed,monday_failed)&created_at=gte.${cutoff24}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
     ]);
     const parseCount = (res) => { const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/); return m ? parseInt(m[1]) : 0; };
     document.getElementById("agent-stat-sent").textContent    = parseCount(sentRes);
@@ -1039,10 +1045,11 @@ async function _refreshAgentFeed() {
     // respetamos ese filtro acá también. Default = todos los agentes.
     const userFilter = (document.getElementById("admin-filter-user")?.value || "").trim();
     const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
-    // SOLO acciones reales del agente: sent / failed / skipped / monday_failed / monday_ok
-    // (excluimos 'reserved' que es solo audit trail interno y duplica con 'sent').
+    // Acciones reales del agente — extendido 2026-05-13 para incluir
+    // re_sent (Email Futuro reengagement) y bounce_retry_sent (auto-retry
+    // tras hard bounce). Excluimos 'reserved' (audit trail interno).
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,failed,skipped,monday_failed,monday_ok,kill_switch)${userClause}&select=*&order=created_at.desc&limit=50`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,monday_ok,kill_switch)${userClause}&select=*&order=created_at.desc&limit=50`,
       { headers }
     );
     if (!res.ok) {
@@ -1053,8 +1060,8 @@ async function _refreshAgentFeed() {
     if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">No activity yet. Toggle ON to start.</div>'; return; }
     // Guardar para el botón CSV
     window._lastAgentFeedRows = rows;
-    const icons = { sent: "✅", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨" };
-    const colorMap = { sent: "#34d399", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444" };
+    const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨" };
+    const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
       const icon = icons[r.action] || "·";
