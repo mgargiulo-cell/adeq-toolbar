@@ -5990,10 +5990,10 @@ async function initCsvQueue() {
       // Dedupe
       const unique = [...new Set(domains)];
 
-      // Cap por tirada actualizado a 50 (decisión user 2026-05-11). Pre-check
-      // de waitlist global (300) se hace en el worker; acá solo el cap por tirada.
-      if (unique.length > 50) {
-        uploadRes.innerHTML = `❌ <strong>Too many domains:</strong> ${unique.length} found. Per-batch limit is <strong>50 domains</strong>. Split your CSV into smaller files (max 50 each).`;
+      // Cap por tirada actualizado a 500 (user 2026-05-13: 200 csv_queue + 300 waitlist).
+      // Pre-check de capacidad real (queue + waitlist) se hace abajo en getCsvQueueStats.
+      if (unique.length > 500) {
+        uploadRes.innerHTML = `❌ <strong>Too many domains:</strong> ${unique.length} found. Per-batch limit is <strong>500 domains</strong> (200 queue + 300 waitlist). Split your CSV into smaller files.`;
         uploadRes.className = "push-result error";
         return;
       }
