@@ -4772,6 +4772,10 @@ const _GL_LOCAL_PARTS = [
   "abuse","admin","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
   "trustandsafety","trust-?and-?safety","trust-?safety","safety","safety-?team","trust-?ops",
   "whois","registrant","registry","registrar","domain-?ops","domain-?abuse","ndomains",
+  // Manejo de dominios/DNS (caso real domains@latinregistrar.com.br se coló al agent 2026-05-13)
+  "domain","domains","domain-?master","domain-?admin","domain-?contact","domain-?renewal",
+  "dns","dns-?master","dns-?host-?master","dns-?admin","nic","nic-?host-?master",
+  "ssl","ssl-?cert","ssl-?admin","tls-?cert",
   "noreply","no-reply","donotreply","do-not-reply","do_not_reply","autoreply","auto-?reply","mailer-?daemon","mta","mailserver","mail-?server","mta-?admin",
   "bounce","bounced","mailer",
   "cert","cert-?admin","csirt","soc","noc","sysadmin","sys-?admin","netops","cert-?manager",
@@ -5043,6 +5047,9 @@ const GARBAGE_DOMAIN_PATTERN = new RegExp([
   "domainsbyproxy\\.com|whoisguard|whoisprivacy|whoisprotect|domainprotect|privacyprotect|contactprivacy|perfectprivacy|namebrightprivacy|withheldforprivacy|protect-?service|protectedmail|protecteddomainservices|panelregister|identity-?protect",
   // Registrars (B2B abuse desks)
   "dropped\\.|internetx\\.com|markmonitor|cscglobal|csc-corp|comlaude|safenames|gandi\\.net|key-systems|1api\\.net|netim\\.com|psi-usa|nameshield|epag\\.de|eurodns|realtimeregister|tld-box|enom\\.|networksolutions|tucows|porkbun\\.com|namecheap.*proxy|hostgator|bluehost|godaddyguard|hostafrica|dominio.*\\.com\\.|dominios?[a-z]+\\.ec|dominios?[a-z]+\\.com",
+  // Heurística genérica: cualquier dominio con palabra "registrar/registry/dnshosting/
+  // domainsby/domainservices/namehost" — caso real latinregistrar.com.br 2026-05-13
+  "(^|[.@])[a-z0-9-]*(?:registrar|registry|dnshosting|domainsby|domainservices|namehost|domainname)[a-z0-9-]*\\.",
   // GDPR masking
   "gdpr-?masked?|gdpr-?mask\\.com|gdpr-?protect|data-?protected|registrant-?private|domains[-._]?by[-._]?proxy|registry-?proxy",
   // Disposable/temp emails

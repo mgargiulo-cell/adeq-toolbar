@@ -81,6 +81,13 @@ const WHOIS_PROXY_LOCALS = new Set([
   "whoisrequest","whoisprivacy","whoisguard","domainabuse","domain-abuse",
   "abusereport","dns-admin","hostmaster","registrar","registrarcontact",
   "legal-notices","takedown","dmca",
+  // Buzones administrativos de manejo de dominios — nunca son contactos
+  // comerciales (case real: domains@latinregistrar.com.br lo agarró el agente).
+  "domains","domain","domainmaster","domain-admin","domainadmin",
+  "domain-contact","domaincontact","domain-renewal","domainrenewal",
+  "dns","dns-admin","dnsadmin","dnshostmaster","dnsmaster",
+  "nic","nichostmaster","ipadmin","ip-admin","networkadmin","network-admin",
+  "sslcert","ssl-cert","tlscertificate","ssl-admin",
 ]);
 
 // ── Garbage emails que NUNCA deben llegar a la UI ─────────────
@@ -96,6 +103,10 @@ const GARBAGE_LOCAL_PREFIXES = [
   "whois","whoisprivacy","whoisguard","whoisrequest",
   "takedown","dmca","copyright-claim","copyrightclaim","legal-notices","legalnotices",
   "domainabuse","domain-abuse","abusereport",
+  // Manejo de dominios / DNS / hosting — caso real domains@latinregistrar.com.br
+  "domains","domain","domainmaster","domain-admin","domainadmin",
+  "dns","dnsmaster","dnshostmaster","nichostmaster",
+  "ssl","ssl-admin","sslcert","tlscert","cert",
 ];
 const GARBAGE_DOMAIN_SUFFIXES = [
   // proxies/registrars
@@ -114,6 +125,11 @@ const GARBAGE_DOMAIN_SUFFIXES = [
  * Cubre proxies de WhoIs, buzones administrativos, mailer-daemon, abuse, etc.
  * Más permisivo que verifyEmail — éste sólo bloquea lo que es inservible per se.
  */
+// Heurística: el dominio del email contiene palabras de registrar/hosting/DNS,
+// nunca son prospects publishers. Ej: latinregistrar.com.br, godaddy-domains.com,
+// nameregistrar.io, dnshosting.net, domainservices.io, etc.
+const REGISTRAR_DOMAIN_REGEX = /\b(registrar|registry|dnshosting|domainsby|domainservices|namehost|domainname|whois|domainabuse)\b/i;
+
 export function isGarbageEmail(email) {
   if (!email || typeof email !== "string") return true;
   const e = email.toLowerCase().trim();
@@ -125,6 +141,9 @@ export function isGarbageEmail(email) {
   for (const d of GARBAGE_DOMAIN_SUFFIXES) {
     if (domain === d || domain.endsWith("." + d)) return true;
   }
+
+  // 1b. Heurística por palabra-clave en el dominio (registrar/dnshosting/etc)
+  if (REGISTRAR_DOMAIN_REGEX.test(domain)) return true;
 
   // 2. Local-part: prefijo administrativo. Aceptamos "abuse", "abuse-domain", "abuse_2024".
   for (const prefix of GARBAGE_LOCAL_PREFIXES) {
