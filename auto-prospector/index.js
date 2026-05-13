@@ -6255,6 +6255,30 @@ async function runAgentCycle(token, allFlags) {
         }).catch(() => null);
         reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id || null;
 
+        // Defense-in-depth: NUNCA mandar a un email cuyo dominio no matchea
+        // el lead.domain. Cubre el caso donde lead.emails se contaminó con
+        // emails de otro prospect (race condition, schema bug, etc.).
+        // Webmail (gmail/hotmail/etc.) permitidos — son personales válidos.
+        const _recipientDom = (email.split("@")[1] || "").toLowerCase();
+        const _leadDom      = domain.toLowerCase().replace(/^www\./, "");
+        const _isWebmail    = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/.test(_recipientDom);
+        const _domMatches   = _recipientDom === _leadDom
+                            || _recipientDom.endsWith("." + _leadDom)
+                            || _leadDom.endsWith("." + _recipientDom)
+                            || _isWebmail;
+        if (!_domMatches) {
+          log(`🚫 ${domain}: ABORT send — recipient ${email} no pertenece al domain del lead. Posible cache leak.`);
+          // Marcar reserved como aborted para no contar al cap
+          if (reservedId) {
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ action: "skipped", reason: "domain_mismatch_recipient" }),
+            }).catch(() => {});
+          }
+          continue; // próximo lead
+        }
+
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId });
 
         // PATCH reserved → sent ahora que confirmamos el envío
