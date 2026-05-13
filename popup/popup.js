@@ -408,13 +408,39 @@ function showPersonalQuotaBanner({ used, limit, pct }) {
   document.getElementById("cap-banner-detail").textContent = ` — ${used.toLocaleString()} / ${limit.toLocaleString()} hits este mes.`;
 }
 
+// Lock para evitar 2-3 pipelines en paralelo si el user clickea rapido o
+// dispara onUpdated multiple veces durante un page load.
+let _pipelineRunning = false;
+let _pipelinePendingDomain = null;
 function runAnalysisPipeline() {
-  runDuplicateCheck().catch(() => {});
-  runTrafficCheck().catch(() => {});
-  runEmailScraper().catch(() => {});
-  if (typeof runAuditCheck === "function")     runAuditCheck().catch(() => {});
-  if (typeof runBannerDetection === "function") runBannerDetection().catch(() => {});
-  if (typeof runPageContext === "function")    runPageContext().catch(() => {});
+  if (_pipelineRunning) {
+    // Otro pipeline en curso — guardamos el domain por si cambió, para
+    // re-correr cuando termine. Evita N pipelines paralelos.
+    _pipelinePendingDomain = state.domain;
+    return;
+  }
+  _pipelineRunning = true;
+  const startedDomain = state.domain;
+
+  const tasks = [
+    runDuplicateCheck().catch(() => {}),
+    runTrafficCheck().catch(() => {}),
+    runEmailScraper().catch(() => {}),
+  ];
+  if (typeof runAuditCheck === "function")     tasks.push(runAuditCheck().catch(() => {}));
+  if (typeof runBannerDetection === "function") tasks.push(runBannerDetection().catch(() => {}));
+  if (typeof runPageContext === "function")    tasks.push(runPageContext().catch(() => {}));
+
+  Promise.all(tasks).finally(() => {
+    _pipelineRunning = false;
+    // Si durante el pipeline cambió el domain, re-correr el nuevo
+    if (_pipelinePendingDomain && _pipelinePendingDomain !== startedDomain) {
+      _pipelinePendingDomain = null;
+      runAnalysisPipeline();
+    } else {
+      _pipelinePendingDomain = null;
+    }
+  });
 }
 
 // ============================================================
@@ -3362,8 +3388,17 @@ function addEmailsWithSource(emails, source, domainGuard = null) {
 }
 
 // Cache de resultados de verifyEmail para no re-verificar el mismo email
-// dentro de la misma sesión del side panel.
+// dentro de la misma sesión del side panel. LRU eviction a 2000 entries
+// para evitar crecimiento sin bound en sesiones largas (10K+ verifications).
 const _emailVerifyCache = new Map(); // email -> {valid, tags, reason, score}
+const _VERIFY_CACHE_MAX = 2000;
+function _evictVerifyCacheIfFull() {
+  if (_emailVerifyCache.size < _VERIFY_CACHE_MAX) return;
+  // Borrar el 20% más viejo (Map mantiene orden de inserción → primeros = más viejos)
+  const toRemove = Math.floor(_VERIFY_CACHE_MAX * 0.2);
+  const keys = _emailVerifyCache.keys();
+  for (let i = 0; i < toRemove; i++) _emailVerifyCache.delete(keys.next().value);
+}
 
 function _verifyClass(result) {
   if (!result) return "verify-pending";
@@ -3473,6 +3508,7 @@ async function autoVerifyEmailChips(listEl) {
       // verifyEmailDeep = local + remote (eva.pingutil con cache 30 días)
       try { result = await verifyEmailDeep(email); }
       catch { result = { valid: false, reason: "Error verifying", tags: ["error"] }; }
+      _evictVerifyCacheIfFull();
       _emailVerifyCache.set(email, result);
     }
     const cls = _verifyClass(result);
@@ -6904,11 +6940,15 @@ async function initAutopilot() {
     } catch {}
   };
   refreshAutopilotLiveStats();
-  setInterval(refreshAutopilotLiveStats, 10_000);
+  // Perf fix: guard module-level para no acumular intervals si initAutopilot
+  // se llama varias veces (caso real: re-entrar a Prospects tab).
+  if (window._autopilotLiveTimer) clearInterval(window._autopilotLiveTimer);
+  window._autopilotLiveTimer = setInterval(refreshAutopilotLiveStats, 10_000);
 
   // Refresco periódico del estado mutex (cada 30s) para que cuando el dueño
   // apague desde su browser, los demás vean el lock liberado sin reload manual.
-  setInterval(async () => {
+  if (window._autopilotMutexTimer) clearInterval(window._autopilotMutexTimer);
+  window._autopilotMutexTimer = setInterval(async () => {
     try {
       const cur = await getAutopilotState(state.accessToken);
       const isMe = cur.sessionUser?.toLowerCase() === (state.loginEmail || "").toLowerCase();
