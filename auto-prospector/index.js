@@ -4234,10 +4234,25 @@ async function scanBouncesForUser(token, userEmail) {
             .filter(e => !e.includes("mailer-daemon") && !e.includes("postmaster") && e !== userEmail.toLowerCase())
           )].slice(0, 3); // top 3
         }
+        // Hard vs soft bounce detection del body — el hard amerita retry inmediato
+        const bodyText = extractMessageText(msg.payload || {}).toLowerCase();
+        const isHardBounce =
+          /address not found|no se ha encontrado la dirección|endereço não encontrado|indirizzo non trovato|n'a pas été trouvée|nicht gefunden/i.test(bodyText) ||
+          /550[\s-]?5\.1\.1|550[\s-]?user unknown|user does not exist|no such user|mailbox unavailable|recipient does not exist/i.test(bodyText) ||
+          /permanent failure|permanent error/i.test(bodyText);
+        const isSoftBounce =
+          /4\d\d[\s-]?\d\.\d\.\d|mailbox full|over quota|temporarily|temporary failure|try again later|rate limit/i.test(bodyText) &&
+          !isHardBounce;
+        const bounceType = isHardBounce ? "hard" : (isSoftBounce ? "soft" : "unknown");
+
         for (const failed of failedEmails) {
           if (!isBouncedSync(failed)) {
-            await markEmailBounced(token, { email: failed, reason: "smtp_bounce_detected", originalDomain: failed.split("@")[1] });
+            await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1] });
             detected++;
+            // Trigger bounce retry (solo hard bounces — los soft Gmail los reintenta solo)
+            if (bounceType === "hard") {
+              queueBounceRetry(token, userEmail, failed, bounceType).catch(e => log(`⚠️ queueBounceRetry: ${e.message}`));
+            }
           }
         }
       } catch {}

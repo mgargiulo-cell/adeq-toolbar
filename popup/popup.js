@@ -3191,8 +3191,9 @@ async function runEmailScraper() {
     // Page scrape (free) + Apollo (paid pero auto, decisión user 2026-05-08:
     // mostrar al menos 2 emails de Apollo por default sin necesidad de click).
     // Apollo se cachea en session, así que re-visitar subpáginas no re-paga.
+    const _dom = state.domain; // domain guard para descartar promesas tardías
     state.emails = []; state.emailSources = new Map();
-    addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail), "Cache");
+    addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail), "Cache", _dom);
 
     const [pageEmails, apolloResult] = await Promise.all([
       scrapeEmailsFromPage(state.tabId),
@@ -3201,13 +3202,13 @@ async function runEmailScraper() {
         ? Promise.resolve(null)
         : findDecisionMakerViaApollo(state.domain).catch(() => null),
     ]);
-    addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page");
+    addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page", _dom);
 
     // Apollo: agregar los unlocked al pool + render preview
     if (apolloResult) {
       const unlockedEmails = (apolloResult.people || []).filter(p => p.unlocked && p.email).map(p => p.email);
       if (unlockedEmails.length) {
-        addEmailsWithSource(unlockedEmails, "Apollo");
+        addEmailsWithSource(unlockedEmails, "Apollo", _dom);
       }
       if (apolloResult.name)     state.decisionMakerName = apolloResult.name.split(" ")[0];
       if (apolloResult.linkedin) showLinkedIn(apolloResult.linkedin);
@@ -3314,11 +3315,32 @@ function checkAutoPush() {
 // ============================================================
 // EMAIL
 // ============================================================
-function addEmailsWithSource(emails, source) {
+function addEmailsWithSource(emails, source, domainGuard = null) {
+  // Race guard: si pasaste domainGuard y el state.domain cambió (user cambió
+  // de tab), descartamos estos emails — vienen de una promesa del dominio
+  // anterior que resolvió tarde. Sin esto se mezclan emails de dominios distintos.
+  if (domainGuard && state.domain !== domainGuard) return;
+
+  // Validación adicional: solo agregamos emails cuyo dominio matchee el actual
+  // O sea webmail conocido (gmail/hotmail/etc — válido para decision makers).
+  // Sin esto, scrapes de webs sociales (LinkedIn, Twitter) inyectan emails
+  // de OTROS sites (partner emails, signature emails, etc.).
+  const currentSite = (state.domain || "").toLowerCase().replace(/^www\./, "");
+  const WEBMAIL = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/;
+  const _belongsToCurrent = (email) => {
+    if (!currentSite) return true;
+    const dom = (email.split("@")[1] || "").toLowerCase();
+    if (!dom) return false;
+    if (dom === currentSite) return true;
+    if (dom.endsWith("." + currentSite) || currentSite.endsWith("." + dom)) return true;
+    if (WEBMAIL.test(dom)) return true; // emails personales gmail/hotmail OK
+    return false;
+  };
+
   for (const e of emails) {
     if (!e) continue;
-    // Filtro garbage al ingreso — no contamina state.emails con whois/abuse/etc.
     if (isGarbageEmail(e)) continue;
+    if (!_belongsToCurrent(e)) continue; // anti-leak entre dominios
     if (!state.emailSources.has(e)) state.emailSources.set(e, source);
     if (!state.emails.includes(e)) state.emails.push(e);
   }
