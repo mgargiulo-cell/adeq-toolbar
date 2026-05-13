@@ -5237,8 +5237,12 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   if (!local || !dom) return -1;
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
 
+  // Malformed local-part: contiene TLD (.com/.net/.io/etc) → scrape artifact
+  // Caso real 2026-05-13: "lindaikejisblog.com@protecteddomainservices.com"
+  // donde el scraper agarro "site.com@registrar.com" como un solo email.
+  if (/\.(com|net|org|io|co|tv|me|info|biz|us|uk|de|es|fr|it|br|ar|mx)$/i.test(local)) return -1;
+
   // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
-  // Heurística: 6+ caracteres alfanuméricos sin vocales o con patrón random.
   if (/^[a-z0-9]{8,}$/.test(local) && !/[aeiou]{2}/.test(local)) return -1;
 
   let score = 0;
