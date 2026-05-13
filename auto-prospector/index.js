@@ -881,6 +881,96 @@ async function runAutoFeeder(token) {
   }
 }
 
+// ════════════════════════════════════════════════════════════════
+// RE-ENRICH bad leads del review_queue — corre cuando flag activo
+// ────────────────────────────────────────────────────────────────
+// Política user 2026-05-13: hay ~240 leads en review_queue desde antes
+// de los fixes (source-strict, Apollo TLD, etc.). Para que el agent
+// los use bien, re-enriquecemos los que tienen 0 emails O solo generics.
+// Apollo cuesta — controlamos cap diario (150) y monthly (2400).
+// Procesa 5 leads/run, 1 run cada 60 iters (~5h).
+// ════════════════════════════════════════════════════════════════
+let _lastReenrichRunAt = 0;
+const REENRICH_COOLDOWN_MS = 60 * 60 * 1000; // 1h entre runs
+const REENRICH_BATCH = 5;
+
+async function runReenrichBadLeads(token) {
+  try {
+    const cfg = await getConfig(token);
+    if (String(cfg.agent_reenrich_bad_leads || "").toLowerCase() !== "true") return;
+    if (Date.now() - _lastReenrichRunAt < REENRICH_COOLDOWN_MS) return;
+    _lastReenrichRunAt = Date.now();
+
+    const apollo_api_key = cfg.apollo_api_key;
+    if (!apollo_api_key) { log("⚠️ reenrich: sin APOLLO_API_KEY"); return; }
+
+    // Cap check
+    const usage = await getApolloUsageToday(token);
+    if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) {
+      log("⚠️ reenrich: Apollo cap alcanzado, skip");
+      return;
+    }
+
+    // Leads "malos": 0 emails, o solo emails generic (info@/contact@/etc)
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=id,domain,emails,email_sources,contact_name,category&order=created_at.asc&limit=50`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const leads = await res.json();
+    if (!Array.isArray(leads)) return;
+
+    // Filtrar los que necesitan re-enrich
+    const candidates = leads.filter(l => {
+      const emails = Array.isArray(l.emails) ? l.emails : [];
+      if (emails.length === 0) return true;
+      // Si todos los emails son source='generic' o están vacíos → re-enrich
+      const sources = l.email_sources || {};
+      const hasGoodSource = emails.some(e => {
+        const src = sources[e.toLowerCase()] || "";
+        return src === "apollo" || src === "informer";
+      });
+      return !hasGoodSource;
+    }).slice(0, REENRICH_BATCH);
+
+    if (candidates.length === 0) { log("✅ reenrich: todos los leads ya tienen email apollo/informer — flag OFF"); await setConfigValue(token, "agent_reenrich_bad_leads", "false"); return; }
+
+    log(`🔄 reenrich: procesando ${candidates.length} leads malos`);
+    for (const lead of candidates) {
+      try {
+        const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
+          traffic: lead.traffic || 0, allowUnlock: true,
+        });
+        if (apolloRes?.email) {
+          // Merge: apollo first, después los existentes (sin duplicar)
+          const existing = Array.isArray(lead.emails) ? lead.emails : [];
+          const merged = [apolloRes.email, ...existing.filter(e => e.toLowerCase() !== apolloRes.email.toLowerCase())];
+          const validated = await validateEmailsBatch(merged);
+          const newSources = { ...(lead.email_sources || {}) };
+          newSources[apolloRes.email.toLowerCase()] = "apollo";
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({
+              emails: validated,
+              email_sources: newSources,
+              contact_name: apolloRes.contact_name || lead.contact_name || "",
+            }),
+          });
+          log(`  ✅ ${lead.domain}: +apollo ${apolloRes.email}`);
+        } else {
+          log(`  ⏭️ ${lead.domain}: Apollo sin resultados`);
+        }
+        await sleep(1500); // anti rate-limit
+      } catch (e) {
+        log(`  ⚠️ reenrich ${lead.domain}: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    log(`⚠️ runReenrichBadLeads error: ${e.message}`);
+  }
+}
+
 async function backfillMissingFields(token, cfg) {
   const flag = cfg.agent_backfill_missing === "true";
   if (!flag) return;
@@ -6569,6 +6659,9 @@ async function main() {
       // Cola MANUAL de Email Futuro (toolbar_reengagement_queue) — se procesa
       // siempre que esté el flag general activo (mismo gate que el otro).
       processManualReengagementQueue(token).catch(e => log(`⚠️ manualReengage: ${e.message}`));
+      // Re-enrich de leads malos del review_queue (flag agent_reenrich_bad_leads).
+      // Sin esto, los 240 leads viejos sin Apollo nunca se actualizan.
+      runReenrichBadLeads(token).catch(e => log(`⚠️ reenrich: ${e.message}`));
     }
 
     // ── Unfreezer cada 60 iters (~25min) ──
