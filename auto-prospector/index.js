@@ -4271,6 +4271,199 @@ async function scanBouncesForUser(token, userEmail) {
   }
 }
 
+// ════════════════════════════════════════════════════════════════
+// BOUNCE RETRY — re-envío automático a próximo email cuando bounce
+// ────────────────────────────────────────────────────────────────
+// Llamada desde scanBouncesForUser cuando detecta hard bounce.
+// Pasos:
+//   1. Cooldown: no más de 1 retry/domain en 24h
+//   2. Max attempts: 2 (A → B → freeze)
+//   3. Buscar lead en review_queue por domain del bounce
+//   4. Pickear next-best email (source-strict, excluir bounced)
+//   5. Si hay candidato: enviar + insert row bounce_retries + update Monday
+//   6. Si no: freeze 60d
+// ════════════════════════════════════════════════════════════════
+
+async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
+  try {
+    const domain = (bouncedEmail.split("@")[1] || "").toLowerCase();
+    if (!domain) return;
+    log(`🔄 bounceRetry: procesando bounce ${bouncedEmail} (${bounceType}) para ${domain}`);
+
+    // 1. Guard: cooldown 24h por domain
+    const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const recentRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?domain=eq.${encodeURIComponent(domain)}&created_at=gte.${cutoff24h}&select=id,attempt_number&order=created_at.desc&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (recentRes.ok) {
+      const recent = await recentRes.json();
+      if (Array.isArray(recent) && recent.length > 0) {
+        log(`  ⏭️ ${domain}: ya hay bounce retry en últimas 24h (attempt ${recent[0].attempt_number}) — skip`);
+        return;
+      }
+    }
+
+    // 2. Max attempts global por domain (lifetime): 2 attempts
+    const allAttemptsRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?domain=eq.${encodeURIComponent(domain)}&select=id&limit=10`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-9" } }
+    );
+    const rangeHdr = allAttemptsRes.headers.get("content-range") || "";
+    const totalAttempts = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
+    if (totalAttempts >= 2) {
+      log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d`);
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+        method: "POST",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify({
+          domain, frozen_until: new Date(Date.now() + 60 * 86400_000).toISOString(),
+          attempt_count: totalAttempts, last_error: "max_bounce_retries",
+          source: "bounce_retry", uploaded_by: mbEmail, updated_at: new Date().toISOString(),
+        }),
+      }).catch(() => {});
+      return;
+    }
+
+    // 3. Encontrar lead en review_queue
+    const leadRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=*&order=created_at.desc&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!leadRes.ok) { log(`  ⚠️ ${domain}: query lead failed HTTP ${leadRes.status}`); return; }
+    const leadRows = await leadRes.json();
+    if (!Array.isArray(leadRows) || leadRows.length === 0) {
+      log(`  ⏭️ ${domain}: lead no encontrado en review_queue — skip retry`);
+      return;
+    }
+    const lead = leadRows[0];
+
+    // 4. Pickear next-best email — source-strict, excluir bounced
+    const candidates = (lead.emails || []).filter(e => {
+      if (!e || e.toLowerCase() === bouncedEmail.toLowerCase()) return false;
+      if (isBouncedSync(e.toLowerCase())) return false; // ya bounced antes
+      return true;
+    });
+    if (candidates.length === 0) {
+      log(`  ⏭️ ${domain}: no hay alternativas — marcando lead failed_all_bounced`);
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_retries`, {
+        method: "POST",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({
+          domain, mb_email: mbEmail, original_email: bouncedEmail, retry_email: "",
+          bounce_type: bounceType, attempt_number: totalAttempts + 1,
+          status: "skipped_no_alt", reason: "no_alternative_emails",
+        }),
+      }).catch(() => {});
+      return;
+    }
+
+    const SOURCE_RANK = { apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+    const _sourcesMap = lead.email_sources || {};
+    const ranked = candidates
+      .map(e => ({
+        email: e,
+        source: _sourcesMap[e.toLowerCase()] || "",
+        score: rankEmail(e, domain, lead.category || ""),
+      }))
+      .filter(x => x.score >= 0)
+      .sort((a, b) => {
+        const sa = SOURCE_RANK[a.source] || 0;
+        const sb = SOURCE_RANK[b.source] || 0;
+        if (sa !== sb) return sb - sa;
+        return b.score - a.score;
+      });
+    if (ranked.length === 0) {
+      log(`  ⏭️ ${domain}: candidatos existen pero todos con score negativo — skip`);
+      return;
+    }
+    const retryEmail  = ranked[0].email;
+    const retrySource = ranked[0].source || "scrape";
+    log(`  🎯 ${domain}: retry → ${retryEmail} (source=${retrySource}, score=${ranked[0].score})`);
+
+    // 5. Cargar config + send
+    const cfg = await getConfig(token);
+    const mondayApiKey = (cfg[`monday_api_key_${mbEmail.toLowerCase()}`] || cfg.monday_api_key || "").trim();
+
+    // Reusar el pitch del lead (snapshot) o regenerar — preferimos reusar
+    // el pitch original que se generó cuando entró a review_queue
+    const subject = lead.pitch_subject || (lead.pitch_subjects?.[0]) || `Sobre ${domain}`;
+    const body    = lead.pitch || "Hola, quería ver si te puedo sumar algo desde ADEQ. Avisame si te interesa.";
+
+    let retryActionId = null;
+    let sendOk = false;
+    let sendErr = "";
+    try {
+      const sent = await sendGmailServer(token, mbEmail, {
+        to: retryEmail, subject, body, agentActionId: null,
+      });
+      sendOk = sent?.ok === true;
+      if (!sendOk) sendErr = sent?.error || "unknown";
+    } catch (e) {
+      sendErr = e.message;
+    }
+
+    if (sendOk) {
+      // Log agent action
+      try {
+        const resAct = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
+          method: "POST",
+          headers: {
+            "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+            "Content-Type": "application/json", "Prefer": "return=representation",
+          },
+          body: JSON.stringify({
+            user_email: mbEmail, domain, action: "bounce_retry_sent",
+            email_to: retryEmail, pitch_subject: subject,
+            details: { original_email: bouncedEmail, bounce_type: bounceType, retry_source: retrySource },
+          }),
+        });
+        if (resAct.ok) {
+          const arr = await resAct.json().catch(() => []);
+          retryActionId = Array.isArray(arr) ? arr[0]?.id : arr?.id;
+        }
+      } catch {}
+
+      // 6. Update Monday email column al nuevo
+      if (lead.monday_item_id && mondayApiKey) {
+        await updateMondayItemEmail(mondayApiKey, lead.monday_item_id, cfg.monday_active_board || cfg.monday_board_id || 1420268379, retryEmail)
+          .catch(e => log(`  ⚠️ ${domain}: Monday update FAIL: ${e.message}`));
+      }
+      // Sendtrack
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
+        method: "POST",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ domain, send_date: new Date().toISOString().split("T")[0], email: retryEmail, pitch: body.substring(0, 1000) }),
+      }).catch(() => {});
+
+      log(`  ✅ ${domain}: bounce retry enviado a ${retryEmail} + Monday actualizado`);
+    } else {
+      log(`  ❌ ${domain}: bounce retry FAIL — ${sendErr}`);
+    }
+
+    // 7. Insert row bounce_retries (audit trail)
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_retries`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({
+        domain, monday_item_id: lead.monday_item_id,
+        mb_email: mbEmail, original_email: bouncedEmail, retry_email: retryEmail,
+        retry_source: retrySource, bounce_type: bounceType,
+        attempt_number: totalAttempts + 1,
+        status: sendOk ? "sent" : "failed",
+        retry_action_id: retryActionId,
+        reason: sendOk ? null : sendErr.substring(0, 200),
+      }),
+    }).catch(() => {});
+
+  } catch (e) {
+    log(`⚠️ queueBounceRetry ${bouncedEmail}: ${e.message}`);
+  }
+}
+
 function extractMessageText(payload) {
   if (payload.body?.data) {
     try { return Buffer.from(payload.body.data, "base64").toString("utf-8"); } catch { return ""; }
@@ -6487,18 +6680,29 @@ async function main() {
       // Sin esto el agent quedaba 0 envíos/día hasta que admin lo prendiera.
       try {
         if (!_isWeekendSpain() && !_isOutsideActiveHours(9, 23)) {
-          // 1. Asegurar agent_enabled_users tenga al menos al admin
-          const aRes = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_enabled_users&select=value`,
+          // 1. Self-activator — SOLO si el admin no apagó manualmente.
+          //    Bug fix 2026-05-13: antes auto-popoulábamos enabled_users
+          //    cada tick si estaba vacío, lo que PISABA el toggle OFF del
+          //    admin. Ahora chequea agent_manual_off para respetar la
+          //    intención del admin. El toggle del UI setea esta flag.
+          const flagsRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_manual_off)&select=key,value`,
             { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
           );
-          const aRows = await aRes.json().catch(() => []);
+          const flagsRows = await flagsRes.json().catch(() => []);
+          const flagsMap = {};
+          flagsRows.forEach(r => { flagsMap[r.key] = r.value; });
+          const manualOff = String(flagsMap.agent_manual_off || "").toLowerCase() === "true";
           let agentUsers = [];
-          try { agentUsers = JSON.parse(aRows?.[0]?.value || "[]"); } catch {}
-          if (agentUsers.length === 0) {
+          try { agentUsers = JSON.parse(flagsMap.agent_enabled_users || "[]"); } catch {}
+          if (agentUsers.length === 0 && !manualOff) {
             const defaultUsers = ["mgargiulo@adeqmedia.com"];
             await setConfigValue(token, "agent_enabled_users", JSON.stringify(defaultUsers));
             log(`🔛 agent auto-activado L-V Madrid: enabled_users=${JSON.stringify(defaultUsers)}`);
+          } else if (manualOff && agentUsers.length > 0) {
+            // Admin apagó manual desde la toolbar — vaciamos por las dudas
+            log(`🔴 agent_manual_off=true → vaciando agent_enabled_users`);
+            await setConfigValue(token, "agent_enabled_users", "[]");
           }
 
           // 2. Feeder: si review_queue tiene menos de 20 pending → asegurar csv_queue ON

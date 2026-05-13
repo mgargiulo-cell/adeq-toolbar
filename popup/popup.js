@@ -1118,9 +1118,16 @@ async function toggleAgent(e) {
   try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
   users = users.map(u => u.toLowerCase()).filter(u => u !== myEmail);
   if (enabled) users.push(myEmail);
-  await _writeAgentConfig({ agent_enabled_users: JSON.stringify(users) });
+  // Bug fix 2026-05-13: setear agent_manual_off para que el self-activator
+  // del worker respete el toggle OFF. Sin este flag, el self-activator
+  // re-poblaba enabled_users cada tick L-V 9-23 Madrid → agent seguía
+  // mandando aunque el admin tocara OFF.
+  await _writeAgentConfig({
+    agent_enabled_users: JSON.stringify(users),
+    agent_manual_off:    users.length === 0 ? "true" : "false",
+  });
   await loadAdminAgent();
-  showToast(enabled ? "🟢 Agent activado" : "⚪ Agent desactivado", "info");
+  showToast(enabled ? "🟢 Agent activado" : "⚪ Agent desactivado (no auto-reactivará)", "info");
 }
 
 async function saveAgentThresholds() {
