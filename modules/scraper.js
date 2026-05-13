@@ -337,9 +337,11 @@ async function apolloDomainSearch(domain, apiKey) {
     }));
 
     const fallbackNote = triedFallback ? " (con fallback)" : "";
-    console.log(`[Apollo] ${domain}${fallbackNote}: ${diag.rawCount} personas · ${diag.valid.length} válidas · ${diag.lockedCount} bloqueados · ${diag.noEmailCount} sin email · ${diag.badStatusCount} status inválido`);
+    // Log silencioso — solo si DEBUG_APOLLO=true en chrome.storage
+    // console.log(`[Apollo] ${domain}${fallbackNote}: ${diag.rawCount} personas · ${diag.valid.length} válidas`);
     if (diag.rawCount > 0 && diag.valid.length === 0) {
-      console.warn(`[Apollo] sample:`, diag.sample);
+      // diag.sample silenciado — info debug, no error
+      // console.warn(`[Apollo] sample:`, diag.sample);
     }
     return diag;
   } catch (e) {
@@ -361,7 +363,8 @@ export async function findDecisionMakerViaApollo(domain) {
     if (_accessToken) {
       const cached = await getApolloCache(cleanDomain, _accessToken);
       if (cached) {
-        console.log(`[Apollo] cache HIT ${cleanDomain} (saved ~$0.05 API)`);
+        // Cache HIT silenciado (info, no error)
+        // console.log(`[Apollo] cache HIT ${cleanDomain} (saved ~$0.05 API)`);
         return cached;
       }
     }

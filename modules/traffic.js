@@ -280,7 +280,7 @@ export async function getTraffic(domain, opts = {}) {
   // Pre-check blocklist (gratis, no consume API)
   const block = await checkDomainBlocked(cleanDomain, _authToken);
   if (block.blocked) {
-    console.log(`[Traffic] ${cleanDomain} bloqueado: ${block.reason}`);
+    // Bloqueo silenciado — filtro funcionando, no es error
     return { visits: 0, pagesPerVisit: null, pageViews: 0, monthly: 0, rawVisits: 0, noPageViewData: true, ppvSource: null, estimatedPages: false, category: "", topCountries: [], blocked: true, blockedReason: block.reason };
   }
 

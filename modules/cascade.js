@@ -63,14 +63,12 @@ export async function getSimilarSitesFromSimilarSites(domain) {
       signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) {
-      console.warn(`[cascade] similarsites.com HTTP ${res.status} para ${clean}`);
       return [];
     }
 
     const html  = await res.text();
     const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
     if (!match) {
-      console.warn(`[cascade] __NEXT_DATA__ no encontrado en similarsites.com/${clean} — capaz cambiaron HTML`);
       return [];
     }
 
@@ -97,13 +95,9 @@ export async function getSimilarSitesFromSimilarSites(domain) {
     }
     search(json);
 
-    const result = [...new Set(domains)].slice(0, 20);
-    if (result.length === 0) {
-      console.warn(`[cascade] similarsites.com devolvió 0 dominios para ${clean} (HTML cambió o sin data)`);
-    }
-    return result;
-  } catch (e) {
-    console.warn(`[cascade] similarsites.com error para ${clean}:`, e.message);
+    return [...new Set(domains)].slice(0, 20);
+  } catch {
+    // Silent fail — el runCascade aplica fallback automático a RapidAPI
     return [];
   }
 }
@@ -129,16 +123,10 @@ export async function runCascade(seedDomain, onProgress) {
   // FALLBACK: si similarsites.com cambió HTML o está caído, intentar RapidAPI.
   // Gasta 1 hit pero permite que el feature siga funcionando.
   if (!ssLevel1 || ssLevel1.length === 0) {
-    console.warn(`[cascade] similarsites.com vacío — fallback a RapidAPI para ${seedDomain}`);
     try {
       const rapidApiSites = await getSimilarSites(seedDomain);
       ssLevel1 = (rapidApiSites || []).map(s => s.domain).filter(Boolean);
-      if (ssLevel1.length > 0) {
-        console.log(`[cascade] fallback RapidAPI devolvió ${ssLevel1.length} dominios`);
-      }
-    } catch (e) {
-      console.warn(`[cascade] fallback RapidAPI también falló:`, e.message);
-    }
+    } catch { /* silent — feature degrada naturalmente */ }
   }
 
   // Stub objects — sin visits/geo (los traerá Analysis cuando el MB haga click)
