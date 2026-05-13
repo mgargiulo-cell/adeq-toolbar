@@ -2714,16 +2714,36 @@ function initHistoryModal() {
 function initTabs() {
   const loadedTabs = new Set(["core"]); // core loads eagerly with the page
 
-  document.querySelectorAll(".tab-btn").forEach(btn => {
+  // Click rate-limiter — bloquea clicks repetidos en <300ms (user
+  // tendría "doble-click rebote" perception si la pestaña ya cambió).
+  let _lastTabClick = 0;
+  // Cache de querySelectorAll para no re-scan DOM en cada click
+  const _tabBtnsCache = document.querySelectorAll(".tab-btn");
+  const _tabContentsCache = document.querySelectorAll(".tab-content");
+
+  _tabBtnsCache.forEach(btn => {
     btn.addEventListener("click", async () => {
-      document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-      document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
+      // Rate-limit: ignorar segundo click <300ms
+      const now = Date.now();
+      if (now - _lastTabClick < 300) return;
+      _lastTabClick = now;
+
+      // ── PASO 1: DOM update INMEDIATO (síncrono, ~1ms) ───────────
+      // Esto hace que la pestaña visualmente cambie YA, sin esperar
+      // que async init termine. Mejora la percepción de respuesta.
+      _tabBtnsCache.forEach(b => b.classList.remove("active"));
+      _tabContentsCache.forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       const tabId  = btn.dataset.tab;
       const tabEl  = document.getElementById(`tab-${tabId}`);
-      tabEl.classList.add("active");
+      if (tabEl) tabEl.classList.add("active");
 
-      // Lazy load: only initialize the tab the first time it's opened
+      // ── PASO 2: yield al browser para repaint ANTES del trabajo ──
+      // requestAnimationFrame + setTimeout(0) garantiza que el browser
+      // pinta los class changes antes que arranque el await pesado.
+      await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+
+      // ── PASO 3: Lazy load async (puede tardar pero la UI ya respondió)
       if (!loadedTabs.has(tabId)) {
         loadedTabs.add(tabId);
         try {
@@ -2738,6 +2758,8 @@ function initTabs() {
           }
         } catch (e) {
           console.error(`[Tab ${tabId}]`, e);
+          // Si falló, permitir reintentar
+          loadedTabs.delete(tabId);
         }
       }
     });
