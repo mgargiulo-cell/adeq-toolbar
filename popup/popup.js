@@ -7723,9 +7723,18 @@ function initProspectCard(card, data) {
     const listEl = card.querySelector(".pcard-email-list");
     if (!listEl || emails.length === 0) return;
 
-    // Backend ya guardó Apollo primero en r.emails (apolloEmails antes que scraperEmails),
-    // pero por las dudas reordenamos por source si lo tenemos
-    const sorted = emails;
+    // Orden por grade (A > B > C > D > E) — el mejor queda arriba y auto-selecto.
+    // Backend prioriza Apollo en el array pero el ranking real es por grade.
+    const _gradeRank = { A: 5, B: 4, C: 3, D: 2, E: 1 };
+    const sorted = [...emails].sort((a, b) => {
+      const cA = _emailVerifyCache.get(a);
+      const cB = _emailVerifyCache.get(b);
+      const sA = state.emailSources.get(a) || "";
+      const sB = state.emailSources.get(b) || "";
+      const gA = _gradeRank[_emailGrade(a, cA, sA).grade] || 0;
+      const gB = _gradeRank[_emailGrade(b, cB, sB).grade] || 0;
+      return gB - gA;
+    });
 
     const VISIBLE = 5;
     const visible = sorted.slice(0, VISIBLE);
@@ -7801,8 +7810,13 @@ function initProspectCard(card, data) {
     if (first) first.classList.add("selected");
     _syncSelectedToInput();
 
-    // Auto-verify en background — pinta colores
-    autoVerifyEmailChips(listEl).catch(e => console.warn("[pcard autoVerify]", e));
+    // Auto-verify en background — pinta colores y refresca el orden
+    // (porque el grade A-E puede cambiar tras verify SMTP/DNS confirmed).
+    autoVerifyEmailChips(listEl).then(() => {
+      // Re-render con los nuevos verify results para que el orden sea
+      // el correcto (mejor grade arriba + auto-selected).
+      renderProspectEmailList();
+    }).catch(e => console.warn("[pcard autoVerify]", e));
   };
   renderProspectEmailList();
 

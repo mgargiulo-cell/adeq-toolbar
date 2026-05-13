@@ -127,8 +127,12 @@ const GARBAGE_DOMAIN_SUFFIXES = [
  */
 // Heurística: el dominio del email contiene palabras de registrar/hosting/DNS,
 // nunca son prospects publishers. Ej: latinregistrar.com.br, godaddy-domains.com,
-// nameregistrar.io, dnshosting.net, domainservices.io, etc.
-const REGISTRAR_DOMAIN_REGEX = /\b(registrar|registry|dnshosting|domainsby|domainservices|namehost|domainname|whois|domainabuse)\b/i;
+// nameregistrar.io, dnshosting.net, domainservices.io, whoisprotectservice.net, etc.
+const REGISTRAR_DOMAIN_REGEX = /\b(registrar|registry|dnshosting|domainsby|domainservices|namehost|domainname|whois|whoisprotect|protectwhois|domainprotect|protectdomain|domainabuse|privacyguard|privacyprotect)\b/i;
+
+// Detección de emails malformados con dominio en el local-part
+// (ej: "Csitio.com@whoisprotectservice.net" — scraped wrong, no es real).
+const MALFORMED_LOCAL_REGEX = /^[a-z]?[a-z0-9-]+\.(com|net|org|io|co|tv|me|info|biz)$/i;
 
 export function isGarbageEmail(email) {
   if (!email || typeof email !== "string") return true;
@@ -142,8 +146,13 @@ export function isGarbageEmail(email) {
     if (domain === d || domain.endsWith("." + d)) return true;
   }
 
-  // 1b. Heurística por palabra-clave en el dominio (registrar/dnshosting/etc)
+  // 1b. Heurística por palabra-clave en el dominio (registrar/dnshosting/whoisprotect/etc)
   if (REGISTRAR_DOMAIN_REGEX.test(domain)) return true;
+
+  // 1c. Local-part malformado (ej: "Cbasketball-video.com@..." — scrape error)
+  //     Detecta cuando el local-part TERMINA en TLD (.com/.net/.io/etc), señal
+  //     casi infalible de email scraped mal extraído.
+  if (MALFORMED_LOCAL_REGEX.test(local)) return true;
 
   // 2. Local-part: prefijo administrativo. Aceptamos "abuse", "abuse-domain", "abuse_2024".
   for (const prefix of GARBAGE_LOCAL_PREFIXES) {
