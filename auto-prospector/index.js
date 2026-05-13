@@ -4066,19 +4066,38 @@ async function processManualReengagementQueue(token) {
 // ════════════════════════════════════════════════════════════════
 
 async function logAgentAction(token, userEmail, payload) {
-  try {
-    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-      },
-      body: JSON.stringify({ user_email: userEmail, ...payload }),
-    });
-  } catch (e) {
-    log(`⚠️ logAgentAction failed: ${e.message}`);
+  // Audit P1 fix: 3 retries con backoff. Si toolbar_agent_actions falla,
+  // el cap diario (getAgentDailyCount) no cuenta este send → over-send.
+  // Antes era fire-and-forget swallowing silencioso.
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
+        method: "POST",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({ user_email: userEmail, ...payload }),
+      });
+      if (res.ok) return; // éxito
+      // 4xx no se reintenta (request mal armado), 5xx sí
+      if (res.status >= 400 && res.status < 500) {
+        log(`⚠️ logAgentAction ${res.status} (no retry): ${await res.text().catch(() => "")}`);
+        return;
+      }
+      throw new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      if (attempt === MAX_RETRIES - 1) {
+        // Último intento — loguear el fail crítico
+        log(`🔴 logAgentAction failed después de ${MAX_RETRIES} intentos: ${e.message} — payload: ${JSON.stringify(payload).slice(0, 200)}`);
+        return;
+      }
+      // Exponential backoff: 500ms, 1s, 2s
+      await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+    }
   }
 }
 
@@ -5689,11 +5708,19 @@ async function runAgentCycle(token, allFlags) {
           }
         }
 
-        // 1b. Si NO hay email decente, dispara enrichment AGRESIVO:
+        // 1b. Si NO hay email DECENTE (rankScore >= 50), dispara enrichment AGRESIVO:
         //     - findBestApolloEmail (free verified, o unlock 1 credit si traffic ≥ 500K)
         //     - scrapeEmailsForDomain como fallback (gratis)
-        const hasGoodEmail = emails.some(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
+        // Audit fix 2026-05-13: antes "hasGoodEmail" solo chequeaba garbage filters,
+        // entonces "contato@filmelier.com" (no-garbage pero generic role) era
+        // considerado bueno → Apollo NO se llamaba → agent mandaba al rol genérico.
+        // Ahora chequeamos rankScore real: si el mejor < 50 (no commercial-grade)
+        // → fuerza Apollo lookup para tratar de conseguir un personal email.
         emails = emails.filter(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
+        const currentBestScore = emails.length > 0
+          ? Math.max(...emails.map(e => rankEmail(e, domain, lead.category)))
+          : -1;
+        const hasGoodEmail = currentBestScore >= 50;
         if (!hasGoodEmail) {
           try {
             // PASO 1: Scraping primero (gratis). Si encuentra email decente
