@@ -7094,6 +7094,9 @@ async function loadProspectsTab() {
 
   updateProspectsDailyBar(dailyCount);
   if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidate${rows.length === 1 ? "" : "s"}` : "No pending candidates";
+  // Tab counter — vista de pajaro de cuánto hay para revisar.
+  const tabCount = document.getElementById("tab-prospects-count");
+  if (tabCount) tabCount.textContent = rows.length > 0 ? `(${rows.length})` : "";
 
   if (!rows.length) {
     // Empty state inteligente: si hay actividad activa del worker, mostrar qué

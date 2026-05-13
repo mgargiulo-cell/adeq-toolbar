@@ -6179,6 +6179,48 @@ async function main() {
         await backfillMissingFields(token, cfgRefresh);
       } catch (e) { log(`⚠️ refresh+backfill: ${e.message}`); }
 
+      // ── Self-activator del AGENT autopilot (regla user 2026-05-13) ─────
+      // L-V 9-23 Madrid: garantizar que el agent está prendido si la whitelist
+      // tiene users y sent_today < daily_cap. Si la cola review_queue está
+      // bajo umbral → asegurar csv_queue activa para que se rellene desde el
+      // pipeline existente (CSV upload + Monday refresh manual).
+      // Sin esto el agent quedaba 0 envíos/día hasta que admin lo prendiera.
+      try {
+        if (!_isWeekendSpain() && !_isOutsideActiveHours(9, 23)) {
+          // 1. Asegurar agent_enabled_users tenga al menos al admin
+          const aRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_enabled_users&select=value`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          );
+          const aRows = await aRes.json().catch(() => []);
+          let agentUsers = [];
+          try { agentUsers = JSON.parse(aRows?.[0]?.value || "[]"); } catch {}
+          if (agentUsers.length === 0) {
+            const defaultUsers = ["mgargiulo@adeqmedia.com"];
+            await setConfigValue(token, "agent_enabled_users", JSON.stringify(defaultUsers));
+            log(`🔛 agent auto-activado L-V Madrid: enabled_users=${JSON.stringify(defaultUsers)}`);
+          }
+
+          // 2. Feeder: si review_queue tiene menos de 20 pending → asegurar csv_queue ON
+          //    para que el worker la procese (si hay items pending) o el admin
+          //    haga import manual desde la toolbar.
+          const rqRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=id&limit=20`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-19" } }
+          );
+          const rqRange = rqRes.headers.get("content-range") || "";
+          const rqCount = parseInt(rqRange.match(/\/(\d+)$/)?.[1] || "0", 10);
+          if (rqCount < 20) {
+            // Setea flag de "review_queue baja" — el admin puede verlo en UI y
+            // disparar Monday URL refresh o sellers.json import manual.
+            await setConfigValue(token, "review_queue_low_warning", `${rqCount}_at_${new Date().toISOString()}`);
+            if (iterCount % 12 === 0) {
+              log(`⚠️ review_queue baja: ${rqCount} pending con traffic>=400K. Admin: disparar Monday URL refresh o sellers.json import desde toolbar.`);
+            }
+          }
+        }
+      } catch (e) { log(`⚠️ agent auto-activator: ${e.message}`); }
+
       // Auto-encender csv_queue_enabled si hay items pending y el flag está OFF.
       // Política user 2026-05-13: "siempre que hay urls en cola, procesarlas
       // hasta finalizar". Antes el flag se apagaba al vaciar la cola y había
