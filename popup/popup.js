@@ -1171,8 +1171,31 @@ function _exportAgentFeedCsv() {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// Helper: si está fuera de 9-23 L-V Madrid, pregunta por cuántas horas activar override (1-8).
+// Setea toolbar_config.manual_override_until. Devuelve true si puede proceder, false si canceló.
+async function _checkManualOverrideIfOutside() {
+  const mNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
+  const h = mNow.getHours();
+  const d = mNow.getDay();
+  const outside = (d === 0 || d === 6 || h < 9 || h >= 23);
+  if (!outside) return true;
+  const ans = prompt(`⚠️ Fuera del horario operativo (9-23 L-V Madrid). Hora Madrid: ${h}h.\n\n¿Por cuántas horas activar override? (1-8)\nDespués de ese tiempo el worker vuelve a dormir solo.`, "2");
+  if (ans === null) return false;
+  const hrs = parseInt(ans, 10);
+  if (!hrs || hrs < 1 || hrs > 8) { alert("⛔ Valor inválido. Tiene que ser entre 1 y 8 horas."); return false; }
+  const until = new Date(Date.now() + hrs * 60 * 60 * 1000).toISOString();
+  await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
+    method: "POST",
+    headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ key: "manual_override_until", value: until }),
+  }).catch(() => {});
+  return true;
+}
+
 async function toggleAgent(e) {
   const enabled = e.target.checked;
+  // Solo aplicar gate al PRENDER (apagar siempre puede)
+  if (enabled && !(await _checkManualOverrideIfOutside())) { e.target.checked = false; return; }
   const myEmail = (state.loginEmail || "").toLowerCase();
   const cfg = await _readAgentConfig();
   let users = [];
@@ -6016,6 +6039,11 @@ async function initCsvQueue() {
       enabledCbx.checked = true; // forzar a quedar visualmente ON
       return;
     }
+    // Gate horario operativo (solo al prender)
+    if (enabledCbx.checked && !(await _checkManualOverrideIfOutside())) {
+      enabledCbx.checked = false;
+      return;
+    }
     await setCsvQueueEnabled(enabledCbx.checked, state.accessToken, state.loginEmail);
     if (enabledCbx.checked) startHeartbeat();
     else stopHeartbeat();
@@ -6952,6 +6980,9 @@ async function initAutopilot() {
       // Cap por usuario: el admin pudo desactivarle el autopilot a este MB
       const can = await checkUserCanDo(state.accessToken, state.loginEmail, "autopilot_on");
       if (!can.allowed) { alert(`⛔ ${can.reason}`); return; }
+
+      // Gate horario operativo (solo al prender)
+      if (!(await _checkManualOverrideIfOutside())) return;
 
       // Mutex: otro user lo tiene activo
       const cur = await getAutopilotState(state.accessToken);

@@ -3474,11 +3474,114 @@ async function runSession(token, cfg, sessionStart) {
   const _rapidStart   = rapidUsage.usedToday;
   const _rapidMonthStart = rapidMonth.usedThisMonth;
 
-  // ── POOL HÍBRIDO ──
-  // Cuando hay target_geos: combinar Radar + Majestic-filtered-by-TLD
-  // Sin target_geos: usar Majestic completo
+  // ── ROTACIÓN INTERNA AUTOPILOT con RATIO ADAPTATIVO (user 2026-05-13) ──
+  // Mismo botón, 2 ideas: Majestic vs similar-sites discovery.
+  // Sistema aprende cuál genera más leads durante el día y ajusta el ratio.
+  // Floor 20%/cap 80% para no abandonar al peor (puede mejorar más tarde).
+  let _probMajestic = 0.5;
+  try {
+    const statsRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autopilot_majestic_leads_today,autopilot_similar_leads_today,autopilot_stats_date)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const statsRows = await statsRes.json();
+    const statsMap = {}; statsRows.forEach(r => { statsMap[r.key] = r.value; });
+    const fmt2 = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
+    const today2 = fmt2.format(new Date());
+    if (statsMap.autopilot_stats_date === today2) {
+      const majLeads = parseInt(statsMap.autopilot_majestic_leads_today || "0", 10);
+      const simLeads = parseInt(statsMap.autopilot_similar_leads_today || "0", 10);
+      if (majLeads + simLeads >= 5) {  // mínimo data point antes de adaptarse
+        _probMajestic = Math.max(0.2, Math.min(0.8, majLeads / (majLeads + simLeads)));
+      }
+      log(`📊 Stats hoy — Majestic: ${majLeads} leads, Similar: ${simLeads} leads → P(majestic)=${_probMajestic.toFixed(2)}`);
+    }
+  } catch {}
+  const _autopilotMode = Math.random() < _probMajestic ? "majestic" : "similar_discovery";
+  log(`🎲 Autopilot mode: ${_autopilotMode} (P_majestic=${_probMajestic.toFixed(2)})`);
+  const _modeStartLeadCount = await (async () => {
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?source=eq.autopilot&select=id`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+      );
+      const range = r.headers.get("content-range") || "";
+      return parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch { return 0; }
+  })();
+
   let pool;
-  if (hasTargetGeo) {
+  if (_autopilotMode === "similar_discovery") {
+    // Seeds: 10 dominios random de review_queue con traffic>=400K + 10 de Monday activo
+    const seedDomains = new Set();
+    try {
+      const rqSeedRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=domain&order=score.desc.nullslast&limit=10`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      const rqSeeds = await rqSeedRes.json();
+      if (Array.isArray(rqSeeds)) rqSeeds.forEach(r => r.domain && seedDomains.add(r.domain.toLowerCase().replace(/^www\./, "")));
+    } catch {}
+    // Monday active: tomar 10 random de mondayDomains (ya cargados arriba)
+    const mondaySeeds = mondayDomains.slice(0, 10);
+    mondaySeeds.forEach(d => seedDomains.add(d));
+    log(`Similar discovery seeds: ${seedDomains.size} dominios (review_queue + Monday)`);
+    if (seedDomains.size === 0) {
+      log("Sin seeds disponibles — fallback a Majestic global");
+      pool = majesticFullPool;
+      poolSource = "majestic-global-fallback";
+    } else {
+      const discoveredSet = new Set();
+      // similarsites.com scrape (gratis) por cada seed, hasta 20 dominios/seed
+      const seedArray = [...seedDomains];
+      for (let i = 0; i < seedArray.length; i += 4) {
+        const chunk = seedArray.slice(i, i + 4);
+        const results = await Promise.all(chunk.map(d =>
+          (async () => {
+            try {
+              const r = await fetch(`https://www.similarsites.com/site/${encodeURIComponent(d)}`, {
+                headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0" },
+                signal: AbortSignal.timeout(8000),
+              });
+              if (!r.ok) return [];
+              const html = await r.text();
+              const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+              if (!m) return [];
+              const j = JSON.parse(m[1]);
+              const found = [];
+              const search = (obj) => {
+                if (!obj || typeof obj !== "object") return;
+                if (Array.isArray(obj)) {
+                  for (const it of obj) {
+                    if (it && typeof it === "object") {
+                      const dd = it.domain || it.Domain || it.hostname;
+                      if (dd && typeof dd === "string" && dd.includes(".") && !dd.includes("/")) {
+                        found.push(dd.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, ""));
+                      }
+                      search(it);
+                    }
+                  }
+                } else {
+                  for (const v of Object.values(obj)) search(v);
+                }
+              };
+              search(j);
+              return [...new Set(found)].slice(0, 20);
+            } catch { return []; }
+          })()
+        ));
+        results.flat().forEach(d => d && d !== "" && discoveredSet.add(d));
+      }
+      pool = [...discoveredSet];
+      poolSource = `similar-sites-${seedDomains.size}seeds`;
+      log(`Similar discovery: ${pool.length.toLocaleString()} dominios descubiertos desde ${seedDomains.size} seeds (gratis)`);
+      if (pool.length === 0) {
+        log("Similar discovery vacío — fallback a Majestic global");
+        pool = majesticFullPool;
+        poolSource = "majestic-global-fallback";
+      }
+    }
+  } else if (hasTargetGeo) {
     // Expandir targets a lista de TLDs relevantes
     const targetTLDs = new Set();
     for (const g of targetGeos) {
@@ -3942,6 +4045,29 @@ async function runSession(token, cfg, sessionStart) {
   await saveRapidApiUsage(token, _rapidGlobalCounter, rapidUsage.today);
   await saveRapidApiMonthlyUsage(token, _rapidGlobalCounter, rapidMonth.period);
   await flushAutopilotStats(token, true).catch(() => {});
+
+  // ── PERSIST STATS para ratio adaptativo ──
+  try {
+    const fmtP = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
+    const todayP = fmtP.format(new Date());
+    const statsPrev = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autopilot_majestic_leads_today,autopilot_similar_leads_today,autopilot_stats_date)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const prevRows = await statsPrev.json();
+    const prevMap = {}; prevRows.forEach(r => { prevMap[r.key] = r.value; });
+    const dateMatches = prevMap.autopilot_stats_date === todayP;
+    const prevMaj = dateMatches ? parseInt(prevMap.autopilot_majestic_leads_today || "0", 10) : 0;
+    const prevSim = dateMatches ? parseInt(prevMap.autopilot_similar_leads_today || "0", 10) : 0;
+    const newMaj  = _autopilotMode === "majestic" ? prevMaj + added : prevMaj;
+    const newSim  = _autopilotMode === "similar_discovery" ? prevSim + added : prevSim;
+    await Promise.all([
+      setConfigValue(token, "autopilot_majestic_leads_today", String(newMaj)),
+      setConfigValue(token, "autopilot_similar_leads_today",  String(newSim)),
+      setConfigValue(token, "autopilot_stats_date",           todayP),
+    ]);
+    log(`📊 Stats actualizadas: Majestic=${newMaj} · Similar=${newSim} (esta sesión: ${_autopilotMode} +${added})`);
+  } catch (e) { log(`⚠️ persist autopilot stats: ${e.message}`); }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -6946,7 +7072,12 @@ async function main() {
       const ghTestMode = String(ghCfg.agent_test_mode || "").toLowerCase() === "true";
       const ghStart = parseInt(ghCfg.active_hours_start || "9", 10);
       const ghEnd   = parseInt(ghCfg.active_hours_end   || "23", 10);
-      if (!ghTestMode) {
+      // Manual override del admin: si flag manual_override_until > now, bypass horario.
+      // Permite encender autopilot/queue fuera de 9-23 L-V cuando admin lo necesita.
+      // Expira solo (2h default) para que no quede prendido olvidado todo el finde.
+      const ghOverrideUntil = ghCfg.manual_override_until ? new Date(ghCfg.manual_override_until).getTime() : 0;
+      const ghOverrideActive = ghOverrideUntil > Date.now();
+      if (!ghTestMode && !ghOverrideActive) {
         if (_isWeekendSpain()) {
           if (iterCount === 1 || iterCount % 30 === 0) {
             log(`💤 Fin de semana en España (weekday=${_spainWeekday()}) — worker dormido hasta lunes`);
