@@ -190,19 +190,21 @@ a:hover { text-decoration: underline; }
 .login-logo .logo-sub  { font-size: var(--fs-base); font-weight: 700; color: #34d399; letter-spacing: 4px; }
 .login-subtitle { text-align: center; font-size: var(--fs-base); color: #94a3b8; margin-bottom: var(--sp-6); }
 .login-card .form-input {
-  background: rgba(255,255,255,0.08);
-  border-color: rgba(255,255,255,0.15);
-  color: #f1f5f9;
-  -webkit-text-fill-color: #f1f5f9;
+  background: #1e293b !important;
+  border-color: rgba(255,255,255,0.15) !important;
+  color: #f1f5f9 !important;
+  -webkit-text-fill-color: #f1f5f9 !important;
+  caret-color: #f1f5f9 !important;
 }
 .login-card .form-input::placeholder { color: #64748b; }
 .login-card .form-input:focus,
 .login-card .form-input:hover {
-  background: rgba(255,255,255,0.12) !important;
+  background: #0f172a !important;
   border-color: #38bdf8 !important;
-  box-shadow: 0 0 0 3px rgba(56,189,248,0.2);
+  box-shadow: 0 0 0 3px rgba(56,189,248,0.2) !important;
   color: #f1f5f9 !important;
   -webkit-text-fill-color: #f1f5f9 !important;
+  caret-color: #f1f5f9 !important;
 }
 /* Chrome autofill: anular el background amarillo y el texto negro automáticos */
 .login-card .form-input:-webkit-autofill,
