@@ -5394,10 +5394,14 @@ async function startCascade() {
 
     if (cascadeResults.length === 0) {
       resultsEl.innerHTML = '<div class="cascade-empty">No prospects found with those filters.</div>';
+      actionsEl.style.display = "none";
     } else {
       const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (limit ${CASCADE_LIMIT})` : "";
       statusEl.textContent = `✅ ${cascadeResults.length} prospects${limitMsg}${filteredCount ? ` · ${filteredCount} filtered out` : ""}`;
-      actionsEl.style.display = "block";
+      // Defensive: forzar visibilidad + setAttribute para evitar que algún
+      // CSS override mate el display. User reportó botones invisibles 2026-05-13.
+      actionsEl.style.cssText = "display: block !important; margin-top: 10px";
+      actionsEl.removeAttribute("hidden");
       updateCascadeSummary();
     }
   } catch (err) {
@@ -7284,52 +7288,25 @@ async function loadProspectsTab() {
   // Mantener el orden del shuffle original (assignedIds está ordenado al azar ya).
   const idSet = new Set(assignedIds);
   const idOrder = new Map(assignedIds.map((id, i) => [id, i]));
-  const sampleAll = rows
+  const sample = rows
     .filter(r => idSet.has(r.id))
     .sort((a, b) => idOrder.get(a.id) - idOrder.get(b.id));
 
-  // PERF FIX 2026-05-13: hard cap 100 leads en pantalla. User pidió que
-  // el resto quede en backend solo para rotación. Antes renderizaba 240+
-  // cards de una vez con su initProspectCard → main thread bloqueado.
-  const HARD_CAP = 100;
-  const sample = sampleAll.slice(0, HARD_CAP);
-  const pooledBackend = sampleAll.length - sample.length;
-
+  // RESTAURADO al render original simple (como funcionaba antes de hoy).
+  // Los chunks + DocumentFragment que probé causaron renders concurrentes
+  // (loadProspectsTab no awaitaba renderChunk → DOM duplicado).
+  listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
   if (statsEl) {
     const remaining = DAILY_SEND_CAP - sentFromProspects;
     const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
-    const pooledStr = pooledBackend > 0 ? ` · +${pooledBackend} en pool` : "";
-    statsEl.innerHTML = `<strong>${sample.length}</strong> leads visibles${pooledStr} · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${remaining}) · 🔄 nuevo lote en ${minsLeft}min`;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> leads en tu lote · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${remaining}) · 🔄 nuevo lote en ${minsLeft}min`;
   }
 
-  // Render en chunks de 25 con yield entre cada uno → main thread libre
-  // para responder otros clicks mientras pinta el resto en background.
-  const CHUNK_SIZE = 25;
-  listEl.innerHTML = "";
-  let cursor = 0;
-  const renderChunk = async () => {
-    const chunk = sample.slice(cursor, cursor + CHUNK_SIZE);
-    if (chunk.length === 0) return;
-    // Build HTML del chunk + append (no innerHTML completo)
-    const tmp = document.createElement("div");
-    tmp.innerHTML = chunk.map(r => renderProspectCard(r)).join("");
-    const fragment = document.createDocumentFragment();
-    while (tmp.firstChild) fragment.appendChild(tmp.firstChild);
-    listEl.appendChild(fragment);
-    // Init solo las cards recién agregadas
-    listEl.querySelectorAll(".pcard").forEach(card => {
-      if (card.dataset._inited) return;
-      const id   = parseInt(card.dataset.id);
-      const data = chunk.find(r => r.id === id);
-      if (data) { initProspectCard(card, data); card.dataset._inited = "1"; }
-    });
-    cursor += CHUNK_SIZE;
-    if (cursor < sample.length) {
-      await new Promise(r => setTimeout(r, 30)); // yield 30ms al browser
-      renderChunk();
-    }
-  };
-  renderChunk();
+  listEl.querySelectorAll(".pcard").forEach(card => {
+    const id   = parseInt(card.dataset.id);
+    const data = sample.find(r => r.id === id);
+    if (data) initProspectCard(card, data);
+  });
 }
 
 function updateProspectsDailyBar(count) {
