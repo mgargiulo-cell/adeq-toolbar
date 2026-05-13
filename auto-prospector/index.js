@@ -737,6 +737,149 @@ async function refreshOneEmptyLead(token, cfg) {
 // usando fetchPageContent + Apollo + detectLanguageRobust + scoreWebsite.
 // Cache 90d traffic + 7d Apollo → mayoría son hits gratis.
 const BACKFILL_BATCH = 5;
+// ════════════════════════════════════════════════════════════════
+// AUTO-FEEDER — nutre review_queue desde sellers.json cuando se vacía
+// ────────────────────────────────────────────────────────────────
+// Política user 2026-05-13: "Nunca tiene que estar sin trabajar L-V".
+// Si review_queue está bajo umbral, el worker pickea una sellers.json
+// random de la lista oficial (mismo set que usa la toolbar UI), filtra
+// PUBLISHER seller_type, dedupe contra tablas existentes, e inserta N
+// dominios nuevos en toolbar_csv_queue con status='pending' source='auto_feeder'.
+// El CSV queue pipeline existente los enriquece y los empuja a
+// review_queue. El agent autopilot los pickea naturalmente.
+// ════════════════════════════════════════════════════════════════
+
+const SELLERS_JSON_SOURCES = [
+  // Mismas URLs que modules/sellersJson.js DEFAULT_SELLERS_COMPANIES.
+  // Las grandes primero — más diversidad de leads.
+  "https://improvedigital.com/sellers.json",
+  "https://www.truvid.com/sellers.json",
+  "https://www.themoneytizer.com/sellers.json",
+  "https://triplelift.com/sellers.json",
+  "https://www.vidoomy.com/sellers.json",
+  "https://teads.tv/sellers.json",
+  "https://pubmatic.com/sellers.json",
+  "https://ad.plus/sellers.json",
+  "https://openx.com/sellers.json",
+  "https://sharethrough.com/sellers.json",
+  "https://optad360.com/sellers.json",
+  "https://setupad.com/sellers.json",
+  "https://www.indexexchange.com/sellers.json",
+  "https://152media.info/sellers.json",
+  "https://mowplayer.com/sellers.json",
+  "https://nsightvideo.com/sellers.json",
+  "https://rubiconproject.com/sellers.json",
+  "https://smartadserver.com/sellers.json",
+  "https://www.seedtag.com/sellers.json",
+  "https://verve.com/sellers.json",
+];
+
+let _lastFeederRunAt = 0;
+const FEEDER_COOLDOWN_MS = 60 * 60 * 1000;       // 1h entre runs
+const FEEDER_INJECT_MAX  = 50;                    // máx N dominios nuevos por run
+
+function _normalizeFeederDomain(d) {
+  if (!d) return "";
+  return d.toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/.*$/, "")
+    .trim();
+}
+
+async function _findKnownDomainsWorker(token, candidates) {
+  if (!Array.isArray(candidates) || candidates.length === 0) return new Set();
+  const known = new Set();
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const BATCH = 200;
+  const tables = [
+    { table: "toolbar_csv_queue",     col: "domain" },
+    { table: "toolbar_review_queue",  col: "domain" },
+    { table: "toolbar_historial",     col: "domain" },
+    { table: "toolbar_sendtrack",     col: "domain" },
+    { table: "toolbar_url_blocklist", col: "domain" },
+  ];
+  for (let i = 0; i < candidates.length; i += BATCH) {
+    const slice = candidates.slice(i, i + BATCH);
+    const inList = slice.map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
+    await Promise.all(tables.map(async ({ table, col }) => {
+      try {
+        const res = await fetch(
+          `${SUPABASE_URL}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}`,
+          { headers }
+        );
+        if (!res.ok) return;
+        const rows = await res.json();
+        rows.forEach(r => { if (r[col]) known.add(r[col].toLowerCase()); });
+      } catch {}
+    }));
+  }
+  return known;
+}
+
+async function runAutoFeeder(token) {
+  // Cooldown: no más de 1 vez por hora aunque el caller insista
+  if (Date.now() - _lastFeederRunAt < FEEDER_COOLDOWN_MS) return 0;
+  _lastFeederRunAt = Date.now();
+
+  try {
+    // 1. Pickear sellers.json random (round-robin por timestamp para diversidad)
+    const idx = Math.floor((Date.now() / FEEDER_COOLDOWN_MS) % SELLERS_JSON_SOURCES.length);
+    const sourceUrl = SELLERS_JSON_SOURCES[idx];
+    log(`🌱 auto-feeder: fetching ${sourceUrl}`);
+
+    // 2. Fetch + parse
+    const res = await fetch(sourceUrl, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) { log(`⚠️ auto-feeder HTTP ${res.status} en ${sourceUrl}`); return 0; }
+    const data = await res.json().catch(() => null);
+    if (!data || !Array.isArray(data.sellers)) { log(`⚠️ auto-feeder: invalid JSON`); return 0; }
+
+    // 3. Filtrar PUBLISHER + normalizar + dedupe
+    const candidates = [...new Set(
+      data.sellers
+        .filter(s => (s.seller_type || "").toUpperCase() === "PUBLISHER")
+        .map(s => _normalizeFeederDomain(s.domain || ""))
+        .filter(Boolean)
+    )];
+    if (candidates.length === 0) { log(`⚠️ auto-feeder: sin PUBLISHERs en ${sourceUrl}`); return 0; }
+
+    // 4. Filtrar los ya conocidos (csv_queue, review_queue, historial, sendtrack, blocklist)
+    const known = await _findKnownDomainsWorker(token, candidates);
+    const fresh = candidates.filter(d => !known.has(d));
+    log(`🌱 auto-feeder: ${candidates.length} PUBLISHERs, ${known.size} ya conocidos, ${fresh.length} nuevos`);
+    if (fresh.length === 0) return 0;
+
+    // 5. Limitar inyección (no saturar la cola de una vez)
+    const toInject = fresh.slice(0, FEEDER_INJECT_MAX);
+
+    // 6. INSERT en toolbar_csv_queue con source='auto_feeder'
+    const payload = toInject.map(domain => ({
+      domain,
+      status:      "pending",
+      source:      "auto_feeder",
+      uploaded_by: "worker@autofeeder",
+      uploaded_at: new Date().toISOString(),
+    }));
+    const insRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal,resolution=ignore-duplicates",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!insRes.ok) {
+      log(`⚠️ auto-feeder INSERT failed: HTTP ${insRes.status}`);
+      return 0;
+    }
+    log(`✅ auto-feeder inyectó ${toInject.length} dominios nuevos (source=auto_feeder) desde ${sourceUrl.split("/")[2]}`);
+    return toInject.length;
+  } catch (e) {
+    log(`⚠️ runAutoFeeder error: ${e.message}`);
+    return 0;
+  }
+}
+
 async function backfillMissingFields(token, cfg) {
   const flag = cfg.agent_backfill_missing === "true";
   if (!flag) return;
@@ -6211,12 +6354,15 @@ async function main() {
           const rqRange = rqRes.headers.get("content-range") || "";
           const rqCount = parseInt(rqRange.match(/\/(\d+)$/)?.[1] || "0", 10);
           if (rqCount < 20) {
-            // Setea flag de "review_queue baja" — el admin puede verlo en UI y
-            // disparar Monday URL refresh o sellers.json import manual.
+            // Setea flag de "review_queue baja" — el admin puede verlo en UI.
             await setConfigValue(token, "review_queue_low_warning", `${rqCount}_at_${new Date().toISOString()}`);
             if (iterCount % 12 === 0) {
-              log(`⚠️ review_queue baja: ${rqCount} pending con traffic>=400K. Admin: disparar Monday URL refresh o sellers.json import desde toolbar.`);
+              log(`⚠️ review_queue baja: ${rqCount} pending con traffic>=400K. Disparando auto-feeder...`);
             }
+            // Auto-feeder: pickea sellers.json random, dedupe contra existentes,
+            // inyecta hasta 50 dominios nuevos a csv_queue (status=pending).
+            // Cooldown 1h interno — no satura aunque rqCount<20 cada tick.
+            runAutoFeeder(token).catch(e => log(`⚠️ autoFeeder: ${e.message}`));
           }
         }
       } catch (e) { log(`⚠️ agent auto-activator: ${e.message}`); }
