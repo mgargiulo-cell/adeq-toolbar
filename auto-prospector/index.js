@@ -24,7 +24,7 @@ const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 const SESSION_LIMIT_MS  = 20 * 60 * 1000; // 20 minutos máx por sesión de autopilot — auto-corte
 const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
-const IDLE_EXIT_MS      = 30 * 60 * 1000; // si está idle 30 min seguidos, exit (Railway no factura idle)
+const IDLE_EXIT_MS      = 4 * 60 * 60 * 1000; // 4h sin trabajo → exit (subido de 30min para evitar restarts frecuentes 2026-05-13)
 const DOMAIN_DELAY_MS  = 2500;
 const MIN_TRAFFIC      = 400_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
 const REVIEW_QUEUE_MIN_TRAFFIC = 400_000; // Floor absoluto en review_queue. Items debajo se auto-borran (no acumulan basura).
@@ -6178,6 +6178,32 @@ async function main() {
         // en paralelo lógico con refresh de tráfico. Ambos terminan rápido (paralelo).
         await backfillMissingFields(token, cfgRefresh);
       } catch (e) { log(`⚠️ refresh+backfill: ${e.message}`); }
+
+      // Auto-encender csv_queue_enabled si hay items pending y el flag está OFF.
+      // Política user 2026-05-13: "siempre que hay urls en cola, procesarlas
+      // hasta finalizar". Antes el flag se apagaba al vaciar la cola y había
+      // que prenderlo manualmente al subir más items.
+      try {
+        const pcRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id&limit=1`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+        );
+        const range = pcRes.headers.get("content-range") || "";
+        const pendingCount = parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+        if (pendingCount > 0) {
+          // Lee el flag actual y solo lo prende si está apagado (evita writes vacíos)
+          const fRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.csv_queue_enabled&select=value`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          );
+          const fRows = await fRes.json().catch(() => []);
+          const isOn = (fRows?.[0]?.value || "").toLowerCase() === "true";
+          if (!isOn) {
+            await setConfigValue(token, "csv_queue_enabled", "true");
+            log(`🔛 csv_queue auto-encendida: ${pendingCount} items pending detectados`);
+          }
+        }
+      } catch (e) { log(`⚠️ csvQueue auto-enable: ${e.message}`); }
 
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);
