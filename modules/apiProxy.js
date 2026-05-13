@@ -163,9 +163,10 @@ async function loadUserPersonalCap() {
       _userPersonalCap = rows?.[0]?.monthly_api_cap ? parseInt(rows[0].monthly_api_cap, 10) : null;
     }
     // Sumar todos los hits de ESTE user en el mes corriente desde toolbar_api_usage.
-    // period ya viene en formato YYYY-MM-06 (cycle 6→6 start). NO agregar "-01".
+    // period es "YYYY-MM" (mes calendario, decisión user 2026-05-12).
+    // Le concatenamos "-01" para que PostgREST acepte el cast a date.
     const usageRes = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(_sbUserEmail)}&day=gte.${period}&select=by_provider`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?user_email=eq.${encodeURIComponent(_sbUserEmail)}&day=gte.${period}-01&select=by_provider`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${_sbAuthToken}` } }
     );
     if (usageRes.ok) {

@@ -312,6 +312,14 @@ const EVA_ENDPOINT = "https://api.eva.pingutil.com/email";
 const VERIFY_CACHE_KEY = "email_verify_deep_cache_v1";
 const VERIFY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días
 
+// Circuit breaker — si eva.pingutil.com se cae (DNS dead, 5xx repetidos),
+// dejamos de intentar por X minutos. Evita el flood de ERR_NAME_NOT_RESOLVED
+// y ahorra latencia. Reset automático cada CIRCUIT_BREAKER_MS.
+const CIRCUIT_BREAKER_MS    = 15 * 60 * 1000; // 15min sin intentar tras N fails
+const CIRCUIT_BREAKER_FAILS = 3;               // tras 3 fails seguidos → open circuit
+let _evaConsecutiveFails = 0;
+let _evaCircuitOpenUntil = 0;
+
 async function _getCachedVerify(email) {
   try {
     if (typeof chrome === "undefined" || !chrome.storage?.local) return null;
@@ -356,19 +364,34 @@ export async function verifyEmailDeep(email) {
     return local;
   }
 
-  // 3. Remote check (eva.pingutil.com) con timeout 4s
+  // 3. Remote check (eva.pingutil.com) con timeout 4s + circuit breaker.
+  //    Si el servicio falla 3 veces seguidas → skip durante 15 min para
+  //    evitar el flood de ERR_NAME_NOT_RESOLVED en consola.
   let remote = null;
-  try {
-    const ctrl = new AbortController();
-    const tid  = setTimeout(() => ctrl.abort(), 4000);
-    const res  = await fetch(`${EVA_ENDPOINT}?email=${encodeURIComponent(email)}`, { signal: ctrl.signal });
-    clearTimeout(tid);
-    if (res.ok) {
-      const json = await res.json();
-      // {status, data:{deliverable, disposable, spam, mx_records, valid_syntax, ...}}
-      remote = json?.data || json || null;
+  if (Date.now() < _evaCircuitOpenUntil) {
+    // Circuit abierto — saltear, usar solo local
+  } else {
+    try {
+      const ctrl = new AbortController();
+      const tid  = setTimeout(() => ctrl.abort(), 4000);
+      const res  = await fetch(`${EVA_ENDPOINT}?email=${encodeURIComponent(email)}`, { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (res.ok) {
+        const json = await res.json();
+        remote = json?.data || json || null;
+        _evaConsecutiveFails = 0; // reset
+      } else {
+        _evaConsecutiveFails++;
+      }
+    } catch {
+      _evaConsecutiveFails++;
     }
-  } catch { /* timeout o red caída — usamos solo local */ }
+    if (_evaConsecutiveFails >= CIRCUIT_BREAKER_FAILS) {
+      _evaCircuitOpenUntil = Date.now() + CIRCUIT_BREAKER_MS;
+      console.warn(`[emailVerifier] eva.pingutil.com falló ${_evaConsecutiveFails}× — circuit OPEN por ${CIRCUIT_BREAKER_MS/60000}min, usando solo local`);
+      _evaConsecutiveFails = 0;
+    }
+  }
 
   // 4. Combinar local + remote
   if (!remote) {
