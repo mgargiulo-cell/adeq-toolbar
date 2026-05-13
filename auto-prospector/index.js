@@ -632,7 +632,7 @@ async function promoteWaitlist(token) {
   }
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactPhone, emails, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactPhone, emails, emailSources = {}, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
   // Esta función solo INSERTA y devuelve boolean.
@@ -653,6 +653,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
       contact_name:   contactName    || "",
       contact_phone:  contactPhone   || "",
       emails:         emails         || [],
+      email_sources:  emailSources   || {},  // {email: "apollo"|"scrape"|"informer"|"generic"} para pick prioritario
       pitch:          pitch          || "",
       pitch_subject:  pitchSubject   || "",
       pitch_subjects: pitchSubjects  || [],
@@ -1858,12 +1859,39 @@ async function bumpApolloUnlocks(token, n = 1) {
 const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}(?=\s|$|[^a-zA-Z])/g;
 const IGNORE_EMAIL = ["example.com","domain.com","sentry.io","google.com","w3.org","schema.org","cloudflare.com"];
 
+// Limpieza de prefijo "C" pegado al email — artifact común del scrape de HTML
+// donde "Contato: foo@bar.com" se captura como "Cfoo@bar.com" porque la regex
+// agarró la C de "Contato:" cuando no había espacio. Casos reales 2026-05-13:
+//   - Cpublicidade@autoracing.com.br → publicidade@autoracing.com.br
+//   - Cbasketball-video.com@whoisprotectservice.net → basketball-video.com@... (queda invalido por TLD, se descarta)
+//   - Cluciano@phonecall.com.br → luciano@phonecall.com.br
+function _stripScrapePrefix(email) {
+  if (!email || typeof email !== "string") return email;
+  const [local, domain] = email.split("@");
+  if (!local || !domain) return email;
+  // Solo si local-part empieza con 1 letra MAYÚSCULA seguida de letra minúscula:
+  // "Cpublicidade", "Cluciano". Y la versión sin la letra debe seguir matcheando
+  // formato normal (5+ chars y no es la inicial de "carlos" ej.)
+  if (/^[A-Z][a-z]{4,}/.test(local)) {
+    const stripped = local.slice(1).toLowerCase();
+    // Solo limpiar si la versión strip es una palabra reconocible (rol/keyword común)
+    // o tiene patrón firstname normal sin la mayúscula al inicio.
+    const KNOWN_LOCAL = /^(publicidade|publicidad|contato|contatto|contact|contacto|info|hola|atendimento|suporte|soporte|prensa|press|imprensa|sales|ventas|marketing|comercial|info|hello|hi|news|press|admin|director|gerente|owner|founder|ceo|cto|editor|redaccion|redacao)/i;
+    const FIRSTNAME = /^[a-z]{3,12}$/i; // single lowercase word that could be firstname
+    if (KNOWN_LOCAL.test(stripped) || FIRSTNAME.test(stripped)) {
+      return `${stripped}@${domain}`;
+    }
+  }
+  return email.toLowerCase();
+}
+
 function extractEmailsFromHtml(html) {
   const clean = html
     .replace(/&#64;|&#x40;/gi, "@").replace(/&#46;|&#x2e;/gi, ".")
     .replace(/\[\s*at\s*\]/gi, "@").replace(/\(\s*at\s*\)/gi, "@")
     .replace(/\barroba\b/gi,   "@").replace(/\bpunto\b/gi,    ".");
-  const found = [...new Set((clean.match(EMAIL_REGEX) || []).map(e => e.toLowerCase()))];
+  const raw = [...new Set((clean.match(EMAIL_REGEX) || []).map(e => _stripScrapePrefix(e)))];
+  const found = [...new Set(raw.map(e => e.toLowerCase()))];
   return found.filter(e => {
     const lower = e.toLowerCase();
     if (IGNORE_EMAIL.some(p => lower.includes(p))) return false;
@@ -2754,8 +2782,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const apolloContactName = apolloRes?.contact_name || "";
   const apolloPhone       = apolloRes?.phone || "";
   const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
-  // Apollo va PRIMERO en el array (rankEmail prefiere personal > scraping anyway)
+  // Apollo va PRIMERO en el array. emailSources mapea cada email a su origen
+  // para pick prioritario en agent: apollo > scrape > generic.
   const rawEmails = [...new Set([...apolloEmail, ...scraperEmails])];
+  const emailSources = {};
+  apolloEmail.forEach(e => { emailSources[e.toLowerCase()] = "apollo"; });
+  scraperEmails.forEach(e => {
+    const lower = e.toLowerCase();
+    if (!emailSources[lower]) {
+      // Generic role detection: si el local-part es info/contact/sales/etc → "generic", sino "scrape"
+      const local = (lower.split("@")[0] || "");
+      const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
+      emailSources[lower] = IS_GENERIC.test(local) ? "generic" : "scrape";
+    }
+  });
   // Filtrar emails con dominio sin MX records ANTES de guardar
   const emails = await validateEmailsBatch(rawEmails);
   if (rawEmails.length !== emails.length) {
@@ -2775,6 +2815,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       contactName:    apolloContactName,
       contactPhone:   apolloPhone,
       emails,
+      emailSources,                              // source tracking apollo/scrape/generic
       pitch:          "",
       pitchSubject:   "",
       pitchSubjects:  [],
@@ -4201,7 +4242,13 @@ async function scanBouncesForUser(token, userEmail) {
         }
       } catch {}
     }
-    if (detected) log(`🚫 scanBounces ${userEmail}: detectó ${detected} email(s) rebotados`);
+    if (detected) {
+      log(`🚫 scanBounces ${userEmail}: detectó ${detected} email(s) rebotados`);
+      // Audit P1 fix: invalidar cache de bounced para que el próximo
+      // rankEmail use la lista actualizada. Antes la cache TTL 5min podía
+      // dejar pasar un email que JUST bounced en este mismo ciclo.
+      _bouncedCache.ts = 0;
+    }
     return detected;
   } catch (e) {
     log(`⚠️ scanBounces error: ${e.message}`);
@@ -5755,11 +5802,25 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // Re-pickear el MEJOR email después del enrichment.
-        // Threshold ESTRICTO: solo score >= 0 (positivo). Score negativo significa
-        // que las penalties superan los bonuses → es mejor NO mandar y dejar que
-        // el lead caiga a freeze que mandar a garbage (webmail cross-domain, etc.).
-        const _rankedAll = emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) }));
-        const ranked = _rankedAll.filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
+        // Política user 2026-05-13: prioridad ESTRICTA por SOURCE primero:
+        //   apollo > informer > scrape > generic
+        // (regardless de rank score). Si hay varios del mismo source → rank decide.
+        // Threshold: solo score >= 0 (positivo); negativo = no mandar.
+        const SOURCE_RANK = { apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+        const _sourcesMap = lead.email_sources || {};
+        const _rankedAll = emails.map(e => ({
+          email:  e,
+          source: _sourcesMap[e.toLowerCase()] || "",
+          score:  rankEmail(e, domain, lead.category),
+        }));
+        const ranked = _rankedAll
+          .filter(x => x.score >= 0)
+          .sort((a, b) => {
+            const sa = SOURCE_RANK[a.source] || 0;
+            const sb = SOURCE_RANK[b.source] || 0;
+            if (sa !== sb) return sb - sa;     // mejor source primero
+            return b.score - a.score;          // dentro del mismo source, mejor rank
+          });
         let email = ranked[0]?.email;
         // Log diagnóstico — ver qué pasó con cada candidate
         if (emails.length > 0) {
@@ -6011,17 +6072,30 @@ async function runAgentCycle(token, allFlags) {
             estado_idx: 3, // Propuesta Vigente (T)
           }, AGENT_DEFAULTS.monday_board_id);
         } catch (mondayErr) {
-          // Edge case raro: mail YA se mandó pero Monday falló.
-          // Loggeamos como sent_no_monday para que admin pueda crear el item manual.
-          // No es crítico — el lead recibió el pitch, solo falta tracking en CRM.
-          log(`⚠️ Agent ${userEmail}: Gmail OK pero Monday falló para ${domain}: ${mondayErr.message}`);
-          // NO duplicar action='sent' — ya quedó reservado pre-send.
+          // Audit P1 fix: Gmail OK + Monday FAIL = lead recibió pitch pero no
+          // hay tracking en CRM. Antes solo log; ahora guardamos el payload
+          // COMPLETO en details.retry_payload para que admin pueda re-push manual
+          // desde un script o el panel admin. Sendtrack + review_queue siguen
+          // marcando para no re-enviar.
+          log(`🟠 Agent ${userEmail}: Gmail OK pero Monday FAIL ${domain}: ${mondayErr.message} — guardando retry_payload`);
           await logAgentAction(token, userEmail, {
             domain, action: "monday_failed", reason: "monday_push_error",
             pitch_subject: subject,
-            details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language, monday_error: mondayErr.message?.substring(0, 200) },
+            details: {
+              email, traffic: leadTraffic, geo: leadGeo,
+              language: lead.language,
+              monday_error: mondayErr.message?.substring(0, 200),
+              // Retry payload: todo lo necesario para que admin re-pushee manual
+              retry_payload: {
+                domain, email, geo: leadGeo, traffic: leadTraffic,
+                language: lead.language, contact_name: lead.contact_name || "",
+                pitch_subject: subject,
+                pitch_body: pitch.body?.substring(0, 5000) || "",
+                sent_at: new Date().toISOString(),
+                sender_user: userEmail,
+              },
+            },
           });
-          // Igual marcamos sendtrack + review_queue para no re-mandar
         }
 
         // 6. Track en sendtrack para no re-enviar (siempre, mail YA salió)
@@ -6136,6 +6210,32 @@ async function main() {
     if (cleanupRes.ok) log("🧹 Cleanup: items processing → pending (recovery from previous run)");
   } catch (e) {
     log(`⚠️ Cleanup processing items failed: ${e.message}`);
+  }
+
+  // ── Cleanup: reserved slots huérfanos (> 5min sin patch a sent/failed) ──
+  // Audit P1 fix: si Railway crashea entre el INSERT reserved y el PATCH→sent,
+  // el slot queda como 'reserved' permanente y cuenta para el cap diario.
+  // Acumula con cada crash → over-count → menos envíos de los permitidos.
+  // Acá los marcamos como 'failed' con reason='orphaned_reserve' para que el
+  // contador del cap no los cuente (filtra solo action='sent').
+  try {
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // 5min atrás
+    const orphanRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.reserved&created_at=lt.${cutoff}`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${BACKEND_BEARER || ""}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({ action: "failed", reason: "orphaned_reserve_crash_recovery" }),
+      }
+    );
+    if (orphanRes.ok) log("🧹 Cleanup: reserved slots huérfanos → failed (cap diario corregido)");
+  } catch (e) {
+    log(`⚠️ Cleanup orphaned reserves failed: ${e.message}`);
   }
 
 
