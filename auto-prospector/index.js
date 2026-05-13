@@ -1744,6 +1744,9 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
 const APOLLO_UNLOCK_MIN_TRAFFIC = 500_000;
 async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allowUnlock = true } = {}) {
   if (!apolloKey || !domain) return null;
+  // Audit P2 fix: Apollo espera dominio limpio sin www. Antes lookups con
+  // "www.sitio.com" fallaban silenciosamente.
+  domain = domain.replace(/^https?:\/\//, "").replace(/^www\./, "").toLowerCase().trim();
 
   // 1. Cache 7d
   if (token) {
@@ -4991,17 +4994,22 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   const EDITORIAL  = /^(editor|editor-in-chief|chief-editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
   const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
 
+  // ORDEN: chequear generics PRIMERO (antes que "single name"), sino palabras
+  // tipo "contato" se cuelan como single-name con score alto en lugar de role.
+  const IS_GENERIC = /^(info|contact|contacto|contato|contatto|contattare|kontakt|kontact|hello|hi|hey|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|bonjour|news|press|prensa|imprensa|stampa|presse|presseportal|noticias|reception|recepcion|recepcao|general)$/i;
+
   if (EXEC.test(local))           score += 90;       // CEO/founder = jackpot
   else if (COMMERCIAL.test(local)) score += 80;
   else if (EDITORIAL.test(local))  score += 60;
   // Pattern firstname.lastname (juan.perez@x.com) = persona real
   else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) score += 70;
   // Pattern firstinitial+lastname (jperez@x.com, mgarcia@x.com) = común corp
-  else if (/^[a-z][a-z]{4,14}$/.test(local) && local.length >= 5 && /[aeiou]/.test(local)) score += 55;
+  else if (/^[a-z][a-z]{4,14}$/.test(local) && local.length >= 5 && /[aeiou]/.test(local) && !IS_GENERIC.test(local)) score += 55;
+  // Generics — OK pero baja conversión. Cobertura multi-idioma (PT/IT/FR/DE/ES).
+  // CHEQUEADO ANTES que single-name para que "contato" no se cuele como persona.
+  else if (IS_GENERIC.test(local)) score += 15;
   // Single name (juan@x.com) — could be person or generic
   else if (/^[a-z]{3,12}$/.test(local) && /[aeiou]/.test(local)) score += 30;
-  // Generics — OK pero baja conversión
-  else if (/^(info|contact|contacto|hello|hi|hola|support|soporte|mail|email|inbox)$/.test(local)) score += 20;
 
   // ── CATEGORY-ROLE MATCH (peso 0-25) ──
   // Si el sitio es "sports" y el email es marketing/comercial → bonus extra

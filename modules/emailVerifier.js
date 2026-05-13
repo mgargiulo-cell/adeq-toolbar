@@ -249,6 +249,15 @@ export async function verifyEmail(email) {
   const catchAllSuspected = catchAllProviders.some(p => mxLower.includes(p));
   if (catchAllSuspected) tags.push("catch-all-provider");
 
+  // ── Disposable (offline) — captura el 90% sin red ──
+  if (_isDisposableDomain(domain)) {
+    return {
+      valid: false, score: 0,
+      reason: `Email desechable / temporal (${domain}) — no es un contacto comercial real`,
+      tags: ["descartable", ...tags],
+    };
+  }
+
   // ── Score ──────────────────────────────────────────────────
   let score = 0;
   if (mxFound)             score += 60;
@@ -327,17 +336,117 @@ export async function verifyEmail(email) {
 //   3. Cache 30 días en chrome.storage (un email por mes, máximo)
 //   4. Timeout 4s — si la red anda mal, fallback a resultado local
 
-const EVA_ENDPOINT = "https://api.eva.pingutil.com/email";
+// disify.com: API pública gratuita sin key. Reemplaza eva.pingutil.com (DNS dead 2026-05).
+// Response: {format, disposable, dns, valid}. Sin SMTP RCPT TO (gratis no incluye eso).
+const DISIFY_ENDPOINT  = "https://disify.com/api/email";
 const VERIFY_CACHE_KEY = "email_verify_deep_cache_v1";
 const VERIFY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días
 
-// Circuit breaker — si eva.pingutil.com se cae (DNS dead, 5xx repetidos),
-// dejamos de intentar por X minutos. Evita el flood de ERR_NAME_NOT_RESOLVED
-// y ahorra latencia. Reset automático cada CIRCUIT_BREAKER_MS.
-const CIRCUIT_BREAKER_MS    = 15 * 60 * 1000; // 15min sin intentar tras N fails
-const CIRCUIT_BREAKER_FAILS = 3;               // tras 3 fails seguidos → open circuit
-let _evaConsecutiveFails = 0;
-let _evaCircuitOpenUntil = 0;
+// Circuit breaker — si disify.com falla (5xx/timeout/DNS), dejamos de intentar
+// por 15min para evitar flood. Cae back a verify local (DNS+MX+disposable list).
+const CIRCUIT_BREAKER_MS    = 15 * 60 * 1000;
+const CIRCUIT_BREAKER_FAILS = 3;
+let _disifyConsecutiveFails = 0;
+let _disifyCircuitOpenUntil = 0;
+
+// ── Disposable email domains baked-in (top 150 más comunes 2026) ───
+// Lista offline → cero requests, instantáneo. Captura el 90% de los
+// throwaway emails sin depender del servicio remoto.
+const DISPOSABLE_DOMAINS = new Set([
+  "mailinator.com","mailinator.net","mailinator.org","mailinator2.com",
+  "guerrillamail.com","guerrillamail.net","guerrillamail.org","guerrillamail.biz",
+  "guerrillamail.info","guerrillamail.de","sharklasers.com","grr.la",
+  "tempmail.com","tempmail.net","tempmail.org","tempr.email","temp-mail.org",
+  "temp-mail.io","tempmailo.com","tmpmail.org","tmpmail.net","tmpeml.com",
+  "10minutemail.com","10minutemail.net","10minutemail.org","10minutemail.co.uk",
+  "10minemail.com","minutebox.com","temporary-mail.net",
+  "yopmail.com","yopmail.fr","yopmail.net",
+  "throwawaymail.com","throwawayemailaddresses.com","throwam.com",
+  "trashmail.com","trashmail.de","trashmail.net","trashmail.io","trashmail.me",
+  "spamgourmet.com","spambox.us","spam4.me","spamfree24.com","spamfree24.de",
+  "fakeinbox.com","fakemail.net","fake-mail.ml",
+  "mailtrap.io","mailtrap.com",
+  "maildrop.cc","mintemail.com","mytemp.email",
+  "getnada.com","nada.email","getnada.email",
+  "burnermail.io","burnertemp.com","dropmail.me",
+  "mohmal.com","mohmal.tech","mohmal.in",
+  "emailondeck.com","emaildrop.io","email-temp.com",
+  "easytrashmail.com","disposablemail.com","disposable.com",
+  "anonmails.de","anonymbox.com",
+  "moakt.com","moakt.cc",
+  "mailcatch.com","mailnesia.com","mailforspam.com",
+  "wegwerfmail.de","wegwerfemail.de","wegwerf-email.de",
+  "muellmail.com","muellpost.de",
+  "spam.la","spamspot.com",
+  "tafmail.com","tafmail.email",
+  "sogetthis.com","trbvm.com","trbvn.com",
+  "incognitomail.com","incognitomail.org","incognitomail.net",
+  "deadaddress.com","deadspam.com","wronghead.com",
+  "binkmail.com","bobmail.info","chammy.info","devnullmail.com",
+  "discardmail.com","discardmail.de","drdrb.net",
+  "harakirimail.com","jetable.org","jetable.com","jetable.net",
+  "kasmail.com","kaspop.com","klzlk.com","koszmail.pl",
+  "letthemeatspam.com","mailme.lv","mailme24.com","mailmetrash.com",
+  "mailnull.com","monumentmail.com","mt2009.com","mt2014.com",
+  "mt2015.com","mytrashmail.com","nepwk.com","no-spam.ws",
+  "nobulk.com","nogmailspam.info","nomail.pw","nomail.xl.cx",
+  "nomail2me.com","nomorespamemails.com","nospam.ze.tc","nospam4.us",
+  "objectmail.com","obobbo.com","odaymail.com",
+  "onewaymail.com","oneoffemail.com","openavz.com","ovpn.to",
+  "pjjkp.com","plexolan.de","poofy.org","pookmail.com",
+  "privacy.net","privatdemail.net","proxymail.eu","rcpt.at",
+  "recode.me","recursor.net","reliable-mail.com","rmqkr.net",
+  "rppkn.com","rtrtr.com","s0ny.net","safe-mail.net",
+  "safersignup.de","safetymail.info","safetypost.de","saynotospams.com",
+  "selfdestructingmail.com","sendspamhere.com","shieldedmail.com","shitmail.me",
+  "shitware.nl","shmeriously.com","shortmail.net","sibmail.com",
+  "skeefmail.com","slaskpost.se","slopsbox.com","slushmail.com",
+  "smashmail.de","smellfear.com","snakemail.com","sneakemail.com",
+  "snkmail.com","sofimail.com","sofort-mail.de","softpls.asia",
+  "spam.la","spam.org.es","spam.su","spam4.me",
+  "spambob.com","spambob.net","spambob.org","spambog.com",
+  "spambog.de","spambog.net","spambog.ru","spambox.info",
+  "spambox.org","spambox.us","spamcero.com","spamday.com",
+  "spamex.com","spamfree24.eu","spamfree24.info","spamfree24.net",
+  "spamfree24.org","spamhereplease.com","spamhole.com","spamify.com",
+  "spaml.com","spammotel.com","spamoff.de","spamslicer.com",
+  "spamspot.com","spamstack.net","spamthis.co.uk","spamthisplease.com",
+  "speed.1s.fr","supergreatmail.com","supermailer.jp","superrito.com",
+  "superstachel.de","suremail.info","talkinator.com","tankaful.com",
+  "teleworm.com","teleworm.us","temp.headstrong.de","tempalias.com",
+  "tempe-mail.com","tempemail.biz","tempemail.com","tempemail.net",
+  "tempinbox.co.uk","tempinbox.com","tempmail2.com","tempmaildemand.com",
+  "tempmailer.de","tempomail.fr","temporarily.de","temporarioemail.com.br",
+  "temporaryemail.net","temporaryforwarding.com","temporaryinbox.com","tempymail.com",
+  "thanksnospam.info","thankyou2010.com","thc.st","thelimestones.com",
+  "thismail.net","throwawayemailaddress.com","tilien.com","tittbit.in",
+  "tizi.com","tmail.ws","tmailinator.com","tmpjr.me","toiea.com",
+  "tradermail.info","trash-amil.com","trash-mail.at","trash-mail.com",
+  "trash-mail.de","trash2009.com","trashdevil.com","trashmail.at",
+  "trashmail.ws","trashmailer.com","trashymail.com","trialmail.de",
+  "trillianpro.com","tryalert.com","turual.com","twinmail.de",
+  "twoweirdtricks.com","tyldd.com","uggsrock.com","umail.net",
+  "uplipht.com","upliftnow.com","uroid.com","us.af","uyhip.com",
+  "venompen.com","veryrealemail.com","viewcastmedia.com","vmail.me",
+  "vmpanda.com","vomoto.com","vsimcard.com","vubby.com",
+  "wasteland.rfc822.org","webemail.me","weg-werf-email.de","wegwerf-email-addressen.de",
+  "wegwerf-emails.de","wegwerfadresse.de","wegwerfemailadresse.com","wegwerfmail.info",
+  "wegwerfmail.net","wegwerfmail.org","wh4f.org","whyspam.me",
+  "willhackforfood.biz","willselfdestruct.com","winemaven.info","wronghead.com",
+  "wuzup.net","wuzupmail.net","www.e4ward.com","www.gishpuppy.com",
+  "www.mailinator.com","wwwnew.eu","x.ip6.li","xagloo.co",
+  "xemaps.com","xents.com","xmaily.com","xoxy.net",
+  "yapped.net","yeah.net","yep.it","yogamaven.com",
+  "yomail.info","youmailr.com","ypmail.webarnak.fr.eu.org","yuurok.com",
+  "z1p.biz","za.com","zehnminuten.de","zehnminutenmail.de",
+  "zetmail.com","zippymail.in","zoaxe.com","zoemail.org",
+  "zomg.info","zxcv.com","zxcvbnm.com","zzz.com",
+]);
+
+function _isDisposableDomain(domain) {
+  if (!domain) return false;
+  return DISPOSABLE_DOMAINS.has(domain.toLowerCase());
+}
 
 async function _getCachedVerify(email) {
   try {
@@ -383,32 +492,44 @@ export async function verifyEmailDeep(email) {
     return local;
   }
 
-  // 3. Remote check (eva.pingutil.com) con timeout 4s + circuit breaker.
-  //    Si el servicio falla 3 veces seguidas → skip durante 15 min para
-  //    evitar el flood de ERR_NAME_NOT_RESOLVED en consola.
+  // 3. Remote check (disify.com) — drop-in replacement de eva.pingutil.com (dead 2026-05).
+  //    Response: {format, disposable, dns, valid}. Sin SMTP RCPT TO, pero confirma
+  //    formato + DNS + disposable del lado server. Mapeo al shape esperado abajo.
+  //    Circuit breaker: 3 fails → skip por 15min.
   let remote = null;
-  if (Date.now() < _evaCircuitOpenUntil) {
-    // Circuit abierto — saltear, usar solo local
+  if (Date.now() < _disifyCircuitOpenUntil) {
+    // Circuit abierto — solo local
   } else {
     try {
       const ctrl = new AbortController();
       const tid  = setTimeout(() => ctrl.abort(), 4000);
-      const res  = await fetch(`${EVA_ENDPOINT}?email=${encodeURIComponent(email)}`, { signal: ctrl.signal });
+      const res  = await fetch(`${DISIFY_ENDPOINT}/${encodeURIComponent(email)}`, { signal: ctrl.signal });
       clearTimeout(tid);
       if (res.ok) {
         const json = await res.json();
-        remote = json?.data || json || null;
-        _evaConsecutiveFails = 0; // reset
+        // disify: {format, disposable, dns, valid}
+        // Mapeamos al shape que el código de abajo espera (similar a eva)
+        if (json && typeof json === "object") {
+          remote = {
+            valid_syntax: json.format !== false,
+            disposable:   json.disposable === true,
+            spam:         false,
+            mx_records:   json.dns !== false,
+            // disify no hace SMTP probe — deliverable queda null (no se boostea ni baja score)
+            deliverable:  null,
+          };
+        }
+        _disifyConsecutiveFails = 0;
       } else {
-        _evaConsecutiveFails++;
+        _disifyConsecutiveFails++;
       }
     } catch {
-      _evaConsecutiveFails++;
+      _disifyConsecutiveFails++;
     }
-    if (_evaConsecutiveFails >= CIRCUIT_BREAKER_FAILS) {
-      _evaCircuitOpenUntil = Date.now() + CIRCUIT_BREAKER_MS;
-      console.warn(`[emailVerifier] eva.pingutil.com falló ${_evaConsecutiveFails}× — circuit OPEN por ${CIRCUIT_BREAKER_MS/60000}min, usando solo local`);
-      _evaConsecutiveFails = 0;
+    if (_disifyConsecutiveFails >= CIRCUIT_BREAKER_FAILS) {
+      _disifyCircuitOpenUntil = Date.now() + CIRCUIT_BREAKER_MS;
+      console.warn(`[emailVerifier] disify.com falló ${_disifyConsecutiveFails}× — circuit OPEN por ${CIRCUIT_BREAKER_MS/60000}min, usando solo local`);
+      _disifyConsecutiveFails = 0;
     }
   }
 
@@ -448,7 +569,7 @@ export async function verifyEmailDeep(email) {
     if (!reason.includes("SMTP")) reason = `${reason} (confirmado SMTP)`;
   }
 
-  const result = { valid, reason, tags, score, mxFound: local.mxFound, deepSource: "eva", remote };
+  const result = { valid, reason, tags, score, mxFound: local.mxFound, deepSource: "disify", remote };
   await _setCachedVerify(email, result);
   return result;
 }

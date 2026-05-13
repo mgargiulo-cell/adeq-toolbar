@@ -3366,7 +3366,8 @@ function _emailGrade(email, result, source) {
         tags.includes("spam") || tags.includes("proxy-whois")) {
       return { grade: "E", label: "Descartable" };
     }
-    if (result.deepSource === "eva") score += 25;       // SMTP remoto confirmó
+    if (result.deepSource === "disify") score += 15;       // DNS+disposable confirmado remoto
+    else if (result.deepSource === "eva") score += 25;     // legacy SMTP (cache pre-2026-05)
     else if (result.deepSource === "local-only") score += 5; // solo DNS local
     if (tags.includes("rol"))                score -= 20;
     if (tags.includes("catch-all"))          score -= 15;
@@ -3404,7 +3405,7 @@ function _verifyTooltip(result) {
   const status = result.valid ? "✔ Valid" : "✖ Invalid";
   const reason = result.reason || "";
   const tags   = (result.tags || []).join(", ");
-  const src    = result.deepSource === "eva" ? "[SMTP confirmado]"
+  const src    = result.deepSource === "disify" || result.deepSource === "eva" ? "[remoto confirmado]"
                : result.deepSource === "local-only" ? "[solo DNS local]"
                : "";
   const cache  = result.fromCache ? "[cache]" : "";
