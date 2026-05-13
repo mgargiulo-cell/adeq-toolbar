@@ -493,6 +493,8 @@ export const APOLLO_MONTHLY_HARD_CAP = 2400;
 // - waiting_pool: max 300 items en hold (se promueven a pending cuando libera)
 // - review_queue (Prospects) NO tiene cap — puede crecer indefinido (es mejor tener variedad)
 export const CSV_QUEUE_HARD_CAP = 200;
+export const CSV_WAITING_POOL_CAP = 300;
+export const CSV_UPLOAD_MAX = 1000;
 export const WAITLIST_HARD_CAP  = 300;
 
 export async function getApolloMonthlyUsage(accessToken) {
@@ -1013,30 +1015,55 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!Array.isArray(domains) || domains.length === 0) return { inserted: 0 };
 
-  // Pre-check: cuántos espacio tenemos en la cola pending (max 200)
-  // Los primeros N entran como "pending", el resto como "waiting_pool".
-  let pendingNow = 0;
+  // Pre-check capacidades:
+  // - pending (cap 200): cola activa, worker procesa de acá
+  // - waiting_pool (cap 300): cola intermedia, promote a pending cuando libera
+  // - next_day: excedente del budget diario (1000/día total), rollover medianoche Madrid
+  let pendingNow = 0, waitingNow = 0, dailyCount = 0, dailyCap = 1000;
   try {
-    const r = await fetch(
-      `${url}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
-    );
-    const range = r.headers.get("content-range") || r.headers.get("Content-Range") || "";
-    const m = range.match(/\/(\d+)$/);
-    pendingNow = m ? parseInt(m[1]) : 0;
+    const [rPending, rWaiting, rCfg] = await Promise.all([
+      fetch(`${url}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`,
+        { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${url}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`,
+        { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${url}/rest/v1/toolbar_config?key=in.(csv_daily_count,csv_daily_count_date,csv_queue_daily_cap)&select=key,value`,
+        { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }),
+    ]);
+    const parseCount = (r) => {
+      const range = r.headers.get("content-range") || r.headers.get("Content-Range") || "";
+      const m = range.match(/\/(\d+)$/);
+      return m ? parseInt(m[1]) : 0;
+    };
+    pendingNow = parseCount(rPending);
+    waitingNow = parseCount(rWaiting);
+    const cfgRows = await rCfg.json().catch(() => []);
+    const cfgMap = {}; cfgRows.forEach(r => { cfgMap[r.key] = r.value; });
+    const todaySpain = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid" })).toISOString().split("T")[0];
+    if (cfgMap.csv_daily_count_date === todaySpain) {
+      dailyCount = parseInt(cfgMap.csv_daily_count || "0", 10);
+    }
+    dailyCap = parseInt(cfgMap.csv_queue_daily_cap || "1000", 10);
   } catch {}
-  const slotsLeft = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
 
-  // Batch de 500 (límite seguro de Supabase REST)
+  const pendingSlots  = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
+  const waitingSlots  = Math.max(0, CSV_WAITING_POOL_CAP - waitingNow);
+  const todayBudget   = Math.max(0, dailyCap - dailyCount); // cuántos más caben en el budget de hoy
+
+  // Distribución: pending (limitado por pendingSlots Y todayBudget) → waiting_pool (limitado por waitingSlots Y todayBudget) → next_day (sin cap)
   const BATCH = 500;
-  let inserted = 0, intoPending = 0, intoWaiting = 0;
-  let consumed = 0; // cuántos ya asigné (para distribuir entre pending y waiting_pool)
+  let inserted = 0, intoPending = 0, intoWaiting = 0, intoNextDay = 0;
+  let consumedPending = 0, consumedWaiting = 0;
+  let consumedTodayBudget = 0; // cuántos slots consumimos del budget diario (pending + waiting cuentan)
   for (let i = 0; i < domains.length; i += BATCH) {
     const slice = domains.slice(i, i + BATCH).map(d => {
-      const goesIntoPending = consumed < slotsLeft;
-      consumed++;
-      const status = goesIntoPending ? "pending" : "waiting_pool";
-      if (goesIntoPending) intoPending++; else intoWaiting++;
+      let status;
+      if (consumedPending < pendingSlots && consumedTodayBudget < todayBudget) {
+        status = "pending"; consumedPending++; consumedTodayBudget++; intoPending++;
+      } else if (consumedWaiting < waitingSlots && consumedTodayBudget < todayBudget) {
+        status = "waiting_pool"; consumedWaiting++; consumedTodayBudget++; intoWaiting++;
+      } else {
+        status = "next_day"; intoNextDay++;
+      }
       return { domain: d, status, uploaded_by: userEmail, source };
     });
     try {
@@ -1057,7 +1084,7 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
       console.warn("uploadCsvDomains batch failed:", e.message);
     }
   }
-  return { inserted, attempted: domains.length, intoPending, intoWaiting };
+  return { inserted, attempted: domains.length, intoPending, intoWaiting, intoNextDay };
 }
 
 // Re-export for callers

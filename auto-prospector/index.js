@@ -521,12 +521,13 @@ async function bumpStat(token, userEmail, reason, n = 1) {
 // El worker promueve waiting_pool → pending automáticamente cuando se libera
 // espacio (al procesar items y bajar el count de pending).
 const CSV_QUEUE_HARD_CAP = 200;
+const CSV_WAITING_POOL_CAP = 300;
 const WAITLIST_HARD_CAP  = 300;
 // Cap diario GLOBAL — protege RapidAPI mensual (40K hits) + Railway billing.
 // 1000 csv_queue + 300 autopilot = 1300/día = ~39K/mes.
 // Configurable runtime: toolbar_config.csv_queue_daily_cap, autopilot_daily_cap_global
 const DEFAULT_CSV_DAILY_GLOBAL_CAP = 1000;
-const DEFAULT_AUTOPILOT_DAILY_GLOBAL_CAP = 300;
+const DEFAULT_AUTOPILOT_DAILY_GLOBAL_CAP = 1000;
 
 // Counters in-process — se persisten al config para que sobrevivan restart
 let _csvDailyCounterDate = null;
@@ -546,8 +547,23 @@ async function getDailyGlobalCounters(token) {
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
   const todaySpain = fmt.format(new Date());
   // Reset si cambió el día calendario
+  const _dayChanged = _csvDailyCounterDate !== null && _csvDailyCounterDate !== todaySpain;
   if (_csvDailyCounterDate !== todaySpain) { _csvDailyCounterDate = todaySpain; _csvDailyCounter = 0; }
   if (_autopilotDailyCounterDate !== todaySpain) { _autopilotDailyCounterDate = todaySpain; _autopilotDailyCounter = 0; }
+  // Rollover next_day → waiting_pool al cambiar el día (regla user: excedente diario espera al siguiente día operativo)
+  if (_dayChanged) {
+    try {
+      const promoteRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day`, {
+        method: "PATCH",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=representation" },
+        body: JSON.stringify({ status: "waiting_pool" }),
+      });
+      if (promoteRes.ok) {
+        const rows = await promoteRes.json().catch(() => []);
+        log(`🌅 day rollover ${todaySpain}: promoted ${rows.length} next_day → waiting_pool`);
+      }
+    } catch (e) { log(`⚠️ next_day rollover: ${e.message}`); }
+  }
   // Cargar persisted counters de Supabase si vienen del mismo día
   try {
     const res = await fetch(
@@ -850,17 +866,25 @@ async function runAutoFeeder(token) {
     log(`🌱 auto-feeder: ${candidates.length} PUBLISHERs, ${known.size} ya conocidos, ${fresh.length} nuevos`);
     if (fresh.length === 0) return 0;
 
-    // 5. Limitar inyección (no saturar la cola de una vez)
+    // 5. Limitar inyección — respetar CSV_QUEUE_HARD_CAP (200). El exceso va a waiting_pool.
+    const pendingNow = await getCsvQueuePendingCountServer(token).catch(() => 0);
+    const slotsLeft = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
     const toInject = fresh.slice(0, FEEDER_INJECT_MAX);
 
     // 6. INSERT en toolbar_csv_queue con source='auto_feeder'
-    const payload = toInject.map(domain => ({
+    //    Primeros slotsLeft van a pending, resto a waiting_pool (worker los promueve cuando baje pending).
+    let _consumed = 0;
+    const payload = toInject.map(domain => {
+      const goesPending = _consumed < slotsLeft;
+      _consumed++;
+      return {
       domain,
-      status:      "pending",
+      status:      goesPending ? "pending" : "waiting_pool",
       source:      "auto_feeder",
       uploaded_by: "worker@autofeeder",
       uploaded_at: new Date().toISOString(),
-    }));
+      };
+    });
     const insRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
       method: "POST",
       headers: {
@@ -891,8 +915,8 @@ async function runAutoFeeder(token) {
 // Procesa 5 leads/run, 1 run cada 60 iters (~5h).
 // ════════════════════════════════════════════════════════════════
 let _lastReenrichRunAt = 0;
-const REENRICH_COOLDOWN_MS = 60 * 60 * 1000; // 1h entre runs
-const REENRICH_BATCH = 5;
+const REENRICH_COOLDOWN_MS = 15 * 60 * 1000; // 15min entre runs (era 1h)
+const REENRICH_BATCH = 10;                    // procesar 10 por run (era 5)
 
 async function runReenrichBadLeads(token) {
   try {
@@ -911,7 +935,9 @@ async function runReenrichBadLeads(token) {
       return;
     }
 
-    // Leads "malos": 0 emails, o solo emails generic (info@/contact@/etc)
+    // Leads que necesitan re-enrich:
+    // - 0 emails
+    // - Solo emails generic (info@/contact@) sin source apollo/informer
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=id,domain,emails,email_sources,contact_name,category&order=created_at.asc&limit=50`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
@@ -938,28 +964,57 @@ async function runReenrichBadLeads(token) {
     log(`🔄 reenrich: procesando ${candidates.length} leads malos`);
     for (const lead of candidates) {
       try {
-        const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
-          traffic: lead.traffic || 0, allowUnlock: true,
-        });
-        if (apolloRes?.email) {
-          // Merge: apollo first, después los existentes (sin duplicar)
+        // 1) Scrape PRIMERO (gratis) — con CF decoder + JSON-LD nuevos
+        let foundEmail = null;
+        let foundSource = null;
+        let foundContactName = "";
+        try {
+          const scraped = await scrapeEmailsForDomain(lead.domain);
+          if (Array.isArray(scraped) && scraped.length > 0) {
+            // Pickear el mejor por rank
+            const ranked = scraped
+              .map(e => ({ email: e, score: rankEmail(e, lead.domain) }))
+              .filter(r => r.score > 0)
+              .sort((a, b) => b.score - a.score);
+            if (ranked.length > 0) {
+              foundEmail = ranked[0].email;
+              foundSource = "scrape";
+            }
+          }
+        } catch (e) { log(`  ⚠️ scrape ${lead.domain}: ${e.message}`); }
+
+        // 2) Apollo SOLO si scrape no encontró nada (ahorra crédito)
+        if (!foundEmail) {
+          try {
+            const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
+              traffic: lead.traffic || 0, allowUnlock: true,
+            });
+            if (apolloRes?.email) {
+              foundEmail = apolloRes.email;
+              foundSource = "apollo";
+              foundContactName = apolloRes.contact_name || "";
+            }
+          } catch (e) { log(`  ⚠️ apollo ${lead.domain}: ${e.message}`); }
+        }
+
+        if (foundEmail) {
           const existing = Array.isArray(lead.emails) ? lead.emails : [];
-          const merged = [apolloRes.email, ...existing.filter(e => e.toLowerCase() !== apolloRes.email.toLowerCase())];
+          const merged = [foundEmail, ...existing.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
           const validated = await validateEmailsBatch(merged);
           const newSources = { ...(lead.email_sources || {}) };
-          newSources[apolloRes.email.toLowerCase()] = "apollo";
+          newSources[foundEmail.toLowerCase()] = foundSource;
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
             body: JSON.stringify({
               emails: validated,
               email_sources: newSources,
-              contact_name: apolloRes.contact_name || lead.contact_name || "",
+              contact_name: foundContactName || lead.contact_name || "",
             }),
           });
-          log(`  ✅ ${lead.domain}: +apollo ${apolloRes.email}`);
+          log(`  ✅ ${lead.domain}: +${foundSource} ${foundEmail}`);
         } else {
-          log(`  ⏭️ ${lead.domain}: Apollo sin resultados`);
+          log(`  ⏭️ ${lead.domain}: scrape+Apollo sin resultados`);
         }
         await sleep(1500); // anti rate-limit
       } catch (e) {
@@ -968,6 +1023,127 @@ async function runReenrichBadLeads(token) {
     }
   } catch (e) {
     log(`⚠️ runReenrichBadLeads error: ${e.message}`);
+  }
+}
+
+// ── Frozen Weekly Report ────────────────────────────────────────
+// Cada domingo 20-21hs Madrid, manda email a mgargiulo@adeqmedia.com con CSV
+// de dominios en toolbar_csv_queue.status='frozen' para análisis manual.
+async function runFrozenWeeklyReport(token) {
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false, weekday: "short" });
+  const parts = fmt.formatToParts(new Date());
+  const partMap = {}; parts.forEach(p => { partMap[p.type] = p.value; });
+  const weekday = partMap.weekday; // "Sun"
+  const hour = parseInt(partMap.hour, 10);
+  if (weekday !== "Sun" || hour < 20 || hour >= 21) return;
+
+  // Una vez por semana — chequear flag con week-of-year
+  const today = `${partMap.year}-${partMap.month}-${partMap.day}`;
+  try {
+    const cfgRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.last_frozen_report_at&select=value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    const cfgRows = await cfgRes.json().catch(() => []);
+    const lastSent = cfgRows?.[0]?.value || "";
+    if (lastSent === today) return; // ya se mandó hoy
+  } catch {}
+
+  // Pull frozen rows
+  const frozenRes = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.frozen&select=domain,uploaded_at,uploaded_by,source,error_message,processed_at&order=uploaded_at.desc&limit=5000`,
+    { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+  );
+  if (!frozenRes.ok) return;
+  const rows = await frozenRes.json();
+  if (!Array.isArray(rows) || rows.length === 0) {
+    log("📊 frozen weekly: 0 rows, skip email");
+    await setConfigValue(token, "last_frozen_report_at", today);
+    return;
+  }
+
+  // Build CSV
+  const csvCell = (v) => {
+    if (v == null) return "";
+    const s = String(v).replace(/"/g, '""');
+    return `"${s}"`;
+  };
+  const header = "domain,uploaded_at,uploaded_by,source,error_message,processed_at";
+  const lines = [header];
+  rows.forEach(r => {
+    lines.push([r.domain, r.uploaded_at, r.uploaded_by, r.source, r.error_message, r.processed_at].map(csvCell).join(","));
+  });
+  const csvContent = lines.join("\n");
+
+  // Stats
+  const byError = {};
+  rows.forEach(r => { const e = r.error_message || "unknown"; byError[e] = (byError[e] || 0) + 1; });
+  const topErrors = Object.entries(byError).sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([err, n]) => `  - ${err}: ${n}`).join("\n");
+
+  const subject = `[ADEQ Toolbar] Frozen domains weekly — ${today} (${rows.length} leads)`;
+  const body = [
+    `📊 Frozen domains report — ${today}`,
+    ``,
+    `Total frozen: ${rows.length}`,
+    ``,
+    `Top errores:`,
+    topErrors,
+    ``,
+    `Ver CSV adjunto para análisis manual.`,
+    ``,
+    `--`,
+    `ADEQ Toolbar v5.0.33 worker`,
+  ].join("\n");
+
+  // Send con attachment via MIME multipart/mixed
+  try {
+    const userEmail = "mgargiulo@adeqmedia.com";
+    const accessToken = await getGmailAccessToken(userEmail);
+    const boundary = `----=adeq_frozen_${Date.now().toString(36)}`;
+    const csvBase64 = Buffer.from(csvContent, "utf-8").toString("base64");
+    const csvBase64Wrapped = csvBase64.match(/.{1,76}/g).join("\r\n");
+
+    const mime = [
+      `To: ${userEmail}`,
+      `From: ${userEmail}`,
+      `Subject: ${subject}`,
+      "MIME-Version: 1.0",
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      "Content-Type: text/plain; charset=utf-8",
+      "Content-Transfer-Encoding: 8bit",
+      "",
+      body,
+      "",
+      `--${boundary}`,
+      `Content-Type: text/csv; charset=utf-8; name="frozen_${today}.csv"`,
+      "Content-Transfer-Encoding: base64",
+      `Content-Disposition: attachment; filename="frozen_${today}.csv"`,
+      "",
+      csvBase64Wrapped,
+      "",
+      `--${boundary}--`,
+    ].join("\r\n");
+
+    const raw = Buffer.from(mime, "utf-8").toString("base64")
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+    const sendRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ raw }),
+    });
+    if (!sendRes.ok) {
+      const errText = await sendRes.text();
+      log(`⚠️ frozen weekly send failed: ${sendRes.status} ${errText.slice(0,200)}`);
+      return;
+    }
+    await setConfigValue(token, "last_frozen_report_at", today);
+    log(`📧 Frozen weekly report enviado: ${rows.length} dominios → ${userEmail}`);
+  } catch (e) {
+    log(`⚠️ frozen weekly: ${e.message}`);
   }
 }
 
@@ -1975,14 +2151,38 @@ function _stripScrapePrefix(email) {
   return email.toLowerCase();
 }
 
+// Cloudflare Email Obfuscation decoder.
+// CF Pro reemplaza emails con <a class="__cf_email__" data-cfemail="HEX">[email protected]</a>.
+// El HEX es: primer byte = XOR key, resto = caracteres del email XOR'd con el key.
+function _decodeCfEmail(hex) {
+  try {
+    const key = parseInt(hex.slice(0, 2), 16);
+    let email = "";
+    for (let i = 2; i < hex.length; i += 2) {
+      email += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16) ^ key);
+    }
+    return email;
+  } catch { return null; }
+}
+
 function extractEmailsFromHtml(html) {
   const clean = html
     .replace(/&#64;|&#x40;/gi, "@").replace(/&#46;|&#x2e;/gi, ".")
     .replace(/\[\s*at\s*\]/gi, "@").replace(/\(\s*at\s*\)/gi, "@")
     .replace(/\barroba\b/gi,   "@").replace(/\bpunto\b/gi,    ".");
-  const raw = [...new Set((clean.match(EMAIL_REGEX) || []).map(e => _stripScrapePrefix(e)))];
-  const found = [...new Set(raw.map(e => e.toLowerCase()))];
-  return found.filter(e => {
+  const collected = new Set();
+  // 1) Regex tradicional
+  (clean.match(EMAIL_REGEX) || []).forEach(e => collected.add(_stripScrapePrefix(e).toLowerCase()));
+  // 2) Cloudflare data-cfemail decoder — gap común en sitios con CF Pro
+  const cfMatches = html.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi);
+  for (const m of cfMatches) {
+    const decoded = _decodeCfEmail(m[1]);
+    if (decoded && decoded.includes("@")) collected.add(decoded.toLowerCase());
+  }
+  // 3) JSON-LD schema.org "email": "x@y"
+  const jsonLdMatches = html.matchAll(/"email"\s*:\s*"([^"]+@[^"]+)"/gi);
+  for (const m of jsonLdMatches) collected.add(m[1].toLowerCase());
+  return [...collected].filter(e => {
     const lower = e.toLowerCase();
     if (IGNORE_EMAIL.some(p => lower.includes(p))) return false;
     const parts = e.split("@");
@@ -2457,6 +2657,46 @@ function isDomainBlocked(domain) {
   return null;
 }
 
+// Cache admin blocklist (toolbar_url_blocklist) — refresca cada 5min.
+// Fix 2026-05-13: antes el worker SOLO chequeaba hardcoded blocklist.
+// Los 500+ dominios que admin agrega manualmente no se filtraban en
+// autopilot path. Ahora ambos paths (CSV + autopilot + agent send) consultan.
+let _adminBlocklistCacheWorker = null;
+let _adminBlocklistFetchedAtWorker = 0;
+const ADMIN_BLOCKLIST_TTL_MS = 5 * 60 * 1000;
+async function getAdminBlocklistWorker(token) {
+  const now = Date.now();
+  if (_adminBlocklistCacheWorker && (now - _adminBlocklistFetchedAtWorker) < ADMIN_BLOCKLIST_TTL_MS) {
+    return _adminBlocklistCacheWorker;
+  }
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return _adminBlocklistCacheWorker || new Set();
+    const rows = await res.json();
+    _adminBlocklistCacheWorker = new Set((rows || []).map(r => (r.domain || "").toLowerCase().replace(/^www\./, "")));
+    _adminBlocklistFetchedAtWorker = now;
+    return _adminBlocklistCacheWorker;
+  } catch { return _adminBlocklistCacheWorker || new Set(); }
+}
+
+// Chequeo unificado: combina hardcoded + admin blocklist.
+// Devuelve string razón si está bloqueado, null si pasa.
+async function isDomainBlockedFull(domain, token) {
+  const hardcoded = isDomainBlocked(domain);
+  if (hardcoded) return hardcoded;
+  const d = domain.toLowerCase().replace(/^www\./, "");
+  const adminList = await getAdminBlocklistWorker(token);
+  if (adminList.has(d)) return "admin-blocklist";
+  // Subdominios de un dominio en blocklist
+  for (const b of adminList) {
+    if (d.endsWith("." + b)) return `admin-blocklist-subdomain (${b})`;
+  }
+  return null;
+}
+
 // Infiere país desde el TLD — fallback cuando SimilarWeb no devuelve topCountry
 const TLD_TO_COUNTRY = {
   ".ar": "Argentina", ".mx": "Mexico", ".co": "Colombia", ".cl": "Chile", ".br": "Brazil",
@@ -2740,6 +2980,15 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const { rapidapi_key, apollo_api_key } = cfg;
   const domain = item.domain;
 
+  // 0. Blocklist check (hardcoded + admin) ANTES de gastar API
+  // Fix 2026-05-13: el CSV worker no chequeaba admin blocklist, solo hardcoded.
+  const blockReason = await isDomainBlockedFull(domain, token);
+  if (blockReason) {
+    await markCsvItem(token, item.id, "skipped", { error_message: `blocked: ${blockReason}` });
+    log(`  ⊘ ${domain} — ${blockReason}, sin consumir API`);
+    return;
+  }
+
   // Buscar en Monday para detectar si es CSV externo (no existe) o Monday Refresh (sí existe + Ciclo Finalizado)
   const mondayApiKey = getMondayKeyForUser(cfg, item.uploaded_by);
   let match = null;
@@ -2796,6 +3045,26 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         const rows = await existing.json();
         const prevFreeze = Array.isArray(rows) && rows[0] ? parseInt(rows[0].attempt_count || 1, 10) : 0;
         const days = prevFreeze === 0 ? 15 : prevFreeze === 1 ? 30 : 60;
+        // Auto-blocklist permanente tras 3+ freeze cycles sin traffic data.
+        // Dominios "inoperativos": están caídos o RapidAPI no los reconoce. No vale gastar más.
+        if (prevFreeze >= 2) {
+          try {
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_url_blocklist`, {
+              method: "POST",
+              headers: {
+                "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+                "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=minimal",
+              },
+              body: JSON.stringify({
+                domain: domain.toLowerCase().replace(/^www\./, ""),
+                category: "inoperativo",
+                added_by: "worker_auto",
+                reason: `3 freeze cycles sin traffic data (último intento ${new Date().toISOString().split("T")[0]})`,
+              }),
+            });
+            log(`  🚫 ${domain} → AUTO-BLOCKLIST 'inoperativo' (3 freeze cycles)`);
+          } catch (e) { log(`  ⚠️ auto-blocklist err: ${e.message}`); }
+        }
         const frozenUntil = new Date(Date.now() + days * 86400_000).toISOString();
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
           method: "POST",
@@ -2860,15 +3129,28 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
     && apolloMonthRemaining > 0;
 
-  // Apollo: 1 email max + maybe unlock si traffic ≥ 500K + cap < 2400.
-  // Scraping: siempre como fallback (gratis).
-  const [apolloRes, scraperEmails] = await Promise.all([
-    canUseApollo
-      ? findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
-          .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
-      : Promise.resolve(null),
-    scrapeEmailsForDomain(domain),
-  ]);
+  // Estrategia de rotación (user 2026-05-13): no quemar Apollo en cada lead.
+  // 50% → scrape primero, si vacío Apollo fallback (ahorra crédito en sitios obvios)
+  // 50% → Apollo primero, si vacío scrape fallback (mejor calidad cuando funciona)
+  // Resultado: ~50% de Apollo lookups vs antes (100%).
+  const useApolloFirst = canUseApollo && Math.random() < 0.5;
+  let apolloRes = null;
+  let scraperEmails = [];
+  if (useApolloFirst) {
+    apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+      .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
+      .catch(() => null);
+    if (!apolloRes?.email) {
+      scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+    }
+  } else {
+    scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+    if (scraperEmails.length === 0 && canUseApollo) {
+      apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+        .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
+        .catch(() => null);
+    }
+  }
   const apolloContactName = apolloRes?.contact_name || "";
   const apolloPhone       = apolloRes?.phone || "";
   const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
@@ -3371,8 +3653,8 @@ async function runSession(token, cfg, sessionStart) {
       count++; skipped++;
       continue;
     }
-    // 1) Blocklist corporativa / universidades / adultos / tech giants
-    const blockReason = isDomainBlocked(domain);
+    // 1) Blocklist corporativa / universidades / adultos / tech giants + ADMIN URLs
+    const blockReason = await isDomainBlockedFull(domain, token);
     if (blockReason) {
       log(`  ⊘ ${domain} — ${blockReason}, saltado sin consumir API`);
       // Permanent: these categories won't change
@@ -3572,14 +3854,25 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ⚠️ Apollo skip: ${reason}`);
     }
 
-    const [apolloRes, scraperEmails, similarSites] = await Promise.all([
-      canUseApollo
-        ? findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
-            .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
-        : Promise.resolve(null),
-      scrapeEmailsForDomain(domain),
-      findSimilarSites(domain, rapidapi_key),
-    ]);
+    // Rotación 50/50 Apollo vs scrape (user 2026-05-13) — ahorra créditos Apollo.
+    const useApolloFirst = canUseApollo && Math.random() < 0.5;
+    const similarPromise = findSimilarSites(domain, rapidapi_key);
+    let apolloRes = null;
+    let scraperEmails = [];
+    if (useApolloFirst) {
+      apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+        .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
+        .catch(() => null);
+      if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+    } else {
+      scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+      if (scraperEmails.length === 0 && canUseApollo) {
+        apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+          .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
+          .catch(() => null);
+      }
+    }
+    const similarSites = await similarPromise;
     const apolloContactNameAuto = apolloRes?.contact_name || "";
     const apolloPhoneAuto       = apolloRes?.phone || "";
     const apolloEmailAuto = apolloRes?.email ? [apolloRes.email] : [];
@@ -5929,6 +6222,12 @@ async function runAgentCycle(token, allFlags) {
     const candidatesRaw = await queueRes.json();
     if (!Array.isArray(candidatesRaw) || candidatesRaw.length === 0) {
       log(`🤖 Agent ${userEmail}: 0 candidatos (threshold=${aCfg.thresholdTraffic}, geos=${focus.geosPriority.join(",")||"all"}, cat=${focus.categoriesPriority.join(",")||"all"})`);
+      // Loggear al feed UI para que el admin vea actividad aunque no haya envíos
+      await logAgentAction(token, userEmail, {
+        domain: "_cycle_", action: "cycle_no_candidates",
+        reason: `threshold=${aCfg.thresholdTraffic}`,
+        details: { threshold: aCfg.thresholdTraffic, geos: focus.geosPriority, categories: focus.categoriesPriority },
+      });
       continue;
     }
 
@@ -5985,6 +6284,7 @@ async function runAgentCycle(token, allFlags) {
       let leadTraffic = lead.traffic || 0;
       let leadGeo = lead.geo || "";
       let leadLanguage = (lead.language || "").toLowerCase().split("-")[0];
+      let reservedId = null;
 
       try {
         // ── DETECCIÓN ROBUSTA DE IDIOMA (CRÍTICO) ──
@@ -6305,8 +6605,22 @@ async function runAgentCycle(token, allFlags) {
         // 4. Send Gmail PRIMERO — si falla, no toca Monday
         const subject = pitch.subjects[0];
 
-        // Hoist para que el catch pueda PATCHearlo a failed_reserved si el send rompe
-        let reservedId = null;
+        // BLOCKLIST GUARD (defense-in-depth) — admin pudo agregar el dominio
+        // entre intake y send. Recheck antes de mandar.
+        const _blockGuard = await isDomainBlockedFull(domain, token).catch(() => null);
+        if (_blockGuard) {
+          log(`  ⊘ ${domain}: ABORT send — admin blocklist (${_blockGuard})`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `blocklist:${_blockGuard}` });
+          // Marcar review_queue como rejected para no re-considerar
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ status: "rejected", validated_by: `admin_blocklist`, validated_at: new Date().toISOString() }),
+          }).catch(() => {});
+          continue;
+        }
+
+        // reservedId ya está declarado al inicio del loop (scope del for) para que catch lo vea
         // ── SENDTRACK 30d GUARD (último filtro antes del send) ──
         // Aunque upstream filtre, defense-in-depth: chequeamos si el dominio
         // recibió mail en los últimos 30 días por CUALQUIER MB (humano o agente).
@@ -6793,61 +7107,49 @@ async function main() {
         await backfillMissingFields(token, cfgRefresh);
       } catch (e) { log(`⚠️ refresh+backfill: ${e.message}`); }
 
-      // ── Self-activator del AGENT autopilot (regla user 2026-05-13) ─────
-      // L-V 9-23 Madrid: garantizar que el agent está prendido si la whitelist
-      // tiene users y sent_today < daily_cap. Si la cola review_queue está
-      // bajo umbral → asegurar csv_queue activa para que se rellene desde el
-      // pipeline existente (CSV upload + Monday refresh manual).
-      // Sin esto el agent quedaba 0 envíos/día hasta que admin lo prendiera.
+      // ── BANDA review_queue 120-300 (regla user 2026-05-13) ─────
+      // Mantener entre 120 (mínimo) y 300 (tope) leads válidos (traffic>=400K).
+      // Si baja de 120 → refill random pick entre: sellers.json | csv_promote (50/50).
+      // Si <80 → forzar sellers.json ignorando cooldown 1h (urgencia).
+      // Monday recyclables queda pendiente para v5.0.34 (requiere GraphQL pull).
       try {
-        if (!_isWeekendSpain() && !_isOutsideActiveHours(9, 23)) {
-          // 1. Self-activator — SOLO si el admin no apagó manualmente.
-          //    Bug fix 2026-05-13: antes auto-popoulábamos enabled_users
-          //    cada tick si estaba vacío, lo que PISABA el toggle OFF del
-          //    admin. Ahora chequea agent_manual_off para respetar la
-          //    intención del admin. El toggle del UI setea esta flag.
-          const flagsRes = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_manual_off)&select=key,value`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-          );
-          const flagsRows = await flagsRes.json().catch(() => []);
-          const flagsMap = {};
-          flagsRows.forEach(r => { flagsMap[r.key] = r.value; });
-          const manualOff = String(flagsMap.agent_manual_off || "").toLowerCase() === "true";
-          let agentUsers = [];
-          try { agentUsers = JSON.parse(flagsMap.agent_enabled_users || "[]"); } catch {}
-          if (agentUsers.length === 0 && !manualOff) {
-            const defaultUsers = ["mgargiulo@adeqmedia.com"];
-            await setConfigValue(token, "agent_enabled_users", JSON.stringify(defaultUsers));
-            log(`🔛 agent auto-activado L-V Madrid: enabled_users=${JSON.stringify(defaultUsers)}`);
-          } else if (manualOff && agentUsers.length > 0) {
-            // Admin apagó manual desde la toolbar — vaciamos por las dudas
-            log(`🔴 agent_manual_off=true → vaciando agent_enabled_users`);
-            await setConfigValue(token, "agent_enabled_users", "[]");
-          }
+        const rqRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=id`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+        );
+        const rqRange = rqRes.headers.get("content-range") || "";
+        const rqValid = parseInt(rqRange.match(/\/(\d+)$/)?.[1] || "0", 10);
 
-          // 2. Feeder: si review_queue tiene menos de 20 pending → asegurar csv_queue ON
-          //    para que el worker la procese (si hay items pending) o el admin
-          //    haga import manual desde la toolbar.
-          const rqRes = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=id&limit=20`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-19" } }
-          );
-          const rqRange = rqRes.headers.get("content-range") || "";
-          const rqCount = parseInt(rqRange.match(/\/(\d+)$/)?.[1] || "0", 10);
-          if (rqCount < 20) {
-            // Setea flag de "review_queue baja" — el admin puede verlo en UI.
-            await setConfigValue(token, "review_queue_low_warning", `${rqCount}_at_${new Date().toISOString()}`);
-            if (iterCount % 12 === 0) {
-              log(`⚠️ review_queue baja: ${rqCount} pending con traffic>=400K. Disparando auto-feeder...`);
-            }
-            // Auto-feeder: pickea sellers.json random, dedupe contra existentes,
-            // inyecta hasta 50 dominios nuevos a csv_queue (status=pending).
-            // Cooldown 1h interno — no satura aunque rqCount<20 cada tick.
-            runAutoFeeder(token).catch(e => log(`⚠️ autoFeeder: ${e.message}`));
-          }
+        // Persistir métrica para UI admin
+        await setConfigValue(token, "review_queue_band_status",
+          JSON.stringify({ valid: rqValid, min: 120, max: 300, at: new Date().toISOString() })
+        );
+
+        if (rqValid >= 300) {
+          if (iterCount % 12 === 0) log(`📊 review_queue=${rqValid} ≥ 300 → intake paused`);
+        } else if (rqValid < 120) {
+          // Refill: sellers.json random + (futuro v5.0.34) Monday recyclables.
+          // CSV waiting_pool→pending no es fuente autónoma (depende de uploads),
+          // pero igual se promueve en el loop main si hay items.
+          log(`📉 review_queue válidos=${rqValid} < 120 → refill via sellers_json`);
+          if (rqValid < 80) _lastFeederRunAt = 0;  // force, ignorar cooldown 1h
+          await runAutoFeeder(token).catch(e => log(`⚠️ feeder: ${e.message}`));
         }
-      } catch (e) { log(`⚠️ agent auto-activator: ${e.message}`); }
+
+        // Boot-time guarantee: agent_enabled_users siempre con mgargiulo si vacío.
+        // Reemplaza al self-activator viejo (sin chequear horario ni manual_off).
+        const flagsRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_enabled_users&select=value`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        const flagsRows = await flagsRes.json().catch(() => []);
+        let agentUsers = [];
+        try { agentUsers = JSON.parse(flagsRows?.[0]?.value || "[]"); } catch {}
+        if (agentUsers.length === 0) {
+          await setConfigValue(token, "agent_enabled_users", JSON.stringify(["mgargiulo@adeqmedia.com"]));
+          log(`🔛 boot guarantee: agent_enabled_users=[mgargiulo@adeqmedia.com]`);
+        }
+      } catch (e) { log(`⚠️ band maintainer: ${e.message}`); }
 
       // Auto-encender csv_queue_enabled si hay items pending y el flag está OFF.
       // Política user 2026-05-13: "siempre que hay urls en cola, procesarlas
@@ -6874,6 +7176,9 @@ async function main() {
           }
         }
       } catch (e) { log(`⚠️ csvQueue auto-enable: ${e.message}`); }
+
+      // Frozen weekly report — domingo 20-21hs Madrid, 1 vez por semana
+      try { await runFrozenWeeklyReport(token); } catch (e) { log(`⚠️ frozenReport: ${e.message}`); }
 
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);

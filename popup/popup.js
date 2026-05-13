@@ -640,17 +640,19 @@ async function loadAdminGlobalCaps() {
   const stEl  = document.getElementById("admin-global-caps-status");
   if (!csvEl || !apEl) return;
   try {
-    const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(csv_queue_daily_cap,autopilot_daily_cap_global,csv_daily_count,csv_daily_count_date,autopilot_daily_count,autopilot_daily_count_date)&select=key,value`,
-      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
-    );
-    if (res.ok) {
-      const rows = await res.json();
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const [cfgRes, pendingRes, waitingRes, nextDayRes, bandRes] = await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(csv_queue_daily_cap,autopilot_daily_cap_global,csv_daily_count,csv_daily_count_date,autopilot_daily_count,autopilot_daily_count_date,review_queue_band_status)&select=key,value`, { headers }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+    ]);
+    if (cfgRes.ok) {
+      const rows = await cfgRes.json();
       const map = {};
       rows.forEach(r => { map[r.key] = r.value; });
       csvEl.value = map.csv_queue_daily_cap || "1000";
-      apEl.value  = map.autopilot_daily_cap_global || "300";
-      // Mostrar progreso de hoy si counter está al día
+      apEl.value  = map.autopilot_daily_cap_global || "1000";
       const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
       const today = fmt.format(new Date());
       const csvCount = map.csv_daily_count_date === today ? parseInt(map.csv_daily_count || "0", 10) : 0;
@@ -659,7 +661,32 @@ async function loadAdminGlobalCaps() {
       const apCap  = parseInt(apEl.value, 10);
       const csvPct = csvCap > 0 ? Math.round(csvCount / csvCap * 100) : 0;
       const apPct  = apCap  > 0 ? Math.round(apCount  / apCap  * 100) : 0;
-      stEl.textContent = `Today processed: 📦 CSV ${csvCount}/${csvCap} (${csvPct}%) · 🤖 Autopilot ${apCount}/${apCap} (${apPct}%)`;
+      const parseCount = (r) => {
+        const range = r.headers.get("content-range") || r.headers.get("Content-Range") || "";
+        const m = range.match(/\/(\d+)$/);
+        return m ? parseInt(m[1]) : 0;
+      };
+      const pendingCount = parseCount(pendingRes);
+      const waitingCount = parseCount(waitingRes);
+      const nextDayCount = parseCount(nextDayRes);
+      let bandValid = "?", bandColor = "#64748b";
+      try {
+        const band = JSON.parse(map.review_queue_band_status || "{}");
+        bandValid = band.valid ?? "?";
+        if (typeof bandValid === "number") {
+          if (bandValid < 120)      bandColor = "#dc2626";
+          else if (bandValid >= 300) bandColor = "#f59e0b";
+          else                       bandColor = "#10b981";
+        }
+      } catch {}
+      stEl.innerHTML = `
+        <div style="font-weight:600;margin-bottom:6px">Today processed</div>
+        <div>📦 CSV ${csvCount}/${csvCap} (${csvPct}%) · 🤖 Autopilot ${apCount}/${apCap} (${apPct}%)</div>
+        <div style="margin-top:8px;font-weight:600">Intake queues</div>
+        <div>⚙️ pending=${pendingCount}/200 · ⏳ waiting=${waitingCount}/300 · 🌅 next_day=${nextDayCount}</div>
+        <div style="margin-top:8px;font-weight:600">Review queue band (≥400K traffic)</div>
+        <div style="color:${bandColor}">📊 ${bandValid} / [120 — 300]</div>
+      `;
     }
   } catch (e) { stEl.textContent = `Error: ${e.message}`; }
 }
@@ -1076,7 +1103,7 @@ async function _refreshAgentFeed() {
     // Acciones reales del agente — extendido 2026-05-13. Excluimos
     // 'reserved' (audit interno) y 'monday_ok' (duplica con 'sent').
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,kill_switch)${userClause}&select=*&order=created_at.desc&limit=50`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,kill_switch,cycle_no_candidates,cycle_heartbeat)${userClause}&select=*&order=created_at.desc&limit=50`,
       { headers }
     );
     if (!res.ok) {
@@ -1087,8 +1114,8 @@ async function _refreshAgentFeed() {
     if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">No activity yet. Toggle ON to start.</div>'; return; }
     // Guardar para el botón CSV
     window._lastAgentFeedRows = rows;
-    const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨" };
-    const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444" };
+    const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨", cycle_no_candidates: "🔍", cycle_heartbeat: "💓" };
+    const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444", cycle_no_candidates: "#94a3b8", cycle_heartbeat: "#64748b" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
       const icon = icons[r.action] || "·";
@@ -1281,15 +1308,25 @@ async function loadAdminBlocklist() {
   try {
     const { TOP_500_BLOCKED } = await import("../modules/blockedDomainsTop500.js");
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain&order=domain`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain,category,reason,added_by&order=category,domain`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
     );
-    const adminList = res.ok ? (await res.json()).map(r => r.domain) : [];
-    ta.value = adminList.join("\n");
+    const adminList = res.ok ? await res.json() : [];
+    const byCategory = { manual: [], corporate: [], inoperativo: [] };
+    adminList.forEach(r => {
+      const cat = r.category || "manual";
+      if (byCategory[cat]) byCategory[cat].push(r);
+    });
+    // Textarea muestra solo "manual" (los editables)
+    ta.value = byCategory.manual.map(r => r.domain).join("\n");
     status.innerHTML = `
-      <strong>${adminList.length}</strong> dominios admin custom (editables) +
-      <strong>${TOP_500_BLOCKED.length}</strong> dominios baked-in (top 500 no-publishers, gratuitos).
-      <br/><span style="opacity:.7">Total efectivo: ${(adminList.length + TOP_500_BLOCKED.length).toLocaleString()} dominios bloqueados pre-API.</span>
+      <div style="margin-bottom:6px"><strong>${adminList.length}</strong> dominios admin custom (editables abajo) + <strong>${TOP_500_BLOCKED.length}</strong> baked-in.</div>
+      <div style="display:flex;gap:12px;font-size:11px">
+        <span>✋ manual: <strong>${byCategory.manual.length}</strong></span>
+        <span>🏢 corporate: <strong>${byCategory.corporate.length}</strong></span>
+        <span title="Auto-bloqueados tras 3 freeze cycles sin traffic data">🚫 inoperativo: <strong>${byCategory.inoperativo.length}</strong></span>
+      </div>
+      <div style="opacity:.7;font-size:10px;margin-top:4px">Total efectivo: ${(adminList.length + TOP_500_BLOCKED.length).toLocaleString()} dominios bloqueados pre-API.</div>
     `;
   } catch (e) { status.textContent = "Error: " + e.message; }
 }
@@ -1303,8 +1340,8 @@ async function saveAdminBlocklist() {
   if (!domains.length) { status.textContent = "❌ Empty list."; return; }
   status.textContent = "⏳ Guardando...";
   try {
-    // Borrar todo y re-insertar (operación admin, no es alta frecuencia)
-    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?domain=neq.zzz_never_match`, {
+    // Borrar SOLO category='manual' (no tocar inoperativo/corporate auto-poblados)
+    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?category=eq.manual`, {
       method: "DELETE",
       headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` },
     });
@@ -1316,7 +1353,7 @@ async function saveAdminBlocklist() {
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal",
       },
-      body: JSON.stringify(domains.map(d => ({ domain: d, added_by: state.loginEmail }))),
+      body: JSON.stringify(domains.map(d => ({ domain: d, category: "manual", added_by: state.loginEmail }))),
     });
     status.textContent = `✅ ${domains.length} dominios guardados.`;
     logAuditEvent(state.accessToken, {
