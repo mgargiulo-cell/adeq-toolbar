@@ -1022,7 +1022,9 @@ async function _refreshAgentStats(userEmail) {
   const startToday = new Date(); startToday.setHours(0,0,0,0);
   const emailLower = (userEmail || "").toLowerCase();
   const userClause = `user_email=eq.${encodeURIComponent(emailLower)}`;
-  const sentActions = "action=in.(sent,re_sent,bounce_retry_sent,monday_ok)";
+  // NO incluir 'monday_ok' — es row separado por cada send (audit trail
+  // de Monday push). Si lo sumamos, contamos cada email 2× (sent + monday_ok).
+  const sentActions = "action=in.(sent,re_sent,bounce_retry_sent)";
   try {
     const [sentRes, skipRes, failRes] = await Promise.all([
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause}&${sentActions}&created_at=gte.${startToday.toISOString()}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
@@ -1045,11 +1047,10 @@ async function _refreshAgentFeed() {
     // respetamos ese filtro acá también. Default = todos los agentes.
     const userFilter = (document.getElementById("admin-filter-user")?.value || "").trim();
     const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
-    // Acciones reales del agente — extendido 2026-05-13 para incluir
-    // re_sent (Email Futuro reengagement) y bounce_retry_sent (auto-retry
-    // tras hard bounce). Excluimos 'reserved' (audit trail interno).
+    // Acciones reales del agente — extendido 2026-05-13. Excluimos
+    // 'reserved' (audit interno) y 'monday_ok' (duplica con 'sent').
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,monday_ok,kill_switch)${userClause}&select=*&order=created_at.desc&limit=50`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,kill_switch)${userClause}&select=*&order=created_at.desc&limit=50`,
       { headers }
     );
     if (!res.ok) {
@@ -3382,13 +3383,25 @@ function _verifyClass(result) {
   return "verify-good";
 }
 
-// Grade A-E por email — diferencia calidad relativa entre emails válidos
-// para que no aparezcan todos en verde idéntico. Combina:
-//   - resultado de verify (SMTP confirmado vs solo DNS vs inválido)
-//   - tags (rol/catch-all/typo penalizan)
-//   - fuente (apollo > scrape > gemini > guessed)
-//   - formato (personal "nombre.apellido@" > rol "info@/contact@")
+// Memoization para _emailGrade — antes recalculaba en cada render.
+// Key: email|verifyHash|source. Verifica hash es un proxy del result.
+const _gradeCache = new Map();
+const _GRADE_CACHE_MAX = 500;
+
+// Grade A-E por email — diferencia calidad relativa entre emails válidos.
 function _emailGrade(email, result, source) {
+  // Memo lookup
+  const verifyTag = result ? `${result.valid ? "v" : "i"}:${(result.tags || []).join(",")}:${result.deepSource || ""}` : "none";
+  const cacheKey = `${email}|${verifyTag}|${source || ""}`;
+  const memo = _gradeCache.get(cacheKey);
+  if (memo) return memo;
+  const r = _emailGradeCompute(email, result, source);
+  if (_gradeCache.size >= _GRADE_CACHE_MAX) _gradeCache.clear();
+  _gradeCache.set(cacheKey, r);
+  return r;
+}
+
+function _emailGradeCompute(email, result, source) {
   if (!email || !email.includes("@")) return { grade: "E", label: "Inválido" };
   let score = 50; // baseline
   const tags = result?.tags || [];
