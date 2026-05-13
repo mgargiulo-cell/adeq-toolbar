@@ -7826,6 +7826,18 @@ function initProspectCard(card, data) {
     const open  = panel.style.display === "none";
     panel.style.display = open ? "block" : "none";
     btn.textContent     = open ? "▲" : "▼";
+    if (open) {
+      // PERF: autoVerify ahora se dispara aquí (al expandir) en lugar de
+      // en render inicial. Solo verifica emails de ESTA card, no de las 100.
+      const listEl = card.querySelector(".pcard-email-list");
+      if (listEl && !card.dataset._verifiedOnce) {
+        card.dataset._verifiedOnce = "1";
+        autoVerifyEmailChips(listEl).then(() => {
+          // Re-render del email-list para reflejar grades nuevos
+          if (typeof renderProspectEmailList === "function") renderProspectEmailList();
+        }).catch(e => console.warn("[pcard autoVerify]", e));
+      }
+    }
     if (open && data.domain) {
       // Verificar si otro MB ya lo lockeó
       const lock = await getActiveProspectLock(state.accessToken, data.domain);
@@ -7953,13 +7965,11 @@ function initProspectCard(card, data) {
     if (first) first.classList.add("selected");
     _syncSelectedToInput();
 
-    // Auto-verify en background — pinta colores y refresca el orden
-    // (porque el grade A-E puede cambiar tras verify SMTP/DNS confirmed).
-    autoVerifyEmailChips(listEl).then(() => {
-      // Re-render con los nuevos verify results para que el orden sea
-      // el correcto (mejor grade arriba + auto-selected).
-      renderProspectEmailList();
-    }).catch(e => console.warn("[pcard autoVerify]", e));
+    // PERF FIX 2026-05-13: NO disparar autoVerify en render inicial.
+    // Antes: 100 cards × 5 emails = 500 verify fetches en paralelo →
+    // hanging. Ahora se verifica SOLO cuando el user expande la card
+    // (click en ▼) — ver wireExpandToggle más abajo. El usuario solo
+    // necesita verify del lead que va a contactar, no de los 100.
   };
   renderProspectEmailList();
 
