@@ -2133,6 +2133,10 @@ const IGNORE_EMAIL = ["example.com","domain.com","sentry.io","google.com","w3.or
 //   - Cluciano@phonecall.com.br → luciano@phonecall.com.br
 function _stripScrapePrefix(email) {
   if (!email || typeof email !== "string") return email;
+  // Decode URL-encoded chars (%20=space, %09=tab) y trim whitespace al inicio.
+  // Caso real 2026-05-14: "%20info@ewdifh.com" salió enviado por el agente.
+  try { email = decodeURIComponent(email); } catch {}
+  email = email.replace(/^[\s​ ]+/, "").trim();
   const [local, domain] = email.split("@");
   if (!local || !domain) return email;
   // Solo si local-part empieza con 1 letra MAYÚSCULA seguida de letra minúscula:
@@ -4780,6 +4784,76 @@ async function scanBouncesForUser(token, userEmail) {
   }
 }
 
+// ── Auto-Reply detector — escanea inbox por respuestas automáticas
+// (out-of-office, vacation, ticket systems, "responderemos en 48h", etc).
+// Si detecta, trata al recipient como "no leerá" y dispara retry a próximo email.
+async function scanAutoRepliesForUser(token, userEmail) {
+  try {
+    const accessToken = await getGmailAccessToken(userEmail);
+    // Query Gmail: subject patrones de auto-reply en 7 idiomas + 1d
+    // Lista corta de keywords muy distintivos para minimizar falsos positivos.
+    const subjectQuery = [
+      '"auto-reply"', '"automatic reply"', '"out of office"', '"vacation"',
+      '"respuesta automática"', '"ausencia"', '"vacaciones"',
+      '"resposta automática"', '"férias"', '"ausência"',
+      '"risposta automatica"', '"assenza"',
+      '"réponse automatique"', '"absence"',
+      '"automatische antwort"', '"abwesend"', '"urlaub"',
+      '"رد تلقائي"',
+      '"accusons bonne réception"', '"acuse de recibo"', '"acusamos recebimento"',
+    ].join(" OR ");
+    const q = encodeURIComponent(`subject:(${subjectQuery}) newer_than:1d`);
+    const listRes = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=15`,
+      { headers: { "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!listRes.ok) {
+      if (listRes.status !== 403) log(`⚠️ scanAutoReplies list ${listRes.status}`);
+      return 0;
+    }
+    const list = await listRes.json();
+    const ids = (list.messages || []).map(m => m.id);
+    if (!ids.length) return 0;
+
+    let detected = 0;
+    for (const id of ids) {
+      try {
+        const msgRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Auto-Submitted&metadataHeaders=X-Auto-Response-Suppress`,
+          { headers: { "Authorization": `Bearer ${accessToken}` } }
+        );
+        if (!msgRes.ok) continue;
+        const msg = await msgRes.json();
+        const headers = msg.payload?.headers || [];
+        const fromH = headers.find(h => h.name?.toLowerCase() === "from")?.value || "";
+        // Extraer email del FROM (esa fue la dirección que respondió auto)
+        const fromMatch = fromH.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+        if (!fromMatch) continue;
+        const respondedFrom = fromMatch[0].toLowerCase();
+        if (respondedFrom === userEmail.toLowerCase()) continue;
+        // Verificar header Auto-Submitted si está presente (más confiable que subject)
+        const autoSub = headers.find(h => h.name?.toLowerCase() === "auto-submitted")?.value || "";
+        const isAutoSubmitted = /auto-replied|auto-generated/i.test(autoSub);
+        // Disparar retry — tratamos el email como "no-reader" igual que un soft bounce
+        if (!isBouncedSync(respondedFrom)) {
+          await markEmailBounced(token, { email: respondedFrom, reason: "auto_reply_detected", originalDomain: respondedFrom.split("@")[1] });
+          queueBounceRetry(token, userEmail, respondedFrom, "auto_reply").catch(e => log(`⚠️ autoReply retry: ${e.message}`));
+          detected++;
+          log(`🔁 auto-reply detectado: ${respondedFrom}${isAutoSubmitted ? " (header)" : " (subject)"} → retry queued`);
+        }
+      } catch {}
+    }
+    if (detected) {
+      _bouncedCache.ts = 0;
+      log(`🔁 scanAutoReplies ${userEmail}: ${detected} respuestas automáticas → retry`);
+    }
+    return detected;
+  } catch (e) {
+    log(`⚠️ scanAutoReplies error: ${e.message}`);
+    return 0;
+  }
+}
+
 // ════════════════════════════════════════════════════════════════
 // BOUNCE RETRY — re-envío automático a próximo email cuando bounce
 // ────────────────────────────────────────────────────────────────
@@ -5556,6 +5630,14 @@ Write the prospecting email. Return JSON only.`;
 const _GL_LOCAL_PARTS = [
   // Sysadmin / mail infra (sin lectura humana real)
   "abuse","admin","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
+  // Roles que no responden / no son decision-makers (cazados 2026-05-14)
+  "feedback","feedbacks","reclamo","reclamos","reclamacao","reclamacoes","quejas","sugerencias","sugestoes",
+  "circulation","subscriptions","subs","newsletter","alerts","alerta","alertas",
+  "training","capacitacion","capacitacao","cursos",
+  "plataforma","plataformas","platform","platforms","sistema","sistemas","tic","tic-admin","tic.adm","tecnologia","tecnologias","tech-admin",
+  "foco","servicioalcliente","servicio-al-cliente","servicio-cliente","atencionalcliente","atencion-al-cliente","customerservice","customer-service","customercare","customer-care",
+  "office","oficina","secretaria","secretariat","reception",
+  "redaction","redazione","redaktion","redactie","editorial",
   "trustandsafety","trust-?and-?safety","trust-?safety","safety","safety-?team","trust-?ops",
   "whois","registrant","registry","registrar","domain-?ops","domain-?abuse","ndomains",
   // Manejo de dominios/DNS (caso real domains@latinregistrar.com.br se coló al agent 2026-05-13)
@@ -5596,7 +5678,104 @@ const GARBAGE_LOCAL_CONTAINS = new RegExp([
   "unsubscribe","opt[-._]?out","removeme",
   "mailer[-._]?daemon","noreply","no[-._]?reply","donotreply","autoreply",
   "dpo","data[-._]?protection",
+  // Capa adicional 2026-05-14 — palabras lexicales en local-part que indican infraestructura
+  "(?:^|[._-])(?:dns|ssl|tls|cert|smtp|imap|pop3|ftp|sftp|vpn)(?:$|[._-])",
+  "(?:^|[._-])(?:registrar|registry|registrant|registered)(?:$|[._-])",
+  "(?:^|[._-])(?:privacy|anonym|shield|guard|hidden|undisclosed)(?:$|[._-])",
+  "(?:^|[._-])(?:billing|invoice|finance|accounting|payable|treasury|cobranza|facturacion|cobros)(?:$|[._-])",
+  "(?:^|[._-])(?:cdn|cloud|hosting|host|server|servers|datacenter|colo)(?:$|[._-])",
+  "(?:^|[._-])(?:legal|compliance|dmca|copyright|takedown|trademark)(?:$|[._-])",
 ].join("|"), "i");
+
+// ── CAPA 3 (defense-in-depth) — palabras-clave en el DOMINIO del email ─────
+// Cualquier dominio que contenga estas palabras = infraestructura, NO publisher.
+// Caso real 2026-05-14: emails enviados a domains@latinregistrar.com.br,
+// ceo@viads.com, trustandsafety@support.aws.com, ayuda@nic.mx, etc.
+const _GARBAGE_DOMAIN_KEYWORDS = [
+  // Registrars / DNS
+  "registrar","registry","registrant","nic\\.","whois","domainsby","domainservice",
+  "dominio","dominios","dominiosecuador","jewellaprivacy","cscinfo","cscglobal",
+  "n2v","markmonitor","godaddyguard","gandi\\.net","enom","netim","epag",
+  "porkbun","namebright","key-systems","onlinenic","ovhcloud","ovh\\.net",
+  // Privacy proxies
+  "privacyprotect","privacyguard","domainprotect","protecteddomain","whoisprotect",
+  "whoisguard","contactprivacy","withheldforprivacy","perfectprivacy",
+  "regprivate","redactedforprivacy","registrationprivate",
+  // GDPR masks
+  "gdpr-mask","gdpr-masked","gdpr-protect","data-protected","redacted-private",
+  // Hosting / Cloud
+  "amazonaws","amazonses","cloudfront","googlecloud","azure-?microsoft","cloudflare",
+  "fastly","akamai","digitalocean","linode","heroku","netlify","vercel","render",
+  "cloudways","kinsta","wpengine","siteground","hostinger","bluehost","hostgator",
+  // Transactional senders (no humans)
+  "sendgrid","mailgun","postmark","mandrill","sparkpost","amazonses","mailtrap",
+  // Trust & safety / abuse desks
+  "trustandsafety","trust-and-safety","abuse-?desk",
+  // Disposable
+  "mailinator","guerrillamail","tempmail","throwaway","sharklasers","yopmail","10minutemail","disposable",
+];
+const GARBAGE_DOMAIN_KEYWORDS = new RegExp(
+  // Match keyword en cualquier nivel del dominio (incluyendo TLDs cortos como nic.mx).
+  // (?:^|[.@]) → inicio o tras . o @
+  // [a-z0-9-]* → prefijo opcional (csc en cscinfo, latin en latinregistrar)
+  // (KEYWORDS) → palabra-clave
+  // [a-z0-9-]* → sufijo opcional
+  // (?=\\.|$) → seguido de . o fin
+  "(?:^|[.@])[a-z0-9-]*(?:" + _GARBAGE_DOMAIN_KEYWORDS.join("|") + ")[a-z0-9-]*(?=\\.|$)",
+  "i"
+);
+// Capa 3 extra: AWS / Google Cloud / Azure subdominios — captura "support.aws.com",
+// "support.amazonaws.com", "abuse.cloudflare.com", etc. donde la keyword está
+// en un subdominio interno (no como dominio raíz).
+const GARBAGE_DOMAIN_SUBDOMAIN = /\.(aws|amazonaws|googlecloud|azure|cloudflare|fastly|akamai)\.com$/i;
+
+// ── CAPA 4 — Helper unificado: clasifica email como reject / low / ok ─────
+// Devuelve { verdict, reason, score }
+//   verdict: "reject" | "low_quality" | "ok"
+//   reason:  string descriptivo (audit trail)
+//   score:   guidance al ranking (negative = nunca pickear)
+function classifyEmail(email, leadDomain = "") {
+  if (!email || typeof email !== "string") return { verdict: "reject", reason: "malformed_empty", score: -1 };
+  const e = email.toLowerCase().trim();
+  if (!e.includes("@") || e.split("@").length !== 2) return { verdict: "reject", reason: "malformed_no_at", score: -1 };
+  const [local, dom] = e.split("@");
+  if (!local || !dom || local.length < 2) return { verdict: "reject", reason: "malformed_short_local", score: -1 };
+
+  // Capa 1: local-part patterns (anclado al inicio)
+  if (GARBAGE_LOCAL.test(local + "@")) return { verdict: "reject", reason: "garbage_local_anchored", score: -1 };
+  // Capa 2: local-part contains (cualquier posición)
+  if (GARBAGE_LOCAL_CONTAINS.test(local)) return { verdict: "reject", reason: "garbage_local_contains", score: -1 };
+  // Capa 3: domain keywords (registrar/privacy/hosting/cloud/etc en el dominio)
+  if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) return { verdict: "reject", reason: "garbage_domain_keywords", score: -1 };
+  // Capa 3b: domain match exacto contra patterns viejos (defense-in-depth, redundante pero seguro)
+  if (typeof GARBAGE_DOMAIN_PATTERN !== "undefined" && GARBAGE_DOMAIN_PATTERN.test(dom)) {
+    return { verdict: "reject", reason: "garbage_domain_pattern", score: -1 };
+  }
+  // Capa 3c: local-part con TLD adentro (caso "site.com@registrar.com")
+  if (/\.(com|net|org|io|co|tv|me|info|biz|us|uk|de|es|fr|it|br|ar|mx)$/i.test(local)) {
+    return { verdict: "reject", reason: "malformed_tld_in_local", score: -1 };
+  }
+  // Capa 3d: cross-domain a no-webmail (defense-in-depth)
+  if (leadDomain) {
+    const _lead = leadDomain.toLowerCase().replace(/^www\./, "");
+    const _isWebmail = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/.test(dom);
+    const _domMatches = dom === _lead || dom.endsWith("." + _lead) || _lead.endsWith("." + dom);
+    if (!_domMatches && !_isWebmail) return { verdict: "reject", reason: "cross_domain_recipient", score: -1 };
+  }
+
+  // Genéricos: pasa pero baja calidad — solo pickear si no hay opción mejor
+  const GENERIC_RE = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hey|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|bonjour|news|press|prensa|imprensa|stampa|presse|noticias|reception|recepcion|recepcao|general|sales|ventas|marketing|publicidade|publicidad|comercial|editor|editorial|redaccion|redacao|jurídico|juridico|juridique)$/i;
+  if (GENERIC_RE.test(local)) return { verdict: "low_quality", reason: "generic_role", score: 20 };
+
+  // OK → score guidance basado en shape
+  // - person-like (nombre.apellido): 80
+  // - single name corto: 50
+  // - otro: 40
+  if (/^[a-z]+\.[a-z]+$/i.test(local)) return { verdict: "ok", reason: "person_firstname_lastname", score: 80 };
+  if (/^[a-z]+_[a-z]+$/i.test(local)) return { verdict: "ok", reason: "person_underscore", score: 75 };
+  if (/^[a-z]{3,15}$/i.test(local))   return { verdict: "ok", reason: "single_name", score: 50 };
+  return { verdict: "ok", reason: "other", score: 40 };
+}
 
 // ── Website composite scoring ──────────────────────────────
 // Score 0-100 por lead, con gates duros (return -1 = descartar).
@@ -5745,6 +5924,7 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
+  if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) return -1; // Capa 3: keywords/subdominios garbage
 
   // Malformed local-part: contiene TLD (.com/.net/.io/etc) → scrape artifact
   // Caso real 2026-05-13: "lindaikejisblog.com@protecteddomainservices.com"
@@ -5873,6 +6053,7 @@ async function validateEmailsBatch(emails) {
     const local = lower.split("@")[0];
     if (GARBAGE_LOCAL_CONTAINS.test(local)) continue; // domain.operations@x.com etc
     const dom = lower.split("@")[1];
+    if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) continue; // Capa 3
     const ok = await _hasMxRecords(dom);
     if (ok) out.push(lower);
   }
@@ -5916,8 +6097,11 @@ async function scoreEmail(email) {
   if (GARBAGE_LOCAL_CONTAINS.test(localPart)) {
     return { color: "red", reason: "garbage_local_contains" };
   }
-  // 1) MX records check (gratis vía Cloudflare DoH) — descarta dominios sin mail server
   const dom = lower.split("@")[1];
+  if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) {
+    return { color: "red", reason: "garbage_domain_keywords" };
+  }
+  // 1) MX records check (gratis vía Cloudflare DoH) — descarta dominios sin mail server
   const hasMX = await _hasMxRecords(dom);
   if (!hasMX) return { color: "red", reason: "no_mx_records" };
   // 2) SMTP verify via eva.pingutil (free, no auth) — best-effort
@@ -6292,6 +6476,8 @@ async function runAgentCycle(token, allFlags) {
     }
     // Bounce scan (Gmail INBOX) — fire-and-forget para que no atrase el ciclo
     scanBouncesForUser(token, userEmail).catch(() => {});
+    // Auto-reply scan (out-of-office, ticket systems, etc.) — también dispara retry
+    scanAutoRepliesForUser(token, userEmail).catch(() => {});
     // Kill switch check
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
     // Daily cap

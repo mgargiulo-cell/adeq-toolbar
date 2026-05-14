@@ -1102,16 +1102,29 @@ async function _refreshAgentFeed() {
     const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
     // Acciones reales del agente — extendido 2026-05-13. Excluimos
     // 'reserved' (audit interno) y 'monday_ok' (duplica con 'sent').
-    const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,kill_switch,cycle_no_candidates,cycle_heartbeat)${userClause}&select=*&order=created_at.desc&limit=50`,
-      { headers }
-    );
+    // Probamos 2 queries paralelas: con filter action y SIN filter (raw count)
+    // para diagnosticar si es RLS o filter el problema.
+    const [res, resAll] = await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,kill_switch,cycle_no_candidates,cycle_heartbeat)${userClause}&select=*&order=created_at.desc&limit=50`, { headers }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?select=id&limit=1`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+    ]);
     if (!res.ok) {
-      wrap.innerHTML = `<div style="color:#f87171">HTTP ${res.status} — check toolbar_agent_actions RLS</div>`;
+      const errBody = await res.text().catch(() => "");
+      wrap.innerHTML = `<div style="color:#f87171">HTTP ${res.status} ${esc(errBody.slice(0,120))}<br/>Probable: RLS bloquea SELECT en toolbar_agent_actions para tu user.</div>`;
       return;
     }
     const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) { wrap.innerHTML = '<div style="color:#94a3b8">No activity yet. Toggle ON to start.</div>'; return; }
+    if (!Array.isArray(rows) || rows.length === 0) {
+      // Diagnóstico: ¿RLS bloquea TODO o solo este filter?
+      const rangeAll = resAll.headers.get("content-range") || "";
+      const totalAll = parseInt(rangeAll.match(/\/(\d+|\\*)$/)?.[1] || "0", 10);
+      if (totalAll > 0) {
+        wrap.innerHTML = `<div style="color:#fbbf24">⚠️ Tabla tiene ${totalAll} rows pero filter no matchea ninguno.<br/>Probable: RLS filtra por user_email. Tu accessToken no matchea con user_email de las rows.</div>`;
+      } else {
+        wrap.innerHTML = `<div style="color:#fbbf24">⚠️ Tu user no puede leer toolbar_agent_actions (RLS bloquea SELECT).<br/>Workaround: mandame screenshot y reviso policy en Supabase.</div>`;
+      }
+      return;
+    }
     // Guardar para el botón CSV
     window._lastAgentFeedRows = rows;
     const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨", cycle_no_candidates: "🔍", cycle_heartbeat: "💓" };
@@ -1526,8 +1539,10 @@ async function loadAdminActivity() {
       queueAsHist.push({ ...baseRow, media_buyer: q.created_by });
     }
     // Row 2: para el validador (quien lo procesó/mando mail). Filtra agentes y "agent:..."
-    // Solo cuenta MBs humanos en el comparador. El agente tiene su propia columna.
-    if (q.validated_by && !q.validated_by.startsWith("agent:") && q.validated_by !== q.created_by) {
+    // Solo cuenta MBs humanos en el comparador. El agente y procesos automáticos tienen su propia columna.
+    const _vb = q.validated_by || "";
+    const _isAutoProcess = _vb.startsWith("agent:") || _vb.startsWith("admin_blocklist") || _vb.startsWith("worker_") || _vb === "admin_blocklist_cleanup";
+    if (_vb && !_isAutoProcess && _vb !== q.created_by) {
       queueAsHist.push({
         ...baseRow,
         media_buyer: q.validated_by,
