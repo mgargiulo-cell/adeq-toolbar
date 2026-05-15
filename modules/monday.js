@@ -285,7 +285,9 @@ export async function fetchMondayForRefresh({ geo = "", idioma = "", limit = 75 
       .slice(0, limit);
   } catch (e) {
     console.error("[Refresh] fetchMondayForRefresh error:", e.message);
-    return [];
+    // Re-throw para que la UI muestre el error real (antes devolvía [] silencioso
+    // y user veía "no Ciclo Finalizado matches" sin saber que era Monday API key).
+    throw new Error(`Monday API: ${e.message}`);
   }
 }
 

@@ -641,11 +641,14 @@ async function loadAdminGlobalCaps() {
   if (!csvEl || !apEl) return;
   try {
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-    const [cfgRes, pendingRes, waitingRes, nextDayRes, bandRes] = await Promise.all([
+    const [cfgRes, pendingRes, waitingRes, nextDayRes, bandLiveRes] = await Promise.all([
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(csv_queue_daily_cap,autopilot_daily_cap_global,csv_daily_count,csv_daily_count_date,autopilot_daily_count,autopilot_daily_count_date,review_queue_band_status)&select=key,value`, { headers }),
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      // Band count LIVE — query directo a review_queue en vez de leer el cache de config
+      // (que puede estar stale si worker no corrió hace rato)
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
     ]);
     if (cfgRes.ok) {
       const rows = await cfgRes.json();
@@ -669,16 +672,12 @@ async function loadAdminGlobalCaps() {
       const pendingCount = parseCount(pendingRes);
       const waitingCount = parseCount(waitingRes);
       const nextDayCount = parseCount(nextDayRes);
-      let bandValid = "?", bandColor = "#64748b";
-      try {
-        const band = JSON.parse(map.review_queue_band_status || "{}");
-        bandValid = band.valid ?? "?";
-        if (typeof bandValid === "number") {
-          if (bandValid < 120)      bandColor = "#dc2626";
-          else if (bandValid >= 300) bandColor = "#f59e0b";
-          else                       bandColor = "#10b981";
-        }
-      } catch {}
+      // Band count LIVE — query directo a review_queue (en vez de cache config stale)
+      const bandValid = parseCount(bandLiveRes);
+      let bandColor = "#64748b";
+      if (bandValid < 120)      bandColor = "#dc2626"; // rojo: bajo
+      else if (bandValid >= 300) bandColor = "#f59e0b"; // ámbar: tope
+      else                       bandColor = "#10b981"; // verde: en banda
       stEl.innerHTML = `
         <div style="font-weight:600;margin-bottom:6px">Today processed</div>
         <div>📦 CSV ${csvCount}/${csvCap} (${csvPct}%) · 🤖 Autopilot ${apCount}/${apCap} (${apPct}%)</div>
@@ -770,13 +769,34 @@ async function loadAdminLimits() {
   });
 }
 
+// Mensaje unificado para CSV / Monday / Sellers.json uploads.
+// Toma { inserted, attempted, intoPending, intoWaiting, intoNextDay } y devuelve mensaje claro.
+function formatUploadResult(result, attempted) {
+  const ins = result?.inserted || 0;
+  const attempt = attempted || result?.attempted || 0;
+  const dup = Math.max(0, attempt - ins);
+  const nextDay = result?.intoNextDay || 0;
+  const waiting = result?.intoWaiting || 0;
+  if (ins === 0) {
+    if (dup > 0) return { msg: `⏸ 0 added — all ${dup} already known`, color: "#94a3b8" };
+    return { msg: `⏸ 0 added`, color: "#94a3b8" };
+  }
+  let parts = [`✅ ${ins} added to queue`];
+  if (waiting > 0)  parts.push(`${waiting} in waitlist`);
+  if (nextDay > 0)  parts.push(`${nextDay} for tomorrow`);
+  if (dup > 0)      parts.push(`${dup} dup`);
+  return { msg: parts.join(" · "), color: "#16a34a" };
+}
+
 function addAdminLimitRow() {
   const list = document.getElementById("admin-limits-list");
   if (!list) return;
   list.appendChild(buildLimitRow({
     user_email: "",
     autopilot_enabled: true,
-    monthly_api_cap: null,
+    monthly_api_cap: 10000,
+    autopilot_daily_minutes: 30,
+    autopilot_daily_prospects: 500,
     daily_emails_cap: 100,
     daily_monday_cap: 100,
   }, true));
@@ -787,9 +807,9 @@ function buildLimitRow(l, isNew = false) {
   row.className = "admin-limit-row";
   row.innerHTML = `
     <input type="email" class="form-input lim-email" value="${esc(l.user_email)}" placeholder="user@adeqmedia.com" ${isNew ? "" : "readonly"} />
-    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || ""}" placeholder="API/mo" min="0" title="Monthly RapidAPI hits cap (empty = no per-user cap)" />
-    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 20}" placeholder="min" min="5" max="20" title="Max duration of ONE autopilot session, in minutes (hard cap: 20)" />
-    <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 75}" placeholder="prosp" min="0" max="500" title="Max prospects processed per day by this user in autopilot" />
+    <input type="number" class="form-input lim-monthly" value="${l.monthly_api_cap || 10000}" placeholder="API/mo" min="0" title="Monthly RapidAPI hits cap" />
+    <input type="number" class="form-input lim-ap-mins" value="${l.autopilot_daily_minutes ?? 30}" placeholder="min" min="5" max="60" title="Max duration of ONE autopilot session, in minutes" />
+    <input type="number" class="form-input lim-ap-prospects" value="${l.autopilot_daily_prospects ?? 500}" placeholder="prosp" min="0" max="1000" title="Max prospects processed per day by this user in autopilot" />
     <span class="lim-autopilot ${l.autopilot_enabled ? "toggle-yes" : "toggle-no"}" title="Click para alternar Autopilot ON/OFF">${l.autopilot_enabled ? "AP ✓" : "AP ✗"}</span>
     <button class="save-btn" title="Save changes">💾</button>
     <button class="del-btn" title="Eliminar">×</button>
@@ -835,8 +855,8 @@ async function saveLimitRow(row) {
     user_email:                email,
     autopilot_enabled:         row.querySelector(".lim-autopilot").classList.contains("toggle-yes"),
     monthly_api_cap:           parseInt(row.querySelector(".lim-monthly").value, 10) || null,
-    autopilot_daily_minutes:   isNaN(apMins) || apMins < 5 ? 20 : Math.min(apMins, 20),
-    autopilot_daily_prospects: isNaN(apProsp) || apProsp < 0 ? 75 : Math.min(apProsp, 500),
+    autopilot_daily_minutes:   isNaN(apMins) || apMins < 5 ? 30 : Math.min(apMins, 60),
+    autopilot_daily_prospects: isNaN(apProsp) || apProsp < 0 ? 500 : Math.min(apProsp, 1000),
     // Caps de email/monday quedaron descontinuados por simplicidad; mando 999999 para que no bloqueen.
     daily_emails_cap:          999999,
     daily_monday_cap:          999999,
@@ -1102,33 +1122,27 @@ async function _refreshAgentFeed() {
     const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
     // Acciones reales del agente — extendido 2026-05-13. Excluimos
     // 'reserved' (audit interno) y 'monday_ok' (duplica con 'sent').
-    // Probamos 2 queries paralelas: con filter action y SIN filter (raw count)
-    // para diagnosticar si es RLS o filter el problema.
-    const [res, resAll] = await Promise.all([
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent,failed,skipped,monday_failed,kill_switch,cycle_no_candidates,cycle_heartbeat)${userClause}&select=*&order=created_at.desc&limit=50`, { headers }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?select=id&limit=1`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
-    ]);
+    // Query sin filter de action — mostramos TODO. Acción raras (reserved, monday_ok, etc)
+    // sirven para debug también. Después filtramos en cliente solo lo relevante para display.
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause ? userClause + "&" : ""}select=*&order=created_at.desc&limit=50`,
+      { headers }
+    );
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
-      wrap.innerHTML = `<div style="color:#f87171">HTTP ${res.status} ${esc(errBody.slice(0,120))}<br/>Probable: RLS bloquea SELECT en toolbar_agent_actions para tu user.</div>`;
+      wrap.innerHTML = `<div style="color:#f87171">HTTP ${res.status} ${esc(errBody.slice(0,120))}<br/>Likely: RLS blocks SELECT on toolbar_agent_actions.</div>`;
       return;
     }
     const rows = await res.json();
     if (!Array.isArray(rows) || rows.length === 0) {
-      // Diagnóstico: ¿RLS bloquea TODO o solo este filter?
-      const rangeAll = resAll.headers.get("content-range") || "";
-      const totalAll = parseInt(rangeAll.match(/\/(\d+|\\*)$/)?.[1] || "0", 10);
-      if (totalAll > 0) {
-        wrap.innerHTML = `<div style="color:#fbbf24">⚠️ Tabla tiene ${totalAll} rows pero filter no matchea ninguno.<br/>Probable: RLS filtra por user_email. Tu accessToken no matchea con user_email de las rows.</div>`;
-      } else {
-        wrap.innerHTML = `<div style="color:#fbbf24">⚠️ Tu user no puede leer toolbar_agent_actions (RLS bloquea SELECT).<br/>Workaround: mandame screenshot y reviso policy en Supabase.</div>`;
-      }
+      wrap.innerHTML = `<div style="color:#94a3b8">No activity yet. Toggle Agent ON to start sending.</div>`;
       return;
     }
     // Guardar para el botón CSV
     window._lastAgentFeedRows = rows;
-    const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨", cycle_no_candidates: "🔍", cycle_heartbeat: "💓" };
-    const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444", cycle_no_candidates: "#94a3b8", cycle_heartbeat: "#64748b" };
+    const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨", cycle_no_candidates: "🔍", cycle_heartbeat: "💓", reserved: "⏳" };
+    const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444", cycle_no_candidates: "#94a3b8", cycle_heartbeat: "#64748b", reserved: "#64748b" };
+    const actionLabels = { sent: "Sent", re_sent: "Re-sent (follow-up)", bounce_retry_sent: "Bounce retry sent", skipped: "Skipped", failed: "Failed", monday_failed: "Monday push failed", monday_ok: "Monday pushed", kill_switch: "Kill switch fired", cycle_no_candidates: "No candidates this cycle", cycle_heartbeat: "Heartbeat", reserved: "Reserved slot" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
       const icon = icons[r.action] || "·";
@@ -1138,10 +1152,12 @@ async function _refreshAgentFeed() {
       const reasonStr = r.reason ? `<span style="color:#94a3b8"> · ${esc(r.reason)}</span>` : "";
       const emailStr = email ? `<br/><span style="color:#60a5fa;margin-left:18px;font-size:10px">→ ${esc(email)}</span>` : "";
       const subjectStr = r.pitch_subject ? `<br/><span style="color:#cbd5e1;margin-left:18px;font-style:italic;font-size:10px">"${esc(r.pitch_subject.substring(0, 70))}"</span>` : "";
+      const label = actionLabels[r.action] || r.action;
       return `<div style="padding:5px 0;border-bottom:1px solid #334155">
         <span style="color:${color}">${icon}</span>
         <span style="color:#94a3b8;font-size:9px">[${esc(time)}]</span>
         <span style="color:#a78bfa;font-size:9px">${esc(userShort)}</span>
+        <span style="color:${color};font-size:9px;font-weight:600;margin:0 4px">${esc(label)}</span>
         <strong style="color:#e2e8f0">${esc(r.domain)}</strong>${reasonStr}
         ${emailStr}${subjectStr}
       </div>`;
@@ -1489,13 +1505,16 @@ async function loadAdminActivity() {
   // 3) historial rows con email (fallback si api_usage no se bumpeó por bug/version vieja)
   const emailsFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
   const mondayFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
-  const emailsFromAgent = agentActions.filter(a => a.action === "sent").length;
+  const emailsFromAgent = agentActions.filter(a => a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent").length;
   const mondayFromAgent = agentActions.filter(a => a.action === "monday_ok").length;
   // Fallback historial: cada row es un push a Monday; si tiene email también es un send
   const emailsFromHistorial = histRes.filter(h => h.email && /\@/.test(h.email)).length;
   const mondayFromHistorial = histRes.length;
-  // Tomamos MAX entre usage-counter y historial-actual (lo que esté más alto refleja mejor la verdad)
-  const emails = Math.max(emailsFromUsage, emailsFromHistorial) + emailsFromAgent;
+  // Fallback sendtrack: cada row es un envío real (1 dominio = 1 send/día). Source de verdad
+  // cuando api_usage no se bumpeó (versión vieja) o RLS bloquea.
+  const emailsFromSendtrack = Array.isArray(trackRes) ? trackRes.length : 0;
+  // Tomamos MAX entre las 3 fuentes manuales (usage, historial, sendtrack) + sumamos agent.
+  const emails = Math.max(emailsFromUsage, emailsFromHistorial, emailsFromSendtrack) + emailsFromAgent;
   const monday = Math.max(mondayFromUsage, mondayFromHistorial) + mondayFromAgent;
   // toolbar_historial usa page_views/raw_visits (no 'traffic'). Combinar histórico + review_queue para tráfico.
   const trafficOf      = (h) => parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
@@ -4573,6 +4592,15 @@ async function bindButtons() {
     if (e.key === "Enter") startCascade();
   });
   document.getElementById("btn-push-all").addEventListener("click", openCascadeSelected);
+  document.getElementById("btn-push-all-results")?.addEventListener("click", () => {
+    // Abre TODAS las URLs visibles en cascade results (no solo las seleccionadas)
+    const allDomains = (cascadeResults || []).map(s => s.domain).filter(Boolean);
+    if (!allDomains.length) { alert("No hay sitios en los resultados."); return; }
+    if (!confirm(`Abrir ${allDomains.length} tabs?`)) return;
+    allDomains.forEach((d, i) => {
+      setTimeout(() => chrome.tabs.create({ url: `https://${d}`, active: false }), i * 50);
+    });
+  });
   document.getElementById("btn-cascade-apply-filters")?.addEventListener("click", applyCascadeFilters);
   document.getElementById("btn-check-all").addEventListener("click", () => {
     const resultsEl = document.getElementById("cascade-results");
@@ -4707,7 +4735,7 @@ async function bindButtons() {
 
       const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken);
 
-      resultEl.textContent = `✅ ${upload.inserted} added to queue (${selected.length - upload.inserted} already queued). Railway will process if toggle is ON.`;
+      { const r = formatUploadResult(upload, selected.length); resultEl.textContent = r.msg; resultEl.style.color = r.color; }
       resultEl.className = "push-result ok";
 
     } catch (err) {
@@ -5491,26 +5519,19 @@ function appendCascadeItem(site, container) {
   item.className      = "cascade-item";
   item.dataset.domain = site.domain;
 
-  const rankColor  = !site.globalRank ? "" : site.globalRank < 50000 ? "rank-ok" : site.globalRank < 200000 ? "rank-warn" : "rank-bad";
-  const rankText   = site.globalRank ? `#${site.globalRank.toLocaleString()}` : "—";
-  const countryStr = site.countryCode ? (COUNTRY_NAMES[site.countryCode] || site.countryCode) : "—";
-
-  // Si visits=0 (Cascade post-refactor: no enriquece para ahorrar hits) → mostrar "?".
-  // El usuario verá los datos reales recién al abrir Analysis del dominio elegido.
-  const visitsLabel = site.visits > 0 ? formatTraffic(site.visits) : "?";
-  const grade = site.visits > 0
-    ? (() => { const s = scoreProspect({ pageViews: site.visits, rawVisits: site.visits }); return `<span class="score-grade-sm" style="background:${s.color}" title="${s.label}">${s.grade}</span>`; })()
-    : `<span class="score-grade-sm" style="background:#94a3b8" title="Not enriched — open domain to see data">?</span>`;
-
+  // Cascade post-refactor 2026-05-08: NO enriquece (ahorra hits RapidAPI).
+  // Antes había columnas visits/rank/country pero salían siempre "?", "—", "—".
+  // Ahora simplificado: checkbox + favicon + domain + botón "Open" individual.
   item.innerHTML = `
     <input type="checkbox" />
     <img class="cascade-favicon" loading="lazy" src="https://www.google.com/s2/favicons?domain=${esc(site.domain)}&sz=16" onerror="this.style.display='none'" />
-    <span class="cascade-domain" title="${esc(site.domain)}">${esc(site.domain)}</span>
-    <span class="cascade-visits">${esc(visitsLabel)}</span>
-    <span class="cascade-rank ${rankColor}">${rankText}</span>
-    <span class="cascade-country">${esc(countryStr)}</span>
-    ${grade}
+    <span class="cascade-domain" title="${esc(site.domain)}" style="flex:1">${esc(site.domain)}</span>
+    <button class="cascade-open-one btn btn-sm btn-secondary" title="Abrir esta URL" style="padding:2px 8px;font-size:11px">↗ Open</button>
   `;
+  item.querySelector(".cascade-open-one")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    chrome.tabs.create({ url: `https://${site.domain}`, active: false });
+  });
 
   const cb = item.querySelector("input");
   // unchecked by default — user picks what to open
@@ -5938,17 +5959,42 @@ async function initCsvQueue() {
 
   const refreshStats = async () => {
     statsEl.textContent = "Loading...";
-    const [stats, reviewPending] = await Promise.all([
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const myEmail = (state.loginEmail || "").toLowerCase();
+    const todayStartIso = new Date(new Date().setHours(0,0,0,0)).toISOString();
+    const userClause = `uploaded_by=eq.${encodeURIComponent(myEmail)}`;
+    const [stats, reviewPending, myPendingRes, myDoneRes, mySkippedRes, myNextDayRes] = await Promise.all([
       getCsvQueueStats(state.accessToken),
       import("../modules/supabase.js").then(m => m.getReviewQueuePendingCount(state.accessToken)).catch(() => 0),
+      // Mis uploads hoy — per-status counts
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?${userClause}&status=in.(pending,processing,waiting_pool)&uploaded_at=gte.${todayStartIso}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?${userClause}&status=eq.done&processed_at=gte.${todayStartIso}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?${userClause}&status=in.(skipped,error)&processed_at=gte.${todayStartIso}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?${userClause}&status=eq.next_day&uploaded_at=gte.${todayStartIso}&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
     ]);
     const csvPending    = stats.pending || 0;
     const csvProcessing = stats.processing || 0;
     const waitlistCount = stats.waiting_pool || 0;
+    const parseCount = (r) => { const m = (r.headers.get("content-range") || "").match(/\/(\d+)$/); return m ? parseInt(m[1]) : 0; };
+    const myPending = parseCount(myPendingRes);
+    const myDone = parseCount(myDoneRes);
+    const mySkipped = parseCount(mySkippedRes);
+    const myNextDay = parseCount(myNextDayRes);
+    const myTotal = myPending + myDone + mySkipped + myNextDay;
+
     statsEl.innerHTML = `
       <div style="margin-bottom:4px"><strong>⚙️ Processing queue:</strong> ${csvPending}/${CSV_PENDING_CAP} pending${csvProcessing ? ` + ${csvProcessing} processing` : ""}</div>
       <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/${WAITLIST_CAP} waiting (auto-promotes when freed)</div>
       <div style="margin-bottom:4px"><strong>📋 Prospects (To Review):</strong> ${reviewPending} enriched leads ready</div>
+      ${myTotal > 0 ? `
+      <div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--border);font-size:11px">
+        <strong style="color:#3b82f6">👤 My uploads today:</strong>
+        ${myPending > 0 ? ` <span style="color:#f59e0b">${myPending} in queue</span> ·` : ""}
+        ${myDone > 0 ? ` <span style="color:#16a34a">${myDone} done</span> ·` : ""}
+        ${myNextDay > 0 ? ` <span style="color:#8b5cf6">${myNextDay} tomorrow</span> ·` : ""}
+        ${mySkipped > 0 ? ` <span style="color:#94a3b8">${mySkipped} skipped</span> ·` : ""}
+        <span style="opacity:.7">(total ${myTotal})</span>
+      </div>` : ""}
     `;
   };
 
@@ -6119,8 +6165,7 @@ async function initCsvQueue() {
       uploadRes.textContent = `Uploading ${unique.length} domains...`;
 
       const result = await uploadCsvDomains(unique, state.loginEmail, state.accessToken);
-      uploadRes.textContent = `✅ ${result.inserted} added (${result.attempted - result.inserted} duplicates ignored).`;
-      uploadRes.className = "push-result ok";
+      { const r = formatUploadResult(result, unique.length); uploadRes.textContent = r.msg; uploadRes.className = "push-result ok"; uploadRes.style.color = r.color; }
       fileInput.value = "";
       await refreshAll();
     } catch (err) {
@@ -6153,11 +6198,7 @@ async function initCsvQueue() {
       }
       resultEl.textContent = `Found ${domains.length}, uploading to queue...`;
       const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken, "monday");
-      resultEl.textContent = `✅ ${up.inserted} added (${domains.length - up.inserted} already queued).`;
-      // Si tu user ya alcanzó el límite diario, avisar
-      if (up.inserted === 0 && domains.length > 0) {
-        resultEl.textContent += " If you hit the 300/day cap, wait until tomorrow or ask admin to raise it.";
-      }
+      { const r = formatUploadResult(up, domains.length); resultEl.textContent = r.msg; resultEl.style.color = r.color; }
       resultEl.className = "push-result ok";
       await refreshAll();
     } catch (err) {
@@ -6331,13 +6372,9 @@ async function initSellersJsonImport(refreshAll) {
       const result = await uploadCsvDomains(slice, state.loginEmail, state.accessToken, "sellers_json");
       const ins = result?.inserted || 0;
       const dup = slice.length - ins;
-      const lines = [
-        `✅ ${company.name}: <strong>${ins} nuevos encolados</strong>`,
-        `📊 Found total: ${domains.length} | Ya conocidos: ${knownCount} | Frescos: ${fresh.length}`,
-      ];
-      if (dup > 0)     lines.push(`⚠️ ${dup} duplicados a último momento (race con otro MB)`);
-      if (skipped > 0) lines.push(`📥 ${skipped} no encolados (cap ${allowed} alcanzado)`);
-      resEl.innerHTML = `<span style="color:#16a34a;line-height:1.5;display:block">${lines.join("<br/>")}</span>`;
+      // Mensaje unificado (helper formatUploadResult — mismo formato para CSV/Monday/Sellers)
+      const r = formatUploadResult(result, slice.length);
+      resEl.innerHTML = `<span style="color:${r.color}">${r.msg}</span>`;
       await refreshAll?.();
     } catch (e) {
       resEl.innerHTML = `<span style="color:#dc2626">❌ Error: ${esc(e.message || String(e))}</span>`;
@@ -7278,12 +7315,22 @@ async function loadProspectsTab() {
   const userFilter   = document.getElementById("prospects-user-filter")?.value   || "";
   let rows = [];
   let dailyCount = 0;
+  let snoozedSet = new Set();
   try {
-    [rows, dailyCount, _cachedProspectDrafts] = await Promise.all([
+    const [_rows, _count, _drafts, _snoozedRes] = await Promise.all([
       fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter, userFilter }),
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
+      // Snoozes activos del MB actual (snooze_until > now). Cada MB tiene su propia bolsa.
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_user_snoozed_prospects?user_email=eq.${encodeURIComponent((state.loginEmail||"").toLowerCase())}&snooze_until=gt.${new Date().toISOString()}&select=domain`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+      ).then(r => r.ok ? r.json() : []).catch(() => []),
     ]);
+    rows = _rows;
+    dailyCount = _count;
+    _cachedProspectDrafts = _drafts;
+    snoozedSet = new Set((_snoozedRes || []).map(r => (r.domain || "").toLowerCase()));
+    if (snoozedSet.size > 0) rows = rows.filter(r => !snoozedSet.has((r.domain || "").toLowerCase()));
     // Sincronizar la cache global de drafts (la usa la bandera+autocarga de cada card)
     _draftsState.all = _cachedProspectDrafts;
     _rebuildDraftsByLang();
@@ -7340,7 +7387,11 @@ async function loadProspectsTab() {
   const SLOT_MIN    = 30; // rotar cada 30 minutos
   const slotIdx     = Math.floor(Date.now() / (SLOT_MIN * 60 * 1000));
   const userKey     = (state.loginEmail || "anon").toLowerCase();
-  const slotKey     = `_prospects_slot_${userKey}_${slotIdx}`;
+  // Bug fix 2026-05-14: slotKey debe incluir filtros, sino cambiar filtro
+  // mantiene los assignedIds viejos y el lote queda "congelado" en el subset
+  // del filter anterior. Filtros distintos = lotes distintos.
+  const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}`;
+  const slotKey     = `_prospects_slot_${userKey}_${filterHash}_${slotIdx}`;
 
   let assignedIds = [];
   try {
@@ -7622,6 +7673,7 @@ function renderProspectCard(r) {
       <div style="display:flex;gap:3px;flex-shrink:0">
         <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Re-fetch traffic + Apollo emails (same as Analysis). Useful if saved data looks incomplete." style="padding:3px 7px;font-size:10px">🔍 Data</button>
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
+        <button class="btn btn-sm pcard-snooze-btn" title="💤 Posponer 21 días solo para vos (otros MBs lo siguen viendo)" style="padding:3px 7px;color:#8b5cf6;background:transparent;border:1px solid var(--border)">💤</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
@@ -8347,6 +8399,28 @@ function initProspectCard(card, data) {
     btn.title = `✓ Dislike${reason ? ` + razón guardada` : " guardado"} — el agente y RAG aprendieron`;
   });
 
+  // Snooze 21d (solo para este MB, otros MBs siguen viendo el prospect)
+  card.querySelector(".pcard-snooze-btn")?.addEventListener("click", async () => {
+    if (!confirm(`💤 Posponer ${data.domain} por 21 días?\n\nSolo lo vas a dejar de ver vos. Otros MBs lo siguen viendo en su lote.`)) return;
+    card.style.opacity = "0.4";
+    try {
+      const until = new Date(Date.now() + 21 * 86400_000).toISOString();
+      const res = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_user_snoozed_prospects`, {
+        method: "POST",
+        headers: {
+          "apikey": CONFIG.SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${state.accessToken}`,
+          "Content-Type": "application/json",
+          "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify({ user_email: state.loginEmail, domain: data.domain, snooze_until: until }),
+      });
+      if (!res.ok) { alert("❌ No se pudo posponer: " + res.status); card.style.opacity = "1"; return; }
+      card.remove();
+      refreshProspectsStats();
+    } catch (e) { alert("❌ " + e.message); card.style.opacity = "1"; }
+  });
+
   // Reject
   card.querySelector(".pcard-reject-btn")?.addEventListener("click", async () => {
     if (!confirm(`Reject and permanently block "${data.domain}"?`)) return;
@@ -8568,10 +8642,26 @@ async function refreshProspectsStats() {
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
   const remaining = listEl?.querySelectorAll(".pcard").length || 0;
-  if (statsEl) statsEl.textContent = remaining ? `${remaining} pending candidate${remaining === 1 ? "" : "s"}` : "No pending candidates";
   if (!remaining && listEl) listEl.innerHTML = '<div class="cascade-empty">Queue empty — great work! 🎉</div>';
   const count = await getDailyValidationCount(state.accessToken, state.loginEmail);
   updateProspectsDailyBar(count);
+  // Mantener formato del lote (consistente con loadProspectsTab) para que el counter
+  // "Enviaste X/30" se actualice on-the-fly tras cada validate sin recargar.
+  if (statsEl) {
+    const DAILY_SEND_CAP = 30;
+    const sent = count;
+    const left = Math.max(0, DAILY_SEND_CAP - sent);
+    const SLOT_MIN = 30;
+    const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
+    if (remaining > 0) {
+      statsEl.innerHTML = `<strong>${remaining}</strong> leads en tu lote · enviaste <strong>${sent}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${left}) · 🔄 nuevo lote en ${minsLeft}min`;
+    } else {
+      statsEl.innerHTML = `enviaste <strong>${sent}/${DAILY_SEND_CAP}</strong> hoy — ¡buen trabajo! 🎉`;
+    }
+  }
+  // Actualizar tab badge
+  const tabCount = document.getElementById("tab-prospects-count");
+  if (tabCount) tabCount.textContent = remaining > 0 ? `(${remaining})` : "";
 }
 
 async function initProspectsTab() {

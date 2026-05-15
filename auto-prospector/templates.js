@@ -43,6 +43,10 @@ Decime y te mando los detalles.`,
         "Header bidding en {{domain}}?",
         "Levantar eCPM en {{domain}} sin tocar la integración",
         "Setup HB para {{domain}}",
+        "Estás monetizando todo el inventario de {{domain}}?",
+        "Una idea para {{domain}} (toma 2 min leer)",
+        "{{domain}} + demand stack ADEQ",
+        "Te suma demanda extra en {{domain}}?",
       ],
       body: `Hola, soy de ADEQ. Vi que {{domain}} tiene buen tráfico y queria preguntarte si ya estás corriendo header bidding o si lo manejas todo via Google directo.
 
@@ -81,6 +85,10 @@ Let me know and I'll send the details.`,
         "Header bidding on {{domain}}?",
         "Lift eCPM on {{domain}} without touching integration",
         "HB setup for {{domain}}",
+        "Are you monetizing all {{domain}} inventory?",
+        "An idea for {{domain}} (2 min read)",
+        "{{domain}} + ADEQ demand stack",
+        "Extra demand for {{domain}}?",
       ],
       body: `Hi, ADEQ here. Saw {{domain}} has solid traffic and wanted to ask if you're already running header bidding or handling everything through Google directly.
 

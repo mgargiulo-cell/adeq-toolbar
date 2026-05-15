@@ -4483,12 +4483,12 @@ async function runReengagementCycle(token) {
         });
       }
 
-      // Update Monday item email column
+      // Update Monday — email + reset FU1/FU2 para que Monday continúe el ciclo
       const mondayItemId = lead.monday_item_id;
       const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || cfg.monday_api_key || "").trim();
       if (mondayItemId && mondayApiKey) {
-        const ok = await updateMondayItemEmail(mondayApiKey, mondayItemId, AGENT_DEFAULTS.monday_board_id, newEmail);
-        log(`  ${ok ? "✅" : "⚠️"} ${domain}: Monday email column ${ok ? "actualizado" : "FAIL"} → ${newEmail}`);
+        const ok = await updateMondayReengagementDispatch(mondayApiKey, mondayItemId, AGENT_DEFAULTS.monday_board_id, newEmail);
+        log(`  ${ok ? "✅" : "⚠️"} ${domain}: Monday email + FU1/FU2 ${ok ? "actualizados" : "FAIL"} → ${newEmail}`);
       }
 
       // Sendtrack
@@ -4925,23 +4925,69 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const lead = leadRows[0];
 
     // 4. Pickear next-best email — source-strict, excluir bounced
-    const candidates = (lead.emails || []).filter(e => {
+    let candidates = (lead.emails || []).filter(e => {
       if (!e || e.toLowerCase() === bouncedEmail.toLowerCase()) return false;
       if (isBouncedSync(e.toLowerCase())) return false; // ya bounced antes
       return true;
     });
+    // RESCATE: si no hay alternativas en el lead, intentar re-enrich on-the-fly.
+    // Scrape primero (gratis, con CF decoder + JSON-LD) → si vacío, Apollo lookup.
+    // Si encuentra algo válido lo agregamos al lead y al pool de candidates.
     if (candidates.length === 0) {
-      log(`  ⏭️ ${domain}: no hay alternativas — marcando lead failed_all_bounced`);
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_retries`, {
-        method: "POST",
-        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({
-          domain, mb_email: mbEmail, original_email: bouncedEmail, retry_email: "",
-          bounce_type: bounceType, attempt_number: totalAttempts + 1,
-          status: "skipped_no_alt", reason: "no_alternative_emails",
-        }),
-      }).catch(() => {});
-      return;
+      log(`  🔍 ${domain}: 0 alternativas — intentando rescate (scrape + Apollo)...`);
+      const newEmails = new Set();
+      try {
+        const scraped = await scrapeEmailsForDomain(domain);
+        scraped.forEach(e => { if (e && e.toLowerCase() !== bouncedEmail.toLowerCase()) newEmails.add(e.toLowerCase()); });
+      } catch {}
+      const cfg2 = await getConfig(token).catch(() => ({}));
+      const apolloKey = cfg2.apollo_api_key;
+      if (apolloKey) {
+        try {
+          const apolloRes = await findBestApolloEmail(domain, apolloKey, token, { traffic: lead.traffic || 0, allowUnlock: true });
+          if (apolloRes?.email && apolloRes.email.toLowerCase() !== bouncedEmail.toLowerCase()) {
+            newEmails.add(apolloRes.email.toLowerCase());
+          }
+        } catch {}
+      }
+      // Filtrar lo que ya bounced o garbage
+      const rescued = [...newEmails].filter(e => !isBouncedSync(e) && rankEmail(e, domain, lead.category || "") >= 0);
+      if (rescued.length > 0) {
+        log(`  💊 ${domain}: rescate encontró ${rescued.length} email(s) nuevos: ${rescued.join(", ")}`);
+        // Persist al lead para que próximas vueltas y otros MBs los vean
+        const mergedEmails = [...(lead.emails || []), ...rescued].filter((e, i, arr) => e && arr.indexOf(e) === i);
+        const mergedSources = { ...(lead.email_sources || {}) };
+        rescued.forEach(e => { if (!mergedSources[e]) mergedSources[e] = "rescue"; });
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ emails: mergedEmails, email_sources: mergedSources }),
+        }).catch(() => {});
+        candidates = rescued;
+      } else {
+        log(`  ⏭️ ${domain}: rescate sin resultados — marcando failed_all_bounced + freeze 30d`);
+        // Marcar bounce retry como skipped
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_retries`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({
+            domain, mb_email: mbEmail, original_email: bouncedEmail, retry_email: "",
+            bounce_type: bounceType, attempt_number: totalAttempts + 1,
+            status: "skipped_no_alt", reason: "no_alternative_emails_after_rescue",
+          }),
+        }).catch(() => {});
+        // Freeze 30d (no 60d) para darle chance que el sitio actualice contactos
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({
+            domain, frozen_until: new Date(Date.now() + 30 * 86400_000).toISOString(),
+            attempt_count: totalAttempts + 1, last_error: "all_emails_bounced_no_rescue",
+            source: "bounce_retry", uploaded_by: mbEmail, updated_at: new Date().toISOString(),
+          }),
+        }).catch(() => {});
+        return;
+      }
     }
 
     const SOURCE_RANK = { apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
@@ -5010,9 +5056,11 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         }
       } catch {}
 
-      // 6. Update Monday email column al nuevo
+      // 6. Update Monday — email + RESET FU1 (today+5) + FU2 (today+10).
+      // Antes solo cambiábamos email, los FU quedaban con fecha vieja y Monday
+      // no disparaba follow-ups o los disparaba tarde. Ahora reset completo.
       if (lead.monday_item_id && mondayApiKey) {
-        await updateMondayItemEmail(mondayApiKey, lead.monday_item_id, cfg.monday_active_board || cfg.monday_board_id || 1420268379, retryEmail)
+        await updateMondayReengagementDispatch(mondayApiKey, lead.monday_item_id, cfg.monday_active_board || cfg.monday_board_id || 1420268379, retryEmail)
           .catch(e => log(`  ⚠️ ${domain}: Monday update FAIL: ${e.message}`));
       }
       // Sendtrack
@@ -6975,20 +7023,42 @@ async function runAgentCycle(token, allFlags) {
         }).catch(() => null);
         reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id || null;
 
-        // Defense-in-depth: NUNCA mandar a un email cuyo dominio no matchea
-        // el lead.domain. Cubre el caso donde lead.emails se contaminó con
-        // emails de otro prospect (race condition, schema bug, etc.).
-        // Webmail (gmail/hotmail/etc.) permitidos — son personales válidos.
+        // Defense-in-depth: validar que el email pertenece a la misma MARCA del lead.
+        // Algoritmo brand-match (2026-05-15): strip TLD para comparar nombre comercial.
+        // Casos resueltos:
+        //   eltribuno.com ↔ eltribuno.com.ar    → match (mismo brand "eltribuno")
+        //   midilibre.fr  ↔ midilibre.com        → match
+        //   tudogostoso.com.br ↔ webedia-group.com → no match (parent corp distinct)
+        //   lafm.com.co ↔ rcnradio.com.co        → no match (parent corp distinct)
         const _recipientDom = (email.split("@")[1] || "").toLowerCase();
         const _leadDom      = domain.toLowerCase().replace(/^www\./, "");
         const _isWebmail    = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/.test(_recipientDom);
+        // Extraer brand: dominio sin TLD ni public suffix
+        const _stripTld = (d) => {
+          // Sacar public suffixes comunes (.com.ar, .com.br, .co.uk, .com.mx, etc.)
+          const parts = d.split(".");
+          if (parts.length <= 2) return parts[0]; // foo.com → foo
+          // Public suffixes de 2 niveles
+          const last2 = parts.slice(-2).join(".");
+          const TWO_LEVEL = new Set([
+            "com.ar","com.br","com.mx","com.co","com.pe","com.cl","com.ve","com.ec","com.uy",
+            "com.py","com.bo","com.gt","com.sv","com.hn","com.ni","com.cr","com.pa","com.do",
+            "co.uk","co.za","co.nz","co.jp","co.kr","co.id","co.in",
+            "com.tr","com.tw","com.hk","com.sg","com.my","com.au","com.eg","com.sa","com.ng",
+            "org.uk","ac.uk","gov.uk","com.pt","org.br","gov.br","edu.br",
+          ]);
+          if (TWO_LEVEL.has(last2)) return parts[parts.length - 3] || "";
+          return parts[parts.length - 2] || ""; // foo.bar.com → bar
+        };
+        const _recipientBrand = _stripTld(_recipientDom);
+        const _leadBrand      = _stripTld(_leadDom);
         const _domMatches   = _recipientDom === _leadDom
                             || _recipientDom.endsWith("." + _leadDom)
                             || _leadDom.endsWith("." + _recipientDom)
+                            || (_recipientBrand && _recipientBrand === _leadBrand && _recipientBrand.length >= 4)
                             || _isWebmail;
         if (!_domMatches) {
-          log(`🚫 ${domain}: ABORT send — recipient ${email} no pertenece al domain del lead. Posible cache leak.`);
-          // Marcar reserved como aborted para no contar al cap
+          log(`🚫 ${domain}: ABORT send — recipient ${email} brand mismatch (${_recipientBrand} ≠ ${_leadBrand}).`);
           if (reservedId) {
             await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
               method: "PATCH",
@@ -6996,6 +7066,14 @@ async function runAgentCycle(token, allFlags) {
               body: JSON.stringify({ action: "skipped", reason: "domain_mismatch_recipient" }),
             }).catch(() => {});
           }
+          // FIX LOOP INFINITO 2026-05-15: marcar lead como rejected para que NO se
+          // vuelva a pickear en próximos ciclos. Antes el agente intentaba lo mismo
+          // cada minuto → 50 skips repetidos por hora del mismo lead.
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ status: "rejected", validated_by: "domain_mismatch_loop_guard", validated_at: new Date().toISOString() }),
+          }).catch(() => {});
           continue; // próximo lead
         }
 
