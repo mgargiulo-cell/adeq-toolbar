@@ -14,7 +14,7 @@ import { detectBanners }                                                        
 import { saveHistory, loadHistory, clearHistory, saveSendDate,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys, setSupabaseAuth,
-         uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled,
+         uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled, logImportAttempt,
          getPitchDrafts, savePitchDraft, deletePitchDraft,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          getAutopilotTarget, setAutopilotTarget,
@@ -162,7 +162,7 @@ function setupVacationToggle() {
   const save = async () => {
     const u = cb.checked ? (until.value || null) : null;
     await setVacationStatus(state.accessToken, state.loginEmail, u);
-    status.textContent = u ? `✅ Marcado como en vacaciones hasta ${u}.` : "✅ Activo.";
+    status.textContent = u ? `✅ Marked as on vacation until ${u}.` : "✅ Active.";
   };
   cb.addEventListener("change", save);
   until.addEventListener("change", save);
@@ -356,7 +356,7 @@ function resetAnalysisUI() {
 
   // 10) Reset botón "Generar Pitch" si quedó en "Regenerar"
   const genBtn = document.getElementById("btn-generate-pitch");
-  if (genBtn) { genBtn.textContent = "✨ Generar Pitch"; genBtn.disabled = false; }
+  if (genBtn) { genBtn.textContent = "✨ Generate Pitch"; genBtn.disabled = false; }
 
   // 11) Restaurar draft del pitch del NUEVO dominio (si existe).
   //     Si no hay draft previo, el textarea queda vacío (ya se limpió arriba).
@@ -405,7 +405,7 @@ function showPersonalQuotaBanner({ used, limit, pct }) {
   banner.classList.add(pct >= 100 ? "cap-reached" : "cap-warning");
   document.getElementById("cap-banner-icon").textContent = pct >= 100 ? "⛔" : "⚠️";
   document.getElementById("cap-banner-title").textContent = `Your personal cap is at ${Math.round(pct)}%`;
-  document.getElementById("cap-banner-detail").textContent = ` — ${used.toLocaleString()} / ${limit.toLocaleString()} hits este mes.`;
+  document.getElementById("cap-banner-detail").textContent = ` — ${used.toLocaleString()} / ${limit.toLocaleString()} hits this month.`;
 }
 
 // Lock para evitar 2-3 pipelines en paralelo si el user clickea rapido o
@@ -549,6 +549,7 @@ function initAdminPanel() {
   // Wire agent
   document.getElementById("agent-toggle")?.addEventListener("change", toggleAgent);
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
+  document.getElementById("btn-feeder-runs-refresh")?.addEventListener("click", () => _refreshFeederRuns());
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
   document.getElementById("agent-unpause")?.addEventListener("click", async () => {
     if (!confirm("Resume agent now? This clears any pause (manual or kill switch).")) return;
@@ -579,7 +580,7 @@ async function resetTrafficCacheAboveThreshold() {
   const threshold = parseInt(document.getElementById("admin-reset-cache-threshold").value, 10) || 400000;
   const status = document.getElementById("admin-reset-cache-status");
   if (!confirm(`Delete ALL cached domains with visits ≥ ${threshold.toLocaleString()}?\n\nThis forces the team to re-analyze them (will spend API).`)) return;
-  status.textContent = "⏳ Borrando...";
+  status.textContent = "⏳ Deleting...";
   try {
     // Borrar via PostgREST con filtros sobre el JSONB.
     // PostgREST no soporta operaciones JSON >= directamente — usamos RPC alternativa:
@@ -596,7 +597,7 @@ async function resetTrafficCacheAboveThreshold() {
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_traffic_cache?select=domain,data`,
       { headers }
     );
-    if (!listRes.ok) { status.textContent = "❌ No se pudo leer la cache."; return; }
+    if (!listRes.ok) { status.textContent = "❌ Could not read cache."; return; }
     const rows = await listRes.json();
     const toDelete = rows.filter(r => {
       const d = r.data || {};
@@ -674,17 +675,14 @@ async function loadAdminGlobalCaps() {
       const nextDayCount = parseCount(nextDayRes);
       // Band count LIVE — query directo a review_queue (en vez de cache config stale)
       const bandValid = parseCount(bandLiveRes);
-      let bandColor = "#64748b";
-      if (bandValid < 120)      bandColor = "#dc2626"; // rojo: bajo
-      else if (bandValid >= 300) bandColor = "#f59e0b"; // ámbar: tope
-      else                       bandColor = "#10b981"; // verde: en banda
+      // Saturación 500: a partir de ahí los crons del feeder pausan intake.
+      // Sin "mínimo" — los crons disparan en horarios fijos (9/12/15/18/20).
+      let bandColor = "#10b981";  // verde por default
+      if (bandValid >= 500) bandColor = "#f59e0b";  // ámbar: saturado
       stEl.innerHTML = `
-        <div style="font-weight:600;margin-bottom:6px">Today processed</div>
-        <div>📦 CSV ${csvCount}/${csvCap} (${csvPct}%) · 🤖 Autopilot ${apCount}/${apCap} (${apPct}%)</div>
-        <div style="margin-top:8px;font-weight:600">Intake queues</div>
-        <div>⚙️ pending=${pendingCount}/200 · ⏳ waiting=${waitingCount}/300 · 🌅 next_day=${nextDayCount}</div>
-        <div style="margin-top:8px;font-weight:600">Review queue band (≥400K traffic)</div>
-        <div style="color:${bandColor}">📊 ${bandValid} / [120 — 300]</div>
+        <div>📦 CSV ${csvCount}/${csvCap} · 🤖 Autopilot ${apCount}/${apCap}</div>
+        <div>⚙️ pending ${pendingCount}/200 · ⏳ waiting ${waitingCount}/300 · 🌅 next_day ${nextDayCount}</div>
+        <div style="color:${bandColor}">📊 Review queue: ${bandValid} (saturates at 500)</div>
       `;
     }
   } catch (e) { stEl.textContent = `Error: ${e.message}`; }
@@ -698,9 +696,9 @@ async function saveAdminGlobalCaps() {
   if (!csvEl || !apEl) return;
   const csv = parseInt(csvEl.value, 10) || 1000;
   const ap  = parseInt(apEl.value, 10)  || 300;
-  if (csv < 50 || csv > 10000) { stEl.textContent = "❌ CSV cap debe estar entre 50 y 10000"; return; }
-  if (ap  < 50 || ap  > 5000)  { stEl.textContent = "❌ Autopilot cap debe estar entre 50 y 5000"; return; }
-  if (btn) { btn.disabled = true; btn.textContent = "Guardando..."; }
+  if (csv < 50 || csv > 10000) { stEl.textContent = "❌ CSV cap must be between 50 and 10000"; return; }
+  if (ap  < 50 || ap  > 5000)  { stEl.textContent = "❌ Autopilot cap must be between 50 and 5000"; return; }
+  if (btn) { btn.disabled = true; btn.textContent = "Saving..."; }
   try {
     const headers = {
       "apikey": CONFIG.SUPABASE_ANON_KEY,
@@ -881,7 +879,7 @@ async function _readAgentConfig() {
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   try {
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_threshold_score,agent_max_per_day,agent_active_hours_start,agent_active_hours_end,agent_paused_until,agent_focus_config,agent_test_mode)&select=key,value`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_max_per_day,agent_active_hours_start,agent_active_hours_end,agent_paused_until,agent_paused_reason,agent_focus_config,agent_test_mode)&select=key,value`,
       { headers }
     );
     const rows = await res.json();
@@ -1008,7 +1006,7 @@ async function _toggleAgentTestMode() {
   await _writeAgentConfig({ agent_test_mode: next });
   _applyAgentTestModeStyle(next === "true");
   if (typeof showToast === "function") {
-    showToast(next === "true" ? "🧪 TEST MODE ON — sin filtros de límites" : "✅ TEST MODE OFF", next === "true" ? "warn" : "ok", 4000);
+    showToast(next === "true" ? "🧪 TEST MODE ON — no limit filters" : "✅ TEST MODE OFF", next === "true" ? "warn" : "ok", 4000);
   }
 }
 
@@ -1048,20 +1046,22 @@ async function loadAdminAgent() {
     const inActiveWindow = startH < endH ? (spainH >= startH && spainH < endH) : (spainH >= startH || spainH < endH);
     if (isPaused) {
       const minLeft = Math.round((pausedUntil - Date.now()) / 60000);
-      statusEl.innerHTML = `⏸ <strong style="color:#f87171">Pausado por ${minLeft}min</strong> (kill switch o pause manual)`;
+      const reason = cfg.agent_paused_reason || "";
+      const reasonStr = reason ? ` <span style="color:#94a3b8;font-size:10px">(${esc(reason.substring(0, 60))})</span>` : "";
+      statusEl.innerHTML = `<strong style="color:#f87171">⏸ Paused ${minLeft}min</strong>${reasonStr}`;
     } else if (enabled && !inActiveWindow) {
-      statusEl.innerHTML = `🌙 Master ON, but <strong style="color:#fbbf24">OUTSIDE active hours</strong> (${startH}h-${endH}h Spain). Auto-resumes when in window. Spain time now: <strong>${spainH}h</strong>.`;
+      statusEl.innerHTML = `<strong style="color:#fbbf24">🌙 Off-hours</strong>`;
     } else if (enabled && inActiveWindow) {
-      statusEl.innerHTML = `🟢 <strong style="color:#34d399">Active</strong>. Processes every ~5min. Sending as <strong>${esc(myEmail)}</strong>. Active hours: ${startH}h-${endH}h Spain.`;
+      statusEl.innerHTML = `<strong style="color:#34d399">🟢 Active</strong>`;
     } else {
-      statusEl.innerHTML = `⚪ Inactive. Toggle ON (master switch) to auto-start during active hours.`;
+      statusEl.innerHTML = `<span style="color:#94a3b8">⚪ Inactive</span>`;
     }
   }
 
   // Inputs de threshold
   const setVal = (id, v, dflt) => { const el = document.getElementById(id); if (el) el.value = v || dflt; };
   setVal("agent-cfg-traffic",      cfg.agent_threshold_traffic,  500000);
-  setVal("agent-cfg-score",        cfg.agent_threshold_score,     40);
+  // agent_threshold_score: hidden field, ya no se usa para filtrar (decisión 2026-05-18).
   setVal("agent-cfg-max",          cfg.agent_max_per_day,         20);
   setVal("agent-cfg-active-start", cfg.agent_active_hours_start,   9);
   setVal("agent-cfg-active-end",   cfg.agent_active_hours_end,    20);
@@ -1084,6 +1084,7 @@ async function loadAdminAgent() {
   // Stats hoy
   await _refreshAgentStats(myEmail);
   await _refreshAgentFeed();
+  await _refreshFeederRuns();
 }
 
 async function _refreshAgentStats(userEmail) {
@@ -1111,6 +1112,85 @@ async function _refreshAgentStats(userEmail) {
   } catch {}
 }
 
+// Panel de Auto-feeder runs (Admin → Agent tab) — muestra los últimos 20
+// disparos del cron 9/12/15/18/20 Madrid con métricas y conversion rate real.
+async function _refreshFeederRuns() {
+  const sumEl  = document.getElementById("feeder-runs-summary");
+  const listEl = document.getElementById("feeder-runs-list");
+  if (!listEl || !sumEl) return;
+  listEl.textContent = "Loading...";
+  sumEl.textContent  = "Loading...";
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_feeder_runs?select=*&order=cron_at.desc&limit=20`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (!res.ok) {
+      listEl.innerHTML = `<div style="color:#f87171">HTTP ${res.status} — ¿RLS bloquea SELECT en toolbar_feeder_runs? (debe permitir solo a admin)</div>`;
+      sumEl.textContent = "—";
+      return;
+    }
+    const runs = await res.json();
+    if (!Array.isArray(runs) || runs.length === 0) {
+      listEl.innerHTML = `<div style="color:#94a3b8;font-style:italic">No runs yet. Next crons: 9/12/15/18/20 Madrid Mon-Fri.</div>`;
+      sumEl.innerHTML = `<span style="color:#94a3b8">No recent activity.</span>`;
+      return;
+    }
+    // Stats agregadas para el último día con actividad
+    const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    const todayRuns = runs.filter(r => (r.cron_at || "").slice(0, 10) === todayISO);
+    const todayOk = todayRuns.filter(r => r.status === "ok");
+    const dayGross = todayOk.reduce((s, r) => s + (parseInt(r.gross_total, 10) || 0), 0);
+    const dayEff = todayOk.reduce((s, r) => s + (parseInt(r.effective_added, 10) || 0), 0);
+    const dayConv = dayGross > 0 ? (dayEff / dayGross * 100).toFixed(1) : "—";
+    const target = 150;
+    const pct = Math.min(100, Math.round((dayEff / target) * 100));
+    sumEl.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <div>
+          <strong style="color:#10b981">Today:</strong> ${dayEff}/${target} effective ·
+          <span style="color:#94a3b8">${dayGross} imported · conv ${dayConv}%</span>
+        </div>
+        <div style="font-size:10px;color:#94a3b8">${todayRuns.length} crons run</div>
+      </div>
+      <div style="margin-top:6px;height:6px;background:#0f172a;border-radius:3px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:linear-gradient(90deg,#3b82f6,#10b981)"></div>
+      </div>
+    `;
+    // Render runs (compact)
+    const statusBadge = (s) => {
+      const map = {
+        ok:                     ["✅", "#10b981"],
+        skipped_rapidapi:       ["⏸",  "#f59e0b"],
+        skipped_saturated:      ["⏸",  "#6366f1"],
+        skipped_daily_target:   ["✓",  "#10b981"],
+        incomplete:             ["⚠️", "#f87171"],
+      };
+      const [icon, color] = map[s] || ["•", "#94a3b8"];
+      return `<span style="color:${color}">${icon} ${s}</span>`;
+    };
+    listEl.innerHTML = runs.map(r => {
+      const slot = (r.slot_label || "").slice(11) || "—";
+      const date = (r.cron_at || "").slice(5, 10);
+      const sources = `S:${r.gross_sellers || 0} M:${r.gross_monday || 0} J:${r.gross_majestic || 0}`;
+      const gross = r.gross_total ?? "—";
+      const eff = r.effective_added != null ? r.effective_added : "<span style='color:#94a3b8'>pending</span>";
+      const conv = r.conversion_pct != null ? `${parseFloat(r.conversion_pct).toFixed(1)}%` : "—";
+      const note = r.notes ? ` <span style="color:#94a3b8">${esc(r.notes.substring(0, 50))}</span>` : "";
+      return `<div style="padding:2px 0;border-bottom:1px solid #334155;line-height:1.6">
+        <span style="color:#94a3b8">${date} ${slot}</span> ·
+        ${statusBadge(r.status || "unknown")} ·
+        <span style="color:#cbd5e1">${sources}</span> ·
+        gross <strong>${gross}</strong> →
+        eff <strong style="color:#10b981">${eff}</strong> · ${conv}${note}
+      </div>`;
+    }).join("");
+  } catch (e) {
+    listEl.innerHTML = `<div style="color:#f87171">Error: ${esc(e.message || String(e))}</div>`;
+    sumEl.textContent = "Error";
+  }
+}
+
 async function _refreshAgentFeed() {
   const wrap = document.getElementById("agent-actions-feed");
   if (!wrap) return;
@@ -1120,12 +1200,13 @@ async function _refreshAgentFeed() {
     // respetamos ese filtro acá también. Default = todos los agentes.
     const userFilter = (document.getElementById("admin-filter-user")?.value || "").trim();
     const userClause = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
-    // Acciones reales del agente — extendido 2026-05-13. Excluimos
-    // 'reserved' (audit interno) y 'monday_ok' (duplica con 'sent').
-    // Query sin filter de action — mostramos TODO. Acción raras (reserved, monday_ok, etc)
-    // sirven para debug también. Después filtramos en cliente solo lo relevante para display.
+    // Política user 2026-05-18: en el feed solo se muestran ACCIONES REALES
+    // (sent / re_sent / bounce_retry_sent). No nos interesa ver skips ni
+    // reserved ni heartbeats — eso es ruido. Si necesitás debug, está en
+    // toolbar_agent_actions completo en Supabase.
+    const realActions = "action=in.(sent,re_sent,bounce_retry_sent)";
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause ? userClause + "&" : ""}select=*&order=created_at.desc&limit=50`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?${userClause ? userClause + "&" : ""}${realActions}&select=*&order=created_at.desc&limit=50`,
       { headers }
     );
     if (!res.ok) {
@@ -1208,10 +1289,10 @@ async function _checkManualOverrideIfOutside() {
   const d = mNow.getDay();
   const outside = (d === 0 || d === 6 || h < 9 || h >= 23);
   if (!outside) return true;
-  const ans = prompt(`⚠️ Fuera del horario operativo (9-23 L-V Madrid). Hora Madrid: ${h}h.\n\n¿Por cuántas horas activar override? (1-8)\nDespués de ese tiempo el worker vuelve a dormir solo.`, "2");
+  const ans = prompt(`⚠️ Outside operating hours (9-23 Mon-Fri Madrid). Madrid time: ${h}h.\n\nFor how many hours enable override? (1-8)\nAfter that the worker goes back to sleep.`, "2");
   if (ans === null) return false;
   const hrs = parseInt(ans, 10);
-  if (!hrs || hrs < 1 || hrs > 8) { alert("⛔ Valor inválido. Tiene que ser entre 1 y 8 horas."); return false; }
+  if (!hrs || hrs < 1 || hrs > 8) { alert("⛔ Invalid value. Must be between 1 and 8 hours."); return false; }
   const until = new Date(Date.now() + hrs * 60 * 60 * 1000).toISOString();
   await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
     method: "POST",
@@ -1240,19 +1321,22 @@ async function toggleAgent(e) {
     agent_manual_off:    users.length === 0 ? "true" : "false",
   });
   await loadAdminAgent();
-  showToast(enabled ? "🟢 Agent activado" : "⚪ Agent desactivado (no auto-reactivará)", "info");
+  showToast(enabled ? "🟢 Agent activated" : "⚪ Agent deactivated (will not auto-reactivate)", "info");
 }
 
 async function saveAgentThresholds() {
+  // 2026-05-18: agent_threshold_score y active_hours quedaron hidden en UI.
+  // El score no se usa para filtrar leads (solo hard gates). Active hours
+  // siguen siendo 9-23 fijo (los slots viven adentro). Por compat seguimos
+  // guardándolos por si hay scripts/integraciones que los lean.
   const updates = {
-    agent_threshold_traffic:  parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 500000,
-    agent_threshold_score:    parseInt(document.getElementById("agent-cfg-score").value, 10) || 40,
-    agent_max_per_day:        parseInt(document.getElementById("agent-cfg-max").value, 10) || 20,
+    agent_threshold_traffic:  parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 400000,
+    agent_max_per_day:        parseInt(document.getElementById("agent-cfg-max").value, 10) || 30,
     agent_active_hours_start: parseInt(document.getElementById("agent-cfg-active-start").value, 10) || 9,
-    agent_active_hours_end:   parseInt(document.getElementById("agent-cfg-active-end").value, 10) || 20,
+    agent_active_hours_end:   parseInt(document.getElementById("agent-cfg-active-end").value, 10) || 23,
   };
   await _writeAgentConfig(updates);
-  showToast("✅ Thresholds guardados", "info");
+  showToast("✅ Thresholds saved", "info");
   await loadAdminAgent();
 }
 
@@ -1267,7 +1351,7 @@ async function saveAgentFocus() {
     weekly_target:       parseInt(document.getElementById("agent-focus-weekly").value, 10) || 0,
   };
   await _writeAgentConfig({ agent_focus_config: JSON.stringify(focus) });
-  showToast("✅ Focus de la semana guardado", "info");
+  showToast("✅ Weekly focus saved", "info");
   await loadAdminAgent();
 }
 
@@ -1275,7 +1359,7 @@ async function saveAgentFocus() {
 // Lee el DOM ya renderizado (contiene los datos del periodo + filtros aplicados).
 function exportComparatorCsv() {
   const wrap = document.getElementById("admin-mb-comparator");
-  if (!wrap) { showToast("❌ Comparador no cargado", "error"); return; }
+  if (!wrap) { showToast("❌ Comparator not loaded", "error"); return; }
   const rows = [];
   // Iterar las filas del grid: cada label + 4 celdas (3 MBs + Agent)
   const cells = wrap.querySelectorAll(".mbc-cell, .mbc-group-sep, .mbc-row-label");
@@ -1304,7 +1388,7 @@ function exportComparatorCsv() {
     i++;
   }
 
-  if (rows.length === 0) { showToast("❌ No hay datos para exportar", "error"); return; }
+  if (rows.length === 0) { showToast("❌ No data to export", "error"); return; }
 
   // Filtros aplicados al título del archivo
   const period = document.getElementById("admin-filter-period")?.value || "";
@@ -1334,11 +1418,11 @@ async function toggleRefreshEmptyLeads() {
     const current = rows?.[0]?.value === "true";
     const newVal = !current;
     await _writeAgentConfig({ agent_refresh_empty_leads: String(newVal) });
-    showToast(newVal ? "🔄 Refresh activado — el worker procesa 1 lead/ciclo" : "⏸ Refresh desactivado", "info");
+    showToast(newVal ? "🔄 Refresh enabled — worker processes 1 lead/cycle" : "⏸ Refresh disabled", "info");
     const statusEl = document.getElementById("agent-refresh-status");
     if (statusEl) statusEl.textContent = `Refresh leads sin traffic: ${newVal ? "🟢 ON" : "⚪ OFF"}`;
     const btnEl = document.getElementById("agent-refresh-toggle");
-    if (btnEl) btnEl.textContent = newVal ? "⏸ Pausar refresh" : "🔄 Activar refresh";
+    if (btnEl) btnEl.textContent = newVal ? "⏸ Pause refresh" : "🔄 Activate refresh";
   } catch (e) {
     showToast("❌ Error: " + e.message, "error");
   }
@@ -1348,7 +1432,7 @@ async function pauseAgent1h() {
   if (!confirm("Pause agent for 1 hour?")) return;
   const pauseUntil = new Date(Date.now() + 3600_000).toISOString();
   await _writeAgentConfig({ agent_paused_until: pauseUntil });
-  showToast("⏸ Agent pausado 1h", "warn");
+  showToast("⏸ Agent paused 1h", "warn");
   await loadAdminAgent();
 }
 
@@ -1390,7 +1474,7 @@ async function saveAdminBlocklist() {
     .split(/[\n,]/).map(d => d.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, ""))
     .filter(d => d && d.includes("."));
   if (!domains.length) { status.textContent = "❌ Empty list."; return; }
-  status.textContent = "⏳ Guardando...";
+  status.textContent = "⏳ Saving...";
   try {
     // Borrar SOLO category='manual' (no tocar inoperativo/corporate auto-poblados)
     await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?category=eq.manual`, {
@@ -3908,6 +3992,7 @@ function renderApolloPeople(resultEl, result) {
       e.preventDefault();
       const idx = parseInt(btn.dataset.idx);
       const person = people[idx];
+      if (!person) { btn.textContent = "❌"; btn.title = "Stale index — re-render the card"; return; }
       btn.disabled = true; btn.textContent = "⏳";
       const r = await revealApolloEmail({
         id:         person.id,
@@ -4204,7 +4289,7 @@ async function bindButtons() {
       likeBtn.style.display = "inline-block";
       dislikeBtn.style.display = "inline-block";
     } catch (err) {
-      ta.value = `Error: ${err.message}`; btn.textContent = "✨ Generar Pitch";
+      ta.value = `Error: ${err.message}`; btn.textContent = "✨ Generate Pitch";
     }
     btn.disabled = false;
   });
@@ -5166,7 +5251,7 @@ async function runKeywordSearch() {
       renderKeywords(local, term);
       el.insertAdjacentHTML("afterbegin", `<div class="kw-api-warn">⚠ Supabase: ${esc(error)} — showing local results</div>`);
     } else {
-      el.innerHTML = `<span class="kw-empty">Error al buscar: ${esc(error)}</span>`;
+      el.innerHTML = `<span class="kw-empty">Error searching: ${esc(error)}</span>`;
     }
     return;
   }
@@ -5809,6 +5894,27 @@ function initLoginScreen() {
 
   screen.style.display = "flex";
 
+  // FIX 2026-05-18: limpiar los campos en cada apertura del login screen y
+  // bloquear autofill. Caso reportado: mgargiulo abrió la extensión, Chrome
+  // tenía autofill con email/password de Agus, mgargiulo no lo vio y entró
+  // a la cuenta equivocada. Forzar input manual cada vez evita el mix-up.
+  const emailIn = document.getElementById("login-email");
+  const passIn  = document.getElementById("login-password");
+  if (emailIn) {
+    emailIn.value = "";
+    emailIn.setAttribute("autocomplete", "off");
+    emailIn.setAttribute("autocapitalize", "off");
+    emailIn.setAttribute("spellcheck", "false");
+    // Algunos managers (1Password, LastPass) ignoran autocomplete=off → reforzar:
+    emailIn.setAttribute("name", "adeq-login-email-" + Date.now());
+  }
+  if (passIn) {
+    passIn.value = "";
+    passIn.setAttribute("autocomplete", "new-password");
+    passIn.setAttribute("name", "adeq-login-pwd-" + Date.now());
+  }
+  setTimeout(() => emailIn?.focus(), 100);
+
   // Enter key en cualquier campo
   ["login-email", "login-password"].forEach(id => {
     document.getElementById(id).addEventListener("keydown", e => {
@@ -5888,10 +5994,24 @@ function initLoginScreen() {
       return;
     }
 
+    // Verificación de identidad: lo que Supabase autenticó tiene que ser
+    // EL MISMO email que se tipeó. Si no matcha (sesión cacheada cruzada,
+    // mix-up de credenciales, etc.) abortamos para no entrar como otro user.
+    // Bug reportado 2026-05-18: mgargiulo tipeaba su email pero entraba
+    // como sales@adeqmedia.com (Agus).
+    const realEmail = (result.authenticated_email || "").toLowerCase();
+    if (realEmail && realEmail !== email.toLowerCase()) {
+      errorEl.textContent = `⚠️ Sesión cruzada: Supabase autenticó "${realEmail}", no "${email}". Cerrá y reabrí la extensión y reintenta.`;
+      btn.disabled = false; btn.textContent = "Sign In";
+      // Limpiar cualquier auth viejo que pudiera estar contaminando
+      await chrome.storage.local.remove("auth").catch(() => {});
+      return;
+    }
+
     const auth = {
       loggedIn:     true,
-      user:         email,
-      name:         AUTHORIZED[email],
+      user:         realEmail || email, // fuente de verdad: el email autenticado
+      name:         AUTHORIZED[realEmail || email],
       ts:           Date.now(),
       accessToken:  result.access_token,
       refreshToken: result.refresh_token,
@@ -5925,6 +6045,12 @@ function applyUserFromAuth(auth) {
   state.role         = getRole(email);
   // Marcar el body con el role para que el CSS pueda mostrar/ocultar UI admin
   document.body.setAttribute("data-role", state.role);
+  // Hide History button for admin (pedido user 2026-05-18 — botón innecesario
+  // para mgargiulo). Otros MBs lo siguen viendo.
+  if (state.role === "admin") {
+    const hb = document.getElementById("btn-history-open");
+    if (hb) hb.style.display = "none";
+  }
   // Wire del triple-click para TODOS los users — los no-admin reciben un alert
   // visible cuando lo intentan (en vez de fallar silencioso)
   wireAdminViewToggle();
@@ -5998,42 +6124,170 @@ async function initCsvQueue() {
     `;
   };
 
-  let currentHistorySource = "csv"; // "csv" | "monday"
+  // ── ACTIVITY VIEW (2026-05-18) ────────────────────────────────
+  // Reemplazo del raw item dump por resumen agrupado por MB + Agent.
+  // Fuente: toolbar_import_attempts (intentos humanos) + toolbar_feeder_runs (Agent).
+  const HISTORY_MBS = [
+    { email: "mgargiulo@adeqmedia.com", name: "Maxi" },
+    { email: "sales@adeqmedia.com",     name: "Agus" },
+    { email: "dhorovitz@adeqmedia.com", name: "Diego" },
+  ];
+  const HISTORY_SOURCE_LABEL = {
+    csv:          { icon: "📥", label: "CSV upload" },
+    sellers_json: { icon: "📋", label: "Sellers.json" },
+    monday:       { icon: "🔄", label: "Monday refresh" },
+  };
+  let _historyRange = "today"; // "today" | "7days"
+
+  function _madridStartOfToday() {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
+    });
+    const dateStr = fmt.format(new Date());
+    return new Date(`${dateStr}T00:00:00Z`).toISOString();  // ~ today 00:00 Madrid (approx)
+  }
+
+  async function _fetchActivityData(sinceISO) {
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const [attemptsRes, feederRes] = await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_import_attempts?at=gte.${sinceISO}&select=*&order=at.desc&limit=500`, { headers }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_feeder_runs?cron_at=gte.${sinceISO}&select=*&order=cron_at.desc`, { headers }),
+    ]);
+    const attempts = attemptsRes.ok ? await attemptsRes.json() : [];
+    const feeders  = feederRes.ok  ? await feederRes.json()  : [];
+    return { attempts, feeders };
+  }
+
+  function _renderAgentBlock(feeders) {
+    if (!feeders || feeders.length === 0) {
+      // Sin actividad → solo el label "Agent", sin descripción
+      return `
+        <div style="padding:8px;border:1px solid #6366f1;border-radius:6px;margin-bottom:8px;background:rgba(99,102,241,0.06)">
+          <div style="font-weight:600;color:#6366f1">🤖 Agent</div>
+        </div>`;
+    }
+    const okRuns = feeders.filter(r => r.status === "ok");
+    const grossTotal     = okRuns.reduce((s, r) => s + (parseInt(r.gross_total, 10)     || 0), 0);
+    const effectiveTotal = okRuns.reduce((s, r) => s + (parseInt(r.effective_added, 10) || 0), 0);
+    const grossSellers   = okRuns.reduce((s, r) => s + (parseInt(r.gross_sellers, 10)   || 0), 0);
+    const grossMonday    = okRuns.reduce((s, r) => s + (parseInt(r.gross_monday, 10)    || 0), 0);
+    const grossMajestic  = okRuns.reduce((s, r) => s + (parseInt(r.gross_majestic, 10)  || 0), 0);
+    const conv = grossTotal > 0 ? (effectiveTotal / grossTotal * 100).toFixed(1) : "—";
+    const skipped = feeders.length - okRuns.length;
+    const last = feeders[0];
+    const lastTime = last?.slot_label?.slice(11) || "—";
+    const lastStatus = last?.status === "ok" ? "✅ ok" : (last?.status || "—");
+    return `
+      <div style="padding:8px;border:1px solid #6366f1;border-radius:6px;margin-bottom:8px;background:rgba(99,102,241,0.06)">
+        <div style="font-weight:600;color:#6366f1">🤖 Agent</div>
+        <div style="font-size:11px;margin-top:4px;line-height:1.6">
+          ${okRuns.length} cron${okRuns.length === 1 ? "" : "s"} ok${skipped > 0 ? ` (${skipped} skipped)` : ""} ·
+          <strong>${grossTotal}</strong> imported →
+          <strong style="color:#16a34a">${effectiveTotal}</strong> to Prospects ·
+          conv ${conv}%
+        </div>
+        <div style="font-size:10px;color:var(--text-muted);margin-top:2px">
+          └─ sellers ${grossSellers} · Monday ${grossMonday} · Majestic ${grossMajestic} · last ${lastTime} ${lastStatus}
+        </div>
+      </div>`;
+  }
+
+  function _renderMbBlock(name, email, attempts) {
+    const mine = attempts.filter(a => (a.user_email || "").toLowerCase() === email);
+    if (mine.length === 0) {
+      return `<div style="font-size:11px;padding:4px 0;color:var(--text-muted)">👤 <strong>${name}</strong> no activity today</div>`;
+    }
+    const grouped = {};
+    mine.forEach(a => {
+      const src = a.source || "csv";
+      if (!grouped[src]) grouped[src] = { attempted: 0, deduped: 0, inserted: 0, batches: 0, details: new Set() };
+      grouped[src].attempted += parseInt(a.attempted_count, 10) || 0;
+      grouped[src].deduped   += parseInt(a.deduped_count,   10) || 0;
+      grouped[src].inserted  += parseInt(a.inserted_count,  10) || 0;
+      grouped[src].batches++;
+      if (a.source_detail) grouped[src].details.add(a.source_detail);
+    });
+    const totalAtt = mine.reduce((s, a) => s + (parseInt(a.attempted_count, 10) || 0), 0);
+    const totalIns = mine.reduce((s, a) => s + (parseInt(a.inserted_count,  10) || 0), 0);
+    const lines = Object.entries(grouped).map(([src, g]) => {
+      const { icon, label } = HISTORY_SOURCE_LABEL[src] || { icon: "•", label: src };
+      const detailStr = g.details.size > 0 && g.details.size <= 3 ? ` (${[...g.details].join(", ")})` : "";
+      const insertedNote = g.inserted === 0 && g.attempted > 0
+        ? `<span style="color:#d97706">${g.attempted} attempts · all duplicates</span>`
+        : `${g.attempted} attempts → <strong>${g.inserted}</strong> queued`;
+      const batchNote = g.batches > 1 ? ` · ${g.batches}×` : "";
+      return `<div style="margin-left:14px;font-size:11px;line-height:1.6">${icon} ${label}${detailStr}: ${insertedNote}${batchNote}</div>`;
+    }).join("");
+    return `
+      <div style="margin:8px 0;padding-bottom:6px;border-bottom:1px dashed var(--border)">
+        <div style="font-weight:600;font-size:12px">👤 ${name}</div>
+        ${lines}
+        <div style="margin-left:14px;font-size:10px;color:var(--text-muted);margin-top:2px">Total: ${totalAtt} attempts · ${totalIns} queued</div>
+      </div>`;
+  }
+
+  function _renderActivityToday(attempts, feeders) {
+    let html = _renderAgentBlock(feeders);
+    HISTORY_MBS.forEach(mb => { html += _renderMbBlock(mb.name, mb.email, attempts); });
+    return html;
+  }
+
+  function _renderActivity7Days(attempts, feeders) {
+    // Agrupar por fecha (YYYY-MM-DD Madrid)
+    const dateOf = (iso) => {
+      try {
+        return new Date(iso).toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+      } catch { return ""; }
+    };
+    const byDate = {};
+    attempts.forEach(a => {
+      const d = dateOf(a.at);
+      if (!d) return;
+      if (!byDate[d]) byDate[d] = { attempts: [], feeders: [] };
+      byDate[d].attempts.push(a);
+    });
+    feeders.forEach(f => {
+      const d = dateOf(f.cron_at);
+      if (!d) return;
+      if (!byDate[d]) byDate[d] = { attempts: [], feeders: [] };
+      byDate[d].feeders.push(f);
+    });
+    const dates = Object.keys(byDate).sort().reverse();
+    if (dates.length === 0) return `<div style="color:var(--text-muted);font-style:italic;padding:8px">No activity in the last 7 days.</div>`;
+    return dates.map(d => `
+      <details style="margin-bottom:6px;border:1px solid var(--border);border-radius:6px;padding:6px" ${d === dates[0] ? "open" : ""}>
+        <summary style="cursor:pointer;font-weight:600;font-size:12px">${d}</summary>
+        <div style="margin-top:6px">
+          ${_renderActivityToday(byDate[d].attempts, byDate[d].feeders)}
+        </div>
+      </details>
+    `).join("");
+  }
 
   const refreshHistory = async () => {
     if (!historyEl) return;
     historyEl.textContent = "Loading...";
-    const rows = await getCsvQueueHistory(state.accessToken, 30, currentHistorySource);
-    if (rows.length === 0) {
-      historyEl.innerHTML = `<div style="color:var(--text-muted);font-style:italic">No domains processed yet in "${currentHistorySource === "csv" ? "External CSV" : "Monday"}"</div>`;
-      return;
+    const titleEl = document.getElementById("history-title");
+    const toggleBtn = document.getElementById("btn-csv-history-toggle-range");
+    if (titleEl) titleEl.textContent = _historyRange === "today" ? "Import Activity Today" : "Import Activity — Last 7 days";
+    if (toggleBtn) toggleBtn.textContent = _historyRange === "today" ? "View last 7 days" : "View today only";
+    const sinceISO = _historyRange === "today"
+      ? _madridStartOfToday()
+      : new Date(Date.now() - 7 * 86400_000).toISOString();
+    try {
+      const { attempts, feeders } = await _fetchActivityData(sinceISO);
+      historyEl.innerHTML = _historyRange === "today"
+        ? _renderActivityToday(attempts, feeders)
+        : _renderActivity7Days(attempts, feeders);
+    } catch (e) {
+      historyEl.innerHTML = `<div style="color:#e53e3e">Error: ${esc(e.message || String(e))}</div>`;
     }
-    const statusIcon = { done: "✅", error: "❌", skipped: "⏭" };
-    historyEl.innerHTML = rows.map(r => {
-      const icon = statusIcon[r.status] || "•";
-      const when = r.processed_at ? new Date(r.processed_at).toLocaleString("es-AR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "";
-      const err  = r.status === "error" && r.error_message ? ` <span style="color:#e53e3e">— ${esc(r.error_message.substring(0, 80))}</span>` : "";
-      const skip = r.status === "skipped" && r.error_message ? ` <span style="color:var(--text-muted)">— ${esc(r.error_message)}</span>` : "";
-      return `<div style="padding:3px 0;border-bottom:1px solid var(--border)"><span>${icon}</span> <strong>${esc(r.domain)}</strong> <span style="color:var(--text-muted)">${when}</span>${err}${skip}</div>`;
-    }).join("");
   };
 
-  // Tab switcher del historial
-  const tabCsv    = document.getElementById("tab-history-csv");
-  const tabMonday = document.getElementById("tab-history-monday");
-  const setTab = (which) => {
-    currentHistorySource = which;
-    [tabCsv, tabMonday].forEach(t => {
-      if (!t) return;
-      t.classList.remove("history-tab-active");
-      t.style.borderBottomColor = "transparent";
-    });
-    const active = which === "csv" ? tabCsv : tabMonday;
-    if (active) { active.classList.add("history-tab-active"); active.style.borderBottomColor = "var(--primary)"; }
+  document.getElementById("btn-csv-history-toggle-range")?.addEventListener("click", () => {
+    _historyRange = _historyRange === "today" ? "7days" : "today";
     refreshHistory();
-  };
-  tabCsv?.addEventListener("click", () => setTab("csv"));
-  tabMonday?.addEventListener("click", () => setTab("monday"));
+  });
 
   const refreshAll = async () => { await Promise.all([refreshStats(), refreshHistory()]); };
 
@@ -6105,7 +6359,16 @@ async function initCsvQueue() {
       enabledCbx.checked = false;
       return;
     }
-    await setCsvQueueEnabled(enabledCbx.checked, state.accessToken, state.loginEmail);
+    // setCsvQueueEnabled ahora devuelve bool. Si falla la save (red, RLS, etc.),
+    // revertimos el checkbox local + mostramos error — antes quedaba ON visual
+    // pero la DB no se updateaba, y al siguiente poll se destildaba "solo".
+    const desired = enabledCbx.checked;
+    const ok = await setCsvQueueEnabled(desired, state.accessToken, state.loginEmail);
+    if (!ok) {
+      enabledCbx.checked = !desired;
+      showToast(`❌ Could not ${desired ? "enable" : "disable"} Auto Import. Retry.`, "error");
+      return;
+    }
     if (enabledCbx.checked) startHeartbeat();
     else stopHeartbeat();
     await refreshCsvMutex();
@@ -6162,9 +6425,34 @@ async function initCsvQueue() {
         return;
       }
 
-      uploadRes.textContent = `Uploading ${unique.length} domains...`;
+      // ── Dedup contra el sistema completo (igual que sellers.json) ────
+      // Sin esto, dominios ya en review_queue / historial / sendtrack / blocklist
+      // se re-procesaban y gastaban API. El auto-feeder los puede haber metido
+      // horas antes — si el MB sube el mismo CSV, se descartan acá.
+      uploadRes.textContent = `🔍 Checking duplicates against system...`;
+      const { findKnownDomains } = await import("../modules/sellersJson.js");
+      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, unique);
+      const _fresh = unique.filter(d => !_known.has(d));
+      const _skippedKnown = unique.length - _fresh.length;
+      if (_fresh.length === 0) {
+        // Log attempt even with 0 inserted — so MB shows up as "tried but all duplicates"
+        logImportAttempt(state.accessToken, {
+          userEmail: state.loginEmail, source: "csv",
+          sourceDetail: file?.name || "", attempted: unique.length, deduped: unique.length, inserted: 0,
+        });
+        uploadRes.innerHTML = `<span style="color:#d97706">⚠️ ${unique.length} domains — ALL already known (queue/review/history/blocklist). Nothing new to queue.</span>`;
+        uploadRes.className = "push-result";
+        return;
+      }
 
-      const result = await uploadCsvDomains(unique, state.loginEmail, state.accessToken);
+      uploadRes.textContent = `Uploading ${_fresh.length} domains${_skippedKnown > 0 ? ` (${_skippedKnown} already in system, skipped)` : ""}...`;
+
+      const result = await uploadCsvDomains(_fresh, state.loginEmail, state.accessToken);
+      logImportAttempt(state.accessToken, {
+        userEmail: state.loginEmail, source: "csv",
+        sourceDetail: file?.name || "",
+        attempted: unique.length, deduped: _skippedKnown, inserted: result?.inserted || 0,
+      });
       { const r = formatUploadResult(result, unique.length); uploadRes.textContent = r.msg; uploadRes.className = "push-result ok"; uploadRes.style.color = r.color; }
       fileInput.value = "";
       await refreshAll();
@@ -6182,30 +6470,55 @@ async function initCsvQueue() {
     const resultEl = document.getElementById("refresh-from-monday-result");
     const geo      = document.getElementById("refresh-geo").value;
     const idioma   = document.getElementById("refresh-idioma").value;
-    // Cap fijo 75 por tirada (decisión user 2026-05-08). El input refresh-limit
-    // ahora es hidden con value="75" — ya no hay UI para cambiarlo.
-    const limit    = 75;
+    // Cap fijo 100 por tirada (user 2026-05-18, antes 75). El input refresh-limit
+    // está hidden con value="100" — ya no hay UI para cambiarlo. El shuffle
+    // Fisher-Yates del pool 1000 (modules/monday.js) garantiza variedad.
+    const limit    = 100;
 
     btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
     resultEl.textContent = ""; resultEl.className = "push-result";
 
     try {
+      const _filterDetail = [geo || "all", idioma || "all"].join("/");
       const domains = await fetchMondayForRefresh({ geo, idioma, limit });
       if (domains.length === 0) {
+        logImportAttempt(state.accessToken, {
+          userEmail: state.loginEmail, source: "monday",
+          sourceDetail: _filterDetail, attempted: 0, deduped: 0, inserted: 0,
+        });
         resultEl.textContent = "No Ciclo Finalizado domains match those filters.";
         resultEl.className = "push-result error";
         return;
       }
-      resultEl.textContent = `Found ${domains.length}, uploading to queue...`;
-      const up = await uploadCsvDomains(domains, state.loginEmail, state.accessToken, "monday");
-      { const r = formatUploadResult(up, domains.length); resultEl.textContent = r.msg; resultEl.style.color = r.color; }
+      // Dedup against full system (same as sellers.json)
+      resultEl.textContent = `🔍 Found ${domains.length}, checking duplicates...`;
+      const { findKnownDomains } = await import("../modules/sellersJson.js");
+      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains);
+      const _fresh = domains.filter(d => !_known.has(d));
+      const _skippedKnown = domains.length - _fresh.length;
+      if (_fresh.length === 0) {
+        logImportAttempt(state.accessToken, {
+          userEmail: state.loginEmail, source: "monday",
+          sourceDetail: _filterDetail, attempted: domains.length, deduped: domains.length, inserted: 0,
+        });
+        resultEl.textContent = `0 added — all ${domains.length} already known (queue/review/history/blocklist).`;
+        resultEl.className = "push-result";
+        return;
+      }
+      resultEl.textContent = `Uploading ${_fresh.length} fresh${_skippedKnown > 0 ? ` (${_skippedKnown} already in system)` : ""}...`;
+      const up = await uploadCsvDomains(_fresh, state.loginEmail, state.accessToken, "monday");
+      logImportAttempt(state.accessToken, {
+        userEmail: state.loginEmail, source: "monday",
+        sourceDetail: _filterDetail, attempted: domains.length, deduped: _skippedKnown, inserted: up?.inserted || 0,
+      });
+      { const r = formatUploadResult(up, _fresh.length); resultEl.textContent = r.msg; resultEl.style.color = r.color; }
       resultEl.className = "push-result ok";
       await refreshAll();
     } catch (err) {
       resultEl.textContent = `❌ ${err.message}`;
       resultEl.className = "push-result error";
     } finally {
-      btn.disabled = false; btn.textContent = "🔄 Fetch &amp; queue from Monday";
+      btn.disabled = false; btn.textContent = "🔄 Fetch & queue from Monday";
     }
   });
 
@@ -6246,7 +6559,7 @@ async function initCsvQueue() {
 // - csv_queue.waiting_pool: 300 (en hold hasta que pending baje)
 // - review_queue (Prospects): SIN CAP (más leads = más variedad para los MBs)
 // - Por tirada de import: 50
-const SELLERS_QUEUE_CAP_PER_RUN = 50;
+const SELLERS_QUEUE_CAP_PER_RUN = 100;
 const SELLERS_OPEN_TABS_CAP     = 30;
 const CSV_PENDING_CAP           = 200;
 const WAITLIST_CAP              = 300;
@@ -6350,19 +6663,25 @@ async function initSellersJsonImport(refreshAll) {
     fetchBtn.disabled = true;
     resEl.innerHTML = `⏳ Fetching ${company.url}...`;
     try {
+      const _sellerName = company.name || (company.url || "").split("/")[2] || "";
       const domains = await fetchSellersJson(company.url);
       if (domains.length === 0) {
+        logImportAttempt(state.accessToken, {
+          userEmail: state.loginEmail, source: "sellers_json",
+          sourceDetail: _sellerName, attempted: 0, deduped: 0, inserted: 0,
+        });
         resEl.innerHTML = `<span style="color:#d97706">⚠️ No se encontraron PUBLISHER en sellers.json.</span>`;
         return;
       }
-      // ── Dedup: filtrar dominios YA conocidos por el sistema ────
-      // Skip los que están en csv_queue / review_queue / historial / sendtrack /
-      // blocklist. Evita re-procesar leads que ya pasamos.
       resEl.innerHTML = `🔍 Found ${domains.length}. Chequeando duplicados contra sistema...`;
       const known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains);
       const fresh = domains.filter(d => !known.has(d));
       const knownCount = domains.length - fresh.length;
       if (fresh.length === 0) {
+        logImportAttempt(state.accessToken, {
+          userEmail: state.loginEmail, source: "sellers_json",
+          sourceDetail: _sellerName, attempted: domains.length, deduped: domains.length, inserted: 0,
+        });
         resEl.innerHTML = `<span style="color:#d97706">⚠️ ${domains.length} dominios — TODOS ya conocidos por el sistema (csv_queue/review_queue/historial/blocklist). Nada nuevo para encolar.</span>`;
         return;
       }
@@ -6372,7 +6691,11 @@ async function initSellersJsonImport(refreshAll) {
       const result = await uploadCsvDomains(slice, state.loginEmail, state.accessToken, "sellers_json");
       const ins = result?.inserted || 0;
       const dup = slice.length - ins;
-      // Mensaje unificado (helper formatUploadResult — mismo formato para CSV/Monday/Sellers)
+      logImportAttempt(state.accessToken, {
+        userEmail: state.loginEmail, source: "sellers_json",
+        sourceDetail: _sellerName,
+        attempted: domains.length, deduped: knownCount, inserted: ins,
+      });
       const r = formatUploadResult(result, slice.length);
       resEl.innerHTML = `<span style="color:${r.color}">${r.msg}</span>`;
       await refreshAll?.();
@@ -6850,7 +7173,7 @@ function initPitchDrafts() {
     const result = await savePitchDraft(state.accessToken, {
       id: editingId, user_email: state.loginEmail, name, language, subject, body, priority,
     });
-    saveBtn.disabled = false; saveBtn.textContent = "💾 Guardar";
+    saveBtn.disabled = false; saveBtn.textContent = "💾 Save";
 
     if (result.ok) {
       resultEl.textContent = editingId ? "✅ Actualizado" : "✅ Guardado";
@@ -7971,7 +8294,7 @@ function initProspectCard(card, data) {
         card.dataset._emailsFetched = "1";
         const enrichBtn = card.querySelector(".pcard-enrich-btn");
         if (enrichBtn) {
-          showToast("🔍 Buscando emails automáticamente…", "info", 3000);
+          showToast("🔍 Searching for emails automatically…", "info", 3000);
           enrichBtn.click();
         }
       }
@@ -8401,7 +8724,7 @@ function initProspectCard(card, data) {
 
   // Snooze 21d (solo para este MB, otros MBs siguen viendo el prospect)
   card.querySelector(".pcard-snooze-btn")?.addEventListener("click", async () => {
-    if (!confirm(`💤 Posponer ${data.domain} por 21 días?\n\nSolo lo vas a dejar de ver vos. Otros MBs lo siguen viendo en su lote.`)) return;
+    if (!confirm(`💤 Snooze ${data.domain} for 21 days?\n\nOnly you'll stop seeing it. Other MBs still see it in their batch.`)) return;
     card.style.opacity = "0.4";
     try {
       const until = new Date(Date.now() + 21 * 86400_000).toISOString();
@@ -8505,53 +8828,53 @@ async function validateProspect(card, data, doSendEmail) {
 
   // 1. GEO
   if (!geo) {
-    setResult("❌ GEO obligatorio. Completá el campo GEO antes de enviar.", false);
+    setResult("❌ GEO required. Fill the GEO field before sending.", false);
     card.querySelector(".pcard-geo")?.focus();
     return;
   }
   // 2. Tráfico (Páginas Vistas) > 0 — leído del input editable
   if (!trafficNum || trafficNum === 0) {
-    setResult("❌ Páginas Vistas obligatorio. Completá el campo Traffic (acepta 500K, 1.2M o número crudo).", false);
+    setResult("❌ Page Views required. Fill the Traffic field (accepts 500K, 1.2M or raw number).", false);
     card.querySelector(".pcard-traffic")?.focus();
     return;
   }
   // 3. Email válido (siempre obligatorio para push, aún si no se manda mail)
   if (!email) {
-    setResult("❌ Email obligatorio. Elegí uno arriba o escribilo manualmente.", false);
+    setResult("❌ Email required. Pick one above or type it manually.", false);
     card.querySelector(".pcard-email-monday")?.focus();
     return;
   }
   if (!isValidEmail(email)) {
-    setResult(`❌ Email inválido: ${email}`, false);
+    setResult(`❌ Invalid email: ${email}`, false);
     card.querySelector(".pcard-email-monday")?.focus();
     return;
   }
   // 4. Subject + Pitch (obligatorios para enviar mail)
   if (doSendEmail) {
     if (!subject) {
-      setResult("❌ Asunto obligatorio. Completalo antes de enviar.", false);
+      setResult("❌ Subject required. Fill it before sending.", false);
       card.querySelector(".pcard-subject")?.focus();
       return;
     }
     if (!pitch) {
-      setResult("❌ Cuerpo del email obligatorio.", false);
+      setResult("❌ Email body required.", false);
       card.querySelector(".pcard-pitch")?.focus();
       return;
     }
   }
   // 5. Owner / Status / Language deben estar seteados
-  if (!ejecutivo)        { setResult("❌ Owner obligatorio.", false);    return; }
-  if (!estado)           { setResult("❌ Status obligatorio.", false);   return; }
-  if (idioma === "" || idioma == null) { setResult("❌ Language obligatorio.", false); return; }
+  if (!ejecutivo)        { setResult("❌ Owner required.", false);    return; }
+  if (!estado)           { setResult("❌ Status required.", false);   return; }
+  if (idioma === "" || idioma == null) { setResult("❌ Language required.", false); return; }
   // 6. Date — debe ser DD/MM/YYYY parseable
   if (!dateStr) {
-    setResult("❌ Date obligatorio.", false);
+    setResult("❌ Date required.", false);
     card.querySelector(".pcard-date")?.focus();
     return;
   }
   const dateParts = dateStr.split("/");
   if (dateParts.length !== 3 || dateParts[2].length !== 4 || isNaN(parseInt(dateParts[0])) || isNaN(parseInt(dateParts[1]))) {
-    setResult("❌ Date inválido. Formato DD/MM/YYYY.", false);
+    setResult("❌ Invalid date. Format DD/MM/YYYY.", false);
     card.querySelector(".pcard-date")?.focus();
     return;
   }
@@ -8592,6 +8915,9 @@ async function validateProspect(card, data, doSendEmail) {
     } else {
       await pushToMonday(mondayPayload);
     }
+    // Bump counter para Activity admin panel. Antes solo se hacía desde Analysis,
+    // las cargas desde Prospects (validate + push/send) no se contaban.
+    incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
     // 2. Send email (if requested and email available)
     if (doSendEmail && email) {
@@ -8606,6 +8932,7 @@ async function validateProspect(card, data, doSendEmail) {
       const fullBody  = bodyWithClosing + (signature ? "\n\n" + signature : "");
       const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
       if (!result.ok) throw new Error(result.error || "Gmail error");
+      incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
     }
 
     // 3. Save to historial
@@ -8759,7 +9086,7 @@ async function initProspectsTab() {
     if (checked.length === 0) return;
     if (!confirm(`Reject ${checked.length} prospects? They will be marked as permanently blocked.`)) return;
     const ids = checked.map(c => parseInt(c.dataset.id, 10)).filter(Boolean);
-    showToast(`⏳ Rechazando ${ids.length} prospects...`, "info");
+    showToast(`⏳ Rejecting ${ids.length} prospects...`, "info");
     let ok = 0, fail = 0;
     for (const id of ids) {
       const card = document.querySelector(`.pcard[data-id="${id}"]`);
@@ -8770,7 +9097,7 @@ async function initProspectsTab() {
         ok++;
       } catch { fail++; }
     }
-    showToast(`✅ Rechazados ${ok}${fail > 0 ? ` (${fail} fallaron)` : ""}.`, fail > 0 ? "warn" : "info");
+    showToast(`✅ Rejected ${ok}${fail > 0 ? ` (${fail} failed)` : ""}.`, fail > 0 ? "warn" : "info");
     updateBulkBar();
     refreshProspectsStats();
   });

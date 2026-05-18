@@ -76,10 +76,14 @@ export async function supabaseSignIn(email, password) {
     });
     const data = await res.json();
     if (!res.ok) return { error: data?.error_description || data?.msg || "Credenciales incorrectas" };
+    // Devolvemos también el email REAL que Supabase autenticó. El caller debe
+    // verificar que matche con lo tipeado — si no, hubo un mix-up de sesión
+    // o de credenciales y NO debemos asumir la identidad tipeada.
     return {
       access_token:  data.access_token,
       refresh_token: data.refresh_token,
       expires_in:    data.expires_in,
+      authenticated_email: (data?.user?.email || "").toLowerCase(),
     };
   } catch (e) {
     return { error: "Error de conexión: " + e.message };
@@ -460,8 +464,12 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
   const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
   const userClause   = userFilter   ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
   try {
+    // Política user 2026-05-18: NO ordenar por score — el score no se usa para
+    // seleccionar URLs (solo rankEmail decide para emails). Cualquier lead con
+    // traffic ≥ 400K + status=pending es válido. Orden FIFO por created_at desc
+    // → primero los más frescos (mejor para que vean los recién agregados).
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}&order=score.desc,created_at.desc&limit=500&select=${cols}`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}&order=created_at.desc&limit=500&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -1010,6 +1018,33 @@ export async function saveApolloCache(domain, data, accessToken) {
   } catch {}
 }
 
+// Log de intento de import. Se llama desde popup tras cada acción de upload
+// (CSV / sellers.json / Monday refresh). Persiste incluso si attempted = 75 y
+// inserted = 0 (todos dedupados) — así se ve "Diego trabajó hoy" en el listado.
+// Fire-and-forget: nunca rompe el flow del caller.
+export async function logImportAttempt(accessToken, { userEmail, source, sourceDetail = "", attempted = 0, deduped = 0, inserted = 0 }) {
+  if (!accessToken || !userEmail) return;
+  try {
+    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_import_attempts`, {
+      method: "POST",
+      headers: {
+        "apikey": CONFIG.SUPABASE_ANON_KEY,
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({
+        user_email:      userEmail.toLowerCase(),
+        source,
+        source_detail:   sourceDetail || null,
+        attempted_count: attempted,
+        deduped_count:   deduped,
+        inserted_count:  inserted,
+      }),
+    });
+  } catch {}
+}
+
 export async function uploadCsvDomains(domains, userEmail, accessToken, source = "csv") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
@@ -1265,13 +1300,21 @@ export async function getCsvQueueEnabled(accessToken) {
 export async function setCsvQueueEnabled(enabled, accessToken, userEmail = "") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
+  // Antes esta función swallow-eaba todos los errores con console.warn. Si la
+  // PATCH fallaba (red, 4xx, RLS, etc.) el checkbox local quedaba ON pero la DB
+  // seguía en OFF → al siguiente poll (30s) el toggle se destildaba solo, sin
+  // explicación al user. Ahora devolvemos boolean para que el caller pueda
+  // revertir + mostrar error inmediatamente.
   try {
-    await fetch(`${url}/rest/v1/toolbar_config?key=eq.csv_queue_enabled`, {
+    const res = await fetch(`${url}/rest/v1/toolbar_config?key=eq.csv_queue_enabled`, {
       method: "PATCH",
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ value: enabled ? "true" : "false" }),
     });
-    // Mutex: registrar quién prendió + timestamp para que otros MBs vean el lock
+    if (!res.ok) {
+      console.warn(`setCsvQueueEnabled PATCH failed: HTTP ${res.status}`);
+      return false;
+    }
     if (enabled && userEmail) {
       const upsert = (k, v) => fetch(`${url}/rest/v1/toolbar_config`, {
         method: "POST",
@@ -1280,20 +1323,19 @@ export async function setCsvQueueEnabled(enabled, accessToken, userEmail = "") {
       });
       await upsert("csv_queue_session_user", userEmail);
       await upsert("csv_queue_session_start", new Date().toISOString());
-      // Force-restart del worker Railway. Setea timestamp; worker en su próximo
-      // loop lo lee y hace process.exit(0). Railway re-arranca container limpio.
-      // Garantiza que no quede en estado raro post-toggle.
+      // Force-restart del worker Railway: lee el timestamp y hace exit(0).
       await upsert("worker_force_restart_at", new Date().toISOString());
     } else if (!enabled) {
-      // Al apagar, limpiar el lock
       await fetch(`${url}/rest/v1/toolbar_config?key=eq.csv_queue_session_user`, {
         method: "PATCH",
         headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body: JSON.stringify({ value: "" }),
       });
     }
+    return true;
   } catch (e) {
     console.warn("setCsvQueueEnabled failed:", e.message);
+    return false;
   }
 }
 

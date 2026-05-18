@@ -124,17 +124,14 @@
   <!-- Tab: 🤖 Agent — autonomous MB only for admin -->
   <div id="admin-tab-agent" class="admin-tab-content">
     <div style="background:#1e293b;border:1px solid #fbbf24;border-radius:8px;padding:10px 12px;margin-bottom:12px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-        <div>
-          <div style="font-weight:700;color:#fbbf24;font-size:13px">🤖 AI Agent MB</div>
-          <div style="font-size:10px;color:#94a3b8;margin-top:2px">Auto-processes review_queue: Claude pitch → push Monday → send Gmail.</div>
-        </div>
-        <label class="toggle-switch" title="Activar / desactivar el agente">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <div style="font-weight:700;color:#fbbf24;font-size:13px">🤖 Agent</div>
+        <span id="agent-toggle-status" style="font-size:11px;color:#cbd5e1;flex:1;text-align:right"></span>
+        <label class="toggle-switch" title="Enable / disable the agent">
           <input id="agent-toggle" type="checkbox" />
           <span class="toggle-slider"></span>
         </label>
       </div>
-      <div id="agent-toggle-status" style="font-size:11px;color:#cbd5e1;line-height:1.6"></div>
     </div>
 
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
@@ -146,43 +143,38 @@
 
     <div class="admin-section-title">⚙️ Thresholds</div>
     <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:8px;padding:6px 8px;background:#0f172a;border-radius:4px;border-left:3px solid #6366f1">
+        🛰️ <strong>Schedule:</strong> Agent fires at fixed slots <strong>9 · 12 · 15 · 18 · 20 hs Madrid</strong> Mon-Fri, max 6 sends/slot = up to 30/day.
+        Hard gates: <strong>Adult / Streaming / Gambling / Mega-corps / Government</strong> always blocked.
+      </div>
       <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;font-size:11px;color:#cbd5e1">
         <label for="agent-cfg-traffic">Min traffic</label>
-        <select id="agent-cfg-traffic" class="form-select" style="font-size:11px;padding:3px 6px">
+        <select id="agent-cfg-traffic" class="form-select" style="font-size:11px;padding:3px 6px" title="Only domains with traffic above this value are eligible. The only quality gate that applies.">
           <option value="1">No filter</option>
-          <option value="400000">≥ 400K visits</option>
-          <option value="500000" selected>≥ 500K visits (default)</option>
+          <option value="400000" selected>≥ 400K visits (default)</option>
+          <option value="500000">≥ 500K visits</option>
           <option value="1000000">≥ 1M visits</option>
           <option value="2000000">≥ 2M visits</option>
           <option value="5000000">≥ 5M visits</option>
         </select>
 
-        <label for="agent-cfg-score">Min score</label>
-        <select id="agent-cfg-score" class="form-select" style="font-size:11px;padding:3px 6px">
-          <option value="0">No filter</option>
-          <option value="20">≥ 20 (low)</option>
-          <option value="40" selected>≥ 40 (medium)</option>
-          <option value="60">≥ 60 (high)</option>
-          <option value="80">≥ 80 (top)</option>
-        </select>
-
         <label for="agent-cfg-max">Max sends / day</label>
-        <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:3px 6px">
+        <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:3px 6px" title="Daily cap distributed across the 5 slots (~6 per slot at 30/day).">
           <option value="5">5/day (test)</option>
           <option value="10">10/day</option>
-          <option value="20" selected>20/day (default)</option>
-          <option value="30">30/day</option>
+          <option value="20">20/day</option>
+          <option value="30" selected>30/day (default · 6 per slot)</option>
           <option value="50">50/day</option>
         </select>
 
-        <label for="agent-cfg-active-start">Active hour START (Spain)</label>
-        <select id="agent-cfg-active-start" class="form-select" style="font-size:11px;padding:3px 6px"></select>
-
-        <label for="agent-cfg-active-end">Active hour END (Spain)</label>
-        <select id="agent-cfg-active-end" class="form-select" style="font-size:11px;padding:3px 6px"></select>
+        <!-- Hidden — score no se usa para filtrar URLs (decisión user 2026-05-18) -->
+        <input type="hidden" id="agent-cfg-score" value="0" />
+        <!-- Hidden — active hours = 9-23 Madrid fijo, los slots fijos viven dentro -->
+        <input type="hidden" id="agent-cfg-active-start" value="9" />
+        <input type="hidden" id="agent-cfg-active-end" value="23" />
       </div>
       <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
-        <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save thresholds</button>
+        <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save</button>
         <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px" title="Pause agent for 1 hour (manual kill switch)">⏸ Pause 1h</button>
         <button id="agent-unpause" class="btn btn-sm" style="background:#16a34a;color:#fff;font-size:11px;padding:3px 10px" title="Clear any pause (manual or kill-switch) and resume agent immediately">▶ Resume now</button>
       </div>
@@ -237,6 +229,14 @@
         <button id="agent-focus-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save focus</button>
       </div>
     </div>
+
+    <!-- Auto-feeder runs panel (2026-05-18) — visibility de los 5 crons/día -->
+    <div class="admin-section-title" style="display:flex;align-items:center;justify-content:space-between">
+      <span>🌱 Auto-feeder runs (last 20)</span>
+      <button id="btn-feeder-runs-refresh" class="btn btn-sm" style="background:#0ea5e9;color:#fff;border:none;border-radius:4px;padding:3px 10px;font-size:10px;cursor:pointer" title="Refresh">↻</button>
+    </div>
+    <div id="feeder-runs-summary" style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:8px;font-size:11px;color:#cbd5e1">Loading...</div>
+    <div id="feeder-runs-list" style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:10px;max-height:240px;overflow-y:auto;font-family:ui-monospace,monospace;margin-bottom:12px">Loading...</div>
 
     <div class="admin-section-title" style="display:flex;align-items:center;justify-content:space-between">
       <span>📋 Last 50 actions</span>
@@ -1016,7 +1016,7 @@
     </div>
     <div id="sellers-company-url" style="font-size:10px;color:var(--text-muted);margin-bottom:8px;word-break:break-all">—</div>
     <div style="display:flex;gap:6px;align-items:center">
-      <input id="sellers-cap-input" type="number" min="1" max="50" value="50" class="form-input" style="width:70px;font-size:11px" title="Per-batch cap: up to 50 for Queue, up to 30 for Open tabs. Auto-adjusts if higher." />
+      <input id="sellers-cap-input" type="number" min="1" max="100" value="100" class="form-input" style="width:70px;font-size:11px" title="Per-batch cap: up to 100 for Queue, up to 30 for Open tabs. Auto-adjusts if higher." />
       <button id="btn-sellers-fetch" class="btn btn-primary btn-sm" style="flex:1;font-size:11px" title="Queue in csv_queue for worker to process (auto)">📥 Queue</button>
       <button id="btn-sellers-open" class="btn btn-secondary btn-sm" style="flex:1;font-size:11px" title="Open each domain in a new tab — for manual prospecting from Analysis tab">🪟 Open tabs</button>
     </div>
@@ -1064,9 +1064,9 @@
       </select>
       <!-- Limit input REMOVIDO. Cap fijo 75 por tirada (decisión user 2026-05-08).
            El cap diario sigue en 300 (acumulado de varias tiradas). -->
-      <input id="refresh-limit" type="hidden" value="50" />
+      <input id="refresh-limit" type="hidden" value="100" />
     </div>
-    <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Each search brings up to <strong>50 domains</strong> (per-batch cap). Daily cap: 300/user. Waitlist global: 300.</div>
+    <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Each search brings up to <strong>100 domains</strong> (per-batch cap). Daily cap: 300/user. Waitlist global: 300.</div>
     <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday (max 50)</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
   </section>
@@ -1096,14 +1096,14 @@
       </label>
     </div>
 
-    <!-- HISTORIAL tabs: External CSV / Monday -->
+    <!-- ACTIVITY: resumen agrupado por MB + Agent (en vez de raw items) -->
     <div style="margin-top:10px">
-      <div style="display:flex;gap:8px;margin-bottom:8px;border-bottom:1px solid var(--border)">
-        <button id="tab-history-csv" class="history-tab-btn history-tab-active" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid var(--primary);cursor:pointer">External CSV</button>
-        <button id="tab-history-monday" class="history-tab-btn" style="font-size:11px;padding:4px 10px;border:none;background:transparent;border-bottom:2px solid transparent;cursor:pointer">Monday</button>
-        <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px;margin-left:auto">↻</button>
+      <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+        <strong style="font-size:11px;color:var(--text)">📊 <span id="history-title">Import Activity Today</span></strong>
+        <button id="btn-csv-history-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px;margin-left:auto" title="Refrescar">↻</button>
+        <button id="btn-csv-history-toggle-range" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px" title="Toggle range">View last 7 days</button>
       </div>
-      <div id="csv-history-list" style="font-size:10px; max-height:220px; overflow-y:auto">Loading...</div>
+      <div id="csv-history-list" style="font-size:11px; max-height:300px; overflow-y:auto">Loading...</div>
     </div>
 
     <div style="display:flex;gap:6px;margin-top:8px">
@@ -1215,7 +1215,7 @@
           <option value="it">🇮🇹 Italian</option>
           <option value="ar">🇸🇦 العربية</option>
         </select>
-        <select id="draft-priority" class="form-select" style="width:90px; font-size:12px" title="1 = se autocarga; 2-5 rotan con click en bandera">
+        <select id="draft-priority" class="form-select" style="width:90px; font-size:12px" title="1 = auto-loads; 2-5 rotate with flag click">
           <option value="1">⭐ 1</option>
           <option value="2">⭐ 2</option>
           <option value="3" selected>⭐ 3</option>

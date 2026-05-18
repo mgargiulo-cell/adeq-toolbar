@@ -255,6 +255,12 @@ export async function fetchMondayForRefresh({ geo = "", idioma = "", limit = 75 
   let cursor   = null;
   let allItems = [];
 
+  // Pool máximo a traer ANTES de mezclar. Si solo trajéramos `limit`, Monday
+  // siempre devuelve los más recientes → mismos 75 → "0 added — all known".
+  // Con 1000 de pool, hay mucha más probabilidad de pegar leads viejos no
+  // procesados al hacer el shuffle.
+  const POOL_MAX = Math.max(1000, limit * 10);
+
   try {
     do {
       const pageArgs = cursor
@@ -275,18 +281,27 @@ export async function fetchMondayForRefresh({ geo = "", idioma = "", limit = 75 
       allItems   = [...allItems, ...(page?.items || [])];
       cursor     = page?.cursor || null;
 
-      // Corte temprano si ya tenemos >= limit (no necesitamos más)
-      if (allItems.length >= limit * 2) break;
+      if (allItems.length >= POOL_MAX) break;
     } while (cursor);
 
-    return allItems
-      .map(it => cleanDomain(it.name))
-      .filter(Boolean)
-      .slice(0, limit);
+    // Limpia dominios + dedup en memoria
+    const pool = [...new Set(
+      allItems
+        .map(it => cleanDomain(it.name))
+        .filter(Boolean)
+    )];
+
+    // Shuffle (Fisher-Yates) → garantiza rotación entre leads viejos y nuevos.
+    // Antes la query siempre devolvía los más recientes primero y caía en el
+    // bucle "siempre los mismos 75 — todos ya conocidos".
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+
+    return pool.slice(0, limit);
   } catch (e) {
     console.error("[Refresh] fetchMondayForRefresh error:", e.message);
-    // Re-throw para que la UI muestre el error real (antes devolvía [] silencioso
-    // y user veía "no Ciclo Finalizado matches" sin saber que era Monday API key).
     throw new Error(`Monday API: ${e.message}`);
   }
 }

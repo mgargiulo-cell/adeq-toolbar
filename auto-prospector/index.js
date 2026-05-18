@@ -8,7 +8,7 @@
 // ============================================================
 
 import fetch from "node-fetch";
-import { pickRandomTemplate, fillTemplate, pickPitchSource } from "./templates.js";
+import { pickRandomTemplate, fillTemplate, pickPitchSource, getSenderName, getBakedTemplates } from "./templates.js";
 
 const SUPABASE_URL              = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY         = process.env.SUPABASE_ANON_KEY;
@@ -755,20 +755,28 @@ async function refreshOneEmptyLead(token, cfg) {
 // Cache 90d traffic + 7d Apollo → mayoría son hits gratis.
 const BACKFILL_BATCH = 5;
 // ════════════════════════════════════════════════════════════════
-// AUTO-FEEDER — nutre review_queue desde sellers.json cuando se vacía
+// AUTO-FEEDER v2 (2026-05-18) — Schedule fijo + 3 fuentes + RapidAPI gate
 // ────────────────────────────────────────────────────────────────
-// Política user 2026-05-13: "Nunca tiene que estar sin trabajar L-V".
-// Si review_queue está bajo umbral, el worker pickea una sellers.json
-// random de la lista oficial (mismo set que usa la toolbar UI), filtra
-// PUBLISHER seller_type, dedupe contra tablas existentes, e inserta N
-// dominios nuevos en toolbar_csv_queue con status='pending' source='auto_feeder'.
-// El CSV queue pipeline existente los enriquece y los empuja a
-// review_queue. El agent autopilot los pickea naturalmente.
+// Política user 2026-05-18:
+//   • 5 crons/día L-V Madrid: 9, 12, 15, 18, 20
+//   • Meta diaria: 150 efectivos sumados a review_queue
+//   • Fuentes mixed (1/3 cada una): sellers.json + Monday Ciclo Finalizado + Majestic
+//   • RapidAPI gate: skip si usedThisMonth ≥ 95% del limit (sin SimilarWeb no
+//     hay enriquecimiento útil)
+//   • Saturation: skip si review_queue ya ≥ 500 efectivos pending
+//   • Conversion-aware: estima conversion rate de últimos 10 runs
 // ════════════════════════════════════════════════════════════════
 
-const SELLERS_JSON_SOURCES = [
-  // Mismas URLs que modules/sellersJson.js DEFAULT_SELLERS_COMPANIES.
-  // Las grandes primero — más diversidad de leads.
+const FEEDER_SLOTS = [9, 12, 15, 18, 20];          // hora Madrid L-V
+const FEEDER_DAILY_TARGET = 150;                    // efectivos sumados a review_queue
+const FEEDER_PER_SLOT_TARGET = 30;                  // máx efectivos a meter en 1 slot
+const FEEDER_RQ_SATURATION = 500;                   // skip si review_queue ya ≥ esto
+const FEEDER_RAPIDAPI_THRESHOLD = 0.95;             // 95% del limit mensual → stop
+const FEEDER_MEASURE_DELAY_MIN = 30;                // medir efectivos N min después
+const FEEDER_DEFAULT_CONVERSION = 0.15;             // sin histórico, 15%
+const FEEDER_FALLBACK_GROSS_CAP = 800;              // techo dur por si conversion se desploma
+
+const FEEDER_SELLERS_SOURCES = [
   "https://improvedigital.com/sellers.json",
   "https://www.truvid.com/sellers.json",
   "https://www.themoneytizer.com/sellers.json",
@@ -789,14 +797,33 @@ const SELLERS_JSON_SOURCES = [
   "https://smartadserver.com/sellers.json",
   "https://www.seedtag.com/sellers.json",
   "https://verve.com/sellers.json",
+  // Agregadas user 2026-05-18 — native + popunder
+  "https://revcontent.com/sellers.json",
+  "https://mgid.com/sellers.json",
+  "https://propellerads.com/sellers.json",
+  "https://admaven.com/sellers.json",
+  // Europa — agregadas user 2026-05-18 (foco EU + LATAM)
+  "https://equativ.com/sellers.json",
+  "https://adagio.io/sellers.json",
+  "https://showheroes.com/sellers.json",
+  "https://adyoulike.com/sellers.json",
+  "https://smartclip.com/sellers.json",
+  "https://yieldbird.com/sellers.json",
+  "https://aniview.com/sellers.json",
+  "https://anyclip.com/sellers.json",
+  "https://vidazoo.com/sellers.json",
+  "https://openweb.com/sellers.json",
+  "https://mobfox.com/sellers.json",
+  "https://adtelligent.com/sellers.json",
+  "https://adkernel.com/sellers.json",
+  "https://aax.network/sellers.json",
+  "https://dailymotion.com/sellers.json",
 ];
 
-let _lastFeederRunAt = 0;
-const FEEDER_COOLDOWN_MS = 60 * 60 * 1000;       // 1h entre runs
-const FEEDER_INJECT_MAX  = 50;                    // máx N dominios nuevos por run
+let _feederLastSlot = "";  // "YYYY-MM-DD-HH:00" del último slot disparado
 
 function _normalizeFeederDomain(d) {
-  if (!d) return "";
+  if (!d || typeof d !== "string") return "";
   return d.toLowerCase()
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
@@ -827,82 +854,497 @@ async function _findKnownDomainsWorker(token, candidates) {
         );
         if (!res.ok) return;
         const rows = await res.json();
-        rows.forEach(r => { if (r[col]) known.add(r[col].toLowerCase()); });
+        rows.forEach(r => {
+          const v = r[col];
+          if (typeof v === "string" && v) known.add(v.toLowerCase());
+        });
       } catch {}
     }));
   }
   return known;
 }
 
-async function runAutoFeeder(token) {
-  // Cooldown: no más de 1 vez por hora aunque el caller insista
-  if (Date.now() - _lastFeederRunAt < FEEDER_COOLDOWN_MS) return 0;
-  _lastFeederRunAt = Date.now();
+function _madridNowParts() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    weekday: "short", hour: "2-digit", hour12: false,
+  });
+  const parts = fmt.formatToParts(new Date()).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+  return {
+    hour: parseInt(parts.hour, 10),
+    weekday: parts.weekday,
+    dateISO: `${parts.year}-${parts.month}-${parts.day}`,
+  };
+}
 
+function _currentFeederSlot() {
+  const { hour, weekday, dateISO } = _madridNowParts();
+  if (weekday === "Sat" || weekday === "Sun") return null;
+  if (!FEEDER_SLOTS.includes(hour)) return null;
+  return { slot: hour, slotLabel: `${dateISO}-${String(hour).padStart(2, "0")}:00` };
+}
+
+async function _getFeederTodayRuns(token, dateISO) {
   try {
-    // 1. Pickear sellers.json random (round-robin por timestamp para diversidad)
-    const idx = Math.floor((Date.now() / FEEDER_COOLDOWN_MS) % SELLERS_JSON_SOURCES.length);
-    const sourceUrl = SELLERS_JSON_SOURCES[idx];
-    log(`🌱 auto-feeder: fetching ${sourceUrl}`);
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?cron_at=gte.${dateISO}T00:00:00&select=*&order=cron_at.asc`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return [];
+    return await res.json();
+  } catch { return []; }
+}
 
-    // 2. Fetch + parse
-    const res = await fetch(sourceUrl, { signal: AbortSignal.timeout(30000) });
-    if (!res.ok) { log(`⚠️ auto-feeder HTTP ${res.status} en ${sourceUrl}`); return 0; }
-    const data = await res.json().catch(() => null);
-    if (!data || !Array.isArray(data.sellers)) { log(`⚠️ auto-feeder: invalid JSON`); return 0; }
+async function _getReviewQueueValidCount(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("content-range") || "";
+    return parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch { return 0; }
+}
 
-    // 3. Filtrar PUBLISHER + normalizar + dedupe
-    const candidates = [...new Set(
-      data.sellers
-        .filter(s => (s.seller_type || "").toUpperCase() === "PUBLISHER")
-        .map(s => _normalizeFeederDomain(s.domain || ""))
-        .filter(Boolean)
-    )];
-    if (candidates.length === 0) { log(`⚠️ auto-feeder: sin PUBLISHERs en ${sourceUrl}`); return 0; }
+async function _getRecentConversionRate(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&effective_added=not.is.null&order=cron_at.desc&limit=10&select=conversion_pct`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const vals = rows.map(r => parseFloat(r.conversion_pct)).filter(v => v > 0);
+    if (vals.length === 0) return null;
+    return (vals.reduce((a, b) => a + b, 0) / vals.length) / 100;
+  } catch { return null; }
+}
 
-    // 4. Filtrar los ya conocidos (csv_queue, review_queue, historial, sendtrack, blocklist)
-    const known = await _findKnownDomainsWorker(token, candidates);
-    const fresh = candidates.filter(d => !known.has(d));
-    log(`🌱 auto-feeder: ${candidates.length} PUBLISHERs, ${known.size} ya conocidos, ${fresh.length} nuevos`);
-    if (fresh.length === 0) return 0;
-
-    // 5. Limitar inyección — respetar CSV_QUEUE_HARD_CAP (200). El exceso va a waiting_pool.
-    const pendingNow = await getCsvQueuePendingCountServer(token).catch(() => 0);
-    const slotsLeft = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
-    const toInject = fresh.slice(0, FEEDER_INJECT_MAX);
-
-    // 6. INSERT en toolbar_csv_queue con source='auto_feeder'
-    //    Primeros slotsLeft van a pending, resto a waiting_pool (worker los promueve cuando baje pending).
-    let _consumed = 0;
-    const payload = toInject.map(domain => {
-      const goesPending = _consumed < slotsLeft;
-      _consumed++;
-      return {
-      domain,
-      status:      goesPending ? "pending" : "waiting_pool",
-      source:      "auto_feeder",
-      uploaded_by: "worker@autofeeder",
-      uploaded_at: new Date().toISOString(),
-      };
-    });
-    const insRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+async function _insertFeederRun(token, slotLabel, data) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs`, {
       method: "POST",
       headers: {
         "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json", "Prefer": "return=minimal,resolution=ignore-duplicates",
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({ slot_label: slotLabel, ...data }),
+    });
+  } catch (e) { log(`⚠️ feeder run log failed: ${e.message}`); }
+}
+
+async function _injectIntoCsvQueue(token, domains, sourceTag) {
+  if (!domains || domains.length === 0) return 0;
+  const pendingNow = await getCsvQueuePendingCountServer(token).catch(() => 0);
+  // Waiting count inline (no hay helper dedicado para waiting_pool)
+  let waitingNow = 0;
+  try {
+    const wr = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    waitingNow = parseInt((wr.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch {}
+  const slotsPending = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
+  const slotsWaiting = Math.max(0, 300 - waitingNow);
+  let _p = 0, _w = 0;
+  const payload = domains.map(domain => {
+    let status;
+    if (_p < slotsPending) { status = "pending"; _p++; }
+    else if (_w < slotsWaiting) { status = "waiting_pool"; _w++; }
+    else { status = "next_day"; }
+    return { domain, status, source: sourceTag, uploaded_by: "worker@autofeeder", uploaded_at: new Date().toISOString() };
+  });
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=ignore-duplicates,return=representation",
       },
       body: JSON.stringify(payload),
     });
-    if (!insRes.ok) {
-      log(`⚠️ auto-feeder INSERT failed: HTTP ${insRes.status}`);
-      return 0;
+    if (!res.ok) return 0;
+    const rows = await res.json().catch(() => []);
+    return Array.isArray(rows) ? rows.length : 0;
+  } catch { return 0; }
+}
+
+async function _getMondayApiKeyForFeeder(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(monday_api_key_default,${encodeURIComponent("monday_api_key_mgargiulo@adeqmedia.com")})&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    const map = {}; rows.forEach(r => { map[r.key] = r.value; });
+    return (map["monday_api_key_mgargiulo@adeqmedia.com"] || map["monday_api_key_default"] || "").trim() || null;
+  } catch { return null; }
+}
+
+// FUENTE 1: sellers.json (rotación, insiste hasta llegar al target)
+async function _feederPullSellers(token, targetCount, sessionKnown) {
+  let inserted = 0;
+  const sourcesToTry = [...FEEDER_SELLERS_SOURCES].sort(() => Math.random() - 0.5);
+  for (const url of sourcesToTry) {
+    if (inserted >= targetCount) break;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      if (!res.ok) continue;
+      const data = await res.json().catch(() => null);
+      if (!data || !Array.isArray(data.sellers)) continue;
+      const candidates = [...new Set(
+        data.sellers
+          .filter(s => (s.seller_type || "").toUpperCase() === "PUBLISHER")
+          .map(s => _normalizeFeederDomain(s.domain || ""))
+          .filter(Boolean)
+      )];
+      if (candidates.length === 0) continue;
+      const known = await _findKnownDomainsWorker(token, candidates);
+      const fresh = candidates.filter(d => !known.has(d) && !sessionKnown.has(d));
+      if (fresh.length === 0) continue;
+      const slice = fresh.slice(0, targetCount - inserted);
+      slice.forEach(d => sessionKnown.add(d));
+      const ok = await _injectIntoCsvQueue(token, slice, "auto_feeder_sellers");
+      inserted += ok;
+      log(`  🌱 sellers ${url.split("/")[2]}: ${candidates.length} pubs → ${fresh.length} frescos → ${ok} insertados`);
+    } catch (e) {
+      log(`  ⚠️ sellers ${url.split("/")[2]} error: ${e.message}`);
     }
-    log(`✅ auto-feeder inyectó ${toInject.length} dominios nuevos (source=auto_feeder) desde ${sourceUrl.split("/")[2]}`);
-    return toInject.length;
+  }
+  return inserted;
+}
+
+// FUENTE 2: Monday Ciclo Finalizado (pool 1000 + shuffle)
+async function _feederPullMonday(token, targetCount, sessionKnown) {
+  try {
+    const mondayApiKey = await _getMondayApiKeyForFeeder(token);
+    if (!mondayApiKey) { log(`  ⚠️ monday: no api key`); return 0; }
+    const POOL_SIZE = 1000;
+    let cursor = null;
+    let items = [];
+    do {
+      const pageArgs = cursor
+        ? `cursor: "${cursor}", limit: 500`
+        : `limit: 500, query_params: { rules: [{ column_id: "deal_stage", compare_value: [5], operator: any_of }] }`;
+      const query = `{ boards(ids: [1420268379]) { items_page(${pageArgs}) { cursor items { name } } } }`;
+      const res = await fetch("https://api.monday.com/v2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": mondayApiKey, "API-Version": "2024-01" },
+        body: JSON.stringify({ query }),
+      });
+      const data = await res.json().catch(() => null);
+      const page = data?.data?.boards?.[0]?.items_page;
+      items = [...items, ...(page?.items || [])];
+      cursor = page?.cursor || null;
+      if (items.length >= POOL_SIZE) break;
+    } while (cursor);
+    if (items.length === 0) return 0;
+    const pool = [...new Set(items.map(it => _normalizeFeederDomain(it.name || "")).filter(Boolean))];
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    const known = await _findKnownDomainsWorker(token, pool);
+    const fresh = pool.filter(d => !known.has(d) && !sessionKnown.has(d));
+    if (fresh.length === 0) return 0;
+    const slice = fresh.slice(0, targetCount);
+    slice.forEach(d => sessionKnown.add(d));
+    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday");
+    log(`  🌱 monday: pool=${pool.length}, frescos=${fresh.length} → insertados=${inserted}`);
+    return inserted;
   } catch (e) {
-    log(`⚠️ runAutoFeeder error: ${e.message}`);
+    log(`  ⚠️ monday feeder error: ${e.message}`);
     return 0;
   }
+}
+
+// FUENTE 3: Majestic Million (sample random top 1M)
+async function _feederPullMajestic(token, targetCount, sessionKnown) {
+  try {
+    const pool = await loadDomainPool();
+    if (!pool || pool.length === 0) return 0;
+    const sampleSize = Math.min(pool.length, targetCount * 5);
+    const sample = [];
+    const seen = new Set();
+    while (sample.length < sampleSize && seen.size < pool.length) {
+      const idx = Math.floor(Math.random() * pool.length);
+      const d = pool[idx];
+      if (!seen.has(d)) { seen.add(d); sample.push(d); }
+    }
+    const known = await _findKnownDomainsWorker(token, sample);
+    const fresh = sample.filter(d => !known.has(d) && !sessionKnown.has(d));
+    if (fresh.length === 0) return 0;
+    const slice = fresh.slice(0, targetCount);
+    slice.forEach(d => sessionKnown.add(d));
+    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_majestic");
+    log(`  🌱 majestic: sample=${sample.length}, frescos=${fresh.length} → insertados=${inserted}`);
+    return inserted;
+  } catch (e) {
+    log(`  ⚠️ majestic feeder error: ${e.message}`);
+    return 0;
+  }
+}
+
+// ORQUESTADOR: chequea si estamos en slot y si no disparó, dispara
+async function maybeRunFeederSlot(token) {
+  const slotInfo = _currentFeederSlot();
+  if (!slotInfo) return;
+  const { slotLabel } = slotInfo;
+  if (_feederLastSlot === slotLabel) return;
+  // DB recuerda (survives worker restart)
+  try {
+    const existing = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?slot_label=eq.${encodeURIComponent(slotLabel)}&select=id&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (existing.ok) {
+      const rows = await existing.json();
+      if (Array.isArray(rows) && rows.length > 0) {
+        _feederLastSlot = slotLabel;
+        return;
+      }
+    }
+  } catch {}
+  _feederLastSlot = slotLabel;
+  await _runFeederSlot(token, slotLabel);
+}
+
+async function _runFeederSlot(token, slotLabel) {
+  log(`🌱 FEEDER cron ${slotLabel} fired`);
+
+  // 1. Daily target check
+  const today = _madridNowParts().dateISO;
+  const todayRuns = await _getFeederTodayRuns(token, today);
+  const dailyEffective = todayRuns.reduce((sum, r) => sum + (parseInt(r.effective_added, 10) || 0), 0);
+  if (dailyEffective >= FEEDER_DAILY_TARGET) {
+    log(`🛑 cron ${slotLabel} SKIP: daily target met (${dailyEffective}/${FEEDER_DAILY_TARGET})`);
+    await _insertFeederRun(token, slotLabel, { status: "skipped_daily_target", notes: `daily=${dailyEffective}` });
+    return;
+  }
+
+  // 2. RapidAPI gate (la única protección real de costo)
+  const { usedThisMonth, limit: rapidLimit } = await getRapidApiUsageThisMonth(token);
+  if (usedThisMonth >= rapidLimit * FEEDER_RAPIDAPI_THRESHOLD) {
+    log(`🛑 cron ${slotLabel} SKIP: RapidAPI ${usedThisMonth}/${rapidLimit} (≥${FEEDER_RAPIDAPI_THRESHOLD * 100}%)`);
+    await _insertFeederRun(token, slotLabel, {
+      status: "skipped_rapidapi", rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
+      notes: "RapidAPI near monthly limit",
+    });
+    return;
+  }
+
+  // 3. Saturation check
+  const rqValid = await _getReviewQueueValidCount(token);
+  if (rqValid >= FEEDER_RQ_SATURATION) {
+    log(`🛑 cron ${slotLabel} SKIP: review_queue saturated (${rqValid}/${FEEDER_RQ_SATURATION})`);
+    await _insertFeederRun(token, slotLabel, {
+      status: "skipped_saturated", rq_valid_before: rqValid,
+      rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
+      notes: "review_queue full",
+    });
+    return;
+  }
+
+  // 4. Calcular target conversion-aware
+  const remaining = FEEDER_DAILY_TARGET - dailyEffective;
+  const targetEffective = Math.min(FEEDER_PER_SLOT_TARGET, remaining);
+  const conv = await _getRecentConversionRate(token) || FEEDER_DEFAULT_CONVERSION;
+  let targetGross = Math.ceil(targetEffective / conv);
+  if (targetGross > FEEDER_FALLBACK_GROSS_CAP) targetGross = FEEDER_FALLBACK_GROSS_CAP;
+  log(`📊 cron ${slotLabel}: target=${targetEffective} efectivos, conv=${(conv * 100).toFixed(1)}%, inyecta hasta ${targetGross} brutos`);
+
+  // 5. Pull from 3 fuentes (split 1/3)
+  const perSource = Math.ceil(targetGross / 3);
+  const sessionKnown = new Set();  // evita que 2 fuentes inserten el mismo dominio en este slot
+  const fromSellers  = await _feederPullSellers(token, perSource, sessionKnown);
+  const fromMonday   = await _feederPullMonday(token, perSource, sessionKnown);
+  const fromMajestic = await _feederPullMajestic(token, perSource, sessionKnown);
+  const grossTotal = fromSellers + fromMonday + fromMajestic;
+
+  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} = ${grossTotal} brutos`);
+
+  await _insertFeederRun(token, slotLabel, {
+    status: grossTotal > 0 ? "ok" : "incomplete",
+    gross_sellers: fromSellers, gross_monday: fromMonday, gross_majestic: fromMajestic,
+    rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
+    rq_valid_before: rqValid,
+  });
+}
+
+// MEASUREMENT: post-mortem para calcular effective_added después de 30 min.
+// Corre 1x por loop iteration. Busca runs OK del día con effective_added=null
+// y > 30 min de antigüedad, mide cuántos pasaron a review_queue, actualiza fila.
+async function _measureFeederRuns(token) {
+  try {
+    const today = _madridNowParts().dateISO;
+    const cutoffAgo = new Date(Date.now() - FEEDER_MEASURE_DELAY_MIN * 60_000).toISOString();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&effective_added=is.null&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,rq_valid_before&limit=5`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const pending = await res.json();
+    if (!Array.isArray(pending) || pending.length === 0) return;
+    for (const run of pending) {
+      const rqValidNow = await _getReviewQueueValidCount(token);
+      const delta = Math.max(0, rqValidNow - (parseInt(run.rq_valid_before, 10) || 0));
+      const eff = Math.min(delta, parseInt(run.gross_total, 10) || 0);
+      const conv = run.gross_total > 0 ? (eff / run.gross_total) * 100 : 0;
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?id=eq.${run.id}`, {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json", "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({ effective_added: eff, conversion_pct: conv.toFixed(2), rq_valid_after: rqValidNow }),
+      }).catch(() => {});
+      log(`📏 feeder run id=${run.id}: gross=${run.gross_total} → efectivos=${eff} (${conv.toFixed(1)}%)`);
+    }
+  } catch (e) { log(`⚠️ measure feeder runs: ${e.message}`); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// AUTOPILOT SLOT — descubrimiento Majestic 1 vez al día (20:00 Madrid L-V).
+// Política user 2026-05-18: además del auto-feeder (sellers.json + Monday +
+// Majestic vía feeder), correr el autopilot completo 1x/día por la tarde
+// para alimentar la cola con leads frescos para el día siguiente.
+// El propio worker auto-apaga después de 20min (SESSION_LIMIT_MS).
+// ════════════════════════════════════════════════════════════════
+const AUTOPILOT_DAILY_HOUR = 20;
+let _autopilotLastSlot = "";
+
+async function maybeStartAutopilotSlot(token) {
+  const { hour, weekday, dateISO } = _madridNowParts();
+  if (weekday === "Sat" || weekday === "Sun") return;
+  if (hour !== AUTOPILOT_DAILY_HOUR) return;
+  const slotLabel = `autopilot-${dateISO}-${String(AUTOPILOT_DAILY_HOUR).padStart(2, "0")}:00`;
+  if (_autopilotLastSlot === slotLabel) return;
+
+  // Race-condition guard: persistir en Supabase para sobrevivir restarts.
+  try {
+    const cfgRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.autopilot_last_slot&select=value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (cfgRes.ok) {
+      const rows = await cfgRes.json();
+      if (rows?.[0]?.value === slotLabel) {
+        _autopilotLastSlot = slotLabel;
+        return;
+      }
+    }
+  } catch {}
+  _autopilotLastSlot = slotLabel;
+  await setConfigValue(token, "autopilot_last_slot", slotLabel).catch(() => {});
+
+  try {
+    const cfg = await getConfig(token);
+    if (String(cfg.auto_prospecting_enabled || "").toLowerCase() === "true") {
+      log(`🛰️ autopilot ${slotLabel}: ya estaba prendido — skip auto-trigger`);
+      return;
+    }
+    await setConfigValue(token, "auto_prospecting_enabled", "true");
+    await setConfigValue(token, "auto_session_user", "worker@autopilot");
+    await setConfigValue(token, "auto_session_start", new Date().toISOString());
+    log(`🛰️ AUTOPILOT slot ${slotLabel} → ON (worker auto-apaga en ~20min)`);
+  } catch (e) { log(`⚠️ maybeStartAutopilotSlot: ${e.message}`); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// AGENT SLOTS — el Agent solo envía en los mismos 5 horarios del feeder.
+// 9/12/15/18/20 Madrid L-V × 6 leads/slot = 30 envíos/día max.
+// Política user 2026-05-18: pattern más sano para Gmail (menos burst) +
+// alineado con el feeder (cuando el cron mete leads, 30min después el
+// worker los procesa, y al próximo slot el Agent ya tiene material).
+// ════════════════════════════════════════════════════════════════
+const AGENT_SLOTS = [9, 12, 15, 18, 20];
+let _agentLastSlot = "";
+
+function _currentAgentSlot() {
+  const { hour, weekday, dateISO } = _madridNowParts();
+  if (weekday === "Sat" || weekday === "Sun") return null;
+  if (!AGENT_SLOTS.includes(hour)) return null;
+  return { slot: hour, slotLabel: `agent-${dateISO}-${String(hour).padStart(2, "0")}:00` };
+}
+
+async function maybeRunAgentSlot(token, allFlags) {
+  // En TEST_MODE bypaseamos slot (para pruebas inmediatas)
+  try {
+    const cfg = await getConfig(token);
+    if (String(cfg.agent_test_mode || "").toLowerCase() === "true") {
+      return await runAgentCycle(token, allFlags);
+    }
+  } catch {}
+  const slotInfo = _currentAgentSlot();
+  if (!slotInfo) return;
+  if (_agentLastSlot === slotInfo.slotLabel) return;
+
+  // Race-condition guard: persistir slot fired en Supabase para sobrevivir
+  // restarts de Railway. Sin esto, si el worker reinicia entre 9:00 y 9:30,
+  // _agentLastSlot se reseteaba en memoria y el slot disparaba 2 veces.
+  try {
+    const cfgRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_last_slot&select=value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (cfgRes.ok) {
+      const rows = await cfgRes.json();
+      const dbVal = rows?.[0]?.value || "";
+      if (dbVal === slotInfo.slotLabel) {
+        _agentLastSlot = dbVal;  // sync memoria con DB
+        return;
+      }
+    }
+  } catch {}
+
+  _agentLastSlot = slotInfo.slotLabel;
+  await setConfigValue(token, "agent_last_slot", slotInfo.slotLabel).catch(() => {});
+  log(`🤖 AGENT slot ${slotInfo.slotLabel} fired — up to 6 leads`);
+  return await runAgentCycle(token, allFlags);
+}
+
+// ════════════════════════════════════════════════════════════════
+// AUTO-PAUSE del Agent si 3 crons seguidos baja de cierto threshold.
+// Política user 2026-05-18: si los últimos 3 runs ok dejaron < 5 efectivos
+// cada uno (target por slot = 30), algo está mal — calidad de fuentes,
+// SimilarWeb degradado, Apollo caído, etc. Pausamos el Agent 2h y loggeamos
+// para que el admin chequee. El user puede reanudar manual con "Resume now".
+// ════════════════════════════════════════════════════════════════
+const AUTOPAUSE_MIN_EFFECTIVE = 5;     // por cron run
+const AUTOPAUSE_LOOKBACK_RUNS = 3;     // últimos N runs ok
+const AUTOPAUSE_DURATION_MIN  = 120;   // 2h pause si dispara
+
+async function _checkAutoPauseAgent(token) {
+  try {
+    // Solo si ya hay >= 3 runs ok medidos (con effective_added != null)
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&effective_added=not.is.null&order=cron_at.desc&limit=${AUTOPAUSE_LOOKBACK_RUNS}&select=id,effective_added,slot_label`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const runs = await res.json();
+    if (!Array.isArray(runs) || runs.length < AUTOPAUSE_LOOKBACK_RUNS) return;
+    // Todos los últimos N runs deben tener effective_added < threshold
+    const allBelow = runs.every(r => (parseInt(r.effective_added, 10) || 0) < AUTOPAUSE_MIN_EFFECTIVE);
+    if (!allBelow) return;
+
+    // Chequear si ya pausamos por esto recientemente (no spammear)
+    const cfg = await getConfig(token);
+    const pausedUntil = cfg.agent_paused_until ? new Date(cfg.agent_paused_until).getTime() : 0;
+    if (pausedUntil > Date.now()) return; // ya está pausado, no re-pausar
+
+    // PAUSE
+    const newUntil = new Date(Date.now() + AUTOPAUSE_DURATION_MIN * 60_000).toISOString();
+    await setConfigValue(token, "agent_paused_until", newUntil);
+    await setConfigValue(token, "agent_paused_reason", `auto: ${AUTOPAUSE_LOOKBACK_RUNS} crons < ${AUTOPAUSE_MIN_EFFECTIVE} efectivos`);
+    const sample = runs.map(r => `${r.slot_label?.slice(11)||"?"}=${r.effective_added}`).join(", ");
+    log(`🛑 AGENT AUTO-PAUSE: últimos ${AUTOPAUSE_LOOKBACK_RUNS} crons bajo target (${sample}) → pause ${AUTOPAUSE_DURATION_MIN}min`);
+  } catch (e) { log(`⚠️ checkAutoPauseAgent: ${e.message}`); }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -2415,6 +2857,39 @@ const DOMAIN_LANG_CACHE_MAX = 1000;
 
 // Árbitro Claude Haiku — clasificación final cuando heurística es ambigua.
 // Cost: ~$0.0005 por call. Cached por dominio.
+// Guess de idioma por DOMINIO + GEO cuando no hay HTML disponible. Sólo se usa
+// en el path de fallback (fetchPageContent falló). Mucho menos confiable que
+// el arbiter normal porque no hay texto, pero supera al "default a EN" puro.
+async function _claudeLangByContext(token, domain, geo) {
+  if (!domain) return null;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "anthropic",
+        path: "/v1/messages",
+        method: "POST",
+        body: {
+          model: "claude-haiku-4-5",
+          max_tokens: 20,
+          system: "Guess the primary content language of a website given ONLY its domain and country code. Reply with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). If unsure, reply 'other'. No explanation.",
+          messages: [{ role: "user", content: `Domain: ${domain}\nCountry: ${geo || "unknown"}` }],
+        },
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = (data?.content?.[0]?.text || "").trim().toLowerCase();
+    const m = text.match(/^([a-z]{2})/);
+    return m && SUPPORTED_AGENT_LANGS.has(m[1]) ? m[1] : null;
+  } catch { return null; }
+}
+
 async function _claudeLangArbiter(token, domain, sample) {
   if (!sample || sample.length < 30) return null;
   try {
@@ -3520,7 +3995,7 @@ async function runSession(token, cfg, sessionStart) {
     const seedDomains = new Set();
     try {
       const rqSeedRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=domain&order=score.desc.nullslast&limit=10`,
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=domain&order=created_at.desc&limit=10`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       );
       const rqSeeds = await rqSeedRes.json();
@@ -4082,15 +4557,16 @@ async function runSession(token, cfg, sessionStart) {
 // ════════════════════════════════════════════════════════════════
 
 const AGENT_DEFAULTS = {
-  threshold_traffic:    500_000,
-  threshold_score:      40,
-  max_per_day:          20,
+  threshold_traffic:    400_000,   // único filtro de calidad real (decisión user 2026-05-18)
+  max_per_day:          30,        // 5 slots × 6 = 30/día
   active_hours_start:   9,         // 9am España (CET/CEST)
   active_hours_end:     23,        // 23hs España
   active_timezone:      "Europe/Madrid",
-  cycle_interval_sec:   300,       // 5 min entre ciclos
-  per_cycle_limit:      3,         // max 3 leads procesados por ciclo (rate limit Gmail-friendly)
+  per_cycle_limit:      6,         // max 6 leads por slot del cron 9/12/15/18/20 Madrid L-V
   monday_board_id:      1420268379,
+  // DEPRECATED (2026-05-18):
+  //   threshold_score: 40    → ya no se filtra por score. Sólo hard gates en scoreWebsite()
+  //   cycle_interval_sec     → ya no se polleaba en intervalo, son slots fijos
 };
 
 function _agentCfg(cfg) {
@@ -4119,7 +4595,6 @@ function _agentCfg(cfg) {
   } catch {}
   return {
     thresholdTraffic: get("threshold_traffic",    AGENT_DEFAULTS.threshold_traffic),
-    thresholdScore:   get("threshold_score",      AGENT_DEFAULTS.threshold_score),
     maxPerDay:        focus.dailyOverride || get("max_per_day", AGENT_DEFAULTS.max_per_day),
     activeStart:      get("active_hours_start",   AGENT_DEFAULTS.active_hours_start),
     activeEnd:        get("active_hours_end",     AGENT_DEFAULTS.active_hours_end),
@@ -4169,7 +4644,7 @@ async function pickDbDraft(token, userEmail, language) {
   let cached = _draftsCache.get(cacheKey);
   if (!cached || Date.now() - cached.ts > DRAFTS_CACHE_TTL) {
     // Fetch: drafts del user impersonado + defaults globales para ese lang
-    const url = `${SUPABASE_URL}/rest/v1/toolbar_pitch_drafts?language=eq.${encodeURIComponent(lang)}&or=(user_email.eq.${encodeURIComponent(userEmail)},is_default.eq.true)&select=name,subject,body,is_default,priority&order=priority.asc,is_default.desc`;
+    const url = `${SUPABASE_URL}/rest/v1/toolbar_pitch_drafts?language=eq.${encodeURIComponent(lang)}&or=(user_email.eq.${encodeURIComponent(userEmail)},is_default.eq.true)&select=id,name,subject,body,is_default,priority&order=priority.asc,is_default.desc`;
     const res = await fetch(url, {
       headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
     });
@@ -4188,6 +4663,146 @@ async function pickDbDraft(token, userEmail, language) {
   return {
     body: pick.body || "",
     subjects: pick.subject ? [pick.subject] : ["Pregunta sobre {{domain}}"],
+  };
+}
+
+// ════════════════════════════════════════════════════════════════
+// pickAnyTemplate — combina baked + DB drafts en un solo pool y elige
+// uno ponderado por open rate histórico.
+//
+// Política user 2026-05-18:
+//   • Combina templates baked (auto-prospector/templates.js, los 3 nuevos)
+//     con los drafts en toolbar_pitch_drafts (3 defaults + custom de cada MB).
+//   • Selección random ponderada por open_rate de los últimos 30 días.
+//     Smoothing Laplace: (opens+1)/(sends+2) — templates nuevos arrancan en 50%
+//     y van bajando/subiendo según resultados reales.
+//   • Devuelve { template, templateId } para que el caller loggee qué template usó.
+//
+// IDs:
+//   baked_<lang>_<idx>   → templates.js
+//   db_<id>              → toolbar_pitch_drafts
+// ════════════════════════════════════════════════════════════════
+
+// Cache de scores (open rates) — refresh cada 10 min. La query agrupa
+// agent_actions+email_opens y es relativamente cara, no la queremos hacer
+// en cada envío del Agent.
+const _templateScoresCache = { map: null, ts: 0 };
+const TEMPLATE_SCORES_TTL_MS = 10 * 60 * 1000;
+
+async function _getTemplateScores(token) {
+  if (_templateScoresCache.map && Date.now() - _templateScoresCache.ts < TEMPLATE_SCORES_TTL_MS) {
+    return _templateScoresCache.map;
+  }
+  const map = new Map(); // templateId → { sends, opens }
+  try {
+    const cutoff = new Date(Date.now() - 30 * 86400_000).toISOString();
+    // 1. Sends por template (últimos 30d)
+    const sentRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&template_id=not.is.null&created_at=gte.${cutoff}&select=id,template_id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (sentRes.ok) {
+      const rows = await sentRes.json();
+      const actionToTpl = new Map();
+      rows.forEach(r => {
+        const tid = r.template_id;
+        if (!tid) return;
+        actionToTpl.set(r.id, tid);
+        if (!map.has(tid)) map.set(tid, { sends: 0, opens: 0 });
+        map.get(tid).sends++;
+      });
+      // 2. Opens por action_id (cruzar con template_id)
+      const actionIds = [...actionToTpl.keys()];
+      if (actionIds.length > 0) {
+        const BATCH = 200;
+        for (let i = 0; i < actionIds.length; i += BATCH) {
+          const slice = actionIds.slice(i, i + BATCH);
+          const inList = slice.join(",");
+          const opRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_email_opens?agent_action_id=in.(${inList})&select=agent_action_id`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          );
+          if (opRes.ok) {
+            const opens = await opRes.json();
+            const seenAction = new Set();
+            opens.forEach(o => {
+              const aid = o.agent_action_id;
+              if (seenAction.has(aid)) return; // 1 open por action máx (anti-pixel-reload)
+              seenAction.add(aid);
+              const tid = actionToTpl.get(aid);
+              if (tid && map.has(tid)) map.get(tid).opens++;
+            });
+          }
+        }
+      }
+    }
+  } catch (e) { log(`⚠️ _getTemplateScores: ${e.message}`); }
+  _templateScoresCache.map = map;
+  _templateScoresCache.ts = Date.now();
+  return map;
+}
+
+async function pickAnyTemplate(token, userEmail, language) {
+  const lang = (language || "en").toLowerCase().slice(0, 2);
+
+  // 1. Recolectar pool combinado (baked + DB drafts)
+  const baked = getBakedTemplates(lang).map(t => ({
+    id: t.id,
+    body: t.body,
+    subjects: t.subjects,
+    source: "baked",
+  }));
+
+  // Reutilizamos el cache de pickDbDraft via fetch directo a la misma URL
+  // (queremos `id` para identificar cada draft DB).
+  const cacheKey = `${userEmail}|${lang}`;
+  let cached = _draftsCache.get(cacheKey);
+  if (!cached || Date.now() - cached.ts > DRAFTS_CACHE_TTL) {
+    try {
+      const url = `${SUPABASE_URL}/rest/v1/toolbar_pitch_drafts?language=eq.${encodeURIComponent(lang)}&or=(user_email.eq.${encodeURIComponent(userEmail)},is_default.eq.true)&select=id,name,subject,body,is_default,priority&order=priority.asc,is_default.desc`;
+      const res = await fetch(url, {
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      });
+      cached = { drafts: res.ok ? (await res.json()) : [], ts: Date.now() };
+      _draftsCache.set(cacheKey, cached);
+    } catch { cached = { drafts: [], ts: Date.now() }; }
+  }
+  const dbDrafts = (cached.drafts || []).map(d => ({
+    id: `db_${d.id}`,
+    body: d.body || "",
+    subjects: d.subject ? [d.subject] : ["Pregunta sobre {{domain}}"],
+    source: "db_draft",
+  }));
+
+  const pool = [...baked, ...dbDrafts];
+  if (pool.length === 0) return { template: null, templateId: null };
+
+  // 2. Scores (open rate Laplace-smoothed + warmup bonus para templates nuevos)
+  // El bonus de exploración hace que templates con <30 envíos reciban más turnos
+  // hasta acumular data confiable. Después de 30 envíos, la fórmula Laplace pura
+  // toma protagonismo y el peso converge al open rate real.
+  const scores = await _getTemplateScores(token).catch(() => new Map());
+  const WARMUP_SENDS = 30;
+  const weighted = pool.map(t => {
+    const s = scores.get(t.id) || { sends: 0, opens: 0 };
+    const smoothedRate = (s.opens + 1) / (s.sends + 2);
+    // Warmup: si tiene < 30 sends, bonus proporcional. Decae linealmente.
+    const warmupBonus = Math.max(0, (WARMUP_SENDS - s.sends) / WARMUP_SENDS) * 0.3;
+    return { ...t, weight: smoothedRate + warmupBonus };
+  });
+
+  // 3. Weighted random pick
+  const totalWeight = weighted.reduce((sum, t) => sum + t.weight, 0);
+  let r = Math.random() * totalWeight;
+  let picked = weighted[weighted.length - 1];
+  for (const t of weighted) {
+    r -= t.weight;
+    if (r <= 0) { picked = t; break; }
+  }
+
+  return {
+    template: { body: picked.body, subjects: picked.subjects },
+    templateId: picked.id,
   };
 }
 
@@ -4412,15 +5027,18 @@ async function runReengagementCycle(token) {
       }
       const { email: newEmail, lead } = next;
 
-      // Pickear template variante distinta (cache 5min)
+      // Pickear template del pool combinado (baked + DB drafts), ponderado
+      // por open rate. Misma lógica que el envío normal del Agent.
       let pitch = null;
       try {
-        const dbDraft = await pickDbDraft(token, userEmail, lead.language || "en");
-        if (dbDraft) {
-          pitch = fillTemplate(dbDraft, { domain, geo: "", traffic: 0 });
+        const senderName = getSenderName(userEmail);
+        const picked = await pickAnyTemplate(token, userEmail, lead.language || "en");
+        if (picked.template) {
+          pitch = fillTemplate(picked.template, { domain, geo: "", traffic: 0, senderName });
+          pitch._templateId = picked.templateId;
         } else {
           const tpl = pickRandomTemplate(lead.language || "en");
-          pitch = fillTemplate(tpl, { domain, geo: "", traffic: 0 });
+          pitch = fillTemplate(tpl, { domain, geo: "", traffic: 0, senderName });
         }
       } catch (e) {
         log(`  ⚠️ ${domain}: pitch error ${e.message} — skip`);
@@ -5141,20 +5759,30 @@ async function getAgentDailyCount(token, userEmail) {
     // Cuenta tanto 'sent' (confirmado) como 'reserved' (pre-send) — la reserva
     // protege contra crashes mid-send: si el worker reinicia entre reserve y
     // confirmación, el slot queda apartado y el next iter no over-sends.
+    // Timeout 5s: si Supabase está lento, no colgamos el worker entero por
+    // este conteo. El fail-open de abajo se encarga del retry next cycle.
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,reserved)&created_at=gte.${cutoffUtc}&select=id`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+      {
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
+        signal: AbortSignal.timeout(5000),
+      }
     );
     if (!res.ok) {
-      log(`⚠️ getAgentDailyCount HTTP ${res.status} — fail-closed (asume cap alcanzado)`);
-      return Infinity; // fail-closed: si no podemos contar, NO mandamos
+      // Fail-open: si no podemos contar, asumimos 0 y seguimos. El riesgo es
+      // sobre-enviar si la query falla repetidamente, pero el sendtrack 30d
+      // guard + reserved slots + per_cycle_limit limitan el daño (peor caso:
+      // 5-15 envíos extra durante una caída sostenida de Supabase). El costo
+      // del fail-closed previo era perder el día entero por un glitch.
+      log(`⚠️ getAgentDailyCount HTTP ${res.status} — fail-open (assume 0, retry next cycle)`);
+      return 0;
     }
     const range = res.headers.get("content-range") || "";
     const m = range.match(/\/(\d+)$/);
     return m ? parseInt(m[1]) : 0;
   } catch (e) {
-    log(`⚠️ getAgentDailyCount error: ${e.message} — fail-closed`);
-    return Infinity;
+    log(`⚠️ getAgentDailyCount error: ${e.message} — fail-open (assume 0)`);
+    return 0;
   }
 }
 
@@ -5892,17 +6520,40 @@ function scoreWebsite(lead) {
   const reasons = [];
   let score = 0;
 
-  // 1. GEO (máx 30, gate si Tier1/UK/RU)
-  const geoPts = scoreGeo(lead.geo);
-  if (geoPts < 0) return { score: -1, color: "red", reasons: [`geo_blocked:${lead.geo}`] };
-  score += geoPts;
-  reasons.push(`geo:${lead.geo || "?"}=${geoPts}`);
+  // ════════════════════════════════════════════════════════════
+  // HARD GATES (user 2026-05-18) — únicos motivos de rechazo:
+  //   1. Categorías peligrosas (adult / streaming pirata / gambling)
+  //   2. Mega-corps (google, amazon, facebook, etc. — no monetizables)
+  //   3. Government / educational (.gov, .edu, .mil, .gob, .ac)
+  // GEO y categoría-preferencia (News > Sports etc.) YA NO bloquean:
+  // si el lead tiene traffic ≥ 400K y no cae en estos gates, el Agent
+  // lo manda. El resto del score queda solo informativo (badges/stars UI).
+  // ════════════════════════════════════════════════════════════
+  const cat    = (lead.category || "").toLowerCase();
+  const domain = (lead.domain   || "").toLowerCase();
 
-  // 2. CATEGORÍA (gate duro adult/streaming)
-  const cat = (lead.category || "").toLowerCase();
   if (BLOCKED_CATEGORIES.has(cat)) {
     return { score: -1, color: "red", reasons: [`cat_blocked:${cat}`] };
   }
+  // Mega-corps — usa el mismo set de EXCLUDE_DOMAINS que el autopilot
+  if (EXCLUDE_DOMAINS.has(domain) || EXCLUDE_DOMAINS.has(domain.replace(/^www\./, ""))) {
+    return { score: -1, color: "red", reasons: [`mega_corp:${domain}`] };
+  }
+  // Government / educational / military / academic
+  if (/(^|\.)(gov|edu|mil|gob|ac)(\.|$)/i.test(domain)) {
+    return { score: -1, color: "red", reasons: [`gov_edu:${domain}`] };
+  }
+
+  // ── A partir de acá: SCORING INFORMATIVO ────────────────────
+  // Score se persiste para UI (stars, badges en Prospects tab) pero
+  // NO afecta la selección del Agent — el query ya no ordena por score
+  // y la única condición de envío es traffic >= 400K + no hard gate.
+
+  // GEO (informativo)
+  const geoPts = scoreGeo(lead.geo);
+  if (geoPts > 0) { score += geoPts; reasons.push(`geo:${lead.geo || "?"}=${geoPts}`); }
+
+  // Categoría (informativo)
   if (cat && cat !== "other") { score += 5; reasons.push(`cat:${cat}=+5`); }
 
   // 3. ENGAGEMENT — traffic ≥ 400K + datos completos
@@ -6099,16 +6750,22 @@ async function validateEmailsBatch(emails) {
     const lower = e.toLowerCase().trim();
     if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) continue;
     const local = lower.split("@")[0];
-    if (GARBAGE_LOCAL_CONTAINS.test(local)) continue; // domain.operations@x.com etc
+    if (GARBAGE_LOCAL_CONTAINS.test(local)) continue;
     const dom = lower.split("@")[1];
-    if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) continue; // Capa 3
-    const ok = await _hasMxRecords(dom);
-    if (ok) out.push(lower);
+    if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) continue;
+    const mx = await _hasMxRecords(dom);
+    // En el INSERT a review_queue toleramos unknown (null) — el dominio puede
+    // ser válido y el DNS estar con blip. La verificación dura ocurre en
+    // scoreEmail antes del send. Confirmed false (no MX) sí descarta acá.
+    if (mx !== false) out.push(lower);
   }
   return [...new Set(out)];
 }
 
 // MX records cache — LRU cap 500 dominios para evitar leak en worker 24/7.
+// Valores: true (has MX), false (confirmed no MX), null (unknown — DNS error).
+// Antes devolvía true en errores de red, lo que dejaba pasar dominios inexistentes
+// durante DNS blips → bounces seguros. Ahora devuelve null y el caller decide.
 const _mxCache = new Map();
 const MX_CACHE_MAX = 500;
 async function _hasMxRecords(domain) {
@@ -6118,19 +6775,22 @@ async function _hasMxRecords(domain) {
     const firstKey = _mxCache.keys().next().value;
     _mxCache.delete(firstKey);
   }
-  try {
-    const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`, {
-      headers: { "accept": "application/dns-json" },
-      signal: AbortSignal.timeout(4000),
-    });
-    // BUG FIX: si DNS falla (network blip), NO cachear. Devolvemos true (asumimos
-    // válido por el momento) pero permitimos retry próxima vez sin estar atascados.
-    if (!res.ok) return true;
-    const data = await res.json();
-    const has = Array.isArray(data?.Answer) && data.Answer.length > 0;
-    _mxCache.set(domain, has);
-    return has;
-  } catch { return true; } // network err — assume valid, no cache
+  // Retry una vez con timeout corto para tolerar blip transitorio.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`, {
+        headers: { "accept": "application/dns-json" },
+        signal: AbortSignal.timeout(attempt === 0 ? 3000 : 5000),
+      });
+      if (!res.ok) continue; // retry
+      const data = await res.json();
+      const has = Array.isArray(data?.Answer) && data.Answer.length > 0;
+      _mxCache.set(domain, has);
+      return has;
+    } catch { /* retry */ }
+  }
+  // Ambos intentos fallaron. NO cachear, devolver null = unknown.
+  return null;
 }
 
 async function scoreEmail(email) {
@@ -6149,25 +6809,44 @@ async function scoreEmail(email) {
   if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) {
     return { color: "red", reason: "garbage_domain_keywords" };
   }
-  // 1) MX records check (gratis vía Cloudflare DoH) — descarta dominios sin mail server
+  // 1) MX records — null=unknown, false=confirmado sin MX, true=tiene MX.
+  // Confirmado-sin-MX = red (dominio inexistente). Unknown = degrade a yellow
+  // (no asumimos green sin confirmación). Antes hi-confidence en blips DNS.
   const hasMX = await _hasMxRecords(dom);
-  if (!hasMX) return { color: "red", reason: "no_mx_records" };
-  // 2) SMTP verify via eva.pingutil (free, no auth) — best-effort
+  if (hasMX === false) return { color: "red", reason: "no_mx_records" };
+  const mxUnknown = hasMX === null;
+
+  // 2) SMTP verify via eva.pingutil (free, no auth)
+  let smtpVerified = false;
+  let catchAll = false;
   try {
     const res = await fetch(`https://api.eva.pingutil.com/email?email=${encodeURIComponent(lower)}`, {
       signal: AbortSignal.timeout(8000),
     });
     if (res.ok) {
       const data = await res.json();
-      const valid = data?.status === "success" && data?.data?.valid_syntax === true;
+      const valid       = data?.status === "success" && data?.data?.valid_syntax === true;
       const deliverable = data?.data?.deliverable === true;
       const isDisposable = data?.data?.disposable === true;
+      catchAll = data?.data?.catch_all === true || data?.data?.smtp_catch_all === true;
       if (isDisposable) return { color: "red", reason: "disposable" };
       if (!valid)        return { color: "red", reason: "invalid_syntax_smtp" };
       if (!deliverable)  return { color: "red", reason: "undeliverable_smtp" };
+      smtpVerified = true;
     }
-  } catch {} // si pingutil falla, seguimos con el check local
+  } catch {} // pingutil falló → smtpVerified queda false
+
+  // Catch-all domain: el servidor acepta cualquier email pero suele rebotar
+  // después al usuario real → high bounce risk. Degradamos a yellow.
+  if (catchAll) return { color: "yellow", reason: "catch_all_domain" };
+
+  // Generic role-based local-part (info@, contact@) → yellow.
   if (GENERIC_LOCAL.test(lower)) return { color: "yellow", reason: "generic_address" };
+
+  // Si MX o SMTP quedaron sin verificar duro, no promovemos a green.
+  if (mxUnknown && !smtpVerified) return { color: "yellow", reason: "mx_smtp_unverified" };
+  if (!smtpVerified)              return { color: "yellow", reason: "smtp_unverified" };
+
   return { color: "green", reason: "ok" };
 }
 
@@ -6314,6 +6993,11 @@ function _textToHtmlServer(text) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/\r\n/g, "\n")
+    // Anti-linkify: rompe la auto-detección de URLs en el cliente del
+    // destinatario. Reemplaza `.` con `&#46;` dentro de patrones de dominio
+    // (alfanuméricos-dot-alfanuméricos). Visual idéntico, sin <a> link.
+    // Pedido del user 2026-05-18: URLs como texto plano.
+    .replace(/\b([a-z0-9-]{2,}(?:\.[a-z0-9-]{2,})+)\b/gi, (m) => m.replace(/\./g, "&#46;"))
     .split("\n\n")
     .map(p => `<p>${p.replace(/\n/g, "<br/>")}</p>`)
     .join("\n");
@@ -6576,7 +7260,7 @@ async function runAgentCycle(token, allFlags) {
     // No filtramos por score porque la lógica del score puede cambiar y
     // no queremos perder leads buenos por una heurística inestable.
     const queueRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&order=score.desc.nullslast,created_at.desc&limit=${batchSize * 3}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&order=created_at.desc&limit=${batchSize * 5}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const candidatesRaw = await queueRes.json();
@@ -6624,12 +7308,11 @@ async function runAgentCycle(token, allFlags) {
       log(`🤖 Agent ${userEmail}: todos los candidatos descartados por gates`);
       continue;
     }
-    // Ordenar por score desc (mejor stars primero), luego created_at desc
-    scored.sort((a, b) => {
-      if (b._scoreData.score !== a._scoreData.score) return b._scoreData.score - a._scoreData.score;
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
-    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos válidos (top: ${scored[0].domain} ${scored[0]._scoreData.stars}★ score=${scored[0]._scoreData.score})`);
+    // Política user 2026-05-18: el score NO se usa para elegir URLs. Si pasó
+    // el gate duro (score >= 0 = no NSFW, no blocked geo) y tiene traffic
+    // ≥ threshold → es válida. Orden por created_at desc (más fresco primero).
+    scored.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos válidos (FIFO por created_at, top: ${scored[0].domain})`);
 
     // No filtramos por sendtrack acá — la regla real es:
     // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
@@ -6683,10 +7366,20 @@ async function runAgentCycle(token, allFlags) {
               body: JSON.stringify({ language: leadLanguage }),
             }).catch(() => {});
           } else {
-            // No pudimos fetchear página → fallback GEO/TLD
+            // No pudimos fetchear página → heurística GEO/TLD primero. Si la
+            // confidence es baja (caso típico: .com con GEO ambiguo), pedimos a
+            // Claude que adivine por domain+geo. Antes el fallback iba directo a
+            // "en" y quemábamos sitios LATAM/europeos. Costo: ~$0.0005/call.
             const det = await detectLanguageRobust({ geo: leadGeo, domain }, { allowClaudeArbiter: false });
             leadLanguage = det.lang;
-            log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence}, sin html)`);
+            if (token && (det.confidence === "low" || det.lang === "en") && !leadGeo) {
+              const guessed = await _claudeLangByContext(token, domain, leadGeo);
+              if (guessed && guessed !== leadLanguage) {
+                log(`  🌐 ${domain}: Claude override ${leadLanguage} → ${guessed} (sin html)`);
+                leadLanguage = guessed;
+              }
+            }
+            log(`  🌐 ${domain}: lang=${leadLanguage} (${det.source}/${det.confidence}, sin html)`);
           }
         }
         // Asegurar que llegue siempre algo soportado
@@ -6770,7 +7463,14 @@ async function runAgentCycle(token, allFlags) {
         // Threshold: solo score >= 0 (positivo); negativo = no mandar.
         const SOURCE_RANK = { apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
         const _sourcesMap = lead.email_sources || {};
-        const _rankedAll = emails.map(e => ({
+        // Filtra bounced ANTES de rankear: si el #1 ya rebotó, no perdemos el
+        // turno descubriéndolo en la validación final.
+        const _bouncedSet = _bouncedCache.set || new Set();
+        const _emailsClean = emails.filter(e => !_bouncedSet.has(e.toLowerCase()));
+        if (_emailsClean.length < emails.length) {
+          log(`  🚫 ${domain}: skip ${emails.length - _emailsClean.length} bounced de ${emails.length}`);
+        }
+        const _rankedAll = _emailsClean.map(e => ({
           email:  e,
           source: _sourcesMap[e.toLowerCase()] || "",
           score:  rankEmail(e, domain, lead.category),
@@ -6932,23 +7632,30 @@ async function runAgentCycle(token, allFlags) {
             continue;
           }
         } else {
-          // Template (80% de los casos) — sin costo Claude.
-          // Prioridad 1: drafts del user en Supabase (toolbar_pitch_drafts) para
-          // ese idioma. Prioridad 2: fallback a templates.js baked.
-          let dbDraft = null;
+          // Template (80% de los casos) — pool combinado baked + DB drafts.
+          // Selección ponderada por open_rate de los últimos 30 días
+          // (templates con más opens reciben más probabilidad).
+          const senderName = getSenderName(userEmail);
+          let templateId = null;
           try {
-            dbDraft = await pickDbDraft(token, userEmail, lead.language);
-          } catch (e) { log(`  ⚠️ pickDbDraft ${domain}: ${e.message}`); }
-          if (dbDraft) {
-            pitch = fillTemplate(dbDraft, {
-              domain, geo: leadGeo, traffic: leadTraffic,
-            });
-          } else {
+            const picked = await pickAnyTemplate(token, userEmail, lead.language);
+            if (picked.template) {
+              templateId = picked.templateId;
+              pitch = fillTemplate(picked.template, {
+                domain, geo: leadGeo, traffic: leadTraffic, senderName,
+              });
+            }
+          } catch (e) { log(`  ⚠️ pickAnyTemplate ${domain}: ${e.message}`); }
+          // Fallback duro si todo falla — no debería pasar pero por las dudas
+          if (!pitch) {
             const tpl = pickRandomTemplate(lead.language);
+            templateId = `baked_${(lead.language || "en").toLowerCase().slice(0,2)}_fallback`;
             pitch = fillTemplate(tpl, {
-              domain, geo: leadGeo, traffic: leadTraffic,
+              domain, geo: leadGeo, traffic: leadTraffic, senderName,
             });
           }
+          // Persistir templateId para que el send loggee qué se usó
+          pitch._templateId = templateId;
         }
 
         // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──
@@ -7080,14 +7787,19 @@ async function runAgentCycle(token, allFlags) {
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId });
 
         // PATCH reserved → sent ahora que confirmamos el envío
+        // Loggeamos también template_id (baked_<lang>_<idx> o db_<id>) para
+        // poder calcular open rates por template y ponderar futuros picks.
         if (reservedId) {
+          const _patchBody = pitch._templateId
+            ? { action: "sent", template_id: pitch._templateId }
+            : { action: "sent" };
           fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
             method: "PATCH",
             headers: {
               "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
               "Content-Type": "application/json", "Prefer": "return=minimal",
             },
-            body: JSON.stringify({ action: "sent" }),
+            body: JSON.stringify(_patchBody),
           }).catch(() => {});
         }
 
@@ -7161,8 +7873,10 @@ async function runAgentCycle(token, allFlags) {
 
         log(`🤖 Agent ${userEmail}: SENT to ${email} for ${domain} (subj: "${subject.substring(0,50)}")`);
         processed++;
-        // Delay entre envíos para no parecer bot
-        await sleep(15000 + Math.random() * 10000);
+        // Delay entre envíos para no parecer bot. Bajado de 15-25s → 10-15s
+        // para subir throughput diario sin disparar rate limits de Gmail
+        // (Gmail tolera ~1 envío/min/cuenta tranquilo).
+        await sleep(10000 + Math.random() * 5000);
 
       } catch (err) {
         // CRITICAL: si el send falló, el slot reservado pre-send queda contado
@@ -7346,14 +8060,18 @@ async function main() {
           if (iterCount === 1 || iterCount % 30 === 0) {
             log(`💤 Fin de semana en España (weekday=${_spainWeekday()}) — worker dormido hasta lunes`);
           }
-          await sleep(POLL_INTERVAL_MS);
+          // Sleep largo fuera de active hours — ahorro CPU/Railway. Antes era
+          // POLL_INTERVAL_MS (20s) que loopeaba sin trabajo. IDLE_INTERVAL_MS (120s)
+          // es suficiente para reaccionar a un toggle ON manual del admin.
+          await sleep(IDLE_INTERVAL_MS);
           continue;
         }
         if (_isOutsideActiveHours(ghStart, ghEnd)) {
           if (iterCount === 1 || iterCount % 30 === 0) {
             log(`💤 Fuera de horario España (h=${_spainHour()}, activo=${ghStart}-${ghEnd}) — worker pausado`);
           }
-          await sleep(POLL_INTERVAL_MS);
+          // Sleep largo fuera de active hours (ver comentario arriba).
+          await sleep(IDLE_INTERVAL_MS);
           continue;
         }
       }
@@ -7502,34 +8220,18 @@ async function main() {
         await backfillMissingFields(token, cfgRefresh);
       } catch (e) { log(`⚠️ refresh+backfill: ${e.message}`); }
 
-      // ── BANDA review_queue 120-300 (regla user 2026-05-13) ─────
-      // Mantener entre 120 (mínimo) y 300 (tope) leads válidos (traffic>=400K).
-      // Si baja de 120 → refill random pick entre: sellers.json | csv_promote (50/50).
-      // Si <80 → forzar sellers.json ignorando cooldown 1h (urgencia).
-      // Monday recyclables queda pendiente para v5.0.34 (requiere GraphQL pull).
+      // ── AUTO-FEEDER v2: schedule fijo 9/12/15/18/20 Madrid L-V ───
+      // Reemplaza el band-maintainer 120-300. Ahora target diario fijo
+      // (150 efectivos) repartido en 5 crons. Ver sección AUTO-FEEDER v2.
       try {
-        const rqRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=id`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
-        );
-        const rqRange = rqRes.headers.get("content-range") || "";
-        const rqValid = parseInt(rqRange.match(/\/(\d+)$/)?.[1] || "0", 10);
-
-        // Persistir métrica para UI admin
+        const rqValid = await _getReviewQueueValidCount(token);
         await setConfigValue(token, "review_queue_band_status",
-          JSON.stringify({ valid: rqValid, min: 120, max: 300, at: new Date().toISOString() })
+          JSON.stringify({ valid: rqValid, saturation: FEEDER_RQ_SATURATION, at: new Date().toISOString() })
         );
-
-        if (rqValid >= 300) {
-          if (iterCount % 12 === 0) log(`📊 review_queue=${rqValid} ≥ 300 → intake paused`);
-        } else if (rqValid < 120) {
-          // Refill: sellers.json random + (futuro v5.0.34) Monday recyclables.
-          // CSV waiting_pool→pending no es fuente autónoma (depende de uploads),
-          // pero igual se promueve en el loop main si hay items.
-          log(`📉 review_queue válidos=${rqValid} < 120 → refill via sellers_json`);
-          if (rqValid < 80) _lastFeederRunAt = 0;  // force, ignorar cooldown 1h
-          await runAutoFeeder(token).catch(e => log(`⚠️ feeder: ${e.message}`));
-        }
+        await maybeRunFeederSlot(token).catch(e => log(`⚠️ feeder slot: ${e.message}`));
+        await maybeStartAutopilotSlot(token).catch(e => log(`⚠️ autopilot slot: ${e.message}`));
+        await _measureFeederRuns(token).catch(e => log(`⚠️ feeder measure: ${e.message}`));
+        await _checkAutoPauseAgent(token).catch(e => log(`⚠️ autopause: ${e.message}`));
 
         // Boot-time guarantee: agent_enabled_users siempre con mgargiulo si vacío.
         // Reemplaza al self-activator viejo (sin chequear horario ni manual_off).
@@ -7611,7 +8313,7 @@ async function main() {
       }
       if (flags.agent) {
         parallelTasks.push(
-          runAgentCycle(token, flags).catch(e => log(`⚠️ runAgentCycle: ${e.message}`))
+          maybeRunAgentSlot(token, flags).catch(e => log(`⚠️ runAgentCycle: ${e.message}`))
         );
       }
       if (parallelTasks.length > 0) {

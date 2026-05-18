@@ -57,6 +57,27 @@ export const DEFAULT_SELLERS_COMPANIES = [
   { name: "Undertone (139 pubs)",         url: "https://undertone.com/sellers.json" },
   { name: "Yieldlab (70 pubs)",           url: "https://yieldlab.net/sellers.json" },
   { name: "Contextweb (26 pubs)",         url: "https://contextweb.com/sellers.json" },
+  // ── Native + popunder agregadas user 2026-05-18 ───────────────────────
+  { name: "Revcontent",                   url: "https://revcontent.com/sellers.json" },
+  { name: "MGID",                         url: "https://mgid.com/sellers.json" },
+  { name: "PropellerAds",                 url: "https://propellerads.com/sellers.json" },
+  { name: "AdMaven",                      url: "https://admaven.com/sellers.json" },
+  // ── Europa — agregadas user 2026-05-18 (foco EU + LATAM) ──────────────
+  { name: "Equativ (FR)",                 url: "https://equativ.com/sellers.json" },
+  { name: "Adagio (FR)",                  url: "https://adagio.io/sellers.json" },
+  { name: "ShowHeroes (DE)",              url: "https://showheroes.com/sellers.json" },
+  { name: "AdYouLike (FR)",               url: "https://adyoulike.com/sellers.json" },
+  { name: "Smartclip (DE)",               url: "https://smartclip.com/sellers.json" },
+  { name: "Yieldbird (PL)",               url: "https://yieldbird.com/sellers.json" },
+  { name: "Aniview (IL/EU)",              url: "https://aniview.com/sellers.json" },
+  { name: "AnyClip (IL/EU)",              url: "https://anyclip.com/sellers.json" },
+  { name: "Vidazoo (IL/EU)",              url: "https://vidazoo.com/sellers.json" },
+  { name: "OpenWeb (IL/EU)",              url: "https://openweb.com/sellers.json" },
+  { name: "Mobfox (DE)",                  url: "https://mobfox.com/sellers.json" },
+  { name: "Adtelligent (UA/EU)",          url: "https://adtelligent.com/sellers.json" },
+  { name: "Adkernel (UA/EU)",             url: "https://adkernel.com/sellers.json" },
+  { name: "AAX (Global)",                 url: "https://aax.network/sellers.json" },
+  { name: "Dailymotion (FR)",             url: "https://dailymotion.com/sellers.json" },
 ];
 
 // Check si los dominios ya fueron procesados antes (csv_queue + review_queue + historial).
@@ -85,7 +106,10 @@ export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candid
         );
         if (!res.ok) return;
         const rows = await res.json();
-        rows.forEach(r => { if (r[col]) known.add(r[col].toLowerCase()); });
+        rows.forEach(r => {
+          const v = r[col];
+          if (typeof v === "string" && v) known.add(v.toLowerCase());
+        });
       } catch {}
     }));
   }
@@ -131,7 +155,7 @@ export async function fetchSellersJson(url) {
 }
 
 function normalizeDomain(d) {
-  if (!d) return "";
+  if (!d || typeof d !== "string") return "";
   return d.toLowerCase()
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")

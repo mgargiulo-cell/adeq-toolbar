@@ -41,21 +41,23 @@ function _headers(token) {
 }
 
 // ── Locks ──────────────────────────────────────────────────
+// Atómico via RPC lock_prospect (advisory lock por dominio). Ver
+// sql/2026-05-18_atomic_prospect_lock.sql. El check-then-write previo
+// tenía una race window que dejaba que dos MBs se pisaran el lock.
 export async function lockProspect(token, domain, email) {
   if (!token || !domain || !email) return { ok: false };
-  const expiresAt = new Date(Date.now() + LOCK_DURATION_MIN * 60_000).toISOString();
   try {
-    // Si existe lock activo de OTRO usuario, no overwritear
-    const cur = await getActiveProspectLock(token, domain);
-    if (cur && cur.locked_by.toLowerCase() !== email.toLowerCase()) {
-      return { ok: false, owned_by: cur.locked_by, expires_at: cur.expires_at };
-    }
-    const res = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_prospect_locks`, {
+    const res = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/lock_prospect`, {
       method: "POST",
-      headers: { ..._headers(token), "Prefer": "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify({ domain, locked_by: email.toLowerCase(), locked_at: new Date().toISOString(), expires_at: expiresAt }),
+      headers: _headers(token),
+      body: JSON.stringify({ p_domain: domain, p_email: email, p_minutes: LOCK_DURATION_MIN }),
     });
-    return { ok: res.ok, expires_at: expiresAt };
+    if (!res.ok) return { ok: false };
+    const rows = await res.json();
+    const row = Array.isArray(rows) ? rows[0] : rows;
+    if (!row) return { ok: false };
+    if (row.ok) return { ok: true, expires_at: row.expires_at };
+    return { ok: false, owned_by: row.locked_by, expires_at: row.expires_at };
   } catch { return { ok: false }; }
 }
 
