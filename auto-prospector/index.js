@@ -1191,10 +1191,21 @@ async function _measureFeederRuns(token) {
     const pending = await res.json();
     if (!Array.isArray(pending) || pending.length === 0) return;
     for (const run of pending) {
-      const rqValidNow = await _getReviewQueueValidCount(token);
-      const delta = Math.max(0, rqValidNow - (parseInt(run.rq_valid_before, 10) || 0));
-      const eff = Math.min(delta, parseInt(run.gross_total, 10) || 0);
+      // FIX 2026-05-19: la medición anterior comparaba review_queue.count antes
+      // vs después de 30min, lo que daba delta=0 cuando el Agent gastaba leads
+      // en paralelo. Ahora contamos directamente cuántos rows de ESTE cron en
+      // toolbar_csv_queue terminaron status='done' (= pasaron todos los filtros
+      // y llegaron al pool). Eso es el "efectivo" real, independiente del consumo.
+      const cronStart = new Date(run.cron_at).toISOString();
+      const cronEnd = new Date(new Date(run.cron_at).getTime() + 15 * 60_000).toISOString();
+      const doneRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_by=eq.worker%40autofeeder&uploaded_at=gte.${cronStart}&uploaded_at=lt.${cronEnd}&select=id`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+      );
+      const rangeHdr = doneRes.headers.get("content-range") || "";
+      const eff = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
       const conv = run.gross_total > 0 ? (eff / run.gross_total) * 100 : 0;
+      const rqValidNow = await _getReviewQueueValidCount(token);
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?id=eq.${run.id}`, {
         method: "PATCH",
         headers: {
@@ -1203,7 +1214,7 @@ async function _measureFeederRuns(token) {
         },
         body: JSON.stringify({ effective_added: eff, conversion_pct: conv.toFixed(2), rq_valid_after: rqValidNow }),
       }).catch(() => {});
-      log(`📏 feeder run id=${run.id}: gross=${run.gross_total} → efectivos=${eff} (${conv.toFixed(1)}%)`);
+      log(`📏 feeder run id=${run.id}: gross=${run.gross_total} → efectivos=${eff} (${conv.toFixed(1)}%) [csv_queue done count]`);
     }
   } catch (e) { log(`⚠️ measure feeder runs: ${e.message}`); }
 }
