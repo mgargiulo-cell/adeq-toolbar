@@ -37,8 +37,12 @@ create table if not exists public.toolbar_notifications (
   dedup_key     text
 );
 
+-- created_at AT TIME ZONE 'UTC' es IMMUTABLE (TZ hardcoded); date(timestamptz)
+-- solo no porque depende del TZ de sesión.
 create unique index if not exists uq_notif_dedup
-  on public.toolbar_notifications (mb_email, type, dedup_key, (date(created_at)));
+  on public.toolbar_notifications (
+    mb_email, type, dedup_key, ((created_at AT TIME ZONE 'UTC')::date)
+  );
 
 create index if not exists idx_notif_mb_unread on public.toolbar_notifications(mb_email, read_at) where read_at is null;
 create index if not exists idx_notif_created on public.toolbar_notifications(created_at desc);
