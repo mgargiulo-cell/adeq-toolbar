@@ -1333,6 +1333,15 @@ async function _checkAutoPauseAgent(token) {
     const allBelow = runs.every(r => (parseInt(r.effective_added, 10) || 0) < AUTOPAUSE_MIN_EFFECTIVE);
     if (!allBelow) return;
 
+    // FIX 2026-05-19: si el pool de review_queue tiene leads válidos esperando,
+    // NO pausar — el Agent debe atacar el pool aunque el feeder esté flojo.
+    // Antes el auto-pause se disparaba aunque hubiera 200+ leads listos para envío.
+    const poolSize = await _getReviewQueueValidCount(token).catch(() => 0);
+    if (poolSize >= AUTOPAUSE_MIN_EFFECTIVE) {
+      log(`ℹ️ AUTO-PAUSE skip: feeder bajo pero pool tiene ${poolSize} leads válidos — Agent sigue corriendo`);
+      return;
+    }
+
     // Chequear si ya pausamos por esto recientemente (no spammear)
     const cfg = await getConfig(token);
     const pausedUntil = cfg.agent_paused_until ? new Date(cfg.agent_paused_until).getTime() : 0;
