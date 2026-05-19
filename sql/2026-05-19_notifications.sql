@@ -32,9 +32,13 @@ create table if not exists public.toolbar_notifications (
   created_at    timestamptz not null default now(),
   -- Dedup: para evitar 50 alertas del mismo tipo, un mismo (mb, type, dedup_key)
   -- dentro del mismo día reemplaza la anterior en vez de duplicar.
-  dedup_key     text,
-  constraint uq_notif_dedup unique (mb_email, type, dedup_key, (date(created_at)))
+  -- (uniqueness se garantiza via índice expression-based abajo — Postgres no
+  -- soporta expresiones en CONSTRAINT UNIQUE.)
+  dedup_key     text
 );
+
+create unique index if not exists uq_notif_dedup
+  on public.toolbar_notifications (mb_email, type, dedup_key, (date(created_at)));
 
 create index if not exists idx_notif_mb_unread on public.toolbar_notifications(mb_email, read_at) where read_at is null;
 create index if not exists idx_notif_created on public.toolbar_notifications(created_at desc);
