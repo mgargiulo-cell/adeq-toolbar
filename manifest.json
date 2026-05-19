@@ -2,9 +2,10 @@
   "manifest_version": 3,
   "name": "ADEQ Toolbar",
   "short_name": "ADEQ",
-  "version": "5.0.35",
+  "version": "5.0.36",
   "author": "ADEQ Media",
   "homepage_url": "https://adeqmedia.com",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6GGPDUsIT/kmfvW9lJpZHpgc2SvitT5i6cGjRiGxM3VaHK3c3/Wj8pnFOFMJ7Hc3pbvxmCZC54Ewi0NBQE9XVDR799UlK9Nu/3oC4z42j3sejixhZATNAy2bHf6E5Sz1MyHjAOBH+FGXG0P/gv6DmPOhUD5deW+VQ+6nkQ4z/xurK24j0XGmN0VSCqHMDGdKb2r0v4IUzI+eZV98XXOiIO5sLnhZoh4RiT4IP7axlTGv6HIwjSdv7nDtjn3lTkXGBnk/8GDyvDf8K/069lWyvP5+k1yCWp6XZia2WmqG0GLxAY8qdxvH5mWPmu6S+wG0zddTwY0V+nEFe4nmxy472wIDAQAB",
   "description": "Internal B2B prospecting tool for authorized ADEQ Media employees — analyze websites, qualify leads, and push to Monday.com.",
   "action": {
     "default_title": "ADEQ Toolbar",
