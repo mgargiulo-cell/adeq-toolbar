@@ -39,9 +39,11 @@ create table if not exists public.toolbar_notifications (
 
 -- created_at AT TIME ZONE 'UTC' es IMMUTABLE (TZ hardcoded); date(timestamptz)
 -- solo no porque depende del TZ de sesión.
+-- COALESCE(dedup_key,'') porque Postgres trata NULLs como distintos en
+-- unique indexes — sin coalesce, dos rows con dedup_key=NULL convivirían.
 create unique index if not exists uq_notif_dedup
   on public.toolbar_notifications (
-    mb_email, type, dedup_key, ((created_at AT TIME ZONE 'UTC')::date)
+    mb_email, type, COALESCE(dedup_key, ''), ((created_at AT TIME ZONE 'UTC')::date)
   );
 
 create index if not exists idx_notif_mb_unread on public.toolbar_notifications(mb_email, read_at) where read_at is null;

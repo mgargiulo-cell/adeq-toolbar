@@ -5676,6 +5676,10 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         source: (manualFutureEmail && e.toLowerCase() === manualFutureEmail) ? "manual" : (_sourcesMap[e.toLowerCase()] || ""),
         score: rankEmail(e, domain, lead.category || ""),
       }))
+      // FIX 2026-05-19: manual future_email del MB nunca se filtra por score.
+      // Es decisión explícita del MB — si rankEmail penaliza ("info@" etc), lo
+      // dejamos pasar igual con score forzado a 0 para que entre al sort.
+      .map(x => (x.source === "manual" && x.score < 0) ? { ...x, score: 0 } : x)
       .filter(x => x.score >= 0)
       .sort((a, b) => {
         const sa = SOURCE_RANK[a.source] || 0;
@@ -7785,6 +7789,7 @@ async function runAgentCycle(token, allFlags) {
           },
           body: JSON.stringify({
             user_email: userEmail, domain, action: "reserved",
+            email_to: email,                            // FIX 2026-05-19: necesario para aggregateSourcePerformance
             pitch_subject: subject,
             details: { email, source: pickedSource, traffic: leadTraffic, geo: leadGeo, language: lead.language },
           }),
@@ -8251,9 +8256,7 @@ function _lastBusinessDays(n) {
 // Scanner 1: low prospecting (L/J 18hs Madrid sobre últimos 5 días hábiles)
 async function scanLowProspecting(token) {
   const now = new Date();
-  const madridDow = parseInt(now.toLocaleString("en-US", { timeZone: "Europe/Madrid", weekday: "long" }).match(/(\d+)/)?.[1] || "0", 10);
   const madridHour = parseInt(now.toLocaleString("en-US", { timeZone: "Europe/Madrid", hour: "2-digit", hour12: false }).replace(/\D/g, "").slice(0, 2), 10);
-  // Real day-of-week (0=Sun..6=Sat) sin parsing engendro:
   const madridStr = now.toLocaleString("en-US", { timeZone: "Europe/Madrid", weekday: "short" });
   const isMonOrThu = madridStr.startsWith("Mon") || madridStr.startsWith("Thu");
   if (!isMonOrThu || madridHour < 18) return;
@@ -8412,7 +8415,13 @@ async function scanSourceInsight(token) {
 // Scanner 5: system_failure — agent failed actions concentrados.
 // Si un MB tiene > 3 failed actions en la última hora → alerta a él.
 // Si el global tiene > 10 failed en la última hora → alerta a admin.
+// FIX 2026-05-19: throttle in-memory para evitar correr 60+ veces/hora.
+// El dedup_key del insert ya evita duplicados a nivel DB, pero igual mandar
+// 60 requests con 409 conflict es ruido innecesario en logs Supabase.
+let _lastSysFailScanAt = 0;
 async function scanSystemFailures(token) {
+  if (Date.now() - _lastSysFailScanAt < 15 * 60 * 1000) return; // throttle 15min
+  _lastSysFailScanAt = Date.now();
   try {
     const cutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const res = await fetch(
@@ -8535,6 +8544,24 @@ async function main() {
     }
   } catch (e) {
     log(`⚠️ Schema check error: ${e.message}`);
+  }
+
+  // FIX 2026-05-19: check de las tablas nuevas (source_performance + notifications).
+  // Sin esto, si las migraciones no se aplicaron, los scanners explotan silenciosos.
+  try {
+    const [perfRes, notifRes] = await Promise.all([
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_source_performance?select=mb_email&limit=1`, {
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || _workerToken}` },
+      }),
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_notifications?select=id&limit=1`, {
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || _workerToken}` },
+      }),
+    ]);
+    if (!perfRes.ok) log(`🚨 SCHEMA CHECK: falta toolbar_source_performance → correr sql/2026-05-19_source_performance.sql`);
+    if (!notifRes.ok) log(`🚨 SCHEMA CHECK: falta toolbar_notifications → correr sql/2026-05-19_notifications.sql`);
+    if (perfRes.ok && notifRes.ok) log("✅ Schema check OK (source_performance + notifications presentes)");
+  } catch (e) {
+    log(`⚠️ Schema check (new tables) error: ${e.message}`);
   }
 
   let idleSince = Date.now();
