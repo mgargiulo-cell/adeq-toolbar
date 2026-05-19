@@ -150,9 +150,7 @@ export function validateEmailFormat(email) {
 }
 
 // ============================================================
-// 5. Decisor — Gemini (nombre) + Apollo oficial (email)
-// Paso 1: Gemini con Google Search → first_name, last_name, title
-// Paso 2: Apollo /mixed_people/search por dominio + títulos ejecutivos
+// 5. Decisor — Apollo oficial (nombre + email)
 // ============================================================
 
 // Valores que Apollo devuelve en email_status — incluimos likely_to_engage (mismatch anterior)
@@ -388,41 +386,7 @@ export async function findDecisionMakerViaApollo(domain) {
     } catch {}
   }
 
-  // ── Paso 1: Gemini con Google Search → nombre del decisor ────
-  let firstName = "", lastName = "", title = "", linkedin = "";
-
-  {
-    try {
-      const prompt = `Find the CEO, founder, or main decision maker of the website "${cleanDomain}".
-Return ONLY a JSON object with no extra text:
-{"first_name":"John","last_name":"Smith","title":"CEO","linkedin":"https://linkedin.com/in/..."}
-If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`;
-
-      const gRes = await callProxy("gemini", "/v1beta/models/gemini-2.5-flash:generateContent", {
-        method: "POST",
-        body: {
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          tools: [{ google_search: {} }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
-        },
-      });
-      if (gRes.ok) {
-        const gData = gRes.data || {};
-        const text  = gData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        const match = text.match(/\{[\s\S]*\}/);
-        if (match) {
-          const p = JSON.parse(match[0]);
-          if (p.first_name) {
-            firstName = p.first_name; lastName = p.last_name || "";
-            title     = p.title     || "";
-            linkedin  = p.linkedin  || "";
-          }
-        }
-      }
-    } catch {}
-  }
-
-  // ── Paso 2: Apollo mixed_people/search por dominio + títulos ──
+  // ── Apollo mixed_people/search por dominio + títulos ──
   const diag = await apolloDomainSearch(cleanDomain, null);
   // Clasificar válidos por bucket (core / fallback / drop) y ordenar:
   //   1) SIEMPRE primero los del bucket "core" (publicidad/marketing/online/dev)
@@ -450,10 +414,10 @@ If not found, return: {"first_name":"","last_name":"","title":"","linkedin":""}`
   }
 
   const result = {
-    name:     primary?.name     || (firstName ? `${firstName} ${lastName}`.trim() : ""),
+    name:     primary?.name     || "",
     email:    primary?.email    || null,
-    title:    primary?.title    || title,
-    linkedin: primary?.linkedin || linkedin,
+    title:    primary?.title    || "",
+    linkedin: primary?.linkedin || "",
     people:   diag.all,           // ALL people (locked + unlocked) for UI rendering
     note,
     diag,

@@ -24,7 +24,8 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          setDomainGeo, getDomainGeo }                                                          from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
-import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking } from "../modules/supabase.js";
+import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, isEmailBounced } from "../modules/supabase.js";
+import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
@@ -1546,7 +1547,10 @@ async function loadAdminActivity() {
   const queueUserClause  = userFilter ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
   const usageUserClause  = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
 
-  const [histRes, trackRes, usageRes, sessionsRes, queueRes, agentActions] = await Promise.all([
+  // toolbar_bounce_retries — 1 row por cada bounce detectado (con mb_email).
+  // La usamos para calcular % bounce por MB en el comparador.
+  const bounceUserClause = userFilter ? `&mb_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
+  const [histRes, trackRes, usageRes, sessionsRes, queueRes, agentActions, bounceRetries] = await Promise.all([
     // toolbar_historial — sites analizados manualmente desde toolbar.
     // Filtro por created_at (timestamp confiable) en vez de date (string DD/MM/YYYY).
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${from}&created_at=lte.${to}T23:59:59${histUserClause}&select=*&order=created_at.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
@@ -1574,6 +1578,7 @@ async function loadAdminActivity() {
     // toolbar_agent_actions — el agente cuenta como "MB" más en el comparador.
     // Filtramos action=sent (los exitosos) en el período.
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${from}&created_at=lte.${to}T23:59:59&select=domain,user_email,pitch_subject,details,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${from}&created_at=lte.${to}T23:59:59${bounceUserClause}&select=mb_email,domain,bounce_type,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
   ]);
 
 
@@ -1661,7 +1666,8 @@ async function loadAdminActivity() {
   renderAdminChart(combined, from, to);
 
   // Comparador de Media Buyers — at-a-glance side-by-side (agente incluído como columna extra)
-  renderAdminComparator(combined, usageRes, sessionsRes, agentActions);
+  renderAdminComparator(combined, usageRes, sessionsRes, agentActions, bounceRetries);
+  renderSourcePerformance().catch(() => {});
 
   // Resumen narrativo por MB (cards con tips para 1:1)
   renderAdminMBSummaries(combined, usageRes, sessionsRes, agentActions);
@@ -1751,10 +1757,18 @@ function _aggregateByUser(historial, usage, sessions) {
 
 // ── Comparador horizontal: tabla con métricas en filas, MBs en columnas ──
 // Pensado para "ver de un vistazo quién está produciendo y quién no".
-function renderAdminComparator(historial, usage, sessions, agentActions = []) {
+function renderAdminComparator(historial, usage, sessions, agentActions = [], bounceRetries = []) {
   const wrap = document.getElementById("admin-mb-comparator");
   if (!wrap) return;
   const byUser = _aggregateByUser(historial, usage, sessions);
+  // Bounces por MB — cada row en toolbar_bounce_retries = 1 bounce atribuido
+  // al MB que mandó el email original. % bounce = bounces / emails enviados.
+  const bouncesByUser = {};
+  (bounceRetries || []).forEach(r => {
+    const u = (r.mb_email || "").toLowerCase();
+    if (!u) return;
+    bouncesByUser[u] = (bouncesByUser[u] || 0) + 1;
+  });
   // Agregar AGENTE como un "MB" más — agrega métricas de agent_actions sent.
   const agentBucket = {
     sites: agentActions.length,
@@ -1776,8 +1790,8 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
   });
 
   // Columnas: 3 MBs + 1 columna Agent (si hay actividad o no, siempre se muestra)
-  const mbs = TEAM_EMAILS.map(e => e.toLowerCase()).map(u => ({ user: u, ...byUser.get(u) }));
-  mbs.push({ user: "agent", ...agentBucket });
+  const mbs = TEAM_EMAILS.map(e => e.toLowerCase()).map(u => ({ user: u, ...byUser.get(u), bounces: bouncesByUser[u] || 0 }));
+  mbs.push({ user: "agent", ...agentBucket, bounces: 0 });
 
   const shortName = (e) => ({
     "mgargiulo@adeqmedia.com": "Maxi",
@@ -1814,6 +1828,8 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
         { label: "Emails sent",        get: m => m.emails, fmt: v => v.toLocaleString() },
         { label: "Monday pushes",      get: m => m.monday, fmt: v => v.toLocaleString() },
         { label: "Conv. push/site",    get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
+        // % bounce — más bajo es mejor (color invertido vs. el resto)
+        { label: "% bounce",           get: m => m.emails > 0 ? Math.round((m.bounces / m.emails) * 100) : 0, fmt: (v, m) => m.emails > 0 ? `${v}% (${m.bounces})` : "—", color: v => v <= 3 ? "good" : v <= 8 ? "warn" : "bad", noBar: true },
       ],
     },
     {
@@ -1849,6 +1865,92 @@ function renderAdminComparator(historial, usage, sessions, agentActions = []) {
     });
   });
   wrap.innerHTML = html.join("");
+}
+
+// ── Source Performance — engagement rolling 30d por MB y source ──
+// Lee toolbar_source_performance (agregada por el worker 1×/día) y muestra
+// por MB qué source (apollo/informer/scrape/generic/manual) está produciendo
+// mejor open_rate y bounce_rate. Usado por el dynamic ranker en el worker
+// para auto-ajustar el pick de email source.
+async function renderSourcePerformance() {
+  let wrap = document.getElementById("admin-source-performance");
+  if (!wrap) {
+    // Auto-inyectar el contenedor justo después del comparator si no existe.
+    const cmpEl = document.getElementById("admin-mb-comparator");
+    if (!cmpEl) return;
+    wrap = document.createElement("div");
+    wrap.id = "admin-source-performance";
+    wrap.style.cssText = "margin-top:16px;padding:10px;background:#0f172a;border-radius:6px";
+    cmpEl.parentNode.insertBefore(wrap, cmpEl.nextSibling);
+  }
+  wrap.innerHTML = `<div style="color:#94a3b8;font-size:11px">Loading source performance…</div>`;
+  try {
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_source_performance?window_days=eq.30&select=mb_email,source,sent,opens,bounces,open_rate,bounce_rate,score,computed_at&order=mb_email.asc,score.desc`,
+      { headers }
+    );
+    if (!res.ok) {
+      wrap.innerHTML = `<div style="color:#f87171;font-size:11px">Source perf HTTP ${res.status} (¿la tabla aún no se creó? Corré sql/2026-05-19_source_performance.sql)</div>`;
+      return;
+    }
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      wrap.innerHTML = `<div style="color:#94a3b8;font-size:11px">Aún no hay datos de source performance. El job corre 1×/día — esperá hasta mañana o forzá con <code>maybeRunSourcePerformanceAggregate</code>.</div>`;
+      return;
+    }
+    // Group by mb_email
+    const byMb = {};
+    rows.forEach(r => {
+      const m = r.mb_email || "_global";
+      if (!byMb[m]) byMb[m] = [];
+      byMb[m].push(r);
+    });
+    const SOURCES = ["apollo", "informer", "scrape", "generic", "manual"];
+    const computedAt = rows[0]?.computed_at ? new Date(rows[0].computed_at).toLocaleString() : "—";
+    const cellFor = (r) => {
+      if (!r || !r.sent) return `<td style="color:#475569;text-align:center">—</td>`;
+      const op = (parseFloat(r.open_rate) * 100).toFixed(0);
+      const bo = (parseFloat(r.bounce_rate) * 100).toFixed(0);
+      const opColor = op >= 25 ? "#10b981" : op >= 10 ? "#f59e0b" : "#f87171";
+      const boColor = bo <= 3 ? "#10b981" : bo <= 8 ? "#f59e0b" : "#f87171";
+      const lowSample = r.sent < 50 ? " <span title='sample chico, ranker usa default' style='color:#f59e0b'>·</span>" : "";
+      return `<td style="text-align:center;padding:3px 6px;font-size:10px">
+        <div><span style="color:${opColor};font-weight:600">${op}%</span> open${lowSample}</div>
+        <div><span style="color:${boColor}">${bo}%</span> bounce</div>
+        <div style="color:#64748b;font-size:9px">n=${r.sent}</div>
+      </td>`;
+    };
+    let html = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <strong style="color:#e2e8f0;font-size:12px">🧠 Source Performance (rolling 30d)</strong>
+      <span style="color:#64748b;font-size:10px">computed: ${computedAt}</span>
+    </div>
+    <div style="color:#94a3b8;font-size:10px;margin-bottom:8px">
+      El agente usa estos rates para elegir qué source priorizar por MB.
+      <span style="color:#f59e0b">·</span> = sample &lt; 50 (ranker default).
+      ε-greedy 10% explora siempre.
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:11px">
+      <thead>
+        <tr style="color:#94a3b8">
+          <th style="text-align:left;padding:4px 6px">MB</th>
+          ${SOURCES.map(s => `<th style="text-align:center;padding:4px 6px;text-transform:capitalize">${s}</th>`).join("")}
+        </tr>
+      </thead>
+      <tbody>`;
+    const mbOrder = Object.keys(byMb).sort((a, b) => a === "_global" ? -1 : b === "_global" ? 1 : a.localeCompare(b));
+    mbOrder.forEach(mb => {
+      const shortName = mb === "_global" ? "🌐 Global" : mb.split("@")[0];
+      html += `<tr style="border-top:1px solid #1e293b">
+        <td style="padding:4px 6px;color:#e2e8f0;font-weight:600">${esc(shortName)}</td>
+        ${SOURCES.map(s => cellFor(byMb[mb].find(r => r.source === s))).join("")}
+      </tr>`;
+    });
+    html += `</tbody></table>`;
+    wrap.innerHTML = html;
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:#f87171;font-size:11px">Source perf error: ${esc(e.message)}</div>`;
+  }
 }
 
 // ── Resumen narrativo por MB ──────────────────────────────
@@ -4550,6 +4652,16 @@ async function bindButtons() {
     if (!isValidEmail(email)) {
       res.textContent = "❌ Enter a valid email first"; res.className = "push-result error"; return;
     }
+    // Guard anti-rebote: si el email ya está marcado como bounced en la DB
+    // global, NO se permite enviarle. Evita re-contactar direcciones muertas.
+    try {
+      const b = await isEmailBounced(state.accessToken, email);
+      if (b.bounced) {
+        res.textContent = `🚫 Cannot send: ${email} is in the bounced emails database (${b.reason || "bounced"}). Use a different address.`;
+        res.className   = "push-result error";
+        return;
+      }
+    } catch {}
     // Cap diario de emails enviados por usuario (admin lo configura)
     const can = await checkUserCanDo(state.accessToken, state.loginEmail, "send_email");
     if (!can.allowed) {
@@ -4598,6 +4710,10 @@ async function bindButtons() {
         email_to:      email,
         pitch_subject: subject,
         language:      lang,
+        // Attribution para toolbar_source_performance: si el email vino de los
+        // candidates detectados (apollo/informer/scrape/generic), pasamos ese
+        // source. Si el MB lo tipeó a mano, queda "manual" por default.
+        email_source:  (state.emailSources?.get(email) || "").toLowerCase() || "manual",
       });
       if (tr.ok && tr.id) {
         trackingActionId = tr.id;
@@ -4630,7 +4746,16 @@ async function bindButtons() {
       // ── Email Futuro — si el MB asignó un slot 2, encolar para +11d ────
       const futureEmail = document.getElementById("form-email-futuro")?.value?.trim();
       const futStatusEl = document.getElementById("email-futuro-status");
-      if (futureEmail && futureEmail !== email && futureEmail.includes("@")) {
+      // Guard: future_email no puede ser un email ya bounced en la DB global.
+      const bFut = (futureEmail && futureEmail.includes("@"))
+        ? await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }))
+        : { bounced: false };
+      if (bFut.bounced) {
+        if (futStatusEl) {
+          futStatusEl.textContent = `🚫 Not queued: ${futureEmail} is flagged as bounced (${bFut.reason || "bounced"}) in our database. Try a different address.`;
+          futStatusEl.style.color = "#dc2626";
+        }
+      } else if (futureEmail && futureEmail !== email && futureEmail.includes("@")) {
         const r = await queueReengagement(state.accessToken, {
           domain:             state.domain,
           monday_item_id:     state.mondayItemId,
@@ -4838,6 +4963,9 @@ async function bindButtons() {
   document.getElementById("btn-settings").addEventListener("click", openSettings);
   document.getElementById("btn-close-settings").addEventListener("click", closeSettings);
 
+  // Notification bell — toggle panel, render lista, marcar leída/dismiss.
+  initNotificationBell();
+
   // Gmail sign-in (trigger interactive OAuth) — rechaza si Chrome Gmail no coincide
   document.getElementById("btn-gmail-connect")?.addEventListener("click", async () => {
     const btn   = document.getElementById("btn-gmail-connect");
@@ -4967,6 +5095,102 @@ function detectPhraseLang(phrase) {
     return "es";
   }
   return "en";
+}
+
+// ── Notification bell ─────────────────────────────────────────
+// Toggle panel, lista, marcar leída/all-read. Auto-refresh badge cada 60s.
+let _notifPollTimer = null;
+
+function initNotificationBell() {
+  const btn  = document.getElementById("btn-notif-bell");
+  const panel = document.getElementById("notif-panel");
+  if (!btn || !panel) return;
+
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const visible = panel.style.display === "flex";
+    panel.style.display = visible ? "none" : "flex";
+    if (!visible) await renderNotificationPanel();
+  });
+
+  // Click fuera cierra
+  document.addEventListener("click", (e) => {
+    if (!panel.contains(e.target) && e.target.id !== "btn-notif-bell") {
+      panel.style.display = "none";
+    }
+  });
+
+  document.getElementById("btn-notif-mark-all")?.addEventListener("click", async () => {
+    if (!state.loginEmail) return;
+    await markAllNotificationsRead(state.accessToken, state.loginEmail);
+    await renderNotificationPanel();
+    await refreshNotificationBadge();
+  });
+
+  // Initial + polling
+  refreshNotificationBadge();
+  if (_notifPollTimer) clearInterval(_notifPollTimer);
+  _notifPollTimer = setInterval(refreshNotificationBadge, 60_000);
+}
+
+async function refreshNotificationBadge() {
+  const badge = document.getElementById("notif-bell-badge");
+  if (!badge || !state.loginEmail || !state.accessToken) return;
+  const notifs = await fetchNotifications(state.accessToken, state.loginEmail, { limit: 50 });
+  const unread = notifs.filter(n => !n.read_at).length;
+  if (unread > 0) {
+    badge.textContent = unread > 99 ? "99+" : String(unread);
+    badge.style.display = "block";
+  } else {
+    badge.style.display = "none";
+  }
+}
+
+async function renderNotificationPanel() {
+  const list = document.getElementById("notif-list");
+  if (!list || !state.loginEmail) return;
+  list.innerHTML = `<div style="padding:20px;text-align:center;color:#64748b;font-size:11px">Loading…</div>`;
+  const notifs = await fetchNotifications(state.accessToken, state.loginEmail, { limit: 30 });
+  if (notifs.length === 0) {
+    list.innerHTML = `<div style="padding:24px;text-align:center;color:#64748b;font-size:11px">No notifications yet.</div>`;
+    return;
+  }
+  const sevColor = { info: "#60a5fa", success: "#10b981", warning: "#f59e0b", error: "#ef4444" };
+  const sevIcon  = { info: "ℹ️", success: "✅", warning: "⚠️", error: "🚨" };
+  const fmtAgo = (iso) => {
+    const ms = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return "just now";
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
+  };
+  list.innerHTML = notifs.map(n => {
+    const isUnread = !n.read_at;
+    const color = sevColor[n.severity] || "#60a5fa";
+    const icon  = sevIcon[n.severity] || "ℹ️";
+    return `<div data-notif-id="${n.id}" style="padding:10px 12px;border-bottom:1px solid #1e293b;${isUnread ? "background:#1e293b" : ""};cursor:pointer" class="notif-item">
+      <div style="display:flex;align-items:flex-start;gap:8px">
+        <span style="font-size:14px;flex-shrink:0">${icon}</span>
+        <div style="flex:1;min-width:0">
+          <div style="color:${color};font-weight:600;font-size:12px;line-height:1.3">${esc(n.title)}</div>
+          ${n.body ? `<div style="color:#cbd5e1;font-size:11px;margin-top:2px;line-height:1.4">${esc(n.body)}</div>` : ""}
+          <div style="color:#64748b;font-size:10px;margin-top:4px">${fmtAgo(n.created_at)}${n.mb_email === "_admin" ? " · admin alert" : ""}</div>
+        </div>
+        ${isUnread ? `<div style="width:6px;height:6px;border-radius:50%;background:${color};flex-shrink:0;margin-top:4px" title="unread"></div>` : ""}
+      </div>
+    </div>`;
+  }).join("");
+  // Bind clicks
+  list.querySelectorAll(".notif-item").forEach(el => {
+    el.addEventListener("click", async () => {
+      const id = el.dataset.notifId;
+      await markNotificationRead(state.accessToken, id);
+      await renderNotificationPanel();
+      await refreshNotificationBadge();
+    });
+  });
 }
 
 async function openSettings() {

@@ -5513,7 +5513,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const rangeHdr = allAttemptsRes.headers.get("content-range") || "";
     const totalAttempts = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
     if (totalAttempts >= 2) {
-      log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d`);
+      log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d + clear Monday email`);
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
         method: "POST",
         headers: {
@@ -5526,6 +5526,19 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           source: "bounce_retry", uploaded_by: mbEmail, updated_at: new Date().toISOString(),
         }),
       }).catch(() => {});
+      // Clear Monday email column — el dominio queda en el board pero sin email
+      // para que el equipo lo vea como "sin contacto activo" y decida qué hacer.
+      try {
+        const cfgClr = await getConfig(token);
+        const mondayKey = (cfgClr[`monday_api_key_${mbEmail.toLowerCase()}`] || cfgClr.monday_api_key || "").trim();
+        if (mondayKey) {
+          const item = await findMondayItem(domain, mondayKey).catch(() => null);
+          if (item?.id) {
+            await updateMondayItem(item.id, { [MONDAY_COL_EMAIL]: { email: "", text: "" } }, mondayKey).catch(() => {});
+            log(`  🧹 ${domain}: Monday email column limpiada (item ${item.id})`);
+          }
+        }
+      } catch (e) { log(`  ⚠️ ${domain}: no se pudo limpiar Monday email: ${e.message}`); }
       return;
     }
 
@@ -5536,18 +5549,68 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     );
     if (!leadRes.ok) { log(`  ⚠️ ${domain}: query lead failed HTTP ${leadRes.status}`); return; }
     const leadRows = await leadRes.json();
-    if (!Array.isArray(leadRows) || leadRows.length === 0) {
-      log(`  ⏭️ ${domain}: lead no encontrado en review_queue — skip retry`);
+    let lead = (Array.isArray(leadRows) && leadRows[0]) || null;
+
+    // 3b. Fallback Monday-only: el lead puede ser pre-toolbar (cargado a Monday
+    // manualmente, nunca pasó por review_queue). En ese caso, lookup directo
+    // en Monday por dominio y armamos un "lead sintético" para el resto del flujo.
+    // Así también esos bounces terminan limpiando la URL en Monday.
+    if (!lead) {
+      const cfgEarly = await getConfig(token).catch(() => ({}));
+      const mondayKeyEarly = (cfgEarly[`monday_api_key_${mbEmail.toLowerCase()}`] || cfgEarly.monday_api_key || "").trim();
+      if (mondayKeyEarly) {
+        const mondayMatch = await findMondayItem(domain, mondayKeyEarly).catch(() => null);
+        if (mondayMatch?.id) {
+          log(`  🔎 ${domain}: lead no estaba en review_queue, pero existe en Monday (item ${mondayMatch.id}) — uso fallback Monday-only`);
+          lead = {
+            id: null,
+            monday_item_id: mondayMatch.id,
+            domain,
+            emails: [],           // sin candidatos: el flujo cae directo a rescate (scrape + Apollo)
+            email_sources: {},
+            category: "",
+            traffic: 0,
+            pitch: null,
+            pitch_subject: null,
+            pitch_subjects: null,
+          };
+        }
+      }
+    }
+    if (!lead) {
+      log(`  ⏭️ ${domain}: lead no encontrado en review_queue ni en Monday — skip retry`);
       return;
     }
-    const lead = leadRows[0];
 
     // 4. Pickear next-best email — source-strict, excluir bounced
+    // PRIORIDAD #1: future_email manual del MB (toolbar_reengagement_queue).
+    // Si el MB tomó la molestia de cargar un email B en la toolbar, esa es
+    // la mejor alternativa — más curada que cualquier scrape/Apollo automático.
+    let manualFutureEmail = null;
+    try {
+      const fqRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?domain=eq.${encodeURIComponent(domain)}&mb_email=eq.${encodeURIComponent(mbEmail.toLowerCase())}&status=eq.pending&select=future_email&order=created_at.desc&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (fqRes.ok) {
+        const fqRows = await fqRes.json();
+        const fe = (fqRows?.[0]?.future_email || "").trim().toLowerCase();
+        if (fe && fe.includes("@") && fe !== bouncedEmail.toLowerCase() && !isBouncedSync(fe)) {
+          manualFutureEmail = fe;
+          log(`  ⭐ ${domain}: usando future_email manual del MB → ${manualFutureEmail}`);
+        }
+      }
+    } catch (e) { log(`  ⚠️ future_email lookup: ${e.message}`); }
+
     let candidates = (lead.emails || []).filter(e => {
       if (!e || e.toLowerCase() === bouncedEmail.toLowerCase()) return false;
       if (isBouncedSync(e.toLowerCase())) return false; // ya bounced antes
       return true;
     });
+    // Si hay future_email manual, lo poneamos al frente del pool
+    if (manualFutureEmail) {
+      candidates = [manualFutureEmail, ...candidates.filter(e => e.toLowerCase() !== manualFutureEmail)];
+    }
     // RESCATE: si no hay alternativas en el lead, intentar re-enrich on-the-fly.
     // Scrape primero (gratis, con CF decoder + JSON-LD) → si vacío, Apollo lookup.
     // Si encuentra algo válido lo agregamos al lead y al pool de candidates.
@@ -5608,12 +5671,16 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       }
     }
 
-    const SOURCE_RANK = { apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+    // Dynamic ranking: lee toolbar_source_performance del MB (fallback _global,
+    // fallback hardcoded). Si hay ε-greedy explore o sample chico → ranking default.
+    // "manual" siempre mantiene rank top — es la decisión explícita del MB.
+    const dynRank = await getDynamicSourceRank(token, mbEmail);
+    const SOURCE_RANK = { ...dynRank, manual: Math.max(dynRank.manual || 0, 5) };
     const _sourcesMap = lead.email_sources || {};
     const ranked = candidates
       .map(e => ({
         email: e,
-        source: _sourcesMap[e.toLowerCase()] || "",
+        source: (manualFutureEmail && e.toLowerCase() === manualFutureEmail) ? "manual" : (_sourcesMap[e.toLowerCase()] || ""),
         score: rankEmail(e, domain, lead.category || ""),
       }))
       .filter(x => x.score >= 0)
@@ -5665,7 +5732,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           body: JSON.stringify({
             user_email: mbEmail, domain, action: "bounce_retry_sent",
             email_to: retryEmail, pitch_subject: subject,
-            details: { original_email: bouncedEmail, bounce_type: bounceType, retry_source: retrySource },
+            details: { original_email: bouncedEmail, bounce_type: bounceType, retry_source: retrySource, source: retrySource },
           }),
         });
         if (resAct.ok) {
@@ -7457,11 +7524,11 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // Re-pickear el MEJOR email después del enrichment.
-        // Política user 2026-05-13: prioridad ESTRICTA por SOURCE primero:
-        //   apollo > informer > scrape > generic
-        // (regardless de rank score). Si hay varios del mismo source → rank decide.
+        // Política user 2026-05-19: ranking dinámico por (mb, source) basado en
+        // open_rate * (1 - bounce_rate) observado en últimos 30d. Con sample
+        // chico o ε-greedy 10%, fallback al hardcoded apollo > informer > scrape.
         // Threshold: solo score >= 0 (positivo); negativo = no mandar.
-        const SOURCE_RANK = { apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+        const SOURCE_RANK = await getDynamicSourceRank(token, userEmail);
         const _sourcesMap = lead.email_sources || {};
         // Filtra bounced ANTES de rankear: si el #1 ya rebotó, no perdemos el
         // turno descubriéndolo en la validación final.
@@ -7484,6 +7551,7 @@ async function runAgentCycle(token, allFlags) {
             return b.score - a.score;          // dentro del mismo source, mejor rank
           });
         let email = ranked[0]?.email;
+        const pickedSource = ranked[0]?.source || "";   // attribution para toolbar_source_performance
         // Log diagnóstico — ver qué pasó con cada candidate
         if (emails.length > 0) {
           const summary = _rankedAll.slice(0, 5).map(x => `${x.email}=${x.score}`).join(", ");
@@ -7725,7 +7793,7 @@ async function runAgentCycle(token, allFlags) {
           body: JSON.stringify({
             user_email: userEmail, domain, action: "reserved",
             pitch_subject: subject,
-            details: { email, traffic: leadTraffic, geo: leadGeo, language: lead.language },
+            details: { email, source: pickedSource, traffic: leadTraffic, geo: leadGeo, language: lead.language },
           }),
         }).catch(() => null);
         reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id || null;
@@ -7935,6 +8003,465 @@ process.on("SIGINT", () => {
   log("🛑 SIGINT recibido — exit gracefully.");
   setTimeout(() => process.exit(0), 500);
 });
+
+// ════════════════════════════════════════════════════════════════
+// SOURCE PERFORMANCE — dynamic ranking de email sources
+// ════════════════════════════════════════════════════════════════
+// Aggregate rolling 30d de (mb_email, source) → open_rate, bounce_rate, score.
+// El job aggregateSourcePerformance() corre diario y upserta a toolbar_source_performance.
+// El picker getDynamicSourceRank(mbEmail) reemplaza el SOURCE_RANK hardcoded en runtime,
+// con cache 1h en memoria, fallback a default si sample chico, y ε-greedy 10%.
+// ════════════════════════════════════════════════════════════════
+
+const SOURCE_RANK_DEFAULT = { manual: 5, apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+const SOURCE_PERF_WINDOW_DAYS = 30;
+const SOURCE_PERF_MIN_SENT = 50;       // sample mínimo por (mb, source) para usar dinámico
+const SOURCE_PERF_EPSILON = 0.10;      // 10% de las decisiones usan ranking default (exploración)
+const SOURCE_PERF_CACHE_TTL = 60 * 60 * 1000;  // 1h
+const _sourceRankCache = new Map();    // mb_email → { rank: {...}, ts: number }
+
+// Convierte una tabla {source: score} a un map {source: rank} estable.
+// El source con mayor score queda con rank más alto (igual semántica que SOURCE_RANK_DEFAULT).
+function _scoresToRank(scoresBySource) {
+  const sorted = Object.entries(scoresBySource).sort((a, b) => b[1] - a[1]);
+  const rank = { "": 0 };
+  // El primero queda con rank = N, el último con rank = 1.
+  sorted.forEach(([src], i) => { rank[src] = sorted.length - i; });
+  return rank;
+}
+
+// Lee de toolbar_source_performance la perf de un MB. Si no hay data suficiente
+// para alguna source (sent < threshold), esa source NO entra en el cómputo y
+// queda con su rank default. Devuelve un map {source: rank} listo para usar.
+async function _fetchDynamicSourceRank(token, mbEmail) {
+  try {
+    const mb = (mbEmail || "_global").toLowerCase();
+    // Buscar primero la fila del MB; si no tiene data suficiente, fallback _global.
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?mb_email=in.(${encodeURIComponent(mb)},_global)&window_days=eq.${SOURCE_PERF_WINDOW_DAYS}&select=mb_email,source,sent,score`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json().catch(() => []);
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    // Preferimos rows del MB; las _global son fallback por source.
+    const scores = {};
+    for (const src of Object.keys(SOURCE_RANK_DEFAULT)) {
+      if (src === "") continue;
+      const mbRow     = rows.find(r => r.mb_email === mb && r.source === src);
+      const globalRow = rows.find(r => r.mb_email === "_global" && r.source === src);
+      const chosen    = (mbRow && mbRow.sent >= SOURCE_PERF_MIN_SENT) ? mbRow
+                      : (globalRow && globalRow.sent >= SOURCE_PERF_MIN_SENT) ? globalRow
+                      : null;
+      if (chosen) scores[src] = parseFloat(chosen.score) || 0;
+    }
+    // Si menos de 2 sources tienen data → no podemos rankear → fallback default.
+    if (Object.keys(scores).length < 2) return null;
+    // Para las sources sin data observada, las dejamos con rank default así no las matamos.
+    // Estrategia: primero rankeamos las observed por score, después appendamos las no-observed
+    // por debajo en orden default. Esto preserva exploration de sources nuevas.
+    const observedRank = _scoresToRank(scores);
+    const merged = { ...observedRank };
+    Object.entries(SOURCE_RANK_DEFAULT).forEach(([src, defRank]) => {
+      if (!(src in merged)) merged[src] = 0.5; // por debajo de cualquier observed (mín 1) pero arriba de "" (0)
+    });
+    return merged;
+  } catch { return null; }
+}
+
+// API pública: devuelve un map {source: rank} para usar en el picker.
+// ε-greedy: 10% de los calls devuelven el ranking default aunque haya data
+// (exploración — evita lock-in si una source empeora con el tiempo).
+async function getDynamicSourceRank(token, mbEmail) {
+  // ε-greedy: con prob ε, ignorar lo aprendido.
+  if (Math.random() < SOURCE_PERF_EPSILON) return SOURCE_RANK_DEFAULT;
+
+  const key = (mbEmail || "_global").toLowerCase();
+  const cached = _sourceRankCache.get(key);
+  if (cached && (Date.now() - cached.ts) < SOURCE_PERF_CACHE_TTL) return cached.rank;
+
+  const dynamic = await _fetchDynamicSourceRank(token, key);
+  const rank = dynamic || SOURCE_RANK_DEFAULT;
+  _sourceRankCache.set(key, { rank, ts: Date.now() });
+  return rank;
+}
+
+// Job diario: agrega toolbar_agent_actions ⨯ toolbar_email_opens ⨯ toolbar_bounce_retries
+// y upserta a toolbar_source_performance. Se llama desde el main loop con guard
+// "1× por día" usando un flag en toolbar_config (last_source_perf_run).
+async function aggregateSourcePerformance(token) {
+  try {
+    const since = new Date(Date.now() - SOURCE_PERF_WINDOW_DAYS * 86400_000).toISOString();
+    log(`📊 Source perf: aggregating window ${SOURCE_PERF_WINDOW_DAYS}d (since ${since.slice(0, 10)})`);
+
+    // 1. Pull todos los sends del período con source poblado en details.
+    const sendsRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent)&created_at=gte.${since}&select=id,user_email,email_to,details,created_at&limit=10000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!sendsRes.ok) { log(`  ⚠️ sends fetch ${sendsRes.status}`); return; }
+    const sends = await sendsRes.json();
+    if (!Array.isArray(sends) || sends.length === 0) { log("  (sin sends en ventana)"); return; }
+
+    // 2. Bulk pull de opens — todas las filas que matchean los action_ids.
+    const sendIds = sends.map(s => s.id).filter(Boolean);
+    const opensByActionId = new Set();
+    // Chunk por 200 para no inflar la URL
+    for (let i = 0; i < sendIds.length; i += 200) {
+      const chunk = sendIds.slice(i, i + 200);
+      const oRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_email_opens?agent_action_id=in.(${chunk.join(",")})&select=agent_action_id`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (oRes.ok) {
+        const opens = await oRes.json().catch(() => []);
+        opens.forEach(o => opensByActionId.add(o.agent_action_id));
+      }
+    }
+
+    // 3. Bulk pull de bounces — match por email_to (los rebotados son target del send).
+    const bouncedEmails = new Set();
+    const bRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${since}&select=original_email`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (bRes.ok) {
+      const brows = await bRes.json().catch(() => []);
+      brows.forEach(b => { if (b.original_email) bouncedEmails.add(b.original_email.toLowerCase()); });
+    }
+
+    // 4. Agregar por (mb, source).
+    const agg = new Map(); // key "mb|source" → {sent, opens, bounces}
+    const bump = (mb, src, field) => {
+      const k = `${mb}|${src}`;
+      if (!agg.has(k)) agg.set(k, { sent: 0, opens: 0, bounces: 0, mb, src });
+      agg.get(k)[field]++;
+    };
+    for (const s of sends) {
+      const mb  = (s.user_email || "").toLowerCase();
+      const src = (s.details?.source || "").toLowerCase();
+      if (!mb || !src) continue;     // sin atribución → skip
+      const isOpen   = opensByActionId.has(s.id);
+      const isBounce = s.email_to ? bouncedEmails.has(s.email_to.toLowerCase()) : false;
+      bump(mb, src, "sent");
+      bump("_global", src, "sent");
+      if (isOpen)   { bump(mb, src, "opens");   bump("_global", src, "opens"); }
+      if (isBounce) { bump(mb, src, "bounces"); bump("_global", src, "bounces"); }
+    }
+
+    // 5. Calcular rates + score y upsert.
+    const rows = [];
+    for (const { mb, src, sent, opens, bounces } of agg.values()) {
+      const openRate   = sent > 0 ? opens / sent   : 0;
+      const bounceRate = sent > 0 ? bounces / sent : 0;
+      const score      = openRate * (1 - bounceRate);
+      rows.push({
+        mb_email: mb, source: src, window_days: SOURCE_PERF_WINDOW_DAYS,
+        sent, opens, bounces,
+        open_rate: openRate.toFixed(4),
+        bounce_rate: bounceRate.toFixed(4),
+        score: score.toFixed(4),
+        computed_at: new Date().toISOString(),
+      });
+    }
+    if (rows.length === 0) { log("  (nada para upsertar)"); return; }
+
+    const upRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?on_conflict=mb_email,source,window_days`,
+      {
+        method: "POST",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json",
+          "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify(rows),
+      }
+    );
+    if (!upRes.ok) {
+      const txt = await upRes.text().catch(() => "");
+      log(`  ⚠️ upsert ${upRes.status}: ${txt.slice(0, 200)}`);
+      return;
+    }
+
+    // 6. Invalidar cache para que el próximo getDynamicSourceRank lea fresh.
+    _sourceRankCache.clear();
+    log(`  ✅ source perf upsert OK: ${rows.length} filas (${sends.length} sends procesados)`);
+  } catch (e) {
+    log(`⚠️ aggregateSourcePerformance: ${e.message}`);
+  }
+}
+
+// Guard: corre 1× por día (hora Madrid). Persiste last-run en toolbar_config.
+async function maybeRunSourcePerformanceAggregate(token) {
+  try {
+    const cfg = await getConfig(token);
+    const enabled = String(cfg.agent_source_perf_enabled ?? "true").toLowerCase() !== "false";
+    if (!enabled) return;
+    const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    const last = cfg.last_source_perf_run || "";
+    if (last === todayMadrid) return;
+    await aggregateSourcePerformance(token);
+    await setConfigValue(token, "last_source_perf_run", todayMadrid).catch(() => {});
+  } catch (e) { log(`⚠️ maybeRunSourcePerformanceAggregate: ${e.message}`); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// NOTIFICATIONS — alert scanners para el bell del popup
+// ════════════════════════════════════════════════════════════════
+// Helper genérico de inserción + 6 scanners que se invocan desde el main loop
+// con guards de frecuencia (low_prosp: L y J 18hs, bounce/open: lunes 09hs).
+// ════════════════════════════════════════════════════════════════
+
+const LOW_PROSPECTING_THRESHOLD = 30;        // hardcoded: regla de negocio
+const BOUNCE_HIGH_FLOOR = 0.10;              // no alertar si bounce < 10% incluso si está sobre el promedio
+const OPEN_LOW_GAP_RATIO = 0.6;              // alertar si MB.open < team_avg * 0.6
+
+async function createNotificationWorker(token, payload) {
+  // payload: { mb_email, type, severity, title, body, metadata, dedup_key }
+  try {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_notifications`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({
+        mb_email:  (payload.mb_email || "_admin").toLowerCase(),
+        type:      payload.type,
+        severity:  payload.severity || "info",
+        title:     payload.title,
+        body:      payload.body || null,
+        metadata:  payload.metadata || {},
+        dedup_key: payload.dedup_key || null,
+      }),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+// Devuelve los últimos N días hábiles (excluye sáb/dom) como array de YYYY-MM-DD.
+function _lastBusinessDays(n) {
+  const days = [];
+  const d = new Date();
+  while (days.length < n) {
+    const dow = d.getDay(); // 0=Sun, 6=Sat
+    if (dow !== 0 && dow !== 6) {
+      days.push(d.toISOString().split("T")[0]);
+    }
+    d.setDate(d.getDate() - 1);
+  }
+  return days;
+}
+
+// Scanner 1: low prospecting (L/J 18hs Madrid sobre últimos 5 días hábiles)
+async function scanLowProspecting(token) {
+  const now = new Date();
+  const madridDow = parseInt(now.toLocaleString("en-US", { timeZone: "Europe/Madrid", weekday: "long" }).match(/(\d+)/)?.[1] || "0", 10);
+  const madridHour = parseInt(now.toLocaleString("en-US", { timeZone: "Europe/Madrid", hour: "2-digit", hour12: false }).replace(/\D/g, "").slice(0, 2), 10);
+  // Real day-of-week (0=Sun..6=Sat) sin parsing engendro:
+  const madridStr = now.toLocaleString("en-US", { timeZone: "Europe/Madrid", weekday: "short" });
+  const isMonOrThu = madridStr.startsWith("Mon") || madridStr.startsWith("Thu");
+  if (!isMonOrThu || madridHour < 18) return;
+
+  const businessDays = _lastBusinessDays(5);
+  const since = businessDays[businessDays.length - 1] + "T00:00:00Z";
+  const dedupKey = `lowprosp-${businessDays[0]}`;
+
+  // Pull TEAM_EMAILS from config — fallback hardcoded
+  const teamEmails = ["mgargiulo@adeqmedia.com", "dhorovitz@adeqmedia.com", "sales@adeqmedia.com"];
+  for (const mb of teamEmails) {
+    try {
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mb)}&action=in.(sent,re_sent,bounce_retry_sent)&created_at=gte.${since}&select=id,created_at&limit=1000`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (!res.ok) continue;
+      const rows = await res.json();
+      // Group by day
+      const byDay = {};
+      rows.forEach(r => { const d = r.created_at.slice(0, 10); byDay[d] = (byDay[d] || 0) + 1; });
+      // Calcular promedio sobre días hábiles que efectivamente trabajó (>=1 envío)
+      const activeDays = businessDays.filter(d => byDay[d] > 0);
+      if (activeDays.length === 0) continue;
+      const avgPerDay = activeDays.reduce((s, d) => s + (byDay[d] || 0), 0) / activeDays.length;
+      if (avgPerDay < LOW_PROSPECTING_THRESHOLD) {
+        await createNotificationWorker(token, {
+          mb_email: mb, type: "low_prospecting", severity: "warning",
+          title: `Low prospecting: ${avgPerDay.toFixed(1)} emails/day average`,
+          body:  `Target is ${LOW_PROSPECTING_THRESHOLD}/day. Last ${activeDays.length} business days: ${activeDays.map(d => byDay[d] || 0).join(" / ")}.`,
+          metadata: { avg: avgPerDay, threshold: LOW_PROSPECTING_THRESHOLD, days: activeDays },
+          dedup_key: dedupKey,
+        });
+      }
+    } catch (e) { log(`⚠️ scanLowProspecting ${mb}: ${e.message}`); }
+  }
+}
+
+// Helper: media + std dev simple.
+function _meanStd(arr) {
+  if (!arr.length) return { mean: 0, std: 0 };
+  const mean = arr.reduce((s, x) => s + x, 0) / arr.length;
+  const variance = arr.reduce((s, x) => s + (x - mean) ** 2, 0) / arr.length;
+  return { mean, std: Math.sqrt(variance) };
+}
+
+// Scanner 2 + 3: bounce_high + open_low (semanal, lunes 09hs Madrid).
+// Lee toolbar_source_performance (que ya tiene rates por MB) y compara contra
+// la distribución del equipo. Auto-calibra: el threshold se mueve con el equipo.
+async function scanWeeklyRates(token) {
+  const now = new Date();
+  const madridStr = now.toLocaleString("en-US", { timeZone: "Europe/Madrid", weekday: "short" });
+  const madridHour = parseInt(now.toLocaleString("en-US", { timeZone: "Europe/Madrid", hour: "2-digit", hour12: false }).replace(/\D/g, "").slice(0, 2), 10);
+  if (!madridStr.startsWith("Mon") || madridHour < 9) return;
+
+  // Compute ISO week key for dedup
+  const weekKey = `${now.getFullYear()}-W${Math.ceil(((now - new Date(now.getFullYear(), 0, 1)) / 86400000 + new Date(now.getFullYear(), 0, 1).getDay() + 1) / 7)}`;
+
+  try {
+    // Agregar TOTAL bounce/open rate por MB (sumando todas las sources)
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?window_days=eq.30&mb_email=neq._global&select=mb_email,sent,opens,bounces`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    // Sum per MB
+    const byMb = {};
+    rows.forEach(r => {
+      const m = r.mb_email;
+      if (!byMb[m]) byMb[m] = { sent: 0, opens: 0, bounces: 0 };
+      byMb[m].sent    += r.sent;
+      byMb[m].opens   += r.opens;
+      byMb[m].bounces += r.bounces;
+    });
+    const mbStats = Object.entries(byMb)
+      .filter(([, v]) => v.sent >= 30)  // mínimo de envíos para tener señal
+      .map(([mb, v]) => ({ mb, openRate: v.opens / v.sent, bounceRate: v.bounces / v.sent }));
+    if (mbStats.length < 2) return;     // necesitamos al menos 2 MBs para comparar
+
+    const openRates   = mbStats.map(s => s.openRate);
+    const bounceRates = mbStats.map(s => s.bounceRate);
+    const openStats   = _meanStd(openRates);
+    const bounceStats = _meanStd(bounceRates);
+
+    for (const s of mbStats) {
+      // Bounce alto: > 1 stddev sobre la media Y sobre floor 10%
+      if (s.bounceRate > (bounceStats.mean + bounceStats.std) && s.bounceRate >= BOUNCE_HIGH_FLOOR) {
+        await createNotificationWorker(token, {
+          mb_email: s.mb, type: "bounce_high", severity: "error",
+          title:    `High bounce rate: ${(s.bounceRate * 100).toFixed(1)}%`,
+          body:     `Team average is ${(bounceStats.mean * 100).toFixed(1)}%. Check your email sources — too many dead addresses.`,
+          metadata: { rate: s.bounceRate, teamMean: bounceStats.mean, teamStd: bounceStats.std },
+          dedup_key: `bounce-${weekKey}`,
+        });
+      }
+      // Open bajo: < 1 stddev bajo media Y gap significativo (< 60% del promedio)
+      if (s.openRate < (openStats.mean - openStats.std) && s.openRate < (openStats.mean * OPEN_LOW_GAP_RATIO)) {
+        await createNotificationWorker(token, {
+          mb_email: s.mb, type: "open_low", severity: "warning",
+          title:    `Open rate below team: ${(s.openRate * 100).toFixed(1)}%`,
+          body:     `Team average is ${(openStats.mean * 100).toFixed(1)}%. Try varying subject lines or warming up Apollo contacts.`,
+          metadata: { rate: s.openRate, teamMean: openStats.mean, teamStd: openStats.std },
+          dedup_key: `openlow-${weekKey}`,
+        });
+      }
+      // Refuerzo positivo: open > 25% Y > 1 stddev sobre la media
+      if (s.openRate >= 0.25 && s.openRate > (openStats.mean + openStats.std)) {
+        await createNotificationWorker(token, {
+          mb_email: s.mb, type: "positive", severity: "success",
+          title:    `🎉 Top open rate this week: ${(s.openRate * 100).toFixed(1)}%`,
+          body:     `You're ${((s.openRate / openStats.mean - 1) * 100).toFixed(0)}% above team average. Keep doing what you're doing.`,
+          metadata: { rate: s.openRate, teamMean: openStats.mean },
+          dedup_key: `positive-${weekKey}`,
+        });
+      }
+    }
+  } catch (e) { log(`⚠️ scanWeeklyRates: ${e.message}`); }
+}
+
+// Scanner 4: source insight semanal — qué source está rindiendo mejor para el MB.
+async function scanSourceInsight(token) {
+  const now = new Date();
+  const madridStr = now.toLocaleString("en-US", { timeZone: "Europe/Madrid", weekday: "short" });
+  const madridHour = parseInt(now.toLocaleString("en-US", { timeZone: "Europe/Madrid", hour: "2-digit", hour12: false }).replace(/\D/g, "").slice(0, 2), 10);
+  if (!madridStr.startsWith("Mon") || madridHour < 9) return;
+
+  const weekKey = `${now.getFullYear()}-W${Math.ceil(((now - new Date(now.getFullYear(), 0, 1)) / 86400000 + new Date(now.getFullYear(), 0, 1).getDay() + 1) / 7)}`;
+
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?window_days=eq.30&mb_email=neq._global&select=mb_email,source,sent,open_rate,bounce_rate,score&order=mb_email.asc,score.desc`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const byMb = {};
+    rows.forEach(r => { if (r.sent >= 20) (byMb[r.mb_email] = byMb[r.mb_email] || []).push(r); });
+    for (const [mb, sources] of Object.entries(byMb)) {
+      if (sources.length < 2) continue;
+      const best = sources[0];
+      const worst = sources[sources.length - 1];
+      const gap = parseFloat(best.open_rate) - parseFloat(worst.open_rate);
+      if (gap < 0.10) continue;   // gap < 10pp → no insight relevante
+      await createNotificationWorker(token, {
+        mb_email: mb, type: "source_insight", severity: "info",
+        title:    `Source insight: ${best.source} is your best lever`,
+        body:     `${best.source} open rate ${(parseFloat(best.open_rate) * 100).toFixed(0)}% vs ${worst.source} ${(parseFloat(worst.open_rate) * 100).toFixed(0)}%. Agent auto-prioritizes ${best.source} for you.`,
+        metadata: { best: best.source, worst: worst.source, gap },
+        dedup_key: `insight-${weekKey}`,
+      });
+    }
+  } catch (e) { log(`⚠️ scanSourceInsight: ${e.message}`); }
+}
+
+// Scanner 5: system_failure — agent failed actions concentrados.
+// Si un MB tiene > 3 failed actions en la última hora → alerta a él.
+// Si el global tiene > 10 failed en la última hora → alerta a admin.
+async function scanSystemFailures(token) {
+  try {
+    const cutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(failed,monday_failed)&created_at=gte.${cutoff}&select=user_email,domain,reason,created_at&limit=200`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) return;
+    const byMb = {};
+    rows.forEach(r => { const m = (r.user_email || "_admin").toLowerCase(); byMb[m] = (byMb[m] || 0) + 1; });
+    const hourKey = new Date().toISOString().slice(0, 13); // hora actual
+    for (const [mb, count] of Object.entries(byMb)) {
+      if (count > 3 && mb !== "_admin") {
+        await createNotificationWorker(token, {
+          mb_email: mb, type: "system_failure", severity: "error",
+          title:    `${count} failed sends in the last hour`,
+          body:     `Most recent: ${rows.find(r => (r.user_email || "").toLowerCase() === mb)?.reason || "unknown"}. Check Gmail token / Monday API key.`,
+          metadata: { count, sample: rows.filter(r => (r.user_email || "").toLowerCase() === mb).slice(0, 3) },
+          dedup_key: `sysfail-${mb}-${hourKey}`,
+        });
+      }
+    }
+    if (rows.length > 10) {
+      await createNotificationWorker(token, {
+        mb_email: "_admin", type: "system_failure", severity: "error",
+        title:    `Global: ${rows.length} failed sends in last hour`,
+        body:     `Across ${Object.keys(byMb).length} MBs. Check Railway logs.`,
+        metadata: { total: rows.length, byMb },
+        dedup_key: `sysfail-global-${hourKey}`,
+      });
+    }
+  } catch (e) { log(`⚠️ scanSystemFailures: ${e.message}`); }
+}
+
+// Orchestrator — runs all scanners. Cada uno tiene guard interno de frecuencia.
+async function runNotificationScanners(token) {
+  await scanLowProspecting(token).catch(e => log(`⚠️ scanLowProsp: ${e.message}`));
+  await scanWeeklyRates(token).catch(e => log(`⚠️ scanWeeklyRates: ${e.message}`));
+  await scanSourceInsight(token).catch(e => log(`⚠️ scanInsight: ${e.message}`));
+  await scanSystemFailures(token).catch(e => log(`⚠️ scanSysFail: ${e.message}`));
+}
 
 async function main() {
   log("ADEQ Auto-Prospector v3 iniciado.");
@@ -8232,6 +8759,10 @@ async function main() {
         await maybeStartAutopilotSlot(token).catch(e => log(`⚠️ autopilot slot: ${e.message}`));
         await _measureFeederRuns(token).catch(e => log(`⚠️ feeder measure: ${e.message}`));
         await _checkAutoPauseAgent(token).catch(e => log(`⚠️ autopause: ${e.message}`));
+        // Source performance aggregate (1× por día, guard interno)
+        await maybeRunSourcePerformanceAggregate(token).catch(e => log(`⚠️ source perf: ${e.message}`));
+        // Notification scanners — cada uno tiene su guard de frecuencia interno
+        await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
         // Boot-time guarantee: agent_enabled_users siempre con mgargiulo si vacío.
         // Reemplaza al self-activator viejo (sin chequear horario ni manual_off).

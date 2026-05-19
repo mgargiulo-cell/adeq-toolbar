@@ -122,6 +122,14 @@ export async function getGmailSignature() {
  */
 export async function sendEmail({ to, subject, body, expectedFrom }) {
   try {
+    // Sanitizar recipient: URL-decode (%20 → espacio), strip zero-width, trim, lowercase.
+    // Sin esto, scrapeos sucios tipo "%20info@x.com" o " info@x.com" rebotan en Gmail.
+    try { to = decodeURIComponent(to); } catch {}
+    to = String(to || "").replace(/[\s​‌‍﻿]+/g, "").toLowerCase();
+    if (!/^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,}$/.test(to)) {
+      throw new Error(`Recipient inválido tras sanitización: "${to}"`);
+    }
+
     let token = await fetchToken(true);
     if (!token) throw new Error("Could not obtain Gmail token. Make sure Chrome is signed in with your @adeqmedia.com account.");
 

@@ -36,6 +36,11 @@ const BLOCKED_DOMAINS = new Set([
   "aws.amazon.com", "cloud.google.com", "azure.microsoft.com",
   "stripe.com", "notion.so", "atlassian.com", "monday.com",
   "adeqmedia.com",
+  // WHOIS-privacy proxies — nunca son contactos reales, scrapearlos siempre da bounces
+  "protecteddomainservices.com", "domainsbyproxy.com", "whoisguard.com",
+  "whoisprivacyprotect.com", "whoisprotectservice.com", "contactprivacy.com",
+  "privacyguardian.org", "anonymize.com", "withheldforprivacy.com",
+  "perfectprivacy.com", "privacy-link.com", "namecheap.com",
 ]);
 
 // Cache en memoria de la blocklist admin (refresca cada 5 min)

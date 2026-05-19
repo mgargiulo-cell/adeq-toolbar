@@ -235,7 +235,9 @@ export async function setCustomPrompt(accessToken, userEmail, value) {
 // toolbar_email_opens(agent_action_id=ID), y el worker de reengagement
 // puede detectar "no abierto" comparando ambas tablas.
 export async function createManualSendTracking(accessToken, payload) {
-  // payload: { user_email, domain, email_to, pitch_subject, language }
+  // payload: { user_email, domain, email_to, pitch_subject, language, email_source? }
+  // email_source: apollo|informer|scrape|generic|manual — usado por toolbar_source_performance.
+  // Si el popup no lo pasa, queda "manual" (el MB tipeó el email a mano).
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!accessToken || !payload?.user_email) return { ok: false, error: "auth required" };
@@ -252,7 +254,11 @@ export async function createManualSendTracking(accessToken, payload) {
         action:        "sent",
         email_to:      payload.email_to || null,
         pitch_subject: payload.pitch_subject || null,
-        details:       { source: "toolbar_manual", language: payload.language || null },
+        details:       {
+          source:    payload.email_source || "manual",
+          ui_origin: "toolbar_manual",
+          language:  payload.language || null,
+        },
       }),
     });
     if (!res.ok) {
@@ -300,6 +306,113 @@ export async function queueReengagement(accessToken, payload) {
     }
     return { ok: true, scheduled_for: scheduled };
   } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ── Bounce check ──────────────────────────────────────────────
+// Chequea si un email está en toolbar_bounced_emails (lista global de
+// emails que ya rebotaron en cualquier MB). Si está, no se debe permitir
+// usarlo como destinatario — ni manual ni como future_email.
+export async function isEmailBounced(accessToken, email) {
+  if (!accessToken || !email) return { bounced: false };
+  const clean = String(email).trim().toLowerCase();
+  if (!clean.includes("@")) return { bounced: false };
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?email=eq.${encodeURIComponent(clean)}&select=email,reason,created_at&limit=1`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return { bounced: false };
+    const rows = await res.json().catch(() => []);
+    if (Array.isArray(rows) && rows.length > 0) {
+      return { bounced: true, reason: rows[0].reason || "bounced", since: rows[0].created_at };
+    }
+    return { bounced: false };
+  } catch { return { bounced: false }; }
+}
+
+// ── Notifications ─────────────────────────────────────────────
+// Lee notificaciones del MB (unread + recent read) para renderizar el bell.
+// Worker side: las crea via createNotification() en auto-prospector/index.js.
+// Popup side: aca solo READ + UPDATE (mark read / dismiss).
+export async function fetchNotifications(accessToken, mbEmail, { limit = 30 } = {}) {
+  if (!accessToken || !mbEmail) return [];
+  try {
+    const mb = mbEmail.toLowerCase();
+    // Trae unread + las read de los últimos 7d para tener histórico cortito.
+    const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString();
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=in.(${encodeURIComponent(mb)},_admin)&or=(read_at.is.null,created_at.gte.${cutoff})&dismissed_at=is.null&select=*&order=created_at.desc&limit=${limit}`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return [];
+    return await res.json().catch(() => []);
+  } catch { return []; }
+}
+
+export async function markNotificationRead(accessToken, id) {
+  if (!accessToken || !id) return false;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?id=eq.${id}`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json", "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({ read_at: new Date().toISOString() }),
+      }
+    );
+    return res.ok;
+  } catch { return false; }
+}
+
+export async function markAllNotificationsRead(accessToken, mbEmail) {
+  if (!accessToken || !mbEmail) return false;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=eq.${encodeURIComponent(mbEmail.toLowerCase())}&read_at=is.null`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json", "Prefer": "return=minimal",
+        },
+        body: JSON.stringify({ read_at: new Date().toISOString() }),
+      }
+    );
+    return res.ok;
+  } catch { return false; }
+}
+
+// Crea una notificación client-side (ej: load_error en el popup).
+// Worker side usa la misma tabla via REST directo.
+export async function createNotification(accessToken, payload) {
+  // payload: { mb_email, type, severity, title, body?, metadata?, dedup_key? }
+  if (!accessToken || !payload?.mb_email || !payload?.type || !payload?.title) return false;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications`,
+      {
+        method: "POST",
+        headers: {
+          "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "Prefer": "resolution=merge-duplicates,return=minimal",
+        },
+        body: JSON.stringify({
+          mb_email:  payload.mb_email.toLowerCase(),
+          type:      payload.type,
+          severity:  payload.severity || "info",
+          title:     payload.title,
+          body:      payload.body || null,
+          metadata:  payload.metadata || {},
+          dedup_key: payload.dedup_key || null,
+        }),
+      }
+    );
+    return res.ok;
+  } catch { return false; }
 }
 
 // Carga las API keys desde toolbar_config (requiere JWT de usuario autenticado)
