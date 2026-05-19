@@ -3480,7 +3480,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     getTrafficData(domain, rapidapi_key),
     fetchPageContent(domain),
   ]);
-  let { visits, topCountry, topCountries3 } = trafficData;
+  let { visits, pagesPerVisit, topCountry, topCountries3 } = trafficData;
   if (!topCountry) {
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
@@ -3560,11 +3560,21 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  ⏸ ${domain} — sin traffic (intento ${newAttempt}/3). Retry próximo iter.`);
     return;
   }
-  if (visits < REVIEW_QUEUE_MIN_TRAFFIC) {
+  // FIX 2026-05-19: el threshold real del negocio son PAGE VIEWS, no visits.
+  // Política user: si la API trajo pagesPerVisit (97% de los hits), usar
+  // pageViews reales (visits × pagesPerVisit). Si no (3%), estimar como
+  // visits × 2.0 (conservador vs el promedio observado 2.75 — no queremos
+  // dejar entrar sitios de bajo tráfico por overshoot del estimador).
+  const PPV_FALLBACK = 2.0;
+  const ppvForThreshold = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : PPV_FALLBACK;
+  const effectivePageViews = Math.round(visits * ppvForThreshold);
+  const usingFallback = !(typeof pagesPerVisit === "number" && pagesPerVisit > 0);
+  if (effectivePageViews < REVIEW_QUEUE_MIN_TRAFFIC) {
+    const label = usingFallback ? `visits×${PPV_FALLBACK} fallback` : `visits×${ppvForThreshold.toFixed(2)}`;
     await markCsvItem(token, item.id, "skipped", {
-      error_message: `traffic ${visits} below min ${REVIEW_QUEUE_MIN_TRAFFIC}`,
+      error_message: `pageviews ${effectivePageViews} (${label}) below min ${REVIEW_QUEUE_MIN_TRAFFIC}`,
     });
-    log(`  ⏭ ${domain} — traffic ${visits} < ${REVIEW_QUEUE_MIN_TRAFFIC} (no entra a review_queue)`);
+    log(`  ⏭ ${domain} — ${effectivePageViews} pageviews (${visits} visits × ${ppvForThreshold.toFixed(2)}) < ${REVIEW_QUEUE_MIN_TRAFFIC}`);
     return;
   }
   const category = pageContent?.category || "";
@@ -4312,10 +4322,9 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
     // Threshold REAL del negocio: visits × pagesPerVisit (= pageViews mensuales).
-    // Si pagesPerVisit no vino en la respuesta, asumimos 1.0 (conservador) para
-    // que solo descarte sitios que ni siquiera con un PPV optimista lleguen al
-    // mínimo. Esto evita false-negatives por data faltante.
-    const ppvSafe   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : 1.0;
+    // Si pagesPerVisit no vino en la respuesta (3% de los hits), asumimos 2.0
+    // (conservador vs el promedio observado 2.75, política user 2026-05-19).
+    const ppvSafe   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : 2.0;
     const pageViews = Math.round(visits * ppvSafe);
     if (pageViews < sessionMinTraffic) {
       log(`  ✗ pageViews (${Math.round(pageViews/1000)}K = ${Math.round(visits/1000)}K visits × ${ppvSafe.toFixed(1)} ppv) < ${(sessionMinTraffic/1000)}K — descartado`);

@@ -243,22 +243,23 @@ async function fetchEngagement(domain) {
 }
 
 // Estimación de PagePerVisit cuando SimilarWeb no devuelve dato real.
-// Se usa como ÚLTIMO RECURSO. Cap conservador a 1.5 — sobrestimar páginas
-// vistas infla el "qualifies" y termina pusheando basura a Monday. Mejor
-// quedarse corto que largo.
+// Política user 2026-05-19: fallback uniforme ×2.0 (conservador vs el
+// promedio observado de 2.75). Más alto inflaba demasiado y dejaba pasar
+// sitios chicos disfrazados de grandes; ×2.0 da margen real sin abrir el
+// portón. Aplicado igual que en auto-prospector/index.js.
 const CATEGORY_PAGES_PER_VISIT = {
-  news:          1.5,
-  sports:        1.5,
-  entertainment: 1.5,
-  gambling:      1.5,
-  finance:       1.3,
-  technology:    1.3,
-  business:      1.3,
-  health:        1.4,
-  travel:        1.5,
-  automotive:    1.4,
-  food:          1.4,
-  other:         1.2,
+  news:          2.0,
+  sports:        2.0,
+  entertainment: 2.0,
+  gambling:      2.0,
+  finance:       2.0,
+  technology:    2.0,
+  business:      2.0,
+  health:        2.0,
+  travel:        2.0,
+  automotive:    2.0,
+  food:          2.0,
+  other:         2.0,
 };
 
 function estimatePagesPerVisit(category) {
