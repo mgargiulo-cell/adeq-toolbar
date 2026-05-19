@@ -1320,40 +1320,15 @@ const AUTOPAUSE_LOOKBACK_RUNS = 3;     // últimos N runs ok
 const AUTOPAUSE_DURATION_MIN  = 120;   // 2h pause si dispara
 
 async function _checkAutoPauseAgent(token) {
-  try {
-    // Solo si ya hay >= 3 runs ok medidos (con effective_added != null)
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&effective_added=not.is.null&order=cron_at.desc&limit=${AUTOPAUSE_LOOKBACK_RUNS}&select=id,effective_added,slot_label`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return;
-    const runs = await res.json();
-    if (!Array.isArray(runs) || runs.length < AUTOPAUSE_LOOKBACK_RUNS) return;
-    // Todos los últimos N runs deben tener effective_added < threshold
-    const allBelow = runs.every(r => (parseInt(r.effective_added, 10) || 0) < AUTOPAUSE_MIN_EFFECTIVE);
-    if (!allBelow) return;
-
-    // FIX 2026-05-19: si el pool de review_queue tiene leads válidos esperando,
-    // NO pausar — el Agent debe atacar el pool aunque el feeder esté flojo.
-    // Antes el auto-pause se disparaba aunque hubiera 200+ leads listos para envío.
-    const poolSize = await _getReviewQueueValidCount(token).catch(() => 0);
-    if (poolSize >= AUTOPAUSE_MIN_EFFECTIVE) {
-      log(`ℹ️ AUTO-PAUSE skip: feeder bajo pero pool tiene ${poolSize} leads válidos — Agent sigue corriendo`);
-      return;
-    }
-
-    // Chequear si ya pausamos por esto recientemente (no spammear)
-    const cfg = await getConfig(token);
-    const pausedUntil = cfg.agent_paused_until ? new Date(cfg.agent_paused_until).getTime() : 0;
-    if (pausedUntil > Date.now()) return; // ya está pausado, no re-pausar
-
-    // PAUSE
-    const newUntil = new Date(Date.now() + AUTOPAUSE_DURATION_MIN * 60_000).toISOString();
-    await setConfigValue(token, "agent_paused_until", newUntil);
-    await setConfigValue(token, "agent_paused_reason", `auto: ${AUTOPAUSE_LOOKBACK_RUNS} crons < ${AUTOPAUSE_MIN_EFFECTIVE} efectivos`);
-    const sample = runs.map(r => `${r.slot_label?.slice(11)||"?"}=${r.effective_added}`).join(", ");
-    log(`🛑 AGENT AUTO-PAUSE: últimos ${AUTOPAUSE_LOOKBACK_RUNS} crons bajo target (${sample}) → pause ${AUTOPAUSE_DURATION_MIN}min`);
-  } catch (e) { log(`⚠️ checkAutoPauseAgent: ${e.message}`); }
+  // DISABLED 2026-05-19: política user — el Agent nunca se debe auto-pausar
+  // por slots de feeder con 0 efectivos. La lógica anterior castigaba al Agent
+  // cuando el feeder se quedaba sin URLs nuevas para descubrir, ignorando que
+  // el pool tuviera 200+ leads viejos listos para envío.
+  //
+  // Si el feeder devuelve 0 efectivos repetidamente, la acción correcta es
+  // investigar la causa (fuentes rotas, todos duplicados, threshold mal puesto),
+  // NO frenar al Agent. La función queda como no-op por si se quiere reactivar.
+  return;
 }
 
 // ════════════════════════════════════════════════════════════════
