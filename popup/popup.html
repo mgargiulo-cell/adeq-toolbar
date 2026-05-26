@@ -860,20 +860,21 @@
 
     </div>
     <button id="btn-cascade-apply-filters" class="btn btn-secondary btn-full" style="margin-top:10px">🎯 Apply filters</button>
-
-    <!-- Bulk actions just below filters — no scroll needed -->
-    <div id="cascade-actions" class="actions" style="display:none;margin-top:10px">
-      <div class="cascade-actions-row">
-        <div class="cascade-summary" id="cascade-summary"></div>
-        <button id="btn-check-all" class="btn btn-secondary btn-sm">Check all</button>
-      </div>
-      <div style="display:flex;gap:6px">
-        <button id="btn-push-all" class="btn btn-primary" style="flex:1">🌐 Open selected</button>
-        <button id="btn-push-all-results" class="btn btn-secondary" style="flex:1" title="Abre TODAS las tabs visibles (no solo las seleccionadas)">🪟 Open all</button>
-      </div>
-      <div id="cascade-push-result" class="push-result"></div>
-    </div>
   </section>
+
+  <!-- Bulk actions — FUERA de la sección de filtros (que está oculta) para
+       que los botones SIEMPRE se vean cuando hay resultados. Bug 2026-05-19. -->
+  <div id="cascade-actions" class="actions" style="display:none;margin:8px 0">
+    <div class="cascade-actions-row">
+      <div class="cascade-summary" id="cascade-summary"></div>
+      <button id="btn-check-all" class="btn btn-secondary btn-sm">Check all</button>
+    </div>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <button id="btn-push-all" class="btn btn-primary" style="flex:1">🌐 Open selected</button>
+      <button id="btn-push-all-results" class="btn btn-secondary" style="flex:1" title="Abre TODAS las tabs visibles (no solo las seleccionadas)">🪟 Open all</button>
+    </div>
+    <div id="cascade-push-result" class="push-result"></div>
+  </div>
 
   <!-- Results -->
   <section id="cascade-results" class="cascade-results">
@@ -1239,14 +1240,14 @@
         </select>
       </div>
       <input id="draft-subject" type="text" class="form-input" placeholder="Email subject (optional)" style="margin-bottom:6px; font-size:12px" />
-      <textarea id="draft-body" class="form-input" placeholder="Email body — use {{domain}} as placeholder." style="width:100%; min-height:240px; font-size:13px; font-family:inherit; line-height:1.5; padding:10px"></textarea>
-
-      <div style="display:flex; gap:6px; margin-top:8px">
+      <!-- Botones MOVIDOS arriba del textarea para que siempre se vean sin scrollear -->
+      <div style="display:flex; gap:6px; margin-bottom:8px">
         <button id="btn-draft-save" class="btn btn-primary btn-sm" style="flex:1">💾 Save</button>
         <button id="btn-draft-new" class="btn btn-secondary btn-sm">➕ New</button>
         <button id="btn-draft-delete" class="btn btn-secondary btn-sm" style="color:#e53e3e;border-color:#e53e3e;display:none">🗑</button>
       </div>
-      <div id="draft-save-result" style="font-size:11px; margin-top:6px; min-height:14px"></div>
+      <div id="draft-save-result" style="font-size:11px; margin-bottom:6px; min-height:14px"></div>
+      <textarea id="draft-body" class="form-input" placeholder="Email body — use {{domain}} as placeholder." style="width:100%; min-height:180px; font-size:13px; font-family:inherit; line-height:1.5; padding:10px"></textarea>
     </div>
   </div>
 </div>
