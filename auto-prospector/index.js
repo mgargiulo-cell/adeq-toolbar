@@ -2203,8 +2203,11 @@ async function getTrafficData(domain, rapidApiKey) {
         category:      data?.WebsiteDetails?.Category || data?.Category || "",
       }).catch(() => {});
     }
-    return { visits, pagesPerVisit, topCountry, topCountries3, error: null };
-  } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], error: e.message }; }
+    // FIX 2026-05-26: devolver también la categoría SimilarWeb para que el filtro
+    // de categorías auto-bloqueadas (banking, gov, universidades, etc.) la use.
+    const swCategory = data?.WebsiteDetails?.Category || data?.Category || "";
+    return { visits, pagesPerVisit, topCountry, topCountries3, swCategory, error: null };
+  } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: e.message }; }
 }
 
 // Cache helpers de tráfico para el worker (acceso directo a Supabase).
@@ -3043,10 +3046,84 @@ const CORPORATE_BLOCKLIST = new Set([
   "chatgpt.com","openai.com","chat.openai.com","claude.ai","anthropic.com","perplexity.ai","gemini.google.com",
 ]);
 
-// TLDs o subcadenas que SIEMPRE indican sitios no-prospectables
-const BLOCKED_TLDS     = [".edu", ".gov", ".mil", ".ac.uk", ".edu.", ".gov.", ".mil."];
+// TLDs o subcadenas que SIEMPRE indican sitios no-prospectables.
+// Política user 2026-05-26: rechazar agresivamente gov/edu/military/academic
+// en TODOS sus variantes nacionales. Estos sitios jamás compran publicidad.
+const BLOCKED_TLDS     = [
+  ".edu", ".gov", ".mil", ".int",
+  ".edu.", ".gov.", ".mil.", ".gob.", ".ac.", ".gouv.",
+  ".ac.uk", ".ac.jp", ".ac.kr", ".ac.in", ".ac.za", ".ac.nz", ".ac.il", ".ac.id", ".ac.th",
+];
 const ADULT_TLDS       = [".xxx", ".adult", ".porn", ".sex"];
 const ADULT_KEYWORDS   = ["porn", "xxx", "xvideos", "sexcam", "camgirl", "fuck", "nsfw", "hentai", "escort"];
+
+// Patrones de nombre de dominio que indican corporativo / marca / institución.
+// Política user 2026-05-26: agresivo, preferir false-positive a meter basura.
+const CORPORATE_PATTERNS = [
+  // Subdominios técnicos / corporativos
+  /^(www\.)?(login|admin|portal|intranet|sso|hr|recruiting|careers|investor|investors|jobs|developer|developers|api|status|docs|support|help|cdn|static|cms|wiki|vendor|partner|partners|mail|webmail)\./,
+  // Industrias reguladas / institucional
+  /(insurance|seguro|salud|hospital|clinic[ao]|medical|farmacia|pharma|pharmaceutic|aseguradora|aseguranca|aseguros)\./i,
+  /^(bank|banco|banque|banca)[a-z0-9-]*\./i,
+  // Corporativos / holdings / grupos
+  /\b(corp|inc|holding|holdings|group|grupo|industries|industria|industrias|company|cia|sa|srl|sas|gmbh|ltd|llc|plc|enterprises?|consult(ing|oria))\.(com|net|org|biz|info|co)/i,
+  /-(corp|inc|holding|holdings|group|grupo|industries|company|enterprises?)\.(com|net|org|biz|info|co)/i,
+  // Energy / telecom / autos (marcas)
+  /^(autos?|motor|motors|automotive|automotriz|vehiculo|vehiculos|energi[ae]|energy|petro|petrol|oil|gas|electric|electrico|nuclear|utilit(y|ies)|telecom|telefon|movistar|claro|tigo|entel|att|verizon|vodafone|orange|deutsche|telekom)\./i,
+  // Real estate / construction
+  /\b(realtor|realestate|inmobil|imobil|construct|construccion|construcao|properties|propiedades|propiedad|propriedade)\./i,
+  // Manufacturing / B2B
+  /\b(manufactur|industria|industrial|fabrica|factory|plant|planta|wholesale|mayorista)\./i,
+  // Airlines / hotels (no media)
+  /^(airlines?|aerolinea|aeroporto|airport|airways|hotels?|hoteles)\./i,
+  // Retail chains
+  /^(walmart|carrefour|tesco|costco|aliexpress|temu|shein)\./i,
+  // Gobierno por nombre (refuerzo)
+  /^(www\.)?(gobierno|gobiern|government|ministerio|ministry|alcaldia|municipio|municipal|ayuntamiento|provincia|congreso|senado|parlamento|parliament)\./i,
+  // Universidades por nombre
+  /^(www\.)?(universidad|universit|university|college|colegio|escuela|school|instituto|facultad|faculty)\./i,
+  // ONG / fundaciones
+  /^(www\.)?(ong|ngo|fundacion|fundacao|foundation|charity|caridad)\./i,
+];
+
+// Categorías de SimilarWeb que indican NO-publisher (marca, institución, B2B).
+// Se chequea DESPUÉS de obtener traffic data (no pre-API).
+const BLOCKED_CATEGORY_KEYWORDS = [
+  "banking", "credit and lending", "credit cards", "insurance",
+  "investing", "stock trading", "asset management",
+  "government", "law and government", "public administration", "military",
+  "universities", "higher education", "school", "academic",
+  "computer hardware", "computer security", "consumer electronics > brand",
+  "telecommunications", "isps", "web hosting", "data center",
+  "software > b2b", "saas", "enterprise software", "cloud computing",
+  "vehicles > manufacturer", "automotive > manufacturer", "auto parts",
+  "consumer goods > manufacturer", "industry", "agriculture", "logistics",
+  "manufacturing", "energy and utilities", "oil and gas",
+  "business and consumer services > consulting",
+  "advertising and marketing > agencies",
+  "marketing and advertising",
+  "pharmaceuticals", "biotechnology", "medical devices",
+  "ecommerce", "shopping", "marketplace",
+  "air travel", "hotels and accommodations", "car rentals", "cruises",
+  "real estate", "property listings",
+];
+
+function isCorporatePattern(domain) {
+  const d = String(domain || "").toLowerCase();
+  for (const re of CORPORATE_PATTERNS) {
+    if (re.test(d)) return true;
+  }
+  return false;
+}
+
+function isCategoryBlockedWorker(category) {
+  if (!category) return null;
+  const cat = String(category).toLowerCase();
+  for (const kw of BLOCKED_CATEGORY_KEYWORDS) {
+    if (cat.includes(kw)) return kw;
+  }
+  return null;
+}
 
 // ── GEO BLACKLIST — países que NUNCA queremos prospectar (aunque no haya targetGeo) ──
 const GEO_BLACKLIST_COUNTRIES = new Set([
@@ -3128,6 +3205,8 @@ function isDomainBlocked(domain) {
   if (ADULT_KEYWORDS.some(k => d.includes(k))) return "adult-keyword";
   // Blacklist geográfica: descarta dominios de USA/CA/RU/AU/NZ/UA por TLD
   if (BLACKLIST_TLDS.some(t => d.endsWith(t))) return "geo-blacklist-tld";
+  // Patrones corporativos/marca/institución (política user 2026-05-26)
+  if (isCorporatePattern(d)) return "corporate-pattern";
   return null;
 }
 
@@ -3491,7 +3570,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     getTrafficData(domain, rapidapi_key),
     fetchPageContent(domain),
   ]);
-  let { visits, pagesPerVisit, topCountry, topCountries3 } = trafficData;
+  let { visits, pagesPerVisit, topCountry, topCountries3, swCategory } = trafficData;
   if (!topCountry) {
     const inferred = inferCountryFromTLD(domain);
     if (inferred) topCountry = inferred;
@@ -3588,7 +3667,18 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  ⏭ ${domain} — ${effectivePageViews} pageviews (${visits} visits × ${ppvForThreshold.toFixed(2)}) < ${REVIEW_QUEUE_MIN_TRAFFIC}`);
     return;
   }
-  const category = pageContent?.category || "";
+  // FIX 2026-05-26: filtro por categoría SimilarWeb — bloquea marcas/instituciones
+  // que pasaron por traffic pero no son publishers. Política user: no quiero ver
+  // bancos, universidades, gobierno, marcas de autos, telcos, etc. en Prospects.
+  const blockedCat = isCategoryBlockedWorker(swCategory);
+  if (blockedCat) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: `category-blocked: "${swCategory}" matchea "${blockedCat}"`,
+    });
+    log(`  ⊘ ${domain} — categoría "${swCategory}" bloqueada (matchea "${blockedCat}")`);
+    return;
+  }
+  const category = pageContent?.category || swCategory || "";
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
 
