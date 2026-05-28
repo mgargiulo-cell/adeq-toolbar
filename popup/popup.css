@@ -551,6 +551,10 @@ a:hover { text-decoration: underline; }
   padding: var(--sp-6);
   width: 360px;
   box-shadow: var(--shadow-lg);
+  /* En notebooks de pantalla baja el modal no debe pasar la pantalla:
+     si no entra, scrollea (el botón Save queda siempre alcanzable). */
+  max-height: 90vh;
+  overflow-y: auto;
 }
 .modal-title {
   font-size: var(--fs-lg);
