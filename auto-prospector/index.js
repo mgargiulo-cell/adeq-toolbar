@@ -1797,6 +1797,9 @@ const APOLLO_MONTHLY_HARD_CAP = 2400;
 // Techo de seguridad por día (protege contra rate-limit de Apollo y errores).
 const APOLLO_DAILY_BURST_MAX = 250;
 
+// Guard para no re-disparar el reset del contador mensual en cada lectura.
+let _apolloPeriodReset = "";
+
 // Días que faltan en el ciclo (mes calendario), incluyendo hoy. Mínimo 1.
 function _daysLeftInCycle() {
   const now = new Date();
@@ -1835,6 +1838,16 @@ async function getApolloUsageToday(token) {
     const storedMonth  = parseInt(map.apollo_calls_month || "0", 10);
     const monthLimit   = parseInt(map.apollo_monthly_limit || String(APOLLO_MONTHLY_HARD_CAP), 10);
     const usedThisMonth = storedPeriod === period ? storedMonth : 0;
+
+    // Rollover mensual a prueba de fallos: el RPC bump_api_counter (que ahora es
+    // la única fuente del contador mensual) no está garantizado que resetee el
+    // period al cambiar de mes. Si quedó viejo, lo reseteamos una vez por proceso
+    // para que el contador no quede congelado ni el cap deje de funcionar.
+    if (storedPeriod !== period && _apolloPeriodReset !== period) {
+      _apolloPeriodReset = period;
+      setConfigValue(token, "apollo_calls_month", "0").catch(() => {});
+      setConfigValue(token, "apollo_calls_month_period", period).catch(() => {});
+    }
 
     // Tope diario = presupuesto dinámico (restante/días que faltan), acotado por
     // un override manual opcional (apollo_daily_limit). Por defecto el override es
