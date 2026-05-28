@@ -4,7 +4,7 @@
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
-import { scrapeEmailsFromPage, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
+import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch }                                                                     from "../modules/gemini.js";
 // (geminiSearch.searchEmailsWithGemini removido — no se usa en popup, solo en scraper.js)
@@ -3540,14 +3540,28 @@ async function runEmailScraper() {
     state.emails = []; state.emailSources = new Map();
     addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail), "Cache", _dom);
 
-    const [pageEmails, apolloResult] = await Promise.all([
+    // Fuentes externas (contacto/directorio + website informer) — solo la primera
+    // vez por dominio en la sesión; después vienen cacheadas como "Cache".
+    const needExternal = !sess?.contactScraped;
+    const [pageEmails, contactEmails, informerEmails, apolloResult] = await Promise.all([
       scrapeEmailsFromPage(state.tabId),
+      needExternal ? scrapeContactPages(`https://${state.domain}`).catch(() => []) : Promise.resolve([]),
+      needExternal ? scrapeWebsiteInformer(state.domain).catch(() => []) : Promise.resolve([]),
       // Si la cache de sesión ya tiene Apollo emails, no re-disparar
       (sess?.apolloPreloaded)
         ? Promise.resolve(null)
         : findDecisionMakerViaApollo(state.domain).catch(() => null),
     ]);
     addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page", _dom);
+    addEmailsWithSource(contactEmails.filter(quickValidateEmail), "Scrape", _dom);
+    addEmailsWithSource(informerEmails.filter(quickValidateEmail), "Informer", _dom);
+    // Marcar que ya bajamos las fuentes externas para este dominio (evita refetch)
+    if (needExternal && state.domain === _dom) {
+      try {
+        const cur = await getSessionCache(state.domain) || {};
+        await setSessionCache(state.domain, { ...cur, contactScraped: true });
+      } catch {}
+    }
 
     // Apollo: agregar los unlocked al pool + render preview
     if (apolloResult) {
@@ -3769,6 +3783,7 @@ function _emailGradeCompute(email, result, source) {
   // Fuente
   const src = (source || "").toLowerCase();
   if (src === "apollo")  score += 15; // Apollo trae status verificado
+  else if (src === "informer") score += 8; // WHOIS/informer — contacto registrante
   else if (src === "scrape" || src === "scraping") score += 5;
   else if (src === "gemini") score += 3;
 

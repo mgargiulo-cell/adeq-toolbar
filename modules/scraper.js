@@ -2,8 +2,9 @@
 // ADEQ TOOLBAR — Módulo Email Scraper
 // Fuentes (en orden de prioridad):
 // 1. DOM de la página actual (footer, contacto, etc.)
-// 2. website.informer.com/{domain}
-// 3. Apollo.io API (decisor CEO/Owner)
+// 2. Páginas de contacto/directorio del sitio (scrapeContactPages)
+// 3. website.informer.com/{domain} + who.is (scrapeWebsiteInformer)
+// 4. Apollo.io API (decisor CEO/Owner)
 // ============================================================
 
 import { CONFIG }    from "../config.js";
@@ -121,23 +122,54 @@ function extractEmailsFromDOM() {
 // 2. Páginas de contacto del propio sitio
 // ============================================================
 export async function scrapeContactPages(baseUrl) {
-  const paths = ["/contact", "/contact-us", "/contacto", "/about", "/about-us", "/legal", "/privacy", "/advertise", "/advertising"];
+  const paths = [
+    "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos",
+    "/about", "/about-us", "/sobre-nosotros", "/quienes-somos", "/nosotros",
+    "/directorio", "/directory", "/team", "/equipo", "/equipe", "/staff",
+    "/advertise", "/advertising", "/publicidad", "/publicidade", "/anunciar", "/anunciantes",
+    "/legal", "/aviso-legal", "/privacy", "/privacidad", "/redaccion",
+  ];
   const emails = new Set();
 
-  for (const path of paths) {
+  const fetchOne = async (path) => {
     try {
       const url      = new URL(path, baseUrl).href;
       const response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(4000) });
-      if (!response.ok) continue;
-
-      const html  = await response.text();
-      const found = filterEmails(extractEmailsFromText(html));
-      found.forEach(e => emails.add(e));
-
-      if (emails.size > 0) break;
+      if (!response.ok) return;
+      const html = await response.text();
+      filterEmails(extractEmailsFromText(html)).forEach(e => emails.add(e));
     } catch { /* página no disponible */ }
+  };
+
+  // Concurrencia limitada (chunks de 5) para no disparar 25 fetch a la vez.
+  // Cortamos temprano si ya juntamos varios correos buenos.
+  const CONCURRENT = 5;
+  for (let i = 0; i < paths.length && emails.size < 12; i += CONCURRENT) {
+    await Promise.all(paths.slice(i, i + CONCURRENT).map(fetchOne));
   }
 
+  return [...emails];
+}
+
+// ============================================================
+// 3. Website Informer + who.is (fuentes externas de contacto)
+// ============================================================
+export async function scrapeWebsiteInformer(domain) {
+  const clean = (domain || "").replace(/^https?:\/\//, "").replace(/^www\./, "").toLowerCase().trim();
+  if (!clean) return [];
+  const emails = new Set();
+  const targets = [
+    `https://website.informer.com/${clean}`,
+    `https://who.is/whois/${clean}`,
+  ];
+  await Promise.all(targets.map(async (url) => {
+    try {
+      const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(6000) });
+      if (!res.ok) return;
+      const html = await res.text();
+      filterEmails(extractEmailsFromText(html)).forEach(e => emails.add(e));
+    } catch { /* bloqueado por anti-bot / rate limit */ }
+  }));
   return [...emails];
 }
 

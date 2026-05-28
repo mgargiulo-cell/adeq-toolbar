@@ -1794,6 +1794,26 @@ async function getUserLimits(token, userEmail) {
 // Si llega → fallback a scraping/page-emails (no rompe flujos, solo no usa Apollo).
 const APOLLO_MONTHLY_HARD_CAP = 2400;
 
+// Techo de seguridad por día (protege contra rate-limit de Apollo y errores).
+const APOLLO_DAILY_BURST_MAX = 250;
+
+// Días que faltan en el ciclo (mes calendario), incluyendo hoy. Mínimo 1.
+function _daysLeftInCycle() {
+  const now = new Date();
+  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
+  return Math.max(1, daysInMonth - now.getUTCDate() + 1);
+}
+
+// Presupuesto diario dinámico: reparte los créditos que quedan del cap mensual
+// entre los días que faltan del ciclo (+15% de margen para recuperar días en que
+// el cron no corrió). Así no se quema todo a principio de mes ni quedan créditos
+// sin usar al final. Nunca supera lo que queda ni el techo de seguridad diario.
+function _apolloPacedDailyCap(monthRemaining) {
+  if (monthRemaining <= 0) return 0;
+  const paced = Math.ceil((monthRemaining / _daysLeftInCycle()) * 1.15);
+  return Math.max(1, Math.min(monthRemaining, APOLLO_DAILY_BURST_MAX, paced));
+}
+
 async function getApolloUsageToday(token) {
   try {
     const res = await fetch(
@@ -1807,7 +1827,6 @@ async function getApolloUsageToday(token) {
     const today   = new Date().toISOString().slice(0, 10);
     const storedDate  = map.apollo_calls_date  || "";
     const storedCount = parseInt(map.apollo_calls_today || "0", 10);
-    const limit       = parseInt(map.apollo_daily_limit || "150", 10);
     const usedToday = storedDate === today ? storedCount : 0;
 
     // Mensual — alineado con billing cycle 6→6 (igual que RapidAPI)
@@ -1817,7 +1836,14 @@ async function getApolloUsageToday(token) {
     const monthLimit   = parseInt(map.apollo_monthly_limit || String(APOLLO_MONTHLY_HARD_CAP), 10);
     const usedThisMonth = storedPeriod === period ? storedMonth : 0;
 
-    return { usedToday, limit, today, usedThisMonth, monthLimit, period };
+    // Tope diario = presupuesto dinámico (restante/días que faltan), acotado por
+    // un override manual opcional (apollo_daily_limit). Por defecto el override es
+    // el techo de seguridad, así no interfiere y manda el pacing mensual.
+    const monthRemaining  = Math.max(0, monthLimit - usedThisMonth);
+    const configuredDaily = parseInt(map.apollo_daily_limit || String(APOLLO_DAILY_BURST_MAX), 10);
+    const limit = Math.min(configuredDaily, _apolloPacedDailyCap(monthRemaining));
+
+    return { usedToday, limit, today, usedThisMonth, monthLimit, period, monthRemaining };
   } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10), usedThisMonth: 0, monthLimit: APOLLO_MONTHLY_HARD_CAP, period: "" }; }
 }
 
@@ -1921,9 +1947,11 @@ async function saveRapidApiUsage(token, callsThisSession, today) {
 async function saveApolloUsage(token, callsThisSession, today) {
   if (callsThisSession === 0) return;
   try {
-    // Leer counters actuales (otra sesión pudo haber corrido en paralelo)
+    // SOLO contador diario. El mensual (apollo_calls_month) lo incrementa de
+    // forma atómica bumpApolloUnlocks() vía RPC en cada unlock — si lo sumáramos
+    // también acá habría doble conteo (cada unlock contaría 2x en el mensual).
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_calls_month,apollo_calls_month_period)&select=key,value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
@@ -1933,14 +1961,6 @@ async function saveApolloUsage(token, callsThisSession, today) {
     const storedDate  = map.apollo_calls_date || "";
     const storedCount = storedDate === today ? parseInt(map.apollo_calls_today || "0", 10) : 0;
     const newCount    = storedCount + callsThisSession;
-
-    // Mensual: ciclo 6→6 igual que RapidAPI
-    const period         = _billingCyclePeriod();
-    const storedPeriod   = map.apollo_calls_month_period || "";
-    const storedMonth    = storedPeriod === period ? parseInt(map.apollo_calls_month || "0", 10) : 0;
-    const newMonth       = storedMonth + callsThisSession;
-    await setConfigValue(token, "apollo_calls_month",        String(newMonth));
-    await setConfigValue(token, "apollo_calls_month_period", period);
 
     await setConfigValue(token, "apollo_calls_today", String(newCount));
     await setConfigValue(token, "apollo_calls_date",  today);
@@ -2448,7 +2468,16 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
 //   3. Si traffic ≥ APOLLO_UNLOCK_MIN_TRAFFIC y cap < APOLLO_MONTHLY_HARD_CAP
 //      → unlock TOP 1 person via /v1/people/match (1 credit)
 //   4. Si no aplica unlock → return null (caller usa scraping fallback)
-const APOLLO_UNLOCK_MIN_TRAFFIC = 500_000;
+const APOLLO_UNLOCK_MIN_TRAFFIC = 399_000;
+
+// Local-parts genéricos (no son una persona). Si el verified gratis es uno de
+// estos y el sitio califica para unlock, gastamos 1 credit para revelar al
+// decision-maker real en vez de quedarnos con el genérico.
+const APOLLO_GENERIC_LOCAL = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster|noreply|no-reply)$/i;
+function _isGenericEmail(email) {
+  const local = (email || "").split("@")[0] || "";
+  return APOLLO_GENERIC_LOCAL.test(local.trim());
+}
 async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allowUnlock = true } = {}) {
   if (!apolloKey || !domain) return null;
   // Audit P2 fix: Apollo espera dominio limpio sin www. Antes lookups con
@@ -2484,35 +2513,44 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     }
   } catch { return null; }
 
-  // 3. ¿Verified gratis?
+  // 3. ¿Verified gratis? Lo guardamos como freeResult (0 credits).
   const verified = people.find(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status));
+  let freeResult = null;
   if (verified) {
-    const phone = _extractApolloPhone(verified);
-    const result = {
+    freeResult = {
       email: verified.email,
       contact_name: `${verified.first_name||""} ${verified.last_name||""}`.trim(),
-      phone,
+      phone: _extractApolloPhone(verified),
       source: "free_verified",
     };
-    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source: "worker_free" }).catch(() => {});
-    return result;
   }
 
-  // 4. ¿Vale la pena unlock? Solo si tráfico alto y allowUnlock y bajo cap mensual
-  if (!allowUnlock || traffic < APOLLO_UNLOCK_MIN_TRAFFIC) return null;
+  // 4. ¿Califica para unlock? Solo si tráfico alto, allowUnlock y bajo cap mensual.
+  const qualifiesUnlock = allowUnlock && traffic >= APOLLO_UNLOCK_MIN_TRAFFIC;
 
-  // Hard cap check: leer apollo_calls_month antes de gastar credit
+  // Si hay verified gratis y NO califica, o el gratis ya es una persona (no genérico),
+  // nos quedamos con el gratis sin gastar crédito.
+  if (freeResult && (!qualifiesUnlock || !_isGenericEmail(freeResult.email))) {
+    if (token) saveApolloCacheServer(token, domain, { emails: [freeResult.email], contact_name: freeResult.contact_name, phone: freeResult.phone, source: "worker_free" }).catch(() => {});
+    return freeResult;
+  }
+
+  // Acá: o no hay gratis, o el gratis es genérico y el sitio califica → intentamos unlock.
+  if (!qualifiesUnlock) return freeResult; // null si tampoco había gratis
+
+  // Hard cap check: leer apollo_calls_month antes de gastar credit.
+  // Si llegamos al cap, devolvemos el gratis (si había) en vez de null.
   try {
     const usage = await getApolloUsageToday(token);
     if ((usage.usedThisMonth || 0) >= APOLLO_MONTHLY_HARD_CAP) {
       log(`  ⚠ Apollo cap ${APOLLO_MONTHLY_HARD_CAP} alcanzado (${usage.usedThisMonth}/${usage.monthLimit}) — skip unlock ${domain}`);
-      return null;
+      return freeResult;
     }
   } catch {}
 
-  // 5. Unlock top 1
+  // 5. Unlock top 1 (decision-maker). Si falla, caemos al gratis (si había).
   const target = people[0];
-  if (!target?.id) return null;
+  if (!target?.id) return freeResult;
   try {
     const unlock = await fetch("https://api.apollo.io/v1/people/match", {
       method: "POST",
@@ -2520,10 +2558,10 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
       body: JSON.stringify({ id: target.id, reveal_personal_emails: true }),
       signal: AbortSignal.timeout(12000),
     });
-    if (!unlock.ok) return null;
+    if (!unlock.ok) return freeResult;
     const data = await unlock.json();
     const person = data?.person;
-    if (!person?.email) return null;
+    if (!person?.email) return freeResult;
     // Bump apollo_calls_month +1 (este endpoint cuesta 1 credit)
     bumpApolloUnlocks(token, 1).catch(() => {});
     const phone = _extractApolloPhone(person);
@@ -2536,7 +2574,7 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     };
     if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source: "worker_unlocked" }).catch(() => {});
     return result;
-  } catch { return null; }
+  } catch { return freeResult; }
 }
 
 // Extrae el primer teléfono útil de un objeto Apollo person.
@@ -2636,9 +2674,12 @@ function extractEmailsFromHtml(html) {
   });
 }
 
-async function scrapeEmailsForDomain(domain) {
+async function scrapeEmailsForDomain(domain, opts = {}) {
   // Trae emails de muchas fuentes con concurrencia limitada (4 a la vez).
   // Usa User-Agent real (Chrome) para evitar anti-bot blocks comunes.
+  // opts.informerOut: Set opcional — recibe los emails que vinieron de
+  // website.informer.com / who.is, para que el caller los etiquete "informer".
+  const informerOut = opts.informerOut || null;
   const emails = new Set();
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
@@ -2646,19 +2687,24 @@ async function scrapeEmailsForDomain(domain) {
   const uaChrome = { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" };
   const uaMobile = { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" };
 
-  const tryFetch = async (url, timeout = 5000, mobile = false) => {
+  const tryFetch = async (url, timeout = 5000, mobile = false, isInformer = false) => {
     try {
       const r = await fetch(url, { headers: mobile ? uaMobile : uaChrome, signal: AbortSignal.timeout(timeout) });
       if (!r.ok) return;
       const html = await r.text();
+      const found = new Set();
       // 1) regex emails en HTML general
-      extractEmailsFromHtml(html).forEach(e => emails.add(e));
+      extractEmailsFromHtml(html).forEach(e => found.add(e));
       // 2) explicit mailto: hrefs (raramente missed pero a veces hay solo ahí)
       const mailtoMatches = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
       for (const m of mailtoMatches) {
         const clean = m[1].toLowerCase().split("?")[0];
-        if (clean.includes("@")) emails.add(clean);
+        if (clean.includes("@")) found.add(clean);
       }
+      found.forEach(e => {
+        emails.add(e);
+        if (isInformer && informerOut) informerOut.add(e.toLowerCase());
+      });
     } catch {}
   };
 
@@ -2675,7 +2721,9 @@ async function scrapeEmailsForDomain(domain) {
   ];
   const internalTargets = paths.map(p => `${base}${p}`);
 
-  // Fuentes externas (WHOIS / informer) — pueden estar bloqueadas por rate limit
+  // Fuentes externas (WHOIS / informer) — pueden estar bloqueadas por rate limit.
+  // Van PRIMERO para que el early-stop no las saltee cuando las páginas internas
+  // ya juntaron suficientes emails (antes quedaban al final y casi nunca corrían).
   const externalTargets = [
     `https://website.informer.com/${cleanDomain}`,
     `https://who.is/whois/${cleanDomain}`,
@@ -2683,10 +2731,13 @@ async function scrapeEmailsForDomain(domain) {
 
   // Procesar en chunks de 4 — concurrencia limitada para no saturar Railway
   const CONCURRENT = 4;
-  const all = [...internalTargets, ...externalTargets];
+  const all = [...externalTargets, ...internalTargets];
   for (let i = 0; i < all.length; i += CONCURRENT) {
     const chunk = all.slice(i, i + CONCURRENT);
-    await Promise.all(chunk.map(url => tryFetch(url, url.match(/informer|who\.is/) ? 6000 : 4000)));
+    await Promise.all(chunk.map(url => {
+      const isInf = /informer|who\.is/.test(url);
+      return tryFetch(url, isInf ? 6000 : 4000, false, isInf);
+    }));
     // Early-stop si ya tenemos varios emails buenos (no garbage)
     if (emails.size >= 10) break;
   }
@@ -3706,19 +3757,22 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Estrategia de rotación (user 2026-05-13): no quemar Apollo en cada lead.
   // 50% → scrape primero, si vacío Apollo fallback (ahorra crédito en sitios obvios)
   // 50% → Apollo primero, si vacío scrape fallback (mejor calidad cuando funciona)
-  // Resultado: ~50% de Apollo lookups vs antes (100%).
-  const useApolloFirst = canUseApollo && Math.random() < 0.5;
+  // EXCEPCIÓN (user 2026-05-28): sitios que califican para unlock (399K+ visitas)
+  // van SIEMPRE Apollo-primero para asegurar que descubrimos al decision-maker.
+  const useApolloFirst = canUseApollo &&
+    (visits >= APOLLO_UNLOCK_MIN_TRAFFIC || Math.random() < 0.5);
   let apolloRes = null;
   let scraperEmails = [];
+  const informerSet = new Set(); // emails que vinieron de website.informer.com / who.is
   if (useApolloFirst) {
     apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
       .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
       .catch(() => null);
     if (!apolloRes?.email) {
-      scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet }).catch(() => []);
     }
   } else {
-    scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet }).catch(() => []);
     if (scraperEmails.length === 0 && canUseApollo) {
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
@@ -3729,17 +3783,18 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const apolloPhone       = apolloRes?.phone || "";
   const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
   // Apollo va PRIMERO en el array. emailSources mapea cada email a su origen
-  // para pick prioritario en agent: apollo > scrape > generic.
+  // para pick prioritario en agent: apollo > informer > scrape > generic.
   const rawEmails = [...new Set([...apolloEmail, ...scraperEmails])];
   const emailSources = {};
   apolloEmail.forEach(e => { emailSources[e.toLowerCase()] = "apollo"; });
   scraperEmails.forEach(e => {
     const lower = e.toLowerCase();
     if (!emailSources[lower]) {
-      // Generic role detection: si el local-part es info/contact/sales/etc → "generic", sino "scrape"
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
-      emailSources[lower] = IS_GENERIC.test(local) ? "generic" : "scrape";
+      // informer tiene prioridad sobre scrape/generic salvo que sea un rol genérico
+      if (informerSet.has(lower) && !IS_GENERIC.test(local)) emailSources[lower] = "informer";
+      else emailSources[lower] = IS_GENERIC.test(local) ? "generic" : "scrape";
     }
   });
   // Filtrar emails con dominio sin MX records ANTES de guardar
@@ -4531,17 +4586,20 @@ async function runSession(token, cfg, sessionStart) {
     }
 
     // Rotación 50/50 Apollo vs scrape (user 2026-05-13) — ahorra créditos Apollo.
-    const useApolloFirst = canUseApollo && Math.random() < 0.5;
+    // EXCEPCIÓN (user 2026-05-28): 399K+ visitas → siempre Apollo-primero.
+    const useApolloFirst = canUseApollo &&
+      (visits >= APOLLO_UNLOCK_MIN_TRAFFIC || Math.random() < 0.5);
     const similarPromise = findSimilarSites(domain, rapidapi_key);
     let apolloRes = null;
     let scraperEmails = [];
+    const informerSetAuto = new Set(); // emails de website.informer.com / who.is
     if (useApolloFirst) {
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
         .catch(() => null);
-      if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+      if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto }).catch(() => []);
     } else {
-      scraperEmails = await scrapeEmailsForDomain(domain).catch(() => []);
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto }).catch(() => []);
       if (scraperEmails.length === 0 && canUseApollo) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
@@ -4553,6 +4611,17 @@ async function runSession(token, cfg, sessionStart) {
     const apolloPhoneAuto       = apolloRes?.phone || "";
     const apolloEmailAuto = apolloRes?.email ? [apolloRes.email] : [];
     const rawEmailsAuto = [...new Set([...apolloEmailAuto, ...scraperEmails])];
+    // Source tracking: apollo > informer > scrape > generic
+    const emailSourcesAuto = {};
+    apolloEmailAuto.forEach(e => { emailSourcesAuto[e.toLowerCase()] = "apollo"; });
+    scraperEmails.forEach(e => {
+      const lower = e.toLowerCase();
+      if (emailSourcesAuto[lower]) return;
+      const local = (lower.split("@")[0] || "");
+      const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
+      if (informerSetAuto.has(lower) && !IS_GENERIC.test(local)) emailSourcesAuto[lower] = "informer";
+      else emailSourcesAuto[lower] = IS_GENERIC.test(local) ? "generic" : "scrape";
+    });
     const emails = await validateEmailsBatch(rawEmailsAuto);
     if (rawEmailsAuto.length !== emails.length) {
       log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
@@ -4585,6 +4654,7 @@ async function runSession(token, cfg, sessionStart) {
       contactName:   apolloContactNameAuto || contactName,
       contactPhone:  apolloPhoneAuto,
       emails,
+      emailSources:  emailSourcesAuto,
       pitch:         "",
       pitchSubject:  "",
       pitchSubjects: [],
