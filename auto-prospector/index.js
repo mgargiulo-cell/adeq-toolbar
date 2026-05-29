@@ -2665,7 +2665,7 @@ const JUNK_LOCAL_RE = /^(dominios?|domainoperations|tldadmin|hostmaster|registra
 // (ej "tenmien.intecom", "admin-domaines-internet", "tdns").
 const JUNK_LOCAL_TOKENS = /(^|[._-])(tenmien|tdns|dns|domain|domains|domaines|hostmaster|registrar|tldadmin|abuse|noc|nic)([._-]|$)/i;
 // Placeholders de plantilla / buzones técnicos que nunca son contacto real.
-const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user$|^usuario$|^demo$|^sample$)/i;
+const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$)/i;
 // Dominios de webmail (gmail, hotmail, etc. en cualquier TLD).
 const WEBMAIL_RE = /^(gmail|hotmail|outlook|live|yahoo|ymail|icloud|proton|protonmail|gmx|aol|msn|mail)\./i;
 
@@ -6980,7 +6980,10 @@ function rankEmail(email, siteDomain, leadCategory = "") {
 
   // ── ROLE QUALITY (peso -20 a +90) ──
   // Roles comerciales = target ideal (decision-makers de monetización)
-  const COMMERCIAL = /^(marketing|comercial|business|partnerships?|partner|ads?|advertising|publicidad|monetiza|ventas|sales|bd|growth|director|gerente|manager|jefe|head|brand|sponsorship|patrocin)\b/;
+  // Roles comerciales/publicidad — cobertura multi-idioma (EN/ES/PT/IT/PL/ID/DE/FR).
+  // Stems como prefijo (sin \b) para agarrar "anuncios", "publicidade", "advertising".
+  // bd/head requieren boundary (cortos, evitan falsos positivos tipo "headlines").
+  const COMMERCIAL = /^(?:(?:marketing|comercial|commercial|business|partnership|partner|advertis|advert|adv|ads|publicidad|publicidade|publicite|pubblicit|werbung|reklam|iklan|anunci|propaganda|monetiz|vendas|ventas|sales|sponsor|patrocin|growth|director|gerente|manager|jefe|brand|media)|(?:bd|head)\b)/i;
   const EDITORIAL  = /^(editor|editor-in-chief|chief-editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
   const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
 
@@ -7010,6 +7013,8 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   }
 
   // ── PENALTIES ──
+  // Placeholders de CMS (user01, user02, usuario3, guest) — no son personas.
+  if (/^(user|usuario|guest|nobody|admin)\d*$/.test(local)) score -= 60;
   // Dígitos largos en local-part (3+) = lista vieja, automated
   if (/\d{3,}/.test(local)) score -= 40;
   // Local muy corto (<3) o muy largo (>30) = sospechoso
