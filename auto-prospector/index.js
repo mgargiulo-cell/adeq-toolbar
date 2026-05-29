@@ -8508,6 +8508,11 @@ async function maybeRunSourcePerformanceAggregate(token) {
 const LOW_PROSPECTING_THRESHOLD = 30;        // hardcoded: regla de negocio
 const BOUNCE_HIGH_FLOOR = 0.10;              // no alertar si bounce < 10% incluso si está sobre el promedio
 const OPEN_LOW_GAP_RATIO = 0.6;              // alertar si MB.open < team_avg * 0.6
+// Umbrales ABSOLUTOS de salud de envío — funcionan con 1 solo MB (scanWeeklyRates
+// necesita ≥2 MBs para comparar y no sirve acá). Baseline actual ~82% open / 4.8% bounce.
+const DELIV_OPEN_FLOOR  = 0.50;              // alertar si open rate global < 50%
+const DELIV_BOUNCE_CEIL = 0.08;              // alertar si bounce rate global > 8%
+const DELIV_MIN_SENT    = 30;                // sample mínimo para tener señal
 
 async function createNotificationWorker(token, payload) {
   // payload: { mb_email, type, severity, title, body, metadata, dedup_key }
@@ -8752,11 +8757,53 @@ async function scanSystemFailures(token) {
 }
 
 // Orchestrator — runs all scanners. Cada uno tiene guard interno de frecuencia.
+// Chequeo ABSOLUTO de salud de envío (1×/día) — avisa si la apertura cae o los
+// rebotes suben, sin depender de comparar contra otros MBs (clave con 1 solo MB).
+async function scanDeliverabilityHealth(token) {
+  try {
+    const cfg = await getConfig(token);
+    const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    if ((cfg.last_deliverability_check || "") === todayMadrid) return;
+
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?window_days=eq.30&mb_email=eq._global&select=sent,opens,bounces`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const tot = (Array.isArray(rows) ? rows : []).reduce(
+      (a, r) => ({ sent: a.sent + (r.sent || 0), opens: a.opens + (r.opens || 0), bounces: a.bounces + (r.bounces || 0) }),
+      { sent: 0, opens: 0, bounces: 0 }
+    );
+    await setConfigValue(token, "last_deliverability_check", todayMadrid).catch(() => {});
+    if (tot.sent < DELIV_MIN_SENT) return;
+
+    const openRate   = tot.opens / tot.sent;
+    const bounceRate = tot.bounces / tot.sent;
+    const problems = [];
+    if (openRate < DELIV_OPEN_FLOOR)   problems.push(`apertura ${(openRate * 100).toFixed(0)}% (piso ${DELIV_OPEN_FLOOR * 100}%)`);
+    if (bounceRate > DELIV_BOUNCE_CEIL) problems.push(`rebotes ${(bounceRate * 100).toFixed(1)}% (techo ${DELIV_BOUNCE_CEIL * 100}%)`);
+    if (!problems.length) return;
+
+    await createNotificationWorker(token, {
+      mb_email: "_admin",
+      type: "deliverability_health",
+      severity: "error",
+      title: "⚠️ Salud de envío en baja",
+      body: `Últimos 30d (${tot.sent} envíos): ${problems.join(" · ")}. Revisar reputación del remitente (Gmail/SPF/DKIM) y calidad de emails.`,
+      metadata: { sent: tot.sent, open_rate: +openRate.toFixed(3), bounce_rate: +bounceRate.toFixed(3) },
+      dedup_key: `deliverability-${todayMadrid}`,
+    });
+    log(`🚨 Deliverability alert: ${problems.join(", ")} (sent=${tot.sent})`);
+  } catch (e) { log(`⚠️ scanDeliverabilityHealth: ${e.message}`); }
+}
+
 async function runNotificationScanners(token) {
   await scanLowProspecting(token).catch(e => log(`⚠️ scanLowProsp: ${e.message}`));
   await scanWeeklyRates(token).catch(e => log(`⚠️ scanWeeklyRates: ${e.message}`));
   await scanSourceInsight(token).catch(e => log(`⚠️ scanInsight: ${e.message}`));
   await scanSystemFailures(token).catch(e => log(`⚠️ scanSysFail: ${e.message}`));
+  await scanDeliverabilityHealth(token).catch(e => log(`⚠️ scanDeliverability: ${e.message}`));
 }
 
 async function main() {
