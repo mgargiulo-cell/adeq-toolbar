@@ -2669,8 +2669,8 @@ function _sanitizeEmail(raw) {
   let e = raw;
   try { e = decodeURIComponent(e); } catch {}
   e = e.replace(/^(u00[0-9a-f]{2})+/i, "");        // u003e, u0022, ...
-  e = e.replace(/[\x00-\x1f\x7f\\]/g, "");         // control chars + backslash pegado
-  e = e.replace(/^[\s.>"'<]+/, "").trim().toLowerCase();
+  e = e.replace(/[\x00-\x1f\x7f\\%]/g, "");        // control chars, backslash y % residual (ej "%hector@")
+  e = e.replace(/^[^a-z0-9]+/i, "").trim().toLowerCase();  // cualquier basura al inicio (.>"'<% etc.)
   return _stripScrapePrefix(e);
 }
 
@@ -7307,6 +7307,14 @@ function _textToHtmlServer(text) {
 }
 
 async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null }) {
+  // Sanitización final del destinatario: aunque venga del review_queue, de un
+  // reintento o de un email viejo/manual, acá lo limpiamos (saca %, control chars,
+  // basura al inicio). Si queda inválido, NO enviamos (evita el caso "%hector@...").
+  to = _sanitizeEmail(to);
+  if (!to || !STRICT_EMAIL_RE.test(to)) {
+    log(`  ⛔ sendGmailServer: destinatario inválido tras sanitizar ("${to}") — no se envía`);
+    return { ok: false, error: "invalid_recipient" };
+  }
   const accessToken = await getGmailAccessToken(userEmail);
   const signatureHtml = await getGmailSignatureHtmlServer(userEmail);
   // Open-rate tracking pixel — solo si tenemos un agent_action_id (envíos del agente)
