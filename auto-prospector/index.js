@@ -1226,14 +1226,18 @@ async function _measureFeederRuns(token) {
 // para alimentar la cola con leads frescos para el día siguiente.
 // El propio worker auto-apaga después de 20min (SESSION_LIMIT_MS).
 // ════════════════════════════════════════════════════════════════
-const AUTOPILOT_DAILY_HOUR = 20;
+// Ventanas de autopilot (Madrid, L-V). Antes era solo 20:00 (1×/día) → "se prende
+// pocas veces". Ahora 4 ventanas alineadas con los slots del agente (9/12/15/18/20)
+// para garantizar que el worker esté despierto cuando dispara. El total diario de
+// prospects igual lo limita agent_max_per_day / daily_override.
+const AUTOPILOT_SLOTS = [12, 15, 18, 20];
 let _autopilotLastSlot = "";
 
 async function maybeStartAutopilotSlot(token) {
   const { hour, weekday, dateISO } = _madridNowParts();
   if (weekday === "Sat" || weekday === "Sun") return;
-  if (hour !== AUTOPILOT_DAILY_HOUR) return;
-  const slotLabel = `autopilot-${dateISO}-${String(AUTOPILOT_DAILY_HOUR).padStart(2, "0")}:00`;
+  if (!AUTOPILOT_SLOTS.includes(hour)) return;
+  const slotLabel = `autopilot-${dateISO}-${String(hour).padStart(2, "0")}:00`;
   if (_autopilotLastSlot === slotLabel) return;
 
   // Race-condition guard: persistir en Supabase para sobrevivir restarts.
@@ -2646,6 +2650,53 @@ function _stripScrapePrefix(email) {
   return email.toLowerCase();
 }
 
+// ── Limpieza/filtrado de emails scrapeados (calidad de contactos) ──
+const STRICT_EMAIL_RE = /^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$/;
+// Dominios de registradores / WHOIS-privacy — nunca son el contacto del medio.
+const JUNK_EMAIL_DOMAINS = new Set([
+  "networksolutionsprivateregistration.com","whoisprotectservice.net","domainsbyproxy.com",
+  "contactprivacy.com","privacyprotect.org","privacy-protect.org","whoisguard.com",
+  "resellerid.com","latintld.com","web.com","networksolutions.com","godaddy.com",
+  "namecheap.com","name.com","gandi.net","tucows.com","enom.com","registrarsafe.com",
+  "1and1.com","ionos.com","cdsfulfillment.com",
+]);
+const JUNK_LOCAL_RE = /^(dominios?|domainoperations|tldadmin|hostmaster|registrar|registrarcontact|abuse|abusereport|dns-admin|postmaster|noc)$/i;
+
+// Saca artefactos de extracción (u003e de JSON escapado, backslash/control chars
+// pegados, %20, prefijo "C"). Casos reales mayo: "u003enews@...", "news@x.tv\".
+function _sanitizeEmail(raw) {
+  if (!raw || typeof raw !== "string") return "";
+  let e = raw;
+  try { e = decodeURIComponent(e); } catch {}
+  e = e.replace(/^(u00[0-9a-f]{2})+/i, "");        // u003e, u0022, ...
+  e = e.replace(/[\x00-\x1f\x7f\\]/g, "");         // control chars + backslash pegado
+  e = e.replace(/^[\s.>"'<]+/, "").trim().toLowerCase();
+  return _stripScrapePrefix(e);
+}
+
+// Filtra emails scrapeados: sanitiza, valida formato estricto, descarta
+// registradores/WHOIS, exige que el dominio sea el del lead (corta ajenos),
+// prioriza personas sobre genéricos y capea a 15 por lead.
+// NO se aplica a emails de Apollo (esos van por otra vía y pueden ser webmail).
+function _cleanScrapedEmails(list, leadDomain) {
+  const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
+  const seen = new Set();
+  const valid = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const e = _sanitizeEmail(raw);
+    if (!e || !STRICT_EMAIL_RE.test(e) || seen.has(e)) continue;
+    if (IGNORE_EMAIL.some(p => e.includes(p))) continue;
+    const local = e.split("@")[0];
+    const dom   = e.split("@")[1];
+    if (JUNK_EMAIL_DOMAINS.has(dom) || JUNK_LOCAL_RE.test(local)) continue;
+    if (core && !(dom === core || dom.endsWith("." + core) || core.endsWith("." + dom))) continue;
+    seen.add(e);
+    valid.push(e);
+  }
+  valid.sort((a, b) => (_isGenericEmail(a) ? 1 : 0) - (_isGenericEmail(b) ? 1 : 0));
+  return valid.slice(0, 15);
+}
+
 // Cloudflare Email Obfuscation decoder.
 // CF Pro reemplaza emails con <a class="__cf_email__" data-cfemail="HEX">[email protected]</a>.
 // El HEX es: primer byte = XOR key, resto = caracteres del email XOR'd con el key.
@@ -2760,7 +2811,9 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     await tryFetch(base, 5000, true);
   }
 
-  return [...emails];
+  // Limpieza final: sanitiza, descarta registradores/WHOIS y ajenos al dominio,
+  // prioriza personas sobre genéricos y capea a 15. Corta el ruido del scraping.
+  return _cleanScrapedEmails([...emails], domain);
 }
 
 // ── Page intelligence ─────────────────────────────────────────
@@ -6992,10 +7045,12 @@ const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|pr
 // bounce. Solo chequeos GRATIS: garbage regex + MX records (DoH Cloudflare).
 async function validateEmailsBatch(emails) {
   if (!Array.isArray(emails) || emails.length === 0) return [];
+  const bounced = await loadBouncedEmails();   // reusa cache existente (TTL 5min)
   const out = [];
   for (const e of emails) {
     if (!e || typeof e !== "string" || !e.includes("@")) continue;
     const lower = e.toLowerCase().trim();
+    if (bounced.has(lower)) continue;   // ya rebotó — no re-agregar
     if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) continue;
     const local = lower.split("@")[0];
     if (GARBAGE_LOCAL_CONTAINS.test(local)) continue;
