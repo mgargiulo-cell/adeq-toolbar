@@ -818,6 +818,32 @@ const FEEDER_SELLERS_SOURCES = [
   "https://adkernel.com/sellers.json",
   "https://aax.network/sellers.json",
   "https://dailymotion.com/sellers.json",
+  // Agregadas user 2026-05-29 — validadas por HTTP (sellers.json real con publishers).
+  // Native/discovery + mobile SDKs + gestión de publishers + LATAM/ES.
+  "https://taboola.com/sellers.json",
+  "https://outbrain.com/sellers.json",
+  "https://nativo.com/sellers.json",
+  "https://applovin.com/sellers.json",
+  "https://ironsrc.com/sellers.json",
+  "https://inmobi.com/sellers.json",
+  "https://smaato.com/sellers.json",
+  "https://mintegral.com/sellers.json",
+  "https://chartboost.com/sellers.json",
+  "https://digitalturbine.com/sellers.json",   // cubre Fyber (misma data)
+  "https://buysellads.com/sellers.json",
+  "https://gourmetads.com/sellers.json",
+  "https://e-planning.net/sellers.json",
+  "https://mediavine.com/sellers.json",
+  "https://adthrive.com/sellers.json",         // = Raptive
+  "https://monetizemore.com/sellers.json",
+  "https://nitropay.com/sellers.json",
+  "https://snack-media.com/sellers.json",
+  "https://freestar.io/sellers.json",
+  "https://playwire.com/sellers.json",
+  "https://publift.com/sellers.json",
+  "https://underdogmedia.com/sellers.json",
+  "https://venatus.com/sellers.json",
+  "https://sunmedia.tv/sellers.json",
 ];
 
 let _feederLastSlot = "";  // "YYYY-MM-DD-HH:00" del último slot disparado
@@ -7559,6 +7585,12 @@ async function runAgentCycle(token, allFlags) {
   const whitelistRaw = (cfg.agent_whitelist || "mgargiulo@adeqmedia.com").trim();
   const AGENT_WHITELIST = new Set(whitelistRaw.split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
 
+  // Cap diario POR USUARIO (override del maxPerDay global). JSON en config:
+  // agent_max_per_day_by_user = {"sales@adeqmedia.com":15,"dhorovitz@adeqmedia.com":15}
+  // Si un user no está en el map, usa aCfg.maxPerDay.
+  let perUserCap = {};
+  try { perUserCap = JSON.parse(cfg.agent_max_per_day_by_user || "{}"); } catch {}
+
   for (const userEmail of allFlags.agentUsers) {
     if (!AGENT_WHITELIST.has((userEmail || "").toLowerCase())) {
       log(`🚫 Agent: user ${userEmail} no está en whitelist hardcoded — skip`);
@@ -7570,10 +7602,11 @@ async function runAgentCycle(token, allFlags) {
     scanAutoRepliesForUser(token, userEmail).catch(() => {});
     // Kill switch check
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
-    // Daily cap
+    // Daily cap — por usuario (override) o global
+    const userMaxPerDay = Number(perUserCap[(userEmail || "").toLowerCase()]) || aCfg.maxPerDay;
     const sentToday = await getAgentDailyCount(token, userEmail);
-    if (!TEST_MODE && sentToday >= aCfg.maxPerDay) {
-      log(`🤖 Agent ${userEmail}: cap diario ${aCfg.maxPerDay} alcanzado (${sentToday})`);
+    if (!TEST_MODE && sentToday >= userMaxPerDay) {
+      log(`🤖 Agent ${userEmail}: cap diario ${userMaxPerDay} alcanzado (${sentToday})`);
       continue;
     }
     // Weekly target (si configurado): cuenta sent en últimos 7 días
@@ -7584,7 +7617,7 @@ async function runAgentCycle(token, allFlags) {
         continue;
       }
     }
-    const remaining = TEST_MODE ? aCfg.perCycleLimit : (aCfg.maxPerDay - sentToday);
+    const remaining = TEST_MODE ? aCfg.perCycleLimit : (userMaxPerDay - sentToday);
     const batchSize = Math.min(aCfg.perCycleLimit, remaining);
 
     // Aplicar focus filtros al query.
