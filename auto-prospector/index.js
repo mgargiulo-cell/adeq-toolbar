@@ -5633,10 +5633,9 @@ async function scanBouncesForUser(token, userEmail) {
           if (!isBouncedSync(failed)) {
             await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1] });
             detected++;
-            // Trigger bounce retry (solo hard bounces — los soft Gmail los reintenta solo)
-            if (bounceType === "hard") {
-              queueBounceRetry(token, userEmail, failed, bounceType).catch(e => log(`⚠️ queueBounceRetry: ${e.message}`));
-            }
+            // user 2026-05-29: TODO rebote detectado (hard, soft/buzón-lleno o unknown)
+            // dispara retry → busca email nuevo, reenvía, actualiza Prospect + FU1/FU2.
+            queueBounceRetry(token, userEmail, failed, bounceType).catch(e => log(`⚠️ queueBounceRetry: ${e.message}`));
           }
         }
       } catch {}
@@ -5998,7 +5997,24 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         }
       } catch {}
 
-      // 6. Update Monday — email + RESET FU1 (today+5) + FU2 (today+10).
+      // 6a. Update Prospect (review_queue): sacar el email rebotado y poner el
+      // nuevo PRIMERO, para que la cola refleje el contacto válido (user 2026-05-29).
+      try {
+        const baseEmails = (lead.emails || []).filter(e => e && e.toLowerCase() !== bouncedEmail.toLowerCase());
+        const newEmails  = [retryEmail, ...baseEmails.filter(e => e.toLowerCase() !== retryEmail.toLowerCase())];
+        const newSources = { ...(lead.email_sources || {}) };
+        delete newSources[bouncedEmail.toLowerCase()];
+        if (!newSources[retryEmail.toLowerCase()]) newSources[retryEmail.toLowerCase()] = retrySource || "rescue";
+        if (lead.id) {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ emails: newEmails, email_sources: newSources }),
+          }).catch(() => {});
+        }
+      } catch (e) { log(`  ⚠️ ${domain}: review_queue update FAIL: ${e.message}`); }
+
+      // 6b. Update Monday — email + RESET FU1 (today+5) + FU2 (today+10).
       // Antes solo cambiábamos email, los FU quedaban con fecha vieja y Monday
       // no disparaba follow-ups o los disparaba tarde. Ahora reset completo.
       if (lead.monday_item_id && mondayApiKey) {
