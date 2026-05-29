@@ -3812,7 +3812,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   }, { token });
   const detectedLang = langDet.lang;
 
-  // 2. Emails — Apollo si visits >= 500K, scraping siempre como fallback.
+  // 2. Emails — Apollo unlock si visits >= 399K, scraping siempre como fallback.
   // Doble cap: diario (150) + mensual (2400 del plan). Si llega cualquiera,
   // skip Apollo y usa solo scraping. Cero impacto al flow (igual hay emails).
   const apolloMonthRemaining = (apolloUsage.monthLimit ?? APOLLO_MONTHLY_HARD_CAP) - (apolloUsage.usedThisMonth ?? 0);
@@ -7722,7 +7722,7 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // 1b. Si NO hay email DECENTE (rankScore >= 50), dispara enrichment AGRESIVO:
-        //     - findBestApolloEmail (free verified, o unlock 1 credit si traffic ≥ 500K)
+        //     - findBestApolloEmail (free verified, o unlock 1 credit si traffic ≥ 399K)
         //     - scrapeEmailsForDomain como fallback (gratis)
         // Audit fix 2026-05-13: antes "hasGoodEmail" solo chequeaba garbage filters,
         // entonces "contato@filmelier.com" (no-garbage pero generic role) era
