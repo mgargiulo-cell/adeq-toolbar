@@ -5578,8 +5578,10 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
 async function scanBouncesForUser(token, userEmail) {
   try {
     const accessToken = await getGmailAccessToken(userEmail);
-    // Query Gmail: from:mailer-daemon OR from:postmaster, últimas 24h
-    const q = encodeURIComponent('from:(mailer-daemon@ OR postmaster@ OR noreply@) subject:(undelivered OR "delivery status" OR "returned mail" OR "failure notice") newer_than:1d');
+    // Query Gmail: from:mailer-daemon OR from:postmaster, últimas 24h.
+    // in:anywhere → incluye Spam y Papelera (los avisos de rebote suelen caer en
+    // Spam por backscatter; sin esto Gmail los excluye y no detectaríamos el rebote).
+    const q = encodeURIComponent('from:(mailer-daemon@ OR postmaster@ OR noreply@) subject:(undelivered OR "delivery status" OR "returned mail" OR "failure notice") newer_than:1d in:anywhere');
     const listRes = await fetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,
       { headers: { "Authorization": `Bearer ${accessToken}` } }
