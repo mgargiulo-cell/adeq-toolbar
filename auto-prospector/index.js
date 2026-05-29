@@ -844,6 +844,12 @@ const FEEDER_SELLERS_SOURCES = [
   "https://underdogmedia.com/sellers.json",
   "https://venatus.com/sellers.json",
   "https://sunmedia.tv/sellers.json",
+  // Agregadas user 2026-05-29 (2da tanda) — LATAM + video. Validadas por HTTP.
+  "https://adsmovil.com/sellers.json",        // mobile LATAM
+  "https://connatix.com/sellers.json",        // video
+  "https://glomex.com/sellers.json",          // video editorial
+  "https://primis.tech/sellers.json",         // video nativo (VideoByte)
+  "https://unrulymedia.com/sellers.json",     // Unruly — video premium
 ];
 
 let _feederLastSlot = "";  // "YYYY-MM-DD-HH:00" del último slot disparado
