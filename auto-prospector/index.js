@@ -2661,6 +2661,23 @@ const JUNK_EMAIL_DOMAINS = new Set([
   "1and1.com","ionos.com","cdsfulfillment.com",
 ]);
 const JUNK_LOCAL_RE = /^(dominios?|domainoperations|tldadmin|hostmaster|registrar|registrarcontact|abuse|abusereport|dns-admin|postmaster|noc)$/i;
+// Tokens de admin de dominio/DNS en cualquier parte del local-part
+// (ej "tenmien.intecom", "admin-domaines-internet", "tdns").
+const JUNK_LOCAL_TOKENS = /(^|[._-])(tenmien|tdns|dns|domain|domains|domaines|hostmaster|registrar|tldadmin|abuse|noc|nic)([._-]|$)/i;
+// Placeholders de plantilla / buzones técnicos que nunca son contacto real.
+const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user$|^usuario$|^demo$|^sample$)/i;
+// Dominios de webmail (gmail, hotmail, etc. en cualquier TLD).
+const WEBMAIL_RE = /^(gmail|hotmail|outlook|live|yahoo|ymail|icloud|proton|protonmail|gmx|aol|msn|mail)\./i;
+
+// ¿El local-part parece una persona real (nombre)? Usado para decidir si
+// aceptamos un webmail scrapeado (juan.perez@gmail sí, info@gmail no).
+function _looksLikePerson(local) {
+  if (!local) return false;
+  if (PLACEHOLDER_LOCAL.test(local) || _isGenericEmail(`${local}@x.com`)) return false;
+  if (/^[a-z]+[._-][a-z]+/.test(local)) return true;            // nombre.apellido
+  if (/^[a-z]{3,18}$/.test(local) && /[aeiou]/.test(local)) return true; // nombre solo
+  return false;
+}
 
 // Saca artefactos de extracción (u003e de JSON escapado, backslash/control chars
 // pegados, %20, prefijo "C"). Casos reales mayo: "u003enews@...", "news@x.tv\".
@@ -2674,10 +2691,10 @@ function _sanitizeEmail(raw) {
   return _stripScrapePrefix(e);
 }
 
-// Filtra emails scrapeados: sanitiza, valida formato estricto, descarta
-// registradores/WHOIS, exige que el dominio sea el del lead (corta ajenos),
-// prioriza personas sobre genéricos y capea a 15 por lead.
-// NO se aplica a emails de Apollo (esos van por otra vía y pueden ser webmail).
+// Filtra emails scrapeados: sanitiza, valida formato, descarta registradores/WHOIS,
+// admin de dominio/DNS y placeholders. Acepta emails del dominio del lead; los
+// webmail (gmail/hotmail) solo si parecen persona (nombre.apellido). Prioriza
+// personas sobre genéricos y capea a 15. NO se aplica a emails de Apollo.
 function _cleanScrapedEmails(list, leadDomain) {
   const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
   const seen = new Set();
@@ -2688,8 +2705,14 @@ function _cleanScrapedEmails(list, leadDomain) {
     if (IGNORE_EMAIL.some(p => e.includes(p))) continue;
     const local = e.split("@")[0];
     const dom   = e.split("@")[1];
-    if (JUNK_EMAIL_DOMAINS.has(dom) || JUNK_LOCAL_RE.test(local)) continue;
-    if (core && !(dom === core || dom.endsWith("." + core) || core.endsWith("." + dom))) continue;
+    // Basura por local-part: roles de registro, admin de dominio/DNS, placeholders
+    if (JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local) || PLACEHOLDER_LOCAL.test(local)) continue;
+    // Basura por dominio: registradores/WHOIS
+    if (JUNK_EMAIL_DOMAINS.has(dom)) continue;
+    const isLeadDomain     = dom === core || dom.endsWith("." + core) || core.endsWith("." + dom);
+    const isPersonalWebmail = WEBMAIL_RE.test(dom) && _looksLikePerson(local);
+    // Solo el dominio del lead, o un webmail que parece persona. Lo demás (ajenos) fuera.
+    if (core && !isLeadDomain && !isPersonalWebmail) continue;
     seen.add(e);
     valid.push(e);
   }
