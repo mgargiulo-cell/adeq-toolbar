@@ -5706,13 +5706,14 @@ async function scanAutoRepliesForUser(token, userEmail) {
         // Verificar header Auto-Submitted si está presente (más confiable que subject)
         const autoSub = headers.find(h => h.name?.toLowerCase() === "auto-submitted")?.value || "";
         const isAutoSubmitted = /auto-replied|auto-generated/i.test(autoSub);
-        // Disparar retry — tratamos el email como "no-reader" igual que un soft bounce
-        if (!isBouncedSync(respondedFrom)) {
-          await markEmailBounced(token, { email: respondedFrom, reason: "auto_reply_detected", originalDomain: respondedFrom.split("@")[1] });
-          queueBounceRetry(token, userEmail, respondedFrom, "auto_reply").catch(e => log(`⚠️ autoReply retry: ${e.message}`));
-          detected++;
-          log(`🔁 auto-reply detectado: ${respondedFrom}${isAutoSubmitted ? " (header)" : " (subject)"} → retry queued`);
-        }
+        // user 2026-05-29: un auto-reply (out-of-office / vacaciones) PRUEBA que el
+        // email es VÁLIDO y hay una persona real — solo está ausente. NO lo
+        // blacklisteamos (antes lo hacía y abandonaba decision-makers buenos para
+        // siempre). Sí probamos un contacto alternativo por si es cola de tickets,
+        // pero el original queda usable para futuros intentos/cadencia.
+        await queueBounceRetry(token, userEmail, respondedFrom, "auto_reply").catch(e => log(`⚠️ autoReply retry: ${e.message}`));
+        detected++;
+        log(`🔁 auto-reply (ausencia) de ${respondedFrom}${isAutoSubmitted ? " (header)" : " (subject)"} → email VÁLIDO (no blacklist), probando alternativa`);
       } catch {}
     }
     if (detected) {
