@@ -8029,7 +8029,7 @@ async function loadProspectsTab() {
   if (statsEl) {
     const remaining = DAILY_SEND_CAP - sentFromProspects;
     const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
-    statsEl.innerHTML = `<strong>${sample.length}</strong> leads en tu lote · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy (te quedan ${remaining}) · 🔄 nuevo lote en ${minsLeft}min`;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> en tu lote · <strong>${rows.length}</strong> disponibles total (sorteo distinto por MB) · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy · 🔄 nuevo lote en ${minsLeft}min`;
   }
 
   listEl.querySelectorAll(".pcard").forEach(card => {

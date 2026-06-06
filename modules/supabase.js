@@ -590,7 +590,7 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
     // traffic ≥ 400K + status=pending es válido. Orden FIFO por created_at desc
     // → primero los más frescos (mejor para que vean los recién agregados).
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}${geoClause}&order=created_at.desc&limit=1000&select=${cols}`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}${geoClause}&order=created_at.desc&limit=3000&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
