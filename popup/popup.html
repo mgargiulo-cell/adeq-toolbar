@@ -115,11 +115,21 @@
       </select>
       <button id="admin-refresh-stats" class="btn btn-sm btn-primary">🔄</button>
     </div>
+    <!-- 👤 Actividad del MB (manual desde la toolbar) -->
+    <div style="font-size:10px;color:#cbd5e1;font-weight:700;letter-spacing:.5px;margin:6px 0 4px">👤 ACTIVIDAD DEL MB (MANUAL)</div>
     <div id="admin-stats-summary" class="admin-stats-summary">
-      <div class="stat-card"><div class="stat-num" id="stat-sites">--</div><div class="stat-label">Sites analyzed</div></div>
-      <div class="stat-card"><div class="stat-num" id="stat-emails">--</div><div class="stat-label">Emails sent</div></div>
-      <div class="stat-card"><div class="stat-num" id="stat-monday">--</div><div class="stat-label">Monday pushes</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-opens">--</div><div class="stat-label">Aperturas toolbar</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-sites">--</div><div class="stat-label">URLs analizadas</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-emails-manual">--</div><div class="stat-label">Emails manuales</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-monday-manual">--</div><div class="stat-label">Monday manuales</div></div>
+    </div>
+    <!-- 🤖 Actividad del agente (acting for this MB) -->
+    <div style="font-size:10px;color:#cbd5e1;font-weight:700;letter-spacing:.5px;margin:10px 0 4px">🤖 AGENTE AUTOMATIZADO (acting for this MB)</div>
+    <div class="admin-stats-summary">
+      <div class="stat-card"><div class="stat-num" id="stat-emails-agent">--</div><div class="stat-label">Emails enviados</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-monday-agent">--</div><div class="stat-label">Monday pushed</div></div>
       <div class="stat-card"><div class="stat-num" id="stat-500k-up">--</div><div class="stat-label">+500K visits</div></div>
+      <div class="stat-card"><div class="stat-num" id="stat-bounces">--</div><div class="stat-label">% rebote</div></div>
     </div>
     <div class="admin-chart-wrap">
       <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">Sites analyzed per day</div>

@@ -1588,23 +1588,24 @@ async function loadAdminActivity() {
   const queueDomains   = new Set(queueRes.map(q => (q.domain || "").toLowerCase()).filter(Boolean));
   const allDomains     = new Set([...histDomains, ...queueDomains]);
   const sites          = allDomains.size;
-  // Emails y Monday pushes — combinamos 3 fuentes para no perder datos:
-  // 1) api_usage._emails_sent / _monday_pushes (popup MB sends)
-  // 2) agent_actions.action='sent' / 'monday_ok' (agente automático)
-  // 3) historial rows con email (fallback si api_usage no se bumpeó por bug/version vieja)
-  const emailsFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
-  const mondayFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
-  const emailsFromAgent = agentActions.filter(a => a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent").length;
-  const mondayFromAgent = agentActions.filter(a => a.action === "monday_ok").length;
-  // Fallback historial: cada row es un push a Monday; si tiene email también es un send
-  const emailsFromHistorial = histRes.filter(h => h.email && /\@/.test(h.email)).length;
-  const mondayFromHistorial = histRes.length;
-  // Fallback sendtrack: cada row es un envío real (1 dominio = 1 send/día). Source de verdad
-  // cuando api_usage no se bumpeó (versión vieja) o RLS bloquea.
-  const emailsFromSendtrack = Array.isArray(trackRes) ? trackRes.length : 0;
-  // Tomamos MAX entre las 3 fuentes manuales (usage, historial, sendtrack) + sumamos agent.
-  const emails = Math.max(emailsFromUsage, emailsFromHistorial, emailsFromSendtrack) + emailsFromAgent;
-  const monday = Math.max(mondayFromUsage, mondayFromHistorial) + mondayFromAgent;
+  // user 2026-05-29: SEPARACIÓN MB MANUAL vs AGENTE.
+  // Manual = lo que el MB hizo a mano desde el popup (api_usage o agent_actions
+  // con details.ui_origin='toolbar_manual').
+  // Agente = lo que el bot automatizado disparó (resto de agent_actions).
+  const popupOpens     = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._popup_opens   || 0, 10), 0);
+  const sitesManual    = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._sites_analyzed || 0, 10), 0);
+  const emailsManualFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent   || 0, 10), 0);
+  const mondayManualFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
+  // Agente: solo lo que NO es ui_origin=toolbar_manual.
+  const isManualAction = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
+  const emailsAgent = agentActions.filter(a => !isManualAction(a) && (a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent")).length;
+  const mondayAgent = agentActions.filter(a => !isManualAction(a) && a.action === "monday_ok").length;
+  // Bounce rate del agente (rebotes / emails enviados por el agente).
+  const bouncesAgent = Array.isArray(bounceRetries) ? bounceRetries.length : 0;
+  const bouncePct = emailsAgent > 0 ? Math.round((bouncesAgent / emailsAgent) * 100) : 0;
+  // Totales (compat): los podemos seguir usando en otras vistas.
+  const emails = emailsManualFromUsage + emailsAgent;
+  const monday = mondayManualFromUsage + mondayAgent;
   // toolbar_historial usa page_views/raw_visits (no 'traffic'). Combinar histórico + review_queue para tráfico.
   const trafficOf      = (h) => parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
   const allRows        = [...histRes, ...queueRes];
@@ -1618,10 +1619,16 @@ async function loadAdminActivity() {
     ? `${Math.floor(apSec / 3600)}h ${Math.round((apSec % 3600) / 60)}m`
     : `${Math.round(apSec / 60)}m`;
 
-  document.getElementById("stat-sites").textContent     = sites.toLocaleString();
-  document.getElementById("stat-emails").textContent    = emails.toLocaleString();
-  document.getElementById("stat-monday").textContent    = monday.toLocaleString();
-  document.getElementById("stat-500k-up").textContent   = above500k.toLocaleString();
+  // 👤 MB MANUAL
+  document.getElementById("stat-opens").textContent          = popupOpens.toLocaleString();
+  document.getElementById("stat-sites").textContent          = (sitesManual || sites).toLocaleString();
+  document.getElementById("stat-emails-manual").textContent  = emailsManualFromUsage.toLocaleString();
+  document.getElementById("stat-monday-manual").textContent  = mondayManualFromUsage.toLocaleString();
+  // 🤖 AGENTE
+  document.getElementById("stat-emails-agent").textContent   = emailsAgent.toLocaleString();
+  document.getElementById("stat-monday-agent").textContent   = mondayAgent.toLocaleString();
+  document.getElementById("stat-500k-up").textContent        = above500k.toLocaleString();
+  document.getElementById("stat-bounces").textContent        = emailsAgent > 0 ? `${bouncePct}%` : "—";
 
   // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial.
   // CADA review_queue row genera 1 row para el created_by (descubrió/importó) Y
@@ -1807,10 +1814,11 @@ function renderAdminComparator(historial, usage, sessions, agentActions = [], bo
   // Definición de filas: { label, group, get(mb) → value, fmt(value) → display, isBest higher/lower, colorFn(value) → class }
   const groups = [
     {
-      title: "VOLUME",
+      title: "USO MANUAL (👤 lo que hace el MB)",
       rows: [
-        { label: "Sites analyzed",         get: m => m.sites, fmt: v => v.toLocaleString() },
-        { label: "Analysis / Prospects",   get: m => m.manualSites + m.autopilotSites, fmt: (_, m) => `${m.manualSites} / ${m.autopilotSites}`, _help: "Analysis = manual from Analysis tab. Prospects = picked from review_queue (autopilot/csv import)." },
+        { label: "Aperturas toolbar",      get: m => m.opens || 0, fmt: v => v.toLocaleString() },
+        { label: "URLs analizadas",        get: m => m.sitesManual || m.sites, fmt: v => v.toLocaleString() },
+        { label: "Analysis / Prospects",   get: m => (m.manualSites || 0) + (m.autopilotSites || 0), fmt: (_, m) => `${m.manualSites || 0} / ${m.autopilotSites || 0}`, _help: "Analysis = manual desde Analysis tab. Prospects = pickeados del review_queue." },
         { label: "Autopilot time",         get: m => m.apSec, fmt: v => fmtTime(v) },
       ],
     },
@@ -1996,11 +2004,13 @@ function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
   // Los totales (emails/monday) se computan sumando ambos para retro-compat.
   usage.forEach(r => {
     const u = _normalizeUserKey(r.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, claude: 0, apSec: 0, popupSec: 0 });
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, opens: 0, sitesManual: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     // SUMAR (api_usage tiene 1 row por día, hay que sumar todos los días)
-    o.emailsManual += parseInt(r.by_provider?._emails_sent   || 0, 10);
-    o.mondayManual += parseInt(r.by_provider?._monday_pushes || 0, 10);
+    o.opens        += parseInt(r.by_provider?._popup_opens    || 0, 10);
+    o.sitesManual  += parseInt(r.by_provider?._sites_analyzed || 0, 10);
+    o.emailsManual += parseInt(r.by_provider?._emails_sent    || 0, 10);
+    o.mondayManual += parseInt(r.by_provider?._monday_pushes  || 0, 10);
     o.claude       += parseInt(r.by_provider?.anthropic || 0, 10);
   });
   sessions.forEach(s => {
@@ -2665,6 +2675,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Tracking real de tiempo: abrir sesión "popup" en Supabase. Se cierra al
   // unload o cuando el side panel se oculta (visibility change).
   startUsageSession(state.accessToken, state.loginEmail, "popup").catch(() => {});
+  // user 2026-05-29: instrumentación nueva del panel admin — cuenta aperturas
+  // de la toolbar (1 por load). Es la métrica "cuánto la usa".
+  incrementUserDailyCounter(state.accessToken, state.loginEmail, "opens").catch(() => {});
 
   // Coordinación entre MBs: vacation toggle en settings + check de handoffs pendientes
   setupVacationToggle();
@@ -3363,6 +3376,16 @@ async function runAuditCheck() {
 
   try {
     const audit      = await runAudit(state.url, state.traffic);
+    // user 2026-05-29: trackeo URL analizada (con dedup por dominio en la sesión
+    // para no contar refreshes del mismo sitio como múltiples análisis).
+    try {
+      const _domNorm = (state.domain || "").toLowerCase();
+      window._analyzedDomainsThisSession = window._analyzedDomainsThisSession || new Set();
+      if (_domNorm && !window._analyzedDomainsThisSession.has(_domNorm)) {
+        window._analyzedDomainsThisSession.add(_domNorm);
+        incrementUserDailyCounter(state.accessToken, state.loginEmail, "sites").catch(() => {});
+      }
+    } catch {}
     state.techStack  = audit.techStack;
     state.adsTxt     = audit.adsTxt;
     state.revenueGap = audit.revenueGap;

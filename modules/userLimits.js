@@ -111,10 +111,11 @@ export async function getUserDailyUsage(accessToken, email) {
 }
 
 export async function incrementUserDailyCounter(accessToken, email, kind) {
-  // kind: "emails" | "monday"
-  if (!accessToken || !email || !["emails", "monday"].includes(kind)) return;
+  // kind: "emails" | "monday" | "opens" | "sites"
+  const FIELDS = { emails: "_emails_sent", monday: "_monday_pushes", opens: "_popup_opens", sites: "_sites_analyzed" };
+  const field = FIELDS[kind];
+  if (!accessToken || !email || !field) return;
   const today = new Date().toISOString().slice(0, 10);
-  const field = kind === "emails" ? "_emails_sent" : "_monday_pushes";
   try {
     // Leer estado actual
     const res = await fetch(
