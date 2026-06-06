@@ -4228,9 +4228,10 @@ async function runSession(token, cfg, sessionStart) {
 
   // ── ROTACIÓN INTERNA AUTOPILOT con RATIO ADAPTATIVO (user 2026-05-13) ──
   // Mismo botón, 2 ideas: Majestic vs similar-sites discovery.
-  // Sistema aprende cuál genera más leads durante el día y ajusta el ratio.
-  // Floor 20%/cap 80% para no abandonar al peor (puede mejorar más tarde).
-  let _probMajestic = 0.5;
+  // user 2026-05-29: el feeder YA cubre Majestic (su pool principal), así que el
+  // autopilot redundaba y producía 0. Lo sesgamos a similar_discovery (su modo
+  // único) — baseline 0.15 majestic / 0.85 similar, floor 0.05.
+  let _probMajestic = 0.15;
   try {
     const statsRes = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autopilot_majestic_leads_today,autopilot_similar_leads_today,autopilot_stats_date)&select=key,value`,
@@ -4244,7 +4245,7 @@ async function runSession(token, cfg, sessionStart) {
       const majLeads = parseInt(statsMap.autopilot_majestic_leads_today || "0", 10);
       const simLeads = parseInt(statsMap.autopilot_similar_leads_today || "0", 10);
       if (majLeads + simLeads >= 5) {  // mínimo data point antes de adaptarse
-        _probMajestic = Math.max(0.2, Math.min(0.8, majLeads / (majLeads + simLeads)));
+        _probMajestic = Math.max(0.05, Math.min(0.5, majLeads / (majLeads + simLeads)));
       }
       log(`📊 Stats hoy — Majestic: ${majLeads} leads, Similar: ${simLeads} leads → P(majestic)=${_probMajestic.toFixed(2)}`);
     }
@@ -4417,23 +4418,37 @@ async function runSession(token, cfg, sessionStart) {
     return;
   }
 
-  // ── SEED desde likes: inyectar similares de los últimos 30 dominios que el user 👍 ──
-  // Esto crea un feedback loop positivo: te gustó X → próxima sesión busca sitios como X
-  // Reducido de 30 → 10 para limitar coste de RapidAPI: 30 likes × 1 call = 30 hits
-  // por arranque de sesión. Con 10 son 10 hits/sesión × 5 MBs = 50/día solo en seeds.
-  const likedSeeds = feedback.likedDomains.slice(0, 10);
+  // ── SEED desde likes + leads VALIDADOS de alto tráfico ──
+  // user 2026-05-29: el autopilot producía 0 porque su pool era 99% conocidos.
+  // Ahora sembramos con: (a) hasta 20 dominios likeados recientes, (b) hasta 15
+  // leads validados (>=500K visitas) del review_queue. Eso son ~35 seeds × ~10
+  // similares cada uno = ~350 candidatos frescos por sesión.
+  const likedSeeds = feedback.likedDomains.slice(0, 20);
+  // (b) Top leads validados recientes — los que ya pasaron por humano = high-signal seeds
+  const validatedSeeds = [];
+  try {
+    const valRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&traffic=gte.500000&select=domain&order=validated_at.desc&limit=15`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (valRes.ok) {
+      const rows = await valRes.json();
+      (Array.isArray(rows) ? rows : []).forEach(r => r.domain && validatedSeeds.push(r.domain.toLowerCase()));
+    }
+  } catch {}
+  const allSeeds = [...new Set([...likedSeeds, ...validatedSeeds])];
   const likedSimilarDomains = new Set();
-  if (likedSeeds.length > 0) {
-    log(`Seeding similar-sites desde ${likedSeeds.length} likes recientes...`);
+  if (allSeeds.length > 0) {
+    log(`Seeding similar-sites desde ${allSeeds.length} seeds (${likedSeeds.length} likes + ${validatedSeeds.length} validados ≥500K)...`);
     const simResults = await Promise.all(
-      likedSeeds.map(d => findSimilarSites(d, rapidapi_key).catch(() => []))
+      allSeeds.map(d => findSimilarSites(d, rapidapi_key).catch(() => []))
     );
     for (const list of simResults) {
       for (const sim of list) {
         if (!mondaySet.has(sim) && !processed.has(sim)) likedSimilarDomains.add(sim);
       }
     }
-    log(`  🔗 Similares de likes: +${likedSimilarDomains.size} dominios con prioridad`);
+    log(`  🔗 Similares de seeds: +${likedSimilarDomains.size} dominios frescos con prioridad`);
   }
 
   // Cola dinámica: priorizar similares-de-likes primero, después pool random
