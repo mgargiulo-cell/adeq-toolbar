@@ -7865,6 +7865,54 @@ async function renderProspectsEmptyState(listEl) {
   listEl.innerHTML = html;
 }
 
+// ── GEO filter dropdown: dinámico desde los leads disponibles ─────────────
+// ISO 2-letter → emoji flag (regional indicator chars).
+function _isoToFlag(iso) {
+  if (!iso || iso.length !== 2) return "🌍";
+  try {
+    return String.fromCodePoint(...[...iso.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
+  } catch { return "🌍"; }
+}
+// Nombres de país comunes. Para los no listados mostramos el ISO solo.
+const _GEO_NAMES = {
+  AR:"Argentina", BR:"Brasil", ES:"España", MX:"México", CO:"Colombia", CL:"Chile",
+  PE:"Perú", UY:"Uruguay", EC:"Ecuador", VE:"Venezuela", DO:"Rep. Dominicana",
+  PA:"Panamá", BO:"Bolivia", GT:"Guatemala", CR:"Costa Rica", HN:"Honduras",
+  SV:"El Salvador", NI:"Nicaragua", PY:"Paraguay", PR:"Puerto Rico", CU:"Cuba",
+  PT:"Portugal", IT:"Italia", FR:"Francia", DE:"Alemania", US:"USA", GB:"Reino Unido",
+  CA:"Canadá", NL:"Países Bajos", BE:"Bélgica", CH:"Suiza", AT:"Austria",
+  IE:"Irlanda", DK:"Dinamarca", SE:"Suecia", NO:"Noruega", FI:"Finlandia",
+  PL:"Polonia", CZ:"Chequia", HU:"Hungría", RO:"Rumania", GR:"Grecia",
+  IN:"India", PK:"Pakistán", BD:"Bangladesh", LK:"Sri Lanka", ID:"Indonesia",
+  PH:"Filipinas", VN:"Vietnam", TH:"Tailandia", MY:"Malasia", SG:"Singapur",
+  SA:"Arabia Saudita", AE:"Emiratos", EG:"Egipto", TR:"Turquía", IL:"Israel",
+  NG:"Nigeria", KE:"Kenia", ZA:"Sudáfrica", MA:"Marruecos", DZ:"Argelia",
+  JP:"Japón", KR:"Corea", AU:"Australia", NZ:"Nueva Zelanda", CN:"China", TW:"Taiwán",
+  RU:"Rusia", UA:"Ucrania", BG:"Bulgaria", HR:"Croacia", SK:"Eslovaquia",
+};
+function _rebuildGeoFilterFromRows(rows) {
+  const sel = document.getElementById("prospects-geo-filter");
+  if (!sel) return;
+  const counts = new Map();
+  for (const r of rows || []) {
+    let iso = "";
+    if (Array.isArray(r.geos_all) && r.geos_all.length) iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
+    else if (r.geo) iso = String(r.geo).toUpperCase().slice(0, 2);
+    if (!iso || iso.length !== 2) continue;
+    counts.set(iso, (counts.get(iso) || 0) + 1);
+  }
+  if (counts.size === 0) return;  // no rows → dejar las opciones actuales
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const current = sel.value;
+  let html = '<option value="">🌍 All GEOs</option>';
+  for (const [iso, n] of sorted) {
+    const name = _GEO_NAMES[iso] || iso;
+    html += `<option value="${iso}">${_isoToFlag(iso)} ${name} (${n})</option>`;
+  }
+  sel.innerHTML = html;
+  if (current && [...sel.options].some(o => o.value === current)) sel.value = current;
+}
+
 async function loadProspectsTab() {
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
@@ -7950,6 +7998,10 @@ async function loadProspectsTab() {
   const SLOT_MIN    = 30;           // rotar cada 30 minutos
   const slotIdx     = Math.floor(Date.now() / (SLOT_MIN * 60 * 1000));
   const userKey     = (state.loginEmail || "anon").toLowerCase();
+
+  // Repoblar dropdown de GEO con TODOS los países que tienen leads disponibles
+  // (solo cuando no hay filtro activo, así vemos el universo completo).
+  if (!geoFilter) _rebuildGeoFilterFromRows(rows);
   // Bug fix 2026-05-14: slotKey debe incluir filtros (incluido geo).
   const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}|${geoFilter}`;
   const slotKey     = `_prospects_slot_${userKey}_${filterHash}_${slotIdx}`;
