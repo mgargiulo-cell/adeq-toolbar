@@ -2909,6 +2909,8 @@ async function fetchPageContent(domain) {
     if (/optad360\.com/i.test(html))                                       adNetworks.push("Optad360");
     if (/embimedia\.com|embi\.media/i.test(html))                         adNetworks.push("Embi Media");
     if (/snigel\.com/i.test(html))                                         adNetworks.push("Snigel");
+    if (/teads\.tv|teads\.com/i.test(html))                                adNetworks.push("Teads");
+    if (/smilewanted\.com/i.test(html))                                    adNetworks.push("SmileWanted");
 
     // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
     // Adult/Streaming PRIMERO porque scoreWebsite los usa como gates duros (descarte total).

@@ -552,10 +552,10 @@ export async function setAutopilotTarget(geo, category, minTraffic, accessToken)
 }
 
 // ── Review Queue — candidatos del auto-prospector para validación ─────
-export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFilter = "", userFilter = "" } = {}) {
+export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFilter = "", userFilter = "", geoFilter = "" } = {}) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const cols = "id,domain,traffic,geo,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by";
+  const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by";
   // Date filter: "" | "today" | "yesterday" | "last7" | "last30"
   let dateClause = "";
   if (dateFilter) {
@@ -576,13 +576,21 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
   }
   const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
   const userClause   = userFilter   ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
+  // Geo filter: matchea contra `geo` (NAME, legacy) o `geos_all` (ISO array).
+  // Acepta ISO 2-letter (AR, BR, ES, MX, etc.). Si el legacy `geo` tiene country
+  // name, hacemos un match laxo con ilike.
+  let geoClause = "";
+  if (geoFilter) {
+    const g = geoFilter.trim().toUpperCase();
+    geoClause = `&or=(geos_all.cs.{${g}},geo.ilike.${encodeURIComponent(g)}*)`;
+  }
   try {
     // Política user 2026-05-18: NO ordenar por score — el score no se usa para
     // seleccionar URLs (solo rankEmail decide para emails). Cualquier lead con
     // traffic ≥ 400K + status=pending es válido. Orden FIFO por created_at desc
     // → primero los más frescos (mejor para que vean los recién agregados).
     const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}&order=created_at.desc&limit=500&select=${cols}`,
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}${geoClause}&order=created_at.desc&limit=1000&select=${cols}`,
       { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];

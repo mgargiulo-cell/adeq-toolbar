@@ -777,13 +777,13 @@ function formatUploadResult(result, attempted) {
   const nextDay = result?.intoNextDay || 0;
   const waiting = result?.intoWaiting || 0;
   if (ins === 0) {
-    if (dup > 0) return { msg: `⏸ 0 added — all ${dup} already known`, color: "#94a3b8" };
-    return { msg: `⏸ 0 added`, color: "#94a3b8" };
+    if (dup > 0) return { msg: `ℹ️ Los ${dup} ya estaban en el sistema (no es error, son repetidos)`, color: "#0ea5e9" };
+    return { msg: `⏸ 0 nuevos para agregar`, color: "#94a3b8" };
   }
-  let parts = [`✅ ${ins} added to queue`];
-  if (waiting > 0)  parts.push(`${waiting} in waitlist`);
-  if (nextDay > 0)  parts.push(`${nextDay} for tomorrow`);
-  if (dup > 0)      parts.push(`${dup} dup`);
+  let parts = [`✅ ${ins} agregados — aparecen primero en Prospects`];
+  if (waiting > 0)  parts.push(`${waiting} en espera`);
+  if (nextDay > 0)  parts.push(`${nextDay} para mañana`);
+  if (dup > 0)      parts.push(`${dup} repetidos`);
   return { msg: parts.join(" · "), color: "#16a34a" };
 }
 
@@ -6605,7 +6605,7 @@ async function initCsvQueue() {
     const ok = await setCsvQueueEnabled(desired, state.accessToken, state.loginEmail);
     if (!ok) {
       enabledCbx.checked = !desired;
-      showToast(`❌ Could not ${desired ? "enable" : "disable"} Auto Import. Retry.`, "error");
+      showToast(`❌ No se pudo ${desired ? "activar" : "desactivar"} Auto Import. Reintentá; si persiste, revisá sesión/permisos o pedile a un admin que verifique RLS.`, "error");
       return;
     }
     if (enabledCbx.checked) startHeartbeat();
@@ -6679,7 +6679,7 @@ async function initCsvQueue() {
           userEmail: state.loginEmail, source: "csv",
           sourceDetail: file?.name || "", attempted: unique.length, deduped: unique.length, inserted: 0,
         });
-        uploadRes.innerHTML = `<span style="color:#d97706">⚠️ ${unique.length} domains — ALL already known (queue/review/history/blocklist). Nothing new to queue.</span>`;
+        uploadRes.innerHTML = `<span style="color:#0ea5e9">ℹ️ Los ${unique.length} dominios ya están en el sistema (no es un error — el sistema descarta repetidos para no duplicarte trabajo). No hay leads nuevos para agregar de este archivo.</span>`;
         uploadRes.className = "push-result";
         return;
       }
@@ -6740,7 +6740,7 @@ async function initCsvQueue() {
           userEmail: state.loginEmail, source: "monday",
           sourceDetail: _filterDetail, attempted: domains.length, deduped: domains.length, inserted: 0,
         });
-        resultEl.textContent = `0 added — all ${domains.length} already known (queue/review/history/blocklist).`;
+        resultEl.textContent = `ℹ️ Los ${domains.length} dominios ya estaban en el sistema (repetidos). 0 nuevos para agregar — no es un error, es que ya los conocíamos.`;
         resultEl.className = "push-result";
         return;
       }
@@ -7875,12 +7875,13 @@ async function loadProspectsTab() {
   const dateFilter   = document.getElementById("prospects-date-filter")?.value   || "";
   const sourceFilter = document.getElementById("prospects-source-filter")?.value || "";
   const userFilter   = document.getElementById("prospects-user-filter")?.value   || "";
+  const geoFilter    = document.getElementById("prospects-geo-filter")?.value    || "";
   let rows = [];
   let dailyCount = 0;
   let snoozedSet = new Set();
   try {
     const [_rows, _count, _drafts, _snoozedRes] = await Promise.all([
-      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter, userFilter }),
+      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter, userFilter, geoFilter }),
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
       // Snoozes activos del MB actual (snooze_until > now). Cada MB tiene su propia bolsa.
@@ -7945,14 +7946,12 @@ async function loadProspectsTab() {
   // toolbar dentro del slot devuelve EL MISMO sample (no se mueve).
   // Cuando entra el próximo slot (30 min), nuevo shuffle automático.
   // Persistido en chrome.storage.local con key que incluye el slot.
-  const VISIBLE_CAP = 100;
-  const SLOT_MIN    = 30; // rotar cada 30 minutos
+  const VISIBLE_CAP = 200;          // user 2026-05-29: subido de 100 → 200
+  const SLOT_MIN    = 30;           // rotar cada 30 minutos
   const slotIdx     = Math.floor(Date.now() / (SLOT_MIN * 60 * 1000));
   const userKey     = (state.loginEmail || "anon").toLowerCase();
-  // Bug fix 2026-05-14: slotKey debe incluir filtros, sino cambiar filtro
-  // mantiene los assignedIds viejos y el lote queda "congelado" en el subset
-  // del filter anterior. Filtros distintos = lotes distintos.
-  const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}`;
+  // Bug fix 2026-05-14: slotKey debe incluir filtros (incluido geo).
+  const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}|${geoFilter}`;
   const slotKey     = `_prospects_slot_${userKey}_${filterHash}_${slotIdx}`;
 
   let assignedIds = [];
@@ -7964,13 +7963,48 @@ async function loadProspectsTab() {
   } catch {}
 
   if (assignedIds.length === 0) {
-    // Nuevo slot — shuffle + slice 100 + persistir
-    const shuffled = [...rows];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    // user 2026-05-29: mezcla balanceada por GEO (antes un shuffle plano dejaba
+    // que IN/GB/US dominaran). Estrategia:
+    //   1. Tus propios imports (created_by = vos) van PRIMERO — para que veas
+    //      el resultado de las búsquedas que disparaste.
+    //   2. El resto: agrupar por GEO, shuffle dentro de cada grupo, y picar
+    //      round-robin (1 de cada GEO por vuelta) hasta llenar VISIBLE_CAP.
+    //      Resultado: ningún país acapara la lista, mucho más variado.
+    const me = (state.loginEmail || "").toLowerCase();
+    const mine  = rows.filter(r => (r.created_by || "").toLowerCase() === me);
+    const other = rows.filter(r => (r.created_by || "").toLowerCase() !== me);
+    const shuffle = (arr) => {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    };
+    shuffle(mine);
+    // Bucketize por geo (legacy `geo` name o primer ISO de geos_all)
+    const buckets = new Map();
+    for (const r of other) {
+      let g = (r.geo || (Array.isArray(r.geos_all) ? r.geos_all[0] : "") || "?").toString().toUpperCase().slice(0,3);
+      if (!buckets.has(g)) buckets.set(g, []);
+      buckets.get(g).push(r);
     }
-    assignedIds = shuffled.slice(0, VISIBLE_CAP).map(r => r.id);
+    for (const arr of buckets.values()) shuffle(arr);
+    // Round-robin: 1 de cada bucket por iteración hasta llenar
+    const mixed = [];
+    const keys = [...buckets.keys()];
+    shuffle(keys); // orden inicial de buckets al azar también
+    let safety = 5000;
+    while (mixed.length + mine.length < VISIBLE_CAP && safety-- > 0) {
+      let progressed = false;
+      for (const k of keys) {
+        const b = buckets.get(k);
+        if (b && b.length) { mixed.push(b.shift()); progressed = true; }
+        if (mixed.length + mine.length >= VISIBLE_CAP) break;
+      }
+      if (!progressed) break;
+    }
+    const finalRows = [...mine, ...mixed].slice(0, VISIBLE_CAP);
+    assignedIds = finalRows.map(r => r.id);
     await chrome.storage.local.set({ [slotKey]: assignedIds }).catch(() => {});
     // Cleanup slots viejos del mismo user
     try {
@@ -9233,13 +9267,15 @@ async function refreshProspectsStats() {
 async function initProspectsTab() {
   // Restore filtros guardados de sesiones previas
   try {
-    const { _prospectsDateFilter, _prospectsSourceFilter, _prospectsUserFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter", "_prospectsUserFilter"]);
+    const { _prospectsDateFilter, _prospectsSourceFilter, _prospectsUserFilter, _prospectsGeoFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter", "_prospectsUserFilter", "_prospectsGeoFilter"]);
     const dateEl   = document.getElementById("prospects-date-filter");
     const sourceEl = document.getElementById("prospects-source-filter");
     const userEl   = document.getElementById("prospects-user-filter");
+    const geoEl    = document.getElementById("prospects-geo-filter");
     if (dateEl   && _prospectsDateFilter)   dateEl.value   = _prospectsDateFilter;
     if (sourceEl && _prospectsSourceFilter) sourceEl.value = _prospectsSourceFilter;
     if (userEl   && _prospectsUserFilter)   userEl.value   = _prospectsUserFilter;
+    if (geoEl    && _prospectsGeoFilter)    geoEl.value    = _prospectsGeoFilter;
   } catch {}
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
@@ -9254,6 +9290,10 @@ async function initProspectsTab() {
   });
   document.getElementById("prospects-user-filter")?.addEventListener("change", async (e) => {
     chrome.storage.local.set({ _prospectsUserFilter: e.target.value }).catch(() => {});
+    await loadProspectsTab();
+  });
+  document.getElementById("prospects-geo-filter")?.addEventListener("change", async (e) => {
+    chrome.storage.local.set({ _prospectsGeoFilter: e.target.value }).catch(() => {});
     await loadProspectsTab();
   });
   // ── Filter presets por SOURCE: filtrar leads según de dónde vinieron ─────
