@@ -1577,7 +1577,7 @@ async function loadAdminActivity() {
     }),
     // toolbar_agent_actions — el agente cuenta como "MB" más en el comparador.
     // Filtramos action=sent (los exitosos) en el período.
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${from}&created_at=lte.${to}T23:59:59&select=domain,user_email,pitch_subject,details,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,monday_ok)&created_at=gte.${from}&created_at=lte.${to}T23:59:59&select=domain,user_email,action,pitch_subject,details,created_at&order=created_at.desc&limit=5000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${from}&created_at=lte.${to}T23:59:59${bounceUserClause}&select=mb_email,domain,bounce_type,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
   ]);
 
@@ -1823,12 +1823,18 @@ function renderAdminComparator(historial, usage, sessions, agentActions = [], bo
       ],
     },
     {
-      title: "OUTREACH",
+      title: "OUTREACH (👤 MANUAL del MB)",
       rows: [
-        { label: "Emails sent",        get: m => m.emails, fmt: v => v.toLocaleString() },
-        { label: "Monday pushes",      get: m => m.monday, fmt: v => v.toLocaleString() },
+        { label: "Emails — manual",    get: m => m.emailsManual || 0, fmt: v => v.toLocaleString() },
+        { label: "Monday — manual",    get: m => m.mondayManual || 0, fmt: v => v.toLocaleString() },
+      ],
+    },
+    {
+      title: "OUTREACH (🤖 AGENTE automatizado)",
+      rows: [
+        { label: "Emails — agente",    get: m => m.emailsAgent || 0, fmt: v => v.toLocaleString() },
+        { label: "Monday — agente",    get: m => m.mondayAgent || 0, fmt: v => v.toLocaleString() },
         { label: "Conv. push/site",    get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
-        // % bounce — más bajo es mejor (color invertido vs. el resto)
         { label: "% bounce",           get: m => m.emails > 0 ? Math.round((m.bounces / m.emails) * 100) : 0, fmt: (v, m) => m.emails > 0 ? `${v}% (${m.bounces})` : "—", color: v => v <= 3 ? "good" : v <= 8 ? "warn" : "bad", noBar: true },
       ],
     },
@@ -1983,33 +1989,48 @@ function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
     o.monday++;
     if (h.email && /\@/.test(h.email)) o.emails++;
   });
+  // user 2026-05-29: nueva separación MB MANUAL vs AGENTE.
+  // - emailsManual / mondayManual: lo que el MB hizo a mano desde el popup
+  //   (agent_actions con details.ui_origin='toolbar_manual' + api_usage popup).
+  // - emailsAgent / mondayAgent: lo que el agente automatizado hizo en su nombre.
+  // Los totales (emails/monday) se computan sumando ambos para retro-compat.
   usage.forEach(r => {
     const u = _normalizeUserKey(r.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
-    // MAX (no sumar — historial ya cuenta cada push y duplicaríamos)
-    const usageEmails = parseInt(r.by_provider?._emails_sent || 0, 10);
-    const usageMonday = parseInt(r.by_provider?._monday_pushes || 0, 10);
-    if (usageEmails > o.emails) o.emails = usageEmails;
-    if (usageMonday > o.monday) o.monday = usageMonday;
-    o.claude += parseInt(r.by_provider?.anthropic || 0, 10);
+    // SUMAR (api_usage tiene 1 row por día, hay que sumar todos los días)
+    o.emailsManual += parseInt(r.by_provider?._emails_sent   || 0, 10);
+    o.mondayManual += parseInt(r.by_provider?._monday_pushes || 0, 10);
+    o.claude       += parseInt(r.by_provider?.anthropic || 0, 10);
   });
   sessions.forEach(s => {
     const u = _normalizeUserKey(s.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     if (s.kind === "autopilot") o.apSec += s.duration_sec || 0;
     if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
   });
-  // Agent actions — sumar emails (sent) + monday (monday_ok) por user
+  // Agent actions: separar MANUAL (ui_origin='toolbar_manual') de AGENTE automatizado.
   agentActions.forEach(a => {
     const u = _normalizeUserKey(a.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
+    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
-    if (a.action === "sent")      o.emails++;
-    if (a.action === "monday_ok") o.monday++;
+    const isManual = (a.details?.ui_origin || "") === "toolbar_manual";
+    if (a.action === "sent") {
+      // Los manuales ya fueron contados desde api_usage._emails_sent — evitar double-count.
+      if (!isManual) o.emailsAgent++;
+    }
+    if (a.action === "monday_ok") {
+      // Los manuales ya fueron contados desde api_usage._monday_pushes.
+      if (!isManual) o.mondayAgent++;
+    }
     if (a.details?.source === "claude") o.claude++;
   });
+  // Totales (compat con el resto del panel)
+  for (const o of byUser.values()) {
+    o.emails = o.emailsManual + o.emailsAgent;
+    o.monday = o.mondayManual + o.mondayAgent;
+  }
 
   wrap.innerHTML = "";
   [...byUser.entries()].sort((a, b) => b[1].sites - a[1].sites).forEach(([email, s]) => {
