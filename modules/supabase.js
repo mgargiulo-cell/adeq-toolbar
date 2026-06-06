@@ -338,10 +338,10 @@ export async function fetchNotifications(accessToken, mbEmail, { limit = 30 } = 
   if (!accessToken || !mbEmail) return [];
   try {
     const mb = mbEmail.toLowerCase();
-    // Trae unread + las read de los últimos 7d para tener histórico cortito.
-    const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString();
+    // user 2026-05-29: notificaciones PERSONALES por MB (no más _admin compartido).
+    // Mostramos solo no descartadas — al hacer "Mark all" se descartan y desaparecen.
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=in.(${encodeURIComponent(mb)},_admin)&or=(read_at.is.null,created_at.gte.${cutoff})&dismissed_at=is.null&select=*&order=created_at.desc&limit=${limit}`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=eq.${encodeURIComponent(mb)}&dismissed_at=is.null&select=*&order=created_at.desc&limit=${limit}`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return [];
@@ -370,15 +370,18 @@ export async function markNotificationRead(accessToken, id) {
 export async function markAllNotificationsRead(accessToken, mbEmail) {
   if (!accessToken || !mbEmail) return false;
   try {
+    // user 2026-05-29: "Mark all" ahora también descarta (dismissed_at) → desaparecen
+    // del listado. Antes solo seteaba read_at pero el fetch seguía mostrándolas.
+    const now = new Date().toISOString();
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=eq.${encodeURIComponent(mbEmail.toLowerCase())}&read_at=is.null`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=eq.${encodeURIComponent(mbEmail.toLowerCase())}&dismissed_at=is.null`,
       {
         method: "PATCH",
         headers: {
           "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}`,
           "Content-Type": "application/json", "Prefer": "return=minimal",
         },
-        body: JSON.stringify({ read_at: new Date().toISOString() }),
+        body: JSON.stringify({ read_at: now, dismissed_at: now }),
       }
     );
     return res.ok;

@@ -8806,36 +8806,48 @@ async function scanDeliverabilityHealth(token) {
     const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
     if ((cfg.last_deliverability_check || "") === todayMadrid) return;
 
+    // user 2026-05-29: PERSONAL por MB. Antes mandaba al _admin (compartido) y
+    // ningún MB podía descartarla. Ahora itera por cada MB con datos en source_performance.
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?window_days=eq.30&mb_email=eq._global&select=sent,opens,bounces`,
+      `${SUPABASE_URL}/rest/v1/toolbar_source_performance?window_days=eq.30&mb_email=neq._global&select=mb_email,sent,opens,bounces`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return;
     const rows = await res.json();
-    const tot = (Array.isArray(rows) ? rows : []).reduce(
-      (a, r) => ({ sent: a.sent + (r.sent || 0), opens: a.opens + (r.opens || 0), bounces: a.bounces + (r.bounces || 0) }),
-      { sent: 0, opens: 0, bounces: 0 }
-    );
     await setConfigValue(token, "last_deliverability_check", todayMadrid).catch(() => {});
-    if (tot.sent < DELIV_MIN_SENT) return;
+    if (!Array.isArray(rows) || rows.length === 0) return;
 
-    const openRate   = tot.opens / tot.sent;
-    const bounceRate = tot.bounces / tot.sent;
-    const problems = [];
-    if (openRate < DELIV_OPEN_FLOOR)   problems.push(`apertura ${(openRate * 100).toFixed(0)}% (piso ${DELIV_OPEN_FLOOR * 100}%)`);
-    if (bounceRate > DELIV_BOUNCE_CEIL) problems.push(`rebotes ${(bounceRate * 100).toFixed(1)}% (techo ${DELIV_BOUNCE_CEIL * 100}%)`);
-    if (!problems.length) return;
+    // Agrupar por MB (sumar todas las sources)
+    const byMb = new Map();
+    for (const r of rows) {
+      const mb = (r.mb_email || "").toLowerCase();
+      if (!mb || mb === "_global") continue;
+      if (!byMb.has(mb)) byMb.set(mb, { sent: 0, opens: 0, bounces: 0 });
+      const t = byMb.get(mb);
+      t.sent    += r.sent    || 0;
+      t.opens   += r.opens   || 0;
+      t.bounces += r.bounces || 0;
+    }
 
-    await createNotificationWorker(token, {
-      mb_email: "_admin",
-      type: "deliverability_health",
-      severity: "error",
-      title: "⚠️ Salud de envío en baja",
-      body: `Últimos 30d (${tot.sent} envíos): ${problems.join(" · ")}. Revisar reputación del remitente (Gmail/SPF/DKIM) y calidad de emails.`,
-      metadata: { sent: tot.sent, open_rate: +openRate.toFixed(3), bounce_rate: +bounceRate.toFixed(3) },
-      dedup_key: `deliverability-${todayMadrid}`,
-    });
-    log(`🚨 Deliverability alert: ${problems.join(", ")} (sent=${tot.sent})`);
+    for (const [mb, tot] of byMb.entries()) {
+      if (tot.sent < DELIV_MIN_SENT) continue;
+      const openRate   = tot.opens   / tot.sent;
+      const bounceRate = tot.bounces / tot.sent;
+      const problems = [];
+      if (openRate   < DELIV_OPEN_FLOOR)   problems.push(`apertura ${(openRate   * 100).toFixed(0)}% (piso ${DELIV_OPEN_FLOOR  * 100}%)`);
+      if (bounceRate > DELIV_BOUNCE_CEIL)  problems.push(`rebotes ${(bounceRate * 100).toFixed(1)}% (techo ${DELIV_BOUNCE_CEIL * 100}%)`);
+      if (!problems.length) continue;
+      await createNotificationWorker(token, {
+        mb_email: mb,
+        type: "deliverability_health",
+        severity: "error",
+        title: "⚠️ Salud de envío en baja",
+        body: `Últimos 30d (${tot.sent} envíos): ${problems.join(" · ")}. Revisar la calidad de los emails y la reputación del remitente.`,
+        metadata: { sent: tot.sent, open_rate: +openRate.toFixed(3), bounce_rate: +bounceRate.toFixed(3) },
+        dedup_key: `deliverability-${mb}-${todayMadrid}`,
+      });
+      log(`🚨 Deliverability alert ${mb}: ${problems.join(", ")} (sent=${tot.sent})`);
+    }
   } catch (e) { log(`⚠️ scanDeliverabilityHealth: ${e.message}`); }
 }
 
