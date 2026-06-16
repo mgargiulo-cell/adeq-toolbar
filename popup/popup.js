@@ -8050,59 +8050,93 @@ async function loadProspectsTab() {
   const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}|${geoFilter}`;
   const slotKey     = `_prospects_slot_${userKey}_${filterHash}_${slotIdx}`;
 
-  let assignedIds = [];
+  // user 2026-06-16: dos cambios importantes en esta sección:
+  //   A) `mine` (created_by = MB actual) se calcula SIEMPRE fresco — no cae al
+  //      caché del slot. Si el MB importa nuevos sitios, aparecen al toque en
+  //      el tope, sin esperar 30 min al próximo slot.
+  //   B) Para los `other`, GEOs deprioritizados (US/GB/CA/AU/NZ/IE) van al
+  //      final. LATAM + Europa continental + resto del mundo arriba.
+  const me = (state.loginEmail || "").toLowerCase();
+  const DEPRIO_ISO   = new Set(["US","USA","GB","UK","CA","AU","NZ","IE"]);
+  const DEPRIO_NAMES = ["united states","usa","united kingdom","uk","britain","england","canada","australia","new zealand","ireland"];
+  const _geoKey = (r) => {
+    if (Array.isArray(r.geos_all) && r.geos_all.length) return String(r.geos_all[0] || "?").toUpperCase().slice(0,3);
+    return String(r.geo || "?").toUpperCase().slice(0,3);
+  };
+  const _isDeprio = (r) => {
+    if (Array.isArray(r.geos_all) && r.geos_all.length) {
+      const iso = String(r.geos_all[0] || "").toUpperCase();
+      if (DEPRIO_ISO.has(iso)) return true;
+    }
+    const g = String(r.geo || "").toLowerCase().trim();
+    if (!g) return false;
+    if (DEPRIO_ISO.has(g.toUpperCase())) return true;
+    return DEPRIO_NAMES.some(n => g === n || g.startsWith(n));
+  };
+  const shuffle = (arr) => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  };
+
+  const mineAll = rows.filter(r => (r.created_by || "").toLowerCase() === me);
+  shuffle(mineAll);
+  const mineIds = new Set(mineAll.map(r => r.id));
+
+  // Cache solo el sample de los "other" (no-mine) por slot. `mine` se overlay
+  // siempre fresco arriba.
+  let cachedOtherIds = [];
   try {
     const stored = await chrome.storage.local.get(slotKey);
-    if (stored?.[slotKey] && Array.isArray(stored[slotKey])) {
-      assignedIds = stored[slotKey];
-    }
+    if (stored?.[slotKey] && Array.isArray(stored[slotKey])) cachedOtherIds = stored[slotKey];
   } catch {}
 
-  if (assignedIds.length === 0) {
-    // user 2026-05-29: mezcla balanceada por GEO (antes un shuffle plano dejaba
-    // que IN/GB/US dominaran). Estrategia:
-    //   1. Tus propios imports (created_by = vos) van PRIMERO — para que veas
-    //      el resultado de las búsquedas que disparaste.
-    //   2. El resto: agrupar por GEO, shuffle dentro de cada grupo, y picar
-    //      round-robin (1 de cada GEO por vuelta) hasta llenar VISIBLE_CAP.
-    //      Resultado: ningún país acapara la lista, mucho más variado.
-    const me = (state.loginEmail || "").toLowerCase();
-    const mine  = rows.filter(r => (r.created_by || "").toLowerCase() === me);
-    const other = rows.filter(r => (r.created_by || "").toLowerCase() !== me);
-    const shuffle = (arr) => {
-      for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
+  // Validar que los ids cacheados sigan en `rows` y NO sean mine (si el MB
+  // tomó ownership de algún row después del slot, sacarlo del bucket "other").
+  const rowsById = new Map(rows.map(r => [r.id, r]));
+  cachedOtherIds = cachedOtherIds.filter(id => rowsById.has(id) && !mineIds.has(id));
+
+  if (cachedOtherIds.length === 0) {
+    const other = rows.filter(r => !mineIds.has(r.id));
+    // Separar en prio vs deprio antes de bucketizar.
+    const prio   = other.filter(r => !_isDeprio(r));
+    const deprio = other.filter(r =>  _isDeprio(r));
+    const buildBuckets = (arr) => {
+      const m = new Map();
+      for (const r of arr) {
+        const g = _geoKey(r);
+        if (!m.has(g)) m.set(g, []);
+        m.get(g).push(r);
       }
-      return arr;
+      for (const a of m.values()) shuffle(a);
+      return m;
     };
-    shuffle(mine);
-    // Bucketize por geo (legacy `geo` name o primer ISO de geos_all)
-    const buckets = new Map();
-    for (const r of other) {
-      let g = (r.geo || (Array.isArray(r.geos_all) ? r.geos_all[0] : "") || "?").toString().toUpperCase().slice(0,3);
-      if (!buckets.has(g)) buckets.set(g, []);
-      buckets.get(g).push(r);
-    }
-    for (const arr of buckets.values()) shuffle(arr);
-    // Round-robin: 1 de cada bucket por iteración hasta llenar
-    const mixed = [];
-    const keys = [...buckets.keys()];
-    shuffle(keys); // orden inicial de buckets al azar también
-    let safety = 5000;
-    while (mixed.length + mine.length < VISIBLE_CAP && safety-- > 0) {
-      let progressed = false;
-      for (const k of keys) {
-        const b = buckets.get(k);
-        if (b && b.length) { mixed.push(b.shift()); progressed = true; }
-        if (mixed.length + mine.length >= VISIBLE_CAP) break;
+    const pickRoundRobin = (buckets, budget) => {
+      const out = [];
+      const keys = [...buckets.keys()];
+      shuffle(keys);
+      let safety = 5000;
+      while (out.length < budget && safety-- > 0) {
+        let progressed = false;
+        for (const k of keys) {
+          const b = buckets.get(k);
+          if (b && b.length) { out.push(b.shift()); progressed = true; }
+          if (out.length >= budget) break;
+        }
+        if (!progressed) break;
       }
-      if (!progressed) break;
-    }
-    const finalRows = [...mine, ...mixed].slice(0, VISIBLE_CAP);
-    assignedIds = finalRows.map(r => r.id);
-    await chrome.storage.local.set({ [slotKey]: assignedIds }).catch(() => {});
-    // Cleanup slots viejos del mismo user
+      return out;
+    };
+    const cap         = VISIBLE_CAP - mineAll.length;
+    const prioBudget  = Math.max(0, cap); // intentar llenar todo con prio primero
+    const prioPicked  = pickRoundRobin(buildBuckets(prio), prioBudget);
+    const remaining   = Math.max(0, cap - prioPicked.length);
+    const deprioPicked = remaining > 0 ? pickRoundRobin(buildBuckets(deprio), remaining) : [];
+    const mixed = [...prioPicked, ...deprioPicked];
+    cachedOtherIds = mixed.map(r => r.id);
+    await chrome.storage.local.set({ [slotKey]: cachedOtherIds }).catch(() => {});
     try {
       const all = await chrome.storage.local.get(null);
       const stale = Object.keys(all).filter(k => k.startsWith(`_prospects_slot_${userKey}_`) && k !== slotKey);
@@ -8110,13 +8144,9 @@ async function loadProspectsTab() {
     } catch {}
   }
 
-  // Filtrar: solo los que SIGUEN en pending (algunos pudieron ser contactados por otro MB)
-  // Mantener el orden del shuffle original (assignedIds está ordenado al azar ya).
-  const idSet = new Set(assignedIds);
-  const idOrder = new Map(assignedIds.map((id, i) => [id, i]));
-  const sample = rows
-    .filter(r => idSet.has(r.id))
-    .sort((a, b) => idOrder.get(a.id) - idOrder.get(b.id));
+  const otherOrdered = cachedOtherIds.map(id => rowsById.get(id)).filter(Boolean);
+  const sample = [...mineAll, ...otherOrdered].slice(0, VISIBLE_CAP);
+  const assignedIds = sample.map(r => r.id);
 
   // RESTAURADO al render original simple (como funcionaba antes de hoy).
   // Los chunks + DocumentFragment que probé causaron renders concurrentes

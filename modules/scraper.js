@@ -124,9 +124,13 @@ function extractEmailsFromDOM() {
 export async function scrapeContactPages(baseUrl) {
   const paths = [
     "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos",
-    "/about", "/about-us", "/sobre-nosotros", "/quienes-somos", "/nosotros",
+    "/contact.html", "/contact.php", "/page/contact", "/pages/contact",
+    "/support/contact", "/help/contact", "/support", "/help", "/help-center",
+    "/lien-he", "/lienhe", "/kontakt", "/contatti", "/contato", "/contattaci",
+    "/about", "/about-us", "/sobre-nosotros", "/quienes-somos", "/nosotros", "/gioi-thieu",
     "/directorio", "/directory", "/team", "/equipo", "/equipe", "/staff",
     "/advertise", "/advertising", "/publicidad", "/publicidade", "/anunciar", "/anunciantes",
+    "/quang-cao", "/werbung", "/pubblicita",
     "/legal", "/aviso-legal", "/privacy", "/privacidad", "/redaccion",
   ];
   const emails = new Set();

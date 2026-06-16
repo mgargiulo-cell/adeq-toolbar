@@ -579,13 +579,35 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
   }
   const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
   const userClause   = userFilter   ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
-  // Geo filter: matchea contra `geo` (NAME, legacy) o `geos_all` (ISO array).
-  // Acepta ISO 2-letter (AR, BR, ES, MX, etc.). Si el legacy `geo` tiene country
-  // name, hacemos un match laxo con ilike.
+  // Geo filter: matchea contra `geo` (NAME en inglés, legacy) o `geos_all`
+  // (ISO array). Acepta ISO 2-letter (AR, BR, ES, MX, etc.). El worker guarda
+  // `geo` como NAME (ej "Vietnam") NO como ISO — para legacy hay que mapear.
   let geoClause = "";
   if (geoFilter) {
     const g = geoFilter.trim().toUpperCase();
-    geoClause = `&or=(geos_all.cs.{${g}},geo.ilike.${encodeURIComponent(g)}*)`;
+    const ISO_TO_NAME = {
+      AR:"Argentina", BR:"Brazil", ES:"Spain", MX:"Mexico", CO:"Colombia",
+      CL:"Chile", PE:"Peru", UY:"Uruguay", EC:"Ecuador", VE:"Venezuela",
+      DO:"Dominican Republic", PA:"Panama", BO:"Bolivia", GT:"Guatemala",
+      CR:"Costa Rica", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
+      PY:"Paraguay", PR:"Puerto Rico", CU:"Cuba", US:"United States",
+      GB:"United Kingdom", CA:"Canada", AU:"Australia", NZ:"New Zealand",
+      PT:"Portugal", IT:"Italy", FR:"France", DE:"Germany", NL:"Netherlands",
+      BE:"Belgium", CH:"Switzerland", AT:"Austria", IE:"Ireland", DK:"Denmark",
+      SE:"Sweden", NO:"Norway", FI:"Finland", PL:"Poland", CZ:"Czech Republic",
+      HU:"Hungary", RO:"Romania", GR:"Greece", IN:"India", PK:"Pakistan",
+      BD:"Bangladesh", LK:"Sri Lanka", ID:"Indonesia", PH:"Philippines",
+      VN:"Vietnam", TH:"Thailand", MY:"Malaysia", SG:"Singapore",
+      SA:"Saudi Arabia", AE:"UAE", EG:"Egypt", TR:"Turkey", IL:"Israel",
+      NG:"Nigeria", KE:"Kenya", ZA:"South Africa", MA:"Morocco", DZ:"Algeria",
+      JP:"Japan", KR:"South Korea", CN:"China", TW:"Taiwan", HK:"Hong Kong",
+      RU:"Russia", UA:"Ukraine", BG:"Bulgaria", HR:"Croatia", SK:"Slovakia",
+    };
+    const name = ISO_TO_NAME[g] || g;
+    const enc = encodeURIComponent(name);
+    // Match: ISO en geos_all (array contains) OR geo (legacy) == name OR
+    // geo (legacy) prefix-match con ISO/name (cubre ambos formatos).
+    geoClause = `&or=(geos_all.cs.{${g}},geo.eq.${enc},geo.ilike.${enc}*,geo.eq.${encodeURIComponent(g)},geo.ilike.${encodeURIComponent(g)}*)`;
   }
   try {
     // Política user 2026-05-18: NO ordenar por score — el score no se usa para

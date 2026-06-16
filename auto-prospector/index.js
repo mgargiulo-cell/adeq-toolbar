@@ -3877,13 +3877,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
     && apolloMonthRemaining > 0;
 
-  // Estrategia de rotación (user 2026-05-13): no quemar Apollo en cada lead.
-  // 50% → scrape primero, si vacío Apollo fallback (ahorra crédito en sitios obvios)
-  // 50% → Apollo primero, si vacío scrape fallback (mejor calidad cuando funciona)
-  // EXCEPCIÓN (user 2026-05-28): sitios que califican para unlock (399K+ visitas)
-  // van SIEMPRE Apollo-primero para asegurar que descubrimos al decision-maker.
-  const useApolloFirst = canUseApollo &&
-    (visits >= APOLLO_UNLOCK_MIN_TRAFFIC || Math.random() < 0.5);
+  // Estrategia de rotación (user 2026-06-16): 50/50 estricto Apollo vs scrape,
+  // SIN excepción por tráfico. Maxi reportó muchos rebotados de Apollo, así que
+  // queremos balancear y dar más peso al scraping del código fuente (emails que
+  // vienen del propio sitio suelen ser más estables que las "guessed" de Apollo).
+  const useApolloFirst = canUseApollo && Math.random() < 0.5;
   let apolloRes = null;
   let scraperEmails = [];
   const informerSet = new Set(); // emails que vinieron de website.informer.com / who.is
@@ -4723,10 +4721,10 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ⚠️ Apollo skip: ${reason}`);
     }
 
-    // Rotación 50/50 Apollo vs scrape (user 2026-05-13) — ahorra créditos Apollo.
-    // EXCEPCIÓN (user 2026-05-28): 399K+ visitas → siempre Apollo-primero.
-    const useApolloFirst = canUseApollo &&
-      (visits >= APOLLO_UNLOCK_MIN_TRAFFIC || Math.random() < 0.5);
+    // Rotación 50/50 estricta Apollo vs scrape (user 2026-06-16) — sin
+    // excepción por tráfico. Maxi vio muchos rebotados de Apollo y prefiere
+    // balancear con scraping del código fuente.
+    const useApolloFirst = canUseApollo && Math.random() < 0.5;
     const similarPromise = findSimilarSites(domain, rapidapi_key);
     let apolloRes = null;
     let scraperEmails = [];
