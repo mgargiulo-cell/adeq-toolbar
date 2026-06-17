@@ -17,6 +17,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled, logImportAttempt,
          getPitchDrafts, savePitchDraft, deletePitchDraft,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
+         fetchRejectedSignatures, trafficBucketLabel,
          getAutopilotTarget, setAutopilotTarget,
          fetchReviewQueue, validateReviewItem, rejectReviewItem, updateReviewItem, clearPendingProspects,
          getDailyValidationCount, getApiUsageToday, getCustomPrompt, setCustomPrompt,
@@ -3798,53 +3799,75 @@ function _emailGrade(email, result, source) {
   return r;
 }
 
+// Logica A-E auditada y reescrita 2026-06-17. Mide CALIDAD/DELIVERABILIDAD del
+// email, no calidad del lead (eso es el score del card). Para que Maxi pueda
+// auditar el grado, el `label` incluye los factores que pesaron.
+//
+// Factores:
+//   ▸ Verify SMTP/disify → +25/+30 (factor más fuerte cuando existe)
+//   ▸ Source: apollo verified +20, informer +15, scrape +10, generic 0
+//     (apollo "guessed" NO suma — solo verified)
+//   ▸ Formato local-part: nombre.apellido +15, normal 5-18 chars +5
+//   ▸ Penalty: rol genérico -25, catch-all -20, tld sospechoso -15
+//   ▸ Tags de error fatales → E directo (typo, sin-mx, descartable, spam)
+//   ▸ SIN verify: baseline 40, max teorico = B (necesitás verify para A)
 function _emailGradeCompute(email, result, source) {
-  if (!email || !email.includes("@")) return { grade: "E", label: "Inválido" };
-  let score = 50; // baseline
+  if (!email || !email.includes("@")) return { grade: "E", label: "Inválido — formato malo" };
+  const reasons = [];
+  let score = 40; // baseline: prospect sin verify queda en "C bueno potencial"
   const tags = result?.tags || [];
 
-  // Verify result — el factor más fuerte
+  // ── Verify result — gate fatal + bonus si existe ──────────────
+  let verified = false;
   if (result) {
-    if (!result.valid) return { grade: "E", label: "SMTP rechazó" };
+    if (!result.valid) return { grade: "E", label: "Inválido — SMTP rechazó" };
     if (tags.includes("descartable") || tags.includes("descartable-remoto") ||
         tags.includes("undeliverable") || tags.includes("typo") ||
         tags.includes("sin-dns") || tags.includes("sin-mx") ||
         tags.includes("spam") || tags.includes("proxy-whois")) {
-      return { grade: "E", label: "Descartable" };
+      return { grade: "E", label: "Descartable — " + (tags.find(t => ["typo","sin-mx","spam","proxy-whois","sin-dns"].includes(t)) || "tag rojo") };
     }
-    if (result.deepSource === "disify") score += 15;       // DNS+disposable confirmado remoto
-    else if (result.deepSource === "eva") score += 25;     // legacy SMTP (cache pre-2026-05)
-    else if (result.deepSource === "local-only") score += 5; // solo DNS local
-    if (tags.includes("rol"))                score -= 20;
-    if (tags.includes("catch-all"))          score -= 15;
-    if (tags.includes("catch-all-provider")) score -= 10;
-    if (tags.includes("tld-sospechoso"))     score -= 15;
-  } else {
-    // No verificado todavía — baseline pendiente
-    score = 40;
+    if (result.deepSource === "eva") { score += 30; verified = true; reasons.push("SMTP+30"); }
+    else if (result.deepSource === "disify") { score += 25; verified = true; reasons.push("DNS-remoto+25"); }
+    else if (result.deepSource === "local-only") { score += 10; reasons.push("DNS-local+10"); }
+    if (tags.includes("catch-all"))          { score -= 20; reasons.push("catch-all-20"); }
+    if (tags.includes("catch-all-provider")) { score -= 12; reasons.push("catchAllProv-12"); }
+    if (tags.includes("tld-sospechoso"))     { score -= 15; reasons.push("TLD-sosp-15"); }
   }
 
-  // Fuente
+  // ── Source ────────────────────────────────────────────────────
   const src = (source || "").toLowerCase();
-  if (src === "apollo")  score += 15; // Apollo trae status verificado
-  else if (src === "informer") score += 8; // WHOIS/informer — contacto registrante
-  else if (src === "scrape" || src === "scraping") score += 5;
-  else if (src === "gemini") score += 3;
+  if (src === "apollo")        { score += 20; reasons.push("apollo+20"); }
+  else if (src === "informer") { score += 15; reasons.push("informer+15"); }
+  else if (src === "scrape" || src === "scraping") { score += 10; reasons.push("sitio+10"); }
+  else if (src === "generic")  { score -= 5;  reasons.push("genérico-5"); }
+  else if (src === "gemini")   { score += 3;  reasons.push("gemini+3"); }
 
-  // Formato — personal vs rol vs aleatorio
+  // ── Formato local-part ────────────────────────────────────────
   const local = email.split("@")[0].toLowerCase();
-  if (/^[a-z]+\.[a-z]+$/.test(local))      score += 10; // nombre.apellido
-  else if (/^[a-z]+[a-z]+$/.test(local) && local.length >= 6 && local.length <= 18) score += 5;
-  if (/^(info|contact|contacto|hello|hola|admin|sales|ventas|support|soporte|help|webmaster|noreply|no-reply)$/i.test(local)) {
-    score -= 15;
+  if (/^[a-z]+\.[a-z]+$/.test(local) && local.length >= 5 && local.length <= 24) {
+    score += 15; reasons.push("nombre.apellido+15");
+  } else if (/^[a-z]+$/.test(local) && local.length >= 5 && local.length <= 18) {
+    score += 5; reasons.push("local-normal+5");
   }
+  // Roles genéricos: penalidad fuerte (no son personas)
+  if (/^(info|contact|contacto|contato|hello|hi|hola|admin|sales|ventas|comercial|support|soporte|atendimento|help|webmaster|noreply|no-reply|press|prensa|media|advertising|publicidad|publicidade|news|marketing)$/i.test(local)) {
+    score -= 25; reasons.push("rol-25");
+  }
+  // Aleatorio / hash sospechoso: penalty leve
+  if (/^[a-z0-9]{20,}$/.test(local)) { score -= 10; reasons.push("hash-10"); }
 
-  // Mapeo a grade
-  if (score >= 85) return { grade: "A", label: "Excelente" };
-  if (score >= 70) return { grade: "B", label: "Bueno" };
-  if (score >= 55) return { grade: "C", label: "Regular" };
-  if (score >= 40) return { grade: "D", label: "Bajo" };
-  return { grade: "E", label: "Descartable" };
+  // ── Mapeo a grade. SIN verify, max es B. ──────────────────────
+  let grade, label;
+  if (score >= 80 && verified)     { grade = "A"; label = "Excelente — verificado + señales fuertes"; }
+  else if (score >= 80)            { grade = "B"; label = "Muy bueno — sin verificar (cap por falta de SMTP)"; }
+  else if (score >= 65)            { grade = "B"; label = "Bueno"; }
+  else if (score >= 50)            { grade = "C"; label = "Regular"; }
+  else if (score >= 30)            { grade = "D"; label = "Bajo"; }
+  else                             { grade = "E"; label = "Muy bajo"; }
+  // Append breakdown a label para auditing (visible en tooltip)
+  if (reasons.length) label += ` · score:${score} (${reasons.join(", ")})`;
+  return { grade, label };
 }
 
 function _verifyTooltip(result) {
@@ -4802,19 +4825,26 @@ async function bindButtons() {
       // de Prospects inmediato (otros MBs no los van a re-contactar).
       markReviewQueueAsContacted(state.accessToken, state.domain, state.loginEmail).catch(() => {});
 
-      // ── Email Futuro — si el MB asignó un slot 2, encolar para +11d ────
-      const futureEmail = document.getElementById("form-email-futuro")?.value?.trim();
+      // ── Emails Futuros (hasta 3) — encolar para +11/+22/+33d ─────────
+      // Maxi 2026-06-17: 3 follow-ups en cascada. Cada uno se dispara si el
+      // ORIGINAL no fue abierto. Si lo abrieron en cualquier momento, el
+      // worker cancela los pendientes.
       const futStatusEl = document.getElementById("email-futuro-status");
-      // Guard: future_email no puede ser un email ya bounced en la DB global.
-      const bFut = (futureEmail && futureEmail.includes("@"))
-        ? await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }))
-        : { bounced: false };
-      if (bFut.bounced) {
-        if (futStatusEl) {
-          futStatusEl.textContent = `🚫 Not queued: ${futureEmail} is flagged as bounced (${bFut.reason || "bounced"}) in our database. Try a different address.`;
-          futStatusEl.style.color = "#dc2626";
+      const futureSlots = [
+        { el: "form-email-futuro",   days: 11, label: "FU2" },
+        { el: "form-email-futuro-2", days: 22, label: "FU3" },
+        { el: "form-email-futuro-3", days: 33, label: "FU4" },
+      ];
+      const queuedMsgs = [];
+      const failMsgs   = [];
+      for (const slot of futureSlots) {
+        const futureEmail = document.getElementById(slot.el)?.value?.trim();
+        if (!futureEmail || !futureEmail.includes("@") || futureEmail === email) continue;
+        const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }));
+        if (bFut.bounced) {
+          failMsgs.push(`${slot.label}: 🚫 ${futureEmail} bounced`);
+          continue;
         }
-      } else if (futureEmail && futureEmail !== email && futureEmail.includes("@")) {
         const r = await queueReengagement(state.accessToken, {
           domain:             state.domain,
           monday_item_id:     state.mondayItemId,
@@ -4823,20 +4853,28 @@ async function bindButtons() {
           future_email:       futureEmail,
           original_subject:   subject,
           original_body:      bodyToSend,
-          tracking_action_id: trackingActionId, // pixel id para detectar opens
+          tracking_action_id: trackingActionId,
+          delay_days:         slot.days,
+          sequence:           slot.label,
         });
         if (r.ok) {
-          if (futStatusEl) {
-            const d = new Date(r.scheduled_for);
-            futStatusEl.textContent = `✅ Email futuro encolado para ${d.toLocaleDateString()} (si no abren el primero)`;
-            futStatusEl.style.color = "#16a34a";
-          }
+          const d = new Date(r.scheduled_for);
+          queuedMsgs.push(`${slot.label}→${d.toLocaleDateString()}`);
         } else {
-          console.warn("[reengagement] queue failed:", r.status, r.error);
-          if (futStatusEl) {
-            futStatusEl.textContent = `⚠ No se pudo encolar el email futuro (${r.status || "err"})`;
-            futStatusEl.style.color = "#dc2626";
-          }
+          failMsgs.push(`${slot.label}: err ${r.status || ""}`);
+          console.warn("[reengagement] queue failed:", slot.label, r.status, r.error);
+        }
+      }
+      if (futStatusEl) {
+        if (queuedMsgs.length && !failMsgs.length) {
+          futStatusEl.textContent = `✅ ${queuedMsgs.length} email(s) futuro(s) encolado(s): ${queuedMsgs.join(" · ")}`;
+          futStatusEl.style.color = "#16a34a";
+        } else if (queuedMsgs.length && failMsgs.length) {
+          futStatusEl.textContent = `⚠ Parcial: ${queuedMsgs.join(" · ")} | ${failMsgs.join(" · ")}`;
+          futStatusEl.style.color = "#d97706";
+        } else if (failMsgs.length) {
+          futStatusEl.textContent = `❌ ${failMsgs.join(" · ")}`;
+          futStatusEl.style.color = "#dc2626";
         }
       }
 
@@ -7934,6 +7972,33 @@ const _GEO_NAMES = {
   JP:"Japón", KR:"Corea", AU:"Australia", NZ:"Nueva Zelanda", CN:"China", TW:"Taiwán",
   RU:"Rusia", UA:"Ucrania", BG:"Bulgaria", HR:"Croacia", SK:"Eslovaquia",
 };
+// Reconstruye chips de GEO clickeables a partir de los datos disponibles.
+// Toolkit user 2026-06-17: chips multi-select para filtrar por varios países a la vez.
+function _rebuildGeoChips(rows, selected) {
+  const wrap = document.getElementById("prospects-geo-chips");
+  if (!wrap) return;
+  const sel = selected instanceof Set ? selected : new Set();
+  const counts = new Map();
+  for (const r of rows || []) {
+    let iso = "";
+    if (Array.isArray(r.geos_all) && r.geos_all.length) iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
+    else if (r.geo) iso = String(r.geo).toUpperCase().slice(0, 2);
+    if (!iso || iso.length !== 2) continue;
+    counts.set(iso, (counts.get(iso) || 0) + 1);
+  }
+  if (counts.size === 0) { wrap.innerHTML = ""; return; }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const allActive = sel.size === 0;
+  let html = `<button class="geo-chip" data-code="_ALL_" type="button" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${allActive ? "#0ea5e9" : "#334155"};background:${allActive ? "#0ea5e9" : "#1e293b"};color:${allActive ? "#fff" : "#cbd5e1"};font-weight:600">🌍 Todos</button>`;
+  for (const [iso, n] of sorted) {
+    const isOn = sel.has(iso);
+    const name = (typeof _GEO_NAMES !== "undefined" && _GEO_NAMES[iso]) || iso;
+    const flag = _isoToFlag(iso);
+    html += `<button class="geo-chip" data-code="${iso}" type="button" title="${esc(name)}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${flag} ${iso} (${n})</button>`;
+  }
+  wrap.innerHTML = html;
+}
+
 function _rebuildGeoFilterFromRows(rows) {
   const sel = document.getElementById("prospects-geo-filter");
   if (!sel) return;
@@ -7964,28 +8029,94 @@ async function loadProspectsTab() {
 
   listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
 
-  const dateFilter   = document.getElementById("prospects-date-filter")?.value   || "";
-  const sourceFilter = document.getElementById("prospects-source-filter")?.value || "";
-  const userFilter   = document.getElementById("prospects-user-filter")?.value   || "";
-  const geoFilter    = document.getElementById("prospects-geo-filter")?.value    || "";
+  const dateFilter    = document.getElementById("prospects-date-filter")?.value    || "";
+  const sourceFilter  = document.getElementById("prospects-source-filter")?.value  || "";
+  const userFilter    = document.getElementById("prospects-user-filter")?.value    || "";
+  const geoFilter     = document.getElementById("prospects-geo-filter")?.value     || "";
+  const trafficFilter = document.getElementById("prospects-traffic-filter")?.value || "";
+  const nameFilterRaw = document.getElementById("prospects-name-filter")?.value    || "";
+  const nameFilter    = nameFilterRaw.trim().toLowerCase();
+  // Multi-GEO chips — si hay chips seleccionados, prevalecen sobre el dropdown legacy
+  const geoChipsSet = window._selectedGeoChips instanceof Set ? window._selectedGeoChips : new Set();
+  // El server-side geoFilter solo se usa si hay 1 chip o el dropdown viejo está activo
+  const effectiveGeoForServer = geoChipsSet.size === 1 ? [...geoChipsSet][0] : (geoChipsSet.size === 0 ? geoFilter : "");
   let rows = [];
+  let allRowsForChips = [];     // sin filtros client-side, para repoblar chips
   let dailyCount = 0;
   let snoozedSet = new Set();
   try {
-    const [_rows, _count, _drafts, _snoozedRes] = await Promise.all([
-      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter, userFilter, geoFilter }),
+    const _gpcMod = await import("../modules/supabase.js");
+    const [_rows, _count, _drafts, _snoozedRes, _globalPool] = await Promise.all([
+      fetchReviewQueue(state.accessToken, { dateFilter, sourceFilter, userFilter, geoFilter: effectiveGeoForServer }),
       getDailyValidationCount(state.accessToken, state.loginEmail),
       getPitchDrafts(state.accessToken, state.loginEmail),
       // Snoozes activos del MB actual (snooze_until > now). Cada MB tiene su propia bolsa.
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_user_snoozed_prospects?user_email=eq.${encodeURIComponent((state.loginEmail||"").toLowerCase())}&snooze_until=gt.${new Date().toISOString()}&select=domain`,
         { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
       ).then(r => r.ok ? r.json() : []).catch(() => []),
+      // Total global del pool (igual para todos los MBs) — Maxi 2026-06-17.
+      _gpcMod.getReviewQueuePendingCount(state.accessToken).catch(() => 0),
     ]);
+    window._prospectsGlobalPool = _globalPool;
     rows = _rows;
     dailyCount = _count;
     _cachedProspectDrafts = _drafts;
     snoozedSet = new Set((_snoozedRes || []).map(r => (r.domain || "").toLowerCase()));
     if (snoozedSet.size > 0) rows = rows.filter(r => !snoozedSet.has((r.domain || "").toLowerCase()));
+    // Maxi 2026-06-17: X-learn — si el MB rechazó 3+ leads con misma firma
+    // (categoria + bucket de tráfico + geo), filtrar futuros similares.
+    // Lookup cacheado 5 min para no recargar en cada refresh.
+    try {
+      const now = Date.now();
+      if (!window._rejectedSigsCache || (now - window._rejectedSigsCache.ts) > 300_000 || window._rejectedSigsCache.user !== state.loginEmail) {
+        const sigs = await fetchRejectedSignatures(state.accessToken, state.loginEmail, 3);
+        window._rejectedSigsCache = { ts: now, user: state.loginEmail, sigs };
+      }
+      const blocked = window._rejectedSigsCache.sigs || [];
+      if (blocked.length > 0) {
+        const sigSet = new Set(blocked.map(s => `${s.category}|${s.traffic_bucket}|${s.geo}`));
+        const beforeN = rows.length;
+        rows = rows.filter(r => {
+          const sig = `${(r.category||"").toLowerCase().trim()}|${trafficBucketLabel(r.traffic)}|${(r.geo||"").toLowerCase().trim()}`;
+          return !sigSet.has(sig);
+        });
+        if (rows.length < beforeN) console.log(`[Prospects] X-learn: -${beforeN - rows.length} leads filtrados por ${blocked.length} firmas rechazadas`);
+      }
+    } catch {}
+    allRowsForChips = rows.slice();
+    // ── Client-side filters: multi-GEO chips + traffic range + name ──
+    // (Estos NO pueden ir en URL PostgREST de forma simple, así que filtramos
+    // acá. El server ya nos trajo hasta 3000 rows = bien manejable.)
+    if (geoChipsSet.size > 1) {
+      rows = rows.filter(r => {
+        const isoArr = Array.isArray(r.geos_all) ? r.geos_all.map(x => String(x).toUpperCase()) : [];
+        const legacyIso = String(r.geo || "").toUpperCase();
+        for (const code of geoChipsSet) {
+          if (isoArr.includes(code)) return true;
+          if (legacyIso === code) return true;
+          // legacy `geo` puede ser NAME, no ISO — mapear minimal
+          const NAME_BY_ISO = { US:"UNITED STATES", GB:"UNITED KINGDOM", BR:"BRAZIL", AR:"ARGENTINA", MX:"MEXICO", ES:"SPAIN", VN:"VIETNAM", IN:"INDIA" };
+          if (NAME_BY_ISO[code] && legacyIso === NAME_BY_ISO[code]) return true;
+        }
+        return false;
+      });
+    }
+    if (trafficFilter) {
+      const [minMStr, maxMStr] = trafficFilter.split("-");
+      const minTraffic = parseFloat(minMStr) * 1_000_000;
+      const maxTraffic = parseFloat(maxMStr) * 1_000_000;
+      rows = rows.filter(r => {
+        const t = parseInt(r.traffic || 0, 10);
+        return t >= minTraffic && t < maxTraffic;
+      });
+    }
+    if (nameFilter) {
+      rows = rows.filter(r => {
+        const d = (r.domain || "").toLowerCase();
+        const t = (r.page_title || "").toLowerCase();
+        return d.includes(nameFilter) || t.includes(nameFilter);
+      });
+    }
     // Sincronizar la cache global de drafts (la usa la bandera+autocarga de cada card)
     _draftsState.all = _cachedProspectDrafts;
     _rebuildDraftsByLang();
@@ -7994,6 +8125,10 @@ async function loadProspectsTab() {
     listEl.innerHTML = `<div class="cascade-empty" style="color:#e53e3e">❌ Error loading prospects: ${esc(err.message || String(err))}</div>`;
     return;
   }
+
+  // Repoblar GEO chips desde el universo SIN filtros client-side, así siempre
+  // ves los países disponibles.
+  _rebuildGeoChips(allRowsForChips, geoChipsSet);
 
   updateProspectsDailyBar(dailyCount);
   if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidate${rows.length === 1 ? "" : "s"}` : "No pending candidates";
@@ -8043,11 +8178,13 @@ async function loadProspectsTab() {
   const slotIdx     = Math.floor(Date.now() / (SLOT_MIN * 60 * 1000));
   const userKey     = (state.loginEmail || "anon").toLowerCase();
 
-  // Repoblar dropdown de GEO con TODOS los países que tienen leads disponibles
-  // (solo cuando no hay filtro activo, así vemos el universo completo).
-  if (!geoFilter) _rebuildGeoFilterFromRows(rows);
+  // GEO chips ya se reconstruyeron arriba (línea _rebuildGeoChips). Dropdown
+  // viejo está hidden — solo lo usamos como storage para compat.
   // Bug fix 2026-05-14: slotKey debe incluir filtros (incluido geo).
-  const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}|${geoFilter}`;
+  // 2026-06-17: incluir traffic + name + chips para que el slot cache no
+  // mezcle resultados entre filtros distintos.
+  const geoChipsKey = [...geoChipsSet].sort().join(",");
+  const filterHash  = `${dateFilter}|${sourceFilter}|${userFilter}|${geoFilter}|${geoChipsKey}|${trafficFilter}|${nameFilter}`;
   const slotKey     = `_prospects_slot_${userKey}_${filterHash}_${slotIdx}`;
 
   // user 2026-06-16: dos cambios importantes en esta sección:
@@ -8155,7 +8292,12 @@ async function loadProspectsTab() {
   if (statsEl) {
     const remaining = DAILY_SEND_CAP - sentFromProspects;
     const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
-    statsEl.innerHTML = `<strong>${sample.length}</strong> en tu lote · <strong>${rows.length}</strong> disponibles total (sorteo distinto por MB) · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy · 🔄 nuevo lote en ${minsLeft}min`;
+    // Maxi 2026-06-17: 3 counts distintos para que el MB entienda qué ve.
+    //   - Global: total del pool (mismo para los 3 MBs, sin snooze/X-learn)
+    //   - Tras filtros: lo que matchea los filtros activos (por MB; snooze + X-learn aplicados)
+    //   - En tu lote: lo que cabe en VISIBLE_CAP (200) — sample shuffled
+    const globalPool = window._prospectsGlobalPool || rows.length;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> en tu lote · <strong>${rows.length}</strong> tras filtros · <strong>${globalPool}</strong> en pool global (mismo para todos) · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy · 🔄 nuevo lote en ${minsLeft}min`;
   }
 
   listEl.querySelectorAll(".pcard").forEach(card => {
@@ -8270,34 +8412,18 @@ function renderProspectCard(r) {
   const adNetworks  = Array.isArray(r.ad_networks) ? r.ad_networks : [];
   const subjects    = Array.isArray(r.pitch_subjects) ? r.pitch_subjects : [];
 
-  // Score → stars 1-5 (1=peor, 5=mejor). Si no hay score persistido, computar
-  // live con quickScore para que TODOS los prospects muestren rating.
+  // Maxi 2026-06-17: stars + fire/warm/cold REMOVIDOS — no se usaban para
+  // decidir nada y ocupaban espacio visual. La info clave (traffic, GEO,
+  // email count, categoria) va ahora directamente en la meta row, más legible.
+  // Mantenemos `score` para el ordenamiento interno pero no se renderiza.
   let score = r.score || 0;
   if (!score) score = quickScoreLead(r);
-  let stars = 1; // default 1 (todos visibles)
-  if      (score >= 80) stars = 5;
-  else if (score >= 60) stars = 4;
-  else if (score >= 40) stars = 3;
-  else if (score >= 20) stars = 2;
-  const colorByStars = stars >= 4 ? "#fbbf24" : stars >= 3 ? "#facc15" : "#94a3b8";
-  const starsHTML = `<span title="Score ${score}/100 (${stars}★)" style="font-size:12px;flex-shrink:0;letter-spacing:-1px;color:${colorByStars}">${"★".repeat(stars)}<span style="opacity:0.25">${"★".repeat(5-stars)}</span></span>`;
-  const scoreBadge = starsHTML;
-
-  // Lead temperature indicator — señal at-a-glance del potencial.
-  // 🔥 HOT  : traffic >= 1M OR (score >= 60 AND email)
-  // ☀️ WARM : traffic >= 400K AND email AND (adNetworks OR score >= 40)
-  // ❄️ COLD : todo lo demás (sin email + low traffic)
-  const _trafficN = parseInt(r.traffic || 0, 10);
-  const _hasEmail = hasEmail;
-  const _hasAdNet = adNetworks.length > 0;
-  let tempBadge = "";
-  if (_trafficN >= 1_000_000 || (score >= 60 && _hasEmail)) {
-    tempBadge = `<span title="🔥 HOT lead — alta probabilidad de cierre" style="font-size:11px;flex-shrink:0">🔥</span>`;
-  } else if (_trafficN >= 400_000 && _hasEmail && (_hasAdNet || score >= 40)) {
-    tempBadge = `<span title="☀️ WARM lead — vale el outreach" style="font-size:11px;flex-shrink:0">☀️</span>`;
-  } else if (!_hasEmail && _trafficN < 400_000) {
-    tempBadge = `<span title="❄️ COLD lead — no email + low traffic, evaluate if worth the effort" style="font-size:11px;flex-shrink:0;opacity:0.7">❄️</span>`;
-  }
+  const scoreBadge = "";
+  const tempBadge  = "";
+  // Sobre con cantidad de emails — destaca arriba (antes estaba abajo, chiquito).
+  const emailCountBadge = hasEmail
+    ? `<span title="${emails.length} email(s) encontrados" style="font-size:11px;font-weight:700;color:#fff;background:#0ea5e9;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ ${emails.length}</span>`
+    : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span>`;
 
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
@@ -8347,56 +8473,56 @@ function renderProspectCard(r) {
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:center;gap:5px">
           ${(() => {
-            // Source badge minimal: solo el icono en cuadradito chico, libera espacio
-            // para el nombre del MB y la URL del dominio. El label completo queda en title.
+            // Source badge — icono + label corto (Auto/CSV/JSON/Monday). Maxi 2026-06-17:
+            // pidió que el label de TIPO de búsqueda quede al lado del nombre. Antes era
+            // solo icono cuadradito. Ahora icon + categoría.
             const src = r.source || "autopilot";
             const badges = {
-              autopilot:      ["🤖", "Auto",            "#6366f1"],
-              csv:            ["📥", "CSV import",      "#0ea5e9"],
-              monday_refresh: ["🔄", "Monday refresh",  "#f59e0b"],
-              sellers_json:   ["📋", "sellers.json",    "#8b5cf6"],
+              autopilot:      ["🤖", "Auto",     "#6366f1"],
+              csv:            ["📥", "CSV",      "#0ea5e9"],
+              monday_refresh: ["🔄", "Monday",   "#f59e0b"],
+              sellers_json:   ["📋", "JSON",     "#8b5cf6"],
             };
             const [icon, label, color] = badges[src] || badges.autopilot;
-            return `<span title="Origen: ${label}" style="font-size:11px;background:${color};border-radius:3px;padding:1px 4px;line-height:1;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:18px;height:16px">${icon}</span>`;
+            return `<span title="Tipo de búsqueda: ${label}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">${icon} ${label}</span>`;
           })()}
           ${(() => {
-            // Badge del usuario que generó el item (autopilot o import). Mapea
-            // email a nombre corto: Maxi / Diego / Agus. Si no matchea, usa
-            // la parte antes del @.
+            // Badge del usuario que generó el item. Mapea email a nombre corto.
+            // Maxi 2026-06-17: si created_by está vacío (worker/autopilot sin
+            // owner real) → mostrar "Maxi" (no "worker" ni vacío) — convención
+            // del equipo: trabajo del worker lo atribuimos a Maxi (admin/owner).
             const email = (r.created_by || "").toLowerCase();
-            if (!email) return "";
             const userMap = {
               "mgargiulo@adeqmedia.com": ["Maxi",  "#10b981"],
               "dhorovitz@adeqmedia.com": ["Diego", "#a855f7"],
               "sales@adeqmedia.com":     ["Agus",  "#ec4899"],
             };
-            const [name, color] = userMap[email] || [email.split("@")[0], "#64748b"];
-            return `<span title="Origen del item: ${esc(email)}" style="font-size:9px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 5px;flex-shrink:0">👤 ${esc(name)}</span>`;
+            const fallback = ["Maxi", "#10b981"];
+            const [name, color] = userMap[email] || (email ? [email.split("@")[0], "#64748b"] : fallback);
+            return `<span title="Origen del item: ${esc(email || "worker (sin owner) → atribuido a Maxi")}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">👤 ${esc(name)}</span>`;
           })()}
           <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
-             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;word-break:break-all;line-height:1.3"
+             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;word-break:break-all;line-height:1.3;flex:1;min-width:0"
              title="${esc(r.domain)}">
             ${esc(r.domain)} ↗
           </a>
-          ${scoreBadge}
-          ${tempBadge}
+          ${emailCountBadge}
         </div>
         ${titleRow}
-        <div style="font-size:10px;color:var(--text-muted);margin-top:3px;display:flex;flex-wrap:wrap;gap:4px">
-          <span>📊 ${trafficFmt}</span>
-          ${r.geo      ? `<span>🌎 ${esc(r.geo)}</span>`      : ""}
-          ${r.language ? `<span>🗣 ${esc(langName)}</span>`    : ""}
-          ${r.category ? `<span>📁 ${esc(r.category)}</span>` : ""}
-          ${r.contact_name ? `<span>👤 ${esc(r.contact_name)}</span>` : ""}
-          ${hasEmail ? `<span style="color:#3b82f6">✉️ ${emails.length}</span>` : '<span style="color:#e53e3e">✉️ —</span>'}
+        <!-- Meta row reordenada Maxi 2026-06-17: GEO + Páginas Vistas + Categoría + Idioma -->
+        <div style="font-size:10px;color:var(--text-muted);margin-top:3px;display:flex;flex-wrap:wrap;gap:6px">
+          ${r.geo      ? `<span title="País principal">🌎 ${esc(r.geo)}</span>` : ""}
+          <span title="Páginas vistas / tráfico mensual">📊 ${trafficFmt}</span>
+          ${r.category ? `<span title="Categoría del sitio">📁 ${esc(r.category)}</span>` : ""}
+          ${r.language ? `<span title="Idioma">🗣 ${esc(langName)}</span>` : ""}
+          ${r.contact_name ? `<span title="Contacto detectado">👤 ${esc(r.contact_name)}</span>` : ""}
           ${adNetRow}
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
         <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Re-fetch traffic + Apollo emails (same as Analysis). Useful if saved data looks incomplete." style="padding:3px 7px;font-size:10px">🔍 Data</button>
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
-        <button class="btn btn-sm pcard-snooze-btn" title="💤 Posponer 21 días solo para vos (otros MBs lo siguen viendo)" style="padding:3px 7px;color:#8b5cf6;background:transparent;border:1px solid var(--border)">💤</button>
-        <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve, no volver a procesar" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
+        <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve + el agente aprende a evitar tipos similares" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
 
@@ -8409,6 +8535,17 @@ function renderProspectCard(r) {
         ${hasEmail ? "" : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails — escribilo manualmente abajo</div>'}
       </div>
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
+
+      <!-- Emails Futuros (hasta 3) — Maxi 2026-06-17. Se envían auto a +11/+22/+33d si no abren el primero. -->
+      <details style="margin-top:6px;font-size:11px">
+        <summary style="cursor:pointer;color:var(--text-muted);font-weight:700;letter-spacing:.3px">⏱ Emails Futuros (opcional — auto +11/+22/+33d)</summary>
+        <div style="display:flex;flex-direction:column;gap:3px;margin-top:5px">
+          <input type="email" class="form-input pcard-future-1" placeholder="FU2 +11d" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-2" placeholder="FU3 +22d" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-3" placeholder="FU4 +33d" style="font-size:11px;padding:3px 6px" />
+          <div class="pcard-future-status" style="font-size:10px;color:var(--text-muted)"></div>
+        </div>
+      </details>
 
       <!-- Pitch — replica EXACTA del bloque del tab Analysis para que el user
            se acostumbre a una sola visual. Reusa las mismas CSS classes
@@ -8729,13 +8866,39 @@ function initProspectCard(card, data) {
     const visible = sorted.slice(0, VISIBLE);
     const hidden  = sorted.slice(VISIBLE);
 
+    // Lee source info del row prospect (email_sources). Backward compat:
+    // - String legacy "scrape" / "apollo" → solo label
+    // - Object nuevo {source, url} → label + URL clickeable (Maxi 2026-06-17)
+    const sourceMap = data.email_sources || {};
+    const _getEmailSource = (em) => {
+      const raw = sourceMap[em.toLowerCase()];
+      if (!raw) return { source: "", url: "" };
+      if (typeof raw === "string") return { source: raw, url: "" };
+      return { source: raw.source || "", url: raw.url || "" };
+    };
+    const SOURCE_LABEL = {
+      apollo:   { txt: "apollo",     color: "#7c3aed" },
+      informer: { txt: "informer",   color: "#0ea5e9" },
+      scrape:   { txt: "sitio",      color: "#10b981" },
+      generic:  { txt: "genérico",   color: "#94a3b8" },
+    };
     const chipFor = (e) => {
       const cached = _emailVerifyCache.get(e);
       const cls    = cached ? _verifyClass(cached) : "verify-pending";
-      const src    = state.emailSources.get(e) || "";
-      const g      = _emailGrade(e, cached, src);
+      const srcObj = _getEmailSource(e);
+      const g      = _emailGrade(e, cached, srcObj.source);
       const gb     = `<span class="email-grade email-grade-${g.grade}" title="${esc(g.label)}">${g.grade}</span>`;
-      return `<div class="email-chip ${cls}" data-email="${esc(e)}" title="Verificando…">${gb}${esc(e)}</div>`;
+      let srcChip  = "";
+      if (srcObj.source) {
+        const meta = SOURCE_LABEL[srcObj.source] || { txt: srcObj.source, color: "#64748b" };
+        // Si tiene URL (scrape/informer): hacerlo clickeable. Apollo: solo label.
+        if (srcObj.url) {
+          srcChip = `<a href="#" class="email-src-link" data-url="${esc(srcObj.url)}" title="Origen: ${esc(srcObj.url)}" style="font-size:9px;color:${meta.color};text-decoration:underline;margin-left:4px">(${meta.txt})</a>`;
+        } else {
+          srcChip = `<span title="Origen: ${esc(meta.txt)}" style="font-size:9px;color:${meta.color};margin-left:4px">(${meta.txt})</span>`;
+        }
+      }
+      return `<div class="email-chip ${cls}" data-email="${esc(e)}" title="Verificando…">${gb}${esc(e)}${srcChip}</div>`;
     };
 
     let html = visible.map(chipFor).join("");
@@ -8790,7 +8953,17 @@ function initProspectCard(card, data) {
     };
 
     listEl.querySelectorAll(".email-chip").forEach(chip => {
-      chip.addEventListener("click", () => {
+      chip.addEventListener("click", (ev) => {
+        // Si clickeó el link de "origen" (URL clickeable), NO toggle del chip
+        // y abrir la URL en nueva pestaña.
+        const srcLink = ev.target.closest(".email-src-link");
+        if (srcLink) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const url = srcLink.dataset.url;
+          if (url) chrome.tabs.create({ url, active: false });
+          return;
+        }
         chip.classList.toggle("selected");
         _syncSelectedToInput();
       });
@@ -9145,14 +9318,16 @@ function initProspectCard(card, data) {
 
   // Reject
   card.querySelector(".pcard-reject-btn")?.addEventListener("click", async () => {
-    if (!confirm(`Reject and permanently block "${data.domain}"?`)) return;
+    if (!confirm(`❌ Descartar "${data.domain}"?\n\nAl rechazar, el agente APRENDE el tipo (categoría + tráfico + geo). Si rechazás 3+ similares, evita ese tipo en futuras búsquedas.`)) return;
     card.style.opacity = "0.4";
-    // Al rechazar, también guardar dislike para el learning
+    // Al rechazar, guardar dislike + signature (categoria + traffic_bucket + geo)
+    // para que el worker la use al filtrar nuevos leads.
     await Promise.all([
       rejectReviewItem(state.accessToken, id, data.domain),
       saveAutopilotFeedback(state.accessToken, {
         user_email: state.loginEmail, domain: data.domain, action: "disliked",
         category: data.category, geo: data.geo, ad_networks: data.ad_networks,
+        traffic: data.traffic,
       }),
     ]);
     card.remove();
@@ -9332,6 +9507,32 @@ async function validateProspect(card, data, doSendEmail) {
       const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
       if (!result.ok) throw new Error(result.error || "Gmail error");
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
+
+      // Maxi 2026-06-17: emails futuros encolados (FU2/FU3/FU4) si MB los completó
+      const futSlots = [
+        { sel: ".pcard-future-1", days: 11, label: "FU2" },
+        { sel: ".pcard-future-2", days: 22, label: "FU3" },
+        { sel: ".pcard-future-3", days: 33, label: "FU4" },
+      ];
+      const futStatusEl = card.querySelector(".pcard-future-status");
+      const queuedMsgs = [];
+      for (const slot of futSlots) {
+        const fe = card.querySelector(slot.sel)?.value?.trim();
+        if (!fe || !fe.includes("@") || fe === email) continue;
+        const bFut = await isEmailBounced(state.accessToken, fe).catch(() => ({ bounced: false }));
+        if (bFut.bounced) continue;
+        const r = await queueReengagement(state.accessToken, {
+          domain: data.domain, monday_item_id: data.monday_item_id || null,
+          mb_email: state.loginEmail, original_email: email, future_email: fe,
+          original_subject: subject, original_body: fullBody,
+          delay_days: slot.days, sequence: slot.label,
+        });
+        if (r.ok) queuedMsgs.push(slot.label);
+      }
+      if (futStatusEl && queuedMsgs.length) {
+        futStatusEl.textContent = `✅ Futuros encolados: ${queuedMsgs.join(", ")}`;
+        futStatusEl.style.color = "#16a34a";
+      }
     }
 
     // 3. Save to historial
@@ -9393,15 +9594,21 @@ async function refreshProspectsStats() {
 async function initProspectsTab() {
   // Restore filtros guardados de sesiones previas
   try {
-    const { _prospectsDateFilter, _prospectsSourceFilter, _prospectsUserFilter, _prospectsGeoFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter", "_prospectsUserFilter", "_prospectsGeoFilter"]);
+    const { _prospectsDateFilter, _prospectsSourceFilter, _prospectsUserFilter, _prospectsGeoFilter, _prospectsGeoChips, _prospectsTrafficFilter, _prospectsNameFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter", "_prospectsUserFilter", "_prospectsGeoFilter", "_prospectsGeoChips", "_prospectsTrafficFilter", "_prospectsNameFilter"]);
     const dateEl   = document.getElementById("prospects-date-filter");
     const sourceEl = document.getElementById("prospects-source-filter");
     const userEl   = document.getElementById("prospects-user-filter");
     const geoEl    = document.getElementById("prospects-geo-filter");
+    const trafEl   = document.getElementById("prospects-traffic-filter");
+    const nameEl   = document.getElementById("prospects-name-filter");
     if (dateEl   && _prospectsDateFilter)   dateEl.value   = _prospectsDateFilter;
     if (sourceEl && _prospectsSourceFilter) sourceEl.value = _prospectsSourceFilter;
     if (userEl   && _prospectsUserFilter)   userEl.value   = _prospectsUserFilter;
     if (geoEl    && _prospectsGeoFilter)    geoEl.value    = _prospectsGeoFilter;
+    if (trafEl   && _prospectsTrafficFilter) trafEl.value  = _prospectsTrafficFilter;
+    if (nameEl   && _prospectsNameFilter)   nameEl.value   = _prospectsNameFilter;
+    // Restore GEO chips selection (set global usado por loadProspectsTab y _rebuildGeoChips)
+    window._selectedGeoChips = new Set(Array.isArray(_prospectsGeoChips) ? _prospectsGeoChips.map(x => String(x).toUpperCase()) : []);
   } catch {}
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
@@ -9420,6 +9627,36 @@ async function initProspectsTab() {
   });
   document.getElementById("prospects-geo-filter")?.addEventListener("change", async (e) => {
     chrome.storage.local.set({ _prospectsGeoFilter: e.target.value }).catch(() => {});
+    await loadProspectsTab();
+  });
+  document.getElementById("prospects-traffic-filter")?.addEventListener("change", async (e) => {
+    chrome.storage.local.set({ _prospectsTrafficFilter: e.target.value }).catch(() => {});
+    await loadProspectsTab();
+  });
+  // Name filter — debounce 300ms para no recargar en cada tecla
+  let _nameDebounce = null;
+  document.getElementById("prospects-name-filter")?.addEventListener("input", (e) => {
+    clearTimeout(_nameDebounce);
+    const v = e.target.value;
+    _nameDebounce = setTimeout(async () => {
+      chrome.storage.local.set({ _prospectsNameFilter: v }).catch(() => {});
+      await loadProspectsTab();
+    }, 300);
+  });
+  // Chips delegate handler
+  document.getElementById("prospects-geo-chips")?.addEventListener("click", async (e) => {
+    const chip = e.target.closest(".geo-chip");
+    if (!chip) return;
+    const code = chip.dataset.code;
+    if (!code) return;
+    if (!window._selectedGeoChips) window._selectedGeoChips = new Set();
+    if (code === "_ALL_") {
+      window._selectedGeoChips.clear();
+    } else {
+      if (window._selectedGeoChips.has(code)) window._selectedGeoChips.delete(code);
+      else window._selectedGeoChips.add(code);
+    }
+    chrome.storage.local.set({ _prospectsGeoChips: [...window._selectedGeoChips] }).catch(() => {});
     await loadProspectsTab();
   });
   // ── Filter presets por SOURCE: filtrar leads según de dónde vinieron ─────

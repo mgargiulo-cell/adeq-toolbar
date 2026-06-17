@@ -525,13 +525,15 @@
       </div>
       <div id="apollo-result" class="apollo-result"></div>
 
-      <!-- Email Futuro — se envía solo a los 11 días si el primer email no se abrió -->
+      <!-- Emails Futuros (hasta 3) — se envían solo a los +11/+22/+33 días si no abrieron el primero -->
       <div id="email-futuro-block" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--surface-3)">
-        <label class="form-label" for="form-email-futuro" style="display:flex;align-items:center;gap:6px;font-size:11px">
-          ⏱️ <span>Email Futuro</span>
-          <span style="font-size:10px;font-weight:500;color:var(--text-muted);font-style:italic">(opcional — envío auto a los 11d si no abrieron el primero)</span>
+        <label class="form-label" style="display:flex;align-items:center;gap:6px;font-size:11px">
+          ⏱️ <span>Emails Futuros (hasta 3)</span>
+          <span style="font-size:10px;font-weight:500;color:var(--text-muted);font-style:italic">(opcional — auto a los +11/+22/+33d si no abrieron el primero)</span>
         </label>
-        <input id="form-email-futuro" class="form-input" type="email" placeholder="email-alternativo@sitio.com" autocomplete="off" />
+        <input id="form-email-futuro"   class="form-input" type="email" placeholder="FU2 — email alternativo +11d" autocomplete="off" style="margin-bottom:4px" />
+        <input id="form-email-futuro-2" class="form-input" type="email" placeholder="FU3 — email alternativo +22d" autocomplete="off" style="margin-bottom:4px" />
+        <input id="form-email-futuro-3" class="form-input" type="email" placeholder="FU4 — email alternativo +33d" autocomplete="off" />
         <div id="email-futuro-status" style="font-size:10px;color:var(--text-muted);margin-top:4px"></div>
       </div>
     </div>
@@ -949,12 +951,14 @@
   <section class="card" style="padding-bottom:10px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;flex-wrap:wrap">
       <div class="card-title" style="margin:0">📋 Review Prospects</div>
-      <div style="display:flex;gap:6px;align-items:center">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="prospects-name-filter" type="text" class="form-input" placeholder="🔎 Buscar dominio / título…" style="font-size:11px;padding:3px 6px;width:160px" title="Filtra por dominio o título de página" />
         <select id="prospects-source-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by source">
           <option value="">All sources</option>
-          <option value="autopilot">🤖 Autopilot</option>
-          <option value="csv">📥 CSV</option>
-          <option value="monday_refresh">🔄 Monday Refresh</option>
+          <option value="autopilot">🤖 Autopilot (Robot Railway)</option>
+          <option value="csv">📥 CSV (External URL Auto Prospector)</option>
+          <option value="monday_refresh">🔄 Monday (URL Auto Prospector)</option>
+          <option value="sellers_json">📋 sellers.json (Import Publishers)</option>
         </select>
         <select id="prospects-user-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by user who imported / discovered">
           <option value="">All users</option>
@@ -969,27 +973,37 @@
           <option value="last7">Last 7 days</option>
           <option value="last30">Last 30 days</option>
         </select>
-        <select id="prospects-geo-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by country (ISO)">
-          <option value="">🌍 All GEOs</option>
-          <option value="AR">🇦🇷 Argentina</option>
-          <option value="BR">🇧🇷 Brasil</option>
-          <option value="ES">🇪🇸 España</option>
-          <option value="MX">🇲🇽 México</option>
-          <option value="CO">🇨🇴 Colombia</option>
-          <option value="CL">🇨🇱 Chile</option>
-          <option value="PE">🇵🇪 Perú</option>
-          <option value="UY">🇺🇾 Uruguay</option>
-          <option value="EC">🇪🇨 Ecuador</option>
-          <option value="VE">🇻🇪 Venezuela</option>
-          <option value="DO">🇩🇴 Rep. Dominicana</option>
-          <option value="PT">🇵🇹 Portugal</option>
-          <option value="IT">🇮🇹 Italia</option>
-          <option value="FR">🇫🇷 Francia</option>
-          <option value="DE">🇩🇪 Alemania</option>
+        <select id="prospects-traffic-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by traffic range">
+          <option value="">📊 All traffic</option>
+          <option value="0-1">0 – 1M</option>
+          <option value="1-2">1M – 2M</option>
+          <option value="2-3">2M – 3M</option>
+          <option value="3-4">3M – 4M</option>
+          <option value="4-5">4M – 5M</option>
+          <option value="5-6">5M – 6M</option>
+          <option value="6-7">6M – 7M</option>
+          <option value="7-8">7M – 8M</option>
+          <option value="8-9">8M – 9M</option>
+          <option value="9-10">9M – 10M</option>
+          <option value="10-11">10M – 11M</option>
+          <option value="11-12">11M – 12M</option>
+          <option value="12-13">12M – 13M</option>
+          <option value="13-14">13M – 14M</option>
+          <option value="14-15">14M – 15M</option>
+          <option value="15-20">15M – 20M</option>
+          <option value="20-25">20M – 25M</option>
+          <option value="25-30">25M – 30M</option>
+          <option value="30-35">30M – 35M</option>
+          <option value="35-40">35M – 40M</option>
+          <option value="40-45">40M – 45M</option>
+          <option value="45-50">45M – 50M</option>
+          <option value="50-9999">50M+</option>
         </select>
         <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
       </div>
     </div>
+    <!-- GEO multi-select chips (clickeables) — Maxi 2026-06-17 -->
+    <div id="prospects-geo-chips" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;font-size:10px"></div>
     <!-- Filter presets — atajos de un click para combos comunes -->
     <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
       <button class="prospects-preset btn btn-sm" data-source="" style="font-size:10px;padding:2px 7px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">∞ All</button>
@@ -998,6 +1012,10 @@
       <button class="prospects-preset btn btn-sm" data-source="csv" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📥 CSV</button>
       <button class="prospects-preset btn btn-sm" data-source="autopilot" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🤖 Autopilot</button>
     </div>
+    <!-- Legacy geo dropdown — escondido pero usado internamente por filtros antiguos -->
+    <select id="prospects-geo-filter" class="form-select" style="display:none">
+      <option value="">All GEOs</option>
+    </select>
     <div id="prospects-stats" style="font-size:11px;color:var(--text-muted);margin-bottom:6px"></div>
     <!-- Bulk action bar — solo visible cuando hay > 0 cards seleccionadas -->
     <div id="prospects-bulk-bar" style="display:none;align-items:center;gap:6px;background:#1e293b;color:#fff;padding:6px 8px;border-radius:6px;margin-bottom:6px;font-size:11px">

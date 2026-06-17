@@ -1159,13 +1159,25 @@ async function _runFeederSlot(token, slotLabel) {
     return;
   }
 
-  // 2. RapidAPI gate (la única protección real de costo)
+  // 2. RapidAPI gate + throttle de pacing (Maxi 2026-06-17).
+  // Hard gate al 95% (no se mueve). Throttle dinámico: si gastamos al 50% pero
+  // solo va 20% del ciclo, pisamos el freno para que el cap dure todo el mes.
   const { usedThisMonth, limit: rapidLimit } = await getRapidApiUsageThisMonth(token);
   if (usedThisMonth >= rapidLimit * FEEDER_RAPIDAPI_THRESHOLD) {
     log(`🛑 cron ${slotLabel} SKIP: RapidAPI ${usedThisMonth}/${rapidLimit} (≥${FEEDER_RAPIDAPI_THRESHOLD * 100}%)`);
     await _insertFeederRun(token, slotLabel, {
       status: "skipped_rapidapi", rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
       notes: "RapidAPI near monthly limit",
+    });
+    return;
+  }
+  if (_isAheadOfPace(usedThisMonth, rapidLimit)) {
+    const tPct = Math.round(_cycleElapsedRatio() * 100);
+    const uPct = Math.round((usedThisMonth / rapidLimit) * 100);
+    log(`⏸️ cron ${slotLabel} SKIP throttle: RapidAPI usado ${uPct}% pero ciclo va ${tPct}% (pacing)`);
+    await _insertFeederRun(token, slotLabel, {
+      status: "skipped_throttle", rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
+      notes: `pacing — used ${uPct}% vs cycle ${tPct}%`,
     });
     return;
   }
@@ -1920,10 +1932,40 @@ async function getRapidApiUsageThisMonth(token) {
   } catch { return { usedThisMonth: 0, limit: 40000, period: _billingCyclePeriod() }; }
 }
 
-// Período mensual = MES CALENDARIO (decisión user 2026-05-12).
-// Reset automático día 1. Formato "YYYY-MM" matchea con popup apiProxy.
+// Período mensual = ciclo 6 → 6 (Maxi 2026-06-17). El RapidAPI cycle real
+// es del día 6 de un mes al día 6 del próximo. Por eso anclamos el período
+// al día 6: si hoy >= 6 → este mes-06. Si hoy < 6 → mes anterior-06.
+// Formato "YYYY-MM-06" (también compat con el legacy "YYYY-MM" via slice(0,7)).
 function _billingCyclePeriod() {
-  return new Date().toISOString().slice(0, 7);
+  const d = new Date();
+  const isBeforeDay6 = d.getUTCDate() < 6;
+  const month = isBeforeDay6 ? d.getUTCMonth() - 1 : d.getUTCMonth();
+  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, 6));
+  return anchor.toISOString().slice(0, 10); // "2026-06-06"
+}
+
+// Calcula % del ciclo transcurrido — 0 = recién empezó, 1 = está por terminar.
+// Usado para throttle dinámico: si gastamos al 80% pero solo va 30% del ciclo,
+// pisamos el freno.
+function _cycleElapsedRatio() {
+  const start = new Date(_billingCyclePeriod() + "T00:00:00Z");
+  const end   = new Date(start.getTime());
+  end.setUTCMonth(end.getUTCMonth() + 1);
+  const total   = end.getTime() - start.getTime();
+  const elapsed = Date.now() - start.getTime();
+  return Math.max(0, Math.min(1, elapsed / total));
+}
+
+// Throttle dinámico: devuelve true si usamos MÁS rápido que el tiempo que pasó.
+// Sirve para Apollo (cap 2400/mes) y RapidAPI (cap 40K/mes). Si ratio gastado
+// > ratio transcurrido × 1.10 (10% margen), bloqueamos hasta que el tiempo
+// se ponga al día. Evita quemar la cuota al día 20 y quedarse sin créditos
+// hasta el próximo ciclo (Maxi 2026-06-17).
+function _isAheadOfPace(used, limit) {
+  if (limit <= 0) return false;
+  const spentRatio = used / limit;
+  const timeRatio  = _cycleElapsedRatio();
+  return spentRatio > (timeRatio + 0.10);
 }
 
 async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {
@@ -2587,12 +2629,21 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
   // Acá: o no hay gratis, o el gratis es genérico y el sitio califica → intentamos unlock.
   if (!qualifiesUnlock) return freeResult; // null si tampoco había gratis
 
-  // Hard cap check: leer apollo_calls_month antes de gastar credit.
-  // Si llegamos al cap, devolvemos el gratis (si había) en vez de null.
+  // Hard cap + throttle de pacing. Si gastamos al X% pero solo va Y% del ciclo
+  // (X > Y + 10%), pisamos el freno para que el cap dure todo el mes
+  // (Maxi 2026-06-17: evitar quemar Apollo al día 20 y quedarse sin créditos).
   try {
     const usage = await getApolloUsageToday(token);
-    if ((usage.usedThisMonth || 0) >= APOLLO_MONTHLY_HARD_CAP) {
-      log(`  ⚠ Apollo cap ${APOLLO_MONTHLY_HARD_CAP} alcanzado (${usage.usedThisMonth}/${usage.monthLimit}) — skip unlock ${domain}`);
+    const used  = usage.usedThisMonth || 0;
+    const cap   = APOLLO_MONTHLY_HARD_CAP;
+    if (used >= cap) {
+      log(`  ⚠ Apollo cap ${cap} alcanzado (${used}/${usage.monthLimit}) — skip unlock ${domain}`);
+      return freeResult;
+    }
+    if (_isAheadOfPace(used, cap)) {
+      const tPct = Math.round(_cycleElapsedRatio() * 100);
+      const uPct = Math.round((used / cap) * 100);
+      log(`  ⏸️ Apollo throttle: usado ${uPct}% pero ciclo va ${tPct}% — skip unlock ${domain} (pacing)`);
       return freeResult;
     }
   } catch {}
@@ -2798,7 +2849,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Usa User-Agent real (Chrome) para evitar anti-bot blocks comunes.
   // opts.informerOut: Set opcional — recibe los emails que vinieron de
   // website.informer.com / who.is, para que el caller los etiquete "informer".
+  // opts.urlByEmail: Map opcional — recibe email→URL de origen para tracking UI
+  // (user 2026-06-17: poder mostrar de qué URL salió cada scraped email).
   const informerOut = opts.informerOut || null;
+  const urlByEmail  = opts.urlByEmail  || null;
   const emails = new Set();
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
@@ -2821,8 +2875,11 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         if (clean.includes("@")) found.add(clean);
       }
       found.forEach(e => {
+        const lower = e.toLowerCase();
         emails.add(e);
-        if (isInformer && informerOut) informerOut.add(e.toLowerCase());
+        if (isInformer && informerOut) informerOut.add(lower);
+        // Track origen URL: solo primera vez (URL más temprana = más cerca de home/contact)
+        if (urlByEmail && !urlByEmail.has(lower)) urlByEmail.set(lower, url);
       });
     } catch {}
   };
@@ -3885,15 +3942,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   let apolloRes = null;
   let scraperEmails = [];
   const informerSet = new Set(); // emails que vinieron de website.informer.com / who.is
+  const urlByEmail  = new Map(); // 2026-06-17: track URL exacta del scrape para UI
   if (useApolloFirst) {
     apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
       .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
       .catch(() => null);
     if (!apolloRes?.email) {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet }).catch(() => []);
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
     }
   } else {
-    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet }).catch(() => []);
+    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
     if (scraperEmails.length === 0 && canUseApollo) {
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
@@ -3905,17 +3963,26 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
   // Apollo va PRIMERO en el array. emailSources mapea cada email a su origen
   // para pick prioritario en agent: apollo > informer > scrape > generic.
+  // 2026-06-17: format = {source: "apollo|scrape|informer|generic", url?: string}
+  // El UI muestra (apollo)/(informer)/(genérico) labels, y para "scrape" hace
+  // clickeable la URL si está. Backward-compat: si el value es string, se trata
+  // como source plano (rows viejas no tienen URL).
   const rawEmails = [...new Set([...apolloEmail, ...scraperEmails])];
   const emailSources = {};
-  apolloEmail.forEach(e => { emailSources[e.toLowerCase()] = "apollo"; });
+  apolloEmail.forEach(e => { emailSources[e.toLowerCase()] = { source: "apollo" }; });
   scraperEmails.forEach(e => {
     const lower = e.toLowerCase();
     if (!emailSources[lower]) {
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
-      // informer tiene prioridad sobre scrape/generic salvo que sea un rol genérico
-      if (informerSet.has(lower) && !IS_GENERIC.test(local)) emailSources[lower] = "informer";
-      else emailSources[lower] = IS_GENERIC.test(local) ? "generic" : "scrape";
+      const url = urlByEmail.get(lower) || "";
+      if (informerSet.has(lower) && !IS_GENERIC.test(local)) {
+        emailSources[lower] = { source: "informer", url: url || "https://website.informer.com/" + domain };
+      } else if (IS_GENERIC.test(local)) {
+        emailSources[lower] = { source: "generic", url };
+      } else {
+        emailSources[lower] = { source: "scrape", url };
+      }
     }
   });
   // Filtrar emails con dominio sin MX records ANTES de guardar
@@ -4729,13 +4796,14 @@ async function runSession(token, cfg, sessionStart) {
     let apolloRes = null;
     let scraperEmails = [];
     const informerSetAuto = new Set(); // emails de website.informer.com / who.is
+    const urlByEmailAuto  = new Map();
     if (useApolloFirst) {
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
         .catch(() => null);
-      if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto }).catch(() => []);
+      if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
     } else {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto }).catch(() => []);
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
       if (scraperEmails.length === 0 && canUseApollo) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
@@ -4747,16 +4815,22 @@ async function runSession(token, cfg, sessionStart) {
     const apolloPhoneAuto       = apolloRes?.phone || "";
     const apolloEmailAuto = apolloRes?.email ? [apolloRes.email] : [];
     const rawEmailsAuto = [...new Set([...apolloEmailAuto, ...scraperEmails])];
-    // Source tracking: apollo > informer > scrape > generic
+    // Source tracking: apollo > informer > scrape > generic. Object format con URL tracking.
     const emailSourcesAuto = {};
-    apolloEmailAuto.forEach(e => { emailSourcesAuto[e.toLowerCase()] = "apollo"; });
+    apolloEmailAuto.forEach(e => { emailSourcesAuto[e.toLowerCase()] = { source: "apollo" }; });
     scraperEmails.forEach(e => {
       const lower = e.toLowerCase();
       if (emailSourcesAuto[lower]) return;
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
-      if (informerSetAuto.has(lower) && !IS_GENERIC.test(local)) emailSourcesAuto[lower] = "informer";
-      else emailSourcesAuto[lower] = IS_GENERIC.test(local) ? "generic" : "scrape";
+      const url = urlByEmailAuto.get(lower) || "";
+      if (informerSetAuto.has(lower) && !IS_GENERIC.test(local)) {
+        emailSourcesAuto[lower] = { source: "informer", url: url || "https://website.informer.com/" + domain };
+      } else if (IS_GENERIC.test(local)) {
+        emailSourcesAuto[lower] = { source: "generic", url };
+      } else {
+        emailSourcesAuto[lower] = { source: "scrape", url };
+      }
     });
     const emails = await validateEmailsBatch(rawEmailsAuto);
     if (rawEmailsAuto.length !== emails.length) {

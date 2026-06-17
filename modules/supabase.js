@@ -275,11 +275,16 @@ export async function createManualSendTracking(accessToken, payload) {
 // Encola un email "futuro" para que el agente lo envíe a los 11d si el
 // primer email no fue abierto. Update Monday columns: email + FU1 + FU2.
 export async function queueReengagement(accessToken, payload) {
-  // payload: { domain, monday_item_id, mb_email, original_email, future_email }
+  // payload: { domain, monday_item_id, mb_email, original_email, future_email,
+  //   delay_days?: 11, sequence?: "FU2" }
+  // Maxi 2026-06-17: delay_days + sequence permiten encolar FU2/FU3/FU4 con
+  // distinto offset. Worker procesa cada uno verificando si el ORIGINAL fue
+  // abierto; si sí → cancela el resto.
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!accessToken || !payload?.future_email) return { ok: false, error: "missing data" };
-  const scheduled = new Date(Date.now() + 11 * 86_400_000).toISOString();
+  const days = parseInt(payload.delay_days || 11, 10);
+  const scheduled = new Date(Date.now() + days * 86_400_000).toISOString();
   try {
     const res = await fetch(`${url}/rest/v1/toolbar_reengagement_queue`, {
       method: "POST",
@@ -298,6 +303,7 @@ export async function queueReengagement(accessToken, payload) {
         tracking_action_id: payload.tracking_action_id || null,
         scheduled_for:    scheduled,
         status:           "pending",
+        sequence:         payload.sequence || "FU2",
       }),
     });
     if (!res.ok) {
@@ -507,9 +513,12 @@ export async function setAutopilotEnabled(enabled, accessToken, userEmail = "") 
 }
 
 // ── Autopilot feedback (learning from user like/dislike) ────
-export async function saveAutopilotFeedback(accessToken, { user_email, domain, action, category, geo, ad_networks }) {
+export async function saveAutopilotFeedback(accessToken, { user_email, domain, action, category, geo, ad_networks, traffic }) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
+  // Bucket de tráfico para detectar tipos rejected. Maxi 2026-06-17:
+  // el agente aprende qué COMBO (categoria + tráfico bucket + geo) no sirve.
+  const trafficBucket = trafficBucketLabel(traffic);
   try {
     const res = await fetch(`${url}/rest/v1/toolbar_autopilot_feedback`, {
       method: "POST",
@@ -517,10 +526,59 @@ export async function saveAutopilotFeedback(accessToken, { user_email, domain, a
         "apikey": key, "Authorization": `Bearer ${accessToken}`,
         "Content-Type": "application/json", "Prefer": "return=minimal",
       },
-      body: JSON.stringify([{ user_email, domain, action, category: category || "", geo: geo || "", ad_networks: ad_networks || [] }]),
+      body: JSON.stringify([{ user_email, domain, action, category: category || "", geo: geo || "", ad_networks: ad_networks || [], traffic_bucket: trafficBucket }]),
     });
     return { ok: res.ok };
   } catch (e) { return { ok: false, error: e.message }; }
+}
+
+// Etiqueta bucket de tráfico — usada por reject-learning para agrupar dislikes
+// por orden de magnitud. Si pegan 3+ dislikes en el mismo bucket+categoria+geo,
+// el worker skipea futuros leads de ese tipo.
+export function trafficBucketLabel(traffic) {
+  const t = parseInt(traffic || 0, 10);
+  if (!t) return "unknown";
+  if (t < 100_000)    return "<100K";
+  if (t < 500_000)    return "100K-500K";
+  if (t < 1_000_000)  return "500K-1M";
+  if (t < 5_000_000)  return "1M-5M";
+  if (t < 15_000_000) return "5M-15M";
+  return "15M+";
+}
+
+// Fetch signatures (categoria + traffic_bucket + geo) que el MB rechazó 3+ veces.
+// Worker usa esto para skipear leads que matchean. Sin RPC para simplicidad —
+// agregamos client-side.
+export async function fetchRejectedSignatures(accessToken, userEmail, threshold = 3) {
+  if (!accessToken) return [];
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    // Solo últimos 90 días — historial reciente, no perpetuo
+    const since = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
+    const u = userEmail ? `&user_email=eq.${encodeURIComponent(userEmail)}` : "";
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_autopilot_feedback?action=eq.disliked&created_at=gte.${since}${u}&select=category,geo,traffic_bucket&limit=2000`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return [];
+    const rows = await res.json();
+    // Cuenta por signatura
+    const counts = new Map();
+    for (const r of (Array.isArray(rows) ? rows : [])) {
+      const sig = `${(r.category||"").toLowerCase().trim()}|${(r.traffic_bucket||"unknown")}|${(r.geo||"").toLowerCase().trim()}`;
+      counts.set(sig, (counts.get(sig) || 0) + 1);
+    }
+    // Devolver signatures que pasaron el threshold
+    const blocked = [];
+    for (const [sig, n] of counts.entries()) {
+      if (n >= threshold) {
+        const [category, traffic_bucket, geo] = sig.split("|");
+        blocked.push({ category, traffic_bucket, geo, count: n });
+      }
+    }
+    return blocked;
+  } catch { return []; }
 }
 
 export async function getAutopilotTarget(accessToken) {
@@ -558,7 +616,7 @@ export async function setAutopilotTarget(geo, category, minTraffic, accessToken)
 export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFilter = "", userFilter = "", geoFilter = "" } = {}) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,emails,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by";
+  const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,emails,email_sources,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by";
   // Date filter: "" | "today" | "yesterday" | "last7" | "last30"
   let dateClause = "";
   if (dateFilter) {

@@ -31,14 +31,16 @@ const FLUSH_EVERY_MS  = 30_000; // persiste como mucho cada 30s
 const FLUSH_EVERY_HITS = 10;    // o cada 10 hits, lo que ocurra antes
 let _hitsSinceFlush = 0;
 
-// Período de facturación: ciclo del 6 al 6 (NO calendario natural).
-// Si hoy es ≥ día 6 → período empieza este mes-6. Si es < día 6 → empezó el
-// mes pasado-6. Devuelve string "YYYY-MM-DD" del primer día del ciclo.
-// Decisión user 2026-05-12: contar por MES CALENDARIO (1 al último día,
-// regardless de mes corto/largo). Reset automático al día 1 del nuevo mes.
-// Formato "YYYY-MM" para que cualquier write con la misma key matchee.
+// Período de facturación: ciclo del 6 al 6 (Maxi 2026-06-17). RapidAPI cobra
+// del día 6 al día 6 del mes siguiente. Si hoy >= día 6 → período empieza este
+// mes-06. Si hoy < día 6 → empezó el mes pasado-06. Formato "YYYY-MM-06" para
+// que matchee con el worker (también compat con slice(0,7) legacy).
 function currentPeriod() {
-  return new Date().toISOString().slice(0, 7); // "2026-05"
+  const d = new Date();
+  const isBeforeDay6 = d.getUTCDate() < 6;
+  const month = isBeforeDay6 ? d.getUTCMonth() - 1 : d.getUTCMonth();
+  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, 6));
+  return anchor.toISOString().slice(0, 10); // "2026-06-06"
 }
 
 async function _readConfigKeys(keys) {
@@ -263,8 +265,15 @@ export async function callProxy(provider, path, opts = {}) {
       // Incrementar contador mensual (rapidapi y apollo cuentan separados).
       // Bump atomic via RPC bump_api_counter — funciona desde popup/agente/worker.
       const inc = 1 + attempt;
-      if (provider === "rapidapi" || provider === "apollo") {
-        // RPC en background, no bloquea
+      // BUG FIX 2026-06-17: Apollo solo cobra crédito por /v1/people/match
+      // (el unlock real). /v1/mixed_people/api_search es GRATIS. Antes
+      // contábamos TODO como crédito → contador inflado 2000+ y Apollo
+      // dashboard mostraba 0 reales. Ahora solo bumpamos cuando es unlock.
+      const isPaidApolloCall = provider === "apollo" && /\/v1\/people\/match/.test(path);
+      const shouldBumpCounter = provider === "rapidapi" || isPaidApolloCall;
+      if (shouldBumpCounter && res.ok) {
+        // RPC en background, no bloquea. Solo bumpa en respuestas exitosas:
+        // Apollo no cobra créditos por errores HTTP 4xx/5xx en /people/match.
         fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/bump_api_counter`, {
           method: "POST",
           headers: {
