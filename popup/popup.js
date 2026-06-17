@@ -1327,18 +1327,36 @@ async function toggleAgent(e) {
 }
 
 async function saveAgentThresholds() {
-  // 2026-05-18: agent_threshold_score y active_hours quedaron hidden en UI.
-  // El score no se usa para filtrar leads (solo hard gates). Active hours
-  // siguen siendo 9-23 fijo (los slots viven adentro). Por compat seguimos
-  // guardándolos por si hay scripts/integraciones que los lean.
+  // Maxi 2026-06-17: UNIFICADO. El botón "💾 Guardar TODO" ahora persiste
+  // thresholds + max/day + GEOs + categorías + weekly de UNA. Antes era
+  // 2 botones separados (Save thresholds vs Save focus), confuso para el MB.
+  // Además: el max_per_day APLICA A TODOS los MBs (es config global del worker).
   const updates = {
     agent_threshold_traffic:  parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 400000,
     agent_max_per_day:        parseInt(document.getElementById("agent-cfg-max").value, 10) || 30,
     agent_active_hours_start: parseInt(document.getElementById("agent-cfg-active-start").value, 10) || 9,
     agent_active_hours_end:   parseInt(document.getElementById("agent-cfg-active-end").value, 10) || 23,
   };
+  // Maxi 2026-06-17: si el admin baja el cap global (ej. 30→15), también
+  // limpiamos `agent_max_per_day_by_user` para que NO siga overrideando.
+  // Antes Diego/Agus quedaban en 15 hardcoded; ahora con UI unificada el cap
+  // global gana sobre el override per-usuario.
+  updates.agent_max_per_day_by_user = "{}";
+
+  // También persistimos focus (GEOs + categorías + weekly) en el mismo save.
+  const parseList = (id) => (document.getElementById(id).value || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const focus = {
+    geos_priority:       parseList("agent-focus-geos-priority").map(s => s.toUpperCase()),
+    geos_excluded:       parseList("agent-focus-geos-excluded").map(s => s.toUpperCase()),
+    categories_priority: parseList("agent-focus-categories").map(s => s.toLowerCase()),
+    daily_override:      parseInt(document.getElementById("agent-focus-daily").value, 10) || 0,
+    weekly_target:       parseInt(document.getElementById("agent-focus-weekly").value, 10) || 0,
+  };
+  updates.agent_focus_config = JSON.stringify(focus);
+
   await _writeAgentConfig(updates);
-  showToast("✅ Thresholds saved", "info");
+  showToast("✅ Configuración guardada (aplica a los 3 MBs)", "info");
   await loadAdminAgent();
 }
 
@@ -1631,6 +1649,9 @@ async function loadAdminActivity() {
   document.getElementById("stat-500k-up").textContent        = above500k.toLocaleString();
   document.getElementById("stat-bounces").textContent        = emailsAgent > 0 ? `${bouncePct}%` : "—";
 
+  // Maxi 2026-06-17: Quickview compacto por MB — manual + agente + eficacia.
+  renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes);
+
   // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial.
   // CADA review_queue row genera 1 row para el created_by (descubrió/importó) Y
   // 1 row adicional para el validated_by (procesó). Así la "actividad" de cada MB
@@ -1679,6 +1700,76 @@ async function loadAdminActivity() {
 
   // Resumen narrativo por MB (cards con tips para 1:1)
   renderAdminMBSummaries(combined, usageRes, sessionsRes, agentActions);
+}
+
+// Maxi 2026-06-17: tablero compacto por MB en la parte superior del admin
+// activity tab. Mostramos 1 fila por MB con: Manual (envío hecho a mano desde
+// la toolbar), Agente (envío automático del worker), Eficacia (validados/
+// enviados). Simple para que Maxi vea quien trabaja cuánto sin escarbar tablas.
+function renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes) {
+  const wrap = document.getElementById("admin-mb-quickview");
+  if (!wrap) return;
+  const MB_INFO = [
+    { email: "mgargiulo@adeqmedia.com", name: "Maxi",  color: "#10b981" },
+    { email: "sales@adeqmedia.com",     name: "Agus",  color: "#ec4899" },
+    { email: "dhorovitz@adeqmedia.com", name: "Diego", color: "#a855f7" },
+  ];
+
+  const isManualAction = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
+
+  const rowsHtml = MB_INFO.map(mb => {
+    const emailLower = mb.email.toLowerCase();
+
+    // Manual emails: del api_usage._emails_sent + agent_actions con ui_origin=toolbar_manual
+    const manualFromUsage = (usageRes || []).filter(u => (u.user_email || "").toLowerCase() === emailLower)
+      .reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
+    const manualFromActions = (agentActions || []).filter(a => (a.user_email || "").toLowerCase() === emailLower && isManualAction(a) && (a.action === "sent" || a.action === "monday_ok")).length;
+    const manualEmails = manualFromUsage + manualFromActions;
+
+    // Agente: agent_actions sin ui_origin=toolbar_manual
+    const agentEmails = (agentActions || []).filter(a =>
+      (a.user_email || "").toLowerCase() === emailLower &&
+      !isManualAction(a) &&
+      (a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent")
+    ).length;
+
+    // Bounces detectados para este MB
+    const bounces = (bounceRetries || []).filter(b => (b.mb_email || "").toLowerCase() === emailLower).length;
+    const bouncePct = agentEmails > 0 ? Math.round((bounces / agentEmails) * 100) : 0;
+
+    // Validados (procesados desde Prospects) por este MB
+    const validated = (queueRes || []).filter(q => (q.validated_by || "").toLowerCase() === emailLower).length;
+    const totalSends = manualEmails + agentEmails;
+    const efficacy = totalSends > 0 ? Math.round((validated / totalSends) * 100) : 0;
+
+    // Color del badge eficacia
+    const effColor = efficacy >= 70 ? "#16a34a" : efficacy >= 40 ? "#d97706" : "#dc2626";
+    const bounceColor = bouncePct >= 10 ? "#dc2626" : bouncePct >= 5 ? "#d97706" : "#16a34a";
+
+    return `
+      <div style="display:grid;grid-template-columns:80px 1fr 1fr 90px 90px;gap:8px;align-items:center;padding:6px 8px;background:#0f172a;border-radius:4px;border-left:3px solid ${mb.color}">
+        <div style="color:${mb.color};font-weight:700">${mb.name}</div>
+        <div title="Manual desde la toolbar (analysis tab)">
+          👤 <strong>${manualEmails}</strong> <span style="opacity:.6">manual</span>
+        </div>
+        <div title="Agente automatizado (sent + re_sent + bounce_retry_sent)">
+          🤖 <strong>${agentEmails}</strong> <span style="opacity:.6">agente</span>
+        </div>
+        <div title="% rebote = bounces / agentEmails" style="color:${bounceColor};text-align:center;font-weight:600">
+          🚫 ${bounces} (${bouncePct}%)
+        </div>
+        <div title="Eficacia = validated / total enviados" style="color:${effColor};text-align:center;font-weight:700">
+          ✅ ${efficacy}%
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  wrap.innerHTML = rowsHtml + `
+    <div style="font-size:10px;color:#64748b;text-align:center;padding-top:4px">
+      👤=manual desde toolbar · 🤖=agente automático · 🚫=rebotes detectados · ✅=eficacia (validated/sent)
+    </div>
+  `;
 }
 
 // ── Helper compartido: agrega métricas por user (usado por Comparator + Summaries) ──

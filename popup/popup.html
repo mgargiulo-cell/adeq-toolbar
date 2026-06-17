@@ -115,6 +115,13 @@
       </select>
       <button id="admin-refresh-stats" class="btn btn-sm btn-primary">🔄</button>
     </div>
+    <!-- Maxi 2026-06-17: Tablero compacto por MB — manual vs agente + eficacia.
+         Visible siempre arriba para entender de un vistazo quién trabaja qué.  -->
+    <div style="font-size:10px;color:#cbd5e1;font-weight:700;letter-spacing:.5px;margin:6px 0 4px">📊 RESUMEN POR MB (período seleccionado)</div>
+    <div id="admin-mb-quickview" style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px;font-size:11px;color:#cbd5e1">
+      <div style="opacity:.6;font-style:italic">Cargando…</div>
+    </div>
+
     <!-- 👤 Actividad del MB (manual desde la toolbar) -->
     <div style="font-size:10px;color:#cbd5e1;font-weight:700;letter-spacing:.5px;margin:6px 0 4px">👤 ACTIVIDAD DEL MB (MANUAL)</div>
     <div id="admin-stats-summary" class="admin-stats-summary">
@@ -166,92 +173,95 @@
       <div class="stat-card"><div class="stat-num" id="agent-stat-cap">20</div><div class="stat-label">Daily cap</div></div>
     </div>
 
-    <div class="admin-section-title">⚙️ Thresholds</div>
-    <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
-      <div style="font-size:10px;color:#94a3b8;margin-bottom:8px;padding:6px 8px;background:#0f172a;border-radius:4px;border-left:3px solid #6366f1">
-        🛰️ <strong>Schedule:</strong> Agent fires at fixed slots <strong>9 · 12 · 15 · 18 · 20 hs Madrid</strong> Mon-Fri, max 6 sends/slot = up to 30/day.
-        Hard gates: <strong>Adult / Streaming / Gambling / Mega-corps / Government</strong> always blocked.
+    <!-- Maxi 2026-06-17: UNIFICADO threshold + weekly focus en un solo panel.
+         Cambia el min traffic + max sends/day + GEOs + categorías de una. Aplica
+         a los 3 MBs (Maxi, Diego, Agus) — es config global del worker. -->
+    <div class="admin-section-title">⚙️ Configuración del Agente <span style="font-size:10px;color:#fbbf24;font-weight:500">· aplica a TODOS los MBs</span></div>
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:10px;margin-bottom:12px">
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:10px;padding:6px 8px;background:#0f172a;border-radius:4px;border-left:3px solid #6366f1">
+        🛰️ <strong>Schedule:</strong> 9 · 12 · 15 · 18 · 20 hs Madrid Mon-Fri.
+        <strong>Hard gates</strong>: Adult / Streaming / Gambling / Mega-corps / Government / USA / UK / CA / AU / NZ / IE bloqueados.
       </div>
-      <div style="display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;font-size:11px;color:#cbd5e1">
-        <label for="agent-cfg-traffic">Min traffic</label>
-        <select id="agent-cfg-traffic" class="form-select" style="font-size:11px;padding:3px 6px" title="Only domains with traffic above this value are eligible. The only quality gate that applies.">
-          <option value="1">No filter</option>
-          <option value="400000" selected>≥ 400K visits (default)</option>
-          <option value="500000">≥ 500K visits</option>
-          <option value="1000000">≥ 1M visits</option>
-          <option value="2000000">≥ 2M visits</option>
-          <option value="5000000">≥ 5M visits</option>
-        </select>
 
-        <label for="agent-cfg-max">Max sends / day</label>
-        <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:3px 6px" title="Daily cap distributed across the 5 slots (~6 per slot at 30/day).">
-          <option value="5">5/day (test)</option>
-          <option value="10">10/day</option>
-          <option value="20">20/day</option>
-          <option value="30" selected>30/day (default · 6 per slot)</option>
-          <option value="50">50/day</option>
-        </select>
-
-        <!-- Hidden — score no se usa para filtrar URLs (decisión user 2026-05-18) -->
-        <input type="hidden" id="agent-cfg-score" value="0" />
-        <!-- Hidden — active hours = 9-23 Madrid fijo, los slots fijos viven dentro -->
-        <input type="hidden" id="agent-cfg-active-start" value="9" />
-        <input type="hidden" id="agent-cfg-active-end" value="23" />
-      </div>
-      <div style="display:flex;gap:6px;margin-top:8px;justify-content:flex-end">
-        <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save</button>
-        <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:3px 10px" title="Pause agent for 1 hour (manual kill switch)">⏸ Pause 1h</button>
-        <button id="agent-unpause" class="btn btn-sm" style="background:#16a34a;color:#fff;font-size:11px;padding:3px 10px" title="Clear any pause (manual or kill-switch) and resume agent immediately">▶ Resume now</button>
-      </div>
-      <div style="margin-top:8px;padding-top:8px;border-top:1px solid #334155">
-        <div style="font-size:10px;color:#94a3b8;margin-bottom:4px">⚙️ Maintenance</div>
-        <div style="display:flex;gap:6px;align-items:center;justify-content:space-between">
-          <span style="font-size:11px;color:#cbd5e1" id="agent-refresh-status">Refresh leads without traffic: ⚪ OFF</span>
-          <button id="agent-refresh-toggle" class="btn btn-sm" style="background:#0ea5e9;color:#fff;font-size:11px;padding:3px 10px" title="Re-fetches traffic+geo for leads without data. 90d cache saves RapidAPI.">🔄 Activate refresh</button>
+      <!-- Row 1: Min Traffic + Max Sends/day -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;font-size:11px;color:#cbd5e1;margin-bottom:10px">
+        <div>
+          <label for="agent-cfg-traffic" style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">📊 Tráfico mínimo</label>
+          <select id="agent-cfg-traffic" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Solo dominios con tráfico arriba de este valor son elegibles. APLICA A TODOS LOS MBS.">
+            <option value="1">Sin filtro</option>
+            <option value="400000" selected>≥ 400K visits</option>
+            <option value="500000">≥ 500K visits</option>
+            <option value="1000000">≥ 1M visits</option>
+            <option value="2000000">≥ 2M visits</option>
+            <option value="5000000">≥ 5M visits</option>
+          </select>
+        </div>
+        <div>
+          <label for="agent-cfg-max" style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">📤 Max envíos/día (por MB)</label>
+          <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Cap diario por MB. 30 = ~6/slot.">
+            <option value="5">5/día (test)</option>
+            <option value="10">10/día</option>
+            <option value="15">15/día</option>
+            <option value="20">20/día</option>
+            <option value="30" selected>30/día (default)</option>
+            <option value="50">50/día</option>
+          </select>
         </div>
       </div>
-    </div>
 
-    <div class="admin-section-title">🎯 Weekly focus</div>
-    <div style="background:#1e293b;border:1px solid #334155;border-radius:6px;padding:8px;margin-bottom:12px">
-      <p style="font-size:10px;color:#94a3b8;margin:0 0 8px">Click chips to toggle. <span style="color:#34d399">Green</span>=PRIORITY, <span style="color:#f87171">Red</span>=EXCLUDED, gray=ignore.</p>
+      <!-- Row 2: GEOs clickeables -->
+      <div style="font-size:10px;color:#94a3b8;margin:8px 0 4px;text-transform:uppercase;letter-spacing:.4px">🌍 GEOs (verde=PRIO · rojo=EXCLUIDO · gris=ignorar)</div>
+      <div id="agent-focus-geos-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;max-height:140px;overflow-y:auto;padding:6px;background:#0f172a;border-radius:4px"></div>
 
-      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">🌍 GEOs</div>
-      <div id="agent-focus-geos-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;max-height:140px;overflow-y:auto"></div>
+      <!-- Row 3: Categorías -->
+      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 Categorías prioridad</div>
+      <div id="agent-focus-categories-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;padding:6px;background:#0f172a;border-radius:4px"></div>
 
-      <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 PRIORITY categories</div>
-      <div id="agent-focus-categories-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>
-
+      <!-- Row 4: Weekly target opcional -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px;color:#cbd5e1;margin-top:8px">
         <div>
-          <label style="display:block;margin-bottom:2px">Override DAILY</label>
-          <select id="agent-focus-daily" class="form-select" style="font-size:11px;padding:3px 6px;width:100%">
-            <option value="0" selected>Use default (20)</option>
-            <option value="5">5/day</option>
-            <option value="10">10/day</option>
-            <option value="30">30/day</option>
-            <option value="50">50/day</option>
+          <label style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">Override diario</label>
+          <select id="agent-focus-daily" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Si está en 'Use default', usa el valor de Max envíos/día arriba.">
+            <option value="0" selected>Usar el default de arriba</option>
+            <option value="5">5/día</option>
+            <option value="10">10/día</option>
+            <option value="30">30/día</option>
+            <option value="50">50/día</option>
           </select>
         </div>
         <div>
-          <label style="display:block;margin-bottom:2px">WEEKLY target</label>
-          <select id="agent-focus-weekly" class="form-select" style="font-size:11px;padding:3px 6px;width:100%">
-            <option value="0" selected>No limit</option>
-            <option value="50">50/week</option>
-            <option value="100">100/week</option>
-            <option value="200">200/week</option>
-            <option value="500">500/week</option>
+          <label style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">Target semanal</label>
+          <select id="agent-focus-weekly" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Opcional. Si llega antes que el cap diario × 7, el agente pausa hasta lunes.">
+            <option value="0" selected>Sin límite</option>
+            <option value="50">50/semana</option>
+            <option value="100">100/semana</option>
+            <option value="200">200/semana</option>
+            <option value="500">500/semana</option>
           </select>
         </div>
       </div>
 
-      <!-- Hidden inputs para mantener compatibilidad con _writeAgentConfig -->
+      <!-- Hidden inputs (compat con _writeAgentConfig + score legacy + hours legacy) -->
+      <input type="hidden" id="agent-cfg-score" value="0" />
+      <input type="hidden" id="agent-cfg-active-start" value="9" />
+      <input type="hidden" id="agent-cfg-active-end" value="23" />
       <input type="hidden" id="agent-focus-geos-priority" />
       <input type="hidden" id="agent-focus-geos-excluded" />
       <input type="hidden" id="agent-focus-categories" />
 
-      <div style="display:flex;justify-content:flex-end;margin-top:8px">
-        <button id="agent-focus-save" class="btn btn-primary btn-sm" style="font-size:11px">💾 Save focus</button>
+      <!-- Acciones -->
+      <div style="display:flex;gap:6px;margin-top:12px;justify-content:flex-end;flex-wrap:wrap">
+        <button id="agent-cfg-save" class="btn btn-primary btn-sm" style="font-size:11px;padding:6px 14px" title="Guarda traffic + max/día + GEOs + categorías + weekly. Aplica a los 3 MBs.">💾 Guardar TODO</button>
+        <button id="agent-focus-save" class="btn btn-primary btn-sm" style="display:none">Save focus (legacy hidden)</button>
+        <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:6px 12px" title="Pause agent for 1 hour (manual kill switch)">⏸ Pausar 1h</button>
+        <button id="agent-unpause" class="btn btn-sm" style="background:#16a34a;color:#fff;font-size:11px;padding:6px 12px" title="Clear any pause">▶ Reanudar</button>
+      </div>
+
+      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #334155">
+        <div style="display:flex;gap:6px;align-items:center;justify-content:space-between;font-size:11px">
+          <span style="color:#cbd5e1" id="agent-refresh-status">Refresh leads sin traffic: ⚪ OFF</span>
+          <button id="agent-refresh-toggle" class="btn btn-sm" style="background:#0ea5e9;color:#fff;font-size:11px;padding:4px 10px" title="Re-fetches traffic+geo. Cache 90d.">🔄 Activar refresh</button>
+        </div>
       </div>
     </div>
 
