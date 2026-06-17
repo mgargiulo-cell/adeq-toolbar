@@ -1932,6 +1932,32 @@ async function getRapidApiUsageThisMonth(token) {
   } catch { return { usedThisMonth: 0, limit: 40000, period: _billingCyclePeriod() }; }
 }
 
+// Maxi 2026-06-17: filtro GEO worker-side. Sitios cuyo topCountry o geos_all[0]
+// matchee esta lista se SKIPEAN antes de Apollo/scrape. Excepción: Monday
+// refresh (re-engage manual del MB siempre se procesa).
+//   USA/Canadá/UK/Australia/Nueva Zelanda/Irlanda → demasiado yanqui, no convierte.
+//   LATAM/Centroamérica/Europa continental/África/Asia → SI procesamos.
+const WORKER_DEPRIO_ISO = new Set([
+  "US","USA","GB","UK","CA","AU","NZ","IE",
+]);
+const WORKER_DEPRIO_NAMES = new Set([
+  "united states","usa","united kingdom","britain","england",
+  "canada","australia","new zealand","ireland",
+]);
+function _isWorkerDeprioGeo(topCountryNameOrIso, geosAllArr) {
+  const norm = (s) => String(s || "").trim();
+  const t = norm(topCountryNameOrIso);
+  if (t) {
+    if (WORKER_DEPRIO_ISO.has(t.toUpperCase())) return true;
+    if (WORKER_DEPRIO_NAMES.has(t.toLowerCase())) return true;
+  }
+  if (Array.isArray(geosAllArr) && geosAllArr.length) {
+    const first = norm(geosAllArr[0]).toUpperCase();
+    if (WORKER_DEPRIO_ISO.has(first)) return true;
+  }
+  return false;
+}
+
 // Período mensual = ciclo 6 → 6 (Maxi 2026-06-17). El RapidAPI cycle real
 // es del día 6 de un mes al día 6 del próximo. Por eso anclamos el período
 // al día 6: si hoy >= 6 → este mes-06. Si hoy < 6 → mes anterior-06.
@@ -2842,6 +2868,47 @@ function extractEmailsFromHtml(html) {
     const tld = parts[1].split(".").pop();
     return tld && tld.length >= 2 && tld.length <= 6;
   });
+}
+
+// Maxi 2026-06-17: Informer-only fetch. Es CHEAP (1 HTTP request, sin Apollo
+// credit, sin scrape de 25+ paths). Pre-check del decision maker antes de
+// elegir 50/50 entre Apollo y HTML scrape.
+async function scrapeInformerOnly(domain) {
+  const cleanDomain = domain.replace(/^www\./, "");
+  const uaChrome = { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" };
+  const emails = new Set();
+  const urlByEmail = new Map();
+  const targets = [
+    `https://website.informer.com/${cleanDomain}`,
+    `https://who.is/whois/${cleanDomain}`,
+  ];
+  await Promise.all(targets.map(async (url) => {
+    try {
+      const r = await fetch(url, { headers: uaChrome, signal: AbortSignal.timeout(6000) });
+      if (!r.ok) return;
+      const html = await r.text();
+      const found = new Set();
+      extractEmailsFromHtml(html).forEach(e => found.add(e));
+      const mailtoMatches = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
+      for (const m of mailtoMatches) {
+        const clean = m[1].toLowerCase().split("?")[0];
+        if (clean.includes("@")) found.add(clean);
+      }
+      found.forEach(e => {
+        const lower = e.toLowerCase();
+        emails.add(e);
+        if (!urlByEmail.has(lower)) urlByEmail.set(lower, url);
+      });
+    } catch {}
+  }));
+  return { emails: _cleanScrapedEmails([...emails], domain), urlByEmail };
+}
+
+// Devuelve true si el local-part es genérico (info@, contact@, etc.). Maxi
+// quiere usar el primer Informer hit si NO es genérico.
+function _isGenericLocalPart(email) {
+  const local = (email || "").split("@")[0].toLowerCase();
+  return /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster|noreply|no-reply)$/i.test(local);
 }
 
 async function scrapeEmailsForDomain(domain, opts = {}) {
@@ -3909,6 +3976,17 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  ⊘ ${domain} — categoría "${swCategory}" bloqueada (matchea "${blockedCat}")`);
     return;
   }
+  // Maxi 2026-06-17: GEO pre-filter. Si el sitio es de USA/Canadá/UK/AU/NZ/IE,
+  // skipear ANTES de gastar Apollo + Claude. Hay demasiado USA y no nos sirve.
+  // Excepción: si el lead vino de Monday refresh, lo procesamos igual (es un
+  // re-engage del usuario, no descubrimiento aleatorio).
+  if (source !== "monday_refresh" && _isWorkerDeprioGeo(topCountry, geosAllIso)) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: `deprio-geo: ${topCountry || geosAllIso[0] || "?"} (USA/UK/CA/AU/NZ/IE no procesados)`,
+    });
+    log(`  🌎 ${domain} — GEO ${topCountry || geosAllIso[0]} bloqueado (no prioritario, ahorrando créditos)`);
+    return;
+  }
   const category = pageContent?.category || swCategory || "";
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
@@ -3934,28 +4012,42 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
     && apolloMonthRemaining > 0;
 
-  // Estrategia de rotación (user 2026-06-16): 50/50 estricto Apollo vs scrape,
-  // SIN excepción por tráfico. Maxi reportó muchos rebotados de Apollo, así que
-  // queremos balancear y dar más peso al scraping del código fuente (emails que
-  // vienen del propio sitio suelen ser más estables que las "guessed" de Apollo).
-  const useApolloFirst = canUseApollo && Math.random() < 0.5;
+  // Estrategia 2026-06-17 (Maxi): 3-tier priority.
+  //   1° INFORMER (WHOIS/website.informer) — barato, sin Apollo credit. Si trae
+  //      un email NO genérico → ese es el decision maker. Listo.
+  //   2° Si Informer vacío o solo genéricos → 50/50 Apollo vs HTML scrape.
+  //      Apollo: caro pero verified. HTML: gratis, riesgo de info@.
   let apolloRes = null;
   let scraperEmails = [];
-  const informerSet = new Set(); // emails que vinieron de website.informer.com / who.is
-  const urlByEmail  = new Map(); // 2026-06-17: track URL exacta del scrape para UI
-  if (useApolloFirst) {
-    apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
-      .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
-      .catch(() => null);
-    if (!apolloRes?.email) {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
-    }
+  const informerSet = new Set();
+  const urlByEmail  = new Map();
+  // Tier 1: Informer fast probe
+  const infRes = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
+  const infNonGeneric = infRes.emails.find(e => !_isGenericLocalPart(e));
+  if (infNonGeneric) {
+    // Hit en Informer — saltamos Apollo + HTML scrape full. Construimos
+    // pseudo-scraperEmails con el Informer hit + cualquier alt genérico de informer.
+    scraperEmails = infRes.emails;
+    infRes.emails.forEach(e => { informerSet.add(e.toLowerCase()); });
+    infRes.urlByEmail.forEach((url, em) => { urlByEmail.set(em, url); });
+    log(`  ✅ Informer hit ${domain} → ${infNonGeneric} (sin Apollo credit, sin HTML scrape)`);
   } else {
-    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
-    if (scraperEmails.length === 0 && canUseApollo) {
+    // Tier 2: 50/50 Apollo vs HTML scrape (sin Informer, ya lo probamos)
+    const useApolloFirst = canUseApollo && Math.random() < 0.5;
+    if (useApolloFirst) {
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
         .catch(() => null);
+      if (!apolloRes?.email) {
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
+      }
+    } else {
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
+      if (scraperEmails.length === 0 && canUseApollo) {
+        apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+          .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
+          .catch(() => null);
+      }
     }
   }
   const apolloContactName = apolloRes?.contact_name || "";
@@ -4670,6 +4762,15 @@ async function runSession(token, cfg, sessionStart) {
       await sleep(DOMAIN_DELAY_MS);
       continue;
     }
+    // Maxi 2026-06-17: deprio GEO (USA/UK/CA/AU/NZ/IE) — skip antes de Apollo/scrape.
+    // Ahorra Apollo credit + Claude tokens + bandwidth en sitios que no nos sirven.
+    if (_isWorkerDeprioGeo(topCountry, geosAllIsoAuto)) {
+      log(`  🌎 ${domain} — GEO ${topCountry} bloqueado (USA/UK/CA/AU/NZ/IE — no prioritario)`);
+      await markProcessed(token, [domain], "country_deprio");
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
 
     // Filtro primario: tráfico mínimo. Si visits=null, puede ser API error vs site sin tráfico.
     // Distinguimos: null = api_error (re-evaluable), número bajo = traffic_low (re-evaluable en 60 días)
@@ -4788,26 +4889,35 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ⚠️ Apollo skip: ${reason}`);
     }
 
-    // Rotación 50/50 estricta Apollo vs scrape (user 2026-06-16) — sin
-    // excepción por tráfico. Maxi vio muchos rebotados de Apollo y prefiere
-    // balancear con scraping del código fuente.
-    const useApolloFirst = canUseApollo && Math.random() < 0.5;
+    // Maxi 2026-06-17: 3-tier — Informer FIRST (cheap), después 50/50 Apollo
+    // vs HTML scrape. Si Informer trae non-genérico, saltamos Apollo (ahorra
+    // crédito) y HTML scrape (ahorra bandwidth).
     const similarPromise = findSimilarSites(domain, rapidapi_key);
     let apolloRes = null;
     let scraperEmails = [];
-    const informerSetAuto = new Set(); // emails de website.informer.com / who.is
+    const informerSetAuto = new Set();
     const urlByEmailAuto  = new Map();
-    if (useApolloFirst) {
-      apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
-        .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
-        .catch(() => null);
-      if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
+    const infResAuto = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
+    const infAutoNonGeneric = infResAuto.emails.find(e => !_isGenericLocalPart(e));
+    if (infAutoNonGeneric) {
+      scraperEmails = infResAuto.emails;
+      infResAuto.emails.forEach(e => { informerSetAuto.add(e.toLowerCase()); });
+      infResAuto.urlByEmail.forEach((url, em) => { urlByEmailAuto.set(em, url); });
+      log(`  ✅ Informer hit ${domain} (autopilot) → ${infAutoNonGeneric} (skip Apollo + HTML)`);
     } else {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
-      if (scraperEmails.length === 0 && canUseApollo) {
+      const useApolloFirst = canUseApollo && Math.random() < 0.5;
+      if (useApolloFirst) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
           .catch(() => null);
+        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
+      } else {
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
+        if (scraperEmails.length === 0 && canUseApollo) {
+          apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+            .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
+            .catch(() => null);
+        }
       }
     }
     const similarSites = await similarPromise;
@@ -5759,6 +5869,14 @@ async function scanBouncesForUser(token, userEmail) {
             // user 2026-05-29: TODO rebote detectado (hard, soft/buzón-lleno o unknown)
             // dispara retry → busca email nuevo, reenvía, actualiza Prospect + FU1/FU2.
             queueBounceRetry(token, userEmail, failed, bounceType).catch(e => log(`⚠️ queueBounceRetry: ${e.message}`));
+            // Maxi 2026-06-17: log de visibilidad — el MB ve en el panel admin
+            // que el sistema detectó el bounce, qué tipo y qué hizo.
+            logAgentAction(token, userEmail, {
+              domain: failed.split("@")[1] || "_bounce_",
+              action: "bounce_detected",
+              reason: `${bounceType}_bounce`,
+              details: { failed_email: failed, bounce_type: bounceType, scan_source: "gmail_inbox_spam_trash" },
+            }).catch(() => {});
           }
         }
       } catch {}
@@ -5835,6 +5953,13 @@ async function scanAutoRepliesForUser(token, userEmail) {
         await queueBounceRetry(token, userEmail, respondedFrom, "auto_reply").catch(e => log(`⚠️ autoReply retry: ${e.message}`));
         detected++;
         log(`🔁 auto-reply (ausencia) de ${respondedFrom}${isAutoSubmitted ? " (header)" : " (subject)"} → email VÁLIDO (no blacklist), probando alternativa`);
+        // Maxi 2026-06-17: log de visibilidad para el panel admin
+        logAgentAction(token, userEmail, {
+          domain: respondedFrom.split("@")[1] || "_oao_",
+          action: "auto_reply_detected",
+          reason: isAutoSubmitted ? "header_auto_submitted" : "subject_match",
+          details: { responded_from: respondedFrom, scan_source: "gmail_inbox_spam_trash" },
+        }).catch(() => {});
       } catch {}
     }
     if (detected) {
@@ -7794,11 +7919,47 @@ async function runAgentCycle(token, allFlags) {
       log(`🤖 Agent ${userEmail}: todos los candidatos descartados por gates`);
       continue;
     }
-    // Política user 2026-05-18: el score NO se usa para elegir URLs. Si pasó
-    // el gate duro (score >= 0 = no NSFW, no blocked geo) y tiene traffic
-    // ≥ threshold → es válida. Orden por created_at desc (más fresco primero).
+    // Maxi 2026-06-17: MIX de prioridades para evitar caer siempre en el mismo
+    // tipo de lead. Estrategia:
+    //   1) Ordenar por created_at desc (más fresco primero) para tener pool
+    //   2) Bucketize por (categoría || "uncategorized") y por geo
+    //   3) Round-robin entre buckets de categoría → variety en cada ciclo
+    //   4) Dentro de cada bucket, shuffle suave (no FIFO puro)
+    // Resultado: el agente no manda 10 leads de "news Argentina" seguidos.
     scored.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos válidos (FIFO por created_at, top: ${scored[0].domain})`);
+    const catBuckets = new Map();
+    for (const c of scored) {
+      const cat = (c.category || "uncategorized").toLowerCase().trim();
+      if (!catBuckets.has(cat)) catBuckets.set(cat, []);
+      catBuckets.get(cat).push(c);
+    }
+    // Shuffle dentro de cada bucket (Fisher-Yates parcial — primeros N quedan random)
+    for (const arr of catBuckets.values()) {
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+    }
+    // Round-robin: 1 de cada categoría por vuelta hasta tener los suficientes
+    const mixed = [];
+    const catKeys = [...catBuckets.keys()];
+    for (let i = catKeys.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [catKeys[i], catKeys[j]] = [catKeys[j], catKeys[i]];
+    }
+    let safety = scored.length * 2;
+    while (mixed.length < scored.length && safety-- > 0) {
+      let progressed = false;
+      for (const k of catKeys) {
+        const b = catBuckets.get(k);
+        if (b && b.length) { mixed.push(b.shift()); progressed = true; }
+        if (mixed.length >= scored.length) break;
+      }
+      if (!progressed) break;
+    }
+    scored.length = 0;
+    scored.push(...mixed);
+    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos válidos (mix por categoría, ${catKeys.length} buckets, top: ${scored[0].domain} · ${scored[0].category || "?"})`);
 
     // No filtramos por sendtrack acá — la regla real es:
     // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
