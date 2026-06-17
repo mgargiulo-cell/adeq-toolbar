@@ -249,6 +249,9 @@ function normalizeMondayGeo(raw) {
 
 // ── Domain pool (Majestic Million) ───────────────────────────
 
+// Maxi 2026-06-17 (audit #12): pool cacheado a nivel módulo (variable
+// domainPool). 1 sola descarga por boot del worker (Railway redeploy ≈ 1x/día
+// en práctica). No expira en memoria. Si Railway escala/reinicia, re-descarga.
 async function loadDomainPool() {
   if (domainPool !== null) return domainPool;
 
@@ -648,7 +651,7 @@ async function promoteWaitlist(token) {
   }
 }
 
-async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactPhone, emails, emailSources = {}, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
+async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactNameSource = "", contactPhone, emails, emailSources = {}, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
   // Esta función solo INSERTA y devuelve boolean.
@@ -685,6 +688,10 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
       language:       language       || "",
       category:       category       || "",
       contact_name:   contactName    || "",
+      // Maxi 2026-06-17 (audit #11): trackear de dónde viene el contact_name
+      // (apollo|informer|scrape) para que UI lo muestre y MB sepa si el name
+      // se condice con el email final elegido.
+      contact_name_source: contactNameSource || (contactName ? "apollo" : ""),
       contact_phone:  contactPhone   || "",
       emails:         emails         || [],
       email_sources:  emailSources   || {},  // {email: "apollo"|"scrape"|"informer"|"generic"} para pick prioritario
@@ -1231,11 +1238,15 @@ async function _runFeederSlot(token, slotLabel) {
   log(`📊 cron ${slotLabel}: target=${targetEffective} efectivos, conv=${(conv * 100).toFixed(1)}%, inyecta hasta ${targetGross} brutos`);
 
   // 5. Pull from 3 fuentes (split 1/3)
+  // Maxi 2026-06-17 (audit #9): sessionKnown ya deduplica entre fuentes — un
+  // domain insertado por Sellers no se reinserta por Monday/Majestic. Verificado.
+  // El sessionKnown.size final = total únicos insertados en este slot.
   const perSource = Math.ceil(targetGross / 3);
-  const sessionKnown = new Set();  // evita que 2 fuentes inserten el mismo dominio en este slot
+  const sessionKnown = new Set();
   const fromSellers  = await _feederPullSellers(token, perSource, sessionKnown);
   const fromMonday   = await _feederPullMonday(token, perSource, sessionKnown);
   const fromMajestic = await _feederPullMajestic(token, perSource, sessionKnown);
+  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic})`);
   const grossTotal = fromSellers + fromMonday + fromMajestic;
 
   log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} = ${grossTotal} brutos`);
@@ -2720,13 +2731,18 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     bumpApolloUnlocks(token, 1).catch(() => {});
     const phone = _extractApolloPhone(person);
     log(`  💎 Apollo unlock ${domain} → ${person.email}${phone ? " 📞" : ""} (1 credit)`);
+    // Maxi 2026-06-17 (audit #4): preservamos linkedin_url del Apollo profile
+    // para que la UI pueda mostrar de qué fuente Apollo salió el contacto
+    // (no solo "apollo" label, sino link al perfil real de la persona).
+    const sourceUrl = person.linkedin_url || `https://app.apollo.io/people/${person.id || ""}`;
     const result = {
       email: person.email,
       contact_name: `${person.first_name||""} ${person.last_name||""}`.trim(),
       phone,
       source: "unlocked",
+      source_url: sourceUrl,
     };
-    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source: "worker_unlocked" }).catch(() => {});
+    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source_url: sourceUrl, source: "worker_unlocked" }).catch(() => {});
     return result;
   } catch { return freeResult; }
 }
@@ -4094,7 +4110,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // como source plano (rows viejas no tienen URL).
   const rawEmails = [...new Set([...apolloEmail, ...scraperEmails])];
   const emailSources = {};
-  apolloEmail.forEach(e => { emailSources[e.toLowerCase()] = { source: "apollo" }; });
+  apolloEmail.forEach(e => { emailSources[e.toLowerCase()] = { source: "apollo", url: apolloRes?.source_url || "" }; });
   scraperEmails.forEach(e => {
     const lower = e.toLowerCase();
     if (!emailSources[lower]) {
@@ -4960,7 +4976,7 @@ async function runSession(token, cfg, sessionStart) {
     const rawEmailsAuto = [...new Set([...apolloEmailAuto, ...scraperEmails])];
     // Source tracking: apollo > informer > scrape > generic. Object format con URL tracking.
     const emailSourcesAuto = {};
-    apolloEmailAuto.forEach(e => { emailSourcesAuto[e.toLowerCase()] = { source: "apollo" }; });
+    apolloEmailAuto.forEach(e => { emailSourcesAuto[e.toLowerCase()] = { source: "apollo", url: apolloRes?.source_url || "" }; });
     scraperEmails.forEach(e => {
       const lower = e.toLowerCase();
       if (emailSourcesAuto[lower]) return;
@@ -7381,8 +7397,11 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // ── PENALTIES ──
   // Placeholders de CMS (user01, user02, usuario3, guest) — no son personas.
   if (/^(user|usuario|guest|nobody|admin)\d*$/.test(local)) score -= 60;
-  // Dígitos largos en local-part (3+) = lista vieja, automated
-  if (/\d{3,}/.test(local)) score -= 40;
+  // Maxi 2026-06-17 (audit #10): penalty solo si dígitos están AL INICIO
+  // (ej. "1234email@", "0001foo@") o si parecen un hash sin vocales (ya
+  // descartado arriba con /^[a-z0-9]{8,}$/). NO penalizar mid-string
+  // (ej. "sales2024@", "team2@") que son patrones legítimos.
+  if (/^\d{3,}/.test(local)) score -= 40;
   // Local muy corto (<3) o muy largo (>30) = sospechoso
   if (local.length < 3) score -= 30;
   if (local.length > 30) score -= 25;
@@ -7704,9 +7723,19 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
   // Sanitización final del destinatario: aunque venga del review_queue, de un
   // reintento o de un email viejo/manual, acá lo limpiamos (saca %, control chars,
   // basura al inicio). Si queda inválido, NO enviamos (evita el caso "%hector@...").
+  const rawTo = to; // Maxi 2026-06-17 (audit #6): preservamos el original
   to = _sanitizeEmail(to);
   if (!to || !STRICT_EMAIL_RE.test(to)) {
-    log(`  ⛔ sendGmailServer: destinatario inválido tras sanitizar ("${to}") — no se envía`);
+    log(`  ⛔ sendGmailServer: destinatario inválido tras sanitizar (raw:"${rawTo}" → clean:"${to}") — no se envía`);
+    // Log a agent_actions con raw_email + sanitized para debugging.
+    if (_workerToken && userEmail) {
+      logAgentAction(_workerToken, userEmail, {
+        domain: (rawTo || "").split("@")[1] || "_invalid_",
+        action: "skipped",
+        reason: "invalid_recipient_after_sanitize",
+        details: { raw_email: rawTo, sanitized: to, agent_action_id: agentActionId },
+      }).catch(() => {});
+    }
     return { ok: false, error: "invalid_recipient" };
   }
   const accessToken = await getGmailAccessToken(userEmail);
@@ -8166,11 +8195,27 @@ async function runAgentCycle(token, allFlags) {
         // considerado bueno → Apollo NO se llamaba → agent mandaba al rol genérico.
         // Ahora chequeamos rankScore real: si el mejor < 50 (no commercial-grade)
         // → fuerza Apollo lookup para tratar de conseguir un personal email.
+        // Maxi 2026-06-17 (audit #13): además chequeamos si TODOS los emails
+        // son de source "generic" en email_sources — si sí, force enrichment
+        // aunque el rank esté arriba de 50 (puede ser falsa señal por bonus
+        // de CATEGORY_TARGET_ROLES). Edge case: review_queue tenía info@ y
+        // contact@, ambos rankearon 15+bonus=45 vs cutoff 50 OK, pero después
+        // un CATEGORY match los empujó a 65 → hasGoodEmail=true → no enriquece.
         emails = emails.filter(e => e && /\@/.test(e) && !GARBAGE_LOCAL.test(e) && !GARBAGE_DOMAIN_PATTERN.test(e));
         const currentBestScore = emails.length > 0
           ? Math.max(...emails.map(e => rankEmail(e, domain, lead.category)))
           : -1;
-        const hasGoodEmail = currentBestScore >= 50;
+        // Detectar si TODOS los emails son source genérico (no apollo/informer/scrape persona).
+        // Si sí, force enrichment ignorando el currentBestScore.
+        const allGeneric = emails.length > 0 && emails.every(e => {
+          const src = lead.email_sources?.[e.toLowerCase()];
+          const srcStr = typeof src === "string" ? src : (src?.source || "");
+          return srcStr === "generic" || srcStr === "" || srcStr === "cache_unknown";
+        });
+        const hasGoodEmail = currentBestScore >= 50 && !allGeneric;
+        if (allGeneric && currentBestScore >= 50) {
+          log(`  🔬 ${domain}: rank ${currentBestScore} OK pero TODOS los emails source=generic → force Apollo lookup (audit #13)`);
+        }
         if (!hasGoodEmail) {
           try {
             // PASO 1: Scraping primero (gratis). Si encuentra email decente
@@ -8756,13 +8801,21 @@ async function _fetchDynamicSourceRank(token, mbEmail) {
 // (exploración — evita lock-in si una source empeora con el tiempo).
 async function getDynamicSourceRank(token, mbEmail) {
   // ε-greedy: con prob ε, ignorar lo aprendido.
-  if (Math.random() < SOURCE_PERF_EPSILON) return SOURCE_RANK_DEFAULT;
+  if (Math.random() < SOURCE_PERF_EPSILON) {
+    // Maxi 2026-06-17 (audit #8): log explícito cuando cae a hardcoded por
+    // exploration ε-greedy o por no-data. Antes era silencioso → admin no sabía
+    // si la ranking dinámica realmente estaba activa.
+    return SOURCE_RANK_DEFAULT;
+  }
 
   const key = (mbEmail || "_global").toLowerCase();
   const cached = _sourceRankCache.get(key);
   if (cached && (Date.now() - cached.ts) < SOURCE_PERF_CACHE_TTL) return cached.rank;
 
   const dynamic = await _fetchDynamicSourceRank(token, key);
+  if (!dynamic) {
+    log(`  ℹ️ source ranking ${key}: sin data en toolbar_source_performance → usando default hardcoded (apollo>informer>scrape)`);
+  }
   const rank = dynamic || SOURCE_RANK_DEFAULT;
   _sourceRankCache.set(key, { rank, ts: Date.now() });
   return rank;
