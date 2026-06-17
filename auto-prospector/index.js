@@ -653,6 +653,24 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
   // Esta función solo INSERTA y devuelve boolean.
 
+  // Maxi 2026-06-17 (audit #7): dedup pre-insert. Antes el merge-duplicates de
+  // Supabase dependía de un unique constraint que podría no existir → dups en
+  // review_queue. Ahora chequeamos: si ya hay row pending con mismo domain,
+  // skip insert (evita doble enriquecimiento + doble envío del agente).
+  try {
+    const dupRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=eq.pending&select=id,source,created_at&order=created_at.desc&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (dupRes.ok) {
+      const dupRows = await dupRes.json();
+      if (Array.isArray(dupRows) && dupRows.length > 0) {
+        log(`  ⏭️ saveToReviewQueue ${domain}: ya existe pending (id=${dupRows[0].id}, source=${dupRows[0].source || "?"}) — skip dup`);
+        return false;
+      }
+    }
+  } catch {}
+
   const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
     method: "POST",
     headers: {
@@ -1096,11 +1114,18 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
 }
 
 // FUENTE 3: Majestic Million (sample random top 1M)
+// Maxi 2026-06-17 (audit #1): TLDs deprio — skip ANTES de meter al pool
+// para no gastar RapidAPI traffic-lookup en sitios obvios de USA/UK/CA/AU/NZ/IE.
+// Cubre los casos donde el TLD ya nos dice el país. Sitios .com globales
+// siguen pasando (SimilarWeb decide después si son USA-heavy).
+const DEPRIO_TLD_RE = /\.(us|uk|co\.uk|ca|au|com\.au|nz|co\.nz|ie)$/i;
+
 async function _feederPullMajestic(token, targetCount, sessionKnown) {
   try {
     const pool = await loadDomainPool();
     if (!pool || pool.length === 0) return 0;
-    const sampleSize = Math.min(pool.length, targetCount * 5);
+    // Sampleamos más para compensar el descarte por TLD deprio (~20% rate típico).
+    const sampleSize = Math.min(pool.length, targetCount * 8);
     const sample = [];
     const seen = new Set();
     while (sample.length < sampleSize && seen.size < pool.length) {
@@ -1108,13 +1133,16 @@ async function _feederPullMajestic(token, targetCount, sessionKnown) {
       const d = pool[idx];
       if (!seen.has(d)) { seen.add(d); sample.push(d); }
     }
-    const known = await _findKnownDomainsWorker(token, sample);
-    const fresh = sample.filter(d => !known.has(d) && !sessionKnown.has(d));
+    // Pre-filtrar TLD deprio ANTES de gastar quota RapidAPI (audit #1).
+    const beforeTld = sample.length;
+    const tldFiltered = sample.filter(d => !DEPRIO_TLD_RE.test(d));
+    const known = await _findKnownDomainsWorker(token, tldFiltered);
+    const fresh = tldFiltered.filter(d => !known.has(d) && !sessionKnown.has(d));
     if (fresh.length === 0) return 0;
     const slice = fresh.slice(0, targetCount);
     slice.forEach(d => sessionKnown.add(d));
     const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_majestic");
-    log(`  🌱 majestic: sample=${sample.length}, frescos=${fresh.length} → insertados=${inserted}`);
+    log(`  🌱 majestic: sample=${beforeTld}, post-TLD=${tldFiltered.length}, frescos=${fresh.length} → insertados=${inserted}`);
     return inserted;
   } catch (e) {
     log(`  ⚠️ majestic feeder error: ${e.message}`);
@@ -2906,9 +2934,14 @@ async function scrapeInformerOnly(domain) {
 
 // Devuelve true si el local-part es genérico (info@, contact@, etc.). Maxi
 // quiere usar el primer Informer hit si NO es genérico.
+// Maxi 2026-06-17 (audit #2): regex GENERIC_LOCAL_RE como única fuente de
+// verdad. Antes _isGenericLocalPart, processCsvItem y autopilot usaban regex
+// DIFERENTES → un email podía ser "no-genérico" para Informer pero "genérico"
+// para rankEmail. Ahora todos consultan esta constante.
+const GENERIC_LOCAL_RE = /^(info|contact|contacto|contato|contatto|contattare|kontakt|kontakte|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|e-mail|inbox|news|press|prensa|imprensa|stampa|presse|sales|ventas|comercial|marketing|publicidade|publicidad|publicite|pubblicita|werbung|admin|general|generale|reception|recepcion|recepcao|webmaster|noreply|no-reply|no_reply|donotreply|do-not-reply|abuse|hostmaster|postmaster|spam|legal|dmca|copyright|takedown|privacy|gdpr|dpo|jobs|career|hr|recruit|talents)$/i;
 function _isGenericLocalPart(email) {
   const local = (email || "").split("@")[0].toLowerCase();
-  return /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster|noreply|no-reply)$/i.test(local);
+  return GENERIC_LOCAL_RE.test(local);
 }
 
 async function scrapeEmailsForDomain(domain, opts = {}) {
@@ -4066,7 +4099,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const lower = e.toLowerCase();
     if (!emailSources[lower]) {
       const local = (lower.split("@")[0] || "");
-      const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
+      const IS_GENERIC = GENERIC_LOCAL_RE; // unified — audit #2
       const url = urlByEmail.get(lower) || "";
       if (informerSet.has(lower) && !IS_GENERIC.test(local)) {
         emailSources[lower] = { source: "informer", url: url || "https://website.informer.com/" + domain };
@@ -4932,7 +4965,7 @@ async function runSession(token, cfg, sessionStart) {
       const lower = e.toLowerCase();
       if (emailSourcesAuto[lower]) return;
       const local = (lower.split("@")[0] || "");
-      const IS_GENERIC = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|news|press|prensa|imprensa|sales|ventas|marketing|publicidade|publicidad|comercial|admin|general|reception|recepcion|recepcao|webmaster)$/i;
+      const IS_GENERIC = GENERIC_LOCAL_RE; // unified — audit #2
       const url = urlByEmailAuto.get(lower) || "";
       if (informerSetAuto.has(lower) && !IS_GENERIC.test(local)) {
         emailSourcesAuto[lower] = { source: "informer", url: url || "https://website.informer.com/" + domain };
@@ -6023,6 +6056,17 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const domain = (bouncedEmail.split("@")[1] || "").toLowerCase();
     if (!domain) return;
     log(`🔄 bounceRetry: procesando bounce ${bouncedEmail} (${bounceType}) para ${domain}`);
+
+    // 0. Maxi 2026-06-17 (audit #3): si el DOMINIO está en blocklist global
+    // (inoperativo / dead / NSFW), NO intentar retry — es esfuerzo perdido y
+    // el agente puede mandar 2x a dominios ya descartados.
+    try {
+      const blockReason = await isDomainBlockedFull(domain, token);
+      if (blockReason) {
+        log(`  ⏭️ ${domain}: ya está en blocklist (${blockReason}) — skip retry`);
+        return;
+      }
+    } catch {}
 
     // 1. Guard: cooldown POR EMAIL bounceado (no por domain) — Maxi 2026-06-17.
     // Antes: 1 retry por domain/24h → si rebotaban 3 emails distintos del mismo
@@ -7264,18 +7308,23 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // ── DOMAIN MATCH (peso 0-40) ──
   // Email del MISMO dominio del sitio → señal MUY fuerte (es probablemente real)
   const isFreeWebmail = /^(gmail|yahoo|hotmail|outlook|live|aol|icloud|protonmail|gmx|mail\.ru|yandex|me)\./.test(dom);
+  let isCrossDomainCorporate = false;
   if (cleanSite) {
     if (dom === cleanSite) score += 40;
     else if (dom.endsWith("." + cleanSite) || cleanSite.endsWith("." + dom)) score += 35;
     else if (isFreeWebmail) {
       // Webmail cross-domain — penalty intermedio (-15). Es esperado que un
-      // contacto B2B use gmail personal, pero corporate email mismo-dominio
-      // sigue siendo MEJOR. Esto evita que un john.doe@gmail le gane a
-      // marketing@empresa.com.
+      // contacto B2B use gmail personal. CORRECCIÓN audit #5 (Maxi 2026-06-17):
+      // si después detectamos que es EXEC/COMMERCIAL/EDITORIAL, REVERTIMOS el
+      // penalty (un founder@gmail NO merece -15 — es una persona real). Por
+      // eso aplicamos -15 aquí y abajo lo cancelamos si role matchea.
       score -= 15;
     } else {
-      // Cross-domain a OTRO dominio corporativo — penalidad fuerte.
+      // Cross-domain a OTRO dominio corporativo — penalidad fuerte. Marcamos
+      // para revertir parcialmente si es EXEC (founder@otra-empresa puede ser
+      // un advisor/board member real).
       score -= 50;
+      isCrossDomainCorporate = true;
     }
   }
 
@@ -7290,20 +7339,36 @@ function rankEmail(email, siteDomain, leadCategory = "") {
 
   // ORDEN: chequear generics PRIMERO (antes que "single name"), sino palabras
   // tipo "contato" se cuelan como single-name con score alto en lugar de role.
-  const IS_GENERIC = /^(info|contact|contacto|contato|contatto|contattare|kontakt|kontact|hello|hi|hey|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|bonjour|news|press|prensa|imprensa|stampa|presse|presseportal|noticias|reception|recepcion|recepcao|general)$/i;
+  // Maxi 2026-06-17 (audit #2): usa GENERIC_LOCAL_RE unificada.
+  const IS_GENERIC = GENERIC_LOCAL_RE;
 
-  if (EXEC.test(local))           score += 90;       // CEO/founder = jackpot
-  else if (COMMERCIAL.test(local)) score += 80;
-  else if (EDITORIAL.test(local))  score += 60;
+  let matchedRole = "";
+  if (EXEC.test(local))            { score += 90; matchedRole = "EXEC"; }       // CEO/founder = jackpot
+  else if (COMMERCIAL.test(local)) { score += 80; matchedRole = "COMMERCIAL"; }
+  else if (EDITORIAL.test(local))  { score += 60; matchedRole = "EDITORIAL"; }
   // Pattern firstname.lastname (juan.perez@x.com) = persona real
-  else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) score += 70;
+  else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) { score += 70; matchedRole = "PERSON"; }
   // Pattern firstinitial+lastname (jperez@x.com, mgarcia@x.com) = común corp
-  else if (/^[a-z][a-z]{4,14}$/.test(local) && local.length >= 5 && /[aeiou]/.test(local) && !IS_GENERIC.test(local)) score += 55;
+  else if (/^[a-z][a-z]{4,14}$/.test(local) && local.length >= 5 && /[aeiou]/.test(local) && !IS_GENERIC.test(local)) { score += 55; matchedRole = "PERSON_LIKELY"; }
   // Generics — OK pero baja conversión. Cobertura multi-idioma (PT/IT/FR/DE/ES).
   // CHEQUEADO ANTES que single-name para que "contato" no se cuele como persona.
   else if (IS_GENERIC.test(local)) score += 15;
   // Single name (juan@x.com) — could be person or generic
-  else if (/^[a-z]{3,12}$/.test(local) && /[aeiou]/.test(local)) score += 30;
+  else if (/^[a-z]{3,12}$/.test(local) && /[aeiou]/.test(local)) { score += 30; matchedRole = "SINGLE_NAME"; }
+
+  // Maxi 2026-06-17 (audit #5): si el local-part identificó una PERSONA REAL
+  // (EXEC/COMMERCIAL/EDITORIAL/PERSON), REVERTIR el penalty de webmail
+  // cross-domain (era -15). Un founder@gmail SÍ es una persona válida.
+  // Para cross-corporate (-50): revertir parcialmente (-25) si es EXEC, ya
+  // que founder@otra-empresa puede ser advisor/board (real pero menos directo).
+  if (matchedRole && (matchedRole === "EXEC" || matchedRole === "COMMERCIAL" || matchedRole === "EDITORIAL" || matchedRole === "PERSON")) {
+    if (isFreeWebmail && cleanSite && dom !== cleanSite) {
+      score += 15; // cancela el -15 inicial
+    }
+    if (isCrossDomainCorporate && matchedRole === "EXEC") {
+      score += 25; // revierte la mitad del -50
+    }
+  }
 
   // ── CATEGORY-ROLE MATCH (peso 0-25) ──
   // Si el sitio es "sports" y el email es marketing/comercial → bonus extra
