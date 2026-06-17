@@ -5809,17 +5809,46 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
 async function scanBouncesForUser(token, userEmail) {
   try {
     const accessToken = await getGmailAccessToken(userEmail);
-    // Query Gmail: from:mailer-daemon OR from:postmaster, últimas 24h.
-    // in:anywhere → incluye Spam y Papelera (los avisos de rebote suelen caer en
-    // Spam por backscatter; sin esto Gmail los excluye y no detectaríamos el rebote).
-    const q = encodeURIComponent('from:(mailer-daemon@ OR postmaster@ OR noreply@) subject:(undelivered OR "delivery status" OR "returned mail" OR "failure notice") newer_than:1d in:anywhere');
+    // Query Gmail AMPLIADA (Maxi 2026-06-17). Antes era muy estrecha — solo
+    // capturaba subjects en inglés y 20 mensajes. Maxi reporta 5-10 rebotes/día
+    // pero solo veíamos ~0.6/día. Cambios:
+    //   - Subjects: agregamos patrones que en realidad llegan (Mail Delivery,
+    //     wasn't delivered, address rejected) + español + portugués + italiano
+    //   - Sender: además de daemons, sumamos common bounce senders + "bounce@"
+    //   - Window: 7 días (era 1d) con dedupe vía isBouncedSync → no reprocesa
+    //   - maxResults: 100 (era 20) → cubre el peor día
+    //   - in:anywhere → Spam + Papelera incluidos (ya estaba)
+    const q = encodeURIComponent(
+      'from:(mailer-daemon OR postmaster OR mail-daemon OR bounce OR no-reply-bounce OR returns OR delivery) ' +
+      'subject:(' +
+        'undelivered OR "delivery status" OR "returned mail" OR "failure notice" OR ' +
+        '"mail delivery" OR "delivery failed" OR "wasn\'t delivered" OR "address rejected" OR ' +
+        '"could not be delivered" OR "permanent failure" OR "delivery problem" OR ' +
+        '"no se ha entregado" OR "mensaje no entregado" OR "devuelto al remitente" OR ' +
+        '"correo no entregado" OR "fallo en la entrega" OR ' +
+        '"não foi entregue" OR "mensagem não entregue" OR "devolvido" OR ' +
+        '"non recapitato" OR "consegna non riuscita" OR ' +
+        '"non distribué" OR "n\'a pas pu être remis"' +
+      ') newer_than:7d in:anywhere'
+    );
     const listRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=100`,
       { headers: { "Authorization": `Bearer ${accessToken}` } }
     );
     if (!listRes.ok) {
-      // 403 = scope readonly no autorizado en Workspace. Skip silencioso.
-      if (listRes.status !== 403) log(`⚠️ scanBounces list ${listRes.status}`);
+      // Maxi 2026-06-17: 403 ya NO es silencioso. Antes no sabíamos si Gmail
+      // estaba devolviendo 403 (= scope readonly no autorizado en Workspace),
+      // por eso nunca nos enterábamos que el scan no corría. Ahora logeamos
+      // y registramos en toolbar_agent_actions para visibilidad.
+      log(`⚠️ scanBounces ${userEmail} HTTP ${listRes.status} — scan NO ejecutado`);
+      if (listRes.status === 403) {
+        logAgentAction(token, userEmail, {
+          domain: "_scan_failed_",
+          action: "bounce_scan_failed",
+          reason: "gmail_403_scope_missing",
+          details: { hint: "agregar gmail.readonly al Workspace OAuth scope", status: 403 },
+        }).catch(() => {});
+      }
       return 0;
     }
     const list = await listRes.json();
@@ -5881,8 +5910,11 @@ async function scanBouncesForUser(token, userEmail) {
         }
       } catch {}
     }
+    // Maxi 2026-06-17: log SIEMPRE — visibilidad de cuántos msgs encontró el
+    // scan, no solo cuando detecta nuevo. Si ids.length > 0 pero detected = 0,
+    // significa que todos ya estaban marcados (bueno) o el parser falló (malo).
+    log(`📬 scanBounces ${userEmail}: ${ids.length} msgs Gmail · ${detected} bounces nuevos`);
     if (detected) {
-      log(`🚫 scanBounces ${userEmail}: detectó ${detected} email(s) rebotados`);
       // Audit P1 fix: invalidar cache de bounced para que el próximo
       // rankEmail use la lista actualizada. Antes la cache TTL 5min podía
       // dejar pasar un email que JUST bounced en este mismo ciclo.
@@ -5992,16 +6024,20 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     if (!domain) return;
     log(`🔄 bounceRetry: procesando bounce ${bouncedEmail} (${bounceType}) para ${domain}`);
 
-    // 1. Guard: cooldown 24h por domain
-    const cutoff24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    // 1. Guard: cooldown POR EMAIL bounceado (no por domain) — Maxi 2026-06-17.
+    // Antes: 1 retry por domain/24h → si rebotaban 3 emails distintos del mismo
+    // domain en el día, solo 1 disparaba retry. Ahora: cooldown solo si el
+    // MISMO email ya disparó retry en últimas 6h (evita duplicados de mismo
+    // bounce reportado 2 veces por Gmail).
+    const cutoff6h = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
     const recentRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?domain=eq.${encodeURIComponent(domain)}&created_at=gte.${cutoff24h}&select=id,attempt_number&order=created_at.desc&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?original_email=eq.${encodeURIComponent(bouncedEmail)}&created_at=gte.${cutoff6h}&select=id&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (recentRes.ok) {
       const recent = await recentRes.json();
       if (Array.isArray(recent) && recent.length > 0) {
-        log(`  ⏭️ ${domain}: ya hay bounce retry en últimas 24h (attempt ${recent[0].attempt_number}) — skip`);
+        log(`  ⏭️ ${bouncedEmail}: ya disparó retry en últimas 6h — skip (dedupe)`);
         return;
       }
     }
