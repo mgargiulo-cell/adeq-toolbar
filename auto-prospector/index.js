@@ -2960,6 +2960,59 @@ function _isGenericLocalPart(email) {
   return GENERIC_LOCAL_RE.test(local);
 }
 
+// Maxi 2026-06-17 v4: extrae emails publicados en redes sociales (FB about,
+// YT about, Twitter bio via Nitter). Fallback worker — solo se llama cuando
+// el scrape normal no encontró email NO-genérico. Devuelve Map<email, "Facebook"|"YouTube"|"Twitter">.
+async function _scrapeEmailsFromSocialLinksWorker(socialLinks) {
+  const found = new Map();
+  if (!Array.isArray(socialLinks) || socialLinks.length === 0) return found;
+  const UA_MOBILE = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
+  const UA_DESKTOP = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+
+  const tryFetchSocial = async (url, source, ua = UA_DESKTOP, timeout = 5000) => {
+    try {
+      const r = await fetch(url, {
+        headers: { "User-Agent": ua, "Accept-Language": "en-US,en;q=0.9" },
+        signal: AbortSignal.timeout(timeout),
+        redirect: "follow",
+      });
+      if (!r.ok) return;
+      const html = await r.text();
+      extractEmailsFromHtml(html).forEach(e => {
+        if (!found.has(e)) found.set(e, source);
+      });
+    } catch {}
+  };
+
+  const seen = new Set();
+  const tasks = [];
+  for (const link of socialLinks) {
+    const lower = link.toLowerCase();
+    if (lower.includes("facebook.com") && !seen.has("fb")) {
+      seen.add("fb");
+      const m = lower.match(/facebook\.com\/(?:pg\/)?([a-z0-9._-]{2,100})/i);
+      const page = m && !["pages","groups","events","sharer","home.php","login","watch"].includes(m[1]) ? m[1] : null;
+      if (page) {
+        tasks.push(tryFetchSocial(`https://m.facebook.com/${page}/about`,                      "Facebook", UA_MOBILE, 6000));
+        tasks.push(tryFetchSocial(`https://m.facebook.com/${page}/about_contact_and_basic_info`, "Facebook", UA_MOBILE, 6000));
+      }
+    }
+    if (lower.includes("youtube.com") && !seen.has("yt")) {
+      seen.add("yt");
+      const m = lower.match(/youtube\.com\/(@[a-z0-9._-]+|c\/[a-z0-9._-]+|channel\/[a-z0-9._-]+|user\/[a-z0-9._-]+)/i);
+      if (m) tasks.push(tryFetchSocial(`https://www.youtube.com/${m[1]}/about`, "YouTube", UA_DESKTOP, 6000));
+    }
+    if ((lower.includes("twitter.com") || lower.includes("x.com")) && !seen.has("tw")) {
+      seen.add("tw");
+      const m = lower.match(/(?:twitter|x)\.com\/([a-z0-9_]{1,20})/i);
+      const handle = m && !["home","login","explore","search","i","intent","share","status","compose"].includes(m[1]) ? m[1] : null;
+      if (handle) tasks.push(tryFetchSocial(`https://nitter.net/${handle}`, "Twitter", UA_DESKTOP, 6000));
+    }
+  }
+  await Promise.all(tasks);
+  return found;
+}
+
 async function scrapeEmailsForDomain(domain, opts = {}) {
   // Trae emails de muchas fuentes con concurrencia limitada (4 a la vez).
   // Usa User-Agent real (Chrome) para evitar anti-bot blocks comunes.
@@ -2969,7 +3022,13 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // (user 2026-06-17: poder mostrar de qué URL salió cada scraped email).
   const informerOut = opts.informerOut || null;
   const urlByEmail  = opts.urlByEmail  || null;
+  // Maxi 2026-06-17 v4: socialOut Map recibe emails extraídos de redes
+  // sociales (FB business email, YT contact for business). Source: "Facebook",
+  // "YouTube", "Twitter".
+  const socialOut   = opts.socialOut   || null;
   const emails = new Set();
+  // socialLinks detectados durante el scraping para hacer fetch posterior
+  const detectedSocialLinks = new Set();
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
   // Chrome real para evitar bloqueos por User-Agent de bot
@@ -2997,6 +3056,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         // Track origen URL: solo primera vez (URL más temprana = más cerca de home/contact)
         if (urlByEmail && !urlByEmail.has(lower)) urlByEmail.set(lower, url);
       });
+      // Maxi 2026-06-17 v4: detectar social media links en el HTML
+      const SOCIAL_RE = /(?:facebook\.com|youtube\.com|twitter\.com|x\.com)\/[A-Za-z0-9._@\-]{2,80}/gi;
+      const socialMatches = html.match(SOCIAL_RE) || [];
+      socialMatches.forEach(s => detectedSocialLinks.add(s.toLowerCase()));
     } catch {}
   };
 
@@ -3037,6 +3100,28 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Última chance — si NADA encontrado, probar mobile UA en home (algunos sites cambian)
   if (emails.size === 0) {
     await tryFetch(base, 5000, true);
+  }
+
+  // Maxi 2026-06-17 v4: si después de todo NO hay email NO-genérico, probar
+  // extraer emails de las redes sociales detectadas en el HTML. Solo como
+  // fallback para no costar bandwidth en cada lead.
+  const hasNonGeneric = [...emails].some(e => !_isGenericLocalPart(e));
+  if (!hasNonGeneric && detectedSocialLinks.size > 0) {
+    log(`  📱 ${domain}: scraping social media (${detectedSocialLinks.size} links) buscando email…`);
+    const socialResults = await _scrapeEmailsFromSocialLinksWorker([...detectedSocialLinks]).catch(() => new Map());
+    socialResults.forEach((src, em) => {
+      const lower = em.toLowerCase();
+      emails.add(em);
+      if (socialOut) socialOut.set(lower, src);
+      if (urlByEmail && !urlByEmail.has(lower)) {
+        // marcar la URL social como origen
+        const u = [...detectedSocialLinks].find(l => l.includes(src.toLowerCase())) || src;
+        urlByEmail.set(lower, "https://" + u);
+      }
+    });
+    if (socialResults.size > 0) {
+      log(`  📱 ${domain}: ${socialResults.size} email(s) extraídos de redes sociales`);
+    }
   }
 
   // Limpieza final: sanitiza, descarta registradores/WHOIS y ajenos al dominio,
@@ -4083,21 +4168,27 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   } else {
     // Tier 2: 50/50 Apollo vs HTML scrape (sin Informer, ya lo probamos)
     const useApolloFirst = canUseApollo && Math.random() < 0.5;
+    // socialOut: Map<email, "Facebook"|"YouTube"|"Twitter"> — emails extraídos
+    // de redes sociales por el fallback dentro de scrapeEmailsForDomain.
+    const socialOut = new Map();
     if (useApolloFirst) {
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
         .catch(() => null);
       if (!apolloRes?.email) {
-        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut }).catch(() => []);
       }
     } else {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail }).catch(() => []);
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut }).catch(() => []);
       if (scraperEmails.length === 0 && canUseApollo) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
           .catch(() => null);
       }
     }
+    // Maxi 2026-06-17 v4: pasamos socialOut al scope superior para que el
+    // emailSources final use el source correcto ("Facebook" en vez de "scrape").
+    var _socialOutCsvScope = socialOut;
   }
   const apolloContactName = apolloRes?.contact_name || "";
   const apolloPhone       = apolloRes?.phone || "";
@@ -4116,6 +4207,12 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     if (!emailSources[lower]) {
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = GENERIC_LOCAL_RE; // unified — audit #2
+      // Maxi 2026-06-17 v4: si el email vino de una red social, source = "Facebook"/"YouTube"/"Twitter"
+      const socialSrc = _socialOutCsvScope?.get(lower);
+      if (socialSrc) {
+        emailSources[lower] = { source: socialSrc, url: urlByEmail.get(lower) || "" };
+        return;
+      }
       const url = urlByEmail.get(lower) || "";
       if (informerSet.has(lower) && !IS_GENERIC.test(local)) {
         emailSources[lower] = { source: "informer", url: url || "https://website.informer.com/" + domain };
@@ -4955,13 +5052,15 @@ async function runSession(token, cfg, sessionStart) {
       log(`  ✅ Informer hit ${domain} (autopilot) → ${infAutoNonGeneric} (skip Apollo + HTML)`);
     } else {
       const useApolloFirst = canUseApollo && Math.random() < 0.5;
+      // socialOut: emails de redes sociales (autopilot path)
+      var socialOutAuto = new Map();
       if (useApolloFirst) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
           .catch(() => null);
-        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
+        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto }).catch(() => []);
       } else {
-        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto }).catch(() => []);
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto }).catch(() => []);
         if (scraperEmails.length === 0 && canUseApollo) {
           apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
             .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
@@ -4982,6 +5081,12 @@ async function runSession(token, cfg, sessionStart) {
       if (emailSourcesAuto[lower]) return;
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = GENERIC_LOCAL_RE; // unified — audit #2
+      // Maxi 2026-06-17 v4: redes sociales primero (Facebook/YouTube/Twitter)
+      const socialSrcA = (typeof socialOutAuto !== "undefined") ? socialOutAuto.get(lower) : null;
+      if (socialSrcA) {
+        emailSourcesAuto[lower] = { source: socialSrcA, url: urlByEmailAuto.get(lower) || "" };
+        return;
+      }
       const url = urlByEmailAuto.get(lower) || "";
       if (informerSetAuto.has(lower) && !IS_GENERIC.test(local)) {
         emailSourcesAuto[lower] = { source: "informer", url: url || "https://website.informer.com/" + domain };

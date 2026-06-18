@@ -4,7 +4,7 @@
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
-import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
+import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch }                                                                     from "../modules/gemini.js";
 // (geminiSearch.searchEmailsWithGemini removido — no se usa en popup, solo en scraper.js)
@@ -3706,12 +3706,28 @@ async function runEmailScraper() {
     // Backward compat: si vino como array, lo tratamos como emails directos.
     const pageEmails = Array.isArray(pageResult) ? pageResult : (pageResult?.emails || []);
     const pageSocialLinks = Array.isArray(pageResult?.socialLinks) ? pageResult.socialLinks : [];
-    // Si encontramos socialLinks, exponer en state Y renderizar la sección
-    // dedicada "📱 Social Media" — SIEMPRE visible, no solo cuando no hay
-    // email. Maxi quiere ver las redes aunque haya email (para DM en paralelo).
+    // Maxi 2026-06-17 v4: NO mostrar social links como chips separados —
+    // INSTEAD, entrar a las redes y EXTRAER emails que estén publicados
+    // ahí (FB business email, YouTube "contact for business", etc).
+    // Cada email encontrado se suma con source="social_facebook"/"_youtube"/etc.
     if (pageSocialLinks.length > 0) {
-      state.pageSocialLinks = pageSocialLinks;
-      renderSocialMediaRow(pageSocialLinks);
+      state.pageSocialLinks = pageSocialLinks; // se mantiene por compat con renderEmailList
+      scrapeEmailsFromSocialLinks(pageSocialLinks).then(socialEmailMap => {
+        if (!socialEmailMap || socialEmailMap.size === 0) return;
+        if (state.domain !== _dom) return; // domain cambió durante el fetch
+        const validEmails = [];
+        socialEmailMap.forEach((src, em) => {
+          if (quickValidateEmail(em)) {
+            validEmails.push(em);
+            // Sobreescribir el source con el social específico
+            state.emailSources.set(em, src);
+          }
+        });
+        if (validEmails.length === 0) return;
+        addEmailsWithSource(validEmails, "Social", _dom);
+        // Re-render para reflejar los nuevos emails con su source social_*
+        renderEmailList(state.emails);
+      }).catch(() => {});
     }
     addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page", _dom);
     addEmailsWithSource(contactEmails.filter(quickValidateEmail), "Scrape", _dom);
@@ -4159,35 +4175,12 @@ function renderEmailList(emails) {
     }
   }
 
-  // Maxi 2026-06-17 v3: chips de Social Media en la misma lista — son "fuente"
-  // más (apollo / informer / sitio / social media). NO se pueden seleccionar
-  // para envío de mail (no son emails). Al click abren en pestaña nueva.
-  if (Array.isArray(state.pageSocialLinks) && state.pageSocialLinks.length > 0) {
-    const socialChipsForList = [...new Set(state.pageSocialLinks.map(s => (s||"").trim()).filter(Boolean))].slice(0, 6).map(url => {
-      const safe = url.startsWith("http") ? url : `https://${url}`;
-      const lower = url.toLowerCase();
-      const key = Object.keys(_SOCIAL_META).find(k => lower.includes(k)) || "";
-      const meta = _SOCIAL_META[key] || { icon: "🔗", label: "Link", color: "#64748b" };
-      const username = url.split("/").filter(Boolean).pop() || meta.label;
-      const display = username.length > 16 ? username.slice(0, 14) + "…" : username;
-      return `<div class="email-chip social-chip" data-social-url="${esc(safe)}" title="${esc(meta.label)}: ${esc(safe)} (click para abrir, no enviable por mail)">
-        <span class="email-grade" style="background:${meta.color};color:#fff">${meta.icon}</span>${esc(display)}<span class="email-src-badge" style="background:${meta.color};color:#fff;border:none">${esc(meta.label)}</span>
-      </div>`;
-    }).join("");
-    html += `<div class="email-group-label">📱 Social Media (${state.pageSocialLinks.length})</div>${socialChipsForList}`;
-  }
+  // Maxi 2026-06-17 v4: emails extraídos de redes sociales (Facebook/YouTube/
+  // Twitter) ya vienen mezclados en `suggested` con state.emailSources de
+  // "Facebook"/"YouTube"/"Twitter" — el chip src-badge los identifica visualmente.
+  // No hay sección separada de social media.
 
   listEl.innerHTML = html;
-
-  // Wire social chips: click abre en pestaña, NO seleccionable como email
-  listEl.querySelectorAll(".social-chip").forEach(chip => {
-    chip.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const url = chip.dataset.socialUrl;
-      if (url) chrome.tabs.create({ url, active: false });
-    });
-  });
 
   // Toggle "ver más"
   const showMoreBtn = listEl.querySelector(".email-show-more");
@@ -4205,21 +4198,19 @@ function renderEmailList(emails) {
   // el email viejo de Monday — siempre preferimos uno fresco de Apollo/scrape
   // (que ya viene rankeado: ad ops > publicidad > marketing > online > dev).
   // Si no hay ninguno fresco, recién ahí caemos al de Monday como fallback.
-  // Maxi 2026-06-17 v3: excluir social-chip (no son emails reales)
-  const preferredChip = listEl.querySelector(".email-chip:not(.monday):not(.social-chip)")
-                     || listEl.querySelector(".email-chip:not(.social-chip)");
+  const preferredChip = listEl.querySelector(".email-chip:not(.monday)")
+                     || listEl.querySelector(".email-chip");
   if (preferredChip) {
     preferredChip.classList.add("selected");
     formEl.value = preferredChip.dataset.email;
   }
 
   // Click para seleccionar (slot 1 = email principal, envío ahora)
-  // Maxi 2026-06-17 v3: excluimos .social-chip — no son emails, no se seleccionan.
-  listEl.querySelectorAll(".email-chip:not(.social-chip)").forEach(chip => {
+  listEl.querySelectorAll(".email-chip").forEach(chip => {
     chip.addEventListener("click", (ev) => {
       // Si tocó el botón "→ 2", no procesar como click de slot 1
       if (ev.target.classList.contains("email-future-btn")) return;
-      listEl.querySelectorAll(".email-chip:not(.social-chip)").forEach(c => c.classList.remove("selected"));
+      listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
       chip.classList.add("selected");
       formEl.value = chip.dataset.email;
       const cached = _emailVerifyCache.get(chip.dataset.email);

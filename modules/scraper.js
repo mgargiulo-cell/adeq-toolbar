@@ -232,6 +232,103 @@ function extractEmailsFromDOM() {
 }
 
 // ============================================================
+// ============================================================
+// Maxi 2026-06-17: Email scraping desde redes sociales públicas.
+// Objetivo: si el sitio tiene Facebook/YouTube/Twitter publicado, intentar
+// extraer el email "de negocios" que algunas pages publican públicamente.
+// LinkedIn e Instagram requieren login → skipeados.
+// Devuelve: Map<email, source> donde source = "social_facebook" / etc.
+// ============================================================
+const UA_MOBILE = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
+const UA_DESKTOP = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+
+function _extractFacebookPageName(url) {
+  // facebook.com/{page} → page. Ignora /pages/, ?ref=, /groups/, /events/
+  const m = url.match(/facebook\.com\/(?:pg\/)?([A-Za-z0-9._-]{2,100})/i);
+  if (!m) return null;
+  const page = m[1];
+  if (["pages","groups","events","sharer","home.php","login","watch"].includes(page.toLowerCase())) return null;
+  return page;
+}
+function _extractYouTubeChannel(url) {
+  // youtube.com/c/{ch}, /channel/{id}, /user/{user}, /@handle
+  const m = url.match(/youtube\.com\/(@[A-Za-z0-9._-]+|c\/[A-Za-z0-9._-]+|channel\/[A-Za-z0-9._-]+|user\/[A-Za-z0-9._-]+)/i);
+  return m ? m[1] : null;
+}
+function _extractTwitterHandle(url) {
+  const m = url.match(/(?:twitter|x)\.com\/([A-Za-z0-9_]{1,20})/i);
+  if (!m) return null;
+  const h = m[1].toLowerCase();
+  if (["home","login","explore","search","i","intent","share","status","compose"].includes(h)) return null;
+  return h;
+}
+
+export async function scrapeEmailsFromSocialLinks(socialLinks) {
+  const found = new Map(); // email → source label
+  if (!Array.isArray(socialLinks) || socialLinks.length === 0) return found;
+
+  const tryFetch = async (url, source, opts = {}) => {
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { "User-Agent": opts.ua || UA_DESKTOP, "Accept-Language": "en-US,en;q=0.9" },
+        signal: AbortSignal.timeout(opts.timeout || 5000),
+        redirect: "follow",
+      });
+      if (!res.ok) return;
+      const html = await res.text();
+      const emails = filterEmails(extractEmailsFromText(html));
+      emails.forEach(e => {
+        if (!found.has(e)) found.set(e, source);
+      });
+    } catch { /* timeout, network, blocked → silent */ }
+  };
+
+  const tasks = [];
+
+  // Dedupe por dominio social (no procesar 2 links a la misma red)
+  const seenPlatform = new Set();
+
+  for (const link of socialLinks) {
+    if (!link) continue;
+    const lower = link.toLowerCase();
+
+    // ── Facebook: m.facebook.com/{page}/about (mobile = menos JS) ──
+    if (lower.includes("facebook.com") && !seenPlatform.has("fb")) {
+      const page = _extractFacebookPageName(link);
+      if (page) {
+        seenPlatform.add("fb");
+        tasks.push(tryFetch(`https://m.facebook.com/${page}/about`,                      "Facebook", { ua: UA_MOBILE, timeout: 6000 }));
+        tasks.push(tryFetch(`https://m.facebook.com/${page}/about_contact_and_basic_info`, "Facebook", { ua: UA_MOBILE, timeout: 6000 }));
+      }
+    }
+
+    // ── YouTube: channel/about — algunos canales tienen email "for business" ──
+    if (lower.includes("youtube.com") && !seenPlatform.has("yt")) {
+      const channel = _extractYouTubeChannel(link);
+      if (channel) {
+        seenPlatform.add("yt");
+        tasks.push(tryFetch(`https://www.youtube.com/${channel}/about`, "YouTube", { timeout: 6000 }));
+      }
+    }
+
+    // ── Twitter/X: bio en page principal del handle ──
+    if ((lower.includes("twitter.com") || lower.includes("x.com")) && !seenPlatform.has("tw")) {
+      const handle = _extractTwitterHandle(link);
+      if (handle) {
+        seenPlatform.add("tw");
+        // Nitter es un mirror sin login wall — más permisivo
+        tasks.push(tryFetch(`https://nitter.net/${handle}`, "Twitter", { timeout: 6000 }));
+      }
+    }
+  }
+
+  // Ejecutar todos en paralelo (max ~6 fetches)
+  await Promise.all(tasks);
+  return found;
+}
+
+// ============================================================
 // 2. Páginas de contacto del propio sitio
 // ============================================================
 export async function scrapeContactPages(baseUrl) {
