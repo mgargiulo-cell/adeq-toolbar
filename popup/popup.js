@@ -7136,10 +7136,13 @@ async function initCsvQueue() {
         resultEl.className = "push-result error";
         return;
       }
-      // Dedup against full system (same as sellers.json)
+      // Dedup against system — Maxi 2026-06-18: para Monday refresh solo
+      // chequeamos csv_queue activo + blocklist (NO review_queue cerrado,
+      // sendtrack, historial). Esos son del ciclo viejo que YA terminó
+      // (por eso está en "Ciclo Finalizado" en Monday). Re-prospectar = OK.
       resultEl.textContent = `🔍 Found ${domains.length}, checking duplicates...`;
       const { findKnownDomains } = await import("../modules/sellersJson.js");
-      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains);
+      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains, { mode: "monday_refresh" });
       const _fresh = domains.filter(d => !_known.has(d));
       const _skippedKnown = domains.length - _fresh.length;
       if (_fresh.length === 0) {

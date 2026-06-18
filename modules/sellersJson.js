@@ -82,26 +82,40 @@ export const DEFAULT_SELLERS_COMPANIES = [
 
 // Check si los dominios ya fueron procesados antes (csv_queue + review_queue + historial).
 // Devuelve Set de dominios ya conocidos. Útil para no re-encolar leads que ya pasamos.
-export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candidates) {
+export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candidates, opts = {}) {
   if (!Array.isArray(candidates) || candidates.length === 0) return new Set();
   const known = new Set();
   const headers = { "apikey": anonKey, "Authorization": `Bearer ${accessToken}` };
-  // PostgREST acepta in.(...) con URL larga, pero por las dudas batcheo 200 por query.
   const BATCH = 200;
-  const tables = [
-    { table: "toolbar_csv_queue",     col: "domain" },
-    { table: "toolbar_review_queue",  col: "domain" },
-    { table: "toolbar_historial",     col: "domain" },
-    { table: "toolbar_sendtrack",     col: "domain" },
-    { table: "toolbar_url_blocklist", col: "domain" },
-  ];
+  // Maxi 2026-06-18: opts.mode controla qué tablas chequea:
+  //  - "all" (default): csv_queue + review_queue + historial + sendtrack + blocklist
+  //  - "monday_refresh": solo csv_queue activo + blocklist
+  //    (uso desde "IMPORT MONDAY BOARD WEBSITES" → Ciclo Finalizado = querés
+  //     re-prospectar aunque tenga sendtrack/historial viejo)
+  let tables;
+  if (opts.mode === "monday_refresh") {
+    tables = [
+      // Solo csv_queue activo (pending/processing) — evita duplicar job actual
+      { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool)" },
+      // Blocklist sí — no re-procesar dominios bloqueados aunque vengan de Monday
+      { table: "toolbar_url_blocklist", col: "domain", filter: "" },
+    ];
+  } else {
+    tables = [
+      { table: "toolbar_csv_queue",     col: "domain", filter: "" },
+      { table: "toolbar_review_queue",  col: "domain", filter: "" },
+      { table: "toolbar_historial",     col: "domain", filter: "" },
+      { table: "toolbar_sendtrack",     col: "domain", filter: "" },
+      { table: "toolbar_url_blocklist", col: "domain", filter: "" },
+    ];
+  }
   for (let i = 0; i < candidates.length; i += BATCH) {
     const slice = candidates.slice(i, i + BATCH);
     const inList = slice.map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
-    await Promise.all(tables.map(async ({ table, col }) => {
+    await Promise.all(tables.map(async ({ table, col, filter }) => {
       try {
         const res = await fetch(
-          `${supabaseUrl}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}`,
+          `${supabaseUrl}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}${filter || ""}`,
           { headers }
         );
         if (!res.ok) return;
