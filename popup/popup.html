@@ -1060,9 +1060,8 @@
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
        SECTION 2/3 — External CSV (URLs not in Monday)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
-  <div class="import-section-label" style="margin-top:20px">②  EXTERNAL URLS AUTO PROSPECTOR (CSV)</div>
-  <section class="card">
-    <div class="card-title">📤 External URLs Auto Prospector</div>
+  <section class="card" style="margin-top:20px">
+    <div class="card-title">📤 External URLs Auto Prospector (CSV)</div>
     <p class="import-desc">Upload a CSV (1 domain per line) with <strong>external</strong> URLs. The auto-prospector processes them in the background — analyzes traffic, emails, and pushes them to Monday as new prospects.</p>
 
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
@@ -1078,8 +1077,7 @@
        SECCIÓN ADICIONAL — Import sellers.json
        (extrae publishers de competidores que publican su inventory)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
-  <div class="import-section-label" style="margin-top:20px">②.b  IMPORT FROM sellers.json</div>
-  <section class="card">
+  <section class="card" style="margin-top:20px">
     <div class="card-title">📋 Import publishers from sellers.json</div>
     <p class="import-desc">Each ad-tech company publishes a public <code>/sellers.json</code> with all the publishers they monetize. Pick a company → fetch → queue all publisher domains for analysis. Cap: <strong>300 pending in queue</strong> (compartido entre todos los imports).</p>
 
@@ -1117,8 +1115,7 @@
        SECCIÓN 3/3 — Monday URL Auto Prospector
        (busca en Monday items ya existentes en Ciclo Finalizado)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
-  <div class="import-section-label" style="margin-top:20px">③  MONDAY URL AUTO PROSPECTOR</div>
-  <section class="card">
+  <section class="card" style="margin-top:20px">
     <div class="card-title">🔄 Monday URL Auto Prospector</div>
     <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
 
@@ -1147,13 +1144,12 @@
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
        COLA + HISTORIAL COMPARTIDO (para secciones 2 y 3)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
-  <div class="import-section-label" style="margin-top:20px">🚦  QUEUE STATUS (sections 2 &amp; 3)</div>
-  <section class="card">
+  <section class="card" style="margin-top:20px">
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>🚦 Queue Status</span>
+      <button id="btn-csv-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px">↻ Refresh</button>
+    </div>
     <div style="margin-bottom:10px;padding:10px;background:var(--bg);border-radius:6px;font-size:11px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <strong>Queue status</strong>
-        <button id="btn-csv-refresh" class="btn btn-secondary btn-sm" style="font-size:10px;padding:2px 8px">↻ Refresh</button>
-      </div>
       <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
     </div>
 
