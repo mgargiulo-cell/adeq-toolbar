@@ -930,15 +930,18 @@
      ==================================================== -->
 <div id="tab-prospects" class="tab-content">
 
-  <!-- HERO: Autopilot control (movido desde el header) -->
-  <section class="card" style="padding:12px; background:linear-gradient(135deg,#0f172a,#1e293b); border:1px solid #334155; color:#fff">
+  <!-- Maxi 2026-06-18: cartel "AUTOPILOT — Discovery from Majestic Million"
+       ELIMINADO. El autopilot se auto-prende cuando hay cola y se apaga
+       cuando se vacía. Mantenemos solo botones target (🎯) y autopilot
+       (kill switch manual) ocultos del usuario pero disponibles para handlers. -->
+  <section class="card" style="padding:8px 12px; background:linear-gradient(135deg,#0f172a,#1e293b); border:1px solid #334155; color:#fff">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
-        <div style="font-size:13px;font-weight:700;color:#f1f5f9">🤖 AUTOPILOT — Discovery from Majestic Million</div>
+        <div style="font-size:11px;color:#cbd5e1">🤖 Autopilot (auto-on cuando hay cola)</div>
       </div>
-      <div style="display:flex;gap:6px;align-items:center">
-        <button id="btn-autopilot-target" class="icon-btn" title="Autopilot target (GEO + category)" aria-label="Autopilot target" style="font-size:13px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:#fff">🎯</button>
-        <button id="btn-autopilot" class="autopilot-btn" title="Prender / apagar">
+      <div style="display:none">
+        <button id="btn-autopilot-target" class="icon-btn">🎯</button>
+        <button id="btn-autopilot" class="autopilot-btn">
           <span class="autopilot-dot"></span>
           <span class="autopilot-label">AUTO OFF</span>
         </button>
@@ -960,69 +963,72 @@
   </section>
 
   <section class="card" style="padding-bottom:10px">
+    <!-- Maxi 2026-06-18: filtros simplificados — quitados los dropdowns que
+         duplicaban los presets de abajo. Arriba solo: buscar + traffic + date.
+         Abajo: chips GEO clickeables + presets de source/user. -->
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;flex-wrap:wrap">
       <div class="card-title" style="margin:0">📋 Review Prospects</div>
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <input id="prospects-name-filter" type="text" class="form-input" placeholder="🔎 Buscar dominio / título…" style="font-size:11px;padding:3px 6px;width:160px" title="Filtra por dominio o título de página" />
-        <select id="prospects-source-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by source">
-          <option value="">All sources</option>
-          <option value="autopilot">🤖 Autopilot (Robot Railway)</option>
-          <option value="csv">📥 CSV (External URL Auto Prospector)</option>
-          <option value="monday_refresh">🔄 Monday (URL Auto Prospector)</option>
-          <option value="sellers_json">📋 sellers.json (Import Publishers)</option>
+        <input id="prospects-name-filter" type="text" class="form-input" placeholder="🔎 Buscar dominio…" style="font-size:11px;padding:3px 6px;width:140px" />
+        <select id="prospects-date-filter" class="form-select" style="font-size:11px;padding:3px 6px">
+          <option value="">📅 Todas las fechas</option>
+          <option value="today">Hoy</option>
+          <option value="yesterday">Ayer</option>
+          <option value="last7">Últimos 7d</option>
+          <option value="last30">Últimos 30d</option>
         </select>
-        <select id="prospects-user-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by user who imported / discovered">
-          <option value="">All users</option>
-          <option value="mgargiulo@adeqmedia.com">Maxi</option>
-          <option value="dhorovitz@adeqmedia.com">Diego</option>
-          <option value="sales@adeqmedia.com">Agus</option>
-        </select>
-        <select id="prospects-date-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by discovery date">
-          <option value="">All dates</option>
-          <option value="today">Today</option>
-          <option value="yesterday">Yesterday</option>
-          <option value="last7">Last 7 days</option>
-          <option value="last30">Last 30 days</option>
-        </select>
-        <select id="prospects-traffic-filter" class="form-select" style="font-size:11px;padding:3px 6px" title="Filter by traffic range">
-          <option value="">📊 All traffic</option>
+        <select id="prospects-traffic-filter" class="form-select" style="font-size:11px;padding:3px 6px">
+          <option value="">📊 Todo el tráfico</option>
           <option value="0-1">0 – 1M</option>
           <option value="1-2">1M – 2M</option>
           <option value="2-3">2M – 3M</option>
           <option value="3-4">3M – 4M</option>
           <option value="4-5">4M – 5M</option>
-          <option value="5-6">5M – 6M</option>
-          <option value="6-7">6M – 7M</option>
-          <option value="7-8">7M – 8M</option>
-          <option value="8-9">8M – 9M</option>
-          <option value="9-10">9M – 10M</option>
-          <option value="10-11">10M – 11M</option>
-          <option value="11-12">11M – 12M</option>
-          <option value="12-13">12M – 13M</option>
-          <option value="13-14">13M – 14M</option>
-          <option value="14-15">14M – 15M</option>
+          <option value="5-10">5M – 10M</option>
+          <option value="10-15">10M – 15M</option>
           <option value="15-20">15M – 20M</option>
-          <option value="20-25">20M – 25M</option>
-          <option value="25-30">25M – 30M</option>
-          <option value="30-35">30M – 35M</option>
-          <option value="35-40">35M – 40M</option>
-          <option value="40-45">40M – 45M</option>
-          <option value="45-50">45M – 50M</option>
+          <option value="20-30">20M – 30M</option>
+          <option value="30-50">30M – 50M</option>
           <option value="50-9999">50M+</option>
         </select>
         <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
       </div>
     </div>
-    <!-- GEO multi-select chips (clickeables) — Maxi 2026-06-17 -->
-    <div id="prospects-geo-chips" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;font-size:10px"></div>
-    <!-- Filter presets — atajos de un click para combos comunes -->
-    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+
+    <!-- Source + user combinados en una sola fila de presets -->
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;align-items:center">
+      <span style="font-size:10px;color:var(--text-muted);font-weight:600;margin-right:4px">FUENTE:</span>
       <button class="prospects-preset btn btn-sm" data-source="" style="font-size:10px;padding:2px 7px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">∞ All</button>
       <button class="prospects-preset btn btn-sm" data-source="sellers_json" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📋 JSON</button>
       <button class="prospects-preset btn btn-sm" data-source="monday_refresh" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔄 Monday</button>
       <button class="prospects-preset btn btn-sm" data-source="csv" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📥 CSV</button>
       <button class="prospects-preset btn btn-sm" data-source="autopilot" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🤖 Autopilot</button>
     </div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;align-items:center">
+      <span style="font-size:10px;color:var(--text-muted);font-weight:600;margin-right:4px">USUARIO:</span>
+      <button class="prospects-user-preset btn btn-sm" data-user="" style="font-size:10px;padding:2px 7px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">∞ Todos</button>
+      <button class="prospects-user-preset btn btn-sm" data-user="mgargiulo@adeqmedia.com" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">👤 Maxi</button>
+      <button class="prospects-user-preset btn btn-sm" data-user="dhorovitz@adeqmedia.com" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">👤 Diego</button>
+      <button class="prospects-user-preset btn btn-sm" data-user="sales@adeqmedia.com" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">👤 Agus</button>
+    </div>
+
+    <!-- GEO chips (dinámico — incluye "Sin GEO" + todos los países disponibles) -->
+    <div style="margin-bottom:6px">
+      <div style="font-size:10px;color:var(--text-muted);font-weight:600;margin-bottom:4px">PAÍS:</div>
+      <div id="prospects-geo-chips" style="display:flex;gap:4px;flex-wrap:wrap;font-size:10px"></div>
+    </div>
+
+    <!-- Hidden inputs para compat con handlers existentes (source/user) -->
+    <select id="prospects-source-filter" style="display:none">
+      <option value="" selected></option>
+      <option value="autopilot"></option>
+      <option value="csv"></option>
+      <option value="monday_refresh"></option>
+      <option value="sellers_json"></option>
+    </select>
+    <select id="prospects-user-filter" style="display:none">
+      <option value="" selected></option>
+    </select>
     <!-- Legacy geo dropdown — escondido pero usado internamente por filtros antiguos -->
     <select id="prospects-geo-filter" class="form-select" style="display:none">
       <option value="">All GEOs</option>

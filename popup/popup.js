@@ -6785,9 +6785,12 @@ async function initCsvQueue() {
     return { attempts, feeders };
   }
 
-  function _renderAgentBlock(feeders) {
+  // Maxi 2026-06-18: "to Prospects" se calcula AHORA mismo desde review_queue
+  // (no del campo effective_added que se mide 30 min después del cron y queda
+  // NULL en los runs recientes → bug de "0 to Prospects" cuando los runs
+  // estaban activos pero sin medir).
+  async function _renderAgentBlock(feeders) {
     if (!feeders || feeders.length === 0) {
-      // Sin actividad → solo el label "Agent", sin descripción
       return `
         <div style="padding:8px;border:1px solid #6366f1;border-radius:6px;margin-bottom:8px;background:rgba(99,102,241,0.06)">
           <div style="font-weight:600;color:#6366f1">🤖 Agent</div>
@@ -6795,10 +6798,25 @@ async function initCsvQueue() {
     }
     const okRuns = feeders.filter(r => r.status === "ok");
     const grossTotal     = okRuns.reduce((s, r) => s + (parseInt(r.gross_total, 10)     || 0), 0);
-    const effectiveTotal = okRuns.reduce((s, r) => s + (parseInt(r.effective_added, 10) || 0), 0);
     const grossSellers   = okRuns.reduce((s, r) => s + (parseInt(r.gross_sellers, 10)   || 0), 0);
     const grossMonday    = okRuns.reduce((s, r) => s + (parseInt(r.gross_monday, 10)    || 0), 0);
     const grossMajestic  = okRuns.reduce((s, r) => s + (parseInt(r.gross_majestic, 10)  || 0), 0);
+
+    // Calcular effectiveTotal en vivo desde review_queue (creados hoy con source del worker)
+    // En vez de leer effective_added que puede ser NULL para runs recientes.
+    let effectiveTotal = 0;
+    try {
+      const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+      const since = todayStart.toISOString();
+      const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+      const rqRes = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&source=in.(csv,autopilot,sellers_json,monday_refresh)&select=id`,
+        { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }
+      );
+      const rangeHdr = rqRes.headers.get("content-range") || "";
+      effectiveTotal = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch {}
+
     const conv = grossTotal > 0 ? (effectiveTotal / grossTotal * 100).toFixed(1) : "—";
     const skipped = feeders.length - okRuns.length;
     const last = feeders[0];
@@ -6853,13 +6871,13 @@ async function initCsvQueue() {
       </div>`;
   }
 
-  function _renderActivityToday(attempts, feeders) {
-    let html = _renderAgentBlock(feeders);
+  async function _renderActivityToday(attempts, feeders) {
+    let html = await _renderAgentBlock(feeders);
     HISTORY_MBS.forEach(mb => { html += _renderMbBlock(mb.name, mb.email, attempts); });
     return html;
   }
 
-  function _renderActivity7Days(attempts, feeders) {
+  async function _renderActivity7Days(attempts, feeders) {
     // Agrupar por fecha (YYYY-MM-DD Madrid)
     const dateOf = (iso) => {
       try {
@@ -6881,14 +6899,15 @@ async function initCsvQueue() {
     });
     const dates = Object.keys(byDate).sort().reverse();
     if (dates.length === 0) return `<div style="color:var(--text-muted);font-style:italic;padding:8px">No activity in the last 7 days.</div>`;
-    return dates.map(d => `
+    const blocks = await Promise.all(dates.map(async d => `
       <details style="margin-bottom:6px;border:1px solid var(--border);border-radius:6px;padding:6px" ${d === dates[0] ? "open" : ""}>
         <summary style="cursor:pointer;font-weight:600;font-size:12px">${d}</summary>
         <div style="margin-top:6px">
-          ${_renderActivityToday(byDate[d].attempts, byDate[d].feeders)}
+          ${await _renderActivityToday(byDate[d].attempts, byDate[d].feeders)}
         </div>
       </details>
-    `).join("");
+    `));
+    return blocks.join("");
   }
 
   const refreshHistory = async () => {
@@ -6904,8 +6923,8 @@ async function initCsvQueue() {
     try {
       const { attempts, feeders } = await _fetchActivityData(sinceISO);
       historyEl.innerHTML = _historyRange === "today"
-        ? _renderActivityToday(attempts, feeders)
-        : _renderActivity7Days(attempts, feeders);
+        ? await _renderActivityToday(attempts, feeders)
+        : await _renderActivity7Days(attempts, feeders);
     } catch (e) {
       historyEl.innerHTML = `<div style="color:#e53e3e">Error: ${esc(e.message || String(e))}</div>`;
     }
@@ -8280,25 +8299,61 @@ const _GEO_NAMES = {
 };
 // Reconstruye chips de GEO clickeables a partir de los datos disponibles.
 // Toolkit user 2026-06-17: chips multi-select para filtrar por varios países a la vez.
+// Maxi 2026-06-18: chips de GEO con TODOS los países disponibles + "Sin GEO".
+// Antes solo aparecían los 4 con datos completos porque exigía `iso.length === 2`.
+// Ahora: detecta geo desde geos_all[0], geo (ISO o NAME), y mapea NAMES → ISO.
 function _rebuildGeoChips(rows, selected) {
   const wrap = document.getElementById("prospects-geo-chips");
   if (!wrap) return;
   const sel = selected instanceof Set ? selected : new Set();
+  // Map NAME en inglés → ISO (cubre el legacy field `geo` que guarda el name).
+  const NAME_TO_ISO = {};
+  const ISO_TO_NAME = {
+    AR:"Argentina", BR:"Brazil", ES:"Spain", MX:"Mexico", CO:"Colombia",
+    CL:"Chile", PE:"Peru", UY:"Uruguay", EC:"Ecuador", VE:"Venezuela",
+    DO:"Dominican Republic", PA:"Panama", BO:"Bolivia", GT:"Guatemala",
+    CR:"Costa Rica", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
+    PY:"Paraguay", PR:"Puerto Rico", CU:"Cuba", US:"United States",
+    GB:"United Kingdom", CA:"Canada", AU:"Australia", NZ:"New Zealand",
+    PT:"Portugal", IT:"Italy", FR:"France", DE:"Germany", NL:"Netherlands",
+    BE:"Belgium", CH:"Switzerland", AT:"Austria", IE:"Ireland", DK:"Denmark",
+    SE:"Sweden", NO:"Norway", FI:"Finland", PL:"Poland", CZ:"Czech Republic",
+    HU:"Hungary", RO:"Romania", GR:"Greece", IN:"India", PK:"Pakistan",
+    BD:"Bangladesh", LK:"Sri Lanka", ID:"Indonesia", PH:"Philippines",
+    VN:"Vietnam", TH:"Thailand", MY:"Malaysia", SG:"Singapore",
+    SA:"Saudi Arabia", AE:"UAE", EG:"Egypt", TR:"Turkey", IL:"Israel",
+    NG:"Nigeria", KE:"Kenya", ZA:"South Africa", MA:"Morocco", DZ:"Algeria",
+    JP:"Japan", KR:"South Korea", CN:"China", TW:"Taiwan", HK:"Hong Kong",
+    RU:"Russia", UA:"Ukraine", BG:"Bulgaria", HR:"Croatia", SK:"Slovakia",
+  };
+  Object.entries(ISO_TO_NAME).forEach(([iso, name]) => { NAME_TO_ISO[name.toUpperCase()] = iso; });
+
   const counts = new Map();
+  let noGeoCount = 0;
   for (const r of rows || []) {
     let iso = "";
-    if (Array.isArray(r.geos_all) && r.geos_all.length) iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
-    else if (r.geo) iso = String(r.geo).toUpperCase().slice(0, 2);
-    if (!iso || iso.length !== 2) continue;
+    if (Array.isArray(r.geos_all) && r.geos_all.length) {
+      iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
+    } else if (r.geo) {
+      const g = String(r.geo).trim().toUpperCase();
+      // Si tiene 2 chars y es ISO conocido, usar directo. Si es nombre, mapear.
+      if (g.length === 2 && ISO_TO_NAME[g]) iso = g;
+      else if (NAME_TO_ISO[g])               iso = NAME_TO_ISO[g];
+      else if (g.length >= 2)                iso = g.slice(0, 2); // fallback
+    }
+    if (!iso) { noGeoCount++; continue; }
     counts.set(iso, (counts.get(iso) || 0) + 1);
   }
-  if (counts.size === 0) { wrap.innerHTML = ""; return; }
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   const allActive = sel.size === 0;
   let html = `<button class="geo-chip" data-code="_ALL_" type="button" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${allActive ? "#0ea5e9" : "#334155"};background:${allActive ? "#0ea5e9" : "#1e293b"};color:${allActive ? "#fff" : "#cbd5e1"};font-weight:600">🌍 Todos</button>`;
+  if (noGeoCount > 0) {
+    const isOn = sel.has("_NONE_");
+    html += `<button class="geo-chip" data-code="_NONE_" type="button" title="Leads sin país detectado" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">❓ Sin GEO (${noGeoCount})</button>`;
+  }
   for (const [iso, n] of sorted) {
     const isOn = sel.has(iso);
-    const name = (typeof _GEO_NAMES !== "undefined" && _GEO_NAMES[iso]) || iso;
+    const name = (typeof _GEO_NAMES !== "undefined" && _GEO_NAMES[iso]) || ISO_TO_NAME[iso] || iso;
     const flag = _isoToFlag(iso);
     html += `<button class="geo-chip" data-code="${iso}" type="button" title="${esc(name)}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${flag} ${iso} (${n})</button>`;
   }
@@ -8393,15 +8448,19 @@ async function loadProspectsTab() {
     // ── Client-side filters: multi-GEO chips + traffic range + name ──
     // (Estos NO pueden ir en URL PostgREST de forma simple, así que filtramos
     // acá. El server ya nos trajo hasta 3000 rows = bien manejable.)
-    if (geoChipsSet.size > 1) {
+    // Maxi 2026-06-18: filtro client-side multi-GEO + soporta "_NONE_" (sin geo)
+    if (geoChipsSet.size >= 1) {
+      const wantsNoGeo = geoChipsSet.has("_NONE_");
+      const NAME_BY_ISO = { US:"UNITED STATES", GB:"UNITED KINGDOM", BR:"BRAZIL", AR:"ARGENTINA", MX:"MEXICO", ES:"SPAIN", VN:"VIETNAM", IN:"INDIA", PT:"PORTUGAL", IT:"ITALY", FR:"FRANCE", DE:"GERMANY", CA:"CANADA", AU:"AUSTRALIA", NZ:"NEW ZEALAND", IE:"IRELAND", PL:"POLAND", CL:"CHILE", CO:"COLOMBIA", PE:"PERU", UY:"URUGUAY", EC:"ECUADOR", VE:"VENEZUELA", JP:"JAPAN", KR:"SOUTH KOREA", CN:"CHINA", RU:"RUSSIA", UA:"UKRAINE", SA:"SAUDI ARABIA", AE:"UAE", EG:"EGYPT", TR:"TURKEY", IL:"ISRAEL", NG:"NIGERIA", ZA:"SOUTH AFRICA", MA:"MOROCCO" };
       rows = rows.filter(r => {
         const isoArr = Array.isArray(r.geos_all) ? r.geos_all.map(x => String(x).toUpperCase()) : [];
         const legacyIso = String(r.geo || "").toUpperCase();
+        const hasGeo = isoArr.length > 0 || !!legacyIso;
+        if (wantsNoGeo && !hasGeo) return true;
         for (const code of geoChipsSet) {
+          if (code === "_NONE_") continue;
           if (isoArr.includes(code)) return true;
           if (legacyIso === code) return true;
-          // legacy `geo` puede ser NAME, no ISO — mapear minimal
-          const NAME_BY_ISO = { US:"UNITED STATES", GB:"UNITED KINGDOM", BR:"BRAZIL", AR:"ARGENTINA", MX:"MEXICO", ES:"SPAIN", VN:"VIETNAM", IN:"INDIA" };
           if (NAME_BY_ISO[code] && legacyIso === NAME_BY_ISO[code]) return true;
         }
         return false;
@@ -9983,25 +10042,40 @@ async function initProspectsTab() {
     chrome.storage.local.set({ _prospectsGeoChips: [...window._selectedGeoChips] }).catch(() => {});
     await loadProspectsTab();
   });
-  // ── Filter presets por SOURCE: filtrar leads según de dónde vinieron ─────
+  // ── Filter presets por SOURCE ─────
   document.querySelectorAll(".prospects-preset").forEach(btn => {
     btn.addEventListener("click", async () => {
       const source = btn.dataset.source || "";
       const sourceEl = document.getElementById("prospects-source-filter");
       if (sourceEl) sourceEl.value = source;
       chrome.storage.local.set({ _prospectsSourceFilter: source }).catch(() => {});
-      // Highlight visual del preset activo
       document.querySelectorAll(".prospects-preset").forEach(b => {
         if (b.dataset.source === source) {
-          b.style.background = "#0ea5e9";
-          b.style.color = "#fff";
-          b.style.border = "none";
-          b.style.fontWeight = "600";
+          b.style.background = "#0ea5e9"; b.style.color = "#fff";
+          b.style.border = "none"; b.style.fontWeight = "600";
         } else {
-          b.style.background = "#1e293b";
-          b.style.color = "#cbd5e1";
-          b.style.border = "1px solid #334155";
-          b.style.fontWeight = "400";
+          b.style.background = "#1e293b"; b.style.color = "#cbd5e1";
+          b.style.border = "1px solid #334155"; b.style.fontWeight = "400";
+        }
+      });
+      await loadProspectsTab();
+    });
+  });
+
+  // Maxi 2026-06-18: Filter presets por USUARIO (Maxi/Diego/Agus/Todos)
+  document.querySelectorAll(".prospects-user-preset").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const user = btn.dataset.user || "";
+      const userEl = document.getElementById("prospects-user-filter");
+      if (userEl) userEl.value = user;
+      chrome.storage.local.set({ _prospectsUserFilter: user }).catch(() => {});
+      document.querySelectorAll(".prospects-user-preset").forEach(b => {
+        if (b.dataset.user === user) {
+          b.style.background = "#0ea5e9"; b.style.color = "#fff";
+          b.style.border = "none"; b.style.fontWeight = "600";
+        } else {
+          b.style.background = "#1e293b"; b.style.color = "#cbd5e1";
+          b.style.border = "1px solid #334155"; b.style.fontWeight = "400";
         }
       });
       await loadProspectsTab();
