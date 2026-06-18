@@ -3482,8 +3482,16 @@ async function runTrafficCheck(opts = {}) {
     if (!state.visits || state.visits === 0) {
       metricEl.innerHTML = `<span style="color:#f59e0b">⚠️ Sin tráfico detectado</span>${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "";
-      breakdownEl.innerHTML = `<button id="btn-traffic-recheck" type="button" style="font-size:11px;padding:4px 10px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:6px">🔄 Re-verificar (bypass cache)</button><span style="font-size:10px;color:#94a3b8">SimilarWeb puede tener data — chequear directo si dudás</span>${cacheStr}`;
-      // Wire button
+      // Maxi 2026-06-18: 3 acciones cuando no encuentra tráfico: re-verificar,
+      // abrir SimilarWeb directo (para chequear visual), y mensaje claro.
+      const swUrl = `https://www.similarweb.com/website/${esc(state.domain || "")}/`;
+      breakdownEl.innerHTML = `
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px">
+          <button id="btn-traffic-recheck" type="button" style="font-size:11px;padding:4px 10px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer">🔄 Re-verificar</button>
+          <a id="btn-similarweb-open" href="${swUrl}" target="_blank" rel="noopener" style="font-size:11px;padding:4px 10px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;display:inline-flex;align-items:center;gap:3px">🌐 Abrir en SimilarWeb</a>
+        </div>
+        <span style="font-size:10px;color:#94a3b8">Si SimilarWeb muestra data y nuestra toolbar no, podés cargar el tráfico manual en el campo Traffic abajo.</span>${cacheStr}
+      `;
       setTimeout(() => {
         document.getElementById("btn-traffic-recheck")?.addEventListener("click", () => {
           runTrafficCheck({ forceRefresh: true }).catch(() => {});

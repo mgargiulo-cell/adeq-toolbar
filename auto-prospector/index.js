@@ -652,6 +652,20 @@ async function promoteWaitlist(token) {
 }
 
 async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactNameSource = "", contactPhone, emails, emailSources = {}, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
+  // Maxi 2026-06-18: GUARD EXPLÍCITO contra leads sin tráfico. Antes saveToReviewQueue
+  // confiaba en que el caller filtraba. Pero rows con NaN/0 se colaban. Ahora se
+  // valida ACÁ — si traffic no es número >= MIN, no se guarda.
+  const trafficNum = Number(traffic);
+  if (!Number.isFinite(trafficNum) || trafficNum < REVIEW_QUEUE_MIN_TRAFFIC) {
+    // EXCEPCIÓN: monday_refresh (re-import de Ciclo Finalizado) puede pasar con
+    // tráfico 0 si SimilarWeb falló temporalmente — esos se procesan igual porque
+    // ya fueron contactados antes y el MB explícitamente quiere re-prospectarlos.
+    if (source !== "monday_refresh") {
+      log(`  ⛔ saveToReviewQueue ${domain} REJECTED — traffic ${trafficNum} < ${REVIEW_QUEUE_MIN_TRAFFIC} (source=${source})`);
+      return false;
+    }
+  }
+
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
   // Esta función solo INSERTA y devuelve boolean.
@@ -10138,9 +10152,9 @@ async function main() {
     }
 
     // ── Cleanup periódico cada 30 iters ──
-    // 1. Borrar leads pending con traffic > 0 AND < 350K (basura que el agente
-    //    nunca pickearía pero acumulan en cola).
-    // 2. Resetear traffic=-1 (sentinel old) → 0 para que refresh los re-intente.
+    // Maxi 2026-06-18: ampliado para incluir leads con traffic=0 / NULL después
+    // de 48hs (les damos chance de que el refresh los enriquezca). Excluye
+    // monday_refresh (re-prospect explícito del MB, se procesan igual).
     if (iterCount % 30 === 0) {
       try {
         // Reset -1 → 0 (re-eligible for refresh)
@@ -10149,20 +10163,34 @@ async function main() {
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
           body: JSON.stringify({ traffic: 0 }),
         }).catch(() => {});
-        // Delete sub-threshold (0 < traffic < min)
-        const delRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`, {
-          method: "GET",
+
+        // 1. DELETE leads con traffic > 0 AND < MIN (basura conocida — el agente nunca los pickearía)
+        const subRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`, {
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
         });
-        const range = delRes.headers.get("content-range") || "";
-        const m = range.match(/\/(\d+)$/);
-        const subCount = m ? parseInt(m[1]) : 0;
+        const subCount = parseInt((subRes.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
         if (subCount > 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}`, {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}`, {
             method: "DELETE",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "return=minimal" },
           }).catch(() => {});
           log(`🗑 Cleanup: ${subCount} leads pending con traffic < ${REVIEW_QUEUE_MIN_TRAFFIC} eliminados`);
+        }
+
+        // 2. DELETE leads con traffic=0 OR NULL después de 48hs (sin tráfico tras
+        //    refresh + re-process — son "fantasma" que ocupan espacio).
+        const cutoff48h = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+        const noTrafficRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&or=(traffic.eq.0,traffic.is.null)&created_at=lt.${encodeURIComponent(cutoff48h)}&select=id`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+        );
+        const noTrafficCount = parseInt((noTrafficRes.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+        if (noTrafficCount > 0) {
+          await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&or=(traffic.eq.0,traffic.is.null)&created_at=lt.${encodeURIComponent(cutoff48h)}`,
+            { method: "DELETE", headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "return=minimal" } }
+          ).catch(() => {});
+          log(`🗑 Cleanup: ${noTrafficCount} leads pending SIN tráfico (> 48hs) eliminados`);
         }
       } catch (e) { log(`⚠️ cleanup: ${e.message}`); }
     }
