@@ -2250,6 +2250,105 @@ async function rapidFetchWithRetry(url, headers, timeout = 8000) {
 let _rapidGlobalCounter = 0;
 let _rapidCapReached    = false;
 
+// Maxi 2026-06-18: FALLBACK de tráfico — si RapidAPI no devuelve, intentar
+// scrapear de fuentes públicas que estiman tráfico mensual.
+// Fuentes (en orden):
+//   1. similarweb.com/website/{d}/   — más confiable cuando no está blocked
+//   2. hypestat.com/info/{d}          — estima daily uniques (× 30 = monthly)
+//   3. siteworthtraffic.com/report/{d} — alternativa
+//
+// Nota: estas son páginas PÚBLICAS — el dato ya es visible al user. Limit:
+// rate-limit + Cloudflare bot protection. Si bloquea, devolvemos null y el
+// flow original (freeze 15-30-60d) sigue.
+async function _scrapeTrafficFallback(domain) {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+  };
+  const tryFetch = async (url) => {
+    try {
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(12000) });
+      if (!r.ok) return null;
+      return await r.text();
+    } catch { return null; }
+  };
+  // Helper: parsea "1.5M" / "1,500,000" / "2.3K" → número
+  const parseHumanNum = (s) => {
+    if (!s) return null;
+    const clean = String(s).trim().replace(/,/g, "").toUpperCase();
+    const m = clean.match(/^(\d+(?:\.\d+)?)\s*([KMB])?$/);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    const mult = m[2] === "K" ? 1e3 : m[2] === "M" ? 1e6 : m[2] === "B" ? 1e9 : 1;
+    return Math.round(n * mult);
+  };
+
+  // ── 1. similarweb.com ──
+  try {
+    const html = await tryFetch(`https://www.similarweb.com/website/${domain}/`);
+    if (html) {
+      // SimilarWeb pública muestra Total Visits en varios formatos. Probamos varios.
+      // a) JSON embebido: "totalVisits":1500000 o similar
+      let m = html.match(/"(?:totalVisits|visits|monthlyVisits)"\s*:\s*(\d+)/i);
+      if (m) {
+        const visits = parseInt(m[1], 10);
+        if (visits >= 1000) {
+          log(`  📊 scrape fallback ${domain}: similarweb JSON → ${visits} visits`);
+          return { visits, source: "similarweb_scrape" };
+        }
+      }
+      // b) Texto visible: <p>1.5M</p> cerca de "Total Visits" o "Monthly Visits"
+      m = html.match(/Total\s*Visits[^<]*<[^>]*>\s*([\d.,]+\s*[KMB]?)/i)
+        || html.match(/Monthly\s*Visits[^<]*<[^>]*>\s*([\d.,]+\s*[KMB]?)/i);
+      if (m) {
+        const visits = parseHumanNum(m[1]);
+        if (visits && visits >= 1000) {
+          log(`  📊 scrape fallback ${domain}: similarweb HTML → ${visits} visits`);
+          return { visits, source: "similarweb_scrape" };
+        }
+      }
+    }
+  } catch {}
+
+  // ── 2. hypestat.com (estima daily uniques → ×30 monthly) ──
+  try {
+    const html = await tryFetch(`https://hypestat.com/info/${domain}`);
+    if (html) {
+      // "Daily Unique Visitors:" 5,000 → ×30
+      let m = html.match(/Daily\s*Unique\s*Visitors[^<]*<[^>]*>([\d.,]+\s*[KMB]?)/i)
+        || html.match(/Estimated\s*Worth[\s\S]{0,300}?Visitors[^<]*<[^>]*>([\d.,]+\s*[KMB]?)/i);
+      if (m) {
+        const daily = parseHumanNum(m[1]);
+        if (daily && daily >= 100) {
+          const visits = daily * 30;
+          log(`  📊 scrape fallback ${domain}: hypestat → daily=${daily} ×30 = ${visits}`);
+          return { visits, source: "hypestat_scrape" };
+        }
+      }
+    }
+  } catch {}
+
+  // ── 3. siteworthtraffic.com ──
+  try {
+    const html = await tryFetch(`https://www.siteworthtraffic.com/report/${domain}`);
+    if (html) {
+      let m = html.match(/Monthly\s*Visitors[^<]*<[^>]*>([\d.,]+\s*[KMB]?)/i)
+        || html.match(/Visitors[\s\S]{0,200}<[^>]*>([\d.,]+)\s*(?:per\s*month|monthly)/i);
+      if (m) {
+        const visits = parseHumanNum(m[1]);
+        if (visits && visits >= 1000) {
+          log(`  📊 scrape fallback ${domain}: siteworthtraffic → ${visits}`);
+          return { visits, source: "siteworthtraffic_scrape" };
+        }
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
 async function getTrafficData(domain, rapidApiKey) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" };
 
@@ -2283,16 +2382,34 @@ async function getTrafficData(domain, rapidApiKey) {
         headers
       );
     }
+    // Maxi 2026-06-18: si RapidAPI vino vacío/error, intentar fallback de scrape
+    // antes de devolver null. Las fuentes públicas (similarweb / hypestat /
+    // siteworthtraffic) son visibles sin login y a veces tienen data cuando
+    // nuestra API no.
+    const _tryScrapeFallback = async (reasonForLog) => {
+      const fb = await _scrapeTrafficFallback(domain).catch(() => null);
+      if (fb && fb.visits >= 1000) {
+        log(`  ✅ getTrafficData ${domain}: ${reasonForLog} → scrape fallback OK (${fb.source})`);
+        return { visits: fb.visits, topCountry: null, error: null, fromScrape: fb.source };
+      }
+      return null;
+    };
     if (!data) {
       log(`  ⚠️ getTrafficData ${domain}: response null (key vacía o servicio caído)`);
+      const fb = await _tryScrapeFallback("rapidapi_null");
+      if (fb) return fb;
       return { visits: null, topCountry: null, error: "null_response" };
     }
     if (data.__error4xx) {
       log(`  ⚠️ getTrafficData ${domain}: ${data.__error4xx}`);
+      const fb = await _tryScrapeFallback(data.__error4xx);
+      if (fb) return fb;
       return { visits: null, topCountry: null, error: data.__error4xx };
     }
     if (data.__error) {
       log(`  ⚠️ getTrafficData ${domain}: ${data.__error}`);
+      const fb = await _tryScrapeFallback(data.__error);
+      if (fb) return fb;
       return { visits: null, topCountry: null, error: data.__error };
     }
 
@@ -2396,8 +2513,25 @@ async function getTrafficData(domain, rapidApiKey) {
     // FIX 2026-05-26: devolver también la categoría SimilarWeb para que el filtro
     // de categorías auto-bloqueadas (banking, gov, universidades, etc.) la use.
     const swCategory = data?.WebsiteDetails?.Category || data?.Category || "";
+    // Maxi 2026-06-18: si RapidAPI devolvió data pero visits=0, intentar scrape.
+    // Caso real: APIs vieja vez devuelven shape OK pero visits=0 cuando hay glitch.
+    if (!visits || visits === 0) {
+      const fb = await _scrapeTrafficFallback(domain).catch(() => null);
+      if (fb && fb.visits >= 1000) {
+        log(`  ✅ getTrafficData ${domain}: RapidAPI dijo 0 → scrape fallback rescató ${fb.visits} (${fb.source})`);
+        return { visits: fb.visits, pagesPerVisit, topCountry, topCountries3, swCategory, error: null, fromScrape: fb.source };
+      }
+    }
     return { visits, pagesPerVisit, topCountry, topCountries3, swCategory, error: null };
-  } catch (e) { return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: e.message }; }
+  } catch (e) {
+    // Si todo explotó, intentar scrape como último recurso
+    const fb = await _scrapeTrafficFallback(domain).catch(() => null);
+    if (fb && fb.visits >= 1000) {
+      log(`  ✅ getTrafficData ${domain}: exception rescatada por scrape fallback (${fb.source})`);
+      return { visits: fb.visits, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: null, fromScrape: fb.source };
+    }
+    return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: e.message };
+  }
 }
 
 // Cache helpers de tráfico para el worker (acceso directo a Supabase).
