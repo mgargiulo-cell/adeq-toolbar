@@ -534,15 +534,17 @@
       </div>
       <div id="apollo-result" class="apollo-result"></div>
 
-      <!-- Emails Futuros (hasta 3) — se envían solo a los +11/+22/+33 días si no abrieron el primero -->
+      <!-- Maxi 2026-06-18: Adicionales (hasta 3) — salen EN PARALELO el día 0
+           junto con el original. NO se encolan. Si el original rebota / OOO,
+           Monday se actualiza con el primer adicional que respondió OK. -->
       <div id="email-futuro-block" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--surface-3)">
         <label class="form-label" style="display:flex;align-items:center;gap:6px;font-size:11px">
-          ⏱️ <span>Emails Futuros (hasta 3)</span>
-          <span style="font-size:10px;font-weight:500;color:var(--text-muted);font-style:italic">(opcional — auto a los +11/+22/+33d si no abrieron el primero)</span>
+          📨 <span>Contactos Adicionales del Sitio (hasta 3)</span>
+          <span style="font-size:10px;font-weight:500;color:var(--text-muted);font-style:italic">(opcional — se envían en paralelo día 0; si el principal rebota/OOO → Monday usa el adicional que funcionó)</span>
         </label>
-        <input id="form-email-futuro"   class="form-input" type="email" placeholder="FU2 — email alternativo +11d" autocomplete="off" style="margin-bottom:4px" />
-        <input id="form-email-futuro-2" class="form-input" type="email" placeholder="FU3 — email alternativo +22d" autocomplete="off" style="margin-bottom:4px" />
-        <input id="form-email-futuro-3" class="form-input" type="email" placeholder="FU4 — email alternativo +33d" autocomplete="off" />
+        <input id="form-email-futuro"   class="form-input" type="email" placeholder="Adicional 1 — ej. ventas@cliente.com" autocomplete="off" style="margin-bottom:4px" />
+        <input id="form-email-futuro-2" class="form-input" type="email" placeholder="Adicional 2 — ej. marketing@cliente.com" autocomplete="off" style="margin-bottom:4px" />
+        <input id="form-email-futuro-3" class="form-input" type="email" placeholder="Adicional 3 — ej. directorgeneral@cliente.com" autocomplete="off" />
         <div id="email-futuro-status" style="font-size:10px;color:var(--text-muted);margin-top:4px"></div>
       </div>
     </div>

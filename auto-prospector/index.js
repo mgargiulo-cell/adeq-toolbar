@@ -6272,6 +6272,55 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       }
     } catch {}
 
+    // 0b. Maxi 2026-06-18: AUTO-PROMOTE en Monday.
+    // Si el dominio recibió OTROS envíos del mismo MB en últimos 7d (vía
+    // response_tracking — los adicionales que mandamos día 0 con el original),
+    // buscar el primero que NO rebotó y actualizar Monday SIN re-mandar mail.
+    // Esto cubre el caso "manda al original + 3 adicionales → original rebota
+    // → Monday queda con email muerto → reemplazar por el adicional que llegó".
+    try {
+      const cutoff7d = new Date(Date.now() - 7 * 86400_000).toISOString();
+      const otherSendsRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?mb_email=eq.${encodeURIComponent(mbEmail.toLowerCase())}&domain=eq.${encodeURIComponent(domain)}&sent_at=gte.${cutoff7d}&select=email_sent_to,response_type,sent_at&order=sent_at.desc&limit=20`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (otherSendsRes.ok) {
+        const sends = await otherSendsRes.json();
+        if (Array.isArray(sends) && sends.length > 1) {
+          // Buscar el primer email que NO rebotó (y no es el que acaba de rebotar)
+          const alive = sends.find(s => {
+            const e = (s.email_sent_to || "").toLowerCase();
+            return e !== bouncedEmail.toLowerCase() && !isBouncedSync(e);
+          });
+          if (alive && alive.email_sent_to) {
+            log(`  🔁 ${domain}: auto-promote Monday — bounced=${bouncedEmail} → vivo=${alive.email_sent_to}`);
+            // Buscar el lead en review_queue (o Monday item directo)
+            try {
+              const leadRes = await fetch(
+                `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=monday_item_id&order=created_at.desc&limit=1`,
+                { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+              );
+              const leadRows = leadRes.ok ? await leadRes.json() : [];
+              const mondayItemId = leadRows[0]?.monday_item_id;
+              const cfg = await getConfig(token);
+              const mondayApiKey = getMondayKeyForUser(cfg, mbEmail) || cfg.monday_api_key;
+              if (mondayItemId && mondayApiKey) {
+                const boardId = cfg.monday_active_board || cfg.monday_board_id || 1420268379;
+                await updateMondayReengagementDispatch(mondayApiKey, mondayItemId, boardId, alive.email_sent_to);
+                log(`  ✅ ${domain}: Monday actualizado con email vivo ${alive.email_sent_to}`);
+                logAgentAction(token, mbEmail, {
+                  domain, action: "auto_promoted",
+                  reason: "bounce_swap_to_alive_adicional",
+                  details: { bounced: bouncedEmail, promoted: alive.email_sent_to, monday_item_id: mondayItemId },
+                }).catch(() => {});
+                return; // No hace falta retry — el adicional ya fue enviado el día 0
+              }
+            } catch (e) { log(`  ⚠️ auto-promote fail ${domain}: ${e.message}`); }
+          }
+        }
+      }
+    } catch (e) { log(`  ⚠️ auto-promote lookup ${domain}: ${e.message}`); }
+
     // 1. Guard: cooldown POR EMAIL bounceado (no por domain) — Maxi 2026-06-17.
     // Antes: 1 retry por domain/24h → si rebotaban 3 emails distintos del mismo
     // domain en el día, solo 1 disparaba retry. Ahora: cooldown solo si el
@@ -8823,6 +8872,43 @@ async function runAgentCycle(token, allFlags) {
             sent_at:         new Date().toISOString(),
           }),
         }).catch(() => {});
+
+        // Maxi 2026-06-18: AGENTE TAMBIÉN manda al 2do mejor email del lead
+        // (si existe y tiene rank decente). Ganamos el que responda primero.
+        // El bounce handler después auto-promueve Monday al que respondió.
+        // Reglas: 2do email debe tener score >= 40, NO bounced, diferente del 1ro.
+        try {
+          const secondCandidate = ranked.find(r =>
+            r.email && r.email.toLowerCase() !== email.toLowerCase() &&
+            r.score >= 40 && !isBouncedSync(r.email)
+          );
+          if (secondCandidate) {
+            log(`  ➕ ${domain}: agente envía AL 2DO email ${secondCandidate.email} (score=${secondCandidate.score}, source=${secondCandidate.source})`);
+            await sendGmailServer(token, userEmail, { to: secondCandidate.email, subject, body: pitch.body, agentActionId: null });
+            // Registrar en response_tracking con source del 2do
+            fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+              method: "POST",
+              headers: {
+                "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+                "Content-Type": "application/json", "Prefer": "return=minimal",
+              },
+              body: JSON.stringify({
+                mb_email:      userEmail.toLowerCase(),
+                domain,
+                email_sent_to: secondCandidate.email,
+                source:        secondCandidate.source || "secondary",
+                geo:           leadGeo || "",
+                category:      lead.category || "",
+                sent_at:       new Date().toISOString(),
+              }),
+            }).catch(() => {});
+            logAgentAction(token, userEmail, {
+              domain, action: "secondary_sent",
+              reason: "agent_2nd_email_parallel",
+              details: { primary: email, secondary: secondCandidate.email, score: secondCandidate.score, source: secondCandidate.source },
+            }).catch(() => {});
+          }
+        } catch (e) { log(`  ⚠️ agente 2do email ${domain}: ${e.message}`); }
 
         // 5. Push to Monday CON estado correcto desde el inicio (Propuesta Vigente T = idx 3)
         let mondayItemId = null;

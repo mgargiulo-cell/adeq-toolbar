@@ -5096,57 +5096,55 @@ async function bindButtons() {
       // de Prospects inmediato (otros MBs no los van a re-contactar).
       markReviewQueueAsContacted(state.accessToken, state.domain, state.loginEmail).catch(() => {});
 
-      // ── Emails Futuros (hasta 3) — encolar para +11/+22/+33d ─────────
-      // Maxi 2026-06-17: 3 follow-ups en cascada. Cada uno se dispara si el
-      // ORIGINAL no fue abierto. Si lo abrieron en cualquier momento, el
-      // worker cancela los pendientes.
+      // ── Emails Adicionales (hasta 3) — Maxi 2026-06-18 ──────────────
+      // CAMBIO DE LÓGICA: ya NO se encolan para +11/+22/+33d. Ahora salen
+      // EN PARALELO el día 0, junto con el original. La idea: ganar al que
+      // responda primero. Si el ORIGINAL después rebota/OOO, el bounce
+      // handler actualiza Monday con el email del que SÍ funcionó.
+      //
+      // Gaps cubiertos:
+      //   - skip si future === original (dedup)
+      //   - bounce check antes de cada send (lista global de bounces)
+      //   - registro en response_tracking para tracking de conversión
       const futStatusEl = document.getElementById("email-futuro-status");
-      const futureSlots = [
-        { el: "form-email-futuro",   days: 11, label: "FU2" },
-        { el: "form-email-futuro-2", days: 22, label: "FU3" },
-        { el: "form-email-futuro-3", days: 33, label: "FU4" },
-      ];
-      const queuedMsgs = [];
-      const failMsgs   = [];
-      for (const slot of futureSlots) {
-        const futureEmail = document.getElementById(slot.el)?.value?.trim();
-        if (!futureEmail || !futureEmail.includes("@") || futureEmail === email) continue;
+      const futureSlots = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
+      const sentMsgs  = [];
+      const failMsgs  = [];
+      for (const slotId of futureSlots) {
+        const futureEmail = document.getElementById(slotId)?.value?.trim()?.toLowerCase();
+        if (!futureEmail || !futureEmail.includes("@")) continue;
+        if (futureEmail === email.toLowerCase()) { failMsgs.push(`⏭️ ${futureEmail} igual al principal`); continue; }
         const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }));
-        if (bFut.bounced) {
-          failMsgs.push(`${slot.label}: 🚫 ${futureEmail} bounced`);
-          continue;
-        }
-        const r = await queueReengagement(state.accessToken, {
-          domain:             state.domain,
-          monday_item_id:     state.mondayItemId,
-          mb_email:           state.loginEmail,
-          original_email:     email,
-          future_email:       futureEmail,
-          original_subject:   subject,
-          original_body:      bodyToSend,
-          tracking_action_id: trackingActionId,
-          delay_days:         slot.days,
-          sequence:           slot.label,
-        });
-        if (r.ok) {
-          const d = new Date(r.scheduled_for);
-          queuedMsgs.push(`${slot.label}→${d.toLocaleDateString()}`);
+        if (bFut.bounced) { failMsgs.push(`🚫 ${futureEmail} bounced`); continue; }
+        // Mandar EL MISMO subject + body al adicional
+        const altRes = await sendEmail({ to: futureEmail, subject, body: bodyToSend, expectedFrom: state.loginEmail });
+        if (altRes.ok) {
+          sentMsgs.push(`✅ ${futureEmail}`);
+          incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
+          // Registrar también en response_tracking (source = "manual_extra")
+          fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+            method: "POST",
+            headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({
+              mb_email:      state.loginEmail.toLowerCase(),
+              domain:        state.domain,
+              email_sent_to: futureEmail,
+              source:        "manual_extra",
+              geo:           document.getElementById("form-geo")?.value || "",
+              category:      state.category || "",
+              sent_at:       new Date().toISOString(),
+            }),
+          }).catch(() => {});
         } else {
-          failMsgs.push(`${slot.label}: err ${r.status || ""}`);
-          console.warn("[reengagement] queue failed:", slot.label, r.status, r.error);
+          failMsgs.push(`❌ ${futureEmail}: ${altRes.error || "send fail"}`);
         }
       }
-      if (futStatusEl) {
-        if (queuedMsgs.length && !failMsgs.length) {
-          futStatusEl.textContent = `✅ ${queuedMsgs.length} email(s) futuro(s) encolado(s): ${queuedMsgs.join(" · ")}`;
-          futStatusEl.style.color = "#16a34a";
-        } else if (queuedMsgs.length && failMsgs.length) {
-          futStatusEl.textContent = `⚠ Parcial: ${queuedMsgs.join(" · ")} | ${failMsgs.join(" · ")}`;
-          futStatusEl.style.color = "#d97706";
-        } else if (failMsgs.length) {
-          futStatusEl.textContent = `❌ ${failMsgs.join(" · ")}`;
-          futStatusEl.style.color = "#dc2626";
-        }
+      if (futStatusEl && (sentMsgs.length || failMsgs.length)) {
+        const parts = [];
+        if (sentMsgs.length) parts.push(`Adicionales enviados día 0: ${sentMsgs.join(" · ")}`);
+        if (failMsgs.length) parts.push(`Problemas: ${failMsgs.join(" · ")}`);
+        futStatusEl.textContent = parts.join(" | ");
+        futStatusEl.style.color = failMsgs.length && !sentMsgs.length ? "#dc2626" : sentMsgs.length ? "#16a34a" : "#d97706";
       }
 
       // Update "From" label with the actual Gmail account used
@@ -8807,13 +8805,14 @@ function renderProspectCard(r) {
       </div>
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
-      <!-- Emails Futuros (hasta 3) — Maxi 2026-06-17. Se envían auto a +11/+22/+33d si no abren el primero. -->
+      <!-- Maxi 2026-06-18: Contactos adicionales — envío PARALELO día 0.
+           Si el principal rebota/OOO, Monday usa el adicional que respondió. -->
       <details style="margin-top:6px;font-size:11px">
-        <summary style="cursor:pointer;color:var(--text-muted);font-weight:700;letter-spacing:.3px">⏱ Emails Futuros (opcional — auto +11/+22/+33d)</summary>
+        <summary style="cursor:pointer;color:var(--text-muted);font-weight:700;letter-spacing:.3px">📨 Contactos Adicionales del Sitio (paralelo día 0)</summary>
         <div style="display:flex;flex-direction:column;gap:3px;margin-top:5px">
-          <input type="email" class="form-input pcard-future-1" placeholder="FU2 +11d" style="font-size:11px;padding:3px 6px" />
-          <input type="email" class="form-input pcard-future-2" placeholder="FU3 +22d" style="font-size:11px;padding:3px 6px" />
-          <input type="email" class="form-input pcard-future-3" placeholder="FU4 +33d" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-1" placeholder="Adicional 1" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-2" placeholder="Adicional 2" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-3" placeholder="Adicional 3" style="font-size:11px;padding:3px 6px" />
           <div class="pcard-future-status" style="font-size:10px;color:var(--text-muted)"></div>
         </div>
       </details>
@@ -9779,30 +9778,47 @@ async function validateProspect(card, data, doSendEmail) {
       if (!result.ok) throw new Error(result.error || "Gmail error");
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
 
-      // Maxi 2026-06-17: emails futuros encolados (FU2/FU3/FU4) si MB los completó
-      const futSlots = [
-        { sel: ".pcard-future-1", days: 11, label: "FU2" },
-        { sel: ".pcard-future-2", days: 22, label: "FU3" },
-        { sel: ".pcard-future-3", days: 33, label: "FU4" },
-      ];
+      // Maxi 2026-06-18: contactos adicionales se envían EN PARALELO día 0
+      // (no se encolan). Si el original rebota/OOO, bounce handler en worker
+      // actualiza Monday con el adicional que respondió bien.
+      const futSels = [".pcard-future-1", ".pcard-future-2", ".pcard-future-3"];
       const futStatusEl = card.querySelector(".pcard-future-status");
-      const queuedMsgs = [];
-      for (const slot of futSlots) {
-        const fe = card.querySelector(slot.sel)?.value?.trim();
-        if (!fe || !fe.includes("@") || fe === email) continue;
+      const sentMsgs = [];
+      const failMsgs = [];
+      for (const sel of futSels) {
+        const fe = card.querySelector(sel)?.value?.trim()?.toLowerCase();
+        if (!fe || !fe.includes("@")) continue;
+        if (fe === email.toLowerCase()) { failMsgs.push(`⏭️ ${fe} igual al principal`); continue; }
         const bFut = await isEmailBounced(state.accessToken, fe).catch(() => ({ bounced: false }));
-        if (bFut.bounced) continue;
-        const r = await queueReengagement(state.accessToken, {
-          domain: data.domain, monday_item_id: data.monday_item_id || null,
-          mb_email: state.loginEmail, original_email: email, future_email: fe,
-          original_subject: subject, original_body: fullBody,
-          delay_days: slot.days, sequence: slot.label,
-        });
-        if (r.ok) queuedMsgs.push(slot.label);
+        if (bFut.bounced) { failMsgs.push(`🚫 ${fe} bounced`); continue; }
+        const altRes = await sendEmail({ to: fe, subject, body: fullBody, expectedFrom: state.loginEmail });
+        if (altRes.ok) {
+          sentMsgs.push(fe);
+          incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
+          // Registrar en response_tracking
+          fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+            method: "POST",
+            headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({
+              mb_email:      state.loginEmail.toLowerCase(),
+              domain:        data.domain,
+              email_sent_to: fe,
+              source:        "manual_extra",
+              geo:           geo,
+              category:      data.category || "",
+              sent_at:       new Date().toISOString(),
+            }),
+          }).catch(() => {});
+        } else {
+          failMsgs.push(`❌ ${fe}: ${altRes.error || "send fail"}`);
+        }
       }
-      if (futStatusEl && queuedMsgs.length) {
-        futStatusEl.textContent = `✅ Futuros encolados: ${queuedMsgs.join(", ")}`;
-        futStatusEl.style.color = "#16a34a";
+      if (futStatusEl && (sentMsgs.length || failMsgs.length)) {
+        const parts = [];
+        if (sentMsgs.length) parts.push(`✅ Adicionales día 0: ${sentMsgs.join(", ")}`);
+        if (failMsgs.length) parts.push(`Problemas: ${failMsgs.join(" · ")}`);
+        futStatusEl.textContent = parts.join(" | ");
+        futStatusEl.style.color = failMsgs.length && !sentMsgs.length ? "#dc2626" : sentMsgs.length ? "#16a34a" : "#d97706";
       }
     }
 
