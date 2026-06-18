@@ -8931,11 +8931,11 @@ function renderProspectCard(r) {
 
       <!-- Maxi 2026-06-18: Adicionales — mismo wording que Analysis tab. -->
       <details style="margin-top:6px;font-size:11px">
-        <summary style="cursor:pointer;color:var(--text-muted);font-weight:700;letter-spacing:.3px">📨 Contactos Adicionales del Sitio (paralelo día 0)</summary>
+        <summary style="cursor:pointer;color:var(--text-muted);font-weight:700;letter-spacing:.3px">📨 Contactos Adicionales</summary>
         <div style="display:flex;flex-direction:column;gap:3px;margin-top:5px">
-          <input type="email" class="form-input pcard-future-1" placeholder="Adicional 1 — ej. ventas@cliente.com" style="font-size:11px;padding:3px 6px" />
-          <input type="email" class="form-input pcard-future-2" placeholder="Adicional 2 — ej. marketing@cliente.com" style="font-size:11px;padding:3px 6px" />
-          <input type="email" class="form-input pcard-future-3" placeholder="Adicional 3 — ej. directorgeneral@cliente.com" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-1" placeholder="Adicional 1" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-2" placeholder="Adicional 2" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-3" placeholder="Adicional 3" style="font-size:11px;padding:3px 6px" />
           <div class="pcard-future-status" style="font-size:10px;color:var(--text-muted)"></div>
         </div>
       </details>
