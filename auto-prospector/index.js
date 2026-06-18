@@ -2011,6 +2011,53 @@ function _isWorkerDeprioGeo(topCountryNameOrIso, geosAllArr) {
   return false;
 }
 
+// Maxi 2026-06-18: cache distribución GEO del review_queue.pending. Se actualiza
+// cada 5 min. Usado por _isGeoOverrepresentedInPool para frenar el feeder
+// cuando un país satura el pool de Prospects.
+const _geoPoolCache = { ts: 0, totalPending: 0, byGeo: new Map() };
+const _GEO_POOL_TTL = 5 * 60 * 1000;
+const _GEO_SATURATION_PCT = 0.25; // >25% del pool → saturado
+async function _refreshGeoPoolCache(token) {
+  if (Date.now() - _geoPoolCache.ts < _GEO_POOL_TTL && _geoPoolCache.totalPending > 0) return;
+  try {
+    // Traer hasta 2000 rows con solo geo/geos_all (liviano)
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=geo,geos_all&limit=2000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const byGeo = new Map();
+    for (const r of rows) {
+      let iso = "";
+      if (Array.isArray(r.geos_all) && r.geos_all.length) iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
+      else if (r.geo) iso = String(r.geo).trim().toUpperCase().slice(0, 2);
+      if (!iso) iso = "UNK";
+      byGeo.set(iso, (byGeo.get(iso) || 0) + 1);
+    }
+    _geoPoolCache.ts = Date.now();
+    _geoPoolCache.totalPending = rows.length;
+    _geoPoolCache.byGeo = byGeo;
+  } catch {}
+}
+async function _isGeoOverrepresentedInPool(token, topCountryName, geosAll) {
+  await _refreshGeoPoolCache(token);
+  if (_geoPoolCache.totalPending < 50) return false; // pool chico, no aplicar
+  // Determinar ISO del lead actual
+  let iso = "";
+  if (Array.isArray(geosAll) && geosAll.length) iso = String(geosAll[0] || "").toUpperCase().slice(0, 2);
+  if (!iso && topCountryName) {
+    // NAME → ISO
+    const found = Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === topCountryName);
+    if (found) iso = found;
+    else iso = String(topCountryName).toUpperCase().slice(0, 2);
+  }
+  if (!iso) return false;
+  const count = _geoPoolCache.byGeo.get(iso) || 0;
+  const pct = count / _geoPoolCache.totalPending;
+  return pct > _GEO_SATURATION_PCT;
+}
+
 // Período mensual = ciclo 6 → 6 (Maxi 2026-06-17). El RapidAPI cycle real
 // es del día 6 de un mes al día 6 del próximo. Por eso anclamos el período
 // al día 6: si hoy >= 6 → este mes-06. Si hoy < 6 → mes anterior-06.
@@ -4317,6 +4364,21 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  🌎 ${domain} — GEO ${topCountry || geosAllIso[0]} bloqueado (no prioritario, ahorrando créditos)`);
     return;
   }
+
+  // Maxi 2026-06-18: INTELIGENCIA DE BALANCE GEO. Si en review_queue.pending
+  // hay MUCHOS de un mismo país (>25% del pool), skipear este lead para
+  // priorizar diversidad. Excepción: monday_refresh + Weekly Focus específico.
+  // Esto evita que el feeder llene Prospects con 200 sitios de Brasil.
+  if (source !== "monday_refresh") {
+    const overrepresented = await _isGeoOverrepresentedInPool(token, topCountry, geosAllIso).catch(() => false);
+    if (overrepresented) {
+      await markCsvItem(token, item.id, "skipped", {
+        error_message: `geo_saturated_in_pool: ${topCountry || "?"} ya tiene >25% del review_queue`,
+      });
+      log(`  ⚖️ ${domain} — GEO ${topCountry} saturado en Prospects (>25%) → skip para balance`);
+      return;
+    }
+  }
   const category = pageContent?.category || swCategory || "";
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
@@ -4342,49 +4404,40 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
     && apolloMonthRemaining > 0;
 
-  // Estrategia 2026-06-17 (Maxi): 3-tier priority.
-  //   1° INFORMER (WHOIS/website.informer) — barato, sin Apollo credit. Si trae
-  //      un email NO genérico → ese es el decision maker. Listo.
-  //   2° Si Informer vacío o solo genéricos → 50/50 Apollo vs HTML scrape.
-  //      Apollo: caro pero verified. HTML: gratis, riesgo de info@.
+  // Estrategia 2026-06-18 (Maxi): nueva prioridad SECUENCIAL — no más 50/50.
+  //   1° INFORMER (WHOIS/website.informer) — gratis, primero siempre. Si trae
+  //      email no genérico → listo, evita Apollo.
+  //   2° SCRAPING del sitio — gratis, segundo siempre. Visita /contact, /team
+  //      y 20+ paths. Si encuentra → listo, evita Apollo.
+  //   3° APOLLO con FORZAR UNLOCK — solo si los 2 anteriores fallaron.
+  //      Gasta crédito para descubrir el decision-maker real.
   let apolloRes = null;
   let scraperEmails = [];
   const informerSet = new Set();
   const urlByEmail  = new Map();
-  const contactForms = new Set(); // Maxi 2026-06-18: URLs de contact forms
-  // Tier 1: Informer fast probe
+  const contactForms = new Set();
+  // Tier 1: Informer
   const infRes = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
   const infNonGeneric = infRes.emails.find(e => !_isGenericLocalPart(e));
   if (infNonGeneric) {
-    // Hit en Informer — saltamos Apollo + HTML scrape full. Construimos
-    // pseudo-scraperEmails con el Informer hit + cualquier alt genérico de informer.
     scraperEmails = infRes.emails;
     infRes.emails.forEach(e => { informerSet.add(e.toLowerCase()); });
     infRes.urlByEmail.forEach((url, em) => { urlByEmail.set(em, url); });
-    log(`  ✅ Informer hit ${domain} → ${infNonGeneric} (sin Apollo credit, sin HTML scrape)`);
+    log(`  ✅ Tier 1 INFORMER hit ${domain} → ${infNonGeneric} (sin Apollo, sin HTML scrape)`);
   } else {
-    // Tier 2: 50/50 Apollo vs HTML scrape (sin Informer, ya lo probamos)
-    const useApolloFirst = canUseApollo && Math.random() < 0.5;
-    // socialOut: Map<email, "Facebook"|"YouTube"|"Twitter"> — emails extraídos
-    // de redes sociales por el fallback dentro de scrapeEmailsForDomain.
+    // Tier 2: SIEMPRE scraping primero (gratis)
     const socialOut = new Map();
-    if (useApolloFirst) {
+    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
+    const scrapedNonGeneric = scraperEmails.find(e => !_isGenericLocalPart(e));
+    if (scrapedNonGeneric) {
+      log(`  ✅ Tier 2 SCRAPE hit ${domain} → ${scrapedNonGeneric} (sin Apollo credit)`);
+    } else if (canUseApollo) {
+      // Tier 3: SCRAPE no encontró persona → Apollo forzar unlock
+      log(`  💎 Tier 3 APOLLO ${domain} (scrape vacío o solo genéricos — forzar unlock)`);
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
         .catch(() => null);
-      if (!apolloRes?.email) {
-        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
-      }
-    } else {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
-      if (scraperEmails.length === 0 && canUseApollo) {
-        apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
-          .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
-          .catch(() => null);
-      }
     }
-    // Maxi 2026-06-17 v4: pasamos socialOut al scope superior para que el
-    // emailSources final use el source correcto ("Facebook" en vez de "scrape").
     var _socialOutCsvScope = socialOut;
   }
   const apolloContactName = apolloRes?.contact_name || "";
@@ -8477,12 +8530,13 @@ async function runAgentCycle(token, allFlags) {
       categoryClause = `&category=in.(${encodeURIComponent(inList)})`;
     }
 
-    // Pull candidates: solo filtro de tráfico (mínimo absoluto) + focus.
-    // El score se usa SOLO para ordenar (los más prometedores primero).
-    // No filtramos por score porque la lógica del score puede cambiar y
-    // no queremos perder leads buenos por una heurística inestable.
+    // Maxi 2026-06-18: pool MUCHO más amplio + sin orden fijo (después
+    // bucketeamos por GEO para diversidad). Antes traíamos 5x batchSize por
+    // created_at DESC → caía siempre en los más nuevos = poca variedad.
+    // Ahora pool grande (300) + el bucket-shuffle por GEO se encarga del orden.
+    const POOL_SIZE = 300;
     const queueRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&order=created_at.desc&limit=${batchSize * 5}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&limit=${POOL_SIZE}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const candidatesRaw = await queueRes.json();
@@ -8530,39 +8584,44 @@ async function runAgentCycle(token, allFlags) {
       log(`🤖 Agent ${userEmail}: todos los candidatos descartados por gates`);
       continue;
     }
-    // Maxi 2026-06-17: MIX de prioridades para evitar caer siempre en el mismo
-    // tipo de lead. Estrategia:
-    //   1) Ordenar por created_at desc (más fresco primero) para tener pool
-    //   2) Bucketize por (categoría || "uncategorized") y por geo
-    //   3) Round-robin entre buckets de categoría → variety en cada ciclo
-    //   4) Dentro de cada bucket, shuffle suave (no FIFO puro)
-    // Resultado: el agente no manda 10 leads de "news Argentina" seguidos.
-    scored.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    const catBuckets = new Map();
+    // Maxi 2026-06-18: DIVERSIDAD POR GEO obligatoria.
+    //   - Bucketize por GEO (no por categoría)
+    //   - Si vos seteaste GEOs en Weekly Focus → se respeta (el query ya filtró)
+    //   - Sin Weekly Focus → round-robin entre TODOS los GEOs disponibles
+    //   - Resultado: el agente NUNCA manda muchos del mismo país en el día
+    //
+    // Ejemplo: si pool tiene [50 BR, 30 AR, 20 ES, 10 IT], el agente del día
+    // sale con 6 BR + 6 AR + 6 ES + 6 IT + 1 más (= 25 emails balanceados).
+    const _geoKey = (c) => {
+      if (Array.isArray(c.geos_all) && c.geos_all.length) return String(c.geos_all[0] || "?").toUpperCase().slice(0,3);
+      return String(c.geo || "?").toUpperCase().slice(0,3);
+    };
+    const geoBuckets = new Map();
     for (const c of scored) {
-      const cat = (c.category || "uncategorized").toLowerCase().trim();
-      if (!catBuckets.has(cat)) catBuckets.set(cat, []);
-      catBuckets.get(cat).push(c);
+      const g = _geoKey(c);
+      if (!geoBuckets.has(g)) geoBuckets.set(g, []);
+      geoBuckets.get(g).push(c);
     }
-    // Shuffle dentro de cada bucket (Fisher-Yates parcial — primeros N quedan random)
-    for (const arr of catBuckets.values()) {
+    // Shuffle dentro de cada bucket de GEO (Fisher-Yates)
+    for (const arr of geoBuckets.values()) {
       for (let i = arr.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [arr[i], arr[j]] = [arr[j], arr[i]];
       }
     }
-    // Round-robin: 1 de cada categoría por vuelta hasta tener los suficientes
+    // Round-robin entre GEOs — 1 de cada país por vuelta hasta vaciar
     const mixed = [];
-    const catKeys = [...catBuckets.keys()];
-    for (let i = catKeys.length - 1; i > 0; i--) {
+    const geoKeys = [...geoBuckets.keys()];
+    // Orden inicial de GEOs random también para que no caiga siempre BR primero
+    for (let i = geoKeys.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [catKeys[i], catKeys[j]] = [catKeys[j], catKeys[i]];
+      [geoKeys[i], geoKeys[j]] = [geoKeys[j], geoKeys[i]];
     }
     let safety = scored.length * 2;
     while (mixed.length < scored.length && safety-- > 0) {
       let progressed = false;
-      for (const k of catKeys) {
-        const b = catBuckets.get(k);
+      for (const k of geoKeys) {
+        const b = geoBuckets.get(k);
         if (b && b.length) { mixed.push(b.shift()); progressed = true; }
         if (mixed.length >= scored.length) break;
       }
@@ -8570,7 +8629,9 @@ async function runAgentCycle(token, allFlags) {
     }
     scored.length = 0;
     scored.push(...mixed);
-    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos válidos (mix por categoría, ${catKeys.length} buckets, top: ${scored[0].domain} · ${scored[0].category || "?"})`);
+    // Stats por GEO en el log para auditing
+    const geoStats = geoKeys.map(k => `${k}:${geoBuckets.get(k)?.length || 0}`).join(",");
+    log(`🤖 Agent ${userEmail}: ${scored.length}/${candidatesRaw.length} candidatos · ${geoKeys.length} GEOs (${geoStats}) · round-robin por país`);
 
     // No filtramos por sendtrack acá — la regla real es:
     // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
