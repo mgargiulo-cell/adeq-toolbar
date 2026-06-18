@@ -9251,6 +9251,18 @@ function initProspectCard(card, data) {
       scrape:   { txt: "sitio",      color: "#10b981" },
       generic:  { txt: "genérico",   color: "#94a3b8" },
     };
+    // Maxi 2026-06-18: botón "+" para asignar email a slot adicional (1/2/3).
+    // Misma lógica que en Analysis (renderEmailList).
+    const slotIdxByEmail = (em) => {
+      const v1 = (card.querySelector(".pcard-future-1")?.value || "").toLowerCase().trim();
+      const v2 = (card.querySelector(".pcard-future-2")?.value || "").toLowerCase().trim();
+      const v3 = (card.querySelector(".pcard-future-3")?.value || "").toLowerCase().trim();
+      const x = em.toLowerCase();
+      if (x === v1) return 1;
+      if (x === v2) return 2;
+      if (x === v3) return 3;
+      return 0;
+    };
     const chipFor = (e) => {
       const cached = _emailVerifyCache.get(e);
       const cls    = cached ? _verifyClass(cached) : "verify-pending";
@@ -9260,14 +9272,19 @@ function initProspectCard(card, data) {
       let srcChip  = "";
       if (srcObj.source) {
         const meta = SOURCE_LABEL[srcObj.source] || { txt: srcObj.source, color: "#64748b" };
-        // Si tiene URL (scrape/informer): hacerlo clickeable. Apollo: solo label.
         if (srcObj.url) {
           srcChip = `<a href="#" class="email-src-link" data-url="${esc(srcObj.url)}" title="Origen: ${esc(srcObj.url)}" style="font-size:9px;color:${meta.color};text-decoration:underline;margin-left:4px">(${meta.txt})</a>`;
         } else {
           srcChip = `<span title="Origen: ${esc(meta.txt)}" style="font-size:9px;color:${meta.color};margin-left:4px">(${meta.txt})</span>`;
         }
       }
-      return `<div class="email-chip ${cls}" data-email="${esc(e)}" title="Verificando…">${gb}${esc(e)}${srcChip}</div>`;
+      const curSlot = slotIdxByEmail(e);
+      const btnLabel = curSlot ? String(curSlot) : "+";
+      const btnTitle = curSlot
+        ? `Asignado como Adicional ${curSlot} — click para quitar`
+        : "Click para agregar como Contacto Adicional (envío paralelo día 0)";
+      const futureBtn = `<button type="button" class="pcard-future-btn ${curSlot ? "assigned" : ""}" data-email-future="${esc(e)}" title="${esc(btnTitle)}" style="margin-left:auto;background:${curSlot?'#dc2626':'#94a3b8'};color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:10px;cursor:pointer;font-weight:700">${btnLabel}</button>`;
+      return `<div class="email-chip ${cls} ${curSlot ? 'slot-future' : ''}" data-email="${esc(e)}" title="Click = email principal · botón +/N = contacto adicional" style="display:flex;align-items:center;gap:4px">${gb}<span style="flex:1">${esc(e)}${srcChip}</span>${futureBtn}</div>`;
     };
 
     let html = visible.map(chipFor).join("");
@@ -9298,33 +9315,22 @@ function initProspectCard(card, data) {
         manualEmailEl.dataset.userEdited = "1";
       });
     }
-    // MULTI-SELECT: click toggle. Si 2+ chips quedan seleccionados, el push
-    // crea N items en Monday (uno por contacto, item_name con sufijo "— local")
-    // y envía N mails en paralelo. Necesario porque Monday tiene automation
-    // por columna email (follow-up + reply detection) que se rompe si se cambia.
+    // Maxi 2026-06-18: SINGLE-SELECT (1 email principal = 1 item Monday).
+    // Antes multi-select creaba N items en Monday (= duplicaba la URL).
+    // Ahora: 1 principal va a Monday; los adicionales se mandan en paralelo
+    // pero NO crean items duplicados. Mismo comportamiento que Analysis.
     const _syncSelectedToInput = () => {
-      const selected = [...listEl.querySelectorAll(".email-chip.selected")].map(c => c.dataset.email);
-      if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1" && selected[0]) {
-        mondayEmailEl.value = selected[0];
+      const sel = listEl.querySelector(".email-chip.selected");
+      if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1" && sel) {
+        mondayEmailEl.value = sel.dataset.email;
       }
-      let badge = card.querySelector(".pcard-multi-badge");
-      if (selected.length > 1) {
-        if (!badge) {
-          badge = document.createElement("div");
-          badge.className = "pcard-multi-badge";
-          badge.style.cssText = "font-size:10px;color:#0369a1;font-weight:700;margin-top:6px;padding:4px 8px;background:#dbeafe;border-radius:4px;display:inline-block";
-          listEl.parentElement.insertBefore(badge, listEl.nextSibling);
-        }
-        badge.textContent = `📨 ${selected.length} contactos seleccionados — crea ${selected.length} items en Monday (uno por persona, sufijo en nombre)`;
-      } else if (badge) {
-        badge.remove();
-      }
+      // Quitar badge legacy multi-select si quedó
+      card.querySelector(".pcard-multi-badge")?.remove();
     };
 
     listEl.querySelectorAll(".email-chip").forEach(chip => {
       chip.addEventListener("click", (ev) => {
-        // Si clickeó el link de "origen" (URL clickeable), NO toggle del chip
-        // y abrir la URL en nueva pestaña.
+        // Click en link "(origen)" → abrir URL, no togglear
         const srcLink = ev.target.closest(".email-src-link");
         if (srcLink) {
           ev.preventDefault();
@@ -9333,13 +9339,55 @@ function initProspectCard(card, data) {
           if (url) chrome.tabs.create({ url, active: false });
           return;
         }
-        chip.classList.toggle("selected");
+        // Click en botón "+ adicional" → manejado abajo, no togglear principal
+        if (ev.target.classList.contains("pcard-future-btn")) return;
+        // Single-select: limpiar todos + seleccionar este
+        listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+        chip.classList.add("selected");
         _syncSelectedToInput();
       });
     });
-    const first = listEl.querySelector(".email-chip");
+    const first = listEl.querySelector(".email-chip:not(.slot-future)") || listEl.querySelector(".email-chip");
     if (first) first.classList.add("selected");
     _syncSelectedToInput();
+
+    // Maxi 2026-06-18: handler del botón "+/N" para slots adicionales.
+    // Misma lógica que en Analysis renderEmailList.
+    listEl.querySelectorAll(".pcard-future-btn").forEach(btn => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const email = btn.dataset.emailFuture;
+        if (!email) return;
+        const slots = [
+          card.querySelector(".pcard-future-1"),
+          card.querySelector(".pcard-future-2"),
+          card.querySelector(".pcard-future-3"),
+        ].filter(Boolean);
+        if (slots.length === 0) return;
+        const lowerE = email.toLowerCase().trim();
+        const existingIdx = slots.findIndex(s => (s.value || "").toLowerCase().trim() === lowerE);
+        if (existingIdx !== -1) {
+          slots[existingIdx].value = "";
+        } else {
+          const freeSlot = slots.find(s => !(s.value || "").trim());
+          if (!freeSlot) slots[slots.length - 1].value = email;
+          else freeSlot.value = email;
+          // Si el email era el principal, liberarlo y elegir otro
+          if (mondayEmailEl && mondayEmailEl.value.toLowerCase() === lowerE) {
+            mondayEmailEl.value = "";
+            mondayEmailEl.dataset.userEdited = "";
+            const next = listEl.querySelector(".email-chip:not(.slot-future):not(.selected)");
+            if (next) {
+              listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+              next.classList.add("selected");
+              if (mondayEmailEl) mondayEmailEl.value = next.dataset.email;
+            }
+          }
+        }
+        // Re-render para actualizar etiquetas +/1/2/3 en TODOS los chips
+        renderProspectEmailList();
+      });
+    });
 
     // PERF FIX 2026-05-13: NO disparar autoVerify en render inicial.
     // Antes: 100 cards × 5 emails = 500 verify fetches en paralelo →
