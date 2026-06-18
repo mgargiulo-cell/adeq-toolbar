@@ -2452,8 +2452,9 @@ function renderRapidApiFooterCounter({ used, limit, period } = {}) {
 }
 
 // Apollo monthly counter — sumado de todos los MBs vía toolbar_config.apollo_calls_month
-// Version check — compara la versión local del manifest con la versión en GitHub.
-// Click → re-check. Auto-check al cargar. Verde = al día, rojo = update available.
+// Version check — usa chrome.runtime.requestUpdateCheck (Chrome consulta al
+// Web Store oficial). Si hay update aprobado y aplicable → 🔴 update. Fallback
+// a GitHub solo si la API nativa falla (modo dev sin store). Click → re-check.
 async function checkExtensionVersion() {
   const el = document.getElementById("version-badge");
   if (!el) return;
@@ -2461,6 +2462,30 @@ async function checkExtensionVersion() {
   el.textContent = `v${localVer} ⏳`;
   el.style.background = "rgba(148,163,184,0.15)";
   el.style.color = "#94a3b8";
+
+  // 1° Chrome Web Store (fuente de verdad)
+  const cwsResult = await _checkChromeWebStoreUpdate();
+  if (cwsResult.ok) {
+    if (cwsResult.hasUpdate) {
+      const remoteVer = cwsResult.version || "?";
+      el.textContent = `v${localVer} 🔴 update`;
+      el.style.background = "rgba(239,68,68,0.15)";
+      el.style.color = "#f87171";
+      el.title = `Update disponible en Chrome Web Store: v${remoteVer}. Chrome la instala sola en las próximas horas, o forzá en chrome://extensions → Update.`;
+      if (!window._versionUpdateToastShown) {
+        window._versionUpdateToastShown = true;
+        if (typeof showToast === "function") showToast(`🔴 Update v${remoteVer} disponible en Chrome Web Store (vos tenés v${localVer})`, "warn", 8000);
+      }
+    } else {
+      el.textContent = `v${localVer} ✓`;
+      el.style.background = "rgba(52,211,153,0.15)";
+      el.style.color = "#34d399";
+      el.title = `Última versión instalada (v${localVer}) — Chrome Web Store al día`;
+    }
+    return;
+  }
+
+  // 2° Fallback a GitHub (modo dev / API throttled / no instalada desde store)
   try {
     const res = await fetch("https://raw.githubusercontent.com/mgargiulo-cell/adeq-toolbar/main/manifest.json", { cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2471,24 +2496,35 @@ async function checkExtensionVersion() {
       el.textContent = `v${localVer} ✓`;
       el.style.background = "rgba(52,211,153,0.15)";
       el.style.color = "#34d399";
-      el.title = `Latest version installed (v${localVer})`;
+      el.title = `Latest version installed (v${localVer}) — comparado vs GitHub (fallback)`;
     } else {
-      el.textContent = `v${localVer} 🔴 update`;
-      el.style.background = "rgba(239,68,68,0.15)";
-      el.style.color = "#f87171";
-      el.title = `Update available! v${remoteVer} on GitHub. Download new ZIP and reload.`;
-      // Toast solo la primera vez por sesión
-      if (!window._versionUpdateToastShown) {
-        window._versionUpdateToastShown = true;
-        if (typeof showToast === "function") showToast(`🔴 Update available: v${remoteVer} (you have v${localVer})`, "warn", 8000);
-      }
+      el.textContent = `v${localVer} ⚠ github`;
+      el.style.background = "rgba(251,191,36,0.15)";
+      el.style.color = "#fbbf24";
+      el.title = `v${remoteVer} en GitHub (todavía no en Chrome Web Store). Esperá review o cargá ZIP local.`;
     }
   } catch (e) {
     el.textContent = `v${localVer} ?`;
     el.style.background = "rgba(251,191,36,0.15)";
     el.style.color = "#fbbf24";
-    el.title = `Could not check GitHub: ${e.message}`;
+    el.title = `No se pudo verificar update: ${e.message}`;
   }
+}
+
+// Wrapper: chrome.runtime.requestUpdateCheck → {ok, hasUpdate, version}.
+// status posibles: "update_available" (hay) | "no_update" (al día) | "throttled" (rate-limit).
+function _checkChromeWebStoreUpdate() {
+  return new Promise((resolve) => {
+    try {
+      if (!chrome?.runtime?.requestUpdateCheck) return resolve({ ok: false });
+      chrome.runtime.requestUpdateCheck((status, details) => {
+        if (chrome.runtime.lastError) return resolve({ ok: false });
+        if (status === "update_available") return resolve({ ok: true, hasUpdate: true, version: details?.version });
+        if (status === "no_update")        return resolve({ ok: true, hasUpdate: false });
+        return resolve({ ok: false }); // throttled → fallback
+      });
+    } catch { resolve({ ok: false }); }
+  });
 }
 function _semverCompare(a, b) {
   const pa = a.split(".").map(Number);
