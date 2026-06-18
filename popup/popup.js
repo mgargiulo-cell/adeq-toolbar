@@ -8399,21 +8399,30 @@ function _rebuildGeoChips(rows, selected) {
   };
   Object.entries(ISO_TO_NAME).forEach(([iso, name]) => { NAME_TO_ISO[name.toUpperCase()] = iso; });
 
+  // Maxi 2026-06-18: contar TODOS los geos de geos_all (no solo el principal).
+  // Un lead con [US, BR, AR] aparece en los 3 chips porque el filtro
+  // (línea ~8533) ya hace `isoArr.includes(code)` — funciona para cualquier
+  // GEO del array, no solo el primario. Si solo se cuenta geos_all[0] y todos
+  // los sitios en inglés tienen US como top → falsa impresión de pool homogéneo.
   const counts = new Map();
   let noGeoCount = 0;
   for (const r of rows || []) {
-    let iso = "";
+    const seen = new Set();
     if (Array.isArray(r.geos_all) && r.geos_all.length) {
-      iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
-    } else if (r.geo) {
+      for (const raw of r.geos_all) {
+        const iso = String(raw || "").toUpperCase().slice(0, 2);
+        if (iso && !seen.has(iso)) { seen.add(iso); counts.set(iso, (counts.get(iso) || 0) + 1); }
+      }
+    }
+    if (r.geo) {
       const g = String(r.geo).trim().toUpperCase();
-      // Si tiene 2 chars y es ISO conocido, usar directo. Si es nombre, mapear.
+      let iso = "";
       if (g.length === 2 && ISO_TO_NAME[g]) iso = g;
       else if (NAME_TO_ISO[g])               iso = NAME_TO_ISO[g];
-      else if (g.length >= 2)                iso = g.slice(0, 2); // fallback
+      else if (g.length >= 2)                iso = g.slice(0, 2);
+      if (iso && !seen.has(iso)) { seen.add(iso); counts.set(iso, (counts.get(iso) || 0) + 1); }
     }
-    if (!iso) { noGeoCount++; continue; }
-    counts.set(iso, (counts.get(iso) || 0) + 1);
+    if (seen.size === 0) noGeoCount++;
   }
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   const allActive = sel.size === 0;

@@ -4220,7 +4220,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Buscar en Monday para detectar si es CSV externo (no existe) o Monday Refresh (sí existe + Ciclo Finalizado)
   const mondayApiKey = getMondayKeyForUser(cfg, item.uploaded_by);
   let match = null;
-  let source = "csv"; // default: URL externa, no está en Monday todavía
+  // Maxi 2026-06-18: respetar el source original del csv_queue.
+  // El feeder inyecta con auto_feeder_sellers / auto_feeder_monday / auto_feeder_majestic.
+  // Antes se hardcodeaba "csv" → todo el chip filter quedaba inútil.
+  let source;
+  switch (item.source) {
+    case "auto_feeder_sellers":  source = "sellers_json"; break;
+    case "auto_feeder_majestic": source = "autopilot";    break;
+    case "auto_feeder_monday":   source = "monday_refresh"; break;
+    default:                     source = "csv"; // CSV manual subido desde popup
+  }
   let mondayItemId = null;
 
   if (mondayApiKey) {
