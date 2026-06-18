@@ -1157,17 +1157,10 @@
       <div id="csv-queue-stats" style="line-height:1.7">Loading...</div>
     </div>
 
-    <!-- AUTO IMPORT toggle (independiente del Autopilot de Prospects) -->
-    <div style="margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;background:#fff7ed;border:1px solid #fb923c;border-radius:6px">
-      <div>
-        <div style="font-size:12px;font-weight:700">📥 AUTO IMPORT</div>
-        <div style="font-size:10px;color:#92400e;margin-top:2px">Processes the URL queue (External CSV + Monday URL). Independent of the Prospects Autopilot.</div>
-      </div>
-      <label class="toggle-switch" title="Processes the queue of uploaded URLs (External CSV + Monday URL refresh). Fully independent of the Autopilot that discovers from Majestic.">
-        <input id="csv-queue-enabled" type="checkbox" />
-        <span class="toggle-slider"></span>
-      </label>
-    </div>
+    <!-- Maxi 2026-06-18: AUTO IMPORT toggle ELIMINADO — el worker enciende
+         el flag automáticamente cuando hay items pending y lo apaga al
+         vaciarse. Botón redundante. Hidden input para compat con popup.js. -->
+    <input type="hidden" id="csv-queue-enabled" checked />
 
     <!-- ACTIVITY: resumen agrupado por MB + Agent (en vez de raw items) -->
     <div style="margin-top:10px">
