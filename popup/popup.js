@@ -8537,11 +8537,9 @@ async function loadProspectsTab() {
   }
 
   // ── Sample 100 random ROTANDO cada 30 minutos por MB ──
-  // Cada slot de 30 min, cada MB recibe 100 random distintos. Refrescar la
-  // toolbar dentro del slot devuelve EL MISMO sample (no se mueve).
-  // Cuando entra el próximo slot (30 min), nuevo shuffle automático.
-  // Persistido en chrome.storage.local con key que incluye el slot.
-  const VISIBLE_CAP = 200;          // user 2026-05-29: subido de 100 → 200
+  // Maxi 2026-06-18: SIN cap visible — todos los MBs ven la totalidad de
+  // disponibles. El shuffle por slot garantiza orden distinto entre MBs.
+  // Antes había VISIBLE_CAP=200, ahora mostramos TODOS los rows tras filtros.
   const SLOT_MIN    = 30;           // rotar cada 30 minutos
   const slotIdx     = Math.floor(Date.now() / (SLOT_MIN * 60 * 1000));
   const userKey     = (state.loginEmail || "anon").toLowerCase();
@@ -8634,10 +8632,11 @@ async function loadProspectsTab() {
       }
       return out;
     };
-    const cap         = VISIBLE_CAP - mineAll.length;
-    const prioBudget  = Math.max(0, cap); // intentar llenar todo con prio primero
-    const prioPicked  = pickRoundRobin(buildBuckets(prio), prioBudget);
-    const remaining   = Math.max(0, cap - prioPicked.length);
+    // Maxi 2026-06-18: SIN cap — meter TODOS los rows other (no solo VISIBLE_CAP)
+    // El round-robin ahora corre con budget = other.length (= todos).
+    const totalOther  = other.length;
+    const prioPicked  = pickRoundRobin(buildBuckets(prio), totalOther);
+    const remaining   = Math.max(0, totalOther - prioPicked.length);
     const deprioPicked = remaining > 0 ? pickRoundRobin(buildBuckets(deprio), remaining) : [];
     const mixed = [...prioPicked, ...deprioPicked];
     cachedOtherIds = mixed.map(r => r.id);
@@ -8650,7 +8649,8 @@ async function loadProspectsTab() {
   }
 
   const otherOrdered = cachedOtherIds.map(id => rowsById.get(id)).filter(Boolean);
-  const sample = [...mineAll, ...otherOrdered].slice(0, VISIBLE_CAP);
+  // Maxi 2026-06-18: sin slice — todos los disponibles
+  const sample = [...mineAll, ...otherOrdered];
   const assignedIds = sample.map(r => r.id);
 
   // RESTAURADO al render original simple (como funcionaba antes de hoy).
@@ -8660,12 +8660,12 @@ async function loadProspectsTab() {
   if (statsEl) {
     const remaining = DAILY_SEND_CAP - sentFromProspects;
     const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
-    // Maxi 2026-06-17: 3 counts distintos para que el MB entienda qué ve.
+    // Maxi 2026-06-18: SIN cap visible — mostramos todos.
     //   - Global: total del pool (mismo para los 3 MBs, sin snooze/X-learn)
-    //   - Tras filtros: lo que matchea los filtros activos (por MB; snooze + X-learn aplicados)
-    //   - En tu lote: lo que cabe en VISIBLE_CAP (200) — sample shuffled
+    //   - Tras filtros: lo que matchea filtros activos (por MB; snooze + X-learn aplicados)
+    //   - Orden: shuffle por MB → cada uno ve los mismos en distinto orden
     const globalPool = window._prospectsGlobalPool || rows.length;
-    statsEl.innerHTML = `<strong>${sample.length}</strong> en tu lote · <strong>${rows.length}</strong> tras filtros · <strong>${globalPool}</strong> en pool global (mismo para todos) · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy · 🔄 nuevo lote en ${minsLeft}min`;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> visibles (orden distinto por MB) · <strong>${globalPool}</strong> en pool global · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy · 🔄 nuevo orden en ${minsLeft}min`;
   }
 
   listEl.querySelectorAll(".pcard").forEach(card => {
