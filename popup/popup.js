@@ -4239,11 +4239,28 @@ function renderEmailList(emails) {
     const verCls = cached ? _verifyClass(cached) : "verify-pending";
     const g = _emailGrade(email, cached, src);
     const gradeBadge = `<span class="email-grade email-grade-${g.grade}" title="${esc(g.label)}">${g.grade}</span>`;
-    // Botón circular "2" (rojo) a la derecha de todo — asigna este email
-    // al slot Email Futuro (envío auto a 11d). El click normal en el chip
-    // sigue siendo "asignar a slot 1 (envío ahora)".
-    const futureBtn = `<button type="button" class="email-future-btn" data-email-future="${esc(email)}" title="Asignar como Email Futuro (envío auto a 11d)">2</button>`;
-    return `<div class="email-chip ${extraClass} ${verCls}" data-email="${esc(email)}" title="Click = enviar ahora. 2 (rojo, derecha) = email futuro (11d)">${gradeBadge}${esc(email)}${srcBadge}${futureBtn}</div>`;
+    // Maxi 2026-06-18: botón "+" rota por los 3 slots de adicionales.
+    // - Si email ya está en un slot, muestra el número (1/2/3)
+    // - Click cuando está vacío → asigna al primer slot LIBRE
+    // - Click cuando está asignado → libera el slot
+    // Antes solo apuntaba al slot 1 → no se podían usar los slots 2/3.
+    const slotIdxByEmail = (em) => {
+      const v1 = (document.getElementById("form-email-futuro")?.value || "").toLowerCase().trim();
+      const v2 = (document.getElementById("form-email-futuro-2")?.value || "").toLowerCase().trim();
+      const v3 = (document.getElementById("form-email-futuro-3")?.value || "").toLowerCase().trim();
+      const e = em.toLowerCase();
+      if (e === v1) return 1;
+      if (e === v2) return 2;
+      if (e === v3) return 3;
+      return 0;
+    };
+    const curSlot = slotIdxByEmail(email);
+    const btnLabel = curSlot ? String(curSlot) : "+";
+    const btnTitle = curSlot
+      ? `Asignado como Adicional ${curSlot} — click para quitar`
+      : "Click para agregar como Contacto Adicional (envío paralelo día 0)";
+    const futureBtn = `<button type="button" class="email-future-btn ${curSlot ? "assigned" : ""}" data-email-future="${esc(email)}" title="${esc(btnTitle)}">${btnLabel}</button>`;
+    return `<div class="email-chip ${extraClass} ${verCls} ${curSlot ? "slot-future" : ""}" data-email="${esc(email)}" title="Click = enviar ahora. + (derecha) = agregar como adicional">${gradeBadge}${esc(email)}${srcBadge}${futureBtn}</div>`;
   };
 
   if (mondayEmail) {
@@ -4287,7 +4304,9 @@ function renderEmailList(emails) {
   // el email viejo de Monday — siempre preferimos uno fresco de Apollo/scrape
   // (que ya viene rankeado: ad ops > publicidad > marketing > online > dev).
   // Si no hay ninguno fresco, recién ahí caemos al de Monday como fallback.
-  const preferredChip = listEl.querySelector(".email-chip:not(.monday)")
+  // Maxi 2026-06-18: excluir slot-future del auto-select del principal
+  const preferredChip = listEl.querySelector(".email-chip:not(.monday):not(.slot-future)")
+                     || listEl.querySelector(".email-chip:not(.slot-future)")
                      || listEl.querySelector(".email-chip");
   if (preferredChip) {
     preferredChip.classList.add("selected");
@@ -4314,27 +4333,45 @@ function renderEmailList(emails) {
   });
 
   // Botón "→ 2" — asigna ese email al slot Email Futuro
+  // Maxi 2026-06-18: handler del botón "+" que rota por los 3 slots de adicionales.
   listEl.querySelectorAll(".email-future-btn").forEach(btn => {
     btn.addEventListener("click", (ev) => {
       ev.stopPropagation();
       const email = btn.dataset.emailFuture;
-      const fut   = document.getElementById("form-email-futuro");
-      if (!fut || !email) return;
-      // Si ya estaba en slot 1 (principal), liberarlo de ahí
-      if (formEl.value === email) formEl.value = "";
-      fut.value = email;
-      // Mark visual: limpiar slot-future previo y poner este chip
-      listEl.querySelectorAll(".email-chip.slot-future").forEach(c => c.classList.remove("slot-future"));
-      btn.closest(".email-chip")?.classList.add("slot-future");
-      // Si quedó vacío slot 1 → preseleccionar el siguiente no-futuro
-      if (!formEl.value) {
-        const next = listEl.querySelector(".email-chip:not(.slot-future):not(.monday)") || listEl.querySelector(".email-chip:not(.slot-future)");
-        if (next) {
-          listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
-          next.classList.add("selected");
-          formEl.value = next.dataset.email;
+      if (!email) return;
+      const slots = [
+        document.getElementById("form-email-futuro"),
+        document.getElementById("form-email-futuro-2"),
+        document.getElementById("form-email-futuro-3"),
+      ].filter(Boolean);
+      if (slots.length === 0) return;
+      const lowerE = email.toLowerCase().trim();
+      // ¿Ya está asignado a algún slot? → quitarlo
+      const existingIdx = slots.findIndex(s => (s.value || "").toLowerCase().trim() === lowerE);
+      if (existingIdx !== -1) {
+        slots[existingIdx].value = "";
+      } else {
+        // No estaba → asignar al primer slot LIBRE
+        const freeSlot = slots.find(s => !(s.value || "").trim());
+        if (!freeSlot) {
+          // Sin slots libres → sobreescribir el último para que igual pueda agregarlo
+          slots[slots.length - 1].value = email;
+        } else {
+          freeSlot.value = email;
+        }
+        // Si el email estaba en slot principal, liberarlo
+        if (formEl.value === email) {
+          formEl.value = "";
+          const next = listEl.querySelector(".email-chip:not(.slot-future):not(.monday)") || listEl.querySelector(".email-chip:not(.slot-future)");
+          if (next) {
+            listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+            next.classList.add("selected");
+            formEl.value = next.dataset.email;
+          }
         }
       }
+      // Re-render para actualizar labels (+/1/2/3) de TODOS los chips
+      renderEmailList(state.emails);
     });
   });
 
