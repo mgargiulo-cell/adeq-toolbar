@@ -2914,30 +2914,55 @@ function extractEmailsFromHtml(html) {
   });
 }
 
-// Maxi 2026-06-17: Informer-only fetch. Es CHEAP (1 HTTP request, sin Apollo
-// credit, sin scrape de 25+ paths). Pre-check del decision maker antes de
-// elegir 50/50 entre Apollo y HTML scrape.
+// Maxi 2026-06-17: Informer-only fetch. CHEAP, sin Apollo credit.
+// Maxi 2026-06-18 fix bug thewordfinder.com: timeout 6s→12s, headers más
+// realistas, URLs adicionales de WHOIS, deobfuscation reforzada.
 async function scrapeInformerOnly(domain) {
   const cleanDomain = domain.replace(/^www\./, "");
-  const uaChrome = { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" };
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+    "Cache-Control": "no-cache",
+  };
   const emails = new Set();
   const urlByEmail = new Map();
   const targets = [
     `https://website.informer.com/${cleanDomain}`,
+    `https://website.informer.com/${cleanDomain}/whois`,    // subpath dedicado a contactos
     `https://who.is/whois/${cleanDomain}`,
+    `https://www.whois.com/whois/${cleanDomain}`,
   ];
   await Promise.all(targets.map(async (url) => {
     try {
-      const r = await fetch(url, { headers: uaChrome, signal: AbortSignal.timeout(6000) });
+      const r = await fetch(url, { headers, signal: AbortSignal.timeout(12000) });
       if (!r.ok) return;
       const html = await r.text();
       const found = new Set();
       extractEmailsFromHtml(html).forEach(e => found.add(e));
+      // Mailto links explícitos
       const mailtoMatches = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
       for (const m of mailtoMatches) {
         const clean = m[1].toLowerCase().split("?")[0];
         if (clean.includes("@")) found.add(clean);
       }
+      // Maxi 2026-06-18: Informer a veces presenta el email con espacios o
+      // entities raras. Hacemos un segundo pass después de deobfuscar más
+      // patrones (espacios, [at], (at), &amp;, &#x40;).
+      const deobfuscated = html
+        .replace(/&amp;#?64;/gi, "@").replace(/&#?64;|&#x40;/gi, "@")
+        .replace(/&#?46;|&#x2e;/gi, ".").replace(/&commat;/gi, "@").replace(/&period;/gi, ".")
+        .replace(/\s*\[\s*at\s*\]\s*/gi, "@").replace(/\s*\(\s*at\s*\)\s*/gi, "@")
+        .replace(/\s+at\s+/gi, "@").replace(/\s+dot\s+/gi, ".");
+      // Re-extract emails del HTML deobfuscado (esto agarra patrones que la
+      // regex original puede haber perdido por espacios o entities)
+      const passTwoRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}/g;
+      (deobfuscated.match(passTwoRegex) || []).forEach(e => {
+        const low = e.toLowerCase();
+        // Filtrar basura típica de WHOIS (proxies y registrar emails)
+        if (/abuse|whoisguard|domainsbyproxy|privacy|protection|registrar|noreply/.test(low)) return;
+        found.add(low);
+      });
       found.forEach(e => {
         const lower = e.toLowerCase();
         emails.add(e);
@@ -4178,6 +4203,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   let scraperEmails = [];
   const informerSet = new Set();
   const urlByEmail  = new Map();
+  const contactForms = new Set(); // Maxi 2026-06-18: URLs de contact forms
   // Tier 1: Informer fast probe
   const infRes = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
   const infNonGeneric = infRes.emails.find(e => !_isGenericLocalPart(e));
@@ -4199,10 +4225,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
         .catch(() => null);
       if (!apolloRes?.email) {
-        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut }).catch(() => []);
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
       }
     } else {
-      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut }).catch(() => []);
+      scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
       if (scraperEmails.length === 0 && canUseApollo) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
@@ -4246,6 +4272,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       }
     }
   });
+  // Maxi 2026-06-18: contact forms detectados → persistir en email_sources
+  // con key especial "__contact_form_N__" para que la UI los muestre como chips.
+  if (contactForms.size > 0) {
+    let i = 1;
+    for (const cfUrl of contactForms) {
+      emailSources[`__contact_form_${i}__`] = { source: "contact_form", url: cfUrl };
+      i++;
+      if (i > 3) break; // max 3 forms
+    }
+  }
   // Filtrar emails con dominio sin MX records ANTES de guardar
   const emails = await validateEmailsBatch(rawEmails);
   if (rawEmails.length !== emails.length) {
@@ -5081,6 +5117,7 @@ async function runSession(token, cfg, sessionStart) {
     let scraperEmails = [];
     const informerSetAuto = new Set();
     const urlByEmailAuto  = new Map();
+    const contactFormsAuto = new Set();
     const infResAuto = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
     const infAutoNonGeneric = infResAuto.emails.find(e => !_isGenericLocalPart(e));
     if (infAutoNonGeneric) {
@@ -5096,9 +5133,9 @@ async function runSession(token, cfg, sessionStart) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
           .catch(() => null);
-        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto }).catch(() => []);
+        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto, contactFormsOut: contactFormsAuto }).catch(() => []);
       } else {
-        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto }).catch(() => []);
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto, contactFormsOut: contactFormsAuto }).catch(() => []);
         if (scraperEmails.length === 0 && canUseApollo) {
           apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
             .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
@@ -5134,6 +5171,15 @@ async function runSession(token, cfg, sessionStart) {
         emailSourcesAuto[lower] = { source: "scrape", url };
       }
     });
+    // Maxi 2026-06-18: contact forms en autopilot path
+    if (contactFormsAuto.size > 0) {
+      let i = 1;
+      for (const cfUrl of contactFormsAuto) {
+        emailSourcesAuto[`__contact_form_${i}__`] = { source: "contact_form", url: cfUrl };
+        i++;
+        if (i > 3) break;
+      }
+    }
     const emails = await validateEmailsBatch(rawEmailsAuto);
     if (rawEmailsAuto.length !== emails.length) {
       log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);

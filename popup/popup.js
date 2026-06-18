@@ -4284,9 +4284,33 @@ function renderEmailList(emails) {
   // Maxi 2026-06-17 v4: emails extraídos de redes sociales (Facebook/YouTube/
   // Twitter) ya vienen mezclados en `suggested` con state.emailSources de
   // "Facebook"/"YouTube"/"Twitter" — el chip src-badge los identifica visualmente.
-  // No hay sección separada de social media.
+
+  // Maxi 2026-06-18: contact forms detectados → chip clickeable separado.
+  // Vienen en state.emailSources con key __contact_form_N__ (worker).
+  const cfChips = [];
+  state.emailSources.forEach((v, k) => {
+    if (k.startsWith("__contact_form_")) {
+      const url = typeof v === "string" ? "" : (v?.url || "");
+      if (url) cfChips.push(url);
+    }
+  });
+  if (cfChips.length > 0) {
+    html += `<div class="email-group-label" style="margin-top:8px">📝 Contact Form</div>`;
+    cfChips.forEach((url, i) => {
+      html += `<a href="#" class="contact-form-chip" data-cf-url="${esc(url)}" title="Abrir formulario de contacto" style="display:inline-flex;align-items:center;gap:4px;padding:3px 9px;background:#10b981;color:#fff;border-radius:4px;font-size:11px;text-decoration:none;margin:2px;font-weight:600">📝 Form ${cfChips.length > 1 ? i + 1 : ""}</a>`;
+    });
+  }
 
   listEl.innerHTML = html;
+
+  // Wire contact form chips
+  listEl.querySelectorAll(".contact-form-chip").forEach(el => {
+    el.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const url = el.dataset.cfUrl;
+      if (url) chrome.tabs.create({ url, active: false });
+    });
+  });
 
   // Toggle "ver más"
   const showMoreBtn = listEl.querySelector(".email-show-more");
@@ -8897,21 +8921,21 @@ function renderProspectCard(r) {
     <!-- Expandable detail panel -->
     <div class="pcard-detail" style="display:none;border-top:1px solid var(--border);padding:10px">
 
-      <!-- Email selection — autoverify + Apollo first + ver más toggle (mismo sistema que Analysis) -->
-      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.5px">Select email to send</div>
+      <!-- Maxi 2026-06-18: vista alineada con Analysis tab — mismo header
+           "✉️ Decision-maker Email" y misma estructura visual. -->
+      <div class="sub-title" style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:5px">✉️ Decision-maker Email</div>
       <div class="pcard-email-list email-list">
         ${hasEmail ? "" : '<div style="font-size:11px;color:#e53e3e;margin-bottom:4px">No emails — escribilo manualmente abajo</div>'}
       </div>
       <input type="text" class="form-input pcard-email-manual" placeholder="Enter email manually..." style="margin-top:4px;font-size:11px;padding:4px 7px" />
 
-      <!-- Maxi 2026-06-18: Contactos adicionales — envío PARALELO día 0.
-           Si el principal rebota/OOO, Monday usa el adicional que respondió. -->
+      <!-- Maxi 2026-06-18: Adicionales — mismo wording que Analysis tab. -->
       <details style="margin-top:6px;font-size:11px">
         <summary style="cursor:pointer;color:var(--text-muted);font-weight:700;letter-spacing:.3px">📨 Contactos Adicionales del Sitio (paralelo día 0)</summary>
         <div style="display:flex;flex-direction:column;gap:3px;margin-top:5px">
-          <input type="email" class="form-input pcard-future-1" placeholder="Adicional 1" style="font-size:11px;padding:3px 6px" />
-          <input type="email" class="form-input pcard-future-2" placeholder="Adicional 2" style="font-size:11px;padding:3px 6px" />
-          <input type="email" class="form-input pcard-future-3" placeholder="Adicional 3" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-1" placeholder="Adicional 1 — ej. ventas@cliente.com" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-2" placeholder="Adicional 2 — ej. marketing@cliente.com" style="font-size:11px;padding:3px 6px" />
+          <input type="email" class="form-input pcard-future-3" placeholder="Adicional 3 — ej. directorgeneral@cliente.com" style="font-size:11px;padding:3px 6px" />
           <div class="pcard-future-status" style="font-size:10px;color:var(--text-muted)"></div>
         </div>
       </details>
@@ -9292,7 +9316,32 @@ function initProspectCard(card, data) {
       html += `<div class="email-chips-hidden" style="display:none">${hidden.map(chipFor).join("")}</div>`;
       html += `<button class="email-show-more" type="button" style="font-size:10px;background:transparent;border:none;color:#0369a1;cursor:pointer;padding:4px 0;text-decoration:underline">+ show ${hidden.length} more…</button>`;
     }
+
+    // Maxi 2026-06-18: contact forms del worker — chip clickeable separado.
+    const cfChips = [];
+    Object.keys(sourceMap).forEach(k => {
+      if (k.startsWith("__contact_form_")) {
+        const v = sourceMap[k];
+        const url = typeof v === "string" ? "" : (v?.url || "");
+        if (url) cfChips.push(url);
+      }
+    });
+    if (cfChips.length > 0) {
+      html += `<div style="margin-top:6px;font-size:10px;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.3px">📝 Contact Form</div>`;
+      cfChips.forEach((url, i) => {
+        html += `<a href="#" class="pcard-contact-form-chip" data-cf-url="${esc(url)}" title="Abrir formulario de contacto" style="display:inline-flex;align-items:center;gap:4px;padding:3px 9px;background:#10b981;color:#fff;border-radius:4px;font-size:11px;text-decoration:none;margin:2px;font-weight:600">📝 Form ${cfChips.length > 1 ? i + 1 : ""}</a>`;
+      });
+    }
     listEl.innerHTML = html;
+
+    // Wire contact form chips
+    listEl.querySelectorAll(".pcard-contact-form-chip").forEach(el => {
+      el.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        const url = el.dataset.cfUrl;
+        if (url) chrome.tabs.create({ url, active: false });
+      });
+    });
 
     // Toggle ver más
     listEl.querySelector(".email-show-more")?.addEventListener("click", (e) => {
