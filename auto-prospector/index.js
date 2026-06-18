@@ -3026,6 +3026,9 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // sociales (FB business email, YT contact for business). Source: "Facebook",
   // "YouTube", "Twitter".
   const socialOut   = opts.socialOut   || null;
+  // Maxi 2026-06-18: contactFormsOut recibe URLs de formularios de contacto.
+  // Si el sitio no tiene email pero tiene contact form, el MB puede usarlo.
+  const contactFormsOut = opts.contactFormsOut || null;
   const emails = new Set();
   // socialLinks detectados durante el scraping para hacer fetch posterior
   const detectedSocialLinks = new Set();
@@ -3060,6 +3063,26 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       const SOCIAL_RE = /(?:facebook\.com|youtube\.com|twitter\.com|x\.com)\/[A-Za-z0-9._@\-]{2,80}/gi;
       const socialMatches = html.match(SOCIAL_RE) || [];
       socialMatches.forEach(s => detectedSocialLinks.add(s.toLowerCase()));
+      // Maxi 2026-06-18: detectar contact form URLs en el HTML. Patrones típicos:
+      // /contactform, /contact-form, /contact.php, /sendmail, etc.
+      if (contactFormsOut) {
+        // 1) URLs explícitas que contienen "contactform" o "contact-form" o "contact_form"
+        const CF_URL_RE = /\/(?:contactform|contact[-_]form|contact-us-form|formulario[-_]contacto)(?:\.[a-z]+)?(?:[\/?][^"' >]*)?/gi;
+        const cfMatches = html.match(CF_URL_RE) || [];
+        cfMatches.forEach(p => {
+          let abs;
+          try { abs = new URL(p.split('"')[0].split("'")[0], base).href; } catch { abs = base + p; }
+          contactFormsOut.add(abs);
+        });
+        // 2) <form action="..."> que termina en algo tipo contact, sendmail, formulario
+        const FORM_ACTION_RE = /<form[^>]+action\s*=\s*["']([^"']+(?:contact|formulario|sendmail|send-mail)[^"']*)["']/gi;
+        for (const m of html.matchAll(FORM_ACTION_RE)) {
+          try {
+            const abs = new URL(m[1], base).href;
+            contactFormsOut.add(abs);
+          } catch {}
+        }
+      }
     } catch {}
   };
 
@@ -4229,6 +4252,21 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  📧 ${domain}: ${rawEmails.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
   }
 
+  // Maxi 2026-06-18: GUARD anti-leads-fantasma. Si después de Apollo + scrape:
+  //   1) NO hay emails Y
+  //   2) NO pudimos cargar la home del sitio (pageContent === null = fetch falló)
+  // → el sitio probablemente está caído / dominio inválido. NO guardar en
+  // review_queue (aparecía como "disponible" sin contacto real). Maxi reportó
+  // casos como contentiq.com, boonsmedia.com, home.gotsport.com.
+  // CRITERIO ESTRICTO: solo si fetch falló totalmente — sites legitimos sin
+  // title NO se filtran (pueden ser sitios chicos).
+  if (emails.length === 0 && pageContent === null) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: "no_emails_and_site_unreachable — Apollo+scrape vacío, fetch del sitio falló (HTTP error/timeout)",
+    });
+    log(`  ⛔ ${domain} — sin emails Y fetch del sitio falló → skip (dominio probablemente muerto)`);
+    return;
+  }
   // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
   //    decida email + draft + push manualmente desde el tab Prospects.
   try {
@@ -5117,6 +5155,15 @@ async function runSession(token, cfg, sessionStart) {
     if (newFromSimilar > 0) log(`  🔗 +${newFromSimilar} sitios similares`);
 
     if (adNetworks.length > 0) log(`  📡 Ad networks: ${adNetworks.join(", ")}`);
+
+    // Maxi 2026-06-18: mismo guard para autopilot — leads sin email + fetch falló
+    if (emails.length === 0 && pageContent === null) {
+      log(`  ⛔ ${domain} — sin emails Y fetch del sitio falló → skip autopilot`);
+      await markProcessed(token, [domain], "no_emails_unreachable");
+      count++; skipped++;
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
 
     const saveOk = await saveToReviewQueue(token, {
       domain,
@@ -9611,12 +9658,227 @@ async function scanDeliverabilityHealth(token) {
   } catch (e) { log(`⚠️ scanDeliverabilityHealth: ${e.message}`); }
 }
 
+// Maxi 2026-06-18: SIMPLIFICAR notificaciones — solo dejamos:
+//   1. Daily digest por MB (resumen de AYER + tip simple)
+//   2. Deliverability health (alerta si bounce>8% o open<50% en 30d)
+// Eliminados: scanLowProspecting, scanWeeklyRates, scanSourceInsight,
+// scanSystemFailures (decisión Maxi: "no sirven, son noise")
 async function runNotificationScanners(token) {
-  await scanLowProspecting(token).catch(e => log(`⚠️ scanLowProsp: ${e.message}`));
-  await scanWeeklyRates(token).catch(e => log(`⚠️ scanWeeklyRates: ${e.message}`));
-  await scanSourceInsight(token).catch(e => log(`⚠️ scanInsight: ${e.message}`));
-  await scanSystemFailures(token).catch(e => log(`⚠️ scanSysFail: ${e.message}`));
+  await generateDailyDigestAllMBs(token).catch(e => log(`⚠️ dailyDigest: ${e.message}`));
   await scanDeliverabilityHealth(token).catch(e => log(`⚠️ scanDeliverability: ${e.message}`));
+}
+
+// ════════════════════════════════════════════════════════════════
+// DAILY DIGEST — resumen diario por MB (Maxi 2026-06-18)
+// Maxi: "Solo enviar notificaciones que indiquen por dia cuantos
+// emails/prospectos realizo el media buyer".
+// Corre 1 vez por día (guard via last_digest_run = YYYY-MM-DD Madrid).
+// Para cada MB activo (mgargiulo / dhorovitz / sales) genera 1 notif personal
+// con stats de AYER + comparación vs media semanal + tip.
+// ════════════════════════════════════════════════════════════════
+async function generateDailyDigestAllMBs(token) {
+  const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+  const cfg = await getConfig(token);
+  if ((cfg.last_digest_run || "") === todayMadrid) return;
+
+  const MBS = [
+    { email: "mgargiulo@adeqmedia.com", name: "Maxi" },
+    { email: "dhorovitz@adeqmedia.com", name: "Diego" },
+    { email: "sales@adeqmedia.com",     name: "Agus" },
+  ];
+  for (const mb of MBS) {
+    try { await generateDailyDigestForMB(token, mb.email, mb.name); }
+    catch (e) { log(`⚠️ digest ${mb.email}: ${e.message}`); }
+  }
+  await setConfigValue(token, "last_digest_run", todayMadrid).catch(() => {});
+  log(`📬 daily digests generados para ${MBS.length} MBs (${todayMadrid})`);
+}
+
+// Mapa país → continente (ISO 2-letter codes). Usado por el digest para
+// agrupar prospects por región. Solo los más comunes — el resto cae en "Otros".
+const COUNTRY_TO_CONTINENT = {
+  // América (latam + norte)
+  AR:"América", BR:"América", MX:"América", CO:"América", CL:"América", PE:"América",
+  UY:"América", EC:"América", VE:"América", PY:"América", BO:"América", DO:"América",
+  PA:"América", GT:"América", HN:"América", SV:"América", NI:"América", CR:"América",
+  CU:"América", PR:"América", US:"América", CA:"América",
+  // Europa
+  ES:"Europa", PT:"Europa", IT:"Europa", FR:"Europa", DE:"Europa", GB:"Europa",
+  NL:"Europa", BE:"Europa", CH:"Europa", AT:"Europa", IE:"Europa", DK:"Europa",
+  SE:"Europa", NO:"Europa", FI:"Europa", PL:"Europa", CZ:"Europa", HU:"Europa",
+  RO:"Europa", GR:"Europa", BG:"Europa", HR:"Europa", SK:"Europa", RU:"Europa", UA:"Europa",
+  // Asia
+  IN:"Asia", CN:"Asia", JP:"Asia", KR:"Asia", VN:"Asia", TH:"Asia", ID:"Asia",
+  PH:"Asia", MY:"Asia", SG:"Asia", PK:"Asia", BD:"Asia", LK:"Asia", TW:"Asia", HK:"Asia",
+  // África / Medio Oriente
+  EG:"África", MA:"África", DZ:"África", NG:"África", KE:"África", ZA:"África",
+  SA:"M.Oriente", AE:"M.Oriente", IL:"M.Oriente", TR:"M.Oriente",
+  // Oceanía
+  AU:"Oceanía", NZ:"Oceanía",
+};
+function _countryToContinent(geoStr) {
+  if (!geoStr) return "Sin GEO";
+  const s = String(geoStr).trim();
+  // ISO 2-letter directo
+  const upper = s.toUpperCase().slice(0,2);
+  if (COUNTRY_TO_CONTINENT[upper]) return COUNTRY_TO_CONTINENT[upper];
+  // NAME mapping (mismo que worker)
+  const NAME_TO_ISO = {
+    "argentina":"AR","brazil":"BR","brasil":"BR","mexico":"MX","colombia":"CO",
+    "chile":"CL","peru":"PE","uruguay":"UY","ecuador":"EC","venezuela":"VE",
+    "paraguay":"PY","bolivia":"BO","spain":"ES","portugal":"PT","italy":"IT",
+    "france":"FR","germany":"DE","united kingdom":"GB","united states":"US",
+    "canada":"CA","australia":"AU","new zealand":"NZ","india":"IN","china":"CN",
+    "japan":"JP","south korea":"KR","vietnam":"VN","thailand":"TH","indonesia":"ID",
+    "philippines":"PH","russia":"RU","ukraine":"UA","turkey":"TR","israel":"IL",
+    "saudi arabia":"SA","egypt":"EG","morocco":"MA","nigeria":"NG","south africa":"ZA",
+  };
+  const iso = NAME_TO_ISO[s.toLowerCase()];
+  return iso && COUNTRY_TO_CONTINENT[iso] ? COUNTRY_TO_CONTINENT[iso] : "Otros";
+}
+
+async function generateDailyDigestForMB(token, mbEmail, mbName) {
+  // Ventana = AYER en horario Madrid (mismo que usamos para slot del agente)
+  const now = new Date();
+  const todayMadridStr = now.toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+  const yesterday = new Date(now.getTime() - 86400_000);
+  const ydayMadridStr = yesterday.toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+  const ydayDisplay = yesterday.toLocaleDateString("es-AR", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/Madrid" });
+
+  // 1. Emails ENVIADOS ayer = response_tracking filtrado por MB + sent_at de ayer
+  //    Distinguimos source para "Analysis (manual)" vs "Agente / Prospects" en details.ui_origin
+  //    pero como response_tracking no guarda ui_origin, usamos agent_actions.
+  const since = `${ydayMadridStr}T00:00:00`;
+  const until = `${ydayMadridStr}T23:59:59`;
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+
+  let actionsRows = [];
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mbEmail)}&action=in.(sent,re_sent,bounce_retry_sent,secondary_sent)&created_at=gte.${encodeURIComponent(since)}&created_at=lte.${encodeURIComponent(until)}&select=action,details&limit=2000`,
+      { headers }
+    );
+    actionsRows = r.ok ? await r.json() : [];
+  } catch {}
+  const isManual = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
+  const emailsManual = actionsRows.filter(isManual).length;
+  const emailsAgent  = actionsRows.length - emailsManual;
+  const emailsTotal  = actionsRows.length;
+
+  // 2. Prospects PROCESADOS ayer = review_queue rows con validated_by=mb O created_by=mb del día
+  let queueRows = [];
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(validated_by.eq.${encodeURIComponent(mbEmail)},created_by.eq.${encodeURIComponent(mbEmail)})&or=(validated_at.gte.${encodeURIComponent(since)},created_at.gte.${encodeURIComponent(since)})&validated_at=lte.${encodeURIComponent(until)}&select=geo,geos_all,created_by,validated_by,created_at,validated_at,domain&limit=2000`,
+      { headers }
+    );
+    queueRows = r.ok ? await r.json() : [];
+  } catch {}
+  // Dedup por domain (alguien puede ser create+validate del mismo)
+  const seen = new Set();
+  const myProspects = [];
+  for (const q of queueRows) {
+    const d = (q.domain || "").toLowerCase();
+    if (!d || seen.has(d)) continue;
+    // Sólo contar si validated_at o created_at cayó ayer (por el OR de arriba puede colarse otra fecha)
+    const va = q.validated_at || "";
+    const ca = q.created_at || "";
+    const validFromY = va.startsWith(ydayMadridStr);
+    const createdY   = ca.startsWith(ydayMadridStr);
+    if (!validFromY && !createdY) continue;
+    seen.add(d);
+    myProspects.push(q);
+  }
+  const prospectsTotal = myProspects.length;
+
+  // 3. Breakdown por continente
+  const byContinent = new Map();
+  for (const q of myProspects) {
+    let iso = "";
+    if (Array.isArray(q.geos_all) && q.geos_all.length) iso = q.geos_all[0];
+    else if (q.geo) iso = q.geo;
+    const cont = _countryToContinent(iso);
+    byContinent.set(cont, (byContinent.get(cont) || 0) + 1);
+  }
+  const contStrs = [...byContinent.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([c, n]) => `${Math.round((n / prospectsTotal) * 100)}% ${c}`)
+    .slice(0, 4);
+
+  // País más frecuente
+  const byCountry = new Map();
+  for (const q of myProspects) {
+    let iso = "";
+    if (Array.isArray(q.geos_all) && q.geos_all.length) iso = String(q.geos_all[0]).toUpperCase().slice(0,2);
+    else if (q.geo) iso = String(q.geo).toUpperCase().slice(0,2);
+    if (!iso) continue;
+    byCountry.set(iso, (byCountry.get(iso) || 0) + 1);
+  }
+  const topCountry = [...byCountry.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+
+  // 4. Promedio semanal del MB (últimos 7 días, exclusive ayer)
+  const weekFrom = new Date(now.getTime() - 8 * 86400_000).toISOString();
+  const weekTo   = `${ydayMadridStr}T00:00:00`;
+  let weekProspects = 0;
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(validated_by.eq.${encodeURIComponent(mbEmail)},created_by.eq.${encodeURIComponent(mbEmail)})&created_at=gte.${encodeURIComponent(weekFrom)}&created_at=lt.${encodeURIComponent(weekTo)}&select=id`,
+      { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const rangeHdr = r.headers.get("content-range") || "";
+    weekProspects = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch {}
+  const weekAvg = weekProspects > 0 ? Math.round(weekProspects / 7) : 0;
+
+  // 5. Construir mensaje rioplatense
+  const lines = [];
+  lines.push(`👋 ${mbName}, ayer ${ydayDisplay}:`);
+  if (prospectsTotal > 0) {
+    let geoLine = `📋 Prospectaste ${prospectsTotal} websites.`;
+    if (contStrs.length) geoLine += ` ${contStrs.join(" · ")}.`;
+    if (topCountry) geoLine += ` Incluyendo varias de "${topCountry}".`;
+    lines.push(geoLine);
+  } else {
+    lines.push(`📋 No prospectaste websites ayer.`);
+  }
+  if (emailsTotal > 0) {
+    lines.push(`✉️ Enviaste ${emailsTotal} emails — ${emailsManual} desde Analysis · ${emailsAgent} desde el agente/Prospects.`);
+  } else {
+    lines.push(`✉️ No enviaste emails ayer.`);
+  }
+  // Tip comparativo
+  if (weekAvg > 0 && prospectsTotal > 0) {
+    if (prospectsTotal < weekAvg * 0.7) {
+      lines.push(`📉 Tu media de prospectos es INFERIOR a la de la semana (promedio ${weekAvg}/día). Quizás vale un push hoy.`);
+    } else if (prospectsTotal > weekAvg * 1.3) {
+      lines.push(`📈 ¡Día arriba del promedio! Tu media semanal es ${weekAvg}/día — ayer la superaste.`);
+    }
+  }
+  // Tip simple basado en patrones
+  if (prospectsTotal > 0 && emailsTotal === 0) {
+    lines.push(`💡 Tip: prospectaste pero no enviaste mails — pasá por Prospects para empujar.`);
+  } else if (prospectsTotal === 0 && emailsTotal > 5) {
+    lines.push(`💡 Tip: muchos envíos pero pocos prospects nuevos — chequeá Prospects, hay leads disponibles.`);
+  } else if (byContinent.size === 1 && prospectsTotal > 0) {
+    lines.push(`💡 Tip: todos tus prospects de ayer fueron de la misma región. Diversificar GEO suele mejorar tasa de respuesta.`);
+  }
+
+  await createNotificationWorker(token, {
+    mb_email: mbEmail.toLowerCase(),
+    type: "daily_digest",
+    severity: "info",
+    title: `📊 Resumen de ayer — ${ydayDisplay}`,
+    body: lines.join("\n"),
+    metadata: {
+      prospects_total: prospectsTotal,
+      emails_total: emailsTotal,
+      emails_manual: emailsManual,
+      emails_agent: emailsAgent,
+      week_avg: weekAvg,
+      top_country: topCountry,
+    },
+    dedup_key: `daily_digest_${mbEmail.toLowerCase()}_${ydayMadridStr}`,
+  });
 }
 
 async function main() {
