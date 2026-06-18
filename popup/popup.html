@@ -205,13 +205,15 @@
           </select>
         </div>
         <div>
-          <label for="agent-cfg-max" style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">📤 Max envíos/día (por MB)</label>
-          <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Cap diario por MB. 30 = ~6/slot.">
+          <label for="agent-cfg-max" style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">📤 Max envíos/día (por MB · cantidad de mails que el agente manda)</label>
+          <select id="agent-cfg-max" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Cap diario que aplica a CADA MB (Maxi/Diego/Agus). 25 = ~5/slot en los 5 slots del día.">
             <option value="5">5/día (test)</option>
             <option value="10">10/día</option>
             <option value="15">15/día</option>
             <option value="20">20/día</option>
-            <option value="30" selected>30/día (default)</option>
+            <option value="25" selected>25/día (default · ~5 por slot)</option>
+            <option value="30">30/día</option>
+            <option value="40">40/día</option>
             <option value="50">50/día</option>
           </select>
         </div>

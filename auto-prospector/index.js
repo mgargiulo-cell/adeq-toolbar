@@ -5437,11 +5437,11 @@ async function runSession(token, cfg, sessionStart) {
 
 const AGENT_DEFAULTS = {
   threshold_traffic:    400_000,   // único filtro de calidad real (decisión user 2026-05-18)
-  max_per_day:          30,        // 5 slots × 6 = 30/día
+  max_per_day:          25,        // Maxi 2026-06-18: 25/día para cada MB (5 slots × 5)
   active_hours_start:   9,         // 9am España (CET/CEST)
   active_hours_end:     23,        // 23hs España
   active_timezone:      "Europe/Madrid",
-  per_cycle_limit:      6,         // max 6 leads por slot del cron 9/12/15/18/20 Madrid L-V
+  per_cycle_limit:      5,         // max 5 leads por slot 9/12/15/18/20 Madrid L-V (= 25/día)
   monday_board_id:      1420268379,
   // DEPRECATED (2026-05-18):
   //   threshold_score: 40    → ya no se filtra por score. Sólo hard gates en scoreWebsite()
