@@ -276,6 +276,7 @@ function resetAnalysisUI() {
   state.pageDescription = "";
   state.siteFooterText = "";
   state.emails        = [];
+  state.pageSocialLinks = []; // Maxi 2026-06-17 v3: limpiar socials del dominio anterior
   state.apolloPeople  = [];
   state.contactName   = "";
   state.pitchSubject  = "";
@@ -3705,9 +3706,13 @@ async function runEmailScraper() {
     // Backward compat: si vino como array, lo tratamos como emails directos.
     const pageEmails = Array.isArray(pageResult) ? pageResult : (pageResult?.emails || []);
     const pageSocialLinks = Array.isArray(pageResult?.socialLinks) ? pageResult.socialLinks : [];
-    // Si no hay emails pero sí tenemos socialLinks, los exponemos en state
-    // para que la UI pueda mostrar "no email pero podés probar estas redes:".
-    if (pageSocialLinks.length > 0) state.pageSocialLinks = pageSocialLinks;
+    // Si encontramos socialLinks, exponer en state Y renderizar la sección
+    // dedicada "📱 Social Media" — SIEMPRE visible, no solo cuando no hay
+    // email. Maxi quiere ver las redes aunque haya email (para DM en paralelo).
+    if (pageSocialLinks.length > 0) {
+      state.pageSocialLinks = pageSocialLinks;
+      renderSocialMediaRow(pageSocialLinks);
+    }
     addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page", _dom);
     addEmailsWithSource(contactEmails.filter(quickValidateEmail), "Scrape", _dom);
     addEmailsWithSource(informerEmails.filter(quickValidateEmail), "Informer", _dom);
@@ -4039,6 +4044,46 @@ function _renderVerifyBadge(badge, result) {
   else { badge.textContent = "✖"; badge.className = "verify-badge fail"; }
 }
 
+// Maxi 2026-06-17 v3: chips de Social Media para AGREGAR junto a la lista de
+// emails — mismo bloque, con label "Social Media" delante. Se renderizan
+// inline con .email-chip mock para mantener el estilo. Devuelve HTML string.
+const _SOCIAL_META = {
+  "facebook.com":  { icon: "📘", label: "Facebook",  color: "#1877f2" },
+  "linkedin.com":  { icon: "💼", label: "LinkedIn",  color: "#0a66c2" },
+  "instagram.com": { icon: "📸", label: "Instagram", color: "#e4405f" },
+  "twitter.com":   { icon: "🐦", label: "Twitter",   color: "#1da1f2" },
+  "x.com":         { icon: "𝕏",  label: "X",         color: "#000000" },
+  "youtube.com":   { icon: "▶️", label: "YouTube",   color: "#ff0000" },
+};
+
+function _buildSocialMediaChipsHTML(socialLinks) {
+  const unique = [...new Set((socialLinks || []).map(s => (s || "").trim()).filter(Boolean))].slice(0, 6);
+  if (unique.length === 0) return "";
+  const chips = unique.map(url => {
+    const safe = url.startsWith("http") ? url : `https://${url}`;
+    const lower = url.toLowerCase();
+    const key = Object.keys(_SOCIAL_META).find(k => lower.includes(k)) || "";
+    const meta = _SOCIAL_META[key] || { icon: "🔗", label: "Link", color: "#64748b" };
+    const username = url.split("/").filter(Boolean).pop() || meta.label;
+    const displayUser = username.length > 16 ? username.slice(0, 14) + "…" : username;
+    return `<a href="#" data-url="${esc(safe)}" class="social-media-chip" title="${esc(meta.label)}: ${esc(safe)}" style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;background:${meta.color};color:#fff;border-radius:4px;font-size:11px;text-decoration:none;font-weight:500;margin:2px">${meta.icon} ${esc(displayUser)}</a>`;
+  }).join("");
+  // Label "Social Media" + chips inline
+  return `<div style="margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:4px"><span style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:.3px">📱 SOCIAL MEDIA:</span>${chips}</div>`;
+}
+
+function _wireSocialMediaChipClicks(container) {
+  container?.querySelectorAll(".social-media-chip").forEach(a => {
+    if (a.dataset._wired) return;
+    a.dataset._wired = "1";
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      chrome.tabs.create({ url: a.dataset.url, active: false });
+    });
+  });
+}
+
 function renderEmailList(emails) {
   const resultEl = document.getElementById("email-result");
   const listEl   = document.getElementById("email-list");
@@ -4062,43 +4107,18 @@ function renderEmailList(emails) {
     ...cleaned.filter(e => !isApollo(e)),
   ];
 
-  if (!mondayEmail && suggested.length === 0) {
+  // Maxi 2026-06-17 v3: si NO hay emails ni socials, mensaje fallback simple.
+  const _socials = Array.isArray(state.pageSocialLinks) ? state.pageSocialLinks : [];
+  if (!mondayEmail && suggested.length === 0 && _socials.length === 0) {
     resultEl.style.display = "block";
-    // Maxi 2026-06-17 v2: si no hay email pero detectamos redes sociales en la
-    // página, mostrarlas como fallback para que el MB pueda probar contacto
-    // por DM. Sino, fallback al mensaje genérico.
-    const socials = Array.isArray(state.pageSocialLinks) ? state.pageSocialLinks : [];
-    if (socials.length > 0) {
-      const SOCIAL_ICONS = {
-        "facebook.com":  "📘 FB",
-        "linkedin.com":  "💼 LinkedIn",
-        "instagram.com": "📸 IG",
-        "twitter.com":   "🐦 Twitter",
-        "x.com":         "𝕏",
-        "youtube.com":   "▶️ YT",
-      };
-      const items = socials.slice(0, 5).map(url => {
-        const safe = url.startsWith("http") ? url : `https://${url}`;
-        const key = Object.keys(SOCIAL_ICONS).find(k => url.toLowerCase().includes(k)) || "";
-        const label = SOCIAL_ICONS[key] || "🔗 link";
-        return `<a href="#" data-url="${esc(safe)}" class="social-fallback-link" style="display:inline-block;margin:2px 4px;padding:3px 8px;background:#0ea5e9;color:#fff;border-radius:4px;font-size:11px;text-decoration:none">${label}</a>`;
-      }).join("");
-      resultEl.innerHTML = `Sin email visible — probá contacto por red social:<br/><div style="margin-top:6px">${items}</div>`;
-      resultEl.className = "email-value";
-      // Listener para abrir cada link
-      resultEl.querySelectorAll(".social-fallback-link").forEach(a => {
-        a.addEventListener("click", (ev) => {
-          ev.preventDefault();
-          chrome.tabs.create({ url: a.dataset.url, active: false });
-        });
-      });
-    } else {
-      resultEl.textContent = "No valid emails — try Apollo";
-      resultEl.className   = "email-value";
-    }
+    resultEl.textContent = "No valid emails — try Apollo";
+    resultEl.className   = "email-value";
     listEl.style.display = "none";
     return;
   }
+  // Si solo hay socials (no emails), mostramos la lista igual abajo —
+  // los chips sociales se renderizan junto a los emails con label "(social media)"
+  // y son clickeables para abrir en pestaña. NO se pueden seleccionar para envío.
 
   resultEl.style.display = "none";
   listEl.style.display   = "block";
@@ -4139,7 +4159,35 @@ function renderEmailList(emails) {
     }
   }
 
+  // Maxi 2026-06-17 v3: chips de Social Media en la misma lista — son "fuente"
+  // más (apollo / informer / sitio / social media). NO se pueden seleccionar
+  // para envío de mail (no son emails). Al click abren en pestaña nueva.
+  if (Array.isArray(state.pageSocialLinks) && state.pageSocialLinks.length > 0) {
+    const socialChipsForList = [...new Set(state.pageSocialLinks.map(s => (s||"").trim()).filter(Boolean))].slice(0, 6).map(url => {
+      const safe = url.startsWith("http") ? url : `https://${url}`;
+      const lower = url.toLowerCase();
+      const key = Object.keys(_SOCIAL_META).find(k => lower.includes(k)) || "";
+      const meta = _SOCIAL_META[key] || { icon: "🔗", label: "Link", color: "#64748b" };
+      const username = url.split("/").filter(Boolean).pop() || meta.label;
+      const display = username.length > 16 ? username.slice(0, 14) + "…" : username;
+      return `<div class="email-chip social-chip" data-social-url="${esc(safe)}" title="${esc(meta.label)}: ${esc(safe)} (click para abrir, no enviable por mail)">
+        <span class="email-grade" style="background:${meta.color};color:#fff">${meta.icon}</span>${esc(display)}<span class="email-src-badge" style="background:${meta.color};color:#fff;border:none">${esc(meta.label)}</span>
+      </div>`;
+    }).join("");
+    html += `<div class="email-group-label">📱 Social Media (${state.pageSocialLinks.length})</div>${socialChipsForList}`;
+  }
+
   listEl.innerHTML = html;
+
+  // Wire social chips: click abre en pestaña, NO seleccionable como email
+  listEl.querySelectorAll(".social-chip").forEach(chip => {
+    chip.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const url = chip.dataset.socialUrl;
+      if (url) chrome.tabs.create({ url, active: false });
+    });
+  });
 
   // Toggle "ver más"
   const showMoreBtn = listEl.querySelector(".email-show-more");
@@ -4157,19 +4205,21 @@ function renderEmailList(emails) {
   // el email viejo de Monday — siempre preferimos uno fresco de Apollo/scrape
   // (que ya viene rankeado: ad ops > publicidad > marketing > online > dev).
   // Si no hay ninguno fresco, recién ahí caemos al de Monday como fallback.
-  const preferredChip = listEl.querySelector(".email-chip:not(.monday)")
-                     || listEl.querySelector(".email-chip");
+  // Maxi 2026-06-17 v3: excluir social-chip (no son emails reales)
+  const preferredChip = listEl.querySelector(".email-chip:not(.monday):not(.social-chip)")
+                     || listEl.querySelector(".email-chip:not(.social-chip)");
   if (preferredChip) {
     preferredChip.classList.add("selected");
     formEl.value = preferredChip.dataset.email;
   }
 
   // Click para seleccionar (slot 1 = email principal, envío ahora)
-  listEl.querySelectorAll(".email-chip").forEach(chip => {
+  // Maxi 2026-06-17 v3: excluimos .social-chip — no son emails, no se seleccionan.
+  listEl.querySelectorAll(".email-chip:not(.social-chip)").forEach(chip => {
     chip.addEventListener("click", (ev) => {
       // Si tocó el botón "→ 2", no procesar como click de slot 1
       if (ev.target.classList.contains("email-future-btn")) return;
-      listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+      listEl.querySelectorAll(".email-chip:not(.social-chip)").forEach(c => c.classList.remove("selected"));
       chip.classList.add("selected");
       formEl.value = chip.dataset.email;
       const cached = _emailVerifyCache.get(chip.dataset.email);
