@@ -4121,6 +4121,11 @@ const MONDAY_USER_IDS = {
   "sales@adeqmedia.com":     60940538, // Agustina
   "dhorovitz@adeqmedia.com": 56938560, // Diego
 };
+// Reverse: Monday user ID → email (Maxi 2026-06-18 v2: para que Monday Refresh
+// tagee el lead con el MB dueño del item original, no con worker@autofeeder).
+const MONDAY_ID_TO_EMAIL = Object.fromEntries(
+  Object.entries(MONDAY_USER_IDS).map(([email, id]) => [String(id), email])
+);
 
 // Elige la Monday API key del usuario que subió el CSV (fallback al default)
 function getMondayKeyForUser(cfg, userEmail) {
@@ -4156,6 +4161,8 @@ async function markCsvItem(token, id, status, fields = {}) {
 }
 
 // Busca un item en Monday por nombre de dominio y devuelve id + estado actual
+// + dueño (deal_owner — persona asignada). Maxi 2026-06-18 v2: el owner se usa
+// para tagear la re-prospección con el MB original, no con worker@autofeeder.
 async function findMondayItem(domain, mondayApiKey) {
   const clean = cleanDomain(domain);
   const query = `{
@@ -4165,7 +4172,7 @@ async function findMondayItem(domain, mondayApiKey) {
       ]}) {
         items {
           id name
-          column_values(ids: ["deal_stage"]) { id text }
+          column_values(ids: ["deal_stage","deal_owner"]) { id text value }
         }
       }
     }
@@ -4181,7 +4188,17 @@ async function findMondayItem(domain, mondayApiKey) {
     const match = items.find(it => cleanDomain(it.name) === clean);
     if (!match) return null;
     const estado = match.column_values?.find(c => c.id === "deal_stage")?.text || "";
-    return { id: match.id, estado };
+    // deal_owner.value es JSON con personsAndTeams: [{ id: 56851451, kind: "person" }]
+    let ownerEmail = "";
+    const ownerCol = match.column_values?.find(c => c.id === "deal_owner");
+    if (ownerCol?.value) {
+      try {
+        const parsed = JSON.parse(ownerCol.value);
+        const personId = parsed?.personsAndTeams?.find(p => p.kind === "person")?.id;
+        if (personId) ownerEmail = MONDAY_ID_TO_EMAIL[String(personId)] || "";
+      } catch {}
+    }
+    return { id: match.id, estado, ownerEmail };
   } catch { return null; }
 }
 
@@ -4543,7 +4560,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       score:          0,
       adNetworks,
       pageTitle,
-      createdBy:      item.uploaded_by || "",
+      // Monday refresh tagea con el MB dueño del item original (deal_owner)
+      // para que el filtro USUARIO en Prospects respete quién hizo el pedido.
+      createdBy:      (source === "monday_refresh" && match?.ownerEmail) ? match.ownerEmail : (item.uploaded_by || ""),
       source,
       mondayItemId,
     });

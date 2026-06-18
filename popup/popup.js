@@ -8370,9 +8370,48 @@ const _GEO_NAMES = {
 };
 // Reconstruye chips de GEO clickeables a partir de los datos disponibles.
 // Toolkit user 2026-06-17: chips multi-select para filtrar por varios países a la vez.
-// Maxi 2026-06-18: chips de GEO con TODOS los países disponibles + "Sin GEO".
-// Antes solo aparecían los 4 con datos completos porque exigía `iso.length === 2`.
-// Ahora: detecta geo desde geos_all[0], geo (ISO o NAME), y mapea NAMES → ISO.
+// Maxi 2026-06-18 v3: chips de CONTINENTE (preview) + dropdown multi-país.
+// Antes mostraba 1 chip por país → con 60+ países era ilegible.
+// Ahora 8 chips: EU/AS/NA/SA/CA/AF/OC + "Sin GEO". Para detalle por país,
+// botón "🌐 Filtrar países" abre panel con checkboxes de los disponibles.
+const ISO_TO_CONTINENT = {
+  // North America
+  US:"NA", CA:"NA", MX:"NA",
+  // Central America + Caribbean
+  GT:"CA", HN:"CA", SV:"CA", NI:"CA", CR:"CA", PA:"CA", BZ:"CA",
+  CU:"CA", DO:"CA", PR:"CA", JM:"CA", HT:"CA", BS:"CA", TT:"CA", BB:"CA",
+  // South America
+  AR:"SA", BR:"SA", CL:"SA", CO:"SA", PE:"SA", UY:"SA", VE:"SA",
+  EC:"SA", BO:"SA", PY:"SA", GY:"SA", SR:"SA",
+  // Europe
+  GB:"EU", IE:"EU", FR:"EU", DE:"EU", ES:"EU", PT:"EU", IT:"EU", NL:"EU",
+  BE:"EU", CH:"EU", AT:"EU", DK:"EU", SE:"EU", NO:"EU", FI:"EU", PL:"EU",
+  CZ:"EU", SK:"EU", HU:"EU", RO:"EU", BG:"EU", GR:"EU", HR:"EU", SI:"EU",
+  EE:"EU", LV:"EU", LT:"EU", LU:"EU", MT:"EU", CY:"EU", IS:"EU", UA:"EU",
+  BY:"EU", MD:"EU", RS:"EU", AL:"EU", MK:"EU", BA:"EU", ME:"EU", XK:"EU", RU:"EU",
+  // Asia
+  CN:"AS", JP:"AS", KR:"AS", IN:"AS", PK:"AS", BD:"AS", LK:"AS", ID:"AS",
+  PH:"AS", VN:"AS", TH:"AS", MY:"AS", SG:"AS", HK:"AS", TW:"AS", MM:"AS",
+  KH:"AS", LA:"AS", BN:"AS", NP:"AS", KZ:"AS", UZ:"AS", AZ:"AS", GE:"AS",
+  AM:"AS", AF:"AS", IR:"AS", IQ:"AS", SY:"AS", JO:"AS", LB:"AS", IL:"AS",
+  SA:"AS", AE:"AS", QA:"AS", BH:"AS", OM:"AS", KW:"AS", YE:"AS", TR:"AS", PS:"AS",
+  // Africa
+  EG:"AFR", MA:"AFR", DZ:"AFR", TN:"AFR", LY:"AFR", NG:"AFR", KE:"AFR",
+  ZA:"AFR", ET:"AFR", GH:"AFR", UG:"AFR", TZ:"AFR", SN:"AFR", CI:"AFR",
+  CM:"AFR", AO:"AFR", MZ:"AFR", ZM:"AFR", ZW:"AFR", BW:"AFR",
+  MG:"AFR", RW:"AFR", SD:"AFR", SS:"AFR",
+  // Oceania
+  AU:"OC", NZ:"OC", FJ:"OC", PG:"OC", SB:"OC",
+};
+const CONTINENT_INFO = {
+  EU:  { name: "Europe",          flag: "🇪🇺" },
+  AS:  { name: "Asia",            flag: "🌏" },
+  NA:  { name: "North America",   flag: "🌎" },
+  SA:  { name: "South America",   flag: "🌎" },
+  CA:  { name: "Center America",  flag: "🌎" },
+  AFR: { name: "Africa",          flag: "🌍" },
+  OC:  { name: "Oceania",         flag: "🌏" },
+};
 function _rebuildGeoChips(rows, selected) {
   const wrap = document.getElementById("prospects-geo-chips");
   if (!wrap) return;
@@ -8399,19 +8438,13 @@ function _rebuildGeoChips(rows, selected) {
   };
   Object.entries(ISO_TO_NAME).forEach(([iso, name]) => { NAME_TO_ISO[name.toUpperCase()] = iso; });
 
-  // Maxi 2026-06-18: contar TODOS los geos de geos_all (no solo el principal).
-  // Un lead con [US, BR, AR] aparece en los 3 chips porque el filtro
-  // (línea ~8533) ya hace `isoArr.includes(code)` — funciona para cualquier
-  // GEO del array, no solo el primario. Si solo se cuenta geos_all[0] y todos
-  // los sitios en inglés tienen US como top → falsa impresión de pool homogéneo.
-  const counts = new Map();
-  let noGeoCount = 0;
-  for (const r of rows || []) {
-    const seen = new Set();
+  // Detectar geo (ISO 2-letter) por lead — soporta geos_all + legacy geo (NAME o ISO)
+  const _isoOfRow = (r) => {
+    const out = new Set();
     if (Array.isArray(r.geos_all) && r.geos_all.length) {
       for (const raw of r.geos_all) {
         const iso = String(raw || "").toUpperCase().slice(0, 2);
-        if (iso && !seen.has(iso)) { seen.add(iso); counts.set(iso, (counts.get(iso) || 0) + 1); }
+        if (iso) out.add(iso);
       }
     }
     if (r.geo) {
@@ -8420,24 +8453,93 @@ function _rebuildGeoChips(rows, selected) {
       if (g.length === 2 && ISO_TO_NAME[g]) iso = g;
       else if (NAME_TO_ISO[g])               iso = NAME_TO_ISO[g];
       else if (g.length >= 2)                iso = g.slice(0, 2);
-      if (iso && !seen.has(iso)) { seen.add(iso); counts.set(iso, (counts.get(iso) || 0) + 1); }
+      if (iso) out.add(iso);
     }
-    if (seen.size === 0) noGeoCount++;
+    return out;
+  };
+  // Contar por CONTINENTE + por país (para panel multi-select).
+  const continentCounts = new Map();
+  const countryCounts   = new Map();
+  let noGeoCount = 0;
+  const seenContByLead  = new Set(); // reset per lead
+  for (const r of rows || []) {
+    const isos = _isoOfRow(r);
+    if (isos.size === 0) { noGeoCount++; continue; }
+    const conts = new Set();
+    for (const iso of isos) {
+      countryCounts.set(iso, (countryCounts.get(iso) || 0) + 1);
+      const cont = ISO_TO_CONTINENT[iso];
+      if (cont) conts.add(cont);
+    }
+    for (const c of conts) continentCounts.set(c, (continentCounts.get(c) || 0) + 1);
   }
-  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  // Render chips de continente — solo los que tienen al menos 1 lead.
+  const sortedConts = [...continentCounts.entries()].sort((a, b) => b[1] - a[1]);
   const allActive = sel.size === 0;
   let html = `<button class="geo-chip" data-code="_ALL_" type="button" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${allActive ? "#0ea5e9" : "#334155"};background:${allActive ? "#0ea5e9" : "#1e293b"};color:${allActive ? "#fff" : "#cbd5e1"};font-weight:600">🌍 Todos</button>`;
+  for (const [cont, n] of sortedConts) {
+    const code = `_C_${cont}`;
+    const isOn = sel.has(code);
+    const info = CONTINENT_INFO[cont] || { name: cont, flag: "🌐" };
+    html += `<button class="geo-chip" data-code="${code}" type="button" title="${esc(info.name)}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${info.flag} ${info.name} (${n})</button>`;
+  }
   if (noGeoCount > 0) {
     const isOn = sel.has("_NONE_");
     html += `<button class="geo-chip" data-code="_NONE_" type="button" title="Leads sin país detectado" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">❓ Sin GEO (${noGeoCount})</button>`;
   }
-  for (const [iso, n] of sorted) {
-    const isOn = sel.has(iso);
-    const name = (typeof _GEO_NAMES !== "undefined" && _GEO_NAMES[iso]) || ISO_TO_NAME[iso] || iso;
+  // Mostrar chips de país individuales SOLO si hay alguno seleccionado
+  // (para indicar visualmente cuáles están filtrando desde el panel).
+  const indivSelected = [...sel].filter(c => c.length === 2 && c !== "_C_" && !c.startsWith("_"));
+  for (const iso of indivSelected) {
+    const name = ISO_TO_NAME[iso] || iso;
     const flag = _isoToFlag(iso);
-    html += `<button class="geo-chip" data-code="${iso}" type="button" title="${esc(name)}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${flag} ${iso} (${n})</button>`;
+    html += `<button class="geo-chip" data-code="${iso}" type="button" title="${esc(name)} (click para quitar)" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid #10b981;background:#10b981;color:#fff;font-weight:600">${flag} ${iso} ×</button>`;
   }
   wrap.innerHTML = html;
+  // Guardar contador de países para el panel
+  window._prospectsCountryCounts = countryCounts;
+}
+
+// Panel multi-select de países — se abre con "🌐 Filtrar países"
+function _renderCountryPanel(filter = "") {
+  const list = document.getElementById("prospects-country-list");
+  if (!list) return;
+  const counts = window._prospectsCountryCounts || new Map();
+  const sel = window._selectedGeoChips instanceof Set ? window._selectedGeoChips : new Set();
+  const ISO_TO_NAME_LOCAL = {
+    AR:"Argentina", BR:"Brazil", ES:"Spain", MX:"Mexico", CO:"Colombia",
+    CL:"Chile", PE:"Peru", UY:"Uruguay", EC:"Ecuador", VE:"Venezuela",
+    DO:"Dominican Rep", PA:"Panama", BO:"Bolivia", GT:"Guatemala",
+    CR:"Costa Rica", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
+    PY:"Paraguay", PR:"Puerto Rico", CU:"Cuba", US:"United States",
+    GB:"United Kingdom", CA:"Canada", AU:"Australia", NZ:"New Zealand",
+    PT:"Portugal", IT:"Italy", FR:"France", DE:"Germany", NL:"Netherlands",
+    BE:"Belgium", CH:"Switzerland", AT:"Austria", IE:"Ireland", DK:"Denmark",
+    SE:"Sweden", NO:"Norway", FI:"Finland", PL:"Poland", CZ:"Czech Rep",
+    HU:"Hungary", RO:"Romania", GR:"Greece", IN:"India", PK:"Pakistan",
+    BD:"Bangladesh", LK:"Sri Lanka", ID:"Indonesia", PH:"Philippines",
+    VN:"Vietnam", TH:"Thailand", MY:"Malaysia", SG:"Singapore",
+    SA:"Saudi Arabia", AE:"UAE", EG:"Egypt", TR:"Turkey", IL:"Israel",
+    NG:"Nigeria", KE:"Kenya", ZA:"South Africa", MA:"Morocco", DZ:"Algeria",
+    JP:"Japan", KR:"South Korea", CN:"China", TW:"Taiwan", HK:"Hong Kong",
+    RU:"Russia", UA:"Ukraine", BG:"Bulgaria", HR:"Croatia", SK:"Slovakia",
+  };
+  const sorted = [...counts.entries()]
+    .filter(([iso]) => {
+      if (!filter) return true;
+      const f = filter.toLowerCase();
+      const name = (ISO_TO_NAME_LOCAL[iso] || iso).toLowerCase();
+      return iso.toLowerCase().includes(f) || name.includes(f);
+    })
+    .sort((a, b) => b[1] - a[1]);
+  let html = "";
+  for (const [iso, n] of sorted) {
+    const isOn = sel.has(iso);
+    const name = ISO_TO_NAME_LOCAL[iso] || iso;
+    const flag = _isoToFlag(iso);
+    html += `<button class="country-pick" data-code="${iso}" type="button" title="${esc(name)}" style="font-size:10px;padding:3px 8px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${flag} ${esc(name)} (${n})</button>`;
+  }
+  list.innerHTML = html || `<div style="font-size:11px;color:var(--text-muted);padding:6px">Sin paises ${filter ? "que coincidan" : "disponibles"}.</div>`;
 }
 
 function _rebuildGeoFilterFromRows(rows) {
@@ -8532,16 +8634,32 @@ async function loadProspectsTab() {
     if (geoChipsSet.size >= 1) {
       const wantsNoGeo = geoChipsSet.has("_NONE_");
       const NAME_BY_ISO = { US:"UNITED STATES", GB:"UNITED KINGDOM", BR:"BRAZIL", AR:"ARGENTINA", MX:"MEXICO", ES:"SPAIN", VN:"VIETNAM", IN:"INDIA", PT:"PORTUGAL", IT:"ITALY", FR:"FRANCE", DE:"GERMANY", CA:"CANADA", AU:"AUSTRALIA", NZ:"NEW ZEALAND", IE:"IRELAND", PL:"POLAND", CL:"CHILE", CO:"COLOMBIA", PE:"PERU", UY:"URUGUAY", EC:"ECUADOR", VE:"VENEZUELA", JP:"JAPAN", KR:"SOUTH KOREA", CN:"CHINA", RU:"RUSSIA", UA:"UKRAINE", SA:"SAUDI ARABIA", AE:"UAE", EG:"EGYPT", TR:"TURKEY", IL:"ISRAEL", NG:"NIGERIA", ZA:"SOUTH AFRICA", MA:"MOROCCO" };
+      // Maxi 2026-06-18 v3: continentes `_C_XX` expanden a sus ISOs.
+      // Países individuales `XX` siguen funcionando para selección desde panel.
+      const wantContinents = new Set();
+      const wantCountries  = new Set();
+      for (const code of geoChipsSet) {
+        if (code === "_NONE_") continue;
+        if (code.startsWith("_C_")) wantContinents.add(code.slice(3));
+        else if (code.length === 2) wantCountries.add(code);
+      }
       rows = rows.filter(r => {
-        const isoArr = Array.isArray(r.geos_all) ? r.geos_all.map(x => String(x).toUpperCase()) : [];
+        const isoArr = Array.isArray(r.geos_all) ? r.geos_all.map(x => String(x).toUpperCase().slice(0,2)) : [];
         const legacyIso = String(r.geo || "").toUpperCase();
         const hasGeo = isoArr.length > 0 || !!legacyIso;
         if (wantsNoGeo && !hasGeo) return true;
-        for (const code of geoChipsSet) {
-          if (code === "_NONE_") continue;
+        // Country exact match
+        for (const code of wantCountries) {
           if (isoArr.includes(code)) return true;
           if (legacyIso === code) return true;
           if (NAME_BY_ISO[code] && legacyIso === NAME_BY_ISO[code]) return true;
+        }
+        // Continent: cualquier ISO del lead que esté en ese continente
+        if (wantContinents.size) {
+          for (const iso of isoArr) {
+            if (wantContinents.has(ISO_TO_CONTINENT[iso] || "")) return true;
+          }
+          if (legacyIso.length === 2 && wantContinents.has(ISO_TO_CONTINENT[legacyIso] || "")) return true;
         }
         return false;
       });
@@ -10194,6 +10312,39 @@ async function initProspectsTab() {
     }
     chrome.storage.local.set({ _prospectsGeoChips: [...window._selectedGeoChips] }).catch(() => {});
     await loadProspectsTab();
+  });
+  // Panel multi-país (toggle visibilidad + búsqueda + pick)
+  document.getElementById("btn-prospects-country-picker")?.addEventListener("click", () => {
+    const panel = document.getElementById("prospects-country-panel");
+    if (!panel) return;
+    const open = panel.style.display === "none" || !panel.style.display;
+    panel.style.display = open ? "block" : "none";
+    if (open) _renderCountryPanel(document.getElementById("prospects-country-search")?.value || "");
+  });
+  document.getElementById("prospects-country-search")?.addEventListener("input", (e) => {
+    _renderCountryPanel(e.target.value || "");
+  });
+  document.getElementById("prospects-country-clear")?.addEventListener("click", async () => {
+    if (!window._selectedGeoChips) window._selectedGeoChips = new Set();
+    // Quitar solo los códigos de país (2 chars) — preservar continentes seleccionados
+    for (const code of [...window._selectedGeoChips]) {
+      if (code.length === 2 && !code.startsWith("_")) window._selectedGeoChips.delete(code);
+    }
+    chrome.storage.local.set({ _prospectsGeoChips: [...window._selectedGeoChips] }).catch(() => {});
+    await loadProspectsTab();
+    _renderCountryPanel(document.getElementById("prospects-country-search")?.value || "");
+  });
+  document.getElementById("prospects-country-list")?.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".country-pick");
+    if (!btn) return;
+    const code = btn.dataset.code;
+    if (!code) return;
+    if (!window._selectedGeoChips) window._selectedGeoChips = new Set();
+    if (window._selectedGeoChips.has(code)) window._selectedGeoChips.delete(code);
+    else window._selectedGeoChips.add(code);
+    chrome.storage.local.set({ _prospectsGeoChips: [...window._selectedGeoChips] }).catch(() => {});
+    await loadProspectsTab();
+    _renderCountryPanel(document.getElementById("prospects-country-search")?.value || "");
   });
   // ── Filter presets por SOURCE ─────
   document.querySelectorAll(".prospects-preset").forEach(btn => {

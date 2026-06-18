@@ -617,16 +617,38 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,emails,email_sources,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by";
-  // Date filter: "" | "today" | "yesterday" | "last7" | "last30"
+  // Date filter (Maxi 2026-06-18 v2): "today" | "yesterday" |
+  //   "this_week" | "last_week" | "this_month" | "last_month" |
+  //   (legacy) "last7" | "last30"
   let dateClause = "";
   if (dateFilter) {
     const tzDay = (d) => d.toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
     const now = new Date();
+    // Lunes como inicio de semana (ISO)
+    const startOfWeek = (d) => {
+      const day = d.getDay(); // 0=dom..6=sáb
+      const diff = day === 0 ? 6 : day - 1;
+      return new Date(d.getTime() - diff * 86400000);
+    };
     if (dateFilter === "today") {
       dateClause = `&created_at=gte.${tzDay(now)}T00:00:00`;
     } else if (dateFilter === "yesterday") {
       const y = new Date(now.getTime() - 86400000);
       dateClause = `&created_at=gte.${tzDay(y)}T00:00:00&created_at=lt.${tzDay(now)}T00:00:00`;
+    } else if (dateFilter === "this_week") {
+      const sow = startOfWeek(now);
+      dateClause = `&created_at=gte.${tzDay(sow)}T00:00:00`;
+    } else if (dateFilter === "last_week") {
+      const sow = startOfWeek(now);
+      const sowLast = new Date(sow.getTime() - 7 * 86400000);
+      dateClause = `&created_at=gte.${tzDay(sowLast)}T00:00:00&created_at=lt.${tzDay(sow)}T00:00:00`;
+    } else if (dateFilter === "this_month") {
+      const som = new Date(now.getFullYear(), now.getMonth(), 1);
+      dateClause = `&created_at=gte.${tzDay(som)}T00:00:00`;
+    } else if (dateFilter === "last_month") {
+      const som = new Date(now.getFullYear(), now.getMonth(), 1);
+      const somLast = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      dateClause = `&created_at=gte.${tzDay(somLast)}T00:00:00&created_at=lt.${tzDay(som)}T00:00:00`;
     } else if (dateFilter === "last7") {
       const d7 = new Date(now.getTime() - 7 * 86400000);
       dateClause = `&created_at=gte.${tzDay(d7)}T00:00:00`;

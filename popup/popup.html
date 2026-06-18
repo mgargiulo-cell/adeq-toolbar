@@ -962,36 +962,31 @@
   </section>
 
   <section class="card" style="padding-bottom:10px">
-    <!-- Maxi 2026-06-18: filtros simplificados — quitados los dropdowns que
-         duplicaban los presets de abajo. Arriba solo: buscar + traffic + date.
-         Abajo: chips GEO clickeables + presets de source/user. -->
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;flex-wrap:wrap">
-      <div class="card-title" style="margin:0">📋 Review Prospects</div>
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-        <input id="prospects-name-filter" type="text" class="form-input" placeholder="🔎 Buscar dominio…" style="font-size:11px;padding:3px 6px;width:140px" />
-        <select id="prospects-date-filter" class="form-select" style="font-size:11px;padding:3px 6px">
-          <option value="">📅 Todas las fechas</option>
-          <option value="today">Hoy</option>
-          <option value="yesterday">Ayer</option>
-          <option value="last7">Últimos 7d</option>
-          <option value="last30">Últimos 30d</option>
-        </select>
-        <select id="prospects-traffic-filter" class="form-select" style="font-size:11px;padding:3px 6px">
-          <option value="">📊 Todo el tráfico</option>
-          <option value="0-1">0 – 1M</option>
-          <option value="1-2">1M – 2M</option>
-          <option value="2-3">2M – 3M</option>
-          <option value="3-4">3M – 4M</option>
-          <option value="4-5">4M – 5M</option>
-          <option value="5-10">5M – 10M</option>
-          <option value="10-15">10M – 15M</option>
-          <option value="15-20">15M – 20M</option>
-          <option value="20-30">20M – 30M</option>
-          <option value="30-50">30M – 50M</option>
-          <option value="50-9999">50M+</option>
-        </select>
-        <button id="btn-prospects-refresh" class="btn btn-secondary btn-sm">↻ Refresh</button>
-      </div>
+    <!-- Maxi 2026-06-18 v2: filtros COMPACTOS — solo lo justo, no ocupan
+         todo el ancho. Buscar | Fecha | Tráfico | ↻. Línea única, sin wrap. -->
+    <div style="display:flex;align-items:center;margin-bottom:6px;gap:4px">
+      <div class="card-title" style="margin:0;flex:1;font-size:13px">📋 Review Prospects</div>
+      <input id="prospects-name-filter" type="text" placeholder="🔎" title="Buscar dominio" style="font-size:10px;padding:2px 5px;width:60px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)" />
+      <select id="prospects-date-filter" title="Filtrar por fecha" style="font-size:10px;padding:2px 4px;width:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+        <option value="">📅 Todas</option>
+        <option value="today">Hoy</option>
+        <option value="yesterday">Ayer</option>
+        <option value="this_week">Esta semana</option>
+        <option value="last_week">Semana pasada</option>
+        <option value="this_month">Este mes</option>
+        <option value="last_month">Mes pasado</option>
+      </select>
+      <select id="prospects-traffic-filter" title="Filtrar por tráfico" style="font-size:10px;padding:2px 4px;width:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
+        <option value="">📊 Tráfico</option>
+        <option value="0-1">&lt; 1M</option>
+        <option value="1-2">1–2M</option>
+        <option value="2-5">2–5M</option>
+        <option value="5-10">5–10M</option>
+        <option value="10-20">10–20M</option>
+        <option value="20-50">20–50M</option>
+        <option value="50-9999">50M+</option>
+      </select>
+      <button id="btn-prospects-refresh" title="Refresh" style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text);cursor:pointer">↻</button>
     </div>
 
     <!-- Source + user combinados en una sola fila de presets -->
@@ -1011,10 +1006,20 @@
       <button class="prospects-user-preset btn btn-sm" data-user="sales@adeqmedia.com" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">👤 Agus</button>
     </div>
 
-    <!-- GEO chips (dinámico — incluye "Sin GEO" + todos los países disponibles) -->
+    <!-- GEO: chips por CONTINENTE (preview) + dropdown multi-país (detalle) -->
     <div style="margin-bottom:6px">
-      <div style="font-size:10px;color:var(--text-muted);font-weight:600;margin-bottom:4px">PAÍS:</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <div style="font-size:10px;color:var(--text-muted);font-weight:600">PAÍS / REGIÓN:</div>
+        <button id="btn-prospects-country-picker" type="button" title="Elegir paises" style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--bg-input);color:var(--text);cursor:pointer">🌐 Filtrar países</button>
+      </div>
       <div id="prospects-geo-chips" style="display:flex;gap:4px;flex-wrap:wrap;font-size:10px"></div>
+      <div id="prospects-country-panel" style="display:none;margin-top:6px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);max-height:220px;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <input id="prospects-country-search" type="text" placeholder="🔎 Buscar país…" style="font-size:11px;padding:3px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);flex:1;margin-right:6px" />
+          <button id="prospects-country-clear" type="button" style="font-size:10px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text-muted);cursor:pointer">Limpiar</button>
+        </div>
+        <div id="prospects-country-list" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+      </div>
     </div>
 
     <!-- Hidden inputs para compat con handlers existentes (source/user) -->
@@ -1135,7 +1140,6 @@
            El cap diario sigue en 300 (acumulado de varias tiradas). -->
       <input id="refresh-limit" type="hidden" value="100" />
     </div>
-    <div style="font-size:10px;color:var(--text-muted);margin-bottom:6px">Each search brings up to <strong>100 domains</strong> (per-batch cap). Daily cap: 300/user. Waitlist global: 300.</div>
     <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday (max 50)</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
   </section>
