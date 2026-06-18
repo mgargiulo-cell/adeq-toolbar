@@ -3386,7 +3386,20 @@ async function runTrafficCheck(opts = {}) {
       ? `<span class="main-country-flag" title="Top traffic country: ${esc(topC.name || topC.code)}" data-code="${esc(topC.code)}" style="font-size:18px;margin-left:6px;cursor:help">${countryFlag(topC.code)}</span>`
       : "";
 
-    if (data.noPageViewData) {
+    // Maxi 2026-06-17 v2: si visits=0 mostrar botón explícito de "Re-verificar".
+    // Antes solo mostraba "0" sin acción → MB perdía leads de millones de
+    // visitas que la cache había guardado como 0 por un error transitorio.
+    if (!state.visits || state.visits === 0) {
+      metricEl.innerHTML = `<span style="color:#f59e0b">⚠️ Sin tráfico detectado</span>${mainFlagHtml}`;
+      if (unitEl) unitEl.textContent = "";
+      breakdownEl.innerHTML = `<button id="btn-traffic-recheck" type="button" style="font-size:11px;padding:4px 10px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;margin-right:6px">🔄 Re-verificar (bypass cache)</button><span style="font-size:10px;color:#94a3b8">SimilarWeb puede tener data — chequear directo si dudás</span>${cacheStr}`;
+      // Wire button
+      setTimeout(() => {
+        document.getElementById("btn-traffic-recheck")?.addEventListener("click", () => {
+          runTrafficCheck({ forceRefresh: true }).catch(() => {});
+        });
+      }, 0);
+    } else if (data.noPageViewData) {
       metricEl.innerHTML = `${formatTraffic(state.visits)}${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "visits/mo";
       breakdownEl.innerHTML = `<span class="no-pageview-note">No page-view data</span>${cacheStr}`;
@@ -3679,7 +3692,7 @@ async function runEmailScraper() {
     // Fuentes externas (contacto/directorio + website informer) — solo la primera
     // vez por dominio en la sesión; después vienen cacheadas como "Cache".
     const needExternal = !sess?.contactScraped;
-    const [pageEmails, contactEmails, informerEmails, apolloResult] = await Promise.all([
+    const [pageResult, contactEmails, informerEmails, apolloResult] = await Promise.all([
       scrapeEmailsFromPage(state.tabId),
       needExternal ? scrapeContactPages(`https://${state.domain}`).catch(() => []) : Promise.resolve([]),
       needExternal ? scrapeWebsiteInformer(state.domain).catch(() => []) : Promise.resolve([]),
@@ -3688,6 +3701,13 @@ async function runEmailScraper() {
         ? Promise.resolve(null)
         : findDecisionMakerViaApollo(state.domain).catch(() => null),
     ]);
+    // Maxi 2026-06-17 v2: pageResult ahora es { emails, socialLinks }.
+    // Backward compat: si vino como array, lo tratamos como emails directos.
+    const pageEmails = Array.isArray(pageResult) ? pageResult : (pageResult?.emails || []);
+    const pageSocialLinks = Array.isArray(pageResult?.socialLinks) ? pageResult.socialLinks : [];
+    // Si no hay emails pero sí tenemos socialLinks, los exponemos en state
+    // para que la UI pueda mostrar "no email pero podés probar estas redes:".
+    if (pageSocialLinks.length > 0) state.pageSocialLinks = pageSocialLinks;
     addEmailsWithSource(pageEmails.filter(quickValidateEmail), "Page", _dom);
     addEmailsWithSource(contactEmails.filter(quickValidateEmail), "Scrape", _dom);
     addEmailsWithSource(informerEmails.filter(quickValidateEmail), "Informer", _dom);
@@ -4044,9 +4064,39 @@ function renderEmailList(emails) {
 
   if (!mondayEmail && suggested.length === 0) {
     resultEl.style.display = "block";
-    resultEl.textContent   = "No valid emails — try Apollo";
-    resultEl.className     = "email-value";
-    listEl.style.display   = "none";
+    // Maxi 2026-06-17 v2: si no hay email pero detectamos redes sociales en la
+    // página, mostrarlas como fallback para que el MB pueda probar contacto
+    // por DM. Sino, fallback al mensaje genérico.
+    const socials = Array.isArray(state.pageSocialLinks) ? state.pageSocialLinks : [];
+    if (socials.length > 0) {
+      const SOCIAL_ICONS = {
+        "facebook.com":  "📘 FB",
+        "linkedin.com":  "💼 LinkedIn",
+        "instagram.com": "📸 IG",
+        "twitter.com":   "🐦 Twitter",
+        "x.com":         "𝕏",
+        "youtube.com":   "▶️ YT",
+      };
+      const items = socials.slice(0, 5).map(url => {
+        const safe = url.startsWith("http") ? url : `https://${url}`;
+        const key = Object.keys(SOCIAL_ICONS).find(k => url.toLowerCase().includes(k)) || "";
+        const label = SOCIAL_ICONS[key] || "🔗 link";
+        return `<a href="#" data-url="${esc(safe)}" class="social-fallback-link" style="display:inline-block;margin:2px 4px;padding:3px 8px;background:#0ea5e9;color:#fff;border-radius:4px;font-size:11px;text-decoration:none">${label}</a>`;
+      }).join("");
+      resultEl.innerHTML = `Sin email visible — probá contacto por red social:<br/><div style="margin-top:6px">${items}</div>`;
+      resultEl.className = "email-value";
+      // Listener para abrir cada link
+      resultEl.querySelectorAll(".social-fallback-link").forEach(a => {
+        a.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          chrome.tabs.create({ url: a.dataset.url, active: false });
+        });
+      });
+    } else {
+      resultEl.textContent = "No valid emails — try Apollo";
+      resultEl.className   = "email-value";
+    }
+    listEl.style.display = "none";
     return;
   }
 

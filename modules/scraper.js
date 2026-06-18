@@ -26,112 +26,236 @@ export async function scrapeEmailsFromPage(tabId) {
       target: { tabId },
       func: extractEmailsFromDOM,
     });
-    return filterEmails(result?.result || []);
+    const r = result?.result;
+    // Maxi 2026-06-17 v2: nuevo shape { emails, socialLinks }. Backward compat
+    // si por algún motivo viene como array legacy.
+    if (Array.isArray(r)) return { emails: filterEmails(r), socialLinks: [] };
+    return {
+      emails: filterEmails(r?.emails || []),
+      socialLinks: Array.isArray(r?.socialLinks) ? r.socialLinks : [],
+    };
   } catch {
-    return [];
+    return { emails: [], socialLinks: [] };
   }
 }
 
-// Se ejecuta dentro de la página — función inyectada, debe ser self-contained
+// Se ejecuta dentro de la página — función inyectada, debe ser self-contained.
+// Maxi 2026-06-17 v2: reescrita para ser MUCHO más agresiva. Antes fallaba en
+// sitios con Cloudflare email protection, iframes, JSON-LD, shadow DOM, etc.
+// También colecta socialLinks si no encuentra email — el caller decide qué hacer.
 function extractEmailsFromDOM() {
   const found = new Set();
-  // TLD max 6 chars + requiere no-letra después para evitar "comsoccer"
-  const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}(?=\s|$|[^a-zA-Z])/g;
+  const socialLinks = new Set();
+  // TLD max 10 chars (.museum, .travel) + requiere no-letra después.
+  const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}(?=\s|$|[^a-zA-Z])/g;
 
   // ── Desofuscador de emails ─────────────────────────────────
   function deobfuscate(text) {
     if (!text) return "";
-
-    // 1. Entidades HTML
+    // 1. Entidades HTML decimal y hex
     text = text
-      .replace(/&#64;|&#x40;/gi, "@")
-      .replace(/&#46;|&#x2e;/gi, ".");
-
-    // 2. Variantes con corchetes / paréntesis / llaves
+      .replace(/&#0*64;|&#x0*40;/gi, "@")
+      .replace(/&#0*46;|&#x0*2e;/gi, ".")
+      .replace(/&commat;/gi, "@")
+      .replace(/&period;/gi, ".");
+    // 2. Variantes con brackets / parens / llaves
     text = text
       .replace(/\[\s*at\s*\]/gi,      "@")
       .replace(/\(\s*at\s*\)/gi,      "@")
       .replace(/\{\s*at\s*\}/gi,      "@")
       .replace(/\[\s*arroba\s*\]/gi,  "@")
       .replace(/\(\s*arroba\s*\)/gi,  "@")
-      .replace(/\[\s*a\s*\]/gi,       "@")   // [a]
+      .replace(/\[\s*a\s*\]/gi,       "@")
       .replace(/\[\s*dot\s*\]/gi,     ".")
       .replace(/\(\s*dot\s*\)/gi,     ".")
       .replace(/\{\s*dot\s*\}/gi,     ".")
       .replace(/\[\s*punto\s*\]/gi,   ".")
       .replace(/\(\s*punto\s*\)/gi,   ".")
-      .replace(/\[\s*d\s*\]/gi,       ".");  // [d]
-
-    // 3. Espacio AT espacio en contexto de email
-    //    "nombre AT dominio DOT com" o "nombre AT dominio.com"
+      .replace(/\[\s*d\s*\]/gi,       ".");
+    // 3. Espacio AT espacio
     text = text.replace(
       /([a-zA-Z0-9._%+\-]{2,})\s+(?:at|AT)\s+([a-zA-Z0-9\-]{2,}(?:(?:\s+(?:dot|DOT)\s+|\s*\.\s*)[a-zA-Z]{2,})+)/g,
       (_, local, domain) => {
-        const cleanDomain = domain
-          .replace(/\s+(?:dot|DOT)\s+/g, ".")
-          .replace(/\s*\.\s*/g, ".");
+        const cleanDomain = domain.replace(/\s+(?:dot|DOT)\s+/g, ".").replace(/\s*\.\s*/g, ".");
         return `${local}@${cleanDomain}`;
       }
     );
-
-    // 4. Guión bajo o "arroba" en español sin corchetes
-    text = text.replace(/\barroba\b/gi, "@");
-    text = text.replace(/\bpunto\b/gi, ".");
-
+    // 4. español
+    text = text.replace(/\barroba\b/gi, "@").replace(/\bpunto\b/gi, ".");
+    // 5. Reverso ofuscado típico ("moc.lia@reuser" → "user@ail.com")
+    // Solo si la string completa parece email reverso (heurística leve).
+    if (/^[a-z0-9.\-_]{4,}\.(?:moc|gro|ten|ude|vog|moc\.[a-z]{2})@[a-z0-9.\-_]{2,}$/i.test(text.trim())) {
+      text = text.split("").reverse().join("");
+    }
     return text;
   }
 
+  // Decoder Cloudflare email protection (data-cfemail hex string).
+  // CF cifra con XOR de un byte clave. Inverso: pares hex, primer byte = key.
+  // Sitios protegidos muestran "[email protected]" hasta que un JS de CF
+  // decodifica al cargar. Si el JS no corrió (toolbar lee antes), nosotros
+  // decodificamos manualmente.
+  function decodeCfemail(hex) {
+    try {
+      if (!hex || hex.length < 4) return "";
+      const r = parseInt(hex.substr(0, 2), 16);
+      let email = "";
+      for (let n = 2; n < hex.length; n += 2) {
+        email += String.fromCharCode(parseInt(hex.substr(n, 2), 16) ^ r);
+      }
+      return email;
+    } catch { return ""; }
+  }
+
   function extractFrom(text) {
+    if (!text) return;
     const clean = deobfuscate(text);
     (clean.match(emailRegex) || []).forEach(e => found.add(e.toLowerCase().trim()));
   }
 
-  // ── Fuentes de texto ──────────────────────────────────────
-  // Texto visible
+  // ── 1. Texto visible + HTML completo (innerText + innerHTML) ──
   extractFrom(document.body?.innerText || "");
-  // HTML completo (captura emails en atributos ocultos, comentarios, data-*)
   extractFrom(document.body?.innerHTML || "");
+  // 1b. <head> también puede tener emails en meta tags, schema, etc.
+  extractFrom(document.head?.innerHTML || "");
 
-  // mailto: links
-  document.querySelectorAll("a[href^='mailto:']").forEach(a => {
-    const mail = a.href.replace("mailto:", "").split("?")[0].trim();
-    if (mail) found.add(mail.toLowerCase());
+  // ── 2. mailto: links (ampliado: cualquier href con mailto) ──
+  document.querySelectorAll("a[href*='mailto']").forEach(a => {
+    const m = a.href.match(/mailto:([^?&"' >]+)/i);
+    if (m && m[1]) {
+      const mail = decodeURIComponent(m[1]).trim();
+      if (mail.includes("@")) found.add(mail.toLowerCase());
+    }
   });
 
-  // Data attributes comunes para ofuscación JS
-  document.querySelectorAll("[data-email],[data-mail],[data-contact],[data-correo]").forEach(el => {
-    ["data-email","data-mail","data-contact","data-correo"].forEach(attr => {
-      extractFrom(el.getAttribute(attr) || "");
+  // ── 3. Cloudflare email protection ──
+  // CF envuelve el email en <a class="__cf_email__" data-cfemail="abc123...">
+  // Si el JS de CF no corrió, decodificamos nosotros.
+  document.querySelectorAll("[data-cfemail],.__cf_email__").forEach(el => {
+    const hex = el.getAttribute("data-cfemail") || "";
+    const decoded = decodeCfemail(hex);
+    if (decoded && decoded.includes("@")) found.add(decoded.toLowerCase());
+  });
+
+  // ── 4. Data attributes comunes ──
+  const dataAttrs = [
+    "data-email","data-mail","data-contact","data-correo","data-courriel",
+    "data-emailaddress","data-email-address","data-cfemail","data-mailtolink",
+    "data-cf-emailprotection",
+  ];
+  document.querySelectorAll(dataAttrs.map(a => `[${a}]`).join(",")).forEach(el => {
+    dataAttrs.forEach(attr => {
+      const v = el.getAttribute(attr) || "";
+      if (v) {
+        extractFrom(v);
+        // si parece hex de CF, también probar decode
+        if (/^[a-f0-9]{6,}$/i.test(v)) {
+          const d = decodeCfemail(v);
+          if (d && d.includes("@")) found.add(d.toLowerCase());
+        }
+      }
     });
   });
 
-  // Atributos title (tooltips con emails)
-  document.querySelectorAll("[title]").forEach(el => {
-    extractFrom(el.getAttribute("title") || "");
+  // ── 5. title / aria-label / placeholder / alt ──
+  ["title","aria-label","placeholder","alt"].forEach(attr => {
+    document.querySelectorAll(`[${attr}]`).forEach(el => extractFrom(el.getAttribute(attr) || ""));
   });
 
-  // Atributos aria-label (accesibilidad con emails)
-  document.querySelectorAll("[aria-label]").forEach(el => {
-    extractFrom(el.getAttribute("aria-label") || "");
+  // ── 6. Inputs <input type="email" value="..."> y forms con default ──
+  document.querySelectorAll("input[type='email']").forEach(el => {
+    extractFrom(el.value || el.getAttribute("value") || el.placeholder || "");
   });
 
-  return [...found];
+  // ── 7. JSON-LD structured data (schema.org/Organization, ContactPoint) ──
+  document.querySelectorAll("script[type*='ld+json'], script[type='application/json']").forEach(s => {
+    extractFrom(s.textContent || "");
+  });
+
+  // ── 8. <meta> tags (algunos sitios ponen email en meta content) ──
+  document.querySelectorAll("meta[content]").forEach(m => {
+    const v = m.getAttribute("content") || "";
+    if (v.includes("@")) extractFrom(v);
+  });
+
+  // ── 9. Shadow DOM accesible (open shadow roots) ──
+  function walkShadowRoots(root) {
+    if (!root) return;
+    try {
+      if (root.querySelectorAll) {
+        root.querySelectorAll("*").forEach(el => {
+          if (el.shadowRoot) {
+            extractFrom(el.shadowRoot.innerHTML || "");
+            walkShadowRoots(el.shadowRoot);
+          }
+        });
+      }
+    } catch {}
+  }
+  walkShadowRoots(document);
+
+  // ── 10. Iframes mismo-origen (try/catch porque cross-origin tira SecurityError) ──
+  document.querySelectorAll("iframe").forEach(f => {
+    try {
+      const doc = f.contentDocument || f.contentWindow?.document;
+      if (doc?.body) {
+        extractFrom(doc.body.innerText || "");
+        extractFrom(doc.body.innerHTML || "");
+        doc.querySelectorAll("a[href*='mailto']").forEach(a => {
+          const m = a.href.match(/mailto:([^?&"' >]+)/i);
+          if (m && m[1]) found.add(decodeURIComponent(m[1]).trim().toLowerCase());
+        });
+      }
+    } catch {}
+  });
+
+  // ── 11. Redes sociales como fallback ──
+  // Si la página no nos dió email, capturar links a redes sociales para que
+  // el MB pueda buscar contacto ahí manualmente.
+  const SOCIAL_PATTERNS = [
+    /facebook\.com\/[^"' >/]+/i,
+    /linkedin\.com\/(?:company|in)\/[^"' >/]+/i,
+    /instagram\.com\/[^"' >/]+/i,
+    /twitter\.com\/[^"' >/]+/i,
+    /x\.com\/[^"' >/]+/i,
+    /youtube\.com\/(?:c|channel|user|@)[^"' >/]+/i,
+  ];
+  document.querySelectorAll("a[href]").forEach(a => {
+    const href = a.href || "";
+    SOCIAL_PATTERNS.forEach(re => {
+      const m = href.match(re);
+      if (m) socialLinks.add(m[0]);
+    });
+  });
+
+  return { emails: [...found], socialLinks: [...socialLinks] };
 }
 
 // ============================================================
 // 2. Páginas de contacto del propio sitio
 // ============================================================
 export async function scrapeContactPages(baseUrl) {
+  // Maxi 2026-06-17 v2: ampliado con variantes con guión bajo (`/contact_us`
+  // — caso lucianne.com) y trailing slash. Antes solo guión medio.
   const paths = [
-    "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos",
-    "/contact.html", "/contact.php", "/page/contact", "/pages/contact",
-    "/support/contact", "/help/contact", "/support", "/help", "/help-center",
-    "/lien-he", "/lienhe", "/kontakt", "/contatti", "/contato", "/contattaci",
-    "/about", "/about-us", "/sobre-nosotros", "/quienes-somos", "/nosotros", "/gioi-thieu",
-    "/directorio", "/directory", "/team", "/equipo", "/equipe", "/staff",
+    // EN — todas las variantes
+    "/contact", "/contact/", "/contact-us", "/contact_us", "/contact_us/", "/contactus",
+    "/contact.html", "/contact.php", "/contact.aspx", "/page/contact", "/pages/contact",
+    "/support/contact", "/help/contact", "/support", "/help", "/help-center", "/helpdesk",
+    // ES / PT
+    "/contacto", "/contactanos", "/contactenos", "/contato", "/contate-nos", "/fale-conosco",
+    // IT / FR / DE
+    "/contatti", "/contattaci", "/kontakt", "/kontakte", "/contactez-nous",
+    // VN / RU / PL
+    "/lien-he", "/lienhe", "/gioi-thieu", "/svyaz", "/kontakty",
+    // About / team
+    "/about", "/about-us", "/about_us", "/sobre-nosotros", "/quienes-somos", "/nosotros",
+    "/team", "/equipo", "/equipe", "/staff", "/directorio", "/directory", "/redaccion",
+    // Advertise / monetization (high signal)
     "/advertise", "/advertising", "/publicidad", "/publicidade", "/anunciar", "/anunciantes",
-    "/quang-cao", "/werbung", "/pubblicita",
-    "/legal", "/aviso-legal", "/privacy", "/privacidad", "/redaccion",
+    "/quang-cao", "/werbung", "/pubblicita", "/media-kit", "/mediakit", "/partners", "/sponsors",
+    // Legal (last resort)
+    "/legal", "/aviso-legal", "/privacy", "/privacidad", "/imprint", "/impressum",
   ];
   const emails = new Set();
 

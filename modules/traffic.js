@@ -381,11 +381,17 @@ export async function getTraffic(domain, opts = {}) {
           topCountries,
           tags:           data.Tags         || [],
         };
-        await saveTrafficCache(cleanDomain, result);
-        // Persistir GEO al cache compartido (autopilot lo aprovecha también)
-        if (topCountries[0]?.code && _authToken) {
-          const src = topCountries[0]?.source === "tld" ? "tld" : "similarweb";
-          setDomainGeo(_authToken, cleanDomain, topCountries[0].code, src, SOURCE_CONFIDENCE[src]).catch(() => {});
+        // Maxi 2026-06-17 v2: NO cachear si visits=0. Antes guardábamos 0s en
+        // cache por 90 días → la toolbar decía "sin tráfico" aunque SimilarWeb
+        // tuviera la data correcta horas después. Solo cacheamos visits >= 1.
+        if (visits >= 1) {
+          await saveTrafficCache(cleanDomain, result);
+          if (topCountries[0]?.code && _authToken) {
+            const src = topCountries[0]?.source === "tld" ? "tld" : "similarweb";
+            setDomainGeo(_authToken, cleanDomain, topCountries[0].code, src, SOURCE_CONFIDENCE[src]).catch(() => {});
+          }
+        } else {
+          console.log(`[Traffic] ${cleanDomain} visits=0 desde /all-insights — NO cachear, dejar re-fetch para la próxima`);
         }
         return result;
       }
@@ -430,10 +436,15 @@ export async function getTraffic(domain, opts = {}) {
       globalRank:     fData.GlobalRank   || null,
       tags: [], topCountries,
     };
-    await saveTrafficCache(cleanDomain, result);
-    if (topCountries[0]?.code && _authToken) {
-      const src = topCountries[0]?.source === "tld" ? "tld" : "similarweb";
-      setDomainGeo(_authToken, cleanDomain, topCountries[0].code, src, SOURCE_CONFIDENCE[src]).catch(() => {});
+    // Maxi 2026-06-17 v2: igual que arriba — NO cachear 0s en fallback /similar-sites.
+    if (visits >= 1) {
+      await saveTrafficCache(cleanDomain, result);
+      if (topCountries[0]?.code && _authToken) {
+        const src = topCountries[0]?.source === "tld" ? "tld" : "similarweb";
+        setDomainGeo(_authToken, cleanDomain, topCountries[0].code, src, SOURCE_CONFIDENCE[src]).catch(() => {});
+      }
+    } else {
+      console.log(`[Traffic] ${cleanDomain} visits=0 desde /similar-sites fallback — NO cachear`);
     }
     return result;
 
