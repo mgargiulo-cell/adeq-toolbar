@@ -6735,10 +6735,10 @@ async function initCsvQueue() {
     const myNextDay = parseCount(myNextDayRes);
     const myTotal = myPending + myDone + mySkipped + myNextDay;
 
+    // Maxi 2026-06-18: quitada la línea "Prospects (To Review)" — duplicada con el tab counter
     statsEl.innerHTML = `
       <div style="margin-bottom:4px"><strong>⚙️ Processing queue:</strong> ${csvPending}/${CSV_PENDING_CAP} pending${csvProcessing ? ` + ${csvProcessing} processing` : ""}</div>
       <div style="margin-bottom:4px"><strong>⏳ Waitlist:</strong> ${waitlistCount}/${WAITLIST_CAP} waiting (auto-promotes when freed)</div>
-      <div style="margin-bottom:4px"><strong>📋 Prospects (To Review):</strong> ${reviewPending} enriched leads ready</div>
       ${myTotal > 0 ? `
       <div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--border);font-size:11px">
         <strong style="color:#3b82f6">👤 My uploads today:</strong>

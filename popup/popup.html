@@ -1067,9 +1067,7 @@
        SECTION 2/3 — External CSV (URLs not in Monday)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card" style="margin-top:20px">
-    <div class="card-title">📤 External URLs Auto Prospector (CSV)</div>
-    <p class="import-desc">Upload a CSV (1 domain per line) with <strong>external</strong> URLs. The auto-prospector processes them in the background — analyzes traffic, emails, and pushes them to Monday as new prospects.</p>
-
+    <div class="card-title">📤 IMPORT CSV-EXCEL</div>
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
       <input id="csv-file-input" type="file" accept=".csv,.txt" style="flex:1;font-size:11px" />
       <button id="btn-csv-upload" class="btn btn-primary btn-sm">Upload</button>
@@ -1084,9 +1082,7 @@
        (extrae publishers de competidores que publican su inventory)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card" style="margin-top:20px">
-    <div class="card-title">📋 Import publishers from sellers.json</div>
-    <p class="import-desc">Each ad-tech company publishes a public <code>/sellers.json</code> with all the publishers they monetize. Pick a company → fetch → queue all publisher domains for analysis. Cap: <strong>300 pending in queue</strong> (compartido entre todos los imports).</p>
-
+    <div class="card-title">📋 IMPORT SELLERS.JSON FROM PARTNERS</div>
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
       <select id="sellers-company-select" class="form-select" style="flex:1;font-size:11px"></select>
       <button id="btn-sellers-edit" class="btn btn-secondary btn-sm" style="font-size:11px;padding:3px 8px" title="Edit company list">✏️ Edit</button>
@@ -1122,9 +1118,7 @@
        (busca en Monday items ya existentes en Ciclo Finalizado)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card" style="margin-top:20px">
-    <div class="card-title">🔄 Monday URL Auto Prospector</div>
-    <p class="import-desc">Searches for domains <strong>already in Monday</strong> with <strong>Ciclo Finalizado</strong> status (filtered by Geo and Language) and re-prospects them in background. Refreshes email, traffic, geo, and moves them to <strong>Propuesta Vigente (T)</strong>.</p>
-
+    <div class="card-title">🔄 IMPORT MONDAY BOARD WEBSITES</div>
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
       <select id="refresh-geo" class="form-select" style="font-size:11px" title="Must match exact value of GEO column in Monday.">
         <option value="">Geo: Todos</option>
