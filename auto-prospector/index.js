@@ -4404,41 +4404,51 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     && (apolloUsage.usedToday + apolloCallsThisSessionRef.count) < apolloUsage.limit
     && apolloMonthRemaining > 0;
 
-  // Estrategia 2026-06-18 (Maxi): nueva prioridad SECUENCIAL — no más 50/50.
-  //   1° INFORMER (WHOIS/website.informer) — gratis, primero siempre. Si trae
-  //      email no genérico → listo, evita Apollo.
-  //   2° SCRAPING del sitio — gratis, segundo siempre. Visita /contact, /team
-  //      y 20+ paths. Si encuentra → listo, evita Apollo.
-  //   3° APOLLO con FORZAR UNLOCK — solo si los 2 anteriores fallaron.
-  //      Gasta crédito para descubrir el decision-maker real.
+  // Estrategia 2026-06-18 v2 (Maxi): Informer + Scrape gratis SIEMPRE,
+  //   Apollo se mete RANDOM forzado por pacing diario para consumir el cupo
+  //   mensual. La probabilidad de tirar Apollo escala con cuánto cupo queda
+  //   en el día (más temprano del día → más probabilidad).
+  //   - Si informer/scrape no encontraron persona → Apollo sí o sí (cubre el caso vacío)
+  //   - Si informer/scrape sí encontraron → Apollo con prob = remaining_today / daily_limit
+  //     (al inicio del día ~100%, al final ~0%). Cuando dispara aporta un 2do
+  //     email decision-maker (Apollo siempre va PRIMERO en el array).
   let apolloRes = null;
   let scraperEmails = [];
   const informerSet = new Set();
   const urlByEmail  = new Map();
   const contactForms = new Set();
-  // Tier 1: Informer
+  // Tier 1: Informer (gratis, siempre)
   const infRes = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
   const infNonGeneric = infRes.emails.find(e => !_isGenericLocalPart(e));
+  let scrapedNonGeneric = null;
+  let _socialOutCsvScope = null;
   if (infNonGeneric) {
     scraperEmails = infRes.emails;
     infRes.emails.forEach(e => { informerSet.add(e.toLowerCase()); });
     infRes.urlByEmail.forEach((url, em) => { urlByEmail.set(em, url); });
-    log(`  ✅ Tier 1 INFORMER hit ${domain} → ${infNonGeneric} (sin Apollo, sin HTML scrape)`);
+    log(`  ✅ Tier 1 INFORMER hit ${domain} → ${infNonGeneric}`);
   } else {
-    // Tier 2: SIEMPRE scraping primero (gratis)
+    // Tier 2: SIEMPRE scraping (gratis)
     const socialOut = new Map();
     scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
-    const scrapedNonGeneric = scraperEmails.find(e => !_isGenericLocalPart(e));
-    if (scrapedNonGeneric) {
-      log(`  ✅ Tier 2 SCRAPE hit ${domain} → ${scrapedNonGeneric} (sin Apollo credit)`);
-    } else if (canUseApollo) {
-      // Tier 3: SCRAPE no encontró persona → Apollo forzar unlock
-      log(`  💎 Tier 3 APOLLO ${domain} (scrape vacío o solo genéricos — forzar unlock)`);
+    scrapedNonGeneric = scraperEmails.find(e => !_isGenericLocalPart(e));
+    if (scrapedNonGeneric) log(`  ✅ Tier 2 SCRAPE hit ${domain} → ${scrapedNonGeneric}`);
+    _socialOutCsvScope = socialOut;
+  }
+  // Apollo random forzado por pacing diario (consume cupo)
+  if (canUseApollo) {
+    const haveDM = !!(infNonGeneric || scrapedNonGeneric);
+    const dailyLimit  = Math.max(1, apolloUsage.limit || 1);
+    const usedToday   = apolloUsage.usedToday + apolloCallsThisSessionRef.count;
+    const remainingPct = Math.max(0, Math.min(1, (dailyLimit - usedToday) / dailyLimit));
+    // Si no tenemos decision-maker → 100% Apollo. Si ya tenemos → prob = pacing
+    const apolloChance = haveDM ? remainingPct : 1;
+    if (Math.random() < apolloChance) {
+      log(`  💎 Apollo ${domain} (haveDM=${haveDM}, pacing=${(remainingPct*100).toFixed(0)}%)`);
       apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
         .catch(() => null);
     }
-    var _socialOutCsvScope = socialOut;
   }
   const apolloContactName = apolloRes?.contact_name || "";
   const apolloPhone       = apolloRes?.phone || "";
