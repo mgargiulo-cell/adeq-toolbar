@@ -6160,6 +6160,89 @@ async function scanAutoRepliesForUser(token, userEmail) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// SCAN RESPUESTAS REALES — Maxi 2026-06-18
+// ────────────────────────────────────────────────────────────────
+// Objetivo: detectar cuando un contacto responde REAL (no OOO, no bounce,
+// no auto-reply). Cada respuesta real se marca en toolbar_response_tracking
+// para alimentar las stats de conversion rate por source/geo/category.
+//
+// Lógica:
+//   1. Leer envíos sin respuesta de últimos 14 días (mb_email)
+//   2. Para cada uno, buscar en Gmail si llegó respuesta del email_sent_to
+//   3. Si llegó: chequear si es OOO / auto-reply (NO cuenta) o real
+//   4. Marcar responded_at + response_type ("real"|"ooo")
+// ════════════════════════════════════════════════════════════════
+async function scanRealResponsesForUser(token, userEmail) {
+  try {
+    const accessToken = await getGmailAccessToken(userEmail);
+    // Envíos pendientes de respuesta — últimos 14 días, sin responded_at
+    const since14d = new Date(Date.now() - 14 * 86400_000).toISOString();
+    const trackRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?mb_email=eq.${encodeURIComponent(userEmail.toLowerCase())}&responded_at=is.null&sent_at=gte.${since14d}&select=id,email_sent_to,sent_at,domain&order=sent_at.desc&limit=200`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!trackRes.ok) return 0;
+    const pending = await trackRes.json();
+    if (!Array.isArray(pending) || pending.length === 0) return 0;
+
+    let detected = 0;
+    // Procesar en chunks para no spammear Gmail
+    for (const row of pending) {
+      try {
+        const to = (row.email_sent_to || "").toLowerCase();
+        if (!to.includes("@")) continue;
+        // Query Gmail: respuestas DEL contact al userEmail después del envío
+        const sentDate = new Date(row.sent_at);
+        const afterDate = `${sentDate.getUTCFullYear()}/${sentDate.getUTCMonth()+1}/${sentDate.getUTCDate()}`;
+        const q = encodeURIComponent(`from:${to} to:${userEmail} after:${afterDate} in:anywhere`);
+        const listRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=5`,
+          { headers: { "Authorization": `Bearer ${accessToken}` } }
+        );
+        if (!listRes.ok) continue;
+        const list = await listRes.json();
+        const ids = (list.messages || []).map(m => m.id);
+        if (!ids.length) continue;
+
+        // Hay respuesta — chequear si es OOO / auto-reply
+        let isAutoReply = false;
+        for (const id of ids) {
+          const msgRes = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=Auto-Submitted&metadataHeaders=Subject&metadataHeaders=X-Autoreply&metadataHeaders=X-Auto-Response-Suppress`,
+            { headers: { "Authorization": `Bearer ${accessToken}` } }
+          );
+          if (!msgRes.ok) continue;
+          const msg = await msgRes.json();
+          const headers = msg.payload?.headers || [];
+          const autoSub = headers.find(h => h.name?.toLowerCase() === "auto-submitted")?.value || "";
+          const subj = headers.find(h => h.name?.toLowerCase() === "subject")?.value || "";
+          const hasAutoReplyHeader = !!headers.find(h => ["x-autoreply","x-auto-response-suppress"].includes(h.name?.toLowerCase()));
+          const subjOOO = /\b(out of office|out-of-office|away|ausencia|vacation|vacaciones|férias|ferie|abwesen|auto[-\s]?reply|automatic reply|automatisch|absence|absencia)\b/i.test(subj);
+          if (/auto-replied|auto-generated/i.test(autoSub) || hasAutoReplyHeader || subjOOO) {
+            isAutoReply = true;
+            break;
+          }
+        }
+        const responseType = isAutoReply ? "ooo" : "real";
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?id=eq.${row.id}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ responded_at: new Date().toISOString(), response_type: responseType }),
+        }).catch(() => {});
+        if (!isAutoReply) detected++;
+      } catch {}
+    }
+    if (detected > 0) {
+      log(`💌 scanRealResponses ${userEmail}: ${detected} respuesta(s) REAL detectada(s)`);
+    }
+    return detected;
+  } catch (e) {
+    log(`⚠️ scanRealResponses error: ${e.message}`);
+    return 0;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
 // BOUNCE RETRY — re-envío automático a próximo email cuando bounce
 // ────────────────────────────────────────────────────────────────
 // Llamada desde scanBouncesForUser cuando detecta hard bounce.
@@ -8053,6 +8136,9 @@ async function runAgentCycle(token, allFlags) {
     }
     // Bounce scan (Gmail INBOX) — fire-and-forget para que no atrase el ciclo
     scanBouncesForUser(token, userEmail).catch(() => {});
+    // Maxi 2026-06-18: scan respuestas REALES (no OOO) para nutrir
+    // toolbar_response_tracking + ranking dinámico por source.
+    scanRealResponsesForUser(token, userEmail).catch(() => {});
     // Auto-reply scan (out-of-office, ticket systems, etc.) — también dispara retry
     scanAutoRepliesForUser(token, userEmail).catch(() => {});
     // Kill switch check
@@ -8684,6 +8770,20 @@ async function runAgentCycle(token, allFlags) {
           continue; // próximo lead
         }
 
+        // Maxi 2026-06-18: re-check bounce JUSTO antes de enviar. Entre el rank
+        // inicial y este send pueden haber pasado minutos; otro MB/scan pudo
+        // haber marcado este email como bounced. Si rebotó ahora → skip.
+        if (isBouncedSync(email)) {
+          log(`  🚫 ${domain}: ${email} marcado bounced ENTRE rank y send — abortar envío`);
+          if (reservedId) {
+            fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ action: "skipped", reason: "bounced_in_window" }),
+            }).catch(() => {});
+          }
+          continue; // próximo lead
+        }
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId });
 
         // PATCH reserved → sent ahora que confirmamos el envío
@@ -8702,6 +8802,27 @@ async function runAgentCycle(token, allFlags) {
             body: JSON.stringify(_patchBody),
           }).catch(() => {});
         }
+
+        // Maxi 2026-06-18: registrar envío en response_tracking para medir
+        // qué TIPO de email convierte mejor (apollo/informer/scrape/social/generic).
+        // responded_at queda NULL hasta que scanRealResponsesForUser detecte un reply real.
+        fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+          method: "POST",
+          headers: {
+            "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+            "Content-Type": "application/json", "Prefer": "return=minimal,resolution=merge-duplicates",
+          },
+          body: JSON.stringify({
+            agent_action_id: reservedId || null,
+            mb_email:        userEmail.toLowerCase(),
+            domain,
+            email_sent_to:   email,
+            source:          pickedSource || "unknown",
+            geo:             leadGeo || "",
+            category:        lead.category || "",
+            sent_at:         new Date().toISOString(),
+          }),
+        }).catch(() => {});
 
         // 5. Push to Monday CON estado correcto desde el inicio (Propuesta Vigente T = idx 3)
         let mondayItemId = null;
@@ -8865,6 +8986,44 @@ function _scoresToRank(scoresBySource) {
 // Lee de toolbar_source_performance la perf de un MB. Si no hay data suficiente
 // para alguna source (sent < threshold), esa source NO entra en el cómputo y
 // queda con su rank default. Devuelve un map {source: rank} listo para usar.
+// Maxi 2026-06-18: ranking por TASA DE RESPUESTA REAL.
+// Lee toolbar_response_tracking de últimos N días y computa:
+//   conversion_rate(source) = (count where response_type='real') / count_sent
+// Si hay sample suficiente (≥10 envíos por source en ≥2 sources), devuelve rank.
+// Sino devuelve null y el caller cae al ranking viejo (open_rate-based).
+async function _fetchResponseRateRank(token, mbEmail) {
+  try {
+    const mb = (mbEmail || "").toLowerCase();
+    const since = new Date(Date.now() - SOURCE_PERF_WINDOW_DAYS * 86400_000).toISOString();
+    const filter = mb ? `&mb_email=eq.${encodeURIComponent(mb)}` : "";
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${since}${filter}&select=source,response_type&limit=5000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json().catch(() => []);
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    // Contadores por source
+    const counts = new Map(); // source → { sent, real }
+    for (const r of rows) {
+      const src = (r.source || "unknown").toLowerCase();
+      const c = counts.get(src) || { sent: 0, real: 0 };
+      c.sent++;
+      if (r.response_type === "real") c.real++;
+      counts.set(src, c);
+    }
+    // Filtrar sources con ≥10 envíos (sample mínimo)
+    const qualified = [...counts.entries()].filter(([_, c]) => c.sent >= 10);
+    if (qualified.length < 2) return null; // necesitamos ≥2 para rankear
+    // Score = response_rate (0-1) + smoothing leve
+    const scores = {};
+    for (const [src, c] of qualified) {
+      scores[src] = c.sent > 0 ? (c.real / c.sent) : 0;
+    }
+    return _scoresToRank(scores);
+  } catch { return null; }
+}
+
 async function _fetchDynamicSourceRank(token, mbEmail) {
   try {
     const mb = (mbEmail || "_global").toLowerCase();
@@ -8917,11 +9076,19 @@ async function getDynamicSourceRank(token, mbEmail) {
   const cached = _sourceRankCache.get(key);
   if (cached && (Date.now() - cached.ts) < SOURCE_PERF_CACHE_TTL) return cached.rank;
 
-  const dynamic = await _fetchDynamicSourceRank(token, key);
-  if (!dynamic) {
-    log(`  ℹ️ source ranking ${key}: sin data en toolbar_source_performance → usando default hardcoded (apollo>informer>scrape)`);
+  // Maxi 2026-06-18: PRIORIDAD a respuestas REALES (toolbar_response_tracking).
+  // Fallback al ranking viejo (open_rate-based) y por último al default hardcoded.
+  let rank = await _fetchResponseRateRank(token, key);
+  let source = "response_rate";
+  if (!rank) {
+    rank = await _fetchDynamicSourceRank(token, key);
+    source = "open_rate";
   }
-  const rank = dynamic || SOURCE_RANK_DEFAULT;
+  if (!rank) {
+    rank = SOURCE_RANK_DEFAULT;
+    source = "hardcoded_default";
+  }
+  log(`  ℹ️ source ranking ${key}: usando ${source} → ${Object.entries(rank).filter(([k])=>k).map(([k,v])=>`${k}:${v.toFixed(2)}`).join(", ")}`);
   _sourceRankCache.set(key, { rank, ts: Date.now() });
   return rank;
 }

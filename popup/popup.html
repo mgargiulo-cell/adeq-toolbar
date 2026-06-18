@@ -122,6 +122,14 @@
       <div style="opacity:.6;font-style:italic">Cargando…</div>
     </div>
 
+    <!-- Maxi 2026-06-18: conversion rate por fuente de email (apollo / informer /
+         scrape / Facebook / YouTube / Twitter / generic). Mide RESPUESTAS REALES
+         (excluye OOO). El agente usa esto para rankear sources. -->
+    <div style="font-size:10px;color:#cbd5e1;font-weight:700;letter-spacing:.5px;margin:10px 0 4px">💌 CONVERSIÓN POR FUENTE DE EMAIL (últimos 30 días)</div>
+    <div id="admin-conversion-by-source" style="display:flex;flex-direction:column;gap:3px;margin-bottom:10px;font-size:11px;color:#cbd5e1">
+      <div style="opacity:.6;font-style:italic">Cargando…</div>
+    </div>
+
     <!-- 👤 Actividad del MB (manual desde la toolbar) -->
     <div style="font-size:10px;color:#cbd5e1;font-weight:700;letter-spacing:.5px;margin:6px 0 4px">👤 ACTIVIDAD DEL MB (MANUAL)</div>
     <div id="admin-stats-summary" class="admin-stats-summary">
@@ -217,28 +225,19 @@
       <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 Categorías prioridad</div>
       <div id="agent-focus-categories-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;padding:6px;background:#0f172a;border-radius:4px"></div>
 
-      <!-- Row 4: Weekly target opcional -->
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px;color:#cbd5e1;margin-top:8px">
-        <div>
-          <label style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">Override diario</label>
-          <select id="agent-focus-daily" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Si está en 'Use default', usa el valor de Max envíos/día arriba.">
-            <option value="0" selected>Usar el default de arriba</option>
-            <option value="5">5/día</option>
-            <option value="10">10/día</option>
-            <option value="30">30/día</option>
-            <option value="50">50/día</option>
-          </select>
-        </div>
-        <div>
-          <label style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">Target semanal</label>
-          <select id="agent-focus-weekly" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Opcional. Si llega antes que el cap diario × 7, el agente pausa hasta lunes.">
-            <option value="0" selected>Sin límite</option>
-            <option value="50">50/semana</option>
-            <option value="100">100/semana</option>
-            <option value="200">200/semana</option>
-            <option value="500">500/semana</option>
-          </select>
-        </div>
+      <!-- Maxi 2026-06-18: Override DAILY ELIMINADO. El cap diario único es
+           "Max envíos/día" de arriba — aplica a los 3 MBs. Weekly target sigue
+           opcional. agent-focus-daily queda hidden para no romper _writeAgentConfig. -->
+      <input type="hidden" id="agent-focus-daily" value="0" />
+      <div style="font-size:11px;color:#cbd5e1;margin-top:8px">
+        <label style="display:block;margin-bottom:3px;color:#94a3b8;font-size:10px;text-transform:uppercase">Target semanal (opcional)</label>
+        <select id="agent-focus-weekly" class="form-select" style="font-size:11px;padding:4px 7px;width:100%" title="Si llega antes que el cap diario × 7, el agente pausa hasta lunes.">
+          <option value="0" selected>Sin límite</option>
+          <option value="50">50/semana</option>
+          <option value="100">100/semana</option>
+          <option value="200">200/semana</option>
+          <option value="500">500/semana</option>
+        </select>
       </div>
 
       <!-- Hidden inputs (compat con _writeAgentConfig + score legacy + hours legacy) -->

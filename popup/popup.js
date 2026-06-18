@@ -925,62 +925,79 @@ const AGENT_CATEGORIES = [
   "fashion", "politics", "weather", "science", "shopping",
 ];
 
-// Render chips selector. State: 0=ignored, 1=priority (verde), 2=excluded (rojo).
-// onChange recibe ({priority: [...], excluded: [...]}). Persiste en hidden inputs.
+// Maxi 2026-06-18: chips de GEO/Cat reescritos con delegación de eventos +
+// listeners persistentes. Antes fallaba en algunos paths (no se actualizaba
+// el visual al click). Ahora el listener queda 1 vez en el wrap padre y
+// sobrevive re-renders. Estado: 0=ignored, 1=priority (verde), 2=excluded (rojo).
 function _renderGeoChips() {
   const wrap = document.getElementById("agent-focus-geos-chips");
   if (!wrap) return;
-  // Estado actual desde hidden inputs (CSV format)
   const priInput = document.getElementById("agent-focus-geos-priority");
   const excInput = document.getElementById("agent-focus-geos-excluded");
+  if (!priInput || !excInput) return;
   const priSet = new Set((priInput.value || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
   const excSet = new Set((excInput.value || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
 
-  // Lista ordenada por nombre español
   const entries = Object.entries(GEO_LABEL).sort((a, b) => a[1].localeCompare(b[1]));
   wrap.innerHTML = entries.map(([code, name]) => {
     const isPri = priSet.has(code);
     const isExc = excSet.has(code);
     const bg = isPri ? "#16a34a" : isExc ? "#dc2626" : "#334155";
     const ico = isPri ? "✓" : isExc ? "✕" : "";
-    return `<button type="button" class="agent-geo-chip" data-code="${code}" style="background:${bg};color:#fff;border:none;border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;font-weight:600">${ico} ${name}</button>`;
+    return `<button type="button" class="agent-geo-chip" data-code="${code}" style="background:${bg};color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:10px;cursor:pointer;font-weight:600;margin:1px">${ico} ${name}</button>`;
   }).join("");
 
-  wrap.querySelectorAll(".agent-geo-chip").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const code = btn.dataset.code;
+  // Delegación: 1 solo listener en el wrap, sobrevive a re-renders.
+  if (!wrap.dataset._delegated) {
+    wrap.dataset._delegated = "1";
+    wrap.addEventListener("click", (e) => {
+      const chip = e.target.closest(".agent-geo-chip");
+      if (!chip) return;
+      const code = chip.dataset.code;
+      const pri = document.getElementById("agent-focus-geos-priority");
+      const exc = document.getElementById("agent-focus-geos-excluded");
+      if (!pri || !exc) return;
+      const p = new Set((pri.value || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
+      const x = new Set((exc.value || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
       // Cycle: ignored → priority → excluded → ignored
-      if (priSet.has(code)) { priSet.delete(code); excSet.add(code); }
-      else if (excSet.has(code)) { excSet.delete(code); }
-      else { priSet.add(code); }
-      priInput.value = [...priSet].join(",");
-      excInput.value = [...excSet].join(",");
-      _renderGeoChips(); // re-render
+      if (p.has(code))      { p.delete(code); x.add(code); }
+      else if (x.has(code)) { x.delete(code); }
+      else                  { p.add(code); }
+      pri.value = [...p].join(",");
+      exc.value = [...x].join(",");
+      _renderGeoChips();
     });
-  });
+  }
 }
 
 function _renderCategoryChips() {
   const wrap = document.getElementById("agent-focus-categories-chips");
   if (!wrap) return;
   const input = document.getElementById("agent-focus-categories");
+  if (!input) return;
   const selected = new Set((input.value || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
 
   wrap.innerHTML = AGENT_CATEGORIES.map(cat => {
     const isOn = selected.has(cat);
     const bg = isOn ? "#16a34a" : "#334155";
     const ico = isOn ? "✓ " : "";
-    return `<button type="button" class="agent-cat-chip" data-cat="${cat}" style="background:${bg};color:#fff;border:none;border-radius:4px;padding:2px 7px;font-size:10px;cursor:pointer;font-weight:600">${ico}${cat}</button>`;
+    return `<button type="button" class="agent-cat-chip" data-cat="${cat}" style="background:${bg};color:#fff;border:none;border-radius:4px;padding:3px 8px;font-size:10px;cursor:pointer;font-weight:600;margin:1px">${ico}${cat}</button>`;
   }).join("");
 
-  wrap.querySelectorAll(".agent-cat-chip").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const cat = btn.dataset.cat;
-      if (selected.has(cat)) selected.delete(cat); else selected.add(cat);
-      input.value = [...selected].join(",");
+  if (!wrap.dataset._delegated) {
+    wrap.dataset._delegated = "1";
+    wrap.addEventListener("click", (e) => {
+      const chip = e.target.closest(".agent-cat-chip");
+      if (!chip) return;
+      const inp = document.getElementById("agent-focus-categories");
+      if (!inp) return;
+      const cat = chip.dataset.cat;
+      const cur = new Set((inp.value || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+      if (cur.has(cat)) cur.delete(cat); else cur.add(cat);
+      inp.value = [...cur].join(",");
       _renderCategoryChips();
     });
-  });
+  }
 }
 
 // Populate hour selects (0-23)
@@ -1652,6 +1669,7 @@ async function loadAdminActivity() {
 
   // Maxi 2026-06-17: Quickview compacto por MB — manual + agente + eficacia.
   renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes);
+  renderAdminConversionBySource().catch(() => {});
 
   // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial.
   // CADA review_queue row genera 1 row para el created_by (descubrió/importó) Y
@@ -1707,6 +1725,77 @@ async function loadAdminActivity() {
 // activity tab. Mostramos 1 fila por MB con: Manual (envío hecho a mano desde
 // la toolbar), Agente (envío automático del worker), Eficacia (validados/
 // enviados). Simple para que Maxi vea quien trabaja cuánto sin escarbar tablas.
+// Maxi 2026-06-18: conversion rate por source (apollo/informer/scrape/social/generic)
+// Mide respuestas REALES (excluye OOO) de toolbar_response_tracking en últimos 30d.
+async function renderAdminConversionBySource() {
+  const wrap = document.getElementById("admin-conversion-by-source");
+  if (!wrap) return;
+  try {
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const since = new Date(Date.now() - 30 * 86400_000).toISOString();
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${since}&select=source,response_type&limit=10000`,
+      { headers }
+    );
+    if (!res.ok) {
+      wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin data — la tabla aún no tiene envíos registrados.</div>';
+      return;
+    }
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin envíos en los últimos 30 días. Esperá a que el agente registre actividad.</div>';
+      return;
+    }
+    // Agregar por source
+    const SOURCE_META = {
+      apollo:   { label: "🎯 Apollo",       color: "#7c3aed" },
+      informer: { label: "🔍 Informer",     color: "#0ea5e9" },
+      scrape:   { label: "🌐 Sitio (HTML)", color: "#10b981" },
+      generic:  { label: "📨 Genérico",     color: "#94a3b8" },
+      Facebook: { label: "📘 Facebook",     color: "#1877f2" },
+      YouTube:  { label: "▶️ YouTube",       color: "#ff0000" },
+      Twitter:  { label: "🐦 Twitter",      color: "#1da1f2" },
+      unknown:  { label: "❓ Unknown",      color: "#64748b" },
+    };
+    const counts = new Map();
+    for (const r of rows) {
+      const src = r.source || "unknown";
+      const c = counts.get(src) || { sent: 0, real: 0, ooo: 0 };
+      c.sent++;
+      if (r.response_type === "real") c.real++;
+      if (r.response_type === "ooo")  c.ooo++;
+      counts.set(src, c);
+    }
+    // Ordenar por conversion rate desc
+    const sorted = [...counts.entries()]
+      .map(([src, c]) => ({ src, ...c, rate: c.sent > 0 ? c.real / c.sent : 0 }))
+      .sort((a, b) => b.rate - a.rate);
+    const html = sorted.map(r => {
+      const meta = SOURCE_META[r.src] || SOURCE_META.unknown;
+      const ratePct = (r.rate * 100).toFixed(1);
+      const barWidth = Math.min(100, r.rate * 500); // 20% real = 100% bar
+      const rateColor = r.rate >= 0.05 ? "#16a34a" : r.rate >= 0.02 ? "#d97706" : "#dc2626";
+      return `
+        <div style="display:grid;grid-template-columns:120px 1fr 80px 80px;gap:6px;align-items:center;padding:4px 6px;background:#0f172a;border-radius:4px;border-left:3px solid ${meta.color}">
+          <div style="color:${meta.color};font-weight:700">${meta.label}</div>
+          <div style="background:#1e293b;height:8px;border-radius:4px;overflow:hidden;position:relative">
+            <div style="height:100%;width:${barWidth}%;background:${rateColor};border-radius:4px"></div>
+          </div>
+          <div style="text-align:right;color:${rateColor};font-weight:700">${ratePct}% real</div>
+          <div style="text-align:right;color:#94a3b8;font-size:10px">${r.real}/${r.sent} envíos${r.ooo > 0 ? ` · ${r.ooo} OOO` : ""}</div>
+        </div>
+      `;
+    }).join("");
+    wrap.innerHTML = html + `
+      <div style="font-size:10px;color:#64748b;text-align:center;padding-top:4px">
+        Tasa de respuesta REAL (excluye Out-of-Office). El agente usa estos números para rankear qué fuente priorizar.
+      </div>
+    `;
+  } catch (e) {
+    wrap.innerHTML = `<div style="opacity:.6;color:#dc2626">Error: ${esc(e.message || String(e))}</div>`;
+  }
+}
+
 function renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes) {
   const wrap = document.getElementById("admin-mb-quickview");
   if (!wrap) return;
