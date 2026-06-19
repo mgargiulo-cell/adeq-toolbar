@@ -26,8 +26,14 @@ const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 4 * 60 * 60 * 1000; // 4h sin trabajo → exit (subido de 30min para evitar restarts frecuentes 2026-05-13)
 const DOMAIN_DELAY_MS  = 2500;
-const MIN_TRAFFIC      = 400_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
-const REVIEW_QUEUE_MIN_TRAFFIC = 400_000; // Floor absoluto en review_queue. Items debajo se auto-borran (no acumulan basura).
+// Maxi 2026-06-19: umbral = 350K PAGEVIEWS (no visits). El número del negocio
+// son páginas vistas: si SimilarWeb da pageViews se usa ese, si solo da visits
+// se estima visits × 2 (ppv promedio inventado). La columna `traffic` de
+// review_queue ahora guarda PAGEVIEWS (antes guardaba visits crudos → los pisos
+// downstream rechazaban/borraban sitios potables de 200-350K visits con buenos
+// pageviews; ese era el bug de "queued → 0 to Prospects").
+const MIN_TRAFFIC      = 350_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
+const REVIEW_QUEUE_MIN_TRAFFIC = 350_000; // Floor absoluto en review_queue (en PAGEVIEWS). Items debajo se auto-borran.
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
@@ -1171,6 +1177,199 @@ async function _feederPullMajestic(token, targetCount, sessionKnown) {
   }
 }
 
+// ════════════════════════════════════════════════════════════════
+// M3 (Maxi 2026-06-19): ASIGNACIÓN INTELIGENTE DE FUENTES DEL FEEDER.
+// Antes el feeder repartía 1/3 FIJO a sellers/monday/majestic sin importar
+// cuál producía leads válidos. Ahora reparte por RENDIMIENTO REAL (yield =
+// efectivos/brutos de los últimos 7 días por fuente), con piso de exploración
+// del 15% para que ninguna fuente muera y pueda recuperarse. Las fuentes
+// agotadas (devuelven pocos efectivos o pocos frescos) pierden peso solas
+// (P1 yield + P3 agotamiento; el costo P2 queda implícito: bajo yield = caro
+// por lead → menos peso). SIN cambios de schema: usa el tag `source` que ya
+// llevan los rows de csv_queue + las columnas gross_* de toolbar_feeder_runs.
+// ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+// FUENTE RENOVABLE (Maxi 2026-06-19): ads.txt → sellers.json (graph expander).
+// Antídoto a "se acaban los JSON": en vez de una lista FIJA de redes, descubre
+// REDES NUEVAS leyendo el ads.txt de publishers que YA validamos, baja su
+// sellers.json y saca PUBLISHERS nuevos. Se auto-alimenta y crece solo. Costo $0
+// (solo HTTP, sin RapidAPI/Apollo). Las redes nuevas se persisten en config para
+// que el descubrimiento compounding crezca con el tiempo.
+// ════════════════════════════════════════════════════════════════
+function _hostFromSellersUrl(u) {
+  try { return new URL(u).hostname.replace(/^www\./, "").toLowerCase(); } catch { return ""; }
+}
+const _KNOWN_SELLER_HOSTS = new Set(FEEDER_SELLERS_SOURCES.map(_hostFromSellersUrl).filter(Boolean));
+
+async function _adsTxtSystems(domain) {
+  try {
+    const res = await fetch(`https://${domain}/ads.txt`, { redirect: "follow", signal: AbortSignal.timeout(9000) });
+    if (!res.ok) return [];
+    const text = await res.text();
+    if (/^\s*<!doctype|<html/i.test(text.trim())) return [];
+    const systems = new Set();
+    for (const line of text.slice(0, 200000).split("\n")) {
+      const clean = line.split("#")[0].trim();
+      if (!clean) continue;
+      const parts = clean.split(",").map(s => s.trim());
+      if (parts.length < 3) continue;
+      const d = _normalizeFeederDomain(parts[0]);
+      if (d && !/^(subdomain|contact|cname|owner)/i.test(d)) systems.add(d);
+    }
+    return [...systems];
+  } catch { return []; }
+}
+
+async function _publishersFromSellersJson(networkDomain) {
+  for (const url of [`https://${networkDomain}/sellers.json`, `https://www.${networkDomain}/sellers.json`]) {
+    try {
+      const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "Accept": "application/json" } });
+      if (!res.ok) continue;
+      const text = await res.text();
+      if (/^\s*<!doctype|<html/i.test(text.trim())) continue;
+      const data = JSON.parse(text);
+      const pubs = (data?.sellers || [])
+        .filter(s => (s.seller_type || "").toUpperCase() === "PUBLISHER")
+        .map(s => _normalizeFeederDomain(s.domain || ""))
+        .filter(Boolean);
+      if (pubs.length) return [...new Set(pubs)];
+    } catch {}
+  }
+  return [];
+}
+
+async function _feederPullAdsTxtGraph(token, maxInject, sessionKnown) {
+  if (maxInject <= 0) return 0;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  // 1. Semillas: publishers que YA validamos (los mejores). Fallback a recientes.
+  let seeds = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&select=domain&order=validated_at.desc&limit=40`, { headers: auth });
+    if (r.ok) seeds = (await r.json()).map(x => _normalizeFeederDomain(x.domain || "")).filter(Boolean);
+  } catch {}
+  if (seeds.length < 5) {
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=domain&order=created_at.desc&limit=40`, { headers: auth });
+      if (r.ok) seeds.push(...(await r.json()).map(x => _normalizeFeederDomain(x.domain || "")).filter(Boolean));
+    } catch {}
+  }
+  seeds = [...new Set(seeds)].slice(0, 25);
+  if (!seeds.length) { log(`  🌐 adstxt-graph: sin semillas (review_queue vacío)`); return 0; }
+
+  // 2. Redes ya conocidas: las fijas (FEEDER_SELLERS_SOURCES) + las descubiertas antes.
+  let discovered = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.discovered_sellers_networks&select=value`, { headers: auth });
+    if (r.ok) { const rows = await r.json(); discovered = JSON.parse(rows?.[0]?.value || "[]"); }
+  } catch {}
+  const knownNetworks = new Set([..._KNOWN_SELLER_HOSTS, ...discovered.map(d => String(d).toLowerCase())]);
+
+  // 3. ads.txt de las semillas → ad-systems → quedarse con los que NO conocíamos.
+  const newNetworks = new Set();
+  for (let i = 0; i < seeds.length; i += 6) {
+    const lists = await Promise.all(seeds.slice(i, i + 6).map(d => _adsTxtSystems(d)));
+    for (const list of lists) for (const net of list) if (!knownNetworks.has(net)) newNetworks.add(net);
+  }
+  if (!newNetworks.size) { log(`  🌐 adstxt-graph: 0 redes nuevas (de ${seeds.length} semillas)`); return 0; }
+
+  // 4. sellers.json de hasta 15 redes nuevas → publishers nuevos → dedup → inject.
+  let inserted = 0;
+  const confirmedNets = [];
+  for (const net of [...newNetworks].slice(0, 15)) {
+    if (inserted >= maxInject) break;
+    const pubs = await _publishersFromSellersJson(net);
+    if (!pubs.length) continue;
+    confirmedNets.push(net);
+    const known = await _findKnownDomainsWorker(token, pubs);
+    const fresh = pubs.filter(d => !known.has(d) && !sessionKnown.has(d));
+    if (!fresh.length) continue;
+    const slice = fresh.slice(0, maxInject - inserted);
+    slice.forEach(d => sessionKnown.add(d));
+    const ok = await _injectIntoCsvQueue(token, slice, "auto_feeder_adstxt");
+    inserted += ok;
+    log(`  🌐 adstxt-graph red NUEVA ${net}: ${pubs.length} pubs → ${fresh.length} frescos → ${ok} insertados`);
+  }
+
+  // 5. Persistir las redes nuevas confirmadas (compounding — la base crece sola).
+  if (confirmedNets.length) {
+    const merged = [...new Set([...discovered, ...confirmedNets])].slice(0, 500);
+    await setConfigValue(token, "discovered_sellers_networks", JSON.stringify(merged)).catch(() => {});
+    log(`  🌐 adstxt-graph: +${confirmedNets.length} redes nuevas guardadas (total acumulado ${merged.length})`);
+  }
+  return inserted;
+}
+
+const FEEDER_SOURCE_KEYS = [
+  { key: "sellers",  tag: "auto_feeder_sellers"  },
+  { key: "monday",   tag: "auto_feeder_monday"   },
+  { key: "majestic", tag: "auto_feeder_majestic" },
+];
+const FEEDER_EXPLORE_FLOOR     = 0.15; // cada fuente recibe ≥15% del split (exploración)
+const FEEDER_WEIGHTS_MIN_GROSS = 30;   // bajo este total de brutos en 7d → 1/3 fijo (cold start)
+
+// Sube las fuentes por debajo del piso y baja proporcionalmente las de arriba.
+function _applyExploreFloor(w, floor) {
+  const keys = ["sellers", "monday", "majestic"];
+  const out = { ...w };
+  let deficit = 0;
+  const above = [];
+  for (const k of keys) {
+    if (out[k] < floor) { deficit += (floor - out[k]); out[k] = floor; }
+    else above.push(k);
+  }
+  if (deficit > 0 && above.length) {
+    const aboveSum = above.reduce((s, k) => s + out[k], 0) || 1;
+    for (const k of above) out[k] = Math.max(floor, out[k] - deficit * (out[k] / aboveSum));
+  }
+  // re-normalizar por si el reparto dejó suma != 1
+  const s = out.sellers + out.monday + out.majestic;
+  return { sellers: out.sellers / s, monday: out.monday / s, majestic: out.majestic / s };
+}
+
+async function _getFeederSourceWeights(token) {
+  const equal = { sellers: 1 / 3, monday: 1 / 3, majestic: 1 / 3, debug: "equal(coldstart)" };
+  try {
+    const sinceISO = new Date(Date.now() - 7 * 86400_000).toISOString();
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    // Brutos por fuente (suma de columnas existentes en runs ok últimos 7 días)
+    const runsRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&cron_at=gte.${sinceISO}&select=gross_sellers,gross_monday,gross_majestic`,
+      { headers: auth }
+    );
+    if (!runsRes.ok) return equal;
+    const runs = await runsRes.json();
+    const gross = { sellers: 0, monday: 0, majestic: 0 };
+    for (const r of (runs || [])) {
+      gross.sellers  += parseInt(r.gross_sellers, 10)  || 0;
+      gross.monday   += parseInt(r.gross_monday, 10)   || 0;
+      gross.majestic += parseInt(r.gross_majestic, 10) || 0;
+    }
+    const totalGross = gross.sellers + gross.monday + gross.majestic;
+    if (totalGross < FEEDER_WEIGHTS_MIN_GROSS) return equal; // poca data → arrancar parejo
+    // Efectivos por fuente: rows que llegaron a status='done' con ese source en la ventana
+    const eff = { sellers: 0, monday: 0, majestic: 0 };
+    for (const s of FEEDER_SOURCE_KEYS) {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&source=eq.${s.tag}&uploaded_at=gte.${sinceISO}&select=id`,
+        { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } }
+      );
+      eff[s.key] = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    }
+    // Yield con suavizado Beta(1,1): (eff+1)/(gross+2)
+    const yld = {
+      sellers:  (eff.sellers  + 1) / (gross.sellers  + 2),
+      monday:   (eff.monday   + 1) / (gross.monday   + 2),
+      majestic: (eff.majestic + 1) / (gross.majestic + 2),
+    };
+    const sum = yld.sellers + yld.monday + yld.majestic;
+    if (!(sum > 0)) return equal;
+    let w = { sellers: yld.sellers / sum, monday: yld.monday / sum, majestic: yld.majestic / sum };
+    w = _applyExploreFloor(w, FEEDER_EXPLORE_FLOOR);
+    w.debug = `eff s/m/j=${eff.sellers}/${eff.monday}/${eff.majestic} gross=${gross.sellers}/${gross.monday}/${gross.majestic}`;
+    return w;
+  } catch { return equal; }
+}
+
 // ORQUESTADOR: chequea si estamos en slot y si no disparó, dispara
 async function maybeRunFeederSlot(token) {
   const slotInfo = _currentFeederSlot();
@@ -1251,25 +1450,34 @@ async function _runFeederSlot(token, slotLabel) {
   if (targetGross > FEEDER_FALLBACK_GROSS_CAP) targetGross = FEEDER_FALLBACK_GROSS_CAP;
   log(`📊 cron ${slotLabel}: target=${targetEffective} efectivos, conv=${(conv * 100).toFixed(1)}%, inyecta hasta ${targetGross} brutos`);
 
-  // 5. Pull from 3 fuentes (split 1/3)
+  // 5. Pull from 3 fuentes — M3: split por RENDIMIENTO (no más 1/3 fijo).
   // Maxi 2026-06-17 (audit #9): sessionKnown ya deduplica entre fuentes — un
   // domain insertado por Sellers no se reinserta por Monday/Majestic. Verificado.
   // El sessionKnown.size final = total únicos insertados en este slot.
-  const perSource = Math.ceil(targetGross / 3);
+  const w = await _getFeederSourceWeights(token);
+  const allocSellers  = Math.max(1, Math.round(targetGross * w.sellers));
+  const allocMonday   = Math.max(1, Math.round(targetGross * w.monday));
+  const allocMajestic = Math.max(1, Math.round(targetGross * w.majestic));
+  log(`  ⚖️ feeder weights: sellers=${(w.sellers * 100).toFixed(0)}% monday=${(w.monday * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
   const sessionKnown = new Set();
-  const fromSellers  = await _feederPullSellers(token, perSource, sessionKnown);
-  const fromMonday   = await _feederPullMonday(token, perSource, sessionKnown);
-  const fromMajestic = await _feederPullMajestic(token, perSource, sessionKnown);
-  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic})`);
-  const grossTotal = fromSellers + fromMonday + fromMajestic;
+  const fromSellers  = await _feederPullSellers(token, allocSellers, sessionKnown);
+  const fromMonday   = await _feederPullMonday(token, allocMonday, sessionKnown);
+  const fromMajestic = await _feederPullMajestic(token, allocMajestic, sessionKnown);
+  // BONUS renovable: ads.txt → sellers.json (descubre redes/publishers nuevos, $0).
+  // Va ENCIMA del split de las 3 (no compite por el yield) — supply extra que
+  // crece sola con el tiempo. Cap modesto por slot para acotar el HTTP.
+  const fromAdsTxt = await _feederPullAdsTxtGraph(token, Math.min(40, Math.max(15, allocSellers)), sessionKnown).catch(() => 0);
+  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic}+adstxt=${fromAdsTxt})`);
+  const grossTotal = fromSellers + fromMonday + fromMajestic + fromAdsTxt;
 
-  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} = ${grossTotal} brutos`);
+  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} adstxt=${fromAdsTxt} = ${grossTotal} brutos`);
 
   await _insertFeederRun(token, slotLabel, {
     status: grossTotal > 0 ? "ok" : "incomplete",
     gross_sellers: fromSellers, gross_monday: fromMonday, gross_majestic: fromMajestic,
     rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
     rq_valid_before: rqValid,
+    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/${(w.monday * 100).toFixed(0)}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt}`,
   });
 }
 
@@ -1327,7 +1535,11 @@ async function _measureFeederRuns(token) {
 // pocas veces". Ahora 4 ventanas alineadas con los slots del agente (9/12/15/18/20)
 // para garantizar que el worker esté despierto cuando dispara. El total diario de
 // prospects igual lo limita agent_max_per_day / daily_override.
-const AUTOPILOT_SLOTS = [12, 15, 18, 20];
+// Maxi 2026-06-19: "prendido casi todo el día". Antes 4 ventanas (12/15/18/20)
+// = ~80min/día. Ahora cada hora 9-20 (L-V). NO revienta presupuesto porque cada
+// arranque pasa por el freno de pacing (abajo): si vamos gastando RapidAPI más
+// rápido que el ritmo del ciclo, ese slot se saltea solo.
+const AUTOPILOT_SLOTS = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
 let _autopilotLastSlot = "";
 
 async function maybeStartAutopilotSlot(token) {
@@ -1353,6 +1565,22 @@ async function maybeStartAutopilotSlot(token) {
   } catch {}
   _autopilotLastSlot = slotLabel;
   await setConfigValue(token, "autopilot_last_slot", slotLabel).catch(() => {});
+
+  // Maxi 2026-06-19: FRENO DE PACING. Como ahora hay slots cada hora, este guard
+  // evita reventar el cupo: si gastamos RapidAPI más rápido que lo que va del
+  // ciclo (6-a-6), o estamos cerca del cap, NO arrancamos este slot. Se auto-frena
+  // al inicio del ciclo y deja correr al final (igual que el feeder).
+  try {
+    const { usedThisMonth, limit: rapidLimit } = await getRapidApiUsageThisMonth(token);
+    if (usedThisMonth >= rapidLimit * FEEDER_RAPIDAPI_THRESHOLD) {
+      log(`🛰️ autopilot ${slotLabel} SKIP: RapidAPI ${usedThisMonth}/${rapidLimit} cerca del cap`);
+      return;
+    }
+    if (_isAheadOfPace(usedThisMonth, rapidLimit)) {
+      log(`🛰️ autopilot ${slotLabel} SKIP throttle: RapidAPI adelantado al ritmo del ciclo (pacing)`);
+      return;
+    }
+  } catch {}
 
   try {
     const cfg = await getConfig(token);
@@ -2360,19 +2588,30 @@ async function _scrapeTrafficFallback(domain) {
   } catch {}
 
   // ── 2. hypestat.com (estima daily uniques → ×30 monthly) ──
+  // Maxi 2026-06-19: Hypestat muestra "Daily Pageviews" — que es JUSTO la métrica
+  // del negocio (350K pageviews). Antes solo tomábamos visitors y el threshold
+  // hacía visits×2 (estimación). Ahora, si hay pageviews directo, los devolvemos.
   try {
     const html = await tryFetch(`https://hypestat.com/info/${domain}`);
     if (html) {
+      // Daily Pageviews directo (preferido)
+      const pvM = html.match(/Daily\s*Page\s*?views?[^<]*<[^>]*>([\d.,]+\s*[KMB]?)/i);
+      const dailyPv = pvM ? parseHumanNum(pvM[1]) : null;
       // "Daily Unique Visitors:" 5,000 → ×30
       let m = html.match(/Daily\s*Unique\s*Visitors[^<]*<[^>]*>([\d.,]+\s*[KMB]?)/i)
         || html.match(/Estimated\s*Worth[\s\S]{0,300}?Visitors[^<]*<[^>]*>([\d.,]+\s*[KMB]?)/i);
-      if (m) {
-        const daily = parseHumanNum(m[1]);
-        if (daily && daily >= 100) {
-          const visits = daily * 30;
-          log(`  📊 scrape fallback ${domain}: hypestat → daily=${daily} ×30 = ${visits}`);
-          return { visits, source: "hypestat_scrape" };
-        }
+      const daily = m ? parseHumanNum(m[1]) : null;
+      if (daily && daily >= 100) {
+        const visits = daily * 30;
+        const pageViews = (dailyPv && dailyPv >= 100) ? dailyPv * 30 : null;
+        log(`  📊 scrape fallback ${domain}: hypestat → daily=${daily} ×30 = ${visits}${pageViews ? ` · pageviews=${pageViews}` : ""}`);
+        return { visits, pageViews, source: "hypestat_scrape" };
+      }
+      // Caso: hay pageviews pero no visitors → derivar visits ≈ pageviews/2 para compat
+      if (dailyPv && dailyPv >= 100) {
+        const pageViews = dailyPv * 30;
+        log(`  📊 scrape fallback ${domain}: hypestat → daily pageviews=${dailyPv} ×30 = ${pageViews}`);
+        return { visits: Math.round(pageViews / 2), pageViews, source: "hypestat_scrape" };
       }
     }
   } catch {}
@@ -2437,7 +2676,7 @@ async function getTrafficData(domain, rapidApiKey) {
       const fb = await _scrapeTrafficFallback(domain).catch(() => null);
       if (fb && fb.visits >= 1000) {
         log(`  ✅ getTrafficData ${domain}: ${reasonForLog} → scrape fallback OK (${fb.source})`);
-        return { visits: fb.visits, topCountry: null, error: null, fromScrape: fb.source };
+        return { visits: fb.visits, pageViews: fb.pageViews ?? null, topCountry: null, error: null, fromScrape: fb.source };
       }
       return null;
     };
@@ -2566,7 +2805,7 @@ async function getTrafficData(domain, rapidApiKey) {
       const fb = await _scrapeTrafficFallback(domain).catch(() => null);
       if (fb && fb.visits >= 1000) {
         log(`  ✅ getTrafficData ${domain}: RapidAPI dijo 0 → scrape fallback rescató ${fb.visits} (${fb.source})`);
-        return { visits: fb.visits, pagesPerVisit, topCountry, topCountries3, swCategory, error: null, fromScrape: fb.source };
+        return { visits: fb.visits, pageViews: fb.pageViews ?? null, pagesPerVisit, topCountry, topCountries3, swCategory, error: null, fromScrape: fb.source };
       }
     }
     return { visits, pagesPerVisit, topCountry, topCountries3, swCategory, error: null };
@@ -2575,7 +2814,7 @@ async function getTrafficData(domain, rapidApiKey) {
     const fb = await _scrapeTrafficFallback(domain).catch(() => null);
     if (fb && fb.visits >= 1000) {
       log(`  ✅ getTrafficData ${domain}: exception rescatada por scrape fallback (${fb.source})`);
-      return { visits: fb.visits, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: null, fromScrape: fb.source };
+      return { visits: fb.visits, pageViews: fb.pageViews ?? null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: null, fromScrape: fb.source };
     }
     return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: e.message };
   }
@@ -2677,7 +2916,7 @@ async function findSimilarSites(domain, rapidApiKey) {
           }
         }
         search(json);
-        return [...new Set(domains)].slice(0, 20).filter(d => isDomainAllowed(d));
+        return [...new Set(domains)].slice(0, 60).filter(d => isDomainAllowed(d)); // Maxi 2026-06-19: 20→60
       } catch { return []; }
     })(),
   ]);
@@ -3413,6 +3652,14 @@ async function fetchPageContent(domain) {
     if (/teads\.tv|teads\.com/i.test(html))                                adNetworks.push("Teads");
     if (/smilewanted\.com/i.test(html))                                    adNetworks.push("SmileWanted");
 
+    // Maxi 2026-06-19 (filtro basura B2): señal de MONETIZACIÓN REAL — AdSense /
+    // Google Ad Manager / programmatic. Más universal que ads.txt: si una web
+    // corre esto, es un publisher monetizable de verdad. Gov/uni/corp/SaaS casi
+    // nunca lo tienen. Es el discriminador positivo más fuerte (más que partner-SSP).
+    const PROGRAMMATIC_RE = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|securepubads\.g\.doubleclick|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|aps\.amazon|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid\.js|prebidjs|adnxs\.com|appnexus|33across|sovrn\.com|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|adservice\.google|fundingchoicesmessages)/i;
+    const hasProgrammatic = PROGRAMMATIC_RE.test(html);
+    const hasDisplayAds   = hasProgrammatic || adNetworks.length > 0;
+
     // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
     // Adult/Streaming PRIMERO porque scoreWebsite los usa como gates duros (descarte total).
     const textForCategory = `${title} ${desc} ${domain}`.toLowerCase();
@@ -3449,10 +3696,102 @@ async function fetchPageContent(domain) {
       title: title.slice(0, 100),
       description: desc.slice(0, 280),
       adNetworks, category,
+      hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
       htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
       textSample,
     };
   } catch { return null; }
+}
+
+// ════════════════════════════════════════════════════════════════
+// FILTRO DE BASURA (Maxi 2026-06-19) — "¿es un publisher monetizable o es
+// basura (gobierno/universidad/empresa/SaaS/e-commerce/marca)?". Combina señales
+// que YA tenemos (no agrega costo de tráfico): publicidad en la página, ads.txt,
+// categoría, y un clasificador Haiku barato SOLO para los casos dudosos.
+// ads.txt NO es obligatorio (muchos publishers buenos no lo tienen) — es UNA
+// señal más. La señal fuerte es la publicidad real en el HTML.
+// ════════════════════════════════════════════════════════════════
+const PUBLISHER_CATEGORIES = new Set(["news","sports","entertainment","finance","technology","health","travel","food","automotive","gambling","streaming","business"]);
+// Títulos típicos de NO-publisher (empresa/SaaS/login/checkout).
+const NON_PUBLISHER_TITLE_RE = /\b(log ?in|sign ?in|sign ?up|my account|mi cuenta|request a demo|book a demo|get a demo|free trial|prueba gratis|pricing|precios|checkout|add to cart|carrito|shopping cart|dashboard|control panel|panel de control|webmail|cpanel|plesk|online banking|banca en l[ií]nea|government|gobierno|ministerio|ministry|municipal|ayuntamiento|university|universidad|faculty|facultad)\b/i;
+
+// Chequeo ligero de ads.txt — true si existe y tiene ≥1 línea de seller real.
+const _adsTxtCache = new Map();
+async function _hasRealAdsTxt(domain) {
+  if (_adsTxtCache.has(domain)) return _adsTxtCache.get(domain);
+  let ok = false;
+  try {
+    const res = await fetch(`https://${domain}/ads.txt`, { signal: AbortSignal.timeout(7000), redirect: "follow" });
+    if (res.ok) {
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      const txt = (await res.text()).slice(0, 20000);
+      // Debe ser texto (no HTML de 404) y tener líneas "dominio, pub-id, DIRECT/RESELLER".
+      const looksHtml = /<html|<!doctype/i.test(txt);
+      const sellerLines = (txt.match(/^[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || []).length;
+      ok = !looksHtml && !ct.includes("text/html") && sellerLines >= 1;
+    }
+  } catch {}
+  if (_adsTxtCache.size > 2000) _adsTxtCache.clear();
+  _adsTxtCache.set(domain, ok);
+  return ok;
+}
+
+// Clasificador Haiku (barato) SOLO para dudosos. Cache por dominio.
+const _publisherClassCache = new Map();
+async function _haikuPublisherClass(token, domain, pageContent, swCategory) {
+  if (_publisherClassCache.has(domain)) return _publisherClassCache.get(domain);
+  const title = pageContent?.title || ""; const desc = pageContent?.description || "";
+  if (!title && !desc) return null; // sin nada que clasificar
+  let type = null;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "anthropic", path: "/v1/messages", method: "POST",
+        body: {
+          model: "claude-haiku-4-5", max_tokens: 20,
+          system: "Clasificás sitios web. Un 'publisher' es un medio/blog/revista/portal de CONTENIDO que vive de publicidad display (noticias, deportes, entretenimiento, etc.). NO son publishers: empresas de servicios, gobiernos, universidades, bancos, SaaS, e-commerce, sitios corporativos de marca. Respondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | other.",
+          messages: [{ role: "user", content: `Domain: ${domain}\nTitle: ${title}\nDescription: ${desc}\nSimilarWeb category: ${swCategory || "?"}` }],
+        },
+      }),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const t = (data?.content?.[0]?.text || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
+      if (["publisher","corp","gov","edu","saas","ecommerce","other"].includes(t)) type = t;
+    }
+  } catch {}
+  if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
+  _publisherClassCache.set(domain, type);
+  return type;
+}
+
+// Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
+async function classifyPublisher(token, domain, pageContent, swCategory) {
+  // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
+  // caído un momento). El guard de "no_emails_and_site_unreachable" downstream
+  // maneja los dominios realmente muertos. Evita falsos rechazos.
+  if (!pageContent) return { ok: true, reason: "no_pagecontent" };
+  const title = (pageContent?.title || "");
+  const cat   = (pageContent?.category || "");
+  // 1. Negativo fuerte por título (empresa/SaaS/login/gov/uni) → basura, gratis.
+  if (NON_PUBLISHER_TITLE_RE.test(title)) return { ok: false, reason: `title_nonpub:"${title.slice(0,40)}"` };
+  // 2. Señal positiva fuerte: publicidad real en la página → publisher. Pasa.
+  if (pageContent?.hasDisplayAds) return { ok: true, reason: pageContent.hasProgrammatic ? "programmatic_ads" : "partner_ssp" };
+  // 3. Categoría de medios (heurística de la home o de SimilarWeb).
+  if (PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
+  const swc = (swCategory || "").toLowerCase();
+  if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
+  // 4. ads.txt como segunda chance (no todos los publishers exponen tags visibles).
+  if (await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
+  // 5. Dudoso (sin ads, sin categoría de medios, sin ads.txt) → Haiku decide.
+  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory);
+  if (type === "publisher") return { ok: true, reason: "haiku_publisher" };
+  if (type) return { ok: false, reason: `haiku_${type}` };
+  // Sin ninguna señal y Haiku no respondió → rechazar (política: menos basura).
+  return { ok: false, reason: "no_publisher_signal" };
 }
 
 // ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
@@ -4358,10 +4697,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // dejar entrar sitios de bajo tráfico por overshoot del estimador).
   const PPV_FALLBACK = 2.0;
   const ppvForThreshold = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : PPV_FALLBACK;
-  const effectivePageViews = Math.round(visits * ppvForThreshold);
-  const usingFallback = !(typeof pagesPerVisit === "number" && pagesPerVisit > 0);
+  // Maxi 2026-06-19: si el 2º chequeo (Hypestat scrape) trajo PÁGINAS VISTAS
+  // directas, usarlas (más preciso que el estimado visits×ppv).
+  const scrapePV = (typeof trafficData.pageViews === "number" && trafficData.pageViews > 0) ? trafficData.pageViews : null;
+  const effectivePageViews = scrapePV != null ? scrapePV : Math.round(visits * ppvForThreshold);
+  const usingFallback = scrapePV == null && !(typeof pagesPerVisit === "number" && pagesPerVisit > 0);
   if (effectivePageViews < REVIEW_QUEUE_MIN_TRAFFIC) {
-    const label = usingFallback ? `visits×${PPV_FALLBACK} fallback` : `visits×${ppvForThreshold.toFixed(2)}`;
+    const label = scrapePV != null ? "hypestat pageviews" : (usingFallback ? `visits×${PPV_FALLBACK} fallback` : `visits×${ppvForThreshold.toFixed(2)}`);
     await markCsvItem(token, item.id, "skipped", {
       error_message: `pageviews ${effectivePageViews} (${label}) below min ${REVIEW_QUEUE_MIN_TRAFFIC}`,
     });
@@ -4402,6 +4744,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         error_message: `geo_saturated_in_pool: ${topCountry || "?"} ya tiene >25% del review_queue`,
       });
       log(`  ⚖️ ${domain} — GEO ${topCountry} saturado en Prospects (>25%) → skip para balance`);
+      return;
+    }
+  }
+  // ── FILTRO DE BASURA (Maxi 2026-06-19) — descartar gov/uni/empresa/SaaS antes
+  // de gastar Apollo+Claude. Excepción: monday_refresh (re-prospect explícito del MB).
+  if (source !== "monday_refresh") {
+    const pub = await classifyPublisher(token, domain, pageContent, swCategory);
+    if (!pub.ok) {
+      await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${pub.reason}` });
+      log(`  🗑 ${domain} — no parece publisher (${pub.reason}) → skip`);
       return;
     }
   }
@@ -4543,9 +4895,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
   //    decida email + draft + push manualmente desde el tab Prospects.
   try {
-    await saveToReviewQueue(token, {
+    // Maxi 2026-06-19: guardamos PAGEVIEWS (no visits crudos) — es el número del
+    // negocio y el que usan los pisos de saveToReviewQueue/cleanup/saturación.
+    const saved = await saveToReviewQueue(token, {
       domain,
-      traffic:        visits || 0,
+      traffic:        effectivePageViews || visits || 0,
       geo:            topCountry || "",
       geosAll:        geosAllIso,
       language:       detectedLang,
@@ -4566,11 +4920,24 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       source,
       mondayItemId,
     });
-    await markCsvItem(token, item.id, "done", { monday_item_id: mondayItemId });
-    // Bump counter global diario (cap safety net 1000/día)
-    bumpCsvDailyCounter(token, 1).catch(() => {});
-    const vstr = visits ? formatVisitsForMonday(visits) : "-";
-    log(`  ✅ ${domain} → review_queue (source:${source}, visits:${vstr}, geo:${topCountry || "-"}, ${emails.length} email(s))`);
+    // Maxi 2026-06-19 (fix): respetar el resultado de saveToReviewQueue. Antes se
+    // marcaba "done" SIEMPRE, aunque saveToReviewQueue devolviera false (rechazo
+    // por dup o por el piso) → el item se contaba como "done" pero NUNCA llegaba
+    // a Prospects (el famoso "34 done · 0 to Prospects"). Ahora si no se guardó,
+    // se marca "skipped" con razón visible en el diagnóstico.
+    if (saved) {
+      await markCsvItem(token, item.id, "done", { monday_item_id: mondayItemId });
+      // Bump counter global diario (cap safety net 1000/día)
+      bumpCsvDailyCounter(token, 1).catch(() => {});
+      const vstr = visits ? formatVisitsForMonday(visits) : "-";
+      log(`  ✅ ${domain} → review_queue (source:${source}, visits:${vstr}, geo:${topCountry || "-"}, ${emails.length} email(s))`);
+    } else {
+      await markCsvItem(token, item.id, "skipped", {
+        error_message: "saveToReviewQueue=false (dup pending o piso de pageviews)",
+        monday_item_id: mondayItemId,
+      });
+      log(`  ⏭️ ${domain} — saveToReviewQueue devolvió false (no llegó a Prospects)`);
+    }
   } catch (e) {
     await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500), monday_item_id: mondayItemId });
     log(`  ❌ ${domain} — ${e.message}`);
@@ -4997,6 +5364,13 @@ async function runSession(token, cfg, sessionStart) {
   const mondaySet  = new Set(mondayDomains);
   let candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
 
+  // Maxi 2026-06-19 (ahorro de créditos): descartar TLDs claramente Anglo
+  // (.us/.co.uk/.ca/.com.au/.nz/.ie) ANTES de pagar el lookup de tráfico. Antes
+  // se pagaba RapidAPI y recién después se descartaban por GEO (desperdicio).
+  const _beforeTld = candidates.length;
+  candidates = candidates.filter(d => !DEPRIO_TLD_RE.test(d));
+  if (_beforeTld !== candidates.length) log(`Pre-filtro TLD Anglo: -${_beforeTld - candidates.length} descartados sin gastar SimilarWeb`);
+
   // ── PRE-FILTRO POR GEO CACHE ──────────────────────────────────
   // Para cada candidato chequeamos si ya conocemos su país en cache.
   // Si está y NO matchea allowedCountries → descartar SIN llamar SimilarWeb.
@@ -5244,7 +5618,8 @@ async function runSession(token, cfg, sessionStart) {
     // Si pagesPerVisit no vino en la respuesta (3% de los hits), asumimos 2.0
     // (conservador vs el promedio observado 2.75, política user 2026-05-19).
     const ppvSafe   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : 2.0;
-    const pageViews = Math.round(visits * ppvSafe);
+    // Maxi 2026-06-19: usar pageviews directos del 2º chequeo (Hypestat) si vinieron.
+    const pageViews = (typeof trafficData.pageViews === "number" && trafficData.pageViews > 0) ? trafficData.pageViews : Math.round(visits * ppvSafe);
     if (pageViews < sessionMinTraffic) {
       log(`  ✗ pageViews (${Math.round(pageViews/1000)}K = ${Math.round(visits/1000)}K visits × ${ppvSafe.toFixed(1)} ppv) < ${(sessionMinTraffic/1000)}K — descartado`);
       await markProcessed(token, [domain], "traffic_low");
@@ -5297,6 +5672,20 @@ async function runSession(token, cfg, sessionStart) {
     if (hasTargetGeo && topCountry && !allowedCountries.has(topCountry)) {
       log(`  ✗ GEO ${topCountry} ∉ {${[...allowedCountries].slice(0,5).join(",")}${allowedCountries.size>5?"...":""}} — descartado`);
       await markProcessed(token, [domain], "geo_target_mismatch");
+      count++; skipped++;
+      trackAutopilotEvent("filtered", domain);
+      trackAutopilotEvent("processed", domain);
+      flushAutopilotStats(token).catch(() => {});
+      await sleep(DOMAIN_DELAY_MS);
+      continue;
+    }
+
+    // ── FILTRO DE BASURA (Maxi 2026-06-19) — antes el autopilot NO filtraba
+    // gov/uni/empresa/SaaS (solo el path CSV lo hacía). Ahora también acá.
+    const _pub = await classifyPublisher(token, domain, pageContent, trafficData?.swCategory);
+    if (!_pub.ok) {
+      log(`  🗑 ${domain} — no parece publisher (${_pub.reason}) → skip`);
+      await markProcessed(token, [domain], "not_publisher");
       count++; skipped++;
       trackAutopilotEvent("filtered", domain);
       trackAutopilotEvent("processed", domain);
@@ -5452,7 +5841,9 @@ async function runSession(token, cfg, sessionStart) {
 
     const saveOk = await saveToReviewQueue(token, {
       domain,
-      traffic:       visits,
+      // Maxi 2026-06-19: PAGEVIEWS (visits × ppv), no visits crudos — consistente
+      // con el piso de saveToReviewQueue/cleanup y con lo que muestra la UI.
+      traffic:       pageViews || visits,
       geo:           topCountry,
       geosAll:       geosAllIsoAuto,
       language,
@@ -7491,8 +7882,10 @@ async function generatePitchAgent(token, ctx) {
   const ragDislikes = rag.dislikes.length > 0
     ? `\n\n# ESTILO A EVITAR (rechazados por el MB — NO escribir nada que se les parezca):\n${rag.dislikes.map((p, i) => `Rechazado ${i + 1}:\n"""${p.substring(0, 300)}"""`).join("\n\n")}`
     : "";
+  // M2: reglas destiladas del feedback 👍/👎 de este MB (síntesis diaria).
+  const rulesBlock = await _getPitchRulesBlock(token, ragOwner);
 
-  const systemMsg = `${adeqStyle}${ragLikes}${ragDislikes}
+  const systemMsg = `${adeqStyle}${ragLikes}${ragDislikes}${rulesBlock}
 
 # OUTPUT REQUIREMENTS — MAIL INICIAL CORTO Y SIMPLE
 Este es el PRIMER mail al publisher: NO sobre-analizar, NO largo, NO armado.
@@ -9640,6 +10033,124 @@ async function maybeRunSourcePerformanceAggregate(token) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// M2 (Maxi 2026-06-19): SÍNTESIS DE FEEDBACK DEL EMAIL IA.
+// Antes el generador solo recuperaba ejemplos sueltos (👍/👎) por similitud.
+// Ahora, 1× por día por MB, Claude (Haiku, barato) LEE los emails likeados y
+// rechazados (+ el motivo del 👎) y los DESTILA en reglas concretas: "HACÉ ..."
+// y "EVITÁ ...". Esas reglas se inyectan en CADA generación (worker + popup),
+// así el sistema "aprende qué tener y qué no tener en cuenta". Se guarda en
+// toolbar_config key `pitch_rules_<email>`.
+// ════════════════════════════════════════════════════════════════
+async function aggregatePitchFeedbackRules(token, userEmail) {
+  const emailLc = (userEmail || "").toLowerCase();
+  if (!emailLc) return;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const sinceISO = new Date(Date.now() - 60 * 86400_000).toISOString();
+  const pull = async (action) => {
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_pitch_feedback?user_email=eq.${encodeURIComponent(emailLc)}&action=eq.${action}&created_at=gte.${sinceISO}&select=pitch_body,context,created_at&order=created_at.desc&limit=15`,
+        { headers: auth }
+      );
+      return r.ok ? (await r.json()) : [];
+    } catch { return []; }
+  };
+  const [liked, disliked] = await Promise.all([pull("liked"), pull("disliked")]);
+  // Necesitamos señal mínima para que valga la pena destilar.
+  if ((liked.length + disliked.length) < 3) return;
+
+  const fmt = (arr) => arr.map((r, i) => {
+    // El motivo del 👎 viene embebido en context como "USER_FEEDBACK_REASON: ..."
+    const reason = (r.context || "").match(/USER_FEEDBACK_REASON:\s*([^\n]+)/i)?.[1] || "";
+    const body = (r.pitch_body || "").substring(0, 400);
+    return `${i + 1}. "${body}"${reason ? `\n   [motivo del MB: ${reason.trim()}]` : ""}`;
+  }).join("\n");
+
+  const userMsg = `Estos son emails de prospección que un media buyer marcó como BUENOS (👍) y MALOS (👎). Tu tarea: detectar PATRONES recurrentes y destilarlos en reglas cortas y accionables para que la IA genere mejores emails para ESTE media buyer.
+
+EMAILS BUENOS (👍):
+${liked.length ? fmt(liked) : "(ninguno aún)"}
+
+EMAILS MALOS (👎):
+${disliked.length ? fmt(disliked) : "(ninguno aún)"}
+
+Devolveme SOLO JSON:
+{ "do": ["regla corta 1", "..."], "avoid": ["regla corta 1", "..."] }
+- Máximo 6 reglas en cada lista, en español, concretas (ej: "evitar palabras como 'sinergia'", "abrir mencionando el dominio", "no más de 2 párrafos").
+- Basate en patrones REALES de los ejemplos, no inventes. Si no hay señal suficiente para una lista, devolvela vacía.`;
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "anthropic", path: "/v1/messages", method: "POST",
+        body: {
+          model: "claude-haiku-4-5", max_tokens: 600,
+          system: "Sos un analista de copywriting B2B. Destilás feedback en reglas accionables. Devolvés SOLO JSON válido.",
+          messages: [{ role: "user", content: userMsg }],
+        },
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const text = data?.content?.[0]?.text || "";
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) return;
+    const parsed = JSON.parse(m[0]);
+    const doRules    = Array.isArray(parsed.do)    ? parsed.do.filter(Boolean).slice(0, 6)    : [];
+    const avoidRules = Array.isArray(parsed.avoid) ? parsed.avoid.filter(Boolean).slice(0, 6) : [];
+    if (doRules.length === 0 && avoidRules.length === 0) return;
+    const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    await setConfigValue(token, `pitch_rules_${emailLc}`, JSON.stringify({ do: doRules, avoid: avoidRules, at: todayMadrid, n: liked.length + disliked.length })).catch(() => {});
+    log(`🧠 pitch rules synth ${emailLc}: ${doRules.length} HACÉ + ${avoidRules.length} EVITÁ (de ${liked.length}👍/${disliked.length}👎)`);
+  } catch (e) { log(`⚠️ aggregatePitchFeedbackRules ${emailLc}: ${e.message}`); }
+}
+
+// Guard: corre 1× por día (hora Madrid) para cada MB habilitado.
+async function maybeRunPitchRulesSynthesis(token) {
+  try {
+    const cfg = await getConfig(token);
+    const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    if (cfg.last_pitch_rules_run === todayMadrid) return;
+    let users = [];
+    try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+    if (!users.length) return;
+    for (const u of users) await aggregatePitchFeedbackRules(token, u);
+    await setConfigValue(token, "last_pitch_rules_run", todayMadrid).catch(() => {});
+  } catch (e) { log(`⚠️ maybeRunPitchRulesSynthesis: ${e.message}`); }
+}
+
+// Lee las reglas destiladas del MB y las formatea como bloque para el prompt.
+// Cache 10min en memoria para no pegarle a config en cada generación.
+const _pitchRulesCache = new Map();
+async function _getPitchRulesBlock(token, userEmail) {
+  const emailLc = (userEmail || "").toLowerCase();
+  if (!emailLc) return "";
+  const cached = _pitchRulesCache.get(emailLc);
+  if (cached && (Date.now() - cached.at) < 600_000) return cached.block;
+  let block = "";
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.${encodeURIComponent(`pitch_rules_${emailLc}`)}&select=value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (r.ok) {
+      const rows = await r.json();
+      const parsed = rows?.[0]?.value ? JSON.parse(rows[0].value) : null;
+      if (parsed && (parsed.do?.length || parsed.avoid?.length)) {
+        const doStr    = (parsed.do || []).map(x => `- ${x}`).join("\n");
+        const avoidStr = (parsed.avoid || []).map(x => `- ${x}`).join("\n");
+        block = `\n\n# REGLAS APRENDIDAS DEL FEEDBACK DE ESTE MB (cumplir SIEMPRE):${doStr ? `\nHACÉ:\n${doStr}` : ""}${avoidStr ? `\nEVITÁ:\n${avoidStr}` : ""}`;
+      }
+    }
+  } catch {}
+  _pitchRulesCache.set(emailLc, { block, at: Date.now() });
+  return block;
+}
+
+// ════════════════════════════════════════════════════════════════
 // NOTIFICATIONS — alert scanners para el bell del popup
 // ════════════════════════════════════════════════════════════════
 // Helper genérico de inserción + 6 scanners que se invocan desde el main loop
@@ -10504,6 +11015,8 @@ async function main() {
         await _checkAutoPauseAgent(token).catch(e => log(`⚠️ autopause: ${e.message}`));
         // Source performance aggregate (1× por día, guard interno)
         await maybeRunSourcePerformanceAggregate(token).catch(e => log(`⚠️ source perf: ${e.message}`));
+        // M2: síntesis de reglas del feedback 👍/👎 del email IA (1× por día, guard interno)
+        await maybeRunPitchRulesSynthesis(token).catch(e => log(`⚠️ pitch rules synth: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 

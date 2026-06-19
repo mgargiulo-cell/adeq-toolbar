@@ -47,5 +47,5 @@ export const CONFIG = {
 
   // ── General ────────────────────────────────────────────────────
   MEDIA_BUYER: "Max",
-  MIN_TRAFFIC: 400000,  // pageViews mínimos (visits × pagesPerVisit). Debajo: descartar sin enriquecer. (User 2026-05-08: fijo +400K)
+  MIN_TRAFFIC: 350000,  // pageViews mínimos (visits × pagesPerVisit). Debajo: descartar. (User 2026-06-19: 350K pageviews; era 400K)
 };

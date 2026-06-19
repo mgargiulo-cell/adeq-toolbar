@@ -883,7 +883,10 @@ async function _readAgentConfig() {
   try {
     const res = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_max_per_day,agent_active_hours_start,agent_active_hours_end,agent_paused_until,agent_paused_reason,agent_focus_config,agent_test_mode)&select=key,value`,
-      { headers }
+      // Maxi 2026-06-19 (fix): timeout. Sin esto, si el fetch se colgaba,
+      // loadAdminAgent quedaba congelado en este await → los chips de GEO/Cat
+      // nunca se dibujaban y el panel Auto-feeder quedaba en "Loading..." eterno.
+      { headers, signal: AbortSignal.timeout(8000) }
     );
     const rows = await res.json();
     const cfg = {};
@@ -1102,9 +1105,13 @@ async function loadAdminAgent() {
   _renderCategoryChips();
 
   // Stats hoy
-  await _refreshAgentStats(myEmail);
-  await _refreshAgentFeed();
-  await _refreshFeederRuns();
+  // Maxi 2026-06-19 (fix): en paralelo + allSettled. Antes era await secuencial:
+  // si uno se colgaba, los siguientes (ej. feeder runs) nunca corrían.
+  await Promise.allSettled([
+    _refreshAgentStats(myEmail),
+    _refreshAgentFeed(),
+    _refreshFeederRuns(),
+  ]);
 }
 
 async function _refreshAgentStats(userEmail) {
@@ -1143,7 +1150,9 @@ async function _refreshFeederRuns() {
   try {
     const res = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_feeder_runs?select=*&order=cron_at.desc&limit=20`,
-      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+      // Maxi 2026-06-19 (fix): timeout para que no quede "Loading..." eterno si
+      // el fetch se cuelga (sin esto el panel nunca salía del estado inicial).
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` }, signal: AbortSignal.timeout(8000) }
     );
     if (!res.ok) {
       listEl.innerHTML = `<div style="color:#f87171">HTTP ${res.status} — ¿RLS bloquea SELECT en toolbar_feeder_runs? (debe permitir solo a admin)</div>`;
@@ -1635,8 +1644,16 @@ async function loadAdminActivity() {
   const mondayManualFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
   // Agente: solo lo que NO es ui_origin=toolbar_manual.
   const isManualAction = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
-  const emailsAgent = agentActions.filter(a => !isManualAction(a) && (a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent")).length;
-  const mondayAgent = agentActions.filter(a => !isManualAction(a) && a.action === "monday_ok").length;
+  // Maxi 2026-06-19 (fix): las tarjetas de arriba ("AGENTE AUTOMATIZADO acting
+  // for this MB") deben respetar el filtro USUARIO. Antes contaban agentActions
+  // GLOBAL (todos los MBs) → mostraba lo mismo para Maxi/Diego/Agus. El fetch de
+  // agent_actions NO filtra por user_email a propósito (el comparador de abajo
+  // necesita TODOS los MBs), así que filtramos acá una copia para las stat cards.
+  const agentActionsMB = userFilter
+    ? agentActions.filter(a => (a.user_email || "").toLowerCase() === userFilter.toLowerCase())
+    : agentActions;
+  const emailsAgent = agentActionsMB.filter(a => !isManualAction(a) && (a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent")).length;
+  const mondayAgent = agentActionsMB.filter(a => !isManualAction(a) && a.action === "monday_ok").length;
   // Bounce rate del agente (rebotes / emails enviados por el agente).
   const bouncesAgent = Array.isArray(bounceRetries) ? bounceRetries.length : 0;
   const bouncePct = emailsAgent > 0 ? Math.round((bouncesAgent / emailsAgent) * 100) : 0;
@@ -3525,8 +3542,7 @@ async function runTrafficCheck(opts = {}) {
         <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px">
           <button id="btn-traffic-recheck" type="button" style="font-size:11px;padding:4px 10px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer">🔄 Re-verificar</button>
           <a id="btn-similarweb-open" href="${swUrl}" target="_blank" rel="noopener" style="font-size:11px;padding:4px 10px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;display:inline-flex;align-items:center;gap:3px">🌐 Abrir en SimilarWeb</a>
-        </div>
-        <span style="font-size:10px;color:#94a3b8">Si SimilarWeb muestra data y nuestra toolbar no, podés cargar el tráfico manual en el campo Traffic abajo.</span>${cacheStr}
+        </div>${cacheStr}
       `;
       setTimeout(() => {
         document.getElementById("btn-traffic-recheck")?.addEventListener("click", () => {
@@ -3810,6 +3826,51 @@ function inferCountryFromPageSignals() {
   return null;
 }
 
+// Maxi 2026-06-19: Apollo AUTO-PACING en Analysis MANUAL (decisión user). Mismo
+// criterio que el agente automatizado: si NO hay decision-maker NO genérico por
+// fuentes gratis → fuerza Apollo (prob 1.0); si ya hay → probabilidad = % de cupo
+// MENSUAL restante (más reveals al inicio del ciclo 6-a-6, menos al final). Se
+// auto-calibra solo y SIEMPRE respeta el tope: si no queda cupo, no revela.
+// Cada reveal consume 1 crédito Apollo (/v1/people/match).
+function _isGenericEmailLocal(email) {
+  const local = String(email || "").split("@")[0].toLowerCase().replace(/[._-]/g, "");
+  return /^(info|contact|hello|hi|admin|support|sales|team|press|media|marketing|office|general|ventas|contacto|hola|ayuda|soporte|prensa|comercial|webmaster|enquiries|hr|jobs|careers|noreply|donotreply)$/.test(local);
+}
+async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
+  try {
+    if (!apolloResult || !Array.isArray(apolloResult.people)) return;
+    // Candidato a revelar: primer contacto bloqueado con id (Apollo los ordena por relevancia)
+    const locked = apolloResult.people.find(p => !p.unlocked && p.id);
+    if (!locked) return;
+    // ¿Ya tenemos un decision-maker NO genérico por fuentes gratis?
+    const haveDM = (state.emails || []).some(e => !_isGenericEmailLocal(e));
+    // Cupo mensual Apollo (mismo origen que el footer)
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_monthly_limit)&select=key,value`, { headers, signal: AbortSignal.timeout(6000) });
+    const rows = r.ok ? await r.json() : [];
+    const map = {}; (rows || []).forEach(x => { map[x.key] = x.value; });
+    const limit = parseInt(map.apollo_monthly_limit || "2400", 10) || 2400;
+    const used  = parseInt(map.apollo_calls_month   || "0", 10) || 0;
+    const remaining = Math.max(0, limit - used);
+    if (remaining <= 0) return; // tope mensual alcanzado → no gastar
+    const remainingPct = Math.max(0, Math.min(1, remaining / limit));
+    const chance = haveDM ? remainingPct : 1;          // sin DM → siempre; con DM → pacing
+    if (Math.random() >= chance) return;               // el pacing decidió que no esta vez
+    const rev = await revealApolloEmail({ id: locked.id, first_name: locked.first_name, last_name: locked.last_name, domain: state.domain });
+    if (state.domain !== domainGuard) return;          // cambió de dominio durante el reveal
+    if (rev?.ok && rev.person?.email) {
+      const idx = apolloResult.people.indexOf(locked);
+      if (idx >= 0) apolloResult.people[idx] = rev.person;
+      addEmailsWithSource([rev.person.email], "Apollo", domainGuard);
+      const apolloEl = document.getElementById("apollo-result");
+      if (apolloEl) renderApolloPeople(apolloEl, apolloResult);
+      renderEmailList(state.emails);
+      refreshApolloFooterCounter();
+      console.log(`[Apollo auto-pace] reveal ${rev.person.email} (haveDM=${haveDM}, chance=${(chance*100).toFixed(0)}%, cupo=${remaining}/${limit})`);
+    }
+  } catch {}
+}
+
 async function runEmailScraper() {
   const el = document.getElementById("email-result");
   try {
@@ -3884,6 +3945,8 @@ async function runEmailScraper() {
       // Pre-render Apollo people block (default 2 visible + ver más)
       const apolloEl = document.getElementById("apollo-result");
       if (apolloEl) renderApolloPeople(apolloEl, apolloResult);
+      // Maxi 2026-06-19: auto-pacing Apollo (1 reveal automático según cupo, como el agente)
+      await _apolloAutoPaceReveal(apolloResult, _dom);
       // Persistir Apollo en session cache para subpáginas
       try {
         const cur = await getSessionCache(state.domain) || {};
@@ -4578,6 +4641,36 @@ function renderApolloPeople(resultEl, result) {
 // ============================================================
 // BOTONES
 // ============================================================
+// M2: reglas destiladas del feedback 👍/👎 del MB (las sintetiza el worker 1×/día
+// y las guarda en toolbar_config `pitch_rules_<email>`). Acá las leemos para
+// inyectarlas también en la generación MANUAL del popup. Cache 10min.
+let _pitchRulesBlockCache = { at: 0, email: "", block: "" };
+async function _getPitchRulesBlockPopup() {
+  const email = (state.loginEmail || "").toLowerCase();
+  if (!email) return "";
+  if (_pitchRulesBlockCache.email === email && (Date.now() - _pitchRulesBlockCache.at) < 600_000) {
+    return _pitchRulesBlockCache.block;
+  }
+  let block = "";
+  try {
+    const r = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.${encodeURIComponent(`pitch_rules_${email}`)}&select=value`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` }, signal: AbortSignal.timeout(6000) }
+    );
+    if (r.ok) {
+      const rows = await r.json();
+      const parsed = rows?.[0]?.value ? JSON.parse(rows[0].value) : null;
+      if (parsed && (parsed.do?.length || parsed.avoid?.length)) {
+        const doStr    = (parsed.do || []).map(x => `- ${x}`).join("\n");
+        const avoidStr = (parsed.avoid || []).map(x => `- ${x}`).join("\n");
+        block = `LEARNED RULES FROM THIS MB'S FEEDBACK (always follow):${doStr ? `\nDO:\n${doStr}` : ""}${avoidStr ? `\nAVOID:\n${avoidStr}` : ""}`;
+      }
+    }
+  } catch {}
+  _pitchRulesBlockCache = { at: Date.now(), email, block };
+  return block;
+}
+
 // ── RAG helpers (Voyage embeddings + Supabase pgvector retrieval) ──
 // Returns { likeBodies: string[], dislikeBodies: string[] }. Empty arrays on
 // any failure — caller silently falls back to heuristic favorites.
@@ -4831,6 +4924,7 @@ async function bindButtons() {
         decisionMakerName: state.decisionMakerName,
         previousPitches: state.generatedPitches.slice(-3),
         dislikes,
+        feedbackRules: await _getPitchRulesBlockPopup(),
         customPrompt: state.customPrompt || "",
         ...cfg, favExamples,
       });
@@ -4916,6 +5010,7 @@ async function bindButtons() {
         decisionMakerName: state.decisionMakerName,
         previousPitches: state.generatedPitches.slice(-3),
         dislikes,
+        feedbackRules: await _getPitchRulesBlockPopup(),
         customPrompt: state.customPrompt || "",
         ...cfg, favExamples,
       });
@@ -6212,7 +6307,7 @@ async function startCascade() {
     "stackoverflow.com","github.com","gitlab.com","canva.com","figma.com",
   ]);
 
-  const CASCADE_LIMIT = 50;
+  const CASCADE_LIMIT = 150; // Maxi 2026-06-19: 50→150 (mostrar más similares; el scrape es gratis)
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días).
   // Si falla (timeout/401/red), seguimos igual con índice vacío — no bloqueamos al MB.
@@ -7018,26 +7113,16 @@ async function initCsvQueue() {
 
   // Estado inicial del toggle + mutex check
   const refreshCsvMutex = async () => {
+    // Maxi 2026-06-19: el toggle visible de AUTO IMPORT se eliminó (2026-06-18;
+    // el worker prende/apaga el flag solo). Antes esta función pintaba un cartel
+    // "🔒 Locked by ... apagar este toggle" al lado de un input ahora OCULTO →
+    // aparecía suelto y confundía. Quitamos el cartel (era código muerto de UI).
+    // Mantenemos el sync del hidden input por compat con el resto de popup.js.
     const st = await import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => null);
     if (!st) return;
     enabledCbx.checked = st.enabled;
-    const isMine = st.sessionUser && st.sessionUser.toLowerCase() === (state.loginEmail || "").toLowerCase();
-    const otherActive = st.enabled && st.sessionUser && !isMine;
-    // UI lock cuando otro user lo tiene activo
-    enabledCbx.disabled = otherActive;
-    let badge = document.getElementById("csv-queue-lock-badge");
-    if (otherActive) {
-      if (!badge) {
-        badge = document.createElement("div");
-        badge.id = "csv-queue-lock-badge";
-        badge.style.cssText = "font-size:10px;color:#991b1b;background:rgba(239,68,68,0.12);border:1px solid #ef4444;border-radius:4px;padding:3px 6px;margin-top:6px";
-        enabledCbx.closest("div").parentElement?.appendChild(badge);
-      }
-      const ownerShort = st.sessionUser.split("@")[0];
-      badge.textContent = `🔒 Locked by ${ownerShort}. Solo ese user puede apagar este toggle.`;
-    } else {
-      badge?.remove();
-    }
+    // Limpiar cartel viejo si quedó renderizado de una versión anterior.
+    document.getElementById("csv-queue-lock-badge")?.remove();
   };
   await refreshCsvMutex();
   if (enabledCbx.checked) startHeartbeat();
@@ -8408,7 +8493,7 @@ const CONTINENT_INFO = {
   AS:  { name: "Asia",            flag: "🌏" },
   NA:  { name: "North America",   flag: "🌎" },
   SA:  { name: "South America",   flag: "🌎" },
-  CA:  { name: "Center America",  flag: "🌎" },
+  CA:  { name: "Central America", flag: "🌎" },
   AFR: { name: "Africa",          flag: "🌍" },
   OC:  { name: "Oceania",         flag: "🌏" },
 };
@@ -8532,6 +8617,22 @@ function _renderCountryPanel(filter = "") {
       return iso.toLowerCase().includes(f) || name.includes(f);
     })
     .sort((a, b) => b[1] - a[1]);
+
+  // Maxi 2026-06-19: fila de CONTINENTES (en inglés) SIEMPRE visible — además de
+  // los países. North/Central/South America separados + Europe/Asia/Africa/Oceania.
+  // Usan los mismos códigos `_C_XX` que ya entiende el filtro multi-GEO, y la misma
+  // clase .country-pick (el handler togglea data-code en _selectedGeoChips).
+  const CONTINENT_ORDER = ["NA", "CA", "SA", "EU", "AS", "AFR", "OC"];
+  let contHtml = "";
+  for (const cont of CONTINENT_ORDER) {
+    const code = `_C_${cont}`;
+    const info = CONTINENT_INFO[cont] || { name: cont, flag: "🌐" };
+    const isOn = sel.has(code);
+    const cn = [...counts.entries()].reduce((acc, [iso, n]) => acc + ((ISO_TO_CONTINENT[iso] === cont) ? n : 0), 0);
+    contHtml += `<button class="country-pick" data-code="${code}" type="button" title="${esc(info.name)}" style="font-size:10px;padding:3px 8px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#0ea5e9"};background:${isOn ? "#10b981" : "#0b2a3d"};color:${isOn ? "#fff" : "#7dd3fc"};font-weight:600">${info.flag} ${esc(info.name)}${cn ? ` (${cn})` : ""}</button>`;
+  }
+  const contBlock = `<div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin:0 0 4px">🌐 Continents</div><div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid #334155">${contHtml}</div>`;
+
   let html = "";
   for (const [iso, n] of sorted) {
     const isOn = sel.has(iso);
@@ -8539,7 +8640,10 @@ function _renderCountryPanel(filter = "") {
     const flag = _isoToFlag(iso);
     html += `<button class="country-pick" data-code="${iso}" type="button" title="${esc(name)}" style="font-size:10px;padding:3px 8px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${flag} ${esc(name)} (${n})</button>`;
   }
-  list.innerHTML = html || `<div style="font-size:11px;color:var(--text-muted);padding:6px">Sin paises ${filter ? "que coincidan" : "disponibles"}.</div>`;
+  const countriesBlock = html
+    ? `<div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin:0 0 4px">📍 Countries</div><div style="display:flex;flex-wrap:wrap;gap:4px">${html}</div>`
+    : `<div style="font-size:11px;color:var(--text-muted);padding:6px">Sin paises ${filter ? "que coincidan" : "disponibles (todavía no hay leads cargados)"}.</div>`;
+  list.innerHTML = contBlock + countriesBlock;
 }
 
 function _rebuildGeoFilterFromRows(rows) {
@@ -8986,7 +9090,9 @@ function renderProspectCard(r) {
   // Sobre con cantidad de emails — destaca arriba (antes estaba abajo, chiquito).
   const emailCountBadge = hasEmail
     ? `<span title="${emails.length} email(s) encontrados" style="font-size:11px;font-weight:700;color:#fff;background:#0ea5e9;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ ${emails.length}</span>`
-    : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span>`;
+    // Maxi 2026-06-19: sin emails → además del badge rojo, botón verde "SW" para
+    // abrir SimilarWeb del dominio (chequear visual si la web vale la pena).
+    : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span><a href="https://www.similarweb.com/website/${esc(r.domain || "")}/" target="_blank" rel="noopener" title="Ver ${esc(r.domain || "")} en SimilarWeb" style="font-size:10px;font-weight:700;color:#fff;background:#10b981;border-radius:4px;padding:1px 6px;flex-shrink:0;text-decoration:none">SW</a>`;
 
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
@@ -9835,6 +9941,7 @@ function initProspectCard(card, data) {
         decisionMakerName: data.contact_name || "",
         previousPitches:   [],
         dislikes,
+        feedbackRules: await _getPitchRulesBlockPopup(),
         favExamples,
         customPrompt:      state.customPrompt || "",
         ...cfg,

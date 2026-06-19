@@ -95,7 +95,7 @@ export async function getSimilarSitesFromSimilarSites(domain) {
     }
     search(json);
 
-    return [...new Set(domains)].slice(0, 20);
+    return [...new Set(domains)].slice(0, 60); // Maxi 2026-06-19: 20→60 (más similares, sigue gratis sin RapidAPI)
   } catch {
     // Silent fail — el runCascade aplica fallback automático a RapidAPI
     return [];
@@ -114,9 +114,37 @@ export async function getSimilarSitesFromSimilarSites(domain) {
  *
  * Resultado: 0 hits de RapidAPI por sesión de Cascade.
  */
+// Maxi 2026-06-19: Cascade ahora hace 2 SALTOS (antes solo 1). Tras traer los
+// similares del seed (nivel 1), expande con los similares-de-los-similares
+// (nivel 2) usando el MISMO scrape gratis de similarsites.com → muchos más
+// resultados SIN gastar créditos. Concurrencia limitada + tope total para no
+// abusar del scrape. Cuando el MB hace click en uno, Analysis enriquece tráfico.
+const CASCADE_MAX_TOTAL   = 150; // tope de dominios acumulados (alineado con CASCADE_LIMIT del popup)
+const CASCADE_L2_SEEDS    = 18;  // cuántos dominios de nivel 1 se expanden a nivel 2
+const CASCADE_L2_CONCURR  = 4;   // fetches simultáneos en nivel 2
+
 export async function runCascade(seedDomain, onProgress) {
   const found = new Map();
 
+  const addDomain = (d, level) => {
+    if (!d || d === seedDomain || found.has(d)) return false;
+    const stub = {
+      domain:      d,
+      title:       d,
+      visits:      0,           // placeholder — se completa cuando user hace Analysis
+      country:     "",
+      countryCode: "",
+      globalRank:  null,
+      description: "",
+      favicon:     `https://www.google.com/s2/favicons?domain=${d}&sz=32`,
+      level,
+    };
+    found.set(d, stub);
+    onProgress?.({ status: "found", site: stub, level });
+    return true;
+  };
+
+  // ── Nivel 1: similares directos del seed ──────────────────────────────
   onProgress?.({ status: "searching", domain: seedDomain, level: 1 });
   let ssLevel1 = await getSimilarSitesFromSimilarSites(seedDomain);
 
@@ -128,28 +156,27 @@ export async function runCascade(seedDomain, onProgress) {
       ssLevel1 = (rapidApiSites || []).map(s => s.domain).filter(Boolean);
     } catch { /* silent — feature degrada naturalmente */ }
   }
+  for (const d of ssLevel1) addDomain(d, 1);
 
-  // Stub objects — sin visits/geo (los traerá Analysis cuando el MB haga click)
-  for (const d of ssLevel1) {
-    if (!found.has(d) && d !== seedDomain) {
-      const stub = {
-        domain:      d,
-        title:       d,
-        visits:      0,           // placeholder — se completa cuando user hace Analysis
-        country:     "",
-        countryCode: "",
-        globalRank:  null,
-        description: "",
-        favicon:     `https://www.google.com/s2/favicons?domain=${d}&sz=32`,
-        level:       1,
-      };
-      found.set(d, stub);
-      onProgress?.({ status: "found", site: stub, level: 1 });
+  // ── Nivel 2: similares de los primeros N de nivel 1 (mismo scrape gratis) ──
+  const l2Seeds = (ssLevel1 || []).slice(0, CASCADE_L2_SEEDS);
+  for (let i = 0; i < l2Seeds.length && found.size < CASCADE_MAX_TOTAL; i += CASCADE_L2_CONCURR) {
+    const batch = l2Seeds.slice(i, i + CASCADE_L2_CONCURR);
+    onProgress?.({ status: "searching", domain: batch[0], level: 2 });
+    const results = await Promise.all(
+      batch.map(seed => getSimilarSitesFromSimilarSites(seed).catch(() => []))
+    );
+    for (const list of results) {
+      for (const d of (list || [])) {
+        if (found.size >= CASCADE_MAX_TOTAL) break;
+        addDomain(d, 2);
+      }
     }
+    await sleep(150); // cortesía con el scrape público
   }
 
-  // Devolvemos sin sort por visits (no las tenemos) — alfabético.
-  return [...found.values()].sort((a, b) => a.domain.localeCompare(b.domain));
+  // Devolvemos sin sort por visits (no las tenemos) — nivel 1 primero, luego alfabético.
+  return [...found.values()].sort((a, b) => (a.level - b.level) || a.domain.localeCompare(b.domain));
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

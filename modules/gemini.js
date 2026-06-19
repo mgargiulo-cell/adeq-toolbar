@@ -144,6 +144,7 @@ export async function generatePitch(ctx) {
     dislikes = [],
     tone = "informal", length = "short", focus = "analysis", opening = "direct",
     favExamples = [],
+    feedbackRules = "",  // M2: reglas destiladas del feedback 👍/👎 (síntesis diaria del worker)
     customPrompt = "",   // optional per-user instructions (Settings → Claude Prompt)
   } = ctx;
 
@@ -229,7 +230,7 @@ EMAIL STRUCTURE — follow this exact order:
 
 TONE: ${toneInstr}
 ANGLE FOR THIS EMAIL: ${angle}
-${previousSection}${favSection}${dislikeSection}
+${previousSection}${favSection}${dislikeSection}${feedbackRules ? `\n${feedbackRules}\n` : ""}
 DO NOT START WITH: "${avoid}"
 
 CRITICAL LANGUAGE RULE: The ENTIRE response (body AND all 3 subject lines) MUST be written in ${langName}. Do NOT mix languages. Every word — in ${langName}.${customPrompt ? `
