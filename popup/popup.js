@@ -6157,11 +6157,22 @@ async function runKeywordSearch() {
 function filterKeywords() {
   const lang = document.getElementById("kw-language").value;
 
-  // Pool: DB primero, built-in como fallback — siempre filtrar nulos
-  let pool = (dbKeywords.length > 0
-    ? dbKeywords
-    : getKeywords(lang).map(k => ({ ...k, db: false }))
-  ).filter(k => typeof k.kw === "string" && k.kw.length > 0);
+  // Pool: SIEMPRE built-in (12 idiomas) + lo importado de DB, deduplicado por frase.
+  // Antes usaba SOLO dbKeywords cuando había imports → al filtrar por un idioma que no
+  // estaba en la DB (polish, german, etc.) no aparecía nada aunque el built-in lo tuviera.
+  const seen = new Set();
+  let pool = [];
+  const addPool = (arr, db) => {
+    for (const k of (Array.isArray(arr) ? arr : [])) {
+      if (typeof k.kw !== "string" || !k.kw) continue;
+      const key = k.kw.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pool.push({ kw: k.kw, lang: k.lang || "", db });
+    }
+  };
+  addPool(getKeywords("").map(k => ({ ...k, db: false })), false);
+  addPool(dbKeywords, true);
 
   if (lang) pool = pool.filter(k => !k.lang || k.lang === lang);
 
@@ -6993,6 +7004,43 @@ async function initCsvQueue() {
     const myNextDay = parseCount(myNextDayRes);
     const myTotal = myPending + myDone + mySkipped + myNextDay;
 
+    // Maxi 2026-06-19: DIAGNÓSTICO "¿por qué 0 en Prospects?". Agrupa el error_message
+    // de los descartados HOY (todos: imports + worker) por motivo, para ver el embudo real.
+    let skipBreakdownHtml = "";
+    try {
+      const r = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(skipped,error,frozen)&processed_at=gte.${todayStartIso}&select=error_message&limit=2000`,
+        { headers }
+      );
+      const rows = r.ok ? await r.json() : [];
+      if (Array.isArray(rows) && rows.length) {
+        // Normaliza el error_message a una "razón" corta (el texto antes de ":" o "—").
+        const bucket = {};
+        const label = (msg) => {
+          const m = (msg || "").toLowerCase();
+          if (!m) return "sin motivo";
+          if (m.includes("pageviews") && m.includes("below")) return "🚦 tráfico < 350K";
+          if (m.includes("no_traffic") || m.includes("sin traffic")) return "📉 sin dato de tráfico";
+          if (m.includes("frozen") || m.includes("freeze")) return "🧊 congelado (3 fallos tráfico)";
+          if (m.includes("deprio-geo")) return "🌎 GEO USA/UK/CA/AU/NZ/IE";
+          if (m.includes("geo_saturated")) return "⚖️ GEO saturado en pool";
+          if (m.includes("not_publisher") || m.includes("publisher_signal") || m.includes("haiku_")) return "🗑 no es publisher (filtro basura)";
+          if (m.includes("category-blocked")) return "🏦 categoría bloqueada";
+          if (m.includes("en monday") || m.includes("estado=")) return "📋 ya en Monday (ciclo activo)";
+          if (m.includes("blocked:")) return "🚫 en blocklist";
+          if (m.includes("unreachable") || m.includes("site_unreachable")) return "💀 sitio caído / sin emails";
+          return "❓ otro: " + m.slice(0, 30);
+        };
+        rows.forEach(row => { const k = label(row.error_message); bucket[k] = (bucket[k] || 0) + 1; });
+        const sorted = Object.entries(bucket).sort((a, b) => b[1] - a[1]);
+        skipBreakdownHtml = `
+          <div style="margin-top:8px;padding-top:6px;border-top:1px dashed var(--border);font-size:11px">
+            <strong style="color:#dc2626">🔎 Por qué se descartaron hoy (${rows.length}):</strong>
+            ${sorted.map(([k, n]) => `<div style="margin-left:8px;color:var(--text-muted)">• ${k} — <strong>${n}</strong></div>`).join("")}
+          </div>`;
+      }
+    } catch {}
+
     // Maxi 2026-06-18: quitada la línea "Prospects (To Review)" — duplicada con el tab counter
     statsEl.innerHTML = `
       <div style="margin-bottom:4px"><strong>⚙️ Processing queue:</strong> ${csvPending}/${CSV_PENDING_CAP} pending${csvProcessing ? ` + ${csvProcessing} processing` : ""}</div>
@@ -7006,6 +7054,7 @@ async function initCsvQueue() {
         ${mySkipped > 0 ? ` <span style="color:#94a3b8">${mySkipped} skipped</span> ·` : ""}
         <span style="opacity:.7">(total ${myTotal})</span>
       </div>` : ""}
+      ${skipBreakdownHtml}
     `;
   };
 
@@ -7312,7 +7361,7 @@ async function initCsvQueue() {
       const _stats = await getCsvQueueStats(state.accessToken);
       const _pending = _stats?.pending || 0;
       const _waiting = _stats?.waiting_pool || 0;
-      const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 500
+      const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 1000
       if (_pending + _waiting + unique.length > _capacityTotal) {
         uploadRes.innerHTML = `❌ <strong>System saturated:</strong> ${_pending}/${CSV_PENDING_CAP} processing + ${_waiting}/${WAITLIST_CAP} waiting. Cannot add ${unique.length} more. Wait for worker.`;
         uploadRes.className = "push-result error";
@@ -7452,14 +7501,15 @@ async function initCsvQueue() {
 //   - OPEN TABS: 30 pestañas por click (memory + popup blocker)
 //   - QUEUE PENDING TOTAL: 300 (compartido entre todos los imports)
 // Caps de la cola (acordados con user 2026-05-11):
-// - csv_queue.pending: 200 (cola de procesamiento del worker)
-// - csv_queue.waiting_pool: 300 (en hold hasta que pending baje)
+// - csv_queue.pending: 200 (cola de procesamiento del worker — throttle fijo del worker)
+// - csv_queue.waiting_pool: 800 (buffer en hold; el worker promueve → pending al liberarse)
 // - review_queue (Prospects): SIN CAP (más leads = más variedad para los MBs)
-// - Por tirada de import: 50
+// Maxi 2026-06-19: capacidad total 500 → 1000 (buffer 300→800). El pending sigue en 200
+// porque lo throttlea el worker; agrandar el buffer deja entrar más URLs de los json nuevos.
 const SELLERS_QUEUE_CAP_PER_RUN = 100;
 const SELLERS_OPEN_TABS_CAP     = 30;
 const CSV_PENDING_CAP           = 200;
-const WAITLIST_CAP              = 300;
+const WAITLIST_CAP              = 800;
 
 async function initSellersJsonImport(refreshAll) {
   const { DEFAULT_SELLERS_COMPANIES, fetchSellersJson, findKnownDomains } = await import("../modules/sellersJson.js");
@@ -7581,7 +7631,7 @@ async function initSellersJsonImport(refreshAll) {
     const stats = await import("../modules/supabase.js").then(m => m.getCsvQueueStats(state.accessToken));
     const _csvPending = stats?.pending || 0;
     const _csvWaiting = stats?.waiting_pool || 0;
-    const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 500
+    const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 1000
     const space = _capacityTotal - _csvPending - _csvWaiting;
     if (space <= 0) {
       resEl.innerHTML = `<span style="color:#dc2626">❌ System saturated: ${_csvPending}/${CSV_PENDING_CAP} processing + ${_csvWaiting}/${WAITLIST_CAP} waiting. Wait for worker before adding more.</span>`;
@@ -7614,7 +7664,12 @@ async function initSellersJsonImport(refreshAll) {
         resEl.innerHTML = `<span style="color:#d97706">⚠️ ${domains.length} dominios — TODOS ya están en la cola activa o en Prospects. Nada nuevo para encolar.</span>`;
         return;
       }
-      const slice   = fresh.slice(0, allowed);
+      // Maxi 2026-06-19: tomar AL AZAR de todo el json (de la primera a la última),
+      // no siempre las primeras N. Así, en sucesivas corridas se recorre el json
+      // entero. Las que no entran NO se marcan como usadas (no se insertan en ningún
+      // lado que el comparador lea) → vuelven a estar disponibles la próxima vez.
+      const shuffledFresh = fresh.slice().sort(() => Math.random() - 0.5);
+      const slice   = shuffledFresh.slice(0, allowed);
       const skipped = fresh.length - slice.length;
       const { uploadCsvDomains } = await import("../modules/supabase.js");
       const result = await uploadCsvDomains(slice, state.loginEmail, state.accessToken, "sellers_json");
@@ -7666,7 +7721,8 @@ async function initSellersJsonImport(refreshAll) {
       if (!confirm(`Open ${N} tabs in browser?\n\nFound: ${domains.length} | Fresh: ${fresh.length} | Cap: ${SELLERS_OPEN_TABS_CAP}/click`)) {
         return;
       }
-      const slice = fresh.slice(0, N);
+      // Aleatorio: recorre todo el json en sucesivas aperturas (no siempre los primeros).
+      const slice = fresh.slice().sort(() => Math.random() - 0.5).slice(0, N);
       resEl.innerHTML = `🪟 Opening ${N} tabs (400ms delay so Chrome doesn't block them)...`;
       slice.forEach((domain, i) => {
         setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);

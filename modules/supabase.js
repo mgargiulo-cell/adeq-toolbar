@@ -727,13 +727,14 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
 export const APOLLO_MONTHLY_HARD_CAP = 2400;
 
 // Caps de la cola de procesamiento (csv_queue):
-// - pending: max 200 items esperando ser procesados por el worker
-// - waiting_pool: max 300 items en hold (se promueven a pending cuando libera)
+// - pending: max 200 items esperando ser procesados por el worker (throttle del worker)
+// - waiting_pool: max 800 items en hold (Maxi 2026-06-19: 300→800, total 1000 con pending)
 // - review_queue (Prospects) NO tiene cap — puede crecer indefinido (es mejor tener variedad)
+// El excedente va a next_day (sin cap) y rolea a waiting_pool a medianoche Madrid → nada se pierde.
 export const CSV_QUEUE_HARD_CAP = 200;
-export const CSV_WAITING_POOL_CAP = 300;
+export const CSV_WAITING_POOL_CAP = 800;
 export const CSV_UPLOAD_MAX = 1000;
-export const WAITLIST_HARD_CAP  = 300;
+export const WAITLIST_HARD_CAP  = 800;
 
 export async function getApolloMonthlyUsage(accessToken) {
   if (!accessToken) return { used: 0, limit: APOLLO_MONTHLY_HARD_CAP, remaining: APOLLO_MONTHLY_HARD_CAP };

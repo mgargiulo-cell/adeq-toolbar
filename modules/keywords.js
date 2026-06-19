@@ -4,7 +4,10 @@
 // Maxi 2026-06-19: lista ampliada ~5x por idioma + idiomas nuevos
 // (de/nl/pl/tr/id/ja). Ruso/ucraniano excluidos por decisión del user.
 // La rotación al azar la hace shuffle() en cada carga (ya existía).
+// Maxi 2026-06-19 (2): banco AMPLIADO +350 frases/idioma en EXTRA (keywordsExtra.js),
+// mergeado y deduplicado abajo → los 12 idiomas con cobertura amplia.
 // ============================================================
+import { EXTRA } from "./keywordsExtra.js";
 
 export const LANGUAGES = {
   "en": "Inglés",
@@ -36,6 +39,19 @@ export const KEYWORDS = {
   ja: ["今日のニュース","日本政治ニュース","政府発表","選挙2025","経済ニュース","国会審議","首相会見","外交政策","世界のニュース","地域ニュース","調査報道","速報ニュース","最新ニュース","政治スキャンダル","デモ最新","政治分析","世論調査","サッカー結果","jリーグ順位","チャンピオンズリーグ抽選","天皇杯","ヨーロッパリーグ","f1レース","テニス全英","バスケットボールnba","ボクシング試合","総合格闘技","自転車ツール","陸上選手権","野球結果","プロ野球順位","esports大会","スポーツベッティング予想","移籍噂","試合プレビュー","選手スタッツ","サッカー日本代表","巨人ニュース","ワールドカップ2026","motogpレース","株価今日","ビットコイン価格","イーサリアム価格","投資のコツ","トレード シグナル","fx分析","個人資産運用","住宅ローン金利","保険比較","老後資金計画","日本経済ニュース","ドル円相場","インフレ動向","仮想通貨市場","お金を貯める方法","不労所得","クレジットカード比較","つみたてnisa","配当株","人工知能ニュース","機械学習活用","サイバーセキュリティ脅威","テックスタートアップ","ソフトウェア開発","ハードウェア新製品","スマホ比較","iphoneレビュー","android最新","クラウドコンピューティング","ブロックチェーンニュース","メタバース動向","sns最新トレンド","tiktok人気","インスタリール","youtubeクリエイター","おすすめスマホ","おすすめノートパソコン","テック小技","wifi設定方法","おすすめイヤホン","映画2025公開","映画レビュー","ドラマ おすすめ","netflix新作","動画配信サービス","アマプラ おすすめ","ディズニープラス","音楽チャート","コンサートチケット","芸能ニュース","アカデミー賞2025","グラミー賞ノミネート","ポップカルチャー","バズり動画","今日のミーム","インフルエンサーニュース","おすすめポッドキャスト","お笑い番組","ドラマシリーズ","芸能ゴシップ","興行収入","リアリティ番組","ヘルシーレシピ","料理のコツ","レストランガイド","糖質制限ダイエット","スポーツ栄養","フィットネス習慣","ヨガ ポーズ","ジムトレーニング","メンタルヘルス対策","ウェルネス習慣","旅行先おすすめ","旅行アイデア","ホテルレビュー","高級旅行","ファッショントレンド2025","美容のコツ","スキンケア方法","メイクチュートリアル","子育てアドバイス","ペットのお世話","インテリア収納","インテリアデザイン","ガーデニングのコツ","diyプロジェクト","ダイエット方法","セルフケア","宇宙探査","nasaニュース","気候変動","環境ニュース","医学研究","がん治療","糖尿病管理","ワクチンニュース","心理学のコツ","生物学発見","物理学ブレイクスルー","化学ニュース","海洋保護","野生動物保護","大学ランキング","オンライン講座","eラーニング","再生可能エネルギー","勉強法","奨学金","日本のニュース今日","東京ニュース","大阪ニュース","名古屋ニュース","福岡ニュース","北海道ニュース","横浜ニュース","京都ニュース","デジタルマーケティング戦略","seo対策","コンテンツマーケティング","ecトレンド","起業","小規模ビジネスのコツ","リード獲得","ビジネスアイデア","google広告 やり方","snsマーケティング","メールマーケティング","アフィリエイト","コピーライティングのコツ","スポーツベッティング予想 今日","オンラインカジノ","ポーカー戦略","オンラインギャンブル","競馬予想","宝くじ結果","サッカー予想","esports賭け","オンラインスロット","試合予想","自動車ニュース","電気自動車レビュー","テスラニュース","自動運転","バイクニュース","車のメンテナンス","中古車","新型車2025","おすすめsuv","車購入ガイド","不動産投資","不動産ニュース","住宅市場","家を買うコツ","賃貸か購入か","商業不動産","airbnbのコツ","住宅ローン計算","初めての住宅購入","おすすめゲーム","ゲームレビュー","esportsニュース","マインクラフト攻略","フォートナイトニュース","ps5ゲーム","xboxゲーム","ニンテンドースイッチゲーム","ゲーミングpc自作","暗号資産ニュース","defiとは","アルトコイン分析","暗号資産ウォレット","web3プロジェクト","ビットコイン半減期","関節炎の対処法","高血圧","不安解消","減量ダイエット","肌トラブル","腰痛改善","睡眠障害","赤ちゃん名前","新生児ケア","子供の遊び","思春期の子育て","家族旅行アイデア","妊娠週数ごと","キッチンリフォーム","観葉植物の育て方","掃除のコツ","収納のコツ","芝生の手入れ","メイクの仕方","ヘアスタイル提案","ネイルデザイン","コーディネート提案","香水レビュー","おすすめ観光地","格安航空券","ドライブ旅行アイデア","ビーチリゾート","旅行のコツ","キャリアアドバイス","履歴書の書き方","面接対策","通信講座","海外留学","おすすめアニメ","アニメおすすめ","漫画ニュース","一気見ドラマ","ヒップホップニュース","ロック音楽ニュース","ポップ音楽ニュース","jポップニュース","kpopニュース","おすすめ新譜","天気予報","気象警報","今日の星占い","星座占い","タロット占い","星座相性","簡単夕食レシピ","電気圧力鍋レシピ","スイーツレシピ","ノンフライヤーレシピ","犬種図鑑","猫の飼い方","犬のしつけ","釣りスポット","キャンプ用品","ハイキングコース","今日のお得情報","クーポンコード","ブラックフライデーセール","聖書の言葉","毎日の祈り","瞑想ガイド","スピリチュアル成長"],
 };
 
+// Merge del banco AMPLIADO (EXTRA) dentro de KEYWORDS, deduplicado por frase.
+// Así cada idioma queda con su set base + ~350 frases nuevas, sin repetidos.
+for (const lang of Object.keys(EXTRA)) {
+  const base = KEYWORDS[lang] || (KEYWORDS[lang] = []);
+  const seen = new Set(base.map(k => k.toLowerCase()));
+  for (const kw of EXTRA[lang]) {
+    const key = (kw || "").toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    base.push(kw);
+  }
+}
+
 // Mezcla aleatoria (Fisher-Yates) para rotación en cada carga
 function shuffle(arr) {
   const a = [...arr];
@@ -63,10 +79,61 @@ export function getKeywords(lang = "", search = "") {
   return items;
 }
 
-// gl = país de búsqueda (config avanzada de Google): simula buscar DESDE ese país
-// → Google prioriza publishers de/para ese país. Combinable con el idioma de la frase.
+// País → nombre canónico de Google (para uule). Sin esto Google IGNORA gl cuando
+// estás logueado y usa tu ubicación real (ej: Barcelona). uule fuerza la ubicación.
+const COUNTRY_CANONICAL = {
+  us: "United States", ca: "Canada", mx: "Mexico", gt: "Guatemala", cr: "Costa Rica",
+  pa: "Panama", sv: "El Salvador", hn: "Honduras", ni: "Nicaragua", do: "Dominican Republic",
+  pr: "Puerto Rico", ar: "Argentina", br: "Brazil", cl: "Chile", co: "Colombia",
+  pe: "Peru", uy: "Uruguay", py: "Paraguay", bo: "Bolivia", ec: "Ecuador", ve: "Venezuela",
+  es: "Spain", it: "Italy", fr: "France", de: "Germany", nl: "Netherlands", pt: "Portugal",
+  be: "Belgium", ch: "Switzerland", at: "Austria", pl: "Poland", gr: "Greece", se: "Sweden",
+  no: "Norway", dk: "Denmark", fi: "Finland", ie: "Ireland", gb: "United Kingdom", uk: "United Kingdom",
+  ro: "Romania", cz: "Czechia", hu: "Hungary", ua: "Ukraine", ru: "Russia",
+  tr: "Turkey", il: "Israel", ae: "United Arab Emirates", sa: "Saudi Arabia", eg: "Egypt",
+  ma: "Morocco", dz: "Algeria", tn: "Tunisia", qa: "Qatar", kw: "Kuwait", jo: "Jordan", lb: "Lebanon",
+  za: "South Africa", ng: "Nigeria", ke: "Kenya", id: "Indonesia", my: "Malaysia",
+  ph: "Philippines", th: "Thailand", vn: "Vietnam", sg: "Singapore", in: "India",
+  jp: "Japan", kr: "South Korea", cn: "China", hk: "Hong Kong", tw: "Taiwan",
+  au: "Australia", nz: "New Zealand"
+};
+
+// País → idioma de interfaz (hl) por defecto, para reforzar el contexto local.
+const COUNTRY_HL = {
+  br: "pt", pt: "pt", fr: "fr", be: "fr", de: "de", at: "de", ch: "de", it: "it",
+  nl: "nl", pl: "pl", gr: "el", se: "sv", tr: "tr", id: "id", jp: "ja", kr: "ko",
+  cn: "zh-CN", ru: "ru", ua: "uk", ro: "ro", cz: "cs", hu: "hu",
+  us: "en", ca: "en", gb: "en", uk: "en", ie: "en", au: "en", nz: "en", in: "en"
+  // resto (LATAM/España) cae a "es" abajo si el país es hispano
+};
+const SPANISH_COUNTRIES = new Set(["es","mx","ar","cl","co","pe","uy","py","bo","ec","ve","gt","cr","pa","sv","hn","ni","do","pr"]);
+
+// Codifica la ubicación canónica al parámetro uule de Google.
+// (Algoritmo documentado y usado por herramientas SEO/Serper para forzar geo.)
+function googleUule(canonicalName) {
+  try {
+    const key = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const b64 = (typeof btoa === "function")
+      ? btoa(unescape(encodeURIComponent(canonicalName)))
+      : Buffer.from(canonicalName, "utf8").toString("base64");
+    const lenChar = key.charAt(canonicalName.length % key.length);
+    return "w+CAIQICI" + lenChar + b64;
+  } catch { return ""; }
+}
+
+// gl/uule = país de búsqueda: fuerza a Google a buscar DESDE ese país (resultados
+// locales) aunque el media buyer esté físicamente en Barcelona. Combinable con el
+// idioma de la frase. Sin uule, Google ignora gl para usuarios logueados.
 export function searchGoogleForDomain(keyword, gl = "") {
-  const query = encodeURIComponent(keyword);
-  const glParam = gl ? `&gl=${encodeURIComponent(gl)}` : "";
-  chrome.tabs.create({ url: `https://www.google.com/search?q=${query}${glParam}`, active: false });
+  const cc = (gl || "").toLowerCase().trim();
+  const params = [`q=${encodeURIComponent(keyword)}`];
+  if (cc) {
+    params.push(`gl=${encodeURIComponent(cc)}`);
+    const canonical = COUNTRY_CANONICAL[cc];
+    if (canonical) params.push(`uule=${encodeURIComponent(googleUule(canonical))}`);
+    const hl = COUNTRY_HL[cc] || (SPANISH_COUNTRIES.has(cc) ? "es" : "");
+    if (hl) params.push(`hl=${encodeURIComponent(hl)}`);
+    params.push("pws=0"); // sin personalización por historial del usuario
+  }
+  chrome.tabs.create({ url: `https://www.google.com/search?${params.join("&")}`, active: false });
 }
