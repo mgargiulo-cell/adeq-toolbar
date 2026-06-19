@@ -513,12 +513,16 @@ export async function setAutopilotEnabled(enabled, accessToken, userEmail = "") 
 }
 
 // ── Autopilot feedback (learning from user like/dislike) ────
-export async function saveAutopilotFeedback(accessToken, { user_email, domain, action, category, geo, ad_networks, traffic }) {
+export async function saveAutopilotFeedback(accessToken, { user_email, domain, action, category, geo, ad_networks, traffic, reason }) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   // Bucket de tráfico para detectar tipos rejected. Maxi 2026-06-17:
   // el agente aprende qué COMBO (categoria + tráfico bucket + geo) no sirve.
   const trafficBucket = trafficBucketLabel(traffic);
+  // Maxi 2026-06-19: guardar el MOTIVO del rechazo (antes se descartaba). El worker
+  // lo sintetiza en reglas de basura por CONTENIDO para descartar futuros similares.
+  const row = { user_email, domain, action, category: category || "", geo: geo || "", ad_networks: ad_networks || [], traffic_bucket: trafficBucket };
+  if (reason) row.reason = String(reason).substring(0, 500);
   try {
     const res = await fetch(`${url}/rest/v1/toolbar_autopilot_feedback`, {
       method: "POST",
@@ -526,7 +530,7 @@ export async function saveAutopilotFeedback(accessToken, { user_email, domain, a
         "apikey": key, "Authorization": `Bearer ${accessToken}`,
         "Content-Type": "application/json", "Prefer": "return=minimal",
       },
-      body: JSON.stringify([{ user_email, domain, action, category: category || "", geo: geo || "", ad_networks: ad_networks || [], traffic_bucket: trafficBucket }]),
+      body: JSON.stringify([row]),
     });
     return { ok: res.ok };
   } catch (e) { return { ok: false, error: e.message }; }

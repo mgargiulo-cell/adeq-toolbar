@@ -9320,7 +9320,7 @@ function renderProspectCard(r) {
         <button type="button" class="pcard-like-btn" title="👍 Like — autopilot prioriza este tipo de lead" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👍</button>
         <button type="button" class="pcard-dislike-btn" title="👎 Dislike — el agente evita este tipo + el RAG aprende del feedback" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👎</button>
       </div>
-      <textarea class="pcard-dislike-reason" placeholder="What failed in this lead/pitch? (optional, helps RAG)" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
+      <textarea class="pcard-dislike-reason" placeholder="¿Por qué lo rechazás? (ej: es empresa/gobierno/universidad, no es publisher, no monetiza, contenido no sirve) — el sistema aprende y descarta similares" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
       <div class="pcard-result" style="min-height:14px;font-size:11px;margin-top:5px;color:#16a34a"></div>
     </div>
 

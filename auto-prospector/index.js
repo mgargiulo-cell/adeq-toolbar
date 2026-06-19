@@ -3738,10 +3738,17 @@ async function _hasRealAdsTxt(domain) {
 
 // Clasificador Haiku (barato) SOLO para dudosos. Cache por dominio.
 const _publisherClassCache = new Map();
-async function _haikuPublisherClass(token, domain, pageContent, swCategory) {
-  if (_publisherClassCache.has(domain)) return _publisherClassCache.get(domain);
+async function _haikuPublisherClass(token, domain, pageContent, swCategory, trashRules = "") {
+  // Cache key incluye si hay reglas (para no servir veredictos viejos cuando el MB
+  // enseña reglas nuevas vía rechazos).
+  const ckey = `${domain}|${trashRules ? "r1" : "r0"}`;
+  if (_publisherClassCache.has(ckey)) return _publisherClassCache.get(ckey);
   const title = pageContent?.title || ""; const desc = pageContent?.description || "";
   if (!title && !desc) return null; // sin nada que clasificar
+  // Reglas de basura aprendidas de los rechazos del MB (por CONTENIDO).
+  const sys = "Clasificás sitios web. Un 'publisher' es un medio/blog/revista/portal de CONTENIDO que vive de publicidad display (noticias, deportes, entretenimiento, etc.). NO son publishers: empresas de servicios, gobiernos, universidades, bancos, SaaS, e-commerce, sitios corporativos de marca."
+    + (trashRules ? `\n\nADEMÁS, el media buyer YA rechazó sitios por estos motivos — si este sitio encaja en alguno, NO es publisher (devolvé el tipo correcto o 'other'):\n${trashRules}` : "")
+    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | other.";
   let type = null;
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
@@ -3751,7 +3758,7 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory) {
         provider: "anthropic", path: "/v1/messages", method: "POST",
         body: {
           model: "claude-haiku-4-5", max_tokens: 20,
-          system: "Clasificás sitios web. Un 'publisher' es un medio/blog/revista/portal de CONTENIDO que vive de publicidad display (noticias, deportes, entretenimiento, etc.). NO son publishers: empresas de servicios, gobiernos, universidades, bancos, SaaS, e-commerce, sitios corporativos de marca. Respondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | other.",
+          system: sys,
           messages: [{ role: "user", content: `Domain: ${domain}\nTitle: ${title}\nDescription: ${desc}\nSimilarWeb category: ${swCategory || "?"}` }],
         },
       }),
@@ -3764,8 +3771,41 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory) {
     }
   } catch {}
   if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
-  _publisherClassCache.set(domain, type);
+  _publisherClassCache.set(ckey, type);
   return type;
+}
+
+// Carga el contexto de basura aprendido de los rechazos del MB (por CONTENIDO,
+// ignora GEO): (a) categorías net-negativas (dislikes ≥5 y > 2× likes), (b) las
+// reglas sintetizadas por Haiku desde los motivos de rechazo. Cache 30min.
+let _trashCtxCache = { at: 0, ctx: null };
+async function _loadProspectTrashContext(token) {
+  if (_trashCtxCache.ctx && (Date.now() - _trashCtxCache.at) < 1800_000) return _trashCtxCache.ctx;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const dislikedCats = new Set();
+  let rules = "";
+  try {
+    const since = new Date(Date.now() - 90 * 86400_000).toISOString();
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?created_at=gte.${since}&select=category,action&limit=5000`, { headers: auth });
+    if (r.ok) {
+      const tally = new Map();
+      for (const x of (await r.json() || [])) {
+        const c = (x.category || "").toLowerCase().trim();
+        if (!c) continue;
+        const t = tally.get(c) || { dis: 0, lik: 0 };
+        if (x.action === "disliked") t.dis++; else if (x.action === "liked") t.lik++;
+        tally.set(c, t);
+      }
+      for (const [c, t] of tally) if (t.dis >= 5 && t.dis > t.lik * 2) dislikedCats.add(c);
+    }
+  } catch {}
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.prospect_trash_rules&select=value`, { headers: auth });
+    if (r.ok) { const rows = await r.json(); rules = String(rows?.[0]?.value || "").slice(0, 1500); }
+  } catch {}
+  const ctx = { dislikedCats, rules };
+  _trashCtxCache = { at: Date.now(), ctx };
+  return ctx;
 }
 
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
@@ -3776,22 +3816,30 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   if (!pageContent) return { ok: true, reason: "no_pagecontent" };
   const title = (pageContent?.title || "");
   const cat   = (pageContent?.category || "");
+  // Contexto aprendido de los rechazos del MB (por CONTENIDO, ignora GEO).
+  const trash = await _loadProspectTrashContext(token);
+  // Si esta CATEGORÍA viene siendo rechazada por el MB, NO la dejamos pasar gratis:
+  // mandamos a Haiku (tuneado con los motivos del MB) para que decida. Así el botón
+  // rojo "enseña" y Prospects se mantiene limpio.
+  const catDisliked = cat && trash.dislikedCats.has(cat);
   // 1. Negativo fuerte por título (empresa/SaaS/login/gov/uni) → basura, gratis.
   if (NON_PUBLISHER_TITLE_RE.test(title)) return { ok: false, reason: `title_nonpub:"${title.slice(0,40)}"` };
-  // 2. Señal positiva fuerte: publicidad real en la página → publisher. Pasa.
-  if (pageContent?.hasDisplayAds) return { ok: true, reason: pageContent.hasProgrammatic ? "programmatic_ads" : "partner_ssp" };
-  // 3. Categoría de medios (heurística de la home o de SimilarWeb).
-  if (PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
+  // 2. Señal positiva fuerte: publicidad real → publisher. (Salvo categoría
+  //    aprendida-como-basura: ahí no alcanza con tener ads, lo revisa Haiku.)
+  if (pageContent?.hasDisplayAds && !catDisliked) return { ok: true, reason: pageContent.hasProgrammatic ? "programmatic_ads" : "partner_ssp" };
+  // 3. Categoría de medios (heurística home / SimilarWeb) — skip si está aprendida-basura.
+  if (!catDisliked && PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
   const swc = (swCategory || "").toLowerCase();
-  if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
-  // 4. ads.txt como segunda chance (no todos los publishers exponen tags visibles).
-  if (await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
-  // 5. Dudoso (sin ads, sin categoría de medios, sin ads.txt) → Haiku decide.
-  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory);
-  if (type === "publisher") return { ok: true, reason: "haiku_publisher" };
+  if (!catDisliked && /news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
+  // 4. ads.txt como segunda chance — skip si categoría aprendida-basura.
+  if (!catDisliked && await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
+  // 5. Dudoso (o categoría aprendida-basura) → Haiku decide, con las reglas que el
+  //    MB enseñó al rechazar (motivos sintetizados).
+  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules);
+  if (type === "publisher") return { ok: true, reason: catDisliked ? "haiku_publisher(despite_disliked_cat)" : "haiku_publisher" };
   if (type) return { ok: false, reason: `haiku_${type}` };
-  // Sin ninguna señal y Haiku no respondió → rechazar (política: menos basura).
-  return { ok: false, reason: "no_publisher_signal" };
+  // Sin señal y Haiku no respondió → rechazar (política: Prospects limpio).
+  return { ok: false, reason: catDisliked ? "disliked_cat_no_signal" : "no_publisher_signal" };
 }
 
 // ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
@@ -10122,6 +10170,65 @@ async function maybeRunPitchRulesSynthesis(token) {
   } catch (e) { log(`⚠️ maybeRunPitchRulesSynthesis: ${e.message}`); }
 }
 
+// ════════════════════════════════════════════════════════════════
+// SÍNTESIS DE REGLAS DE BASURA (Maxi 2026-06-19) — el botón ROJO enseña.
+// 1× por día: Haiku lee los MOTIVOS de rechazo del MB (por CONTENIDO, ignora GEO)
+// y los destila en reglas cortas. classifyPublisher las usa para descartar futuros
+// similares → Prospects se mantiene limpio y va aprendiendo solo.
+// ════════════════════════════════════════════════════════════════
+async function aggregateProspectTrashRules(token) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const since = new Date(Date.now() - 90 * 86400_000).toISOString();
+  let rows = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?action=eq.disliked&reason=not.is.null&created_at=gte.${since}&select=domain,category,reason&order=created_at.desc&limit=100`, { headers: auth });
+    if (r.ok) rows = await r.json();
+  } catch {}
+  rows = (rows || []).filter(x => (x.reason || "").trim().length > 2);
+  if (rows.length < 3) return; // poca señal todavía
+  const list = rows.slice(0, 60).map((x, i) => `${i + 1}. ${x.domain || "?"} [${x.category || "?"}] — "${(x.reason || "").trim().slice(0, 160)}"`).join("\n");
+  const userMsg = `Estos son sitios que el media buyer RECHAZÓ de su lista de prospects de PUBLICIDAD, con el motivo. Detectá PATRONES de CONTENIDO (qué TIPO de sitios NO sirven) y destilá reglas cortas y accionables para descartar futuros similares. IGNORÁ el GEO/país — lo que importa es el CONTENIDO/tipo de sitio.
+
+RECHAZADOS:
+${list}
+
+Devolveme SOLO JSON: { "rules": ["regla corta 1", "regla corta 2", ...] }
+- Máximo 8 reglas, en español, concretas y por CONTENIDO (ej: "e-commerce / tiendas de venta", "blog corporativo de una empresa de servicios", "portal de gobierno o municipio", "sitio de cursos/universidad", "directorio o agregador sin contenido propio", "landing de un producto/SaaS").
+- Basate en patrones REALES de los motivos, no inventes.`;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "anthropic", path: "/v1/messages", method: "POST",
+        body: { model: "claude-haiku-4-5", max_tokens: 500, system: "Sos un analista que destila feedback en reglas de filtrado accionables por contenido. Devolvés SOLO JSON válido.", messages: [{ role: "user", content: userMsg }] },
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const m = (data?.content?.[0]?.text || "").match(/\{[\s\S]*\}/);
+    if (!m) return;
+    const parsed = JSON.parse(m[0]);
+    const rules = Array.isArray(parsed.rules) ? parsed.rules.filter(Boolean).slice(0, 8) : [];
+    if (!rules.length) return;
+    const text = rules.map(r => `- ${r}`).join("\n");
+    await setConfigValue(token, "prospect_trash_rules", text).catch(() => {});
+    _trashCtxCache = { at: 0, ctx: null }; // invalidar cache → toma las reglas nuevas ya
+    log(`🧠 prospect trash rules synth: ${rules.length} reglas (de ${rows.length} rechazos con motivo)`);
+  } catch (e) { log(`⚠️ aggregateProspectTrashRules: ${e.message}`); }
+}
+
+async function maybeRunProspectTrashSynthesis(token) {
+  try {
+    const cfg = await getConfig(token);
+    const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    if (cfg.last_prospect_trash_run === todayMadrid) return;
+    await aggregateProspectTrashRules(token);
+    await setConfigValue(token, "last_prospect_trash_run", todayMadrid).catch(() => {});
+  } catch (e) { log(`⚠️ maybeRunProspectTrashSynthesis: ${e.message}`); }
+}
+
 // Lee las reglas destiladas del MB y las formatea como bloque para el prompt.
 // Cache 10min en memoria para no pegarle a config en cada generación.
 const _pitchRulesCache = new Map();
@@ -11017,6 +11124,8 @@ async function main() {
         await maybeRunSourcePerformanceAggregate(token).catch(e => log(`⚠️ source perf: ${e.message}`));
         // M2: síntesis de reglas del feedback 👍/👎 del email IA (1× por día, guard interno)
         await maybeRunPitchRulesSynthesis(token).catch(e => log(`⚠️ pitch rules synth: ${e.message}`));
+        // Síntesis de reglas de basura desde los rechazos (botón rojo enseña al filtro)
+        await maybeRunProspectTrashSynthesis(token).catch(e => log(`⚠️ prospect trash synth: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
