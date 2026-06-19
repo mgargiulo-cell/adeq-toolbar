@@ -652,7 +652,7 @@ async function loadAdminGlobalCaps() {
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
       // Band count LIVE — query directo a review_queue en vez de leer el cache de config
       // (que puede estar stale si worker no corrió hace rato)
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
     ]);
     if (cfgRes.ok) {
       const rows = await cfgRes.json();
@@ -2582,6 +2582,32 @@ async function refreshApolloFooterCounter() {
   } catch {}
 }
 
+async function refreshSerperFooterCounter() {
+  const el = document.getElementById("serper-monthly-counter");
+  if (!el || !state.accessToken) return;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period)&select=key,value`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    const map = {};
+    rows.forEach(r => { map[r.key] = r.value; });
+    const period = new Date().toISOString().slice(0, 7);
+    const sameMonth = (map.autogoogle_serper_period || "").slice(0, 7) === period;
+    const used = sameMonth ? parseInt(map.autogoogle_serper_used || "0", 10) : 0;
+    const limit = 2500;
+    const pct = limit > 0 ? (used / limit) * 100 : 0;
+    el.classList.remove("usage-warning", "usage-danger", "usage-reached");
+    if (pct >= 100)     el.classList.add("usage-reached");
+    else if (pct >= 75) el.classList.add("usage-danger");
+    else if (pct >= 50) el.classList.add("usage-warning");
+    el.textContent = `AutoGoogle: ${used.toLocaleString()} / ${limit.toLocaleString()}`;
+    el.title = `Búsquedas Serper (AutoGoogle) este mes (${period}): ${used} de ${limit} (${pct.toFixed(1)}%). Plan free; el pacing reparte por días restantes.`;
+  } catch {}
+}
+
 // Estado in-memory para combinar SW + Apollo en un solo banner.
 // Cada provider reporta su {pct, used, limit, period}; el banner muestra el más crítico.
 const _capState = { sw: null, apollo: null };
@@ -2824,6 +2850,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   };
   refreshUsage();
   refreshApolloFooterCounter();
+  refreshSerperFooterCounter();
   checkExtensionVersion();
   setInterval(refreshUsage, 60_000);
   setInterval(refreshApolloFooterCounter, 60_000);
@@ -3607,7 +3634,7 @@ async function runTrafficCheck(opts = {}) {
     }
 
     const trafficForFilter = state.traffic || state.visits;
-    filterEl.textContent = passesTrafficFilter(trafficForFilter) ? "✅ Supera umbral 400K" : "❌ Bajo umbral 400K — no enriquecer";
+    filterEl.textContent = passesTrafficFilter(trafficForFilter) ? "✅ Supera umbral 350K" : "❌ Bajo umbral 350K — no enriquecer";
     filterEl.className   = `filter-tag ${passesTrafficFilter(trafficForFilter) ? "pass" : "fail"}`;
 
     if (passesTrafficFilter(trafficForFilter)) {
@@ -3866,6 +3893,7 @@ async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
       if (apolloEl) renderApolloPeople(apolloEl, apolloResult);
       renderEmailList(state.emails);
       refreshApolloFooterCounter();
+  refreshSerperFooterCounter();
       console.log(`[Apollo auto-pace] reveal ${rev.person.email} (haveDM=${haveDM}, chance=${(chance*100).toFixed(0)}%, cupo=${remaining}/${limit})`);
     }
   } catch {}
@@ -6021,42 +6049,55 @@ function updateRotationTimer() {
   el.textContent = `↻ rota en ${secsLeft}s`;
 }
 
-// Búsqueda directa en Supabase (se llama tras debounce)
+// Búsqueda sobre TODO el contenido disponible (user 2026-06-19): built-in de los 12
+// idiomas (getKeywords) + importados de DB + complemento de Supabase. Antes sólo
+// consultaba la DB, así que el search no encontraba idiomas que están en el built-in
+// (aparecían en la rotación pero no al filtrar).
 async function runKeywordSearch() {
   const lang   = document.getElementById("kw-language").value;
   const search = document.getElementById("kw-search").value.trim();
   if (!search) { filterKeywords(); return; }
+  const term = search.toLowerCase();
 
-  const { rows, error } = await searchKeywordsInDB(search, lang);
-
-  if (error) {
-    // Error de API — fallback a búsqueda local + mostrar aviso
-    const term    = search.toLowerCase();
-    const local   = dbKeywords.filter(k =>
-      typeof k.kw === "string" && k.kw.toLowerCase().includes(term) &&
-      (!lang || !k.lang || k.lang === lang)
-    );
-    const el = document.getElementById("keywords-list");
-    if (local.length > 0) {
-      renderKeywords(local, term);
-      el.insertAdjacentHTML("afterbegin", `<div class="kw-api-warn">⚠ Supabase: ${esc(error)} — showing local results</div>`);
-    } else {
-      el.innerHTML = `<span class="kw-empty">Error searching: ${esc(error)}</span>`;
+  // 1) Pool completo local: built-in (todos los idiomas) + lo importado de DB. Dedup por frase.
+  const seen = new Set();
+  const results = [];
+  const pushAll = (arr, db) => {
+    for (const k of (Array.isArray(arr) ? arr : [])) {
+      const kw = k && k.kw;
+      if (typeof kw !== "string" || !kw) continue;
+      const key = kw.toLowerCase();
+      if (seen.has(key)) continue;
+      if (!key.includes(term)) continue;
+      if (lang && k.lang && k.lang !== lang) continue;
+      seen.add(key);
+      results.push({ kw, lang: k.lang || "", db });
     }
-    return;
-  }
+  };
+  pushAll(getKeywords(""), false);   // built-in 12 idiomas (~3.490 frases)
+  pushAll(dbKeywords, true);         // keywords importados a la DB
 
-  const results = rows
-    .filter(r => typeof r.phrase === "string" && r.phrase.length > 0)
-    .map(r => ({ kw: r.phrase, lang: r.lang || "en", db: true }));
+  // 2) Complemento opcional: frases que viven sólo en Supabase (no rompe si falla).
+  try {
+    const { rows, error } = await searchKeywordsInDB(search, lang);
+    if (!error && Array.isArray(rows)) {
+      for (const r of rows) {
+        const phrase = r && r.phrase;
+        if (typeof phrase !== "string" || !phrase) continue;
+        const key = phrase.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        results.push({ kw: phrase, lang: r.lang || "en", db: true });
+      }
+    }
+  } catch {}
 
   if (results.length === 0) {
     document.getElementById("keywords-list").innerHTML =
-      '<span class="kw-empty">No results — the keyword isn\'t in the database</span>';
+      '<span class="kw-empty">No results — no keyword matches in any language</span>';
     return;
   }
-
-  renderKeywords(results, search.toLowerCase());
+  renderKeywords(results, term);
 }
 
 function filterKeywords() {
@@ -6089,7 +6130,7 @@ function renderKeywords(kws, search = "") {
     el.innerHTML += `<span class="kw-empty" style="margin-top:4px">… and ${kws.length - limit} more. Refine search.</span>`;
   }
   el.querySelectorAll(".kw-chip").forEach(btn => {
-    btn.addEventListener("click", () => searchGoogleForDomain(btn.dataset.kw));
+    btn.addEventListener("click", () => searchGoogleForDomain(btn.dataset.kw, document.getElementById("kw-country")?.value || ""));
   });
 }
 
@@ -6146,7 +6187,7 @@ async function loadHistoryTab() {
         <div class="stat-card stat-card--qual">
           <span class="sc-num">${monthNewQual}</span>
           ${pct(monthNewQual, monthNew)}
-          <span class="sc-lbl">+400K</span>
+          <span class="sc-lbl">+350K</span>
         </div>
         <div class="stat-card stat-card--monday">
           <span class="sc-num">${monthMondayNQ}</span>
@@ -6156,7 +6197,7 @@ async function loadHistoryTab() {
         <div class="stat-card stat-card--neutral">
           <span class="sc-num">${monthNewBelow}</span>
           ${pct(monthNewBelow, monthNew)}
-          <span class="sc-lbl">&lt;400K</span>
+          <span class="sc-lbl">&lt;350K</span>
         </div>
       </div>
     </div>
@@ -6167,7 +6208,7 @@ async function loadHistoryTab() {
         <div class="stat-card stat-card--qual">
           <span class="sc-num">${monthDupQual}</span>
           ${pct(monthDupQual, monthDups)}
-          <span class="sc-lbl">+400K</span>
+          <span class="sc-lbl">+350K</span>
         </div>
         <div class="stat-card stat-card--monday">
           <span class="sc-num">${monthMondayDQ}</span>
@@ -6177,13 +6218,13 @@ async function loadHistoryTab() {
         <div class="stat-card stat-card--neutral">
           <span class="sc-num">${monthDupBelow}</span>
           ${pct(monthDupBelow, monthDups)}
-          <span class="sc-lbl">&lt;400K</span>
+          <span class="sc-lbl">&lt;350K</span>
         </div>
       </div>
     </div>
 
     <div class="stat-category-block">
-      <div class="stat-cat-header stat-cat-below">🔻 Below 400K <span class="stat-cat-count">${monthBelow}</span></div>
+      <div class="stat-cat-header stat-cat-below">🔻 Below 350K <span class="stat-cat-count">${monthBelow}</span></div>
       <div class="stat-grid">
         <div class="stat-card ${monthMondayBelow > 0 ? "stat-card--warn" : "stat-card--neutral"}">
           <span class="sc-num">${monthMondayBelow}</span>
@@ -6973,7 +7014,7 @@ async function initCsvQueue() {
       const since = todayStart.toISOString();
       const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
       const rqRes = await fetch(
-        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&source=in.(csv,autopilot,sellers_json,monday_refresh)&select=id`,
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&source=in.(csv,autopilot,sellers_json,monday_refresh,autogoogle)&select=id`,
         { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }
       );
       const rangeHdr = rqRes.headers.get("content-range") || "";
@@ -7391,14 +7432,46 @@ async function initSellersJsonImport(refreshAll) {
   };
   const saveList = async (list) => chrome.storage.local.set({ [STORAGE_KEY]: list });
 
+  // Filtro por continente (Maxi 2026-06-19): clasifica cada fuente por TLD del dominio;
+  // las multinacionales (.com/.io/.tv…) caen en "Global". "All" muestra todas.
+  const _sellerRegion = (url) => {
+    const h = String(url || "").replace(/^https?:\/\//, "").replace(/^www\.|^static\.cdn\./, "").split("/")[0].toLowerCase();
+    const ends = (...tlds) => tlds.some(t => h.endsWith(t));
+    if (ends(".br", ".ar", ".cl", ".mx", ".pe", ".uy", ".com.br", ".com.ar", ".com.mx", ".com.co", ".com.uy", ".com.bo")) return "LATAM";
+    if (ends(".jp", ".kr", ".cn", ".vn", ".tw", ".hk", ".sg", ".in", ".id", ".my", ".th", ".ph", ".co.jp")) return "APAC";
+    if (ends(".au", ".nz", ".com.au")) return "OC";
+    if (ends(".tr", ".com.tr", ".ae", ".sa", ".eg", ".il")) return "MENA";
+    if (ends(".za", ".co.za", ".ng", ".ke", ".ma")) return "AFR";
+    if (ends(".de", ".fr", ".it", ".es", ".nl", ".be", ".ch", ".at", ".pl", ".cz", ".ro", ".gr", ".se", ".fi", ".dk", ".no", ".pt", ".ie", ".uk", ".co.uk", ".si", ".bg", ".hr", ".sk", ".eu")) return "EU";
+    return "GLOBAL";
+  };
+  const _SELLER_REGIONS = ["ALL", "GLOBAL", "EU", "LATAM", "APAC", "MENA", "AFR", "OC"];
+  const _SELLER_REGION_LABEL = { ALL: "🌍 All", GLOBAL: "🌐 Global", EU: "🇪🇺 Europe", LATAM: "🌎 LATAM", APAC: "🌏 Asia-Pacific", MENA: "🕌 MENA", AFR: "🌍 Africa", OC: "🦘 Oceania" };
+  let _sellersRegionSel = "ALL";
   const renderSelect = async () => {
     const list = await loadList();
-    sel.innerHTML = list.map((c, i) => `<option value="${i}">${c.name}</option>`).join("");
-    const cur = list[0];
-    if (cur && urlEl) urlEl.textContent = cur.url;
+    const counts = {};
+    list.forEach(c => { const r = _sellerRegion(c.url); counts[r] = (counts[r] || 0) + 1; });
+    const filtered = _sellersRegionSel === "ALL" ? list : list.filter(c => _sellerRegion(c.url) === _sellersRegionSel);
+    sel.innerHTML = filtered.map(c => `<option value="${list.indexOf(c)}">${c.name}</option>`).join("");
+    const cur = filtered[0];
+    if (urlEl) urlEl.textContent = cur ? cur.url : "—";
     sel.dataset._list = JSON.stringify(list);
+    const chipsEl = document.getElementById("sellers-region-filter");
+    if (chipsEl) {
+      chipsEl.innerHTML = _SELLER_REGIONS.filter(r => r === "ALL" || counts[r]).map(r => {
+        const on = _sellersRegionSel === r;
+        return `<button type="button" data-region="${r}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${on ? "#0ea5e9" : "#334155"};background:${on ? "#0ea5e9" : "#1e293b"};color:${on ? "#fff" : "#cbd5e1"};font-weight:600">${_SELLER_REGION_LABEL[r]}${r !== "ALL" && counts[r] ? ` (${counts[r]})` : ""}</button>`;
+      }).join("");
+    }
   };
   await renderSelect();
+  document.getElementById("sellers-region-filter")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-region]");
+    if (!btn) return;
+    _sellersRegionSel = btn.dataset.region;
+    renderSelect();
+  });
 
   sel.addEventListener("change", () => {
     const list = JSON.parse(sel.dataset._list || "[]");
@@ -7484,7 +7557,7 @@ async function initSellersJsonImport(refreshAll) {
           userEmail: state.loginEmail, source: "sellers_json",
           sourceDetail: _sellerName, attempted: domains.length, deduped: domains.length, inserted: 0,
         });
-        resEl.innerHTML = `<span style="color:#d97706">⚠️ ${domains.length} dominios — TODOS ya conocidos por el sistema (csv_queue/review_queue/historial/blocklist). Nada nuevo para encolar.</span>`;
+        resEl.innerHTML = `<span style="color:#d97706">⚠️ ${domains.length} dominios — TODOS ya están en la cola activa o en Prospects. Nada nuevo para encolar.</span>`;
         return;
       }
       const slice   = fresh.slice(0, allowed);
@@ -8558,15 +8631,18 @@ function _rebuildGeoChips(rows, selected) {
     }
     for (const c of conts) continentCounts.set(c, (continentCounts.get(c) || 0) + 1);
   }
-  // Render chips de continente — solo los que tienen al menos 1 lead.
-  const sortedConts = [...continentCounts.entries()].sort((a, b) => b[1] - a[1]);
+  // Render chips de CONTINENTE — preview SIEMPRE visible (los 7 continentes, en inglés),
+  // tengan o no leads (user 2026-06-19: "los continentes son un preview a la vista").
+  // El count aparece entre paréntesis solo si hay leads de ese continente.
+  const CONTINENT_ORDER = ["NA", "CA", "SA", "EU", "AS", "AFR", "OC"];
   const allActive = sel.size === 0;
-  let html = `<button class="geo-chip" data-code="_ALL_" type="button" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${allActive ? "#0ea5e9" : "#334155"};background:${allActive ? "#0ea5e9" : "#1e293b"};color:${allActive ? "#fff" : "#cbd5e1"};font-weight:600">🌍 Todos</button>`;
-  for (const [cont, n] of sortedConts) {
+  let html = `<button class="geo-chip" data-code="_ALL_" type="button" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${allActive ? "#0ea5e9" : "#334155"};background:${allActive ? "#0ea5e9" : "#1e293b"};color:${allActive ? "#fff" : "#cbd5e1"};font-weight:600">🌍 All</button>`;
+  for (const cont of CONTINENT_ORDER) {
     const code = `_C_${cont}`;
     const isOn = sel.has(code);
     const info = CONTINENT_INFO[cont] || { name: cont, flag: "🌐" };
-    html += `<button class="geo-chip" data-code="${code}" type="button" title="${esc(info.name)}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${info.flag} ${info.name} (${n})</button>`;
+    const n = continentCounts.get(cont) || 0;
+    html += `<button class="geo-chip" data-code="${code}" type="button" title="${esc(info.name)}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${isOn ? "#10b981" : "#334155"};background:${isOn ? "#10b981" : "#1e293b"};color:${isOn ? "#fff" : "#cbd5e1"};font-weight:${isOn ? 600 : 400}">${info.flag} ${info.name}${n ? ` (${n})` : ""}</button>`;
   }
   if (noGeoCount > 0) {
     const isOn = sel.has("_NONE_");
@@ -8643,7 +8719,9 @@ function _renderCountryPanel(filter = "") {
   const countriesBlock = html
     ? `<div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.4px;margin:0 0 4px">📍 Countries</div><div style="display:flex;flex-wrap:wrap;gap:4px">${html}</div>`
     : `<div style="font-size:11px;color:var(--text-muted);padding:6px">Sin paises ${filter ? "que coincidan" : "disponibles (todavía no hay leads cargados)"}.</div>`;
-  list.innerHTML = contBlock + countriesBlock;
+  // Los CONTINENTES ahora son preview a la vista (en _rebuildGeoChips); el panel
+  // desplegable muestra SOLO países (user 2026-06-19).
+  list.innerHTML = countriesBlock;
 }
 
 function _rebuildGeoFilterFromRows(rows) {

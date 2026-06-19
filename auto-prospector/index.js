@@ -9,6 +9,7 @@
 
 import fetch from "node-fetch";
 import { pickRandomTemplate, fillTemplate, pickPitchSource, getSenderName, getBakedTemplates } from "./templates.js";
+import { KEYWORDS as _AG_KEYWORDS } from "./keywordsData.js";  // 3490 frases (12 idiomas) para AutoGoogle
 
 const SUPABASE_URL              = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY         = process.env.SUPABASE_ANON_KEY;
@@ -20,6 +21,7 @@ const CLOUDFLARE_API_TOKEN      = process.env.CLOUDFLARE_API_TOKEN || null; // o
 // If a service-role key is set, use it as Bearer — bypasses RLS.
 // Otherwise fall back to user JWT (won't see items uploaded by other users with RLS on).
 const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
+const SERPER_API_KEY = (process.env.SERPER_API_KEY || "").trim() || null;  // AutoGoogle: keyword→Google. Sin key = AutoGoogle apagado (no rompe nada).
 
 const SESSION_LIMIT_MS  = 20 * 60 * 1000; // 20 minutos máx por sesión de autopilot — auto-corte
 const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
@@ -862,7 +864,7 @@ const FEEDER_SELLERS_SOURCES = [
   "https://adtelligent.com/sellers.json",
   "https://adkernel.com/sellers.json",
   "https://aax.network/sellers.json",
-  "https://dailymotion.com/sellers.json",
+  // dailymotion.com removido 2026-06-19: su sellers.json está caído (404 confirmado root+www).
   // Agregadas user 2026-05-29 — validadas por HTTP (sellers.json real con publishers).
   // Native/discovery + mobile SDKs + gestión de publishers + LATAM/ES.
   "https://taboola.com/sellers.json",
@@ -895,6 +897,237 @@ const FEEDER_SELLERS_SOURCES = [
   "https://glomex.com/sellers.json",          // video editorial
   "https://primis.tech/sellers.json",         // video nativo (VideoByte)
   "https://unrulymedia.com/sellers.json",     // Unruly — video premium
+  // ─────────────────────────────────────────────────────────────────────────
+  // TANDA IAB EUROPA + LATAM (user 2026-06-19). 105 fuentes nuevas de directorios
+  // IAB (ES/IT/FR/PT/UK/IE/NL/BE/DE/AT/CH/PL/Nórdicos/CEE/GR/TR + LATAM) y lista
+  // manual del user. TODAS verificadas por script: sellers.json con >=10 entradas
+  // seller_type=PUBLISHER con domain (criterio optad360=2482). # publishers al lado.
+  "https://www.reklamstore.com/sellers.json",              // 19954 pub
+  "https://static.cdn.admatic.com.tr/sellers/sellers.json",// 19133 pub
+  "https://unity.com/sellers.json",                        // 11143 pub
+  "https://loopme.com/sellers.json",                       // 2854 pub (curl-only)
+  "https://pubgalaxy.com/sellers.json",                    // 3683 pub
+  "https://premiumads.com.br/sellers.json",                // 1724 pub
+  "https://projectagora.com/sellers.json",                 // 1576 pub
+  "https://smartframe.io/sellers.json",                    // 1565 pub
+  "https://simpleads.com.br/sellers.json",                 // 1446 pub
+  "https://criteo.com/sellers.json",                       // 1209 pub
+  "https://adwmg.com/sellers.json",                        // 1189 pub
+  "https://holid.io/sellers.json",                         // 1090 pub
+  "https://freewheel.com/sellers.json",                    // 1066 pub (curl-only)
+  "https://adpone.com/sellers.json",                       // 1021 pub
+  "https://www.dazn.com/sellers.json",                     // 981 pub
+  "https://adhese.com/sellers.json",                       // 909 pub
+  "https://adnimation.com/sellers.json",                   // 837 pub
+  "https://richaudience.com/sellers.json",                 // 825 pub
+  "https://exte.com/sellers.json",                         // 825 pub
+  "https://adops.gr/sellers.json",                         // 744 pub
+  "https://ogury.com/sellers.json",                        // 734 pub (curl-only)
+  "https://vistarmedia.com/sellers.json",                  // 722 pub
+  "https://movingup.it/sellers.json",                      // 661 pub
+  "https://odeeo.io/sellers.json",                         // 640 pub
+  "https://evolutionadv.it/sellers.json",                  // 626 pub
+  "https://footballco.com/sellers.json",                   // 581 pub
+  "https://optidigital.com/sellers.json",                  // 537 pub
+  "https://audienzz.ch/sellers.json",                      // 502 pub
+  "https://clickio.com/sellers.json",                      // 493 pub
+  "https://r2b2.cz/sellers.json",                          // 487 pub
+  "https://broadsign.com/sellers.json",                    // 484 pub
+  "https://harrenmedia.com/sellers.json",                  // 456 pub
+  "https://streamlyn.com/sellers.json",                    // 449 pub
+  "https://webads.nl/sellers.json",                        // 425 pub
+  "https://onlinemediasolutions.com/sellers.json",         // 425 pub
+  "https://www.phaistosnetworks.gr/sellers.json",          // 405 pub
+  "https://strossle.com/sellers.json",                     // 377 pub
+  "https://tappx.com/sellers.json",                        // 375 pub
+  "https://dianomi.com/sellers.json",                      // 368 pub
+  "https://stroeer.com/sellers.json",                      // 366 pub
+  "https://joinads.me/sellers.json",                       // 366 pub
+  "https://adsocy.com/sellers.json",                       // 336 pub
+  "https://soundstack.com/sellers.json",                   // 317 pub
+  "https://voisetech.com/sellers.json",                    // 316 pub
+  "https://adweb.gr/sellers.json",                         // 313 pub
+  "https://yoc.com/sellers.json",                          // 312 pub
+  "https://onetag.com/sellers.json",                       // 310 pub
+  "https://refinery89.com/sellers.json",                   // 309 pub
+  "https://adswizz.com/sellers.json",                      // 304 pub
+  "https://alkimi.org/sellers.json",                       // 298 pub
+  "https://amagi.com/sellers.json",                        // 264 pub
+  "https://overwolf.com/sellers.json",                     // 259 pub
+  "https://iion.io/sellers.json",                          // 258 pub
+  "https://adform.com/sellers.json",                       // 245 pub
+  "https://connectad.io/sellers.json",                     // 233 pub
+  "https://entravision.com/sellers.json",                  // 230 pub
+  "https://brightcom.com/sellers.json",                    // 218 pub
+  "https://yieldlove.com/sellers.json",                    // 215 pub
+  "https://wurl.com/sellers.json",                         // 201 pub (curl-only)
+  "https://alright.com.br/sellers.json",                   // 151 pub
+  "https://otzads.net/sellers.json",                       // 134 pub
+  "https://stroeer.de/sellers.json",                       // 132 pub
+  "https://digohispanicmedia.com/sellers.json",            // 121 pub
+  "https://seznam.cz/sellers.json",                        // 115 pub
+  "https://flower-ads.com/sellers.json",                   // 111 pub
+  "https://adverty.com/sellers.json",                      // 105 pub
+  "https://undertone.com/sellers.json",                    // 96 pub
+  "https://adtonos.com/sellers.json",                      // 88 pub
+  "https://adasta.it/sellers.json",                        // 83 pub
+  "https://mediasquare.fr/sellers.json",                   // 81 pub
+  "https://gazeta.pl/sellers.json",                        // 77 pub
+  "https://contentignite.com/sellers.json",                // 73 pub
+  "https://iprom.si/sellers.json",                         // 73 pub
+  "https://yieldlab.net/sellers.json",                     // 70 pub
+  "https://sapo.pt/sellers.json",                          // 66 pub
+  "https://next14.com/sellers.json",                       // 65 pub
+  "https://massarius.com/sellers.json",                    // 60 pub
+  "https://ividence.com/sellers.json",                     // 59 pub
+  "https://ozoneproject.com/sellers.json",                 // 51 pub (curl-only)
+  "https://wp.pl/sellers.json",                            // 48 pub
+  "https://livewrapped.com/sellers.json",                  // 37 pub
+  "https://relevant-digital.com/sellers.json",             // 35 pub
+  "https://beintoo.com/sellers.json",                      // 32 pub
+  "https://cpex.cz/sellers.json",                          // 32 pub
+  "https://www.rakuten.tv/sellers.json",                   // 31 pub
+  "https://ringier-advertising.ch/sellers.json",           // 28 pub
+  "https://hubvisor.io/sellers.json",                      // 27 pub
+  "https://russmedia.com/sellers.json",                    // 27 pub
+  "https://adtarget.biz/sellers.json",                     // 27 pub
+  "https://sibboventures.com/sellers.json",                // 25 pub
+  "https://newixmedia.com/sellers.json",                   // 22 pub
+  "https://arbomedia.ro/sellers.json",                     // 22 pub
+  "https://prismamedia.com/sellers.json",                  // 20 pub
+  "https://smartstream.tv/sellers.json",                   // 20 pub
+  "https://adssets.com/sellers.json",                      // 20 pub
+  "https://proximus.be/sellers.json",                      // 15 pub
+  "https://manzoniadvertising.it/sellers.json",            // 14 pub
+  "https://bluebillywig.com/sellers.json",                 // 14 pub
+  "https://italiaonline.it/sellers.json",                  // 13 pub
+  "https://366.fr/sellers.json",                           // 13 pub
+  "https://ad-alliance.de/sellers.json",                   // 13 pub
+  "https://produpress.be/sellers.json",                    // 12 pub
+  "https://canelamedia.com/sellers.json",                  // 11 pub
+  "https://emetriq.com/sellers.json",                      // 11 pub
+  "https://wemass.com/sellers.json",                       // 10 pub
+  // Fuentes "chicas" pero que listan TERCEROS (user 2026-06-19: "todo suma, no publishers
+  // que se listan a sí mismos"). Verificadas: >=2 dominios de terceros en su sellers.json.
+  "https://cdn.nativery.com/widget/js/sellers.json",       // 131 terceros
+  "https://pebblemedia.be/sellers.json",                   // 9 terceros (BE sales house)
+  "https://adsanddata.be/sellers.json",                    // 9 terceros (BE)
+  "https://seven.one/sellers.json",                        // 8 terceros (DE)
+  "https://onedio.com/sellers.json",                       // 7 terceros (TR)
+  "https://first-id.fr/sellers.json",                      // 6 terceros (FR)
+  "https://logan.ai/sellers.json",                         // 6 terceros (LATAM)
+  "https://bonniernews.se/sellers.json",                   // 6 terceros (SE)
+  "https://www.mediamond.it/sellers.json",                 // 4 terceros (IT)
+  "https://admoai.com/sellers.json",                       // 4 terceros (LATAM)
+  "https://dpgmedia.be/sellers.json",                      // 4 terceros (BE)
+  "https://sabah.com.tr/sellers.json",                     // 3 terceros (TR)
+  "https://invidi.com/sellers.json",                       // 3 terceros (Nórdico/CTV)
+  "https://impresa.pt/sellers.json",                       // 3 terceros (PT)
+  "https://www.samsung.com/sellers.json",                  // 2 terceros
+  "https://rmb.be/sellers.json",                           // 2 terceros (BE)
+  "https://dexerto.com/sellers.json",                      // 2 terceros (UK)
+  // ═════════════════════════════════════════════════════════════════════════
+  // TANDA 2 — BÚSQUEDA GLOBAL (user 2026-06-19). 95 fuentes nuevas de 7 agentes
+  // exhaustivos (IAB/LinkedIn/Google/DMEXCO/affbank) por continente. Todas
+  // verificadas por script: >=10 entradas PUBLISHER/BOTH con domain de terceros.
+  // ── 🌏 ASIA-PACÍFICO ──
+  "https://i-mobile.co.jp/sellers.json",
+  "https://ucfunnel.com/sellers.json",
+  "https://aralego.com/sellers.json",
+  "https://auxoads.com/sellers.json",
+  "https://greedygame.com/sellers.json",
+  "https://vertoz.com/sellers.json",
+  "https://adop.cc/sellers.json",
+  "https://ad-stir.com/sellers.json",
+  "https://microad.co.jp/sellers.json",
+  "https://ad-generation.jp/sellers.json",
+  "https://vdo.ai/sellers.json",
+  "https://adingo.jp/sellers.json",
+  "https://yeahmobi.com/sellers.json",
+  "https://innity.com/sellers.json",
+  "https://playstream.media/sellers.json",
+  "https://fout.jp/sellers.json",
+  "https://momagic.com/sellers.json",
+  "https://admicro.vn/sellers.json",
+  "https://pokkt.com/sellers.json",
+  "https://xapads.com/sellers.json",
+  "https://logly.co.jp/sellers.json",
+  "https://adgebra.co/sellers.json",
+  "https://vuukle.com/sellers.json",
+  "https://adpopcorn.com/sellers.json",
+  "https://geniee-ssp.net/sellers.json",
+  "https://playground.xyz/sellers.json",
+  "https://vidcrunch.com/sellers.json",
+  "https://adview.com/sellers.json",
+  "https://adpushup.com/sellers.json",
+  "https://zmaticoo.com/sellers.json",
+  // ── 🌍 MENA + ÁFRICA + ISRAEL ──
+  "https://foxpush.com/sellers.json",
+  "https://adintop.com/sellers.json",
+  "https://arabyads.com/sellers.json",
+  "https://adlive.io/sellers.json",
+  "https://andbeyond.media/sellers.json",
+  "https://dochase.com/sellers.json",
+  "https://kueez.com/sellers.json",
+  "https://kueezrtb.com/sellers.json",
+  "https://mobupps.com/sellers.json",
+  // ── 🌎 LATAM ──
+  "https://wortise.com/sellers.json",
+  "https://denakop.com/sellers.json",
+  "https://nobeta.com.br/sellers.json",
+  "https://audienciad.com/sellers.json",
+  "https://membrana.media/sellers.json",
+  "https://juicebarads.com/sellers.json",
+  "https://adzep.com.br/sellers.json",
+  "https://grumft.com/sellers.json",
+  // ── 🇪🇺 EUROPA ──
+  "https://rtbhouse.com/sellers.json",
+  "https://4wmarketplace.com/sellers.json",
+  "https://sublime.xyz/sellers.json",
+  "https://justpremium.com/sellers.json",
+  "https://quantum-advertising.com/sellers.json",
+  "https://cwire.com/sellers.json",
+  "https://bidmachine.io/sellers.json",
+  "https://insticator.com/sellers.json",
+  "https://adapex.io/sellers.json",
+  "https://sevio.com/sellers.json",
+  "https://stailamedia.com/sellers.json",
+  "https://betweendigital.com/sellers.json",
+  "https://smartclip.net/sellers.json",
+  "https://madvertise.com/sellers.json",
+  "https://adverline.com/sellers.json",
+  "https://admixer.net/sellers.json",
+  "https://admixer.com/sellers.json",
+  "https://eskimi.com/sellers.json",
+  "https://nativery.com/sellers.json",
+  "https://venatusmedia.com/sellers.json",
+  "https://themediagrid.com/sellers.json",
+  "https://www.targetspot.com/sellers.json",
+  // ── 🌎 NORTEAMÉRICA / GLOBAL ──
+  "https://33across.com/sellers.json",
+  "https://media.net/sellers.json",
+  "https://appnexus.com/sellers.json",
+  "https://conversantmedia.com/sellers.json",
+  "https://adcolony.com/sellers.json",
+  "https://fyber.com/sellers.json",
+  "https://nextmillennium.io/sellers.json",
+  "https://lkqd.com/sellers.json",
+  "https://minutemedia.com/sellers.json",
+  "https://gumgum.com/sellers.json",
+  "https://yieldmo.com/sellers.json",
+  "https://beachfront.com/sellers.json",
+  "https://kargo.com/sellers.json",
+  "https://brid.tv/sellers.json",
+  "https://sonobi.com/sellers.json",
+  "https://publir.com/sellers.json",
+  "https://springserve.com/sellers.json",
+  "https://smartyads.com/sellers.json",
+  "https://onomagic.com/sellers.json",
+  "https://pulsepoint.com/sellers.json",
+  "https://adsparc.com/sellers.json",
+  "https://pixfuture.com/sellers.json",
+  "https://adsyield.com/sellers.json",
+  "https://mediafuse.com/sellers.json",
 ];
 
 let _feederLastSlot = "";  // "YYYY-MM-DD-HH:00" del último slot disparado
@@ -913,20 +1146,22 @@ async function _findKnownDomainsWorker(token, candidates) {
   const known = new Set();
   const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const BATCH = 200;
+  // REGLA CANÓNICA (Maxi 2026-06-19): solo bloquear si el dominio ya está en la cola
+  // ACTIVA (no duplicar job en curso) o ya es Prospect (review_queue pending). NO se
+  // bloquea por historial / sendtrack / blocklist — la fuente de verdad es Monday +
+  // Prospects. El worker, al procesar, ya chequea Monday (solo procesa si no existe o
+  // está en "Ciclo Finalizado") + guard 30d de envío. Aplica igual a feeder y autopilot.
   const tables = [
-    { table: "toolbar_csv_queue",     col: "domain" },
-    { table: "toolbar_review_queue",  col: "domain" },
-    { table: "toolbar_historial",     col: "domain" },
-    { table: "toolbar_sendtrack",     col: "domain" },
-    { table: "toolbar_url_blocklist", col: "domain" },
+    { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool)" },
+    { table: "toolbar_review_queue",  col: "domain", filter: "&status=eq.pending" },
   ];
   for (let i = 0; i < candidates.length; i += BATCH) {
     const slice = candidates.slice(i, i + BATCH);
     const inList = slice.map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
-    await Promise.all(tables.map(async ({ table, col }) => {
+    await Promise.all(tables.map(async ({ table, col, filter }) => {
       try {
         const res = await fetch(
-          `${SUPABASE_URL}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}`,
+          `${SUPABASE_URL}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}${filter || ""}`,
           { headers }
         );
         if (!res.ok) return;
@@ -1048,6 +1283,113 @@ async function _injectIntoCsvQueue(token, domains, sourceTag) {
     const rows = await res.json().catch(() => []);
     return Array.isArray(rows) ? rows.length : 0;
   } catch { return 0; }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUTOGOOGLE (user 2026-06-19) — motor SEPARADO del autopilot. Busca keywords en
+// Google vía Serper.dev, extrae los dominios de los resultados orgánicos (web
+// abierta, plata fresca por TEMA), y los encola con source="autogoogle" → mismo
+// dedup canónico + filtro 350K + filtro basura que todo lo demás. El filtro
+// "AutoGoogle" en Prospects mide cuántos llegan a Prospects desde este motor vs
+// el autopilot. Apagado si no hay SERPER_API_KEY (env de Railway).
+const AUTOGOOGLE_SLOTS = [8, 11, 14, 17, 21];  // 5 slots/día L-V, horarios PROPIOS (distintos al feeder 9/12/15/18/20)
+const AUTOGOOGLE_MONTHLY_CAP = 2500;           // techo Serper/mes (plan FREE de Serper); el pacing lo reparte por días
+let _autoGoogleLastSlot = "";
+const _AUTOGOOGLE_KEYWORDS = [
+  "breaking news today","football transfer news","stock market today","crypto news today","best gaming laptops","healthy dinner recipes","weight loss tips","travel destinations 2025","movie reviews","celebrity gossip","nba highlights","premier league news","personal finance tips","ai news today","smartphone reviews","home workout routine","car reviews 2025","real estate market news","budget travel tips","best tv series to watch",
+  "noticias de hoy","fichajes futbol","precio del bitcoin","recetas faciles","consejos de salud","resultados liga","analisis politico","mejores celulares","horoscopo de hoy","peliculas estreno","tips de viaje","mercado inmobiliario","finanzas personales","noticias deportivas","tutoriales tecnologia",
+  "noticias de hoje","futebol ao vivo","preco bitcoin","receitas faceis","dicas de saude","resultados brasileirao","analise politica","melhores celulares","filmes lancamento","dicas de viagem",
+  "notizie di oggi","calciomercato","prezzo bitcoin","ricette facili","consigli salute","risultati serie a","recensioni film","migliori smartphone","viaggi economici","oroscopo oggi",
+  "actualites du jour","mercato football","prix bitcoin","recettes faciles","conseils sante","resultats ligue 1","critiques films","meilleurs smartphones","idees voyage","horoscope du jour",
+  "nachrichten heute","fussball transfers","bitcoin preis","einfache rezepte","gesundheitstipps","bundesliga ergebnisse","filmkritiken","beste smartphones","reisetipps","horoskop heute",
+];
+
+// Países de búsqueda (Serper `gl`) para targeting GEO — NO-Anglo (LATAM + EU + TR/GR).
+// Simula buscar DESDE ese país → Google prioriza publishers de/para ese país.
+const _AUTOGOOGLE_GL = ["mx", "ar", "br", "cl", "co", "pe", "uy", "es", "it", "fr", "de", "nl", "pt", "pl", "tr", "gr", "se", "be", "ch"];
+
+// Pega una keyword a Serper (con país de búsqueda gl) y devuelve los dominios orgánicos.
+async function _serperSearch(query, num = 20, gl = "") {
+  if (!SERPER_API_KEY) return [];
+  try {
+    const body = { q: query, num };
+    if (gl) body.gl = gl;  // país de búsqueda → prioriza publishers de ese país (targeting GEO)
+    const res = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { log(`  ⚠️ Serper ${res.status} para "${query}"`); return []; }
+    const data = await res.json();
+    const out = [];
+    for (const r of (Array.isArray(data.organic) ? data.organic : [])) {
+      try {
+        const h = new URL(r.link).hostname.toLowerCase().replace(/^www\./, "");
+        if (h && h.includes(".")) out.push(h);
+      } catch {}
+    }
+    return [...new Set(out)];
+  } catch (e) { log(`  ⚠️ Serper error "${query}": ${e.message}`); return []; }
+}
+
+async function maybeRunAutoGoogleSlot(token) {
+  if (!SERPER_API_KEY) return;  // sin key → AutoGoogle apagado
+  const { hour, weekday, dateISO } = _madridNowParts();
+  if (weekday === "Sat" || weekday === "Sun") return;  // solo lunes a viernes
+  if (!AUTOGOOGLE_SLOTS.includes(hour)) return;
+  const slotLabel = `${dateISO}-${hour}:00`;
+  if (_autoGoogleLastSlot === slotLabel) return;
+  _autoGoogleLastSlot = slotLabel;
+  try { await _runAutoGoogleSlot(token, slotLabel); }
+  catch (e) { log(`⚠️ AutoGoogle slot: ${e.message}`); }
+}
+
+async function _runAutoGoogleSlot(token, slotLabel) {
+  const { hour, dateISO } = _madridNowParts();
+  const period = dateISO.slice(0, 7);  // YYYY-MM
+  // ── PACING MENSUAL: reparte el cap (20k búsquedas) entre los días/slots que faltan
+  //    del mes, para NO agotar todo en un día (clave para el costo de server). ──
+  let used = 0;
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period)&select=key,value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (r.ok) { const map = {}; (await r.json()).forEach(x => { map[x.key] = x.value; }); if (map.autogoogle_serper_period === period) used = parseInt(map.autogoogle_serper_used || "0", 10) || 0; }
+  } catch {}
+  const remaining = Math.max(0, AUTOGOOGLE_MONTHLY_CAP - used);
+  if (remaining <= 0) { log(`🔎 AutoGoogle: cap mensual ${AUTOGOOGLE_MONTHLY_CAP} alcanzado (${used}) — skip`); return; }
+  const [yy, mm, dd] = dateISO.split("-").map(Number);
+  const daysInMonth = new Date(yy, mm, 0).getDate();
+  const daysLeft = Math.max(1, daysInMonth - dd + 1);                                  // incluye hoy
+  const slotsLeftToday = Math.max(1, AUTOGOOGLE_SLOTS.filter(h => h >= hour).length);  // incluye éste
+  const budgetToday = Math.ceil(remaining / daysLeft);
+  let N = Math.ceil(budgetToday / slotsLeftToday);
+  N = Math.max(1, Math.min(200, N, remaining));                                        // tope de seguridad 200/slot
+  // Pool = TODAS las frases de cascade (3490, 12 idiomas) desde keywordsData.js; fallback inline.
+  let pool;
+  try { pool = Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s); } catch { pool = []; }
+  if (!pool || pool.length < 50) pool = _AUTOGOOGLE_KEYWORDS;
+  const kws = [...pool].sort(() => Math.random() - 0.5).slice(0, N);
+  log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (mes ${used}/${AUTOGOOGLE_MONTHLY_CAP}, ${daysLeft}d restantes)...`);
+  const found = new Set();
+  let queriesDone = 0;
+  for (const kw of kws) {
+    // País de búsqueda rotado (targeting GEO no-Anglo) → trae publishers del país objetivo.
+    const gl = _AUTOGOOGLE_GL[Math.floor(Math.random() * _AUTOGOOGLE_GL.length)];
+    const domains = await _serperSearch(kw, 20, gl);
+    queriesDone++;
+    domains.forEach(d => found.add(d));
+  }
+  try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
+  if (found.size === 0) { log("🔎 AutoGoogle: 0 dominios (¿key inválida o sin resultados?)"); return; }
+  // Pre-filtro TLD Anglo deprio + dedup canónico (cola activa + Prospects).
+  let cands = [...found].filter(d => !DEPRIO_TLD_RE.test(d));
+  const known = await _findKnownDomainsWorker(token, cands);
+  const fresh = cands.filter(d => !known.has(d));
+  if (fresh.length === 0) { log(`🔎 AutoGoogle: ${found.size} encontrados, 0 nuevos tras dedup`); return; }
+  const inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
+  log(`🔎 AutoGoogle: ${found.size} dominios de ${kws.length} keywords → ${fresh.length} nuevos → ${inserted} encolados (source=autogoogle)`);
 }
 
 async function _getMondayApiKeyForFeeder(token) {
@@ -5262,7 +5604,7 @@ async function runSession(token, cfg, sessionStart) {
   // user 2026-05-29: el feeder YA cubre Majestic (su pool principal), así que el
   // autopilot redundaba y producía 0. Lo sesgamos a similar_discovery (su modo
   // único) — baseline 0.15 majestic / 0.85 similar, floor 0.05.
-  let _probMajestic = 0.15;
+  let _probMajestic = 0.12;  // baseline: Majestic es relleno/exploración, NO protagonista (user 2026-06-19)
   try {
     const statsRes = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autopilot_majestic_leads_today,autopilot_similar_leads_today,autopilot_stats_date)&select=key,value`,
@@ -5276,7 +5618,9 @@ async function runSession(token, cfg, sessionStart) {
       const majLeads = parseInt(statsMap.autopilot_majestic_leads_today || "0", 10);
       const simLeads = parseInt(statsMap.autopilot_similar_leads_today || "0", 10);
       if (majLeads + simLeads >= 5) {  // mínimo data point antes de adaptarse
-        _probMajestic = Math.max(0.05, Math.min(0.5, majLeads / (majLeads + simLeads)));
+        // Techo 0.30 (user 2026-06-19): Majestic = lista global ruidosa → nunca domina.
+        // Similar-discovery (parecidos a lo validado/enviado) es de mayor calidad y lleva el resto.
+        _probMajestic = Math.max(0.05, Math.min(0.30, majLeads / (majLeads + simLeads)));
       }
       log(`📊 Stats hoy — Majestic: ${majLeads} leads, Similar: ${simLeads} leads → P(majestic)=${_probMajestic.toFixed(2)}`);
     }
@@ -5296,20 +5640,28 @@ async function runSession(token, cfg, sessionStart) {
 
   let pool;
   if (_autopilotMode === "similar_discovery") {
-    // Seeds: 10 dominios random de review_queue con traffic>=400K + 10 de Monday activo
+    // Seeds (user 2026-06-19, Autopilot v2): priorizar lo que YA funcionó — dominios
+    // ENVIADOS (sendtrack: máxima señal de calidad y SOBREVIVE resets de la base) +
+    // validados + pending>=350K como relleno + Monday. Antes sólo usaba pending>=400K,
+    // que tras el reset quedó en 0 → el autopilot caía siempre a Majestic (baja calidad).
     const seedDomains = new Set();
-    try {
-      const rqSeedRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.400000&select=domain&order=created_at.desc&limit=10`,
-        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-      );
-      const rqSeeds = await rqSeedRes.json();
-      if (Array.isArray(rqSeeds)) rqSeeds.forEach(r => r.domain && seedDomains.add(r.domain.toLowerCase().replace(/^www\./, "")));
+    const _seedAuth = { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } };
+    const _addSeeds = (rows) => { if (Array.isArray(rows)) rows.forEach(r => r.domain && seedDomains.add(r.domain.toLowerCase().replace(/^www\./, ""))); };
+    try { // 1) Enviados recientes (sendtrack) — los que de verdad trabajamos
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain&order=send_date.desc&limit=15`, _seedAuth);
+      if (r.ok) _addSeeds(await r.json());
     } catch {}
-    // Monday active: tomar 10 random de mondayDomains (ya cargados arriba)
-    const mondaySeeds = mondayDomains.slice(0, 10);
-    mondaySeeds.forEach(d => seedDomains.add(d));
-    log(`Similar discovery seeds: ${seedDomains.size} dominios (review_queue + Monday)`);
+    try { // 2) Validados (aprobados por humano)
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&select=domain&order=validated_at.desc&limit=10`, _seedAuth);
+      if (r.ok) _addSeeds(await r.json());
+    } catch {}
+    try { // 3) Pending de alto tráfico (>=350K) como relleno
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&select=domain&order=created_at.desc&limit=10`, _seedAuth);
+      if (r.ok) _addSeeds(await r.json());
+    } catch {}
+    // 4) Monday activo
+    mondayDomains.slice(0, 10).forEach(d => seedDomains.add(d));
+    log(`Similar discovery seeds: ${seedDomains.size} dominios (sendtrack + validated + pending>=350K + Monday)`);
     if (seedDomains.size === 0) {
       log("Sin seeds disponibles — fallback a Majestic global");
       pool = majesticFullPool;
@@ -5466,7 +5818,7 @@ async function runSession(token, cfg, sessionStart) {
   const validatedSeeds = [];
   try {
     const valRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&traffic=gte.500000&select=domain&order=validated_at.desc&limit=15`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&traffic=gte.350000&select=domain&order=validated_at.desc&limit=15`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (valRes.ok) {
@@ -11118,6 +11470,7 @@ async function main() {
         );
         await maybeRunFeederSlot(token).catch(e => log(`⚠️ feeder slot: ${e.message}`));
         await maybeStartAutopilotSlot(token).catch(e => log(`⚠️ autopilot slot: ${e.message}`));
+        await maybeRunAutoGoogleSlot(token).catch(e => log(`⚠️ autogoogle slot: ${e.message}`));
         await _measureFeederRuns(token).catch(e => log(`⚠️ feeder measure: ${e.message}`));
         await _checkAutoPauseAgent(token).catch(e => log(`⚠️ autopause: ${e.message}`));
         // Source performance aggregate (1× por día, guard interno)

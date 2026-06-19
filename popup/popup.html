@@ -759,9 +759,99 @@
         <option value="">All languages</option>
         <option value="en">English</option>
         <option value="es">Spanish</option>
-        <option value="pt">Portuguesee</option>
+        <option value="pt">Portuguese</option>
         <option value="it">Italian</option>
+        <option value="fr">French</option>
+        <option value="de">German</option>
+        <option value="nl">Dutch</option>
+        <option value="pl">Polish</option>
+        <option value="tr">Turkish</option>
+        <option value="id">Indonesian</option>
+        <option value="ja">Japanese</option>
         <option value="ar">Arabic</option>
+      </select>
+      <select id="kw-country" class="filter-select" title="Simula el país de búsqueda en Google (gl) — combinable con el idioma">
+        <option value="">🌍 All countries</option>
+        <optgroup label="North America">
+          <option value="us">United States</option>
+          <option value="ca">Canada</option>
+          <option value="mx">Mexico</option>
+        </optgroup>
+        <optgroup label="Central America &amp; Caribbean">
+          <option value="gt">Guatemala</option>
+          <option value="cr">Costa Rica</option>
+          <option value="pa">Panama</option>
+          <option value="sv">El Salvador</option>
+          <option value="hn">Honduras</option>
+          <option value="ni">Nicaragua</option>
+          <option value="do">Dominican Republic</option>
+          <option value="pr">Puerto Rico</option>
+        </optgroup>
+        <optgroup label="South America">
+          <option value="ar">Argentina</option>
+          <option value="br">Brazil</option>
+          <option value="cl">Chile</option>
+          <option value="co">Colombia</option>
+          <option value="pe">Peru</option>
+          <option value="uy">Uruguay</option>
+          <option value="ec">Ecuador</option>
+          <option value="ve">Venezuela</option>
+          <option value="bo">Bolivia</option>
+          <option value="py">Paraguay</option>
+        </optgroup>
+        <optgroup label="Europe">
+          <option value="es">Spain</option>
+          <option value="it">Italy</option>
+          <option value="fr">France</option>
+          <option value="de">Germany</option>
+          <option value="nl">Netherlands</option>
+          <option value="be">Belgium</option>
+          <option value="ch">Switzerland</option>
+          <option value="at">Austria</option>
+          <option value="pt">Portugal</option>
+          <option value="ie">Ireland</option>
+          <option value="gb">United Kingdom</option>
+          <option value="pl">Poland</option>
+          <option value="cz">Czechia</option>
+          <option value="ro">Romania</option>
+          <option value="gr">Greece</option>
+          <option value="se">Sweden</option>
+          <option value="fi">Finland</option>
+          <option value="dk">Denmark</option>
+          <option value="no">Norway</option>
+          <option value="hu">Hungary</option>
+        </optgroup>
+        <optgroup label="Asia">
+          <option value="in">India</option>
+          <option value="id">Indonesia</option>
+          <option value="ph">Philippines</option>
+          <option value="vn">Vietnam</option>
+          <option value="th">Thailand</option>
+          <option value="my">Malaysia</option>
+          <option value="sg">Singapore</option>
+          <option value="jp">Japan</option>
+          <option value="kr">South Korea</option>
+          <option value="cn">China</option>
+          <option value="tw">Taiwan</option>
+          <option value="hk">Hong Kong</option>
+        </optgroup>
+        <optgroup label="MENA">
+          <option value="tr">Turkey</option>
+          <option value="ae">UAE</option>
+          <option value="sa">Saudi Arabia</option>
+          <option value="eg">Egypt</option>
+          <option value="il">Israel</option>
+          <option value="ma">Morocco</option>
+        </optgroup>
+        <optgroup label="Africa">
+          <option value="za">South Africa</option>
+          <option value="ng">Nigeria</option>
+          <option value="ke">Kenya</option>
+        </optgroup>
+        <optgroup label="Oceania">
+          <option value="au">Australia</option>
+          <option value="nz">New Zealand</option>
+        </optgroup>
       </select>
       <input id="kw-search" type="text" class="seed-input kw-search-input" placeholder="Search keyword..." />
     </div>
@@ -984,6 +1074,7 @@
       <button class="prospects-preset btn btn-sm" data-source="monday_refresh" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔄 Monday</button>
       <button class="prospects-preset btn btn-sm" data-source="csv" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📥 CSV</button>
       <button class="prospects-preset btn btn-sm" data-source="autopilot" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🤖 Autopilot</button>
+      <button class="prospects-preset btn btn-sm" data-source="autogoogle" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔎 AutoGoogle</button>
     </div>
     <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px;align-items:center">
       <span style="font-size:10px;color:var(--text-muted);font-weight:600;margin-right:4px">USUARIO:</span>
@@ -996,14 +1087,14 @@
     <!-- GEO: chips por CONTINENTE (preview) + dropdown multi-país (detalle) -->
     <div style="margin-bottom:6px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
-        <div style="font-size:10px;color:var(--text-muted);font-weight:600">PAÍS / REGIÓN:</div>
-        <button id="btn-prospects-country-picker" type="button" title="Elegir paises" style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--bg-input);color:var(--text);cursor:pointer">🌐 Filtrar países</button>
+        <div style="font-size:10px;color:var(--text-muted);font-weight:600">COUNTRY / REGION:</div>
+        <button id="btn-prospects-country-picker" type="button" title="Pick countries" style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--bg-input);color:var(--text);cursor:pointer">🌐 Filter countries</button>
       </div>
       <div id="prospects-geo-chips" style="display:flex;gap:4px;flex-wrap:wrap;font-size:10px"></div>
       <div id="prospects-country-panel" style="display:none;margin-top:6px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);max-height:220px;overflow-y:auto">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-          <input id="prospects-country-search" type="text" placeholder="🔎 Buscar país…" style="font-size:11px;padding:3px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);flex:1;margin-right:6px" />
-          <button id="prospects-country-clear" type="button" style="font-size:10px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text-muted);cursor:pointer">Limpiar</button>
+          <input id="prospects-country-search" type="text" placeholder="🔎 Search country…" style="font-size:11px;padding:3px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);flex:1;margin-right:6px" />
+          <button id="prospects-country-clear" type="button" style="font-size:10px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:transparent;color:var(--text-muted);cursor:pointer">Clear</button>
         </div>
         <div id="prospects-country-list" style="display:flex;flex-wrap:wrap;gap:4px"></div>
       </div>
@@ -1016,6 +1107,7 @@
       <option value="csv"></option>
       <option value="monday_refresh"></option>
       <option value="sellers_json"></option>
+      <option value="autogoogle"></option>
     </select>
     <select id="prospects-user-filter" style="display:none">
       <option value="" selected></option>
@@ -1072,6 +1164,7 @@
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card" style="margin-top:20px">
     <div class="card-title">📋 IMPORT SELLERS.JSON FROM PARTNERS</div>
+    <div id="sellers-region-filter" style="display:flex;flex-wrap:wrap;gap:4px;margin:0 0 8px"></div>
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
       <select id="sellers-company-select" class="form-select" style="flex:1;font-size:11px"></select>
       <button id="btn-sellers-edit" class="btn btn-secondary btn-sm" style="font-size:11px;padding:3px 8px" title="Edit company list">✏️ Edit</button>
@@ -1236,6 +1329,7 @@
   <span id="version-badge" class="version-badge" style="cursor:pointer" title="Click to check for updates">v—</span>
   <span id="rapidapi-monthly-counter" class="rapidapi-monthly-counter" title="SimilarWeb hits this calendar month (all MBs combined). Compare with RapidAPI dashboard.">SW: --</span>
   <span id="apollo-monthly-counter" class="rapidapi-monthly-counter" title="Apollo unlocks this calendar month (all MBs combined). Stops at 2400/2500 to avoid overage.">Apollo: --</span>
+  <span id="serper-monthly-counter" class="rapidapi-monthly-counter" title="Búsquedas Serper de AutoGoogle este mes (todas combinadas). Plan free 2500; el pacing reparte por días.">AutoGoogle: --</span>
   <span id="req-counter" class="cost-hint" style="display:none"></span>
 </footer>
 
