@@ -928,6 +928,51 @@ const AGENT_CATEGORIES = [
   "fashion", "politics", "weather", "science", "shopping",
 ];
 
+// ── Maxi 2026-06-19: DOS configs GEO/categoría que comparten los mismos chips ──
+//   🤖 Agente (envío, key agent_focus_config) · 🏭 Worker (descubrimiento,
+//   key worker_discovery_config). El toggle cambia cuál set editan los chips.
+window._focusMode  = window._focusMode || "agent";
+window._focusStore = window._focusStore || {
+  agent:  { geos_priority: [], geos_excluded: [], categories_priority: [] },
+  worker: { geos_priority: [], geos_excluded: [], categories_priority: [] },
+};
+function _focusInputEls() {
+  return {
+    pri: document.getElementById("agent-focus-geos-priority"),
+    exc: document.getElementById("agent-focus-geos-excluded"),
+    cat: document.getElementById("agent-focus-categories"),
+  };
+}
+function _captureFocusInputs() {
+  const { pri, exc, cat } = _focusInputEls();
+  const list = (el) => (el?.value || "").split(",").map(s => s.trim()).filter(Boolean);
+  window._focusStore[window._focusMode] = {
+    geos_priority:       list(pri).map(s => s.toUpperCase()),
+    geos_excluded:       list(exc).map(s => s.toUpperCase()),
+    categories_priority: list(cat).map(s => s.toLowerCase()),
+  };
+}
+function _applyFocusMode(mode) {
+  window._focusMode = (mode === "worker") ? "worker" : "agent";
+  const { pri, exc, cat } = _focusInputEls();
+  const s = window._focusStore[window._focusMode] || {};
+  if (pri) pri.value = (s.geos_priority || []).join(",");
+  if (exc) exc.value = (s.geos_excluded || []).join(",");
+  if (cat) cat.value = (s.categories_priority || []).join(",");
+  _renderGeoChips();
+  _renderCategoryChips();
+  const aBtn = document.getElementById("focus-mode-agent");
+  const wBtn = document.getElementById("focus-mode-worker");
+  const hint = document.getElementById("focus-mode-hint");
+  const ON = "#2563eb", OFF = "#334155";
+  if (aBtn) { aBtn.style.background = window._focusMode === "agent"  ? ON : OFF; aBtn.style.color = "#fff"; }
+  if (wBtn) { wBtn.style.background = window._focusMode === "worker" ? ON : OFF; wBtn.style.color = "#fff"; }
+  if (hint) hint.textContent = window._focusMode === "agent"
+    ? "Editando: a qué GEOs/categorías el AGENTE ENVÍA mails (de Prospects)."
+    : "Editando: qué GEOs/categorías el WORKER trae a Prospects (descubrimiento).";
+}
+function _setFocusMode(mode) { _captureFocusInputs(); _applyFocusMode(mode); }
+
 // Maxi 2026-06-18: chips de GEO/Cat reescritos con delegación de eventos +
 // listeners persistentes. Antes fallaba en algunos paths (no se actualizaba
 // el visual al click). Ahora el listener queda 1 vez en el wrap padre y
@@ -1090,19 +1135,24 @@ async function loadAdminAgent() {
   setVal("agent-cfg-active-end",   cfg.agent_active_hours_end,    20);
   document.getElementById("agent-stat-cap").textContent = cfg.agent_max_per_day || "20";
 
-  // Focus config (JSON)
+  // Focus config (JSON) — DOS sets: 🤖 agente (envío) y 🏭 worker (descubrimiento)
   let focus = { geos_priority: [], geos_excluded: [], categories_priority: [], weekly_target: 0, daily_override: 0 };
   try { focus = { ...focus, ...JSON.parse(cfg.agent_focus_config || "{}") }; } catch {}
-  const setStr = (id, v) => { const el = document.getElementById(id); if (el) el.value = (Array.isArray(v) ? v : []).join(","); };
-  setStr("agent-focus-geos-priority",  focus.geos_priority);
-  setStr("agent-focus-geos-excluded",  focus.geos_excluded);
-  setStr("agent-focus-categories",     focus.categories_priority);
+  let wdisc = { geos_priority: [], geos_excluded: [], categories_priority: [] };
+  try { wdisc = { ...wdisc, ...JSON.parse(cfg.worker_discovery_config || "{}") }; } catch {}
+  window._focusStore = {
+    agent:  { geos_priority: focus.geos_priority || [], geos_excluded: focus.geos_excluded || [], categories_priority: focus.categories_priority || [] },
+    worker: { geos_priority: wdisc.geos_priority || [], geos_excluded: wdisc.geos_excluded || [], categories_priority: wdisc.categories_priority || [] },
+  };
   setVal("agent-focus-daily",  focus.daily_override, 0);
   setVal("agent-focus-weekly", focus.weekly_target,  0);
 
-  // Render chips de GEOs y Categorías (lee de los hidden inputs llenados arriba)
-  _renderGeoChips();
-  _renderCategoryChips();
+  // Cablear el toggle Agente/Worker (1 vez) y aplicar el modo activo (carga el set + render).
+  ["focus-mode-agent", "focus-mode-worker"].forEach(id => {
+    const b = document.getElementById(id);
+    if (b && !b.dataset._wired) { b.dataset._wired = "1"; b.addEventListener("click", () => _setFocusMode(b.dataset.mode)); }
+  });
+  _applyFocusMode(window._focusMode || "agent");
 
   // Stats hoy
   // Maxi 2026-06-19 (fix): en paralelo + allSettled. Antes era await secuencial:
@@ -1388,17 +1438,27 @@ async function saveAgentThresholds() {
 }
 
 async function saveAgentFocus() {
-  const parseList = (id) => (document.getElementById(id).value || "")
-    .split(",").map(s => s.trim()).filter(Boolean);
+  // Captura el modo que se está editando al store, después escribe AMBAS configs.
+  _captureFocusInputs();
+  const a = window._focusStore.agent  || {};
+  const w = window._focusStore.worker || {};
   const focus = {
-    geos_priority:       parseList("agent-focus-geos-priority").map(s => s.toUpperCase()),
-    geos_excluded:       parseList("agent-focus-geos-excluded").map(s => s.toUpperCase()),
-    categories_priority: parseList("agent-focus-categories").map(s => s.toLowerCase()),
+    geos_priority:       a.geos_priority || [],
+    geos_excluded:       a.geos_excluded || [],
+    categories_priority: a.categories_priority || [],
     daily_override:      parseInt(document.getElementById("agent-focus-daily").value, 10) || 0,
     weekly_target:       parseInt(document.getElementById("agent-focus-weekly").value, 10) || 0,
   };
-  await _writeAgentConfig({ agent_focus_config: JSON.stringify(focus) });
-  showToast("✅ Weekly focus saved", "info");
+  const worker = {
+    geos_priority:       w.geos_priority || [],
+    geos_excluded:       w.geos_excluded || [],
+    categories_priority: w.categories_priority || [],
+  };
+  await _writeAgentConfig({
+    agent_focus_config:     JSON.stringify(focus),    // 🤖 a qué envía el agente
+    worker_discovery_config: JSON.stringify(worker),  // 🏭 qué trae el worker a Prospects
+  });
+  showToast("✅ Config guardada (agente + worker)", "info");
   await loadAdminAgent();
 }
 

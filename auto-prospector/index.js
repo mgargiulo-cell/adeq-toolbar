@@ -670,7 +670,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
     // ya fueron contactados antes y el MB explícitamente quiere re-prospectarlos.
     if (source !== "monday_refresh") {
       log(`  ⛔ saveToReviewQueue ${domain} REJECTED — traffic ${trafficNum} < ${REVIEW_QUEUE_MIN_TRAFFIC} (source=${source})`);
-      return false;
+      return "floor";
     }
   }
 
@@ -691,7 +691,7 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
       const dupRows = await dupRes.json();
       if (Array.isArray(dupRows) && dupRows.length > 0) {
         log(`  ⏭️ saveToReviewQueue ${domain}: ya existe pending (id=${dupRows[0].id}, source=${dupRows[0].source || "?"}) — skip dup`);
-        return false;
+        return "dup";
       }
     }
   } catch {}
@@ -732,9 +732,9 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     log(`  ❌ saveToReviewQueue ${domain} HTTP ${res.status}: ${txt.substring(0, 200)}`);
-    return false;
+    return `http_${res.status}:${txt.substring(0, 60)}`;
   }
-  return true;
+  return "ok";
 }
 
 // ── Bulk refresh de leads sin traffic ───────────────────────
@@ -2567,7 +2567,13 @@ const WORKER_DEPRIO_NAMES = new Set([
   "united states","usa","united kingdom","britain","england",
   "canada","australia","new zealand","ireland",
 ]);
+// Maxi 2026-06-19: GEO deprio DESACTIVADO. El user nunca pidió bloquear GEOs en el
+// descubrimiento — la selección de GEO se hace al ENVIAR (config del agente). Antes
+// esto descartaba USA/UK/CA/AU/NZ/IE antes de llegar a Prospects. Ahora pasan todos;
+// el único filtro de descubrimiento es el tráfico (<350K). Flag por si se quiere reactivar.
+const WORKER_GEO_DEPRIO_ON = false;
 function _isWorkerDeprioGeo(topCountryNameOrIso, geosAllArr) {
+  if (!WORKER_GEO_DEPRIO_ON) return false;
   const norm = (s) => String(s || "").trim();
   const t = norm(topCountryNameOrIso);
   if (t) {
@@ -4179,9 +4185,13 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   //    MB enseñó al rechazar (motivos sintetizados).
   const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules);
   if (type === "publisher") return { ok: true, reason: catDisliked ? "haiku_publisher(despite_disliked_cat)" : "haiku_publisher" };
-  if (type) return { ok: false, reason: `haiku_${type}` };
-  // Sin señal y Haiku no respondió → rechazar (política: Prospects limpio).
-  return { ok: false, reason: catDisliked ? "disliked_cat_no_signal" : "no_publisher_signal" };
+  if (type) return { ok: false, reason: `haiku_${type}` }; // veredicto EXPLÍCITO de no-publisher
+  // Maxi 2026-06-19: Haiku NO respondió (api-proxy caído/timeout/sin texto). NO rechazar
+  // por una falla del clasificador — antes esto tiraba leads válidos como "no_publisher_signal".
+  // Si la categoría ya venía rechazada por el MB, respetamos su dislike. Si no, PASA
+  // (beneficio de la duda; el tráfico ≥350K ya filtró lo importante).
+  if (catDisliked) return { ok: false, reason: "disliked_cat_no_signal" };
+  return { ok: true, reason: "classifier_unavailable_pass" };
 }
 
 // ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
@@ -5151,6 +5161,37 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const adNetworks = pageContent?.adNetworks || [];
   const pageTitle = pageContent?.title || "";
 
+  // Maxi 2026-06-19: filtro de DESCUBRIMIENTO configurable por el admin
+  // (worker_discovery_config, editable desde el toggle 🏭 Worker). VACÍO = no filtra
+  // (default: solo el bajo tráfico descarta). Si el admin setea prioridades/exclusiones
+  // de GEO o categoría, el worker las respeta para lo que TRAE a Prospects.
+  // monday_refresh se exceptúa (re-prospect explícito del MB).
+  if (source !== "monday_refresh") {
+    let wd = {};
+    try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
+    const geoPri = (wd.geos_priority || []).map(s => String(s).toUpperCase());
+    const geoExc = (wd.geos_excluded || []).map(s => String(s).toUpperCase());
+    const catPri = (wd.categories_priority || []).map(s => String(s).toLowerCase());
+    const iso = String(geosAllIso[0] || "").toUpperCase();
+    const nm  = String(topCountry || "").toUpperCase();
+    const geoMatches = (set) => set.length && set.some(v => v === iso || v === nm);
+    if (geoExc.length && geoMatches(geoExc)) {
+      await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
+      log(`  🏭 ${domain} — GEO ${topCountry || iso} EXCLUIDO por config del worker`);
+      return;
+    }
+    if (geoPri.length && !geoMatches(geoPri)) {
+      await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_not_priority:${topCountry || iso}` });
+      log(`  🏭 ${domain} — GEO ${topCountry || iso} no está en la prioridad del worker`);
+      return;
+    }
+    if (catPri.length && category && !catPri.some(c => category.toLowerCase().includes(c))) {
+      await markCsvItem(token, item.id, "skipped", { error_message: `worker_cat_not_priority:${category}` });
+      log(`  🏭 ${domain} — categoría "${category}" no está en la prioridad del worker`);
+      return;
+    }
+  }
+
   // ── Detección de IDIOMA al insertar — robusta vía detectLanguageRobust ──
   const langDet = await detectLanguageRobust({
     htmlLang:   pageContent?.htmlLang,
@@ -5275,12 +5316,12 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // casos como contentiq.com, boonsmedia.com, home.gotsport.com.
   // CRITERIO ESTRICTO: solo si fetch falló totalmente — sites legitimos sin
   // title NO se filtran (pueden ser sitios chicos).
+  // Maxi 2026-06-19: SIN EMAILS ya NO descarta. Política del user: si el sitio tiene
+  // ≥350K pageviews, entra a Prospects igual (el MB puede conseguir el contacto después).
+  // Lo ÚNICO que descarta en el descubrimiento es el bajo tráfico. Antes acá se tiraba
+  // todo lo "sin emails + sitio caído" → leads válidos perdidos.
   if (emails.length === 0 && pageContent === null) {
-    await markCsvItem(token, item.id, "skipped", {
-      error_message: "no_emails_and_site_unreachable — Apollo+scrape vacío, fetch del sitio falló (HTTP error/timeout)",
-    });
-    log(`  ⛔ ${domain} — sin emails Y fetch del sitio falló → skip (dominio probablemente muerto)`);
-    return;
+    log(`  ⚠️ ${domain} — sin emails y fetch falló, pero tráfico OK → se agrega igual a Prospects (sin contacto)`);
   }
   // 3. NO empujar a Monday automáticamente. Escribir a review_queue para que el MB
   //    decida email + draft + push manualmente desde el tab Prospects.
@@ -5315,18 +5356,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // por dup o por el piso) → el item se contaba como "done" pero NUNCA llegaba
     // a Prospects (el famoso "34 done · 0 to Prospects"). Ahora si no se guardó,
     // se marca "skipped" con razón visible en el diagnóstico.
-    if (saved) {
+    if (saved === "ok") {
       await markCsvItem(token, item.id, "done", { monday_item_id: mondayItemId });
       // Bump counter global diario (cap safety net 1000/día)
       bumpCsvDailyCounter(token, 1).catch(() => {});
       const vstr = visits ? formatVisitsForMonday(visits) : "-";
       log(`  ✅ ${domain} → review_queue (source:${source}, visits:${vstr}, geo:${topCountry || "-"}, ${emails.length} email(s))`);
     } else {
+      // Maxi 2026-06-19: motivo REAL del fallo (dup / floor / http_NNN) — antes se
+      // mezclaba todo en "dup o piso" y ocultaba errores de INSERCIÓN reales.
       await markCsvItem(token, item.id, "skipped", {
-        error_message: "saveToReviewQueue=false (dup pending o piso de pageviews)",
+        error_message: `review_queue_insert_fail:${saved}`,
         monday_item_id: mondayItemId,
       });
-      log(`  ⏭️ ${domain} — saveToReviewQueue devolvió false (no llegó a Prospects)`);
+      log(`  ⏭️ ${domain} — saveToReviewQueue: ${saved} (no llegó a Prospects)`);
     }
   } catch (e) {
     await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500), monday_item_id: mondayItemId });
@@ -6263,7 +6306,7 @@ async function runSession(token, cfg, sessionStart) {
       pageTitle,
       createdBy:     sessionUser,
     });
-    if (saveOk) {
+    if (saveOk === "ok") {
       await markProcessed(token, [domain], "added_to_review");
       count++; added++;
       trackAutopilotEvent("added", domain);
@@ -9393,13 +9436,11 @@ async function runAgentCycle(token, allFlags) {
     for (const c of candidatesRaw) {
       const sw = scoreWebsite(c);
       if (sw.score < 0) {
-        // Marcar como rejected — no entran al pool del MB humano tampoco
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${c.id}`, {
-          method: "PATCH",
-          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ status: "rejected", validated_by: "agent:auto", validated_at: new Date().toISOString() }),
-        }).catch(() => {});
-        log(`  ❌ ${c.domain}: ${sw.reasons.join(", ")}`);
+        // Maxi 2026-06-19: el AGENTE ya NO marca rejected automáticamente. Antes esto
+        // borraba leads del pool del MB humano (Prospects quedaba vacío). Ahora solo
+        // saltea el ENVÍO automático de ese lead; sigue PENDING para que el MB lo vea
+        // y decida. Solo el botón rojo del MB (o blocklist explícito) rechaza.
+        log(`  ⏭️ ${c.domain}: agente no envía (${sw.reasons.join(", ")}) — queda pending para el MB`);
         continue;
       }
       // Persistir score si cambió mucho (evita PATCH spam)
