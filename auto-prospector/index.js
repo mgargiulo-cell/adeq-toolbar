@@ -5625,7 +5625,10 @@ async function runSession(token, cfg, sessionStart) {
       log(`📊 Stats hoy — Majestic: ${majLeads} leads, Similar: ${simLeads} leads → P(majestic)=${_probMajestic.toFixed(2)}`);
     }
   } catch {}
-  const _autopilotMode = Math.random() < _probMajestic ? "majestic" : "similar_discovery";
+  // Maxi 2026-06-19: el autopilot SIEMPRE hace similar_discovery (su fortaleza única:
+  // parecidos a lo que enviaste/validaste). Majestic YA lo cubre el feeder → NO replicar;
+  // queda solo como fallback automático si no hubiera semillas (lo maneja el flujo de abajo).
+  const _autopilotMode = "similar_discovery";
   log(`🎲 Autopilot mode: ${_autopilotMode} (P_majestic=${_probMajestic.toFixed(2)})`);
   const _modeStartLeadCount = await (async () => {
     try {

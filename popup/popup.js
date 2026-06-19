@@ -1687,6 +1687,7 @@ async function loadAdminActivity() {
   // Maxi 2026-06-17: Quickview compacto por MB — manual + agente + eficacia.
   renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes);
   renderAdminConversionBySource().catch(() => {});
+  renderAdminSourcePerformance().catch(() => {});
 
   // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial.
   // CADA review_queue row genera 1 row para el created_by (descubrió/importó) Y
@@ -1808,6 +1809,59 @@ async function renderAdminConversionBySource() {
         Tasa de respuesta REAL (excluye Out-of-Office). El agente usa estos números para rankear qué fuente priorizar.
       </div>
     `;
+  } catch (e) {
+    wrap.innerHTML = `<div style="opacity:.6;color:#dc2626">Error: ${esc(e.message || String(e))}</div>`;
+  }
+}
+
+// Maxi 2026-06-19: rendimiento por MOTOR de descubrimiento. Cruza lo que cada fuente
+// PUSO en Prospects (toolbar_review_queue.source) con lo ENVIADO (toolbar_sendtrack,
+// por dominio). Mayor % = el motor que mejor convierte. AutoGoogle arranca en 0.
+async function renderAdminSourcePerformance() {
+  const wrap = document.getElementById("admin-source-performance");
+  if (!wrap) return;
+  try {
+    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+    const [rqRes, stRes] = await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?select=domain,source&limit=50000`, { headers }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain&limit=50000`, { headers }),
+    ]);
+    if (!rqRes.ok) { wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin data todavía.</div>'; return; }
+    const rq = await rqRes.json();
+    const st = stRes.ok ? await stRes.json() : [];
+    const norm = d => String(d || "").toLowerCase().replace(/^www\./, "");
+    const sentSet = new Set((Array.isArray(st) ? st : []).map(r => norm(r.domain)));
+    const CAT = (s) => {
+      s = (s || "").toLowerCase();
+      if (s.includes("autopilot"))  return "🤖 Autopilot";
+      if (s.includes("autogoogle")) return "🔎 AutoGoogle";
+      if (s.includes("monday"))     return "🔄 Monday";
+      if (s.includes("sellers"))    return "📋 sellers.json";
+      if (s.includes("csv"))        return "📥 CSV";
+      return "❓ Otro";
+    };
+    const byCat = new Map();
+    for (const r of (Array.isArray(rq) ? rq : [])) {
+      const dom = norm(r.domain); if (!dom) continue;
+      const cat = CAT(r.source);
+      const c = byCat.get(cat) || { dom: new Set(), sent: new Set() };
+      c.dom.add(dom);
+      if (sentSet.has(dom)) c.sent.add(dom);
+      byCat.set(cat, c);
+    }
+    const rows = [...byCat.entries()]
+      .map(([cat, c]) => ({ cat, total: c.dom.size, sent: c.sent.size, pct: c.dom.size ? (c.sent.size / c.dom.size * 100) : 0 }))
+      .sort((a, b) => b.pct - a.pct);
+    if (rows.length === 0) { wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin prospects todavía — esperá a que los motores carguen.</div>'; return; }
+    wrap.innerHTML = rows.map(r => {
+      const color = r.pct >= 40 ? "#16a34a" : r.pct >= 20 ? "#d97706" : "#dc2626";
+      return `<div style="display:grid;grid-template-columns:120px 1fr 56px 78px;gap:6px;align-items:center;padding:4px 6px;background:#0f172a;border-radius:4px">
+        <div style="font-weight:700">${r.cat}</div>
+        <div style="background:#1e293b;height:8px;border-radius:4px;overflow:hidden"><div style="height:100%;width:${Math.min(100, r.pct)}%;background:${color};border-radius:4px"></div></div>
+        <div style="text-align:right;color:${color};font-weight:700">${r.pct.toFixed(1)}%</div>
+        <div style="text-align:right;color:#94a3b8;font-size:10px">${r.sent}/${r.total}</div>
+      </div>`;
+    }).join("") + `<div style="font-size:10px;color:#64748b;text-align:center;padding-top:4px">% de lo que cada motor puso en Prospects que terminó enviado (cruce con sendtrack por dominio).</div>`;
   } catch (e) {
     wrap.innerHTML = `<div style="opacity:.6;color:#dc2626">Error: ${esc(e.message || String(e))}</div>`;
   }
