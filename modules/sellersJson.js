@@ -316,15 +316,17 @@ export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candid
       { table: "toolbar_url_blocklist", col: "domain", filter: "" },
     ];
   } else {
-    // REGLA CANÓNICA (Maxi 2026-06-19): un import SOLO se descarta si el dominio ya
-    // está en la cola ACTIVA (no duplicar el job en curso) o ya es un Prospect
-    // (toolbar_review_queue). NO se bloquea por historial / sendtrack / blocklist:
-    // la fuente de verdad es Monday + Prospects. El worker, al PROCESAR la cola, ya
-    // chequea Monday (solo procesa si NO existe o está en "Ciclo Finalizado") y el
-    // guard de envío 30d evita re-spammear. Así, tras un reset, repobla bien.
+    // COBERTURA PROGRESIVA (Maxi 2026-06-22): un import de sellers/CSV descarta el
+    // dominio si YA pasó por el sistema alguna vez — cualquier fila en la cola
+    // (cualquier status: pending/processing/waiting/done/skipped/frozen/next_day) o
+    // cualquier fila en Prospects. Así el import recorre el JSON SIN repetir: cada
+    // tanda toma URLs nuevas, quedan marcadas, y la siguiente avanza a las que faltan.
+    // Cuando ya no quedan nuevas, "ya analizados" es REAL (ese partner está agotado).
+    // Para RE-PROSPECTAR finalizados se usa el flujo Monday (mode monday_refresh), que
+    // NO mira esta historia. Tras un reset total (cola vacía) todo vuelve a ser nuevo.
     tables = [
-      { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool)" },
-      { table: "toolbar_review_queue",  col: "domain", filter: "&status=eq.pending" },
+      { table: "toolbar_csv_queue",     col: "domain", filter: "" },
+      { table: "toolbar_review_queue",  col: "domain", filter: "" },
     ];
   }
   for (let i = 0; i < candidates.length; i += BATCH) {

@@ -7512,7 +7512,7 @@ async function initCsvQueue() {
         return;
       }
       resultEl.textContent = `Uploading ${_fresh.length} fresh${_skippedKnown > 0 ? ` (${_skippedKnown} already in system)` : ""}...`;
-      const up = await uploadCsvDomains(_fresh, state.loginEmail, state.accessToken, "monday");
+      const up = await uploadCsvDomains(_fresh, state.loginEmail, state.accessToken, "monday_refresh");
       logImportAttempt(state.accessToken, {
         userEmail: state.loginEmail, source: "monday",
         sourceDetail: _filterDetail, attempted: domains.length, deduped: _skippedKnown, inserted: up?.inserted || 0,
@@ -8862,7 +8862,8 @@ function _renderCountryPanel(filter = "") {
       const name = (ISO_TO_NAME_LOCAL[iso] || iso).toLowerCase();
       return iso.toLowerCase().includes(f) || name.includes(f);
     })
-    .sort((a, b) => b[1] - a[1]);
+    // Maxi 2026-06-22: orden ALFABÉTICO por nombre de país (antes era por cantidad).
+    .sort((a, b) => (ISO_TO_NAME_LOCAL[a[0]] || a[0]).localeCompare(ISO_TO_NAME_LOCAL[b[0]] || b[0]));
 
   // Maxi 2026-06-19: fila de CONTINENTES (en inglés) SIEMPRE visible — además de
   // los países. North/Central/South America separados + Europe/Asia/Africa/Oceania.

@@ -730,7 +730,11 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   const CORE = new Set(["domain", "traffic", "status"]);
   let body = { ...payload };
   for (let attempt = 0; attempt < 6; attempt++) {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
+    // on_conflict=domain: si el dominio YA existe (validated/rejected/etc.), en vez de
+    // chocar con el unique (409/23505) hace UPSERT → re-activa esa fila a pending para
+    // re-prospectar. El guard de envío 30d evita re-spamear. (Maxi 2026-06-22: antes
+    // merge-duplicates upserteaba sobre la PK id, no sobre domain → 409 → leads perdidos.)
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?on_conflict=domain`, {
       method: "POST",
       headers: {
         "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
@@ -1165,14 +1169,14 @@ async function _findKnownDomainsWorker(token, candidates) {
   const known = new Set();
   const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const BATCH = 200;
-  // REGLA CANÓNICA (Maxi 2026-06-19): solo bloquear si el dominio ya está en la cola
-  // ACTIVA (no duplicar job en curso) o ya es Prospect (review_queue pending). NO se
-  // bloquea por historial / sendtrack / blocklist — la fuente de verdad es Monday +
-  // Prospects. El worker, al procesar, ya chequea Monday (solo procesa si no existe o
-  // está en "Ciclo Finalizado") + guard 30d de envío. Aplica igual a feeder y autopilot.
+  // COBERTURA PROGRESIVA (Maxi 2026-06-22): el feeder también recorre los JSON sin
+  // repetir. Bloquea si el dominio YA pasó por el sistema — cualquier fila en la cola
+  // (cualquier status) o en Prospects. Así no re-analiza lo ya visto y avanza a lo
+  // nuevo. Re-prospect de finalizados = flujo Monday aparte. Tras reset total, todo
+  // vuelve a ser nuevo. (Sincronizado con el import manual en modules/sellersJson.js.)
   const tables = [
-    { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool)" },
-    { table: "toolbar_review_queue",  col: "domain", filter: "&status=eq.pending" },
+    { table: "toolbar_csv_queue",     col: "domain", filter: "" },
+    { table: "toolbar_review_queue",  col: "domain", filter: "" },
   ];
   for (let i = 0; i < candidates.length; i += BATCH) {
     const slice = candidates.slice(i, i + BATCH);
@@ -1443,7 +1447,10 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
       )];
       if (candidates.length === 0) continue;
       const known = await _findKnownDomainsWorker(token, candidates);
-      const fresh = candidates.filter(d => !known.has(d) && !sessionKnown.has(d));
+      // Maxi 2026-06-22: recorrido AL AZAR del JSON (no en orden). Mezclamos los frescos
+      // antes de cortar, así en sucesivas corridas no caemos siempre sobre los primeros.
+      const fresh = candidates.filter(d => !known.has(d) && !sessionKnown.has(d))
+        .sort(() => Math.random() - 0.5);
       if (fresh.length === 0) continue;
       const slice = fresh.slice(0, targetCount - inserted);
       slice.forEach(d => sessionKnown.add(d));
@@ -2799,9 +2806,17 @@ async function getRejectionPatterns(token) {
 
 // ── APIs externas ─────────────────────────────────────────────
 
-// Estados Monday que SE PUEDEN re-prospectar (autopilot + CSV pueden traerlos).
-// Cualquier otro estado bloquea el dominio (En Negociacion / Propuesta Vigente / etc).
-const REPROSPECTABLE_STATES = new Set(["Ciclo Finalizado", "Mail No Enviado"]);
+// Maxi 2026-06-22: LISTA NEGRA (antes era lista blanca). Regla del user: sumar TODO
+// lo disponible; bloquear SOLO los dominios que en Monday están en un deal ACTIVO o
+// con dueño trabajándolo. Todo lo demás (Ciclo Finalizado, Mail No Enviado, Descartado,
+// o que NO esté en Monday) se re-prospecta. Los nombres deben coincidir EXACTO con las
+// labels de la columna deal_stage del board 1420268379.
+const MONDAY_BLOCKED_STATES = new Set([
+  "LIVE", "En Negociacion", "Propuesta Vigente", "Propuesta Vigente (T)",
+  "PAUSADO", "Masivo - Diego", "Masivo - Agus", "Masivo - Max",
+]);
+// Helper: ¿este estado de Monday bloquea el re-prospect? (true = NO sumar)
+function _isMondayBlocked(estado) { return MONDAY_BLOCKED_STATES.has((estado || "").trim()); }
 
 async function fetchMondayDomains(apiKey) {
   // Trae name + estado y devuelve solo dominios cuyo estado NO es re-prospectable.
@@ -2826,7 +2841,7 @@ async function fetchMondayDomains(apiKey) {
   return items
     .filter(i => {
       const estado = i.column_values?.[0]?.text || "";
-      return !REPROSPECTABLE_STATES.has(estado);
+      return _isMondayBlocked(estado); // solo los ACTIVOS/con-dueño se excluyen del pool
     })
     .map(i => cleanDomain(i.name))
     .filter(Boolean);
@@ -4990,23 +5005,33 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Antes se hardcodeaba "csv" → todo el chip filter quedaba inútil.
   let source;
   switch (item.source) {
+    // Alias del feeder automático → source de Prospects
     case "auto_feeder_sellers":  source = "sellers_json"; break;
     case "auto_feeder_majestic": source = "autopilot";    break;
     case "auto_feeder_monday":   source = "monday_refresh"; break;
-    default:                     source = "csv"; // CSV manual subido desde popup
+    // Maxi 2026-06-22 FIX: los imports MANUALES ya vienen con el source correcto
+    // (sellers_json / monday_refresh / csv / autogoogle / autopilot) → PRESERVARLO.
+    // Antes caían en default="csv" → el filtro de FUENTE en Prospects no respetaba nada.
+    case "sellers_json":
+    case "monday_refresh":
+    case "csv":
+    case "autogoogle":
+    case "autopilot":           source = item.source; break;
+    default:                     source = "csv"; // desconocido → csv
   }
   let mondayItemId = null;
 
   if (mondayApiKey) {
     match = await findMondayItem(domain, mondayApiKey);
     if (match) {
-      // Existe en Monday — solo procesar si está en Ciclo Finalizado
-      if (!REPROSPECTABLE_STATES.has(match.estado)) {
+      // Existe en Monday — bloquear SOLO si está en un estado ACTIVO/con-dueño
+      // (lista negra). Ciclo Finalizado / Mail No Enviado / Descartado → se re-prospecta.
+      if (_isMondayBlocked(match.estado)) {
         await markCsvItem(token, item.id, "skipped", {
-          error_message: `estado=${match.estado || "?"} (solo ${[...REPROSPECTABLE_STATES].join(" / ")} se re-prospecta)`,
+          error_message: `monday_activo: estado="${match.estado || "?"}" (deal activo/con dueño — no se re-prospecta)`,
           monday_item_id: match.id,
         });
-        log(`  ⏭ ${domain} — ya está en Monday con estado "${match.estado}"`);
+        log(`  ⏭ ${domain} — Monday estado "${match.estado}" es activo/con-dueño → skip`);
         return;
       }
       source = "monday_refresh";

@@ -1333,12 +1333,18 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
       return { domain: d, status, uploaded_by: userEmail, source };
     });
     try {
+      // Maxi 2026-06-22 FIX: antes "ignore-duplicates" tiraba en silencio cualquier
+      // dominio que ya tuviera una fila vieja (done/skipped/frozen/next_day) → "ya
+      // estaban, 0 nuevos" hasta en el Monday refresh (que existe para re-prospectar).
+      // Ahora "merge-duplicates": re-activa la fila existente al nuevo status (pending/
+      // waiting) → el dominio se re-encola y el worker lo re-procesa (chequea Monday +
+      // tráfico igual, no re-spamea). Sincroniza el insert con el dedup canónico.
       const res = await fetch(`${url}/rest/v1/toolbar_csv_queue`, {
         method: "POST",
         headers: {
           "apikey": key, "Authorization": `Bearer ${accessToken}`,
           "Content-Type": "application/json",
-          "Prefer": "resolution=ignore-duplicates,return=representation",
+          "Prefer": "resolution=merge-duplicates,return=representation",
         },
         body: JSON.stringify(slice),
       });
