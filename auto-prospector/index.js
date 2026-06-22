@@ -1403,6 +1403,12 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     const domains = await _serperSearch(kw, 20, gl);
     queriesDone++;
     domains.forEach(d => found.add(d));
+    // Maxi 2026-06-22: persistir el contador CADA 20 búsquedas (no solo al final).
+    // Antes, si el worker crasheaba/reiniciaba a mitad, esas búsquedas ya facturadas
+    // no se contaban → el próximo slot las re-gastaba y reventaba el cap free de Serper.
+    if (queriesDone % 20 === 0) {
+      try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
+    }
   }
   try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
   if (found.size === 0) { log("🔎 AutoGoogle: 0 dominios (¿key inválida o sin resultados?)"); return; }
@@ -3026,10 +3032,18 @@ async function getTrafficData(domain, rapidApiKey) {
   const cached = await getTrafficCacheServer(cleanD);
   if (cached) {
     log(`  💾 traffic cache HIT ${cleanD} (sin gastar hit)`);
+    // Maxi 2026-06-22 FIX: el HIT devolvía solo visits/ppv/topCountry y PERDÍA
+    // swCategory, topCountries3 y pageViews (sí están guardados) → re-filtraba mal
+    // (categoría vacía → Haiku innecesario; pageViews null → estimación peor; GEO sin top3).
+    const _cc = Array.isArray(cached.topCountries) ? cached.topCountries : [];
+    const _top3 = _cc.map(c => String(c?.code || "").toUpperCase().slice(0, 2)).filter(Boolean).slice(0, 3);
     return {
       visits:        cached.rawVisits || cached.visits || 0,
       pagesPerVisit: cached.pagesPerVisit || null,
-      topCountry:    cached.topCountries?.[0]?.code ? COUNTRY_CODES[cached.topCountries[0].code] || cached.topCountries[0].code : null,
+      pageViews:     cached.pageViews || null,
+      topCountry:    _cc[0]?.code ? (COUNTRY_CODES[_cc[0].code] || _cc[0].code) : null,
+      topCountries3: _top3,
+      swCategory:    cached.category || "",
       error:         null,
       fromCache:     true,
     };
@@ -5059,6 +5073,19 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // - traffic = 0 / null / error → after 3 failed attempts, FREEZE 15d/30d/60d
   // - traffic ≥ 400K → entra al pool
   if (!visits || visits <= 0) {
+    // Maxi 2026-06-22 FIX: NO penalizar/congelar por fallas TRANSITORIAS de la API
+    // (429/5xx/timeout/red). Antes 3 timeouts seguidos congelaban un lead bueno 15-60d
+    // y hasta lo mandaban a blocklist. Solo se cuenta como intento fallido cuando la API
+    // respondió de verdad (0 visitas o 404 "sin data"). Transitorio → reintento limpio.
+    const _errStr = String(trafficData.error || "");
+    const _transient = /429|timeout|timed out|\b5\d\d\b|network|fetch failed|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket|aborted/i.test(_errStr);
+    if (_transient) {
+      await markCsvItem(token, item.id, "pending", {
+        error_message: `traffic_api_transient (reintento sin penalizar): ${_errStr.slice(0, 50)}`,
+      });
+      log(`  🔁 ${domain} — API tráfico transitorio (${_errStr.slice(0, 40)}) → reintento, NO congela`);
+      return;
+    }
     // Tracking de intentos via error_message (no requiere schema change)
     const prevAttempts = parseInt((item.error_message || "").match(/attempt_(\d+)/)?.[1] || "0", 10);
     const newAttempt = prevAttempts + 1;
@@ -5174,10 +5201,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   if (source !== "monday_refresh") {
     const overrepresented = await _isGeoOverrepresentedInPool(token, topCountry, geosAllIso).catch(() => false);
     if (overrepresented) {
-      await markCsvItem(token, item.id, "skipped", {
-        error_message: `geo_saturated_in_pool: ${topCountry || "?"} ya tiene >25% del review_queue`,
+      // Maxi 2026-06-22 FIX: saturación de GEO es TRANSITORIA (el pool se rebalancea).
+      // Antes se marcaba "skipped" → el dedup lo bloqueaba para siempre. Ahora "next_day":
+      // reintenta cuando el pool baje de ese GEO. No se pierde el lead.
+      await markCsvItem(token, item.id, "next_day", {
+        error_message: `geo_saturated_in_pool: ${topCountry || "?"} >25% del pool (reintenta mañana)`,
       });
-      log(`  ⚖️ ${domain} — GEO ${topCountry} saturado en Prospects (>25%) → skip para balance`);
+      log(`  ⚖️ ${domain} — GEO ${topCountry} saturado (>25%) → next_day (reintenta, no se pierde)`);
       return;
     }
   }
@@ -6691,13 +6721,15 @@ async function findUnopenedSends(token, waitDays = 5) {
       const opens = opensRes.ok ? await opensRes.json() : [];
       if (Array.isArray(opens) && opens.length > 0) continue; // abrió → skip
 
-      // Check re_sent — ya intentamos re-engaging este envío?
+      // Check re_sent / exhausted — ya intentamos re-engaging este dominio (o quedó
+      // agotado por falta de email alternativo)? Maxi 2026-06-22: incluye
+      // reengagement_exhausted para no re-evaluar en loop los que no tienen alt email.
       const reSentRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.re_sent&domain=eq.${encodeURIComponent(s.domain)}&select=id&limit=1`,
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(re_sent,reengagement_exhausted)&domain=eq.${encodeURIComponent(s.domain)}&select=id&limit=1`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       );
       const reSents = reSentRes.ok ? await reSentRes.json() : [];
-      if (Array.isArray(reSents) && reSents.length > 0) continue; // ya re-engagéd
+      if (Array.isArray(reSents) && reSents.length > 0) continue; // ya re-engagéd o agotado
 
       candidates.push(s);
     }
@@ -6819,6 +6851,13 @@ async function runReengagementCycle(token) {
     const enabled = String(cfg.agent_reengagement_enabled || "").toLowerCase() === "true";
     if (!enabled) return; // KILL SWITCH
 
+    // Maxi 2026-06-22: mismos gates que el envío normal — NO re-engagear fin de semana
+    // ni fuera de horario laboral (evita mails de madrugada/sábado y cuida reputación Gmail).
+    if (_isWeekendSpain()) { log("🔄 Re-engagement: fin de semana → skip"); return; }
+    const _reAStart = parseInt(cfg.agent_active_hours_start || "9", 10);
+    const _reAEnd   = parseInt(cfg.agent_active_hours_end || "20", 10);
+    if (_isOutsideActiveHours(_reAStart, _reAEnd)) { log("🔄 Re-engagement: fuera de horario → skip"); return; }
+
     const waitDays    = parseInt(cfg.agent_reengagement_wait_days || "5", 10);
     const maxAttempts = parseInt(cfg.agent_reengagement_max_attempts || "3", 10);
 
@@ -6859,9 +6898,13 @@ async function runReengagementCycle(token) {
       const exclude = [originalEmail];
       const next = await pickNextEmailCandidate(token, domain, exclude);
       if (!next) {
-        log(`  ⏭ ${domain}: sin emails alternativos disponibles`);
+        // Maxi 2026-06-22 FIX: marcar AGOTADO (acción terminal) en vez de "skipped".
+        // Antes findUnopenedSends seguía devolviendo este dominio CADA ciclo (25 min)
+        // porque solo excluye los que tienen re_sent → loop infinito (los 1154 casos).
+        // Ahora 'reengagement_exhausted' lo excluye para siempre.
+        log(`  ⏭ ${domain}: sin emails alternativos → AGOTADO (no se re-evalúa más)`);
         await logAgentAction(token, userEmail, {
-          domain, action: "skipped", reason: "reengagement_no_alt_email",
+          domain, action: "reengagement_exhausted", reason: "no_alt_email",
           details: { tried: originalEmail },
         });
         continue;
@@ -7250,7 +7293,15 @@ async function scanBouncesForUser(token, userEmail) {
 
         for (const failed of failedEmails) {
           if (!isBouncedSync(failed)) {
-            await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1] });
+            // Maxi 2026-06-22: un SOFT bounce (buzón lleno / temporal / 4xx / rate-limit)
+            // es TRANSITORIO → NO blacklistear el email para siempre (la semana que viene
+            // puede entrar). Solo hard/unknown matan el contacto. El retry a un alternativo
+            // igual se dispara abajo, así tenemos cobertura sin quemar el email soft.
+            if (bounceType !== "soft") {
+              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1] });
+            } else {
+              log(`  ↩️ soft bounce ${failed} — transitorio, NO se blacklistea (se podrá reintentar)`);
+            }
             detected++;
             // user 2026-05-29: TODO rebote detectado (hard, soft/buzón-lleno o unknown)
             // dispara retry → busca email nuevo, reenvía, actualiza Prospect + FU1/FU2.
@@ -9610,8 +9661,19 @@ async function runAgentCycle(token, allFlags) {
             log(`  🌐 ${domain}: lang=${leadLanguage} (${det.source}/${det.confidence}, sin html)`);
           }
         }
-        // Asegurar que llegue siempre algo soportado
-        if (!SUPPORTED_AGENT_LANGS.has(leadLanguage)) leadLanguage = "en";
+        // Maxi 2026-06-22: si la página declara CLARAMENTE un idioma SIN template
+        // (de/fr/nl/pl/tr/ru/ja/zh/ko/etc.), NO mandar en inglés (quema el dominio).
+        // Lo dejamos pending para que un MB lo trabaje. Ante la duda (sin señal) → EN.
+        if (!SUPPORTED_AGENT_LANGS.has(leadLanguage)) {
+          const _raw = String(_pageContent?.htmlLang || _pageContent?.ogLocale || "")
+            .toLowerCase().split(/[-_]/)[0];
+          const _foreignNoTemplate = new Set(["de","fr","nl","pl","tr","ru","ja","zh","ko","sv","no","da","fi","cs","hu","ro","el","uk","id","vi","th","he","fa"]);
+          if (_foreignNoTemplate.has(_raw)) {
+            log(`  🌐 ${domain} — idioma "${_raw}" sin template → NO se envía en inglés, queda pending para el MB`);
+            continue;
+          }
+          leadLanguage = "en"; // desconocido/ambiguo → inglés (puede ser EN real)
+        }
         lead.language = leadLanguage;
 
         // ── ENRICHMENT ON-THE-FLY (igual que el botón Data del MB humano) ──
@@ -11407,17 +11469,21 @@ async function main() {
         const rows = await res.json();
         if (Array.isArray(rows) && rows.length) {
           for (const row of rows) {
-            // Re-encolar en csv_queue.pending
-            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+            // Maxi 2026-06-22 FIX: UPSERT (on_conflict=domain) en vez de INSERT plano.
+            // Antes el INSERT chocaba con la fila vieja status=frozen (dominio único) →
+            // 409 tragado por .catch → el lead se borraba de frozen pero NO se re-encolaba
+            // = PERDIDO. Ahora re-activa la fila existente a pending (o inserta si no hay).
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?on_conflict=domain`, {
               method: "POST",
               headers: {
                 "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-                "Content-Type": "application/json", "Prefer": "return=minimal",
+                "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
               },
               body: JSON.stringify({
                 domain: row.domain, status: "pending",
                 source: row.source || "frozen_retry",
                 uploaded_by: row.uploaded_by || "",
+                processed_at: null,
                 error_message: `unfrozen_retry_attempt_${(row.attempt_count || 1) + 1}`,
               }),
             }).catch(() => {});
