@@ -696,45 +696,64 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
     }
   } catch {}
 
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
-    method: "POST",
-    headers: {
-      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-      "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
-    },
-    body: JSON.stringify({
-      domain,
-      traffic:        traffic ? Math.round(traffic) : 0,
-      geo:            geo            || "",
-      geos_all:       Array.isArray(geosAll) && geosAll.length ? geosAll : null,
-      language:       language       || "",
-      category:       category       || "",
-      contact_name:   contactName    || "",
-      // Maxi 2026-06-17 (audit #11): trackear de dónde viene el contact_name
-      // (apollo|informer|scrape) para que UI lo muestre y MB sepa si el name
-      // se condice con el email final elegido.
-      contact_name_source: contactNameSource || (contactName ? "apollo" : ""),
-      contact_phone:  contactPhone   || "",
-      emails:         emails         || [],
-      email_sources:  emailSources   || {},  // {email: "apollo"|"scrape"|"informer"|"generic"} para pick prioritario
-      pitch:          pitch          || "",
-      pitch_subject:  pitchSubject   || "",
-      pitch_subjects: pitchSubjects  || [],
-      score:          score          || 0,
-      ad_networks:    adNetworks     || [],
-      page_title:     pageTitle      || "",
-      created_by:     createdBy      || "",
-      source,                                   // "autopilot" | "csv" | "monday_refresh"
-      monday_item_id: mondayItemId,             // si source="monday_refresh" el push hace UPDATE en vez de CREATE
-      status:         "pending",
-    }),
-  });
-  if (!res.ok) {
+  // Payload completo. Campos "core" (domain/traffic/status) son imprescindibles;
+  // el resto es metadata que enriquece pero NO debe hacer caer el lead si falta la
+  // columna en la base (ej: tras un reset que recreó la tabla sin alguna columna).
+  const payload = {
+    domain,
+    traffic:        traffic ? Math.round(traffic) : 0,
+    geo:            geo            || "",
+    geos_all:       Array.isArray(geosAll) && geosAll.length ? geosAll : null,
+    language:       language       || "",
+    category:       category       || "",
+    contact_name:   contactName    || "",
+    // Maxi 2026-06-17 (audit #11): trackear de dónde viene el contact_name.
+    contact_name_source: contactNameSource || (contactName ? "apollo" : ""),
+    contact_phone:  contactPhone   || "",
+    emails:         emails         || [],
+    email_sources:  emailSources   || {},
+    pitch:          pitch          || "",
+    pitch_subject:  pitchSubject   || "",
+    pitch_subjects: pitchSubjects  || [],
+    score:          score          || 0,
+    ad_networks:    adNetworks     || [],
+    page_title:     pageTitle      || "",
+    created_by:     createdBy      || "",
+    source,
+    monday_item_id: mondayItemId,
+    status:         "pending",
+  };
+  // Maxi 2026-06-19 — INSERT AUTO-CURATIVO: si Postgres/PostgREST rechaza por una
+  // columna inexistente (PGRST204), se quita ese campo y se reintenta. Así un reset
+  // que borre una columna NUNCA más bloquea TODOS los leads en silencio (era el bug
+  // que dejó Prospects en 0). Núcleo (domain/traffic/status) jamás se quita.
+  const CORE = new Set(["domain", "traffic", "status"]);
+  let body = { ...payload };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      if (attempt > 0) log(`  ✓ saveToReviewQueue ${domain}: insertado tras saltear columna(s) faltante(s)`);
+      return "ok";
+    }
     const txt = await res.text().catch(() => "");
+    // PGRST204: "Could not find the 'COL' column of '...' in the schema cache"
+    const m = txt.match(/Could not find the '([^']+)' column/);
+    if (res.status === 400 && m && (m[1] in body) && !CORE.has(m[1])) {
+      log(`  ⚠️ saveToReviewQueue ${domain}: columna '${m[1]}' no existe en la base → reintento sin ella (auto-cura)`);
+      delete body[m[1]];
+      continue;
+    }
     log(`  ❌ saveToReviewQueue ${domain} HTTP ${res.status}: ${txt.substring(0, 200)}`);
     return `http_${res.status}:${txt.substring(0, 60)}`;
   }
-  return "ok";
+  return "http_max_retries";
 }
 
 // ── Bulk refresh de leads sin traffic ───────────────────────
@@ -4164,33 +4183,28 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   if (!pageContent) return { ok: true, reason: "no_pagecontent" };
   const title = (pageContent?.title || "");
   const cat   = (pageContent?.category || "");
-  // Contexto aprendido de los rechazos del MB (por CONTENIDO, ignora GEO).
-  const trash = await _loadProspectTrashContext(token);
-  // Si esta CATEGORÍA viene siendo rechazada por el MB, NO la dejamos pasar gratis:
-  // mandamos a Haiku (tuneado con los motivos del MB) para que decida. Así el botón
-  // rojo "enseña" y Prospects se mantiene limpio.
-  const catDisliked = cat && trash.dislikedCats.has(cat);
-  // 1. Negativo fuerte por título (empresa/SaaS/login/gov/uni) → basura, gratis.
+  // Maxi 2026-06-19: filtro NO agresivo. Se SACÓ el aprendizaje por contenido
+  // (dislikedCats / trash rules): hasta confirmar que todo está 100%, NO rechazamos
+  // por "categoría que el MB no quiso". Solo descartamos no-publishers ESTRUCTURALES
+  // (empresas/SaaS/gobierno/universidades/adultos/streaming). Ante la duda, PASA y que
+  // el MB lo rechace a mano (el botón rojo). Lo estructural lo cubren también
+  // isCategoryBlockedWorker (gov/uni/empresas) y scoreWebsite (adult/streaming/gambling).
+  // 1. Negativo fuerte por título (empresa/SaaS/login/gov/uni) → estructural, gratis.
   if (NON_PUBLISHER_TITLE_RE.test(title)) return { ok: false, reason: `title_nonpub:"${title.slice(0,40)}"` };
-  // 2. Señal positiva fuerte: publicidad real → publisher. (Salvo categoría
-  //    aprendida-como-basura: ahí no alcanza con tener ads, lo revisa Haiku.)
-  if (pageContent?.hasDisplayAds && !catDisliked) return { ok: true, reason: pageContent.hasProgrammatic ? "programmatic_ads" : "partner_ssp" };
-  // 3. Categoría de medios (heurística home / SimilarWeb) — skip si está aprendida-basura.
-  if (!catDisliked && PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
+  // 2. Señal positiva: publicidad real → publisher.
+  if (pageContent?.hasDisplayAds) return { ok: true, reason: pageContent.hasProgrammatic ? "programmatic_ads" : "partner_ssp" };
+  // 3. Categoría de medios (heurística home / SimilarWeb) → publisher.
+  if (PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
   const swc = (swCategory || "").toLowerCase();
-  if (!catDisliked && /news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
-  // 4. ads.txt como segunda chance — skip si categoría aprendida-basura.
-  if (!catDisliked && await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
-  // 5. Dudoso (o categoría aprendida-basura) → Haiku decide, con las reglas que el
-  //    MB enseñó al rechazar (motivos sintetizados).
-  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules);
-  if (type === "publisher") return { ok: true, reason: catDisliked ? "haiku_publisher(despite_disliked_cat)" : "haiku_publisher" };
-  if (type) return { ok: false, reason: `haiku_${type}` }; // veredicto EXPLÍCITO de no-publisher
-  // Maxi 2026-06-19: Haiku NO respondió (api-proxy caído/timeout/sin texto). NO rechazar
-  // por una falla del clasificador — antes esto tiraba leads válidos como "no_publisher_signal".
-  // Si la categoría ya venía rechazada por el MB, respetamos su dislike. Si no, PASA
-  // (beneficio de la duda; el tráfico ≥350K ya filtró lo importante).
-  if (catDisliked) return { ok: false, reason: "disliked_cat_no_signal" };
+  if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
+  // 4. ads.txt como segunda chance → publisher.
+  if (await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
+  // 5. Dudoso → Haiku SOLO para detectar tipo estructural (sin reglas de contenido).
+  //    Rechaza únicamente si dice EXPLÍCITAMENTE empresa/gov/uni/saas/ecommerce.
+  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, "");
+  if (type === "publisher") return { ok: true, reason: "haiku_publisher" };
+  if (type && type !== "other") return { ok: false, reason: `haiku_${type}` }; // corp/gov/edu/saas/ecommerce
+  // Sin señal / Haiku no respondió / "other" → PASA (no agresivo).
   return { ok: true, reason: "classifier_unavailable_pass" };
 }
 
@@ -4502,24 +4516,19 @@ const CORPORATE_PATTERNS = [
 
 // Categorías de SimilarWeb que indican NO-publisher (marca, institución, B2B).
 // Se chequea DESPUÉS de obtener traffic data (no pre-API).
+// Maxi 2026-06-19: lista RECORTADA — no agresiva. Solo no-publishers ESTRUCTURALES
+// (gobierno, universidades, empresas/SaaS, fabricantes). Se SACARON categorías que
+// SÍ pueden ser publishers de contenido: finanzas/inversión (sitios de noticias
+// financieras), telecom, ecommerce/shopping (sitios de deals/reviews), viajes
+// (blogs/guías), inmobiliaria (portales con contenido), pharma, logística, etc.
+// Esas, si no sirven, las rechaza el MB a mano (botón rojo). Adult/streaming/gambling
+// los corta scoreWebsite (gate duro). Objetivo: dejar pasar, no sobre-filtrar.
 const BLOCKED_CATEGORY_KEYWORDS = [
-  "banking", "credit and lending", "credit cards", "insurance",
-  "investing", "stock trading", "asset management",
   "government", "law and government", "public administration", "military",
-  "universities", "higher education", "school", "academic",
-  "computer hardware", "computer security", "consumer electronics > brand",
-  "telecommunications", "isps", "web hosting", "data center",
-  "software > b2b", "saas", "enterprise software", "cloud computing",
-  "vehicles > manufacturer", "automotive > manufacturer", "auto parts",
-  "consumer goods > manufacturer", "industry", "agriculture", "logistics",
-  "manufacturing", "energy and utilities", "oil and gas",
-  "business and consumer services > consulting",
-  "advertising and marketing > agencies",
-  "marketing and advertising",
-  "pharmaceuticals", "biotechnology", "medical devices",
-  "ecommerce", "shopping", "marketplace",
-  "air travel", "hotels and accommodations", "car rentals", "cruises",
-  "real estate", "property listings",
+  "universities", "higher education", "academic",
+  "software > b2b", "saas", "enterprise software",
+  "vehicles > manufacturer", "automotive > manufacturer",
+  "consumer goods > manufacturer",
 ];
 
 function isCorporatePattern(domain) {
