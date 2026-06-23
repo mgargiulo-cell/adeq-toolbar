@@ -2909,6 +2909,8 @@ async function setSessionCache(domain, data) {
 let cascadeResults    = [];
 let cascadeRawResults = []; // todos los sites recibidos antes de filtrar — para Apply filters
 let cascadeSelected = new Set();
+let cascadePage = 1;                      // Maxi 2026-06-22: paginación de "Find similar websites"
+const CASCADE_PAGE_SIZE = 30;             // máx 30 por página + nav 1-2-3
 let cascadeBlockedExecSet = new Set(); // domains owned by other media buyers (last 45d) — keep filtered across re-applies
 
 // ============================================================
@@ -3678,11 +3680,14 @@ async function runTrafficCheck(opts = {}) {
       if (unitEl) unitEl.textContent = "";
       // Maxi 2026-06-18: 3 acciones cuando no encuentra tráfico: re-verificar,
       // abrir SimilarWeb directo (para chequear visual), y mensaje claro.
-      const swUrl = `https://www.similarweb.com/website/${esc(state.domain || "")}/`;
+      // Maxi 2026-06-22: hypestat en vez de SimilarWeb (SW limita sesiones rápido).
+      const swUrl  = `https://hypestat.com/info/${esc(state.domain || "")}`;
+      const sw2Url = `https://www.similarweb.com/website/${esc(state.domain || "")}/`;
       breakdownEl.innerHTML = `
         <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:4px">
           <button id="btn-traffic-recheck" type="button" style="font-size:11px;padding:4px 10px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer">🔄 Re-verificar</button>
-          <a id="btn-similarweb-open" href="${swUrl}" target="_blank" rel="noopener" style="font-size:11px;padding:4px 10px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;display:inline-flex;align-items:center;gap:3px">🌐 Abrir en SimilarWeb</a>
+          <a id="btn-similarweb-open" href="${swUrl}" target="_blank" rel="noopener" style="font-size:11px;padding:4px 10px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;display:inline-flex;align-items:center;gap:3px" title="Hypestat — sin límite de sesión">📊 Ver tráfico (Hypestat)</a>
+          <a href="${sw2Url}" target="_blank" rel="noopener" style="font-size:11px;padding:4px 10px;background:#334155;color:#cbd5e1;border-radius:4px;text-decoration:none">SW</a>
         </div>${cacheStr}
       `;
       setTimeout(() => {
@@ -6460,7 +6465,9 @@ async function startCascade() {
 
   btn.disabled = true; btn.textContent = "⏳";
   cascadeResults = []; cascadeRawResults = []; cascadeSelected = new Set(); cascadeBlockedExecSet = new Set();
+  cascadePage = 1;
   resultsEl.innerHTML = ""; actionsEl.style.display = "none";
+  { const nav = document.getElementById("cascade-pagination"); if (nav) nav.style.display = "none"; }
 
   // Dominios genéricos/irrelevantes que SimilarWeb suele devolver por tráfico
   const CASCADE_BLOCKLIST = new Set([
@@ -6542,6 +6549,8 @@ async function startCascade() {
     } else {
       const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (limit ${CASCADE_LIMIT})` : "";
       statusEl.textContent = `✅ ${cascadeResults.length} prospects${limitMsg}${filteredCount ? ` · ${filteredCount} filtered out` : ""}`;
+      // Maxi 2026-06-22: re-render PAGINADO (30/página) — reemplaza el volcado streaming.
+      renderCascadePage(1);
       // Defensive: forzar visibilidad + setAttribute para evitar que algún
       // CSS override mate el display. User reportó botones invisibles 2026-05-13.
       actionsEl.style.cssText = "display: block !important; margin-top: 10px";
@@ -6575,7 +6584,8 @@ function appendCascadeItem(site, container) {
   });
 
   const cb = item.querySelector("input");
-  // unchecked by default — user picks what to open
+  // Maxi 2026-06-22: reflejar la selección (persiste al cambiar de página)
+  cb.checked = cascadeSelected.has(site.domain);
   cb.addEventListener("change", () => {
     if (cb.checked) cascadeSelected.add(site.domain);
     else            cascadeSelected.delete(site.domain);
@@ -6586,6 +6596,50 @@ function appendCascadeItem(site, container) {
   });
 
   container.appendChild(item);
+}
+
+// Maxi 2026-06-22: render PAGINADO de los similares — máx 30 por página + nav 1-2-3.
+function renderCascadePage(page) {
+  const resultsEl = document.getElementById("cascade-results");
+  if (!resultsEl) return;
+  const total = cascadeResults.length;
+  const pages = Math.max(1, Math.ceil(total / CASCADE_PAGE_SIZE));
+  cascadePage = Math.min(Math.max(1, page), pages);
+  const start = (cascadePage - 1) * CASCADE_PAGE_SIZE;
+  const slice = cascadeResults.slice(start, start + CASCADE_PAGE_SIZE);
+
+  resultsEl.innerHTML = "";
+  for (const site of slice) appendCascadeItem(site, resultsEl);
+
+  // Barra de paginación (se crea/actualiza debajo de la lista)
+  let nav = document.getElementById("cascade-pagination");
+  if (!nav) {
+    nav = document.createElement("div");
+    nav.id = "cascade-pagination";
+    nav.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;justify-content:center;align-items:center;margin:10px 0 4px";
+    resultsEl.parentNode.insertBefore(nav, resultsEl.nextSibling);
+  }
+  if (pages <= 1) { nav.innerHTML = ""; nav.style.display = "none"; return; }
+  nav.style.display = "flex";
+  const btn = (label, target, disabled, active) =>
+    `<button class="cascade-page-btn" data-page="${target}" ${disabled ? "disabled" : ""}
+       style="min-width:26px;padding:3px 7px;font-size:11px;border-radius:4px;cursor:${disabled ? "default" : "pointer"};
+       border:1px solid ${active ? "#0ea5e9" : "#334155"};background:${active ? "#0ea5e9" : "#1e293b"};
+       color:${active ? "#fff" : "#cbd5e1"};font-weight:${active ? 700 : 400};opacity:${disabled ? .4 : 1}">${label}</button>`;
+  // Ventana de páginas alrededor de la actual (compacta)
+  const win = [];
+  const from = Math.max(1, cascadePage - 2), to = Math.min(pages, cascadePage + 2);
+  for (let p = from; p <= to; p++) win.push(p);
+  let html = btn("‹", cascadePage - 1, cascadePage === 1, false);
+  if (from > 1) html += btn("1", 1, false, cascadePage === 1) + (from > 2 ? `<span style="color:#64748b">…</span>` : "");
+  for (const p of win) html += btn(String(p), p, false, p === cascadePage);
+  if (to < pages) html += (to < pages - 1 ? `<span style="color:#64748b">…</span>` : "") + btn(String(pages), pages, false, cascadePage === pages);
+  html += btn("›", cascadePage + 1, cascadePage === pages, false);
+  html += `<span style="font-size:10px;color:#64748b;margin-left:6px">${total} sitios</span>`;
+  nav.innerHTML = html;
+  nav.querySelectorAll(".cascade-page-btn").forEach(b => {
+    b.addEventListener("click", () => { if (!b.disabled) renderCascadePage(parseInt(b.dataset.page, 10)); });
+  });
 }
 
 function updateCascadeSummary() {
@@ -6644,19 +6698,16 @@ function applyCascadeFilters() {
     return true;
   }).slice(0, LIMIT);
 
-  // Re-renderizar desde cero
-  cascadeResults  = [];
+  // Re-renderizar desde cero — PAGINADO (Maxi 2026-06-22: 30/página + nav)
+  cascadeResults  = filtered.slice();
   cascadeSelected = new Set();
   resultsEl.innerHTML = "";
-  for (const site of filtered) {
-    cascadeResults.push(site);
-    appendCascadeItem(site, resultsEl);
-  }
-
   if (cascadeResults.length === 0) {
     resultsEl.innerHTML = '<div class="cascade-empty">No results match the current filters.</div>';
     actionsEl.style.display = "none";
+    const nav = document.getElementById("cascade-pagination"); if (nav) nav.style.display = "none";
   } else {
+    renderCascadePage(1);
     actionsEl.style.display = "block";
     updateCascadeSummary();
   }
@@ -7601,16 +7652,19 @@ async function initSellersJsonImport(refreshAll) {
   const _sellerRegion = (url) => {
     const h = String(url || "").replace(/^https?:\/\//, "").replace(/^www\.|^static\.cdn\./, "").split("/")[0].toLowerCase();
     const ends = (...tlds) => tlds.some(t => h.endsWith(t));
-    if (ends(".br", ".ar", ".cl", ".mx", ".pe", ".uy", ".com.br", ".com.ar", ".com.mx", ".com.co", ".com.uy", ".com.bo")) return "LATAM";
+    // Maxi 2026-06-22: Norteamérica / Centroamérica / Sudamérica SEPARADAS (no "LATAM").
+    if (ends(".us", ".ca", ".mx", ".com.mx")) return "NA";
+    if (ends(".gt", ".cr", ".pa", ".sv", ".hn", ".ni", ".do", ".pr", ".cu", ".bz", ".ht", ".jm", ".tt", ".com.gt", ".com.pa", ".com.do", ".com.sv", ".com.hn", ".com.ni", ".com.pr")) return "CAM";
+    if (ends(".br", ".ar", ".cl", ".co", ".pe", ".uy", ".ec", ".ve", ".py", ".bo", ".com.br", ".com.ar", ".com.co", ".com.uy", ".com.bo", ".com.pe", ".com.ve", ".com.ec")) return "SA";
     if (ends(".jp", ".kr", ".cn", ".vn", ".tw", ".hk", ".sg", ".in", ".id", ".my", ".th", ".ph", ".co.jp")) return "APAC";
     if (ends(".au", ".nz", ".com.au")) return "OC";
-    if (ends(".tr", ".com.tr", ".ae", ".sa", ".eg", ".il")) return "MENA";
-    if (ends(".za", ".co.za", ".ng", ".ke", ".ma")) return "AFR";
+    if (ends(".tr", ".com.tr", ".ae", ".sa", ".eg", ".il", ".qa", ".kw", ".jo", ".lb", ".com.sa", ".com.eg")) return "MENA";
+    if (ends(".za", ".co.za", ".ng", ".com.ng", ".ke", ".co.ke", ".ma", ".dz", ".tn", ".gh", ".com.gh", ".ug", ".co.ug", ".tz", ".co.tz", ".sn", ".ci", ".cm", ".ao", ".mz", ".zm", ".zw", ".co.zw", ".rw", ".et")) return "AFR";
     if (ends(".de", ".fr", ".it", ".es", ".nl", ".be", ".ch", ".at", ".pl", ".cz", ".ro", ".gr", ".se", ".fi", ".dk", ".no", ".pt", ".ie", ".uk", ".co.uk", ".si", ".bg", ".hr", ".sk", ".eu")) return "EU";
     return "GLOBAL";
   };
-  const _SELLER_REGIONS = ["ALL", "GLOBAL", "EU", "LATAM", "APAC", "MENA", "AFR", "OC"];
-  const _SELLER_REGION_LABEL = { ALL: "🌍 All", GLOBAL: "🌐 Global", EU: "🇪🇺 Europe", LATAM: "🌎 LATAM", APAC: "🌏 Asia-Pacific", MENA: "🕌 MENA", AFR: "🌍 Africa", OC: "🦘 Oceania" };
+  const _SELLER_REGIONS = ["ALL", "GLOBAL", "NA", "CAM", "SA", "EU", "APAC", "MENA", "AFR", "OC"];
+  const _SELLER_REGION_LABEL = { ALL: "🌍 All", GLOBAL: "🌐 Global", NA: "🌎 Norteamérica", CAM: "🌎 Centroamérica", SA: "🌎 Sudamérica", EU: "🇪🇺 Europe", APAC: "🌏 Asia-Pacific", MENA: "🕌 MENA", AFR: "🌍 Africa", OC: "🦘 Oceania" };
   let _sellersRegionSel = "ALL";
   const renderSelect = async () => {
     const list = await loadList();
@@ -7623,9 +7677,10 @@ async function initSellersJsonImport(refreshAll) {
     sel.dataset._list = JSON.stringify(list);
     const chipsEl = document.getElementById("sellers-region-filter");
     if (chipsEl) {
-      chipsEl.innerHTML = _SELLER_REGIONS.filter(r => r === "ALL" || counts[r]).map(r => {
+      // Maxi 2026-06-22: mostrar SIEMPRE todos los chips (con (0) si no hay fuentes).
+      chipsEl.innerHTML = _SELLER_REGIONS.map(r => {
         const on = _sellersRegionSel === r;
-        return `<button type="button" data-region="${r}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${on ? "#0ea5e9" : "#334155"};background:${on ? "#0ea5e9" : "#1e293b"};color:${on ? "#fff" : "#cbd5e1"};font-weight:600">${_SELLER_REGION_LABEL[r]}${r !== "ALL" && counts[r] ? ` (${counts[r]})` : ""}</button>`;
+        return `<button type="button" data-region="${r}" style="font-size:10px;padding:2px 7px;border-radius:10px;cursor:pointer;border:1px solid ${on ? "#0ea5e9" : "#334155"};background:${on ? "#0ea5e9" : "#1e293b"};color:${on ? "#fff" : "#cbd5e1"};font-weight:600">${_SELLER_REGION_LABEL[r]}${r !== "ALL" ? ` (${counts[r] || 0})` : ""}</button>`;
       }).join("");
     }
   };
@@ -8855,14 +8910,21 @@ function _renderCountryPanel(filter = "") {
     JP:"Japan", KR:"South Korea", CN:"China", TW:"Taiwan", HK:"Hong Kong",
     RU:"Russia", UA:"Ukraine", BG:"Bulgaria", HR:"Croatia", SK:"Slovakia",
   };
-  const sorted = [...counts.entries()]
-    .filter(([iso]) => {
-      if (!filter) return true;
-      const f = filter.toLowerCase();
-      const name = (ISO_TO_NAME_LOCAL[iso] || iso).toLowerCase();
-      return iso.toLowerCase().includes(f) || name.includes(f);
+  // Maxi 2026-06-22: mostrar la MAYORÍA de países SIEMPRE (con (0) si no hay leads),
+  // no solo los que tienen prospects. Y si hay un CONTINENTE seleccionado, mostrar
+  // SOLO los países de ese continente. Orden alfabético.
+  const _selConts = new Set([...sel].filter(c => c.startsWith("_C_")).map(c => c.slice(3)));
+  const sorted = Object.keys(ISO_TO_NAME_LOCAL)
+    .filter(iso => {
+      if (_selConts.size && !_selConts.has(ISO_TO_CONTINENT[iso] || "")) return false;
+      if (filter) {
+        const f = filter.toLowerCase();
+        const name = (ISO_TO_NAME_LOCAL[iso] || iso).toLowerCase();
+        if (!(iso.toLowerCase().includes(f) || name.includes(f))) return false;
+      }
+      return true;
     })
-    // Maxi 2026-06-22: orden ALFABÉTICO por nombre de país (antes era por cantidad).
+    .map(iso => [iso, counts.get(iso) || 0])
     .sort((a, b) => (ISO_TO_NAME_LOCAL[a[0]] || a[0]).localeCompare(ISO_TO_NAME_LOCAL[b[0]] || b[0]));
 
   // Maxi 2026-06-19: fila de CONTINENTES (en inglés) SIEMPRE visible — además de
@@ -8918,12 +8980,14 @@ function _rebuildGeoFilterFromRows(rows) {
   if (current && [...sel.options].some(o => o.value === current)) sel.value = current;
 }
 
-async function loadProspectsTab() {
+async function loadProspectsTab(opts = {}) {
+  // opts.keepPage: mantener la página actual (lo usa el auto-refresh de 15 min para
+  // NO sacar al MB de su lugar). Filtros y ↻ manual arrancan en página 1.
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
   if (!listEl) return;
-
-  listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
+  const _keepPage = opts.keepPage ? (window._prospectsPage || 1) : 1;
+  if (!opts.keepPage) listEl.innerHTML = '<div class="cascade-empty">⏳ Loading...</div>';
 
   const dateFilter    = document.getElementById("prospects-date-filter")?.value    || "";
   const sourceFilter  = document.getElementById("prospects-source-filter")?.value  || "";
@@ -8958,27 +9022,11 @@ async function loadProspectsTab() {
     dailyCount = _count;
     _cachedProspectDrafts = _drafts;
     snoozedSet = new Set((_snoozedRes || []).map(r => (r.domain || "").toLowerCase()));
-    if (snoozedSet.size > 0) rows = rows.filter(r => !snoozedSet.has((r.domain || "").toLowerCase()));
-    // Maxi 2026-06-17: X-learn — si el MB rechazó 3+ leads con misma firma
-    // (categoria + bucket de tráfico + geo), filtrar futuros similares.
-    // Lookup cacheado 5 min para no recargar en cada refresh.
-    try {
-      const now = Date.now();
-      if (!window._rejectedSigsCache || (now - window._rejectedSigsCache.ts) > 300_000 || window._rejectedSigsCache.user !== state.loginEmail) {
-        const sigs = await fetchRejectedSignatures(state.accessToken, state.loginEmail, 3);
-        window._rejectedSigsCache = { ts: now, user: state.loginEmail, sigs };
-      }
-      const blocked = window._rejectedSigsCache.sigs || [];
-      if (blocked.length > 0) {
-        const sigSet = new Set(blocked.map(s => `${s.category}|${s.traffic_bucket}|${s.geo}`));
-        const beforeN = rows.length;
-        rows = rows.filter(r => {
-          const sig = `${(r.category||"").toLowerCase().trim()}|${trafficBucketLabel(r.traffic)}|${(r.geo||"").toLowerCase().trim()}`;
-          return !sigSet.has(sig);
-        });
-        if (rows.length < beforeN) console.log(`[Prospects] X-learn: -${beforeN - rows.length} leads filtrados por ${blocked.length} firmas rechazadas`);
-      }
-    } catch {}
+    // Maxi 2026-06-22: VISTA UNIFICADA — todos los MBs deben ver la MISMA cantidad de
+    // prospects (solo cambia el orden). Antes el snooze y el X-learn (firmas rechazadas)
+    // se aplicaban POR-MB → Diego/Agus/Maxi veían conteos distintos. Ahora NO se filtran
+    // del listado (se mantiene la data por si se reactiva). El pool es el mismo para todos.
+    // (snooze + X-learn desactivados del filtro visible — Maxi 2026-06-22)
     allRowsForChips = rows.slice();
     // ── Client-side filters: multi-GEO chips + traffic range + name ──
     // (Estos NO pueden ir en URL PostgREST de forma simple, así que filtramos
@@ -9012,7 +9060,16 @@ async function loadProspectsTab() {
           for (const iso of isoArr) {
             if (wantContinents.has(ISO_TO_CONTINENT[iso] || "")) return true;
           }
-          if (legacyIso.length === 2 && wantContinents.has(ISO_TO_CONTINENT[legacyIso] || "")) return true;
+          // Maxi 2026-06-22 FIX: el legacy r.geo suele ser el NOMBRE del país
+          // ("Brazil", "United States"), no el ISO de 2 letras → antes no matcheaba
+          // continentes. Ahora: si no es ISO, lo convertimos nombre→ISO.
+          let _legIso = legacyIso.length === 2 ? legacyIso : "";
+          if (!_legIso && legacyIso) {
+            const _f = Object.keys(NAME_BY_ISO).find(k => NAME_BY_ISO[k] === legacyIso)
+              || Object.keys(_GEO_NAMES || {}).find(k => String(_GEO_NAMES[k]).toUpperCase() === legacyIso);
+            if (_f) _legIso = _f;
+          }
+          if (_legIso && wantContinents.has(ISO_TO_CONTINENT[_legIso] || "")) return true;
         }
         return false;
       });
@@ -9132,8 +9189,11 @@ async function loadProspectsTab() {
     return arr;
   };
 
-  const mineAll = rows.filter(r => (r.created_by || "").toLowerCase() === me);
-  shuffle(mineAll);
+  // Maxi 2026-06-22: orden ESTABLE (por fecha desc, nuevos arriba) en vez de shuffle
+  // aleatorio → el listado NO se reordena en cada refresh/click. Antes el shuffle hacía
+  // que el orden cambiara solo y se "perdiera" al actualizar.
+  const mineAll = rows.filter(r => (r.created_by || "").toLowerCase() === me)
+    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   const mineIds = new Set(mineAll.map(r => r.id));
 
   // Cache solo el sample de los "other" (no-mine) por slot. `mine` se overlay
@@ -9199,27 +9259,61 @@ async function loadProspectsTab() {
   const otherOrdered = cachedOtherIds.map(id => rowsById.get(id)).filter(Boolean);
   // Maxi 2026-06-18: sin slice — todos los disponibles
   const sample = [...mineAll, ...otherOrdered];
-  const assignedIds = sample.map(r => r.id);
 
-  // RESTAURADO al render original simple (como funcionaba antes de hoy).
-  // Los chunks + DocumentFragment que probé causaron renders concurrentes
-  // (loadProspectsTab no awaitaba renderChunk → DOM duplicado).
-  listEl.innerHTML = sample.map(r => renderProspectCard(r)).join("");
+  // Maxi 2026-06-22: PAGINACIÓN — antes renderizaba TODAS las cards de una y con
+  // miles (waitlist llegó a 2000+) la UI se COLGABA. Ahora 50 por página + nav 1·2·3.
+  window._prospectsSample = sample;
   if (statsEl) {
-    const remaining = DAILY_SEND_CAP - sentFromProspects;
-    const minsLeft = SLOT_MIN - Math.floor((Date.now() % (SLOT_MIN * 60 * 1000)) / 60000);
-    // Maxi 2026-06-18: SIN cap visible — mostramos todos.
-    //   - Global: total del pool (mismo para los 3 MBs, sin snooze/X-learn)
-    //   - Tras filtros: lo que matchea filtros activos (por MB; snooze + X-learn aplicados)
-    //   - Orden: shuffle por MB → cada uno ve los mismos en distinto orden
     const globalPool = window._prospectsGlobalPool || rows.length;
-    statsEl.innerHTML = `<strong>${sample.length}</strong> visibles (orden distinto por MB) · <strong>${globalPool}</strong> en pool global · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy · 🔄 nuevo orden en ${minsLeft}min`;
+    statsEl.innerHTML = `<strong>${sample.length}</strong> visibles · <strong>${globalPool}</strong> en pool global · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy`;
   }
+  renderProspectsPage(_keepPage);  // 1 normalmente; la página actual si es auto-refresh
+}
 
+const PROSPECTS_PAGE_SIZE = 50;
+function renderProspectsPage(page) {
+  const listEl = document.getElementById("prospects-list");
+  if (!listEl) return;
+  const sample = window._prospectsSample || [];
+  const pages = Math.max(1, Math.ceil(sample.length / PROSPECTS_PAGE_SIZE));
+  window._prospectsPage = Math.min(Math.max(1, page), pages);
+  const start = (window._prospectsPage - 1) * PROSPECTS_PAGE_SIZE;
+  const slice = sample.slice(start, start + PROSPECTS_PAGE_SIZE);
+
+  // Render solo la página actual (rápido — máx 50 cards)
+  let nav = document.getElementById("prospects-pagination");
+  listEl.innerHTML = slice.map(r => renderProspectCard(r)).join("");
   listEl.querySelectorAll(".pcard").forEach(card => {
-    const id   = parseInt(card.dataset.id);
-    const data = sample.find(r => r.id === id);
+    const id = parseInt(card.dataset.id);
+    const data = slice.find(r => r.id === id);
     if (data) initProspectCard(card, data);
+  });
+
+  // Barra de páginas (debajo de la lista)
+  if (!nav) {
+    nav = document.createElement("div");
+    nav.id = "prospects-pagination";
+    nav.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;justify-content:center;align-items:center;margin:10px 8px";
+    listEl.parentNode.insertBefore(nav, listEl.nextSibling);
+  }
+  if (pages <= 1) { nav.innerHTML = ""; nav.style.display = "none"; return; }
+  nav.style.display = "flex";
+  const cur = window._prospectsPage;
+  const btn = (label, target, disabled, active) =>
+    `<button class="prospects-page-btn" data-page="${target}" ${disabled ? "disabled" : ""}
+       style="min-width:26px;padding:3px 8px;font-size:11px;border-radius:4px;cursor:${disabled ? "default" : "pointer"};
+       border:1px solid ${active ? "#0ea5e9" : "#334155"};background:${active ? "#0ea5e9" : "#1e293b"};
+       color:${active ? "#fff" : "#cbd5e1"};font-weight:${active ? 700 : 400};opacity:${disabled ? .4 : 1}">${label}</button>`;
+  const from = Math.max(1, cur - 2), to = Math.min(pages, cur + 2);
+  let html = btn("‹", cur - 1, cur === 1, false);
+  if (from > 1) html += btn("1", 1, false, cur === 1) + (from > 2 ? `<span style="color:#64748b">…</span>` : "");
+  for (let p = from; p <= to; p++) html += btn(String(p), p, false, p === cur);
+  if (to < pages) html += (to < pages - 1 ? `<span style="color:#64748b">…</span>` : "") + btn(String(pages), pages, false, cur === pages);
+  html += btn("›", cur + 1, cur === pages, false);
+  html += `<span style="font-size:10px;color:#64748b;margin-left:6px">${sample.length} leads · pág ${cur}/${pages}</span>`;
+  nav.innerHTML = html;
+  nav.querySelectorAll(".prospects-page-btn").forEach(b => {
+    b.addEventListener("click", () => { if (!b.disabled) { renderProspectsPage(parseInt(b.dataset.page, 10)); document.getElementById("prospects-list")?.scrollIntoView({ block: "start", behavior: "smooth" }); } });
   });
 }
 
@@ -9341,7 +9435,7 @@ function renderProspectCard(r) {
     ? `<span title="${emails.length} email(s) encontrados" style="font-size:11px;font-weight:700;color:#fff;background:#0ea5e9;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ ${emails.length}</span>`
     // Maxi 2026-06-19: sin emails → además del badge rojo, botón verde "SW" para
     // abrir SimilarWeb del dominio (chequear visual si la web vale la pena).
-    : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span><a href="https://www.similarweb.com/website/${esc(r.domain || "")}/" target="_blank" rel="noopener" title="Ver ${esc(r.domain || "")} en SimilarWeb" style="font-size:10px;font-weight:700;color:#fff;background:#10b981;border-radius:4px;padding:1px 6px;flex-shrink:0;text-decoration:none">SW</a>`;
+    : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span><a href="https://hypestat.com/info/${esc(r.domain || "")}" target="_blank" rel="noopener" title="Ver tráfico de ${esc(r.domain || "")} (Hypestat — sin límite de sesión)" style="font-size:10px;font-weight:700;color:#fff;background:#10b981;border-radius:4px;padding:1px 6px;flex-shrink:0;text-decoration:none">📊</a>`;
 
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
@@ -9420,7 +9514,7 @@ function renderProspectCard(r) {
             return `<span title="Origen del item: ${esc(email || "worker (sin owner) → atribuido a Maxi")}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">👤 ${esc(name)}</span>`;
           })()}
           <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
-             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;word-break:break-all;line-height:1.3;flex:1;min-width:0"
+             style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;flex:1;min-width:0"
              title="${esc(r.domain)}">
             ${esc(r.domain)} ↗
           </a>
@@ -9438,7 +9532,9 @@ function renderProspectCard(r) {
         </div>
       </div>
       <div style="display:flex;gap:3px;flex-shrink:0">
-        <button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Re-fetch traffic + Apollo emails (same as Analysis). Useful if saved data looks incomplete." style="padding:3px 7px;font-size:10px">🔍 Data</button>
+        ${(!hasEmail || !r.traffic || r.traffic <= 0)
+          ? `<button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Completar SOLO lo que falta (emails y/o tráfico). No re-gasta créditos si ya hay datos." style="padding:3px 7px;font-size:10px">🔍 Completar</button>`
+          : ""}
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve + el agente aprende a evitar tipos similares" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -9633,13 +9729,13 @@ function initProspectCard(card, data) {
     // los emails guardados son garbage o desactualizados.
     btn.disabled = true; btn.textContent = "⏳ ...";
     try {
-      // RE-FETCH COMPLETO — siempre dispara los 3 fetchers en paralelo, igual
-      // que Analysis. Apollo cache 7d + RapidAPI cache 90d hacen que sea barato
-      // (gratis si ya estaba cacheado). Trae: traffic, geo (top country),
-      // pages_per_visit, category, ad_networks (del HTML), title, language.
+      // Maxi 2026-06-22: COMPLETAR SOLO LO QUE FALTA — no re-gastar créditos.
+      //   - Tráfico: solo si NO hay (igual el caché 90d lo hace gratis en general).
+      //   - Apollo (el que CUESTA crédito): solo si NO hay emails buenos.
+      //   - Page meta (HTML scrape): gratis → siempre, completa título/idioma/adnets.
       const [traffic, apollo, pageMeta] = await Promise.all([
-        getTraffic(data.domain).catch(() => null),
-        findDecisionMakerViaApollo(data.domain).catch(() => null),
+        hasTrafficAlready ? Promise.resolve(null) : getTraffic(data.domain).catch(() => null),
+        hasEmailsAlready  ? Promise.resolve(null) : findDecisionMakerViaApollo(data.domain).catch(() => null),
         _fetchPageMetaForProspect(data.domain).catch(() => null),
       ]);
       let updated = false;
@@ -9700,11 +9796,11 @@ function initProspectCard(card, data) {
         initProspectCard(newCard, data);
       } else {
         btn.textContent = "No more data";
-        setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Data"; }, 2000);
+        setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Completar"; }, 2000);
       }
     } catch (err) {
       console.warn("[pcard enrich]", err);
-      btn.disabled = false; btn.textContent = "🔍 Data";
+      btn.disabled = false; btn.textContent = "🔍 Completar";
     }
   });
 
@@ -10310,19 +10406,42 @@ function initProspectCard(card, data) {
   });
 
   // Reject
+  // Maxi 2026-06-22: RECHAZO INTELIGENTE — el MB escribe POR QUÉ no sirve, Claude
+  // deduce el TIPO de web, y el agente aprende por TIPO (no por geo/categoría).
+  //   1er click → revela el comentario.  2do click → confirma (Claude analiza + aprende).
   card.querySelector(".pcard-reject-btn")?.addEventListener("click", async () => {
-    if (!confirm(`❌ Descartar "${data.domain}"?\n\nAl rechazar, el agente APRENDE el tipo (categoría + tráfico + geo). Si rechazás 3+ similares, evita ese tipo en futuras búsquedas.`)) return;
-    card.style.opacity = "0.4";
-    // Al rechazar, guardar dislike + signature (categoria + traffic_bucket + geo)
-    // para que el worker la use al filtrar nuevos leads.
+    const btn = card.querySelector(".pcard-reject-btn");
+    const reasonEl = card.querySelector(".pcard-dislike-reason");
+    if (reasonEl && reasonEl.style.display === "none") {
+      reasonEl.style.display = "block";
+      reasonEl.placeholder = "¿Por qué NO sirve? Describí el TIPO de web (ej: foro, spam/MFA, agregador, tienda, contenido pobre, sitio corporativo). Claude lo analiza y el agente aprende.";
+      reasonEl.focus();
+      btn.textContent = "✓"; btn.style.color = "#16a34a";
+      btn.title = "Click de nuevo para confirmar el rechazo (el comentario enseña al agente el TIPO de web a evitar)";
+      return;
+    }
+    const reason = (reasonEl?.value || "").trim().substring(0, 500);
+    card.style.opacity = "0.4"; btn.disabled = true; btn.textContent = "⏳";
+    // Claude deduce el TIPO de web (con el comentario del MB como contexto).
+    let webType = "";
+    try {
+      const { callClaude, CLAUDE_HAIKU } = await import("../modules/claude.js");
+      const r = await callClaude({
+        model: CLAUDE_HAIKU, maxTokens: 40,
+        system: "Clasificás sitios web para un equipo de monetización publicitaria. Dado el dominio, su título/categoría y el motivo por el que un media buyer lo rechazó, devolvé en 2-6 palabras el TIPO de web a evitar (ej: 'foro de discusión', 'sitio MFA/spam', 'agregador de noticias', 'e-commerce', 'blog personal bajo tráfico', 'directorio', 'sitio corporativo'). SOLO el tipo, sin explicación.",
+        messages: [{ role: "user", content: `Dominio: ${data.domain}\nTítulo: ${data.page_title || ""}\nCategoría: ${data.category || ""}\nMotivo del rechazo del MB: ${reason || "(sin comentario)"}` }],
+      });
+      webType = (r?.text || "").trim().replace(/^["']|["']$/g, "").slice(0, 60);
+    } catch (e) { console.warn("[reject] Claude type err", e?.message); }
     await Promise.all([
       rejectReviewItem(state.accessToken, id, data.domain),
       saveAutopilotFeedback(state.accessToken, {
         user_email: state.loginEmail, domain: data.domain, action: "disliked",
-        category: data.category, geo: data.geo, ad_networks: data.ad_networks,
-        traffic: data.traffic,
+        category: data.category, geo: data.geo, ad_networks: data.ad_networks, traffic: data.traffic,
+        reason: [reason, webType ? `[tipo: ${webType}]` : ""].filter(Boolean).join(" ") || undefined,
       }),
     ]);
+    if (typeof showToast === "function") showToast(webType ? `🧠 Aprendido — evitar tipo: ${webType}` : "❌ Rechazado", "info", 3500);
     card.remove();
     refreshProspectsStats();
   });
@@ -10604,21 +10723,23 @@ async function refreshProspectsStats() {
 async function initProspectsTab() {
   // Restore filtros guardados de sesiones previas
   try {
-    const { _prospectsDateFilter, _prospectsSourceFilter, _prospectsUserFilter, _prospectsGeoFilter, _prospectsGeoChips, _prospectsTrafficFilter, _prospectsNameFilter } = await chrome.storage.local.get(["_prospectsDateFilter", "_prospectsSourceFilter", "_prospectsUserFilter", "_prospectsGeoFilter", "_prospectsGeoChips", "_prospectsTrafficFilter", "_prospectsNameFilter"]);
+    // Maxi 2026-06-22: por DEFAULT mostrar TODAS las URLs (sin necesidad de clickear
+    // "All"). Antes se restauraban los filtros guardados → al abrir Prospects quedaba
+    // un filtro viejo activo y había que tocar "All" para ver todo. Ahora arranca SIEMPRE
+    // sin filtros = todas. Si el MB activa un filtro en la sesión, ese se aplica.
     const dateEl   = document.getElementById("prospects-date-filter");
     const sourceEl = document.getElementById("prospects-source-filter");
     const userEl   = document.getElementById("prospects-user-filter");
     const geoEl    = document.getElementById("prospects-geo-filter");
     const trafEl   = document.getElementById("prospects-traffic-filter");
     const nameEl   = document.getElementById("prospects-name-filter");
-    if (dateEl   && _prospectsDateFilter)   dateEl.value   = _prospectsDateFilter;
-    if (sourceEl && _prospectsSourceFilter) sourceEl.value = _prospectsSourceFilter;
-    if (userEl   && _prospectsUserFilter)   userEl.value   = _prospectsUserFilter;
-    if (geoEl    && _prospectsGeoFilter)    geoEl.value    = _prospectsGeoFilter;
-    if (trafEl   && _prospectsTrafficFilter) trafEl.value  = _prospectsTrafficFilter;
-    if (nameEl   && _prospectsNameFilter)   nameEl.value   = _prospectsNameFilter;
-    // Restore GEO chips selection (set global usado por loadProspectsTab y _rebuildGeoChips)
-    window._selectedGeoChips = new Set(Array.isArray(_prospectsGeoChips) ? _prospectsGeoChips.map(x => String(x).toUpperCase()) : []);
+    if (dateEl)   dateEl.value   = "";
+    if (sourceEl) sourceEl.value = "";
+    if (userEl)   userEl.value   = "";
+    if (geoEl)    geoEl.value    = "";
+    if (trafEl)   trafEl.value   = "";
+    if (nameEl)   nameEl.value   = "";
+    window._selectedGeoChips = new Set();  // sin chips GEO → todas
   } catch {}
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
@@ -10839,19 +10960,15 @@ async function initProspectsTab() {
   }, 8_000);
 
   // Reload full cada 30s para traer leads NUEVOS del autopilot/csv/sellers.
-  // Más espaciado porque es más caro (re-render todas las cards).
+  // Maxi 2026-06-22: auto-refresh cada 15 MIN (antes 30s, que reordenaba y molestaba).
+  // El orden es estable (por fecha) y se preserva la PÁGINA actual → trae leads nuevos
+  // sin sacar al MB de su lugar. El ↻ manual y los filtros sí re-ordenan/van a página 1.
   setInterval(async () => {
     if (document.visibilityState === "hidden") return;
     const tab = document.getElementById("tab-prospects");
     if (!tab?.classList.contains("active")) return;
-    try {
-      const [{ enabled: ap }, csvSt] = await Promise.all([
-        getAutopilotState(state.accessToken),
-        import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => ({ enabled: false })),
-      ]);
-      if (ap || csvSt?.enabled) await loadProspectsTab();
-    } catch {}
-  }, 30_000);
+    await loadProspectsTab({ keepPage: true }).catch(() => {});
+  }, 15 * 60_000);
 }
 
 async function updateApiFooter() {

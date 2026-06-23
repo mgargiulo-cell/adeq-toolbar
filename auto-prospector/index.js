@@ -1242,6 +1242,22 @@ async function _getReviewQueueValidCount(token) {
   } catch { return 0; }
 }
 
+// Maxi 2026-06-22: BACKLOG de la cola csv (pending+processing+waiting_pool+next_day).
+// Gate de saturación: el feeder/autopilot/autogoogle NO cargan más mientras este
+// número esté alto → la cola drena antes de volver a llenarse (pedido del user: la
+// cola llegó a ~1500 en espera). Resume recién cuando baja del umbral LOW.
+const CSV_QUEUE_HALT_HIGH = 150; // si el backlog supera esto → frenar inyección
+async function _getCsvQueueBacklog(token) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool,next_day)&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const range = res.headers.get("content-range") || "";
+    return parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch { return 0; }
+}
+
 async function _getRecentConversionRate(token) {
   try {
     const res = await fetch(
@@ -1362,6 +1378,9 @@ async function maybeRunAutoGoogleSlot(token) {
   if (!AUTOGOOGLE_SLOTS.includes(hour)) return;
   const slotLabel = `${dateISO}-${hour}:00`;
   if (_autoGoogleLastSlot === slotLabel) return;
+  // Maxi 2026-06-22: gate de backlog — no cargar más si la cola csv está llena.
+  const _bl = await _getCsvQueueBacklog(token);
+  if (_bl >= CSV_QUEUE_HALT_HIGH) { log(`🔎 AutoGoogle SKIP: cola csv backlog ${_bl} (>${CSV_QUEUE_HALT_HIGH})`); return; }
   _autoGoogleLastSlot = slotLabel;
   try { await _runAutoGoogleSlot(token, slotLabel); }
   catch (e) { log(`⚠️ AutoGoogle slot: ${e.message}`); }
@@ -1815,6 +1834,19 @@ async function _runFeederSlot(token, slotLabel) {
     });
     return;
   }
+  // 3b. Maxi 2026-06-22: GATE de backlog de la COLA csv. Si ya hay muchos en
+  // pending/waiting/next_day, NO cargar más → dejar que drene antes de re-llenar
+  // (la cola había llegado a ~1500 en espera).
+  const _backlog = await _getCsvQueueBacklog(token);
+  if (_backlog >= CSV_QUEUE_HALT_HIGH) {
+    log(`🛑 cron ${slotLabel} SKIP: cola csv con backlog ${_backlog} (>${CSV_QUEUE_HALT_HIGH}) — esperar a que drene`);
+    await _insertFeederRun(token, slotLabel, {
+      status: "skipped_saturated", rq_valid_before: rqValid,
+      rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
+      notes: `csv_queue backlog ${_backlog}`,
+    });
+    return;
+  }
 
   // 4. Calcular target conversion-aware
   const remaining = FEEDER_DAILY_TARGET - dailyEffective;
@@ -1922,6 +1954,9 @@ async function maybeStartAutopilotSlot(token) {
   if (!AUTOPILOT_SLOTS.includes(hour)) return;
   const slotLabel = `autopilot-${dateISO}-${String(hour).padStart(2, "0")}:00`;
   if (_autopilotLastSlot === slotLabel) return;
+  // Maxi 2026-06-22: gate de backlog — no descubrir más si la cola csv está llena.
+  const _apBl = await _getCsvQueueBacklog(token);
+  if (_apBl >= CSV_QUEUE_HALT_HIGH) { log(`🤖 Autopilot SKIP: cola csv backlog ${_apBl} (>${CSV_QUEUE_HALT_HIGH})`); return; }
 
   // Race-condition guard: persistir en Supabase para sobrevivir restarts.
   try {
@@ -4228,11 +4263,14 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
   // 4. ads.txt como segunda chance → publisher.
   if (await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
-  // 5. Dudoso → Haiku SOLO para detectar tipo estructural (sin reglas de contenido).
-  //    Rechaza únicamente si dice EXPLÍCITAMENTE empresa/gov/uni/saas/ecommerce.
-  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, "");
+  // 5. Dudoso → Haiku. Maxi 2026-06-22: ahora SÍ recibe las reglas aprendidas por TIPO
+  //    (destiladas de los comentarios del MB al rechazar, via Claude → prospect_trash_rules).
+  //    Así el "botón rojo + comentario" enseña a evitar TIPOS de web (foro/MFA/agregador/
+  //    e-commerce/etc.), no GEO ni categoría. Haiku decide por sitio (no es bloqueo ciego).
+  const trash = await _loadProspectTrashContext(token).catch(() => ({ rules: "" }));
+  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules || "");
   if (type === "publisher") return { ok: true, reason: "haiku_publisher" };
-  if (type && type !== "other") return { ok: false, reason: `haiku_${type}` }; // corp/gov/edu/saas/ecommerce
+  if (type && type !== "other") return { ok: false, reason: `haiku_${type}` }; // corp/gov/edu/saas/ecommerce/tipo-aprendido
   // Sin señal / Haiku no respondió / "other" → PASA (no agresivo).
   return { ok: true, reason: "classifier_unavailable_pass" };
 }
