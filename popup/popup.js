@@ -1130,10 +1130,10 @@ async function loadAdminAgent() {
   const setVal = (id, v, dflt) => { const el = document.getElementById(id); if (el) el.value = v || dflt; };
   setVal("agent-cfg-traffic",      cfg.agent_threshold_traffic,  500000);
   // agent_threshold_score: hidden field, ya no se usa para filtrar (decisión 2026-05-18).
-  setVal("agent-cfg-max",          cfg.agent_max_per_day,         20);
+  setVal("agent-cfg-max",          cfg.agent_max_per_day,         10);
   setVal("agent-cfg-active-start", cfg.agent_active_hours_start,   9);
   setVal("agent-cfg-active-end",   cfg.agent_active_hours_end,    20);
-  document.getElementById("agent-stat-cap").textContent = cfg.agent_max_per_day || "20";
+  document.getElementById("agent-stat-cap").textContent = cfg.agent_max_per_day || "10";
 
   // Focus config (JSON) — DOS sets: 🤖 agente (envío) y 🏭 worker (descubrimiento)
   let focus = { geos_priority: [], geos_excluded: [], categories_priority: [], weekly_target: 0, daily_override: 0 };
@@ -1410,7 +1410,7 @@ async function saveAgentThresholds() {
   // Además: el max_per_day APLICA A TODOS los MBs (es config global del worker).
   const updates = {
     agent_threshold_traffic:  parseInt(document.getElementById("agent-cfg-traffic").value, 10) || 400000,
-    agent_max_per_day:        parseInt(document.getElementById("agent-cfg-max").value, 10) || 30,
+    agent_max_per_day:        parseInt(document.getElementById("agent-cfg-max").value, 10) || 10,
     agent_active_hours_start: parseInt(document.getElementById("agent-cfg-active-start").value, 10) || 9,
     agent_active_hours_end:   parseInt(document.getElementById("agent-cfg-active-end").value, 10) || 23,
   };
@@ -8998,8 +8998,13 @@ async function loadProspectsTab(opts = {}) {
   const nameFilter    = nameFilterRaw.trim().toLowerCase();
   // Multi-GEO chips — si hay chips seleccionados, prevalecen sobre el dropdown legacy
   const geoChipsSet = window._selectedGeoChips instanceof Set ? window._selectedGeoChips : new Set();
-  // El server-side geoFilter solo se usa si hay 1 chip o el dropdown viejo está activo
-  const effectiveGeoForServer = geoChipsSet.size === 1 ? [...geoChipsSet][0] : (geoChipsSet.size === 0 ? geoFilter : "");
+  // El server-side geoFilter SOLO entiende un país real (ISO 2 letras). Un continente
+  // (`_C_EU`) o "Sin GEO" (`_NONE_`) NO existe como valor de `geo` en la tabla → si se
+  // mandaba al server (Maxi 2026-06-30 bug) devolvía 0 rows / no filtraba. Ahora esos
+  // casos se traen completos y los resuelve el filtro client-side de abajo.
+  const _singleChip = geoChipsSet.size === 1 ? [...geoChipsSet][0] : "";
+  const _singleIsCountry = _singleChip.length === 2 && !_singleChip.startsWith("_");
+  const effectiveGeoForServer = _singleIsCountry ? _singleChip : (geoChipsSet.size === 0 ? geoFilter : "");
   let rows = [];
   let allRowsForChips = [];     // sin filtros client-side, para repoblar chips
   let dailyCount = 0;
@@ -9509,9 +9514,14 @@ function renderProspectCard(r) {
               "dhorovitz@adeqmedia.com": ["Diego", "#a855f7"],
               "sales@adeqmedia.com":     ["Agus",  "#ec4899"],
             };
-            const fallback = ["Maxi", "#10b981"];
-            const [name, color] = userMap[email] || (email ? [email.split("@")[0], "#64748b"] : fallback);
-            return `<span title="Origen del item: ${esc(email || "worker (sin owner) → atribuido a Maxi")}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">👤 ${esc(name)}</span>`;
+            // Maxi 2026-06-30: created_by vacío = lo cargó el AGENTE autónomo (no un MB).
+            // Antes se atribuía a "Maxi" → ahora se muestra como "🤖 Agent" para distinguir
+            // el trabajo automático de las cargas manuales de cada MB.
+            let name, color, icon;
+            if (!email)                 { name = "Agent"; color = "#0ea5e9"; icon = "🤖"; }
+            else if (userMap[email])    { [name, color] = userMap[email]; icon = "👤"; }
+            else                        { name = email.split("@")[0]; color = "#64748b"; icon = "👤"; }
+            return `<span title="Origen del item: ${esc(email || "agente autónomo (sin owner manual)")}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">${icon} ${esc(name)}</span>`;
           })()}
           <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
              style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;flex:1;min-width:0"
@@ -9539,6 +9549,12 @@ function renderProspectCard(r) {
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve + el agente aprende a evitar tipos similares" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
+
+    <!-- Maxi 2026-06-30: caja de motivo de rechazo EN EL CUERPO VISIBLE de la card.
+         Antes vivía dentro de .pcard-detail (display:none) → al apretar ❌ en la card
+         colapsada el textarea se ponía en block pero su contenedor padre seguía oculto
+         y el cuadro nunca aparecía. Ahora se revela inline sin tener que expandir. -->
+    <textarea class="pcard-dislike-reason" placeholder="¿Por qué lo rechazás? (ej: es empresa/gobierno/universidad, no es publisher, no monetiza, contenido no sirve) — el sistema aprende y descarta similares" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
 
     <!-- Expandable detail panel -->
     <div class="pcard-detail" style="display:none;border-top:1px solid var(--border);padding:10px">
@@ -9665,7 +9681,7 @@ function renderProspectCard(r) {
         <button type="button" class="pcard-like-btn" title="👍 Like — autopilot prioriza este tipo de lead" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👍</button>
         <button type="button" class="pcard-dislike-btn" title="👎 Dislike — el agente evita este tipo + el RAG aprende del feedback" style="background:#fff;border:1px solid #d1d5db;border-radius:6px;padding:5px 8px;cursor:pointer;font-size:13px">👎</button>
       </div>
-      <textarea class="pcard-dislike-reason" placeholder="¿Por qué lo rechazás? (ej: es empresa/gobierno/universidad, no es publisher, no monetiza, contenido no sirve) — el sistema aprende y descarta similares" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
+      <!-- textarea .pcard-dislike-reason movido al cuerpo visible de la card (arriba) — Maxi 2026-06-30 -->
       <div class="pcard-result" style="min-height:14px;font-size:11px;margin-top:5px;color:#16a34a"></div>
     </div>
 

@@ -2100,14 +2100,20 @@ async function runReenrichBadLeads(token) {
     if (Date.now() - _lastReenrichRunAt < REENRICH_COOLDOWN_MS) return;
     _lastReenrichRunAt = Date.now();
 
+    // Maxi 2026-06-30: el SCRAPE es gratis y no depende de Apollo. Antes, si no había
+    // Apollo o el cap estaba lleno, se cortaba TODO el re-enrich → nunca se re-leían las
+    // webs con el scraper mejorado. Ahora: el scrape siempre corre; Apollo es opcional
+    // (solo como fallback cuando hay cupo).
     const apollo_api_key = cfg.apollo_api_key;
-    if (!apollo_api_key) { log("⚠️ reenrich: sin APOLLO_API_KEY"); return; }
-
-    // Cap check
-    const usage = await getApolloUsageToday(token);
-    if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) {
-      log("⚠️ reenrich: Apollo cap alcanzado, skip");
-      return;
+    let apolloAvailable = !!apollo_api_key;
+    if (apolloAvailable) {
+      const usage = await getApolloUsageToday(token);
+      if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) {
+        log("⚠️ reenrich: Apollo cap alcanzado → solo scrape (gratis)");
+        apolloAvailable = false;
+      }
+    } else {
+      log("ℹ️ reenrich: sin APOLLO_API_KEY → solo scrape (gratis)");
     }
 
     // Leads que necesitan re-enrich:
@@ -2124,14 +2130,18 @@ async function runReenrichBadLeads(token) {
     // Filtrar los que necesitan re-enrich
     const candidates = leads.filter(l => {
       const emails = Array.isArray(l.emails) ? l.emails : [];
-      if (emails.length === 0) return true;
-      // Si todos los emails son source='generic' o están vacíos → re-enrich
+      if (emails.length === 0) return true;  // sin email → re-leer
       const sources = l.email_sources || {};
-      const hasGoodSource = emails.some(e => {
-        const src = sources[e.toLowerCase()] || "";
-        return src === "apollo" || src === "informer";
+      // Maxi 2026-06-30: el lead ya está "resuelto" si tiene un email de apollo/informer
+      // O un email NO-genérico de cualquier fuente (persona/rol real, no info@/contact@).
+      // Así los resueltos SALEN de la cola y el re-enrich avanza por TODAS las webs
+      // (antes solo apollo/informer contaban → re-procesaba siempre los mismos 10 viejos).
+      const hasGood = emails.some(e => {
+        const src = (sources[e.toLowerCase()] || "").toLowerCase();
+        if (src === "apollo" || src === "informer") return true;
+        return !_isGenericLocalPart(e);
       });
-      return !hasGoodSource;
+      return !hasGood;
     }).slice(0, REENRICH_BATCH);
 
     if (candidates.length === 0) { log("✅ reenrich: todos los leads ya tienen email apollo/informer — flag OFF"); await setConfigValue(token, "agent_reenrich_bad_leads", "false"); return; }
@@ -2158,8 +2168,8 @@ async function runReenrichBadLeads(token) {
           }
         } catch (e) { log(`  ⚠️ scrape ${lead.domain}: ${e.message}`); }
 
-        // 2) Apollo SOLO si scrape no encontró nada (ahorra crédito)
-        if (!foundEmail) {
+        // 2) Apollo SOLO si scrape no encontró nada Y hay cupo (ahorra crédito)
+        if (!foundEmail && apolloAvailable) {
           try {
             const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
               traffic: lead.traffic || 0, allowUnlock: true,
@@ -3753,10 +3763,16 @@ function _decodeCfEmail(hex) {
 }
 
 function extractEmailsFromHtml(html) {
+  // Maxi 2026-06-30: deobfuscación AMPLIADA (paridad con el extractor del popup).
+  // Cubre entidades numéricas con ceros (&#0*64;), hex con ceros (&#x0*40;),
+  // entidades nombradas (&commat; &period;), corchetes/llaves [at] {dot} (arroba),
+  // y el patrón hablado "user at domain dot com".
   const clean = html
-    .replace(/&#64;|&#x40;/gi, "@").replace(/&#46;|&#x2e;/gi, ".")
-    .replace(/\[\s*at\s*\]/gi, "@").replace(/\(\s*at\s*\)/gi, "@")
-    .replace(/\barroba\b/gi,   "@").replace(/\bpunto\b/gi,    ".");
+    .replace(/&#0*64;|&#x0*40;|&commat;/gi, "@").replace(/&#0*46;|&#x0*2e;|&period;/gi, ".")
+    .replace(/[\[\(\{]\s*(?:at|arroba)\s*[\]\)\}]/gi, "@")
+    .replace(/[\[\(\{]\s*(?:dot|punto)\s*[\]\)\}]/gi, ".")
+    .replace(/\s+(?:at|arroba)\s+/gi, "@").replace(/\s+(?:dot|punto)\s+/gi, ".")
+    .replace(/\barroba\b/gi, "@").replace(/\bpunto\b/gi, ".");
   const collected = new Set();
   // 1) Regex tradicional
   (clean.match(EMAIL_REGEX) || []).forEach(e => collected.add(_stripScrapePrefix(e).toLowerCase()));
@@ -3769,6 +3785,13 @@ function extractEmailsFromHtml(html) {
   // 3) JSON-LD schema.org "email": "x@y"
   const jsonLdMatches = html.matchAll(/"email"\s*:\s*"([^"]+@[^"]+)"/gi);
   for (const m of jsonLdMatches) collected.add(m[1].toLowerCase());
+  // 4) Maxi 2026-06-30: atributos data-* donde los sitios esconden el mail del DOM
+  //    (data-email / data-mail / data-contact / data-correo / data-emailaddress).
+  const dataAttr = html.matchAll(/data-(?:email|mail|contact|correo|emailaddress)\s*=\s*["']([^"']+@[^"']+)["']/gi);
+  for (const m of dataAttr) collected.add(m[1].toLowerCase());
+  // 5) Maxi 2026-06-30: mailto: hrefs (a veces el único lugar con el mail real)
+  const mailto = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
+  for (const m of mailto) collected.add(m[1].split("?")[0].toLowerCase());
   return [...collected].filter(e => {
     const lower = e.toLowerCase();
     if (IGNORE_EMAIL.some(p => lower.includes(p))) return false;
@@ -3928,9 +3951,14 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   const uaChrome = { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" };
   const uaMobile = { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" };
 
+  // Maxi 2026-06-30: reintento UNA vez si el fetch se corta por timeout. Los sitios
+  // lentos (los que más emails pierden) antes morían al primer AbortSignal de 4s →
+  // ahora el 2º intento usa un timeout 1.6× más largo. redirect:"follow" explícito.
   const tryFetch = async (url, timeout = 5000, mobile = false, isInformer = false) => {
+   let _attempt = 0;
+   while (_attempt < 2) {
     try {
-      const r = await fetch(url, { headers: mobile ? uaMobile : uaChrome, signal: AbortSignal.timeout(timeout) });
+      const r = await fetch(url, { headers: mobile ? uaMobile : uaChrome, redirect: "follow", signal: AbortSignal.timeout(timeout) });
       if (!r.ok) return;
       const html = await r.text();
       const found = new Set();
@@ -3973,7 +4001,13 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
           } catch {}
         }
       }
-    } catch {}
+      return; // éxito → no reintentar
+    } catch (e) {
+      const isTimeout = e?.name === "TimeoutError" || e?.name === "AbortError";
+      if (_attempt === 0 && isTimeout) { _attempt++; timeout = Math.round(timeout * 1.6); continue; }
+      return;
+    }
+   }
   };
 
   // 20 paths potenciales — sites de news/blogs típicos tienen variantes diversas
@@ -3989,9 +4023,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   ];
   const internalTargets = paths.map(p => `${base}${p}`);
 
-  // Fuentes externas (WHOIS / informer) — pueden estar bloqueadas por rate limit.
-  // Van PRIMERO para que el early-stop no las saltee cuando las páginas internas
-  // ya juntaron suficientes emails (antes quedaban al final y casi nunca corrían).
+  // Fuentes externas (WHOIS / informer) — emails de baja calidad (suelen ser del
+  // registrador). Maxi 2026-06-30: van AL FINAL. Con el early-stop por email-real,
+  // las páginas internas (home/contacto/publicidad) tienen el decision-maker bueno;
+  // si lo encontramos ahí, ni gastamos en WHOIS. Solo corren si internas no dieron nada.
   const externalTargets = [
     `https://website.informer.com/${cleanDomain}`,
     `https://who.is/whois/${cleanDomain}`,
@@ -3999,20 +4034,24 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
   // Procesar en chunks de 4 — concurrencia limitada para no saturar Railway
   const CONCURRENT = 4;
-  const all = [...externalTargets, ...internalTargets];
+  const all = [...internalTargets, ...externalTargets];
   for (let i = 0; i < all.length; i += CONCURRENT) {
     const chunk = all.slice(i, i + CONCURRENT);
     await Promise.all(chunk.map(url => {
       const isInf = /informer|who\.is/.test(url);
-      return tryFetch(url, isInf ? 6000 : 4000, false, isInf);
+      // Maxi 2026-06-30: timeouts más largos (sitios lentos = los que más email pierden).
+      return tryFetch(url, isInf ? 8000 : 6000, false, isInf);
     }));
-    // Early-stop si ya tenemos varios emails buenos (no garbage)
-    if (emails.size >= 10) break;
+    // Maxi 2026-06-30: early-stop cuando ya tenemos un email REAL (no-genérico, =
+    // persona/rol útil) o un buen lote. Antes cortaba a las 10 contando basura de
+    // WHOIS → frenaba antes de llegar a /contacto donde está el email bueno.
+    const _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+    if (_hasReal || emails.size >= 12) break;
   }
 
   // Última chance — si NADA encontrado, probar mobile UA en home (algunos sites cambian)
   if (emails.size === 0) {
-    await tryFetch(base, 5000, true);
+    await tryFetch(base, 7000, true);
   }
 
   // Maxi 2026-06-17 v4: si después de todo NO hay email NO-genérico, probar
@@ -6467,11 +6506,11 @@ async function runSession(token, cfg, sessionStart) {
 
 const AGENT_DEFAULTS = {
   threshold_traffic:    400_000,   // único filtro de calidad real (decisión user 2026-05-18)
-  max_per_day:          25,        // Maxi 2026-06-18: 25/día para cada MB (5 slots × 5)
+  max_per_day:          10,        // Maxi 2026-06-30: 10/día para cada MB (5 slots × 2)
   active_hours_start:   9,         // 9am España (CET/CEST)
   active_hours_end:     23,        // 23hs España
   active_timezone:      "Europe/Madrid",
-  per_cycle_limit:      5,         // max 5 leads por slot 9/12/15/18/20 Madrid L-V (= 25/día)
+  per_cycle_limit:      2,         // max 2 leads por slot 9/12/15/18/20 Madrid L-V (= 10/día)
   monday_board_id:      1420268379,
   // DEPRECATED (2026-05-18):
   //   threshold_score: 40    → ya no se filtra por score. Sólo hard gates en scoreWebsite()

@@ -662,7 +662,12 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
     }
   }
   const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
-  const userClause   = userFilter   ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
+  // Maxi 2026-06-30: filtro por owner. "_AGENT_" = lo que cargó el agente autónomo
+  // (created_by vacío/null, sin owner manual). Un email real = carga manual de ese MB
+  // (los imports/CSV setean created_by con el email; el worker autónomo lo deja vacío).
+  let userClause = "";
+  if (userFilter === "_AGENT_")   userClause = `&or=(created_by.is.null,created_by.eq.)`;
+  else if (userFilter)            userClause = `&created_by=eq.${encodeURIComponent(userFilter)}`;
   // Geo filter: matchea contra `geo` (NAME en inglés, legacy) o `geos_all`
   // (ISO array). Acepta ISO 2-letter (AR, BR, ES, MX, etc.). El worker guarda
   // `geo` como NAME (ej "Vietnam") NO como ISO — para legacy hay que mapear.
