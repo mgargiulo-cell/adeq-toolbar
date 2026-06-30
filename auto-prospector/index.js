@@ -3645,7 +3645,9 @@ async function bumpApolloUnlocks(token, n = 1) {
 
 // ── Email scraping fallback (server-side HTTP) ────────────────
 
-const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}(?=\s|$|[^a-zA-Z])/g;
+// Maxi 2026-06-30: TLD 2-10 (paridad con el extractor del dashboard/popup). Antes 2-6
+// rechazaba .travel/.museum/.online/.agency/.media y emails válidos quedaban afuera.
+const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}(?=\s|$|[^a-zA-Z])/g;
 const IGNORE_EMAIL = ["example.com","domain.com","sentry.io","google.com","w3.org","schema.org","cloudflare.com"];
 
 // Limpieza de prefijo "C" pegado al email — artifact común del scrape de HTML
@@ -3762,43 +3764,62 @@ function _decodeCfEmail(hex) {
   } catch { return null; }
 }
 
+// Maxi 2026-06-30: deobfuscador PORTADO VERBATIM del extractor del dashboard
+// (modules/scraper.js → deobfuscate). Paridad total: si el MB lo encuentra a mano,
+// el worker tiene que encontrarlo. Cubre entidades con ceros, &commat;/&period;,
+// [at]/(at)/{at}/[arroba]/[a], [dot]/(dot)/{dot}/[punto]/[d], "user at domain dot com"
+// (regex contextual preciso, no blunt), arroba/punto, y reverso ofuscado.
+function _deobfuscateEmails(text) {
+  if (!text) return "";
+  text = text
+    .replace(/&#0*64;|&#x0*40;/gi, "@").replace(/&#0*46;|&#x0*2e;/gi, ".")
+    .replace(/&commat;/gi, "@").replace(/&period;/gi, ".");
+  text = text
+    .replace(/\[\s*at\s*\]/gi, "@").replace(/\(\s*at\s*\)/gi, "@").replace(/\{\s*at\s*\}/gi, "@")
+    .replace(/\[\s*arroba\s*\]/gi, "@").replace(/\(\s*arroba\s*\)/gi, "@").replace(/\[\s*a\s*\]/gi, "@")
+    .replace(/\[\s*dot\s*\]/gi, ".").replace(/\(\s*dot\s*\)/gi, ".").replace(/\{\s*dot\s*\}/gi, ".")
+    .replace(/\[\s*punto\s*\]/gi, ".").replace(/\(\s*punto\s*\)/gi, ".").replace(/\[\s*d\s*\]/gi, ".");
+  // Espacio AT espacio — contextual (solo cuando se parece a local@domain.tld)
+  text = text.replace(
+    /([a-zA-Z0-9._%+\-]{2,})\s+(?:at|AT)\s+([a-zA-Z0-9\-]{2,}(?:(?:\s+(?:dot|DOT)\s+|\s*\.\s*)[a-zA-Z]{2,})+)/g,
+    (_, local, domain) => `${local}@${domain.replace(/\s+(?:dot|DOT)\s+/g, ".").replace(/\s*\.\s*/g, ".")}`
+  );
+  text = text.replace(/\barroba\b/gi, "@").replace(/\bpunto\b/gi, ".");
+  if (/^[a-z0-9.\-_]{4,}\.(?:moc|gro|ten|ude|vog|moc\.[a-z]{2})@[a-z0-9.\-_]{2,}$/i.test(text.trim())) {
+    text = text.split("").reverse().join("");
+  }
+  return text;
+}
+
 function extractEmailsFromHtml(html) {
-  // Maxi 2026-06-30: deobfuscación AMPLIADA (paridad con el extractor del popup).
-  // Cubre entidades numéricas con ceros (&#0*64;), hex con ceros (&#x0*40;),
-  // entidades nombradas (&commat; &period;), corchetes/llaves [at] {dot} (arroba),
-  // y el patrón hablado "user at domain dot com".
-  const clean = html
-    .replace(/&#0*64;|&#x0*40;|&commat;/gi, "@").replace(/&#0*46;|&#x0*2e;|&period;/gi, ".")
-    .replace(/[\[\(\{]\s*(?:at|arroba)\s*[\]\)\}]/gi, "@")
-    .replace(/[\[\(\{]\s*(?:dot|punto)\s*[\]\)\}]/gi, ".")
-    .replace(/\s+(?:at|arroba)\s+/gi, "@").replace(/\s+(?:dot|punto)\s+/gi, ".")
-    .replace(/\barroba\b/gi, "@").replace(/\bpunto\b/gi, ".");
+  if (!html) return [];
   const collected = new Set();
-  // 1) Regex tradicional
+  // 1) Regex sobre HTML deobfuscado (texto + atributos + scripts, todo junto)
+  const clean = _deobfuscateEmails(html);
   (clean.match(EMAIL_REGEX) || []).forEach(e => collected.add(_stripScrapePrefix(e).toLowerCase()));
   // 2) Cloudflare data-cfemail decoder — gap común en sitios con CF Pro
-  const cfMatches = html.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi);
-  for (const m of cfMatches) {
+  for (const m of html.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi)) {
     const decoded = _decodeCfEmail(m[1]);
     if (decoded && decoded.includes("@")) collected.add(decoded.toLowerCase());
   }
   // 3) JSON-LD schema.org "email": "x@y"
-  const jsonLdMatches = html.matchAll(/"email"\s*:\s*"([^"]+@[^"]+)"/gi);
-  for (const m of jsonLdMatches) collected.add(m[1].toLowerCase());
-  // 4) Maxi 2026-06-30: atributos data-* donde los sitios esconden el mail del DOM
-  //    (data-email / data-mail / data-contact / data-correo / data-emailaddress).
-  const dataAttr = html.matchAll(/data-(?:email|mail|contact|correo|emailaddress)\s*=\s*["']([^"']+@[^"']+)["']/gi);
-  for (const m of dataAttr) collected.add(m[1].toLowerCase());
-  // 5) Maxi 2026-06-30: mailto: hrefs (a veces el único lugar con el mail real)
-  const mailto = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
-  for (const m of mailto) collected.add(m[1].split("?")[0].toLowerCase());
+  for (const m of html.matchAll(/"email"\s*:\s*"([^"]+@[^"]+)"/gi)) collected.add(m[1].toLowerCase());
+  // 4) Atributos data-* donde los sitios esconden el mail (paridad popup: + courriel,
+  //    email-address, mailtolink). Si el valor parece hex CF, se intenta decodificar.
+  for (const m of html.matchAll(/data-(?:email|mail|contact|correo|courriel|emailaddress|email-address|mailtolink)\s*=\s*["']([^"']+)["']/gi)) {
+    const v = m[1];
+    if (v.includes("@")) _deobfuscateEmails(v).match(EMAIL_REGEX)?.forEach(e => collected.add(e.toLowerCase()));
+    else if (/^[a-f0-9]{6,}$/i.test(v)) { const d = _decodeCfEmail(v); if (d && d.includes("@")) collected.add(d.toLowerCase()); }
+  }
+  // 5) mailto: hrefs (a veces el único lugar con el mail real)
+  for (const m of html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi)) collected.add(m[1].split("?")[0].toLowerCase());
   return [...collected].filter(e => {
     const lower = e.toLowerCase();
     if (IGNORE_EMAIL.some(p => lower.includes(p))) return false;
     const parts = e.split("@");
     if (parts.length !== 2) return false;
     const tld = parts[1].split(".").pop();
-    return tld && tld.length >= 2 && tld.length <= 6;
+    return tld && tld.length >= 2 && tld.length <= 10;  // paridad con popup (.travel/.museum/.online)
   });
 }
 
@@ -6287,19 +6308,20 @@ async function runSession(token, cfg, sessionStart) {
     // Penalización por patrones de rechazo aprendidos (globales) — pesa poco
     // para no contaminar el ranking de un user con preferencias de otros.
     const catPenalty = Math.min(10, (rejectionPatterns.categories[category] || 0) * 2);
-    const geoPenalty = Math.min(5,  (rejectionPatterns.geos[topCountry]     || 0) * 1);
+    // Maxi 2026-06-30: GEO NEUTRAL. El user no quiere que el país influya en NADA del
+    // descubrimiento ni del ranking (no descartar ni deprioritizar por geo). Antes geo
+    // penalizaba/bonificaba el score → ahora geoPenalty/userGeoPenalty/userGeoBonus = 0.
+    const geoPenalty = 0;
 
     // Penalización POR USUARIO (feedback like/dislike explícito) — mucho más fuerte
     const userCatDislikes = feedback.dislikedCategories.get(category) || 0;
-    const userGeoDislikes = feedback.dislikedGeos.get(topCountry)     || 0;
     const userCatPenalty  = Math.min(40, userCatDislikes * 10);       // -10 por cada dislike, max -40
-    const userGeoPenalty  = Math.min(30, userGeoDislikes * 8);
+    const userGeoPenalty  = 0;
 
-    // Bonus por LIKES: si la categoría o geo matchea patterns que el user aprobó
+    // Bonus por LIKES: solo por categoría/contenido (geo neutral)
     const userCatLikes = feedback.likedCategories.get(category) || 0;
-    const userGeoLikes = feedback.likedGeos.get(topCountry)     || 0;
     const userCatBonus = Math.min(30, userCatLikes * 6);  // +6 por like, max +30
-    const userGeoBonus = Math.min(20, userGeoLikes * 4);
+    const userGeoBonus = 0;
     // Bonus extra si viene de la inyección de similares de likes
     const fromLikedSeed = likedSimilarDomains.has(domain) ? 15 : 0;
 

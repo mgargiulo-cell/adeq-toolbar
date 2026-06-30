@@ -8795,51 +8795,66 @@ const CONTINENT_INFO = {
   AFR: { name: "Africa",          flag: "🌍" },
   OC:  { name: "Oceania",         flag: "🌏" },
 };
+// Maxi 2026-06-30: mapas de geo a SCOPE DE MÓDULO (antes vivían dentro de
+// _rebuildGeoChips). Así el CONTEO de chips y el FILTRO usan EXACTAMENTE la misma
+// lógica → el número del chip coincide siempre con lo que filtra (fix A4: antes el
+// filtro usaba un mapa reducido distinto y count ≠ filtrado).
+const ISO_TO_NAME_FULL = {
+  AR:"Argentina", BR:"Brazil", ES:"Spain", MX:"Mexico", CO:"Colombia",
+  CL:"Chile", PE:"Peru", UY:"Uruguay", EC:"Ecuador", VE:"Venezuela",
+  DO:"Dominican Republic", PA:"Panama", BO:"Bolivia", GT:"Guatemala",
+  CR:"Costa Rica", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
+  PY:"Paraguay", PR:"Puerto Rico", CU:"Cuba", US:"United States",
+  GB:"United Kingdom", CA:"Canada", AU:"Australia", NZ:"New Zealand",
+  PT:"Portugal", IT:"Italy", FR:"France", DE:"Germany", NL:"Netherlands",
+  BE:"Belgium", CH:"Switzerland", AT:"Austria", IE:"Ireland", DK:"Denmark",
+  SE:"Sweden", NO:"Norway", FI:"Finland", PL:"Poland", CZ:"Czech Republic",
+  HU:"Hungary", RO:"Romania", GR:"Greece", IN:"India", PK:"Pakistan",
+  BD:"Bangladesh", LK:"Sri Lanka", ID:"Indonesia", PH:"Philippines",
+  VN:"Vietnam", TH:"Thailand", MY:"Malaysia", SG:"Singapore",
+  SA:"Saudi Arabia", AE:"UAE", EG:"Egypt", TR:"Turkey", IL:"Israel",
+  NG:"Nigeria", KE:"Kenya", ZA:"South Africa", MA:"Morocco", DZ:"Algeria",
+  JP:"Japan", KR:"South Korea", CN:"China", TW:"Taiwan", HK:"Hong Kong",
+  RU:"Russia", UA:"Ukraine", BG:"Bulgaria", HR:"Croatia", SK:"Slovakia",
+};
+const NAME_TO_ISO_FULL = {};
+Object.entries(ISO_TO_NAME_FULL).forEach(([iso, name]) => { NAME_TO_ISO_FULL[name.toUpperCase()] = iso; });
+// Además, los nombres en español del mapa global _GEO_NAMES (Brasil/España/...).
+try { Object.entries(_GEO_NAMES || {}).forEach(([iso, name]) => { NAME_TO_ISO_FULL[String(name).toUpperCase()] = iso; }); } catch {}
+
+// Detectar geos (ISO 2-letter) de un lead — soporta geos_all + legacy geo (NAME o ISO).
+// ÚNICA fuente de verdad para contar y para filtrar.
+function _rowISOs(r) {
+  const out = new Set();
+  if (Array.isArray(r.geos_all) && r.geos_all.length) {
+    for (const raw of r.geos_all) {
+      const iso = String(raw || "").toUpperCase().slice(0, 2);
+      if (iso) out.add(iso);
+    }
+  }
+  if (r.geo) {
+    const g = String(r.geo).trim().toUpperCase();
+    let iso = "";
+    if (g.length === 2 && ISO_TO_CONTINENT[g]) iso = g;
+    else if (NAME_TO_ISO_FULL[g])              iso = NAME_TO_ISO_FULL[g];
+    else if (g.length >= 2 && ISO_TO_CONTINENT[g.slice(0, 2)]) iso = g.slice(0, 2);
+    if (iso) out.add(iso);
+  }
+  return out;
+}
+// Continentes de un lead (deriva de _rowISOs vía ISO_TO_CONTINENT).
+function _rowContinents(r) {
+  const conts = new Set();
+  for (const iso of _rowISOs(r)) { const c = ISO_TO_CONTINENT[iso]; if (c) conts.add(c); }
+  return conts;
+}
+
 function _rebuildGeoChips(rows, selected) {
   const wrap = document.getElementById("prospects-geo-chips");
   if (!wrap) return;
   const sel = selected instanceof Set ? selected : new Set();
-  // Map NAME en inglés → ISO (cubre el legacy field `geo` que guarda el name).
-  const NAME_TO_ISO = {};
-  const ISO_TO_NAME = {
-    AR:"Argentina", BR:"Brazil", ES:"Spain", MX:"Mexico", CO:"Colombia",
-    CL:"Chile", PE:"Peru", UY:"Uruguay", EC:"Ecuador", VE:"Venezuela",
-    DO:"Dominican Republic", PA:"Panama", BO:"Bolivia", GT:"Guatemala",
-    CR:"Costa Rica", HN:"Honduras", SV:"El Salvador", NI:"Nicaragua",
-    PY:"Paraguay", PR:"Puerto Rico", CU:"Cuba", US:"United States",
-    GB:"United Kingdom", CA:"Canada", AU:"Australia", NZ:"New Zealand",
-    PT:"Portugal", IT:"Italy", FR:"France", DE:"Germany", NL:"Netherlands",
-    BE:"Belgium", CH:"Switzerland", AT:"Austria", IE:"Ireland", DK:"Denmark",
-    SE:"Sweden", NO:"Norway", FI:"Finland", PL:"Poland", CZ:"Czech Republic",
-    HU:"Hungary", RO:"Romania", GR:"Greece", IN:"India", PK:"Pakistan",
-    BD:"Bangladesh", LK:"Sri Lanka", ID:"Indonesia", PH:"Philippines",
-    VN:"Vietnam", TH:"Thailand", MY:"Malaysia", SG:"Singapore",
-    SA:"Saudi Arabia", AE:"UAE", EG:"Egypt", TR:"Turkey", IL:"Israel",
-    NG:"Nigeria", KE:"Kenya", ZA:"South Africa", MA:"Morocco", DZ:"Algeria",
-    JP:"Japan", KR:"South Korea", CN:"China", TW:"Taiwan", HK:"Hong Kong",
-    RU:"Russia", UA:"Ukraine", BG:"Bulgaria", HR:"Croatia", SK:"Slovakia",
-  };
-  Object.entries(ISO_TO_NAME).forEach(([iso, name]) => { NAME_TO_ISO[name.toUpperCase()] = iso; });
-
-  // Detectar geo (ISO 2-letter) por lead — soporta geos_all + legacy geo (NAME o ISO)
-  const _isoOfRow = (r) => {
-    const out = new Set();
-    if (Array.isArray(r.geos_all) && r.geos_all.length) {
-      for (const raw of r.geos_all) {
-        const iso = String(raw || "").toUpperCase().slice(0, 2);
-        if (iso) out.add(iso);
-      }
-    }
-    if (r.geo) {
-      const g = String(r.geo).trim().toUpperCase();
-      let iso = "";
-      if (g.length === 2 && ISO_TO_NAME[g]) iso = g;
-      else if (NAME_TO_ISO[g])               iso = NAME_TO_ISO[g];
-      else if (g.length >= 2)                iso = g.slice(0, 2);
-      if (iso) out.add(iso);
-    }
-    return out;
-  };
+  const ISO_TO_NAME = ISO_TO_NAME_FULL;
+  const _isoOfRow = _rowISOs;
   // Contar por CONTINENTE + por país (para panel multi-select).
   const continentCounts = new Map();
   const countryCounts   = new Map();
@@ -9039,9 +9054,8 @@ async function loadProspectsTab(opts = {}) {
     // Maxi 2026-06-18: filtro client-side multi-GEO + soporta "_NONE_" (sin geo)
     if (geoChipsSet.size >= 1) {
       const wantsNoGeo = geoChipsSet.has("_NONE_");
-      const NAME_BY_ISO = { US:"UNITED STATES", GB:"UNITED KINGDOM", BR:"BRAZIL", AR:"ARGENTINA", MX:"MEXICO", ES:"SPAIN", VN:"VIETNAM", IN:"INDIA", PT:"PORTUGAL", IT:"ITALY", FR:"FRANCE", DE:"GERMANY", CA:"CANADA", AU:"AUSTRALIA", NZ:"NEW ZEALAND", IE:"IRELAND", PL:"POLAND", CL:"CHILE", CO:"COLOMBIA", PE:"PERU", UY:"URUGUAY", EC:"ECUADOR", VE:"VENEZUELA", JP:"JAPAN", KR:"SOUTH KOREA", CN:"CHINA", RU:"RUSSIA", UA:"UKRAINE", SA:"SAUDI ARABIA", AE:"UAE", EG:"EGYPT", TR:"TURKEY", IL:"ISRAEL", NG:"NIGERIA", ZA:"SOUTH AFRICA", MA:"MOROCCO" };
-      // Maxi 2026-06-18 v3: continentes `_C_XX` expanden a sus ISOs.
-      // Países individuales `XX` siguen funcionando para selección desde panel.
+      // Maxi 2026-06-30: el filtro usa EXACTAMENTE la misma detección que el conteo de
+      // chips (_rowISOs/_rowContinents) → el número del chip coincide con lo filtrado.
       const wantContinents = new Set();
       const wantCountries  = new Set();
       for (const code of geoChipsSet) {
@@ -9050,31 +9064,11 @@ async function loadProspectsTab(opts = {}) {
         else if (code.length === 2) wantCountries.add(code);
       }
       rows = rows.filter(r => {
-        const isoArr = Array.isArray(r.geos_all) ? r.geos_all.map(x => String(x).toUpperCase().slice(0,2)) : [];
-        const legacyIso = String(r.geo || "").toUpperCase();
-        const hasGeo = isoArr.length > 0 || !!legacyIso;
-        if (wantsNoGeo && !hasGeo) return true;
-        // Country exact match
-        for (const code of wantCountries) {
-          if (isoArr.includes(code)) return true;
-          if (legacyIso === code) return true;
-          if (NAME_BY_ISO[code] && legacyIso === NAME_BY_ISO[code]) return true;
-        }
-        // Continent: cualquier ISO del lead que esté en ese continente
+        const isos = _rowISOs(r);
+        if (wantsNoGeo && isos.size === 0) return true;
+        for (const code of wantCountries) if (isos.has(code)) return true;
         if (wantContinents.size) {
-          for (const iso of isoArr) {
-            if (wantContinents.has(ISO_TO_CONTINENT[iso] || "")) return true;
-          }
-          // Maxi 2026-06-22 FIX: el legacy r.geo suele ser el NOMBRE del país
-          // ("Brazil", "United States"), no el ISO de 2 letras → antes no matcheaba
-          // continentes. Ahora: si no es ISO, lo convertimos nombre→ISO.
-          let _legIso = legacyIso.length === 2 ? legacyIso : "";
-          if (!_legIso && legacyIso) {
-            const _f = Object.keys(NAME_BY_ISO).find(k => NAME_BY_ISO[k] === legacyIso)
-              || Object.keys(_GEO_NAMES || {}).find(k => String(_GEO_NAMES[k]).toUpperCase() === legacyIso);
-            if (_f) _legIso = _f;
-          }
-          if (_legIso && wantContinents.has(ISO_TO_CONTINENT[_legIso] || "")) return true;
+          for (const cont of _rowContinents(r)) if (wantContinents.has(cont)) return true;
         }
         return false;
       });
@@ -9130,21 +9124,10 @@ async function loadProspectsTab(opts = {}) {
   // mandando desde ahí libremente.
   const DAILY_SEND_CAP = 30;
   const sentFromProspects = dailyCount; // ya viene de getDailyValidationCount arriba
-
-  if (sentFromProspects >= DAILY_SEND_CAP) {
-    listEl.innerHTML = `
-      <div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:18px;border-radius:8px;text-align:center;margin:8px">
-        <div style="font-size:20px;margin-bottom:8px">🎉</div>
-        <div style="font-size:14px;font-weight:700;margin-bottom:6px">¡Llegaste a tu objetivo del día!</div>
-        <div style="font-size:11px;line-height:1.5">
-          Enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> mails hoy de Prospects.<br/>
-          Continuá ahora realizando envíos desde Analytics Tab.
-        </div>
-      </div>
-    `;
-    if (statsEl) statsEl.textContent = `🎉 ${sentFromProspects}/${DAILY_SEND_CAP} from Prospects — keep going in Analytics`;
-    return;
-  }
+  // Maxi 2026-06-30: ANTES, al llegar a 30, se OCULTABA toda la lista y el MB perdía
+  // acceso a Prospects el resto del día (no podía ni revisar/abrir). El envío ya tiene
+  // su propio tope en validateProspect (corta a 50), así que el gate de 30 solo molestaba.
+  // Ahora la lista SIEMPRE se muestra; el progreso se ve en el stats line de abajo.
 
   // ── Sample 100 random ROTANDO cada 30 minutos por MB ──
   // Maxi 2026-06-18: SIN cap visible — todos los MBs ven la totalidad de
@@ -9499,6 +9482,7 @@ function renderProspectCard(r) {
               csv:            ["📥", "CSV",      "#0ea5e9"],
               monday_refresh: ["🔄", "Monday",   "#f59e0b"],
               sellers_json:   ["📋", "JSON",     "#8b5cf6"],
+              autogoogle:     ["🔎", "Google",   "#22c55e"],  // Maxi 2026-06-30: faltaba → caía a "Auto"
             };
             const [icon, label, color] = badges[src] || badges.autopilot;
             return `<span title="Tipo de búsqueda: ${label}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">${icon} ${label}</span>`;
@@ -9554,7 +9538,7 @@ function renderProspectCard(r) {
          Antes vivía dentro de .pcard-detail (display:none) → al apretar ❌ en la card
          colapsada el textarea se ponía en block pero su contenedor padre seguía oculto
          y el cuadro nunca aparecía. Ahora se revela inline sin tener que expandir. -->
-    <textarea class="pcard-dislike-reason" placeholder="¿Por qué lo rechazás? (ej: es empresa/gobierno/universidad, no es publisher, no monetiza, contenido no sirve) — el sistema aprende y descarta similares" style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
+    <textarea class="pcard-dislike-reason" placeholder="¿Por qué NO sirve esta web? Describí el CONTENIDO/TIPO (ej: spam/MFA, contenido autogenerado, agregador sin valor, foro muerto, pocas notas, baja calidad editorial). El agente aprende por TIPO de web — NUNCA descarta por país ni temática." style="display:none;width:100%;margin-top:6px;font-size:11px;padding:5px;border:1px solid #fca5a5;border-radius:4px;min-height:42px;resize:vertical"></textarea>
 
     <!-- Expandable detail panel -->
     <div class="pcard-detail" style="display:none;border-top:1px solid var(--border);padding:10px">
@@ -10430,7 +10414,7 @@ function initProspectCard(card, data) {
     const reasonEl = card.querySelector(".pcard-dislike-reason");
     if (reasonEl && reasonEl.style.display === "none") {
       reasonEl.style.display = "block";
-      reasonEl.placeholder = "¿Por qué NO sirve? Describí el TIPO de web (ej: foro, spam/MFA, agregador, tienda, contenido pobre, sitio corporativo). Claude lo analiza y el agente aprende.";
+      reasonEl.placeholder = "¿Por qué NO sirve esta web? Describí el CONTENIDO/TIPO (spam/MFA, autogenerado, agregador sin valor, foro muerto, baja calidad). El agente aprende por TIPO — NUNCA por país ni temática.";
       reasonEl.focus();
       btn.textContent = "✓"; btn.style.color = "#16a34a";
       btn.title = "Click de nuevo para confirmar el rechazo (el comentario enseña al agente el TIPO de web a evitar)";
@@ -10438,14 +10422,31 @@ function initProspectCard(card, data) {
     }
     const reason = (reasonEl?.value || "").trim().substring(0, 500);
     card.style.opacity = "0.4"; btn.disabled = true; btn.textContent = "⏳";
-    // Claude deduce el TIPO de web (con el comentario del MB como contexto).
+    // Maxi 2026-06-30: INVESTIGAR el sitio para aprender — fetch del HTML en vivo y
+    // extraer título + meta description + headings, para que Claude clasifique por
+    // CONTENIDO REAL (no solo por los campos guardados). Best-effort, con timeout corto.
+    let siteSnippet = "";
+    try {
+      const resp = await fetch(`https://${data.domain}`, { signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        const html = await resp.text();
+        const pick = (re) => { const m = html.match(re); return m ? m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160) : ""; };
+        const title = pick(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        const desc  = pick(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i)
+                   || pick(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i);
+        const heads = [...html.matchAll(/<h[12][^>]*>([\s\S]*?)<\/h[12]>/gi)].slice(0, 4)
+          .map(m => m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean).join(" | ").slice(0, 240);
+        siteSnippet = [title && `Título real: ${title}`, desc && `Descripción: ${desc}`, heads && `Titulares: ${heads}`].filter(Boolean).join("\n");
+      }
+    } catch { /* sitio caído/CORS → uso solo los campos guardados */ }
+    // Claude deduce el TIPO de web por CONTENIDO (ignora país y temática general).
     let webType = "";
     try {
       const { callClaude, CLAUDE_HAIKU } = await import("../modules/claude.js");
       const r = await callClaude({
         model: CLAUDE_HAIKU, maxTokens: 40,
-        system: "Clasificás sitios web para un equipo de monetización publicitaria. Dado el dominio, su título/categoría y el motivo por el que un media buyer lo rechazó, devolvé en 2-6 palabras el TIPO de web a evitar (ej: 'foro de discusión', 'sitio MFA/spam', 'agregador de noticias', 'e-commerce', 'blog personal bajo tráfico', 'directorio', 'sitio corporativo'). SOLO el tipo, sin explicación.",
-        messages: [{ role: "user", content: `Dominio: ${data.domain}\nTítulo: ${data.page_title || ""}\nCategoría: ${data.category || ""}\nMotivo del rechazo del MB: ${reason || "(sin comentario)"}` }],
+        system: "Clasificás sitios web para un equipo de monetización publicitaria. Devolvé en 2-6 palabras el TIPO de web a evitar según su CALIDAD y NATURALEZA de CONTENIDO (ej: 'sitio MFA/spam', 'contenido autogenerado', 'agregador sin valor', 'foro muerto', 'blog bajo tráfico', 'directorio', 'web corporativa sin inventario'). REGLA DURA: NO clasifiques por país/idioma ni por temática general (deportes, noticias, autos, etc. son válidos) — solo por la CALIDAD/TIPO del contenido. SOLO el tipo, sin explicación.",
+        messages: [{ role: "user", content: `Dominio: ${data.domain}\nTítulo guardado: ${data.page_title || ""}\n${siteSnippet || "(no se pudo leer el sitio en vivo)"}\nMotivo del rechazo del MB: ${reason || "(sin comentario)"}` }],
       });
       webType = (r?.text || "").trim().replace(/^["']|["']$/g, "").slice(0, 60);
     } catch (e) { console.warn("[reject] Claude type err", e?.message); }
