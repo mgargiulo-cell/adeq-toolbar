@@ -8844,6 +8844,11 @@ function _rowISOs(r) {
   }
   return out;
 }
+// Maxi 2026-07-01: ¿el lead tiene al menos un email válido? Usado para (a) ordenar
+// los prospects CON email primero en las páginas, y (b) el filtro Type "No Email".
+function _hasEmailRow(r) {
+  return Array.isArray(r && r.emails) && r.emails.some(e => e && /@/.test(e));
+}
 // Continentes de un lead (deriva de _rowISOs vía ISO_TO_CONTINENT).
 function _rowContinents(r) {
   const conts = new Set();
@@ -9091,6 +9096,12 @@ async function loadProspectsTab(opts = {}) {
         return d.includes(nameFilter) || t.includes(nameFilter);
       });
     }
+    // Maxi 2026-07-01: filtro TYPE para revisar categorías aparte.
+    //   alert   → sospechosas de rechazo (⚠️ suspect_reject)
+    //   noemail → sin email (para completarlas/revisarlas)
+    const _typeFilter = window._prospectsTypeFilter || "all";
+    if (_typeFilter === "alert")        rows = rows.filter(r => !!r.suspect_reject);
+    else if (_typeFilter === "noemail") rows = rows.filter(r => !_hasEmailRow(r));
     // Sincronizar la cache global de drafts (la usa la bandera+autocarga de cada card)
     _draftsState.all = _cachedProspectDrafts;
     _rebuildDraftsByLang();
@@ -9248,7 +9259,11 @@ async function loadProspectsTab(opts = {}) {
 
   const otherOrdered = cachedOtherIds.map(id => rowsById.get(id)).filter(Boolean);
   // Maxi 2026-06-18: sin slice — todos los disponibles
-  const sample = [...mineAll, ...otherOrdered];
+  // Maxi 2026-07-01: los que TIENEN email van PRIMERO en las páginas (partición estable:
+  // conserva el orden random por MB dentro de cada grupo). Así el MB trabaja los accionables
+  // arriba y los sin-email quedan al final (o se revisan con el filtro Type "No Email").
+  const _sampleRaw = [...mineAll, ...otherOrdered];
+  const sample = [..._sampleRaw.filter(_hasEmailRow), ..._sampleRaw.filter(r => !_hasEmailRow(r))];
 
   // Maxi 2026-06-22: PAGINACIÓN — antes renderizaba TODAS las cards de una y con
   // miles (waitlist llegó a 2000+) la UI se COLGABA. Ahora 50 por página + nav 1·2·3.
@@ -10552,8 +10567,10 @@ async function validateProspect(card, data, doSendEmail) {
     return;
   }
   // 3. Email válido (siempre obligatorio para push, aún si no se manda mail)
+  // Maxi 2026-07-01: aviso en inglés — el email lo busca el worker automáticamente;
+  // si todavía no está, el MB debe esperar (o tipear uno manual).
   if (!email) {
-    setResult("❌ Email required. Pick one above or type it manually.", false);
+    setResult("⏳ No email yet — the system is still searching for it. Please wait a moment, or type one manually below.", false);
     card.querySelector(".pcard-email-monday")?.focus();
     return;
   }
@@ -10767,6 +10784,7 @@ async function initProspectsTab() {
     if (trafEl)   trafEl.value   = "";
     if (nameEl)   nameEl.value   = "";
     window._selectedGeoChips = new Set();  // sin chips GEO → todas
+    window._prospectsTypeFilter = "all";   // Maxi 2026-07-01: filtro Type arranca en All
   } catch {}
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
@@ -10885,6 +10903,23 @@ async function initProspectsTab() {
           b.style.background = "#1e293b"; b.style.color = "#cbd5e1";
           b.style.border = "1px solid #334155"; b.style.fontWeight = "400";
         }
+      });
+      await loadProspectsTab();
+    });
+  });
+
+  // Maxi 2026-07-01: filtro TYPE (All / ⚠️ Alert / ✉️ No Email)
+  document.querySelectorAll(".prospects-type-preset").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const type = btn.dataset.type || "";
+      window._prospectsTypeFilter = type || "all";
+      chrome.storage.local.set({ _prospectsTypeFilter: window._prospectsTypeFilter }).catch(() => {});
+      document.querySelectorAll(".prospects-type-preset").forEach(b => {
+        const on = (b.dataset.type || "") === type;
+        b.style.background = on ? "#0ea5e9" : "#1e293b";
+        b.style.color = on ? "#fff" : "#cbd5e1";
+        b.style.border = on ? "none" : "1px solid #334155";
+        b.style.fontWeight = on ? "600" : "400";
       });
       await loadProspectsTab();
     });
