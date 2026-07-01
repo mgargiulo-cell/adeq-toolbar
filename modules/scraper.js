@@ -312,15 +312,10 @@ export async function scrapeEmailsFromSocialLinks(socialLinks) {
       }
     }
 
-    // ── Twitter/X: bio en page principal del handle ──
-    if ((lower.includes("twitter.com") || lower.includes("x.com")) && !seenPlatform.has("tw")) {
-      const handle = _extractTwitterHandle(link);
-      if (handle) {
-        seenPlatform.add("tw");
-        // Nitter es un mirror sin login wall — más permisivo
-        tasks.push(tryFetch(`https://nitter.net/${handle}`, "Twitter", { timeout: 6000 }));
-      }
-    }
+    // ── Twitter/X: DESACTIVADO (Maxi 2026-07-01, B8). Las instancias públicas de
+    // nitter.net están caídas/bloqueadas en 2026 → el fetch fallaba siempre gastando
+    // ~6s del budget. twitter.com/x.com tienen login wall → no scrapeable sin auth.
+    // Si en el futuro hay una instancia Nitter viva, re-agregar acá.
   }
 
   // Ejecutar todos en paralelo (max ~6 fetches)

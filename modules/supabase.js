@@ -471,13 +471,19 @@ export async function getAutopilotState(accessToken) {
 }
 
 async function upsertConfig(url, key, headers, configKey, value) {
+  // Maxi 2026-07-01 (M4): guardas — antes check.json() sin res.ok podía tirar sobre una
+  // página de error y el toggle reportaba éxito sin persistir. Ahora lanza si falla.
   const check = await fetch(`${url}/rest/v1/toolbar_config?key=eq.${configKey}&select=key`, { headers });
-  const exists = (await check.json())?.length > 0;
-  await fetch(`${url}/rest/v1/toolbar_config${exists ? `?key=eq.${configKey}` : ""}`, {
+  if (!check.ok) throw new Error(`upsertConfig check ${configKey}: HTTP ${check.status}`);
+  let rows = [];
+  try { rows = await check.json(); } catch {}
+  const exists = Array.isArray(rows) && rows.length > 0;
+  const res = await fetch(`${url}/rest/v1/toolbar_config${exists ? `?key=eq.${configKey}` : ""}`, {
     method: exists ? "PATCH" : "POST",
     headers,
     body: JSON.stringify(exists ? { value } : { key: configKey, value }),
   });
+  if (!res.ok) throw new Error(`upsertConfig write ${configKey}: HTTP ${res.status}`);
 }
 
 export async function setAutopilotEnabled(enabled, accessToken, userEmail = "") {

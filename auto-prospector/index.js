@@ -4010,12 +4010,8 @@ async function _scrapeEmailsFromSocialLinksWorker(socialLinks) {
       const m = lower.match(/youtube\.com\/(@[a-z0-9._-]+|c\/[a-z0-9._-]+|channel\/[a-z0-9._-]+|user\/[a-z0-9._-]+)/i);
       if (m) tasks.push(tryFetchSocial(`https://www.youtube.com/${m[1]}/about`, "YouTube", UA_DESKTOP, 6000));
     }
-    if ((lower.includes("twitter.com") || lower.includes("x.com")) && !seen.has("tw")) {
-      seen.add("tw");
-      const m = lower.match(/(?:twitter|x)\.com\/([a-z0-9_]{1,20})/i);
-      const handle = m && !["home","login","explore","search","i","intent","share","status","compose"].includes(m[1]) ? m[1] : null;
-      if (handle) tasks.push(tryFetchSocial(`https://nitter.net/${handle}`, "Twitter", UA_DESKTOP, 6000));
-    }
+    // Twitter/X DESACTIVADO (Maxi 2026-07-01, B8): nitter.net caído en 2026 → fetch fallaba
+    // siempre gastando 6s. twitter.com/x.com con login wall. Re-agregar si hay Nitter vivo.
   }
   await Promise.all(tasks);
   return found;

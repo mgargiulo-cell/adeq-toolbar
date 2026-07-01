@@ -6,6 +6,15 @@ import { CONFIG } from "../config.js";
 
 const MONDAY_API = "https://api.monday.com/v2";
 
+// Maxi 2026-07-01 (B7): columna de índice (estado/idioma) SOLO si el valor es un entero
+// válido. Antes parseInt(x) sobre un string no-numérico daba NaN → {index:null} → Monday
+// podía blanquear/rechazar la columna. Ahora si no es entero, se omite la columna entera.
+function _mondayIndexCol(val) {
+  if (val === undefined || val === null || val === "") return null;
+  const n = parseInt(val, 10);
+  return Number.isInteger(n) ? { index: n } : null;
+}
+
 async function mondayRequest(query, { timeoutMs = 15000 } = {}) {
   if (!CONFIG.MONDAY_API_KEY) {
     throw new Error("Monday API key no cargada (sesión expirada o sin permisos)");
@@ -111,9 +120,9 @@ export async function pushToMonday(data) {
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
     ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
-    ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
+    ...(_mondayIndexCol(estado) ? { [CONFIG.MONDAY_COLUMNS.estado]: _mondayIndexCol(estado) } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
-    ...(idioma !== "" && idioma !== undefined ? { [CONFIG.MONDAY_COLUMNS.idioma]:        { index: parseInt(idioma) } } : {}),
+    ...(_mondayIndexCol(idioma) ? { [CONFIG.MONDAY_COLUMNS.idioma]: _mondayIndexCol(idioma) } : {}),
   };
 
   const mutation = `mutation {
@@ -139,9 +148,9 @@ export async function updateMonday({ itemId, traffic, email, geo, estado, fecha,
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
     ...(personId                                                          ? { [CONFIG.MONDAY_COLUMNS.ejecutivo]:     { personsAndTeams: [{ id: personId, kind: "person" }] } } : {}),
-    ...(estado !== undefined && estado !== "" ? { [CONFIG.MONDAY_COLUMNS.estado]:        { index: parseInt(estado) } } : {}),
+    ...(_mondayIndexCol(estado) ? { [CONFIG.MONDAY_COLUMNS.estado]: _mondayIndexCol(estado) } : {}),
     ...(fecha                               ? { [CONFIG.MONDAY_COLUMNS.fecha_contacto]: { date: fecha } }             : {}),
-    ...(idioma !== "" && idioma !== undefined ? { [CONFIG.MONDAY_COLUMNS.idioma]:        { index: parseInt(idioma) } } : {}),
+    ...(_mondayIndexCol(idioma) ? { [CONFIG.MONDAY_COLUMNS.idioma]: _mondayIndexCol(idioma) } : {}),
   };
 
   const mutation = `mutation {
