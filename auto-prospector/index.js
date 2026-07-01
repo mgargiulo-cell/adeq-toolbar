@@ -9111,6 +9111,10 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   }
 
   // ── PENALTIES ──
+  // Maxi 2026-07-01: roles LEGALES/compliance (datenschutz@/legal@/privacy@/dpo@/gdpr@/
+  // dmca@/copyright@/abuse@) — obligatorios por ley (sobre todo en /impressum de sitios DE),
+  // NO son comprador y rinden poquísimo. Los dejamos ABAJO de un info@/contact@ normal.
+  if (/^(datenschutz|legal|privacy|privacidad|gdpr|dpo|dsb|dmca|copyright|compliance|abuse|recht)/.test(local)) score -= 30;
   // Placeholders de CMS (user01, user02, usuario3, guest) — no son personas.
   if (/^(user|usuario|guest|nobody|admin)\d*$/.test(local)) score -= 60;
   // Maxi 2026-06-17 (audit #10): penalty solo si dígitos están AL INICIO
