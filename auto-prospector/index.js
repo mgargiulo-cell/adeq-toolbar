@@ -4371,6 +4371,54 @@ async function _loadProspectTrashContext(token) {
   return ctx;
 }
 
+// Maxi 2026-07-01: ANÁLISIS 3×/semana (L/X/V) de los prospects ACTUALES contra el
+// aprendizaje de rechazos (por CONTENIDO/TIPO, ignora geo). Marca suspect_reject=true en
+// las que Haiku considera del mismo tipo que las rechazadas → la toolbar enciende una ⚠️
+// al lado de la X para que el MB revise si conviene descartarlas. Bounded: 200/run.
+let _lastSuspectAnalysisDate = "";
+async function runSuspectRejectAnalysis(token) {
+  const { weekday, dateISO, hour } = _madridNowParts();
+  if (!["Mon", "Wed", "Fri"].includes(weekday)) return;  // 3×/semana
+  if (hour < 10) return;                                   // desde las 10 Madrid
+  if (_lastSuspectAnalysisDate === dateISO) return;
+  try { const cfg = await getConfig(token); if (cfg.last_suspect_analysis_date === dateISO) { _lastSuspectAnalysisDate = dateISO; return; } } catch {}
+  _lastSuspectAnalysisDate = dateISO;
+  const trash = await _loadProspectTrashContext(token);
+  if (!trash.rules && trash.dislikedCats.size === 0) { log("🔎 suspect-analysis: sin aprendizaje de rechazos aún — skip"); return; }
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  let rows = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=eq.false&select=id,domain,page_title,category&order=created_at.desc&limit=200`, { headers: auth });
+    if (r.ok) rows = await r.json();
+  } catch {}
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  log(`🔎 suspect-analysis (${dateISO}): analizando ${rows.length} prospects contra reglas de rechazo`);
+  let flagged = 0;
+  const CONC = 4;
+  for (let i = 0; i < rows.length; i += CONC) {
+    await Promise.all(rows.slice(i, i + CONC).map(async (row) => {
+      const cat = (row.category || "").toLowerCase().trim();
+      let reason = "";
+      if (cat && trash.dislikedCats.has(cat)) reason = `categoría rechazada: ${cat}`;
+      else {
+        const type = await _haikuPublisherClass(token, row.domain, { title: row.page_title || "", description: "" }, row.category || "", trash.rules || "");
+        if (type && type !== "publisher") reason = `tipo detectado: ${type}`;
+      }
+      if (!reason) return;
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${row.id}`, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ suspect_reject: true, suspect_reason: reason.slice(0, 200) }),
+        });
+        flagged++;
+      } catch {}
+    }));
+  }
+  await setConfigValue(token, "last_suspect_analysis_date", dateISO).catch(() => {});
+  log(`🔎 suspect-analysis: ${flagged}/${rows.length} marcadas como sospechosas (⚠️)`);
+}
+
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
 async function classifyPublisher(token, domain, pageContent, swCategory) {
   // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
@@ -11798,6 +11846,8 @@ async function main() {
         await maybeRunPitchRulesSynthesis(token).catch(e => log(`⚠️ pitch rules synth: ${e.message}`));
         // Síntesis de reglas de basura desde los rechazos (botón rojo enseña al filtro)
         await maybeRunProspectTrashSynthesis(token).catch(e => log(`⚠️ prospect trash synth: ${e.message}`));
+        // Maxi 2026-07-01: análisis 3×/semana (L/X/V) — marca prospects sospechosos de rechazo (⚠️)
+        await runSuspectRejectAnalysis(token).catch(e => log(`⚠️ suspect analysis: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 

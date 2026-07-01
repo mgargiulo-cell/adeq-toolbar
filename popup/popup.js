@@ -9525,11 +9525,14 @@ function renderProspectCard(r) {
           ${adNetRow}
         </div>
       </div>
-      <div style="display:flex;gap:3px;flex-shrink:0">
-        ${(!hasEmail || !r.traffic || r.traffic <= 0)
-          ? `<button class="btn btn-secondary btn-sm pcard-enrich-btn" title="Completar SOLO lo que falta (emails y/o tráfico). No re-gasta créditos si ya hay datos." style="padding:3px 7px;font-size:10px">🔍 Completar</button>`
-          : ""}
+      <div style="display:flex;gap:3px;flex-shrink:0;align-items:center">
         <button class="btn btn-secondary btn-sm pcard-expand-btn" title="Expandir para revisar datos, email y pitch antes de enviar" style="padding:3px 7px">▼ Revisar</button>
+        <!-- Maxi 2026-07-01: alerta "sospechosa de rechazo". El worker (3×/semana) analiza
+             los prospects contra los comentarios de descarte y marca suspect_reject=true en
+             las que son del MISMO tipo que las rechazadas. Se enciende la ⚠️ al lado de la X. -->
+        ${r.suspect_reject
+          ? `<span class="pcard-similar-alert" title="⚠️ Sospechosa: parecida a un tipo que descartaste${r.suspect_reason ? ` (${esc(r.suspect_reason)})` : ""}. Revisá si conviene rechazarla." style="color:#f59e0b;font-size:14px;cursor:help;line-height:1">⚠️</span>`
+          : ""}
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve + el agente aprende a evitar tipos similares" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
     </div>
@@ -9984,6 +9987,18 @@ function initProspectCard(card, data) {
     if (manualEmailEl) {
       manualEmailEl.addEventListener("input", () => {
         manualEmailEl.dataset.userEdited = "1";
+        // Maxi 2026-07-01: reflejar el email manual en el cuadro de Monday (el que
+        // realmente se envía), así no queda uno arriba en "manual" y otro distinto abajo.
+        // Si se borra el manual, el cuadro de Monday vuelve a tomar el chip seleccionado.
+        const v = manualEmailEl.value.trim();
+        if (mondayEmailEl) {
+          if (v) { mondayEmailEl.value = v; mondayEmailEl.dataset.userEdited = "1"; }
+          else {
+            mondayEmailEl.dataset.userEdited = "";
+            const sel = listEl.querySelector(".email-chip.selected");
+            if (sel) mondayEmailEl.value = sel.dataset.email || "";
+          }
+        }
       });
     }
     // Maxi 2026-06-18: SINGLE-SELECT (1 email principal = 1 item Monday).
