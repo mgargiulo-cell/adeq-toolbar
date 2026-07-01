@@ -200,7 +200,7 @@ export async function generatePitch(ctx) {
     "Lead with a partnership growth angle.", "Lead with a market timing angle.",
   ];
   const angle = ANGLES[Math.floor(Math.random() * ANGLES.length)];
-  const avoid = AVOID_OPENERS.sort(() => Math.random() - 0.5).slice(0, 4).join('", "');
+  const avoid = [...AVOID_OPENERS].sort(() => Math.random() - 0.5).slice(0, 4).join('", "');  // Maxi 2026-07-01: copia — antes .sort() mutaba el const de módulo compartido
 
   // ── Ángulos ya usados en esta sesión ─────────────────────
   const previousSection = previousPitches.length > 0

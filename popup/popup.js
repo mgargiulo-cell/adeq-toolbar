@@ -570,7 +570,7 @@ function initAdminPanel() {
   // Auto-refresh cada 30s mientras el admin tiene un tab activo (evita stale data).
   // Solo si el admin está visible en el DOM (panel admin abierto).
   setInterval(() => {
-    const panelOpen = document.getElementById("admin-panel-overlay")?.style.display !== "none";
+    const panelOpen = document.getElementById("admin-panel")?.style.display !== "none";  // Maxi 2026-07-01: era "admin-panel-overlay" (no existe) → el intervalo corría SIEMPRE aunque el panel estuviera cerrado, gastando queries a Supabase cada 30s toda la sesión.
     const docVisible = document.visibilityState !== "hidden";
     if (!panelOpen || !docVisible) return;
     const activeTab = document.querySelector(".admin-tab-btn.active")?.dataset.adminTab;
@@ -6661,9 +6661,11 @@ function applyCascadeFilters() {
     const [a, b] = val.split(":");
     return [a === "" || a == null ? 0 : Number(a), b === "" || b == null ? Infinity : Number(b)];
   };
-  const trafficVal = document.getElementById("cascade-min-traffic").value;
-  const rankVal    = document.getElementById("cascade-max-rank").value;
-  const langFilter = document.getElementById("cascade-language").value;
+  // Maxi 2026-07-01: cascade-min-traffic / cascade-max-rank fueron removidos del HTML
+  // (cleanup 2026-05-08) → sin ?. esto CRASHEABA "Apply filters" con TypeError. Guardado.
+  const trafficVal = document.getElementById("cascade-min-traffic")?.value || "";
+  const rankVal    = document.getElementById("cascade-max-rank")?.value || "";
+  const langFilter = document.getElementById("cascade-language")?.value || "";
   const [tMin, tMax] = parseRange(trafficVal);
   const [rMin, rMax] = parseRange(rankVal);
   // Persistir filtros para próximas sesiones (UX audit fix)
@@ -9841,17 +9843,10 @@ function initProspectCard(card, data) {
       if (!data.traffic && !card.dataset._trafficFetched) {
         autoFetchTraffic();
       }
-      // Auto-fetch emails si la card no tiene — dispara el mismo flow que el
-      // botón 🔍 Data (Apollo + scrape + page meta). Apollo cache 7d → barato.
-      const _emailsValid = Array.isArray(data.emails) && data.emails.filter(em => em && /\@/.test(em)).length > 0;
-      if (!_emailsValid && !card.dataset._emailsFetched) {
-        card.dataset._emailsFetched = "1";
-        const enrichBtn = card.querySelector(".pcard-enrich-btn");
-        if (enrichBtn) {
-          showToast("🔍 Searching for emails automatically…", "info", 3000);
-          enrichBtn.click();
-        }
-      }
+      // Maxi 2026-07-01: el auto-fetch de EMAILS al expandir se removió junto con el botón
+      // "Completar". El email ahora lo trae el WORKER sí o sí (re-enrich cada 15min: scrape
+      // mejorado → Apollo pago si el scrape falla). Si un lead todavía no tiene email, el MB
+      // puede tipear uno manual abajo; el worker lo va a completar solo.
     } else if (!open && data.domain) {
       // Al cerrar, liberar el lock SI somos el dueño
       unlockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});

@@ -55,6 +55,7 @@ const CODE_TO_NAME = {
 // Normaliza el shape variable que devuelve RapidAPI: a veces { CountryCode: 32 } (numeric ISO),
 // a veces { CountryCode: "AR" } (alpha2), a veces { country: "Argentina" } (full name).
 function normalizeCountry(c) {
+  if (!c || typeof c !== "object") return null;  // Maxi 2026-07-01: una fila null/mala rompía TODO el lookup de tráfico
   let raw = c.CountryCode ?? c.country_code ?? c.countryCode ?? c.Country ?? c.country ?? "";
   let code = "";
   if (typeof raw === "number") {

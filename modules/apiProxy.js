@@ -285,7 +285,10 @@ export async function callProxy(provider, path, opts = {}) {
         }).catch(() => {});
       }
       // El resto solo aplica a rapidapi (UI cap banner, etc.)
-      if (provider === "rapidapi" && _monthState) {
+      // Maxi 2026-07-01: gatear en res.ok — antes el contador LOCAL subía aunque la
+      // llamada fallara (mientras el RPC de persistencia SÍ estaba gateado en res.ok),
+      // así que el local se adelantaba y disparaba el banner de cap antes de tiempo.
+      if (provider === "rapidapi" && _monthState && res.ok) {
         _monthState.used    += inc;
         _userPersonalUsed   += inc;
         _monthState.dirty    = true;
