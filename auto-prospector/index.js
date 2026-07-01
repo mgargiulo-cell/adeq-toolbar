@@ -561,17 +561,33 @@ async function getDailyGlobalCounters(token) {
   const _dayChanged = _csvDailyCounterDate !== null && _csvDailyCounterDate !== todaySpain;
   if (_csvDailyCounterDate !== todaySpain) { _csvDailyCounterDate = todaySpain; _csvDailyCounter = 0; }
   if (_autopilotDailyCounterDate !== todaySpain) { _autopilotDailyCounterDate = todaySpain; _autopilotDailyCounter = 0; }
-  // Rollover next_day → waiting_pool al cambiar el día (regla user: excedente diario espera al siguiente día operativo)
+  // Rollover next_day → waiting_pool al cambiar el día (excedente diario espera al día
+  // siguiente). Maxi 2026-07-01: RESPETAR el tope del waiting_pool (700). Antes promovía
+  // TODO sin límite → el pool llegó a 1367. Ahora promueve solo hasta llenar 700; el
+  // resto queda en next_day (regulación automática).
   if (_dayChanged) {
     try {
-      const promoteRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day`, {
-        method: "PATCH",
-        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=representation" },
-        body: JSON.stringify({ status: "waiting_pool" }),
-      });
-      if (promoteRes.ok) {
-        const rows = await promoteRes.json().catch(() => []);
-        log(`🌅 day rollover ${todaySpain}: promoted ${rows.length} next_day → waiting_pool`);
+      const _auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+      let _wNow = 0;
+      try {
+        const wr = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`,
+          { headers: { ..._auth, "Prefer": "count=exact", "Range": "0-0" } });
+        _wNow = parseInt((wr.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch {}
+      const _room = Math.max(0, WAITING_POOL_CAP - _wNow);
+      if (_room > 0) {
+        const idsRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&order=uploaded_at.asc&limit=${_room}&select=id`, { headers: _auth });
+        const ids = idsRes.ok ? (await idsRes.json().catch(() => [])).map(r => r.id) : [];
+        if (ids.length) {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})`, {
+            method: "PATCH",
+            headers: { ..._auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ status: "waiting_pool" }),
+          });
+          log(`🌅 day rollover ${todaySpain}: promoted ${ids.length} next_day → waiting_pool (tope ${WAITING_POOL_CAP})`);
+        }
+      } else {
+        log(`🌅 day rollover ${todaySpain}: waiting_pool lleno (${_wNow}/${WAITING_POOL_CAP}) — next_day espera`);
       }
     } catch (e) { log(`⚠️ next_day rollover: ${e.message}`); }
   }
@@ -1294,8 +1310,38 @@ async function _insertFeederRun(token, slotLabel, data) {
   } catch (e) { log(`⚠️ feeder run log failed: ${e.message}`); }
 }
 
+// Maxi 2026-07-01: CARRIL POR FUENTE + tope global del waiting_pool.
+// Cada motor tiene su cupo ACTIVO propio (pending+processing+waiting_pool+next_day) para
+// que un sellers.json no le tape el lugar a AutoGoogle/autopilot. Si una fuente llenó su
+// carril, no inyecta más → regulación automática + podemos analizar qué arrojó cada uno.
+const WAITING_POOL_CAP = 700;                       // el pool no debe pasar de esto (user 2026-07-01)
+const PER_SOURCE_ACTIVE_CAP = {
+  auto_feeder_sellers:  250,
+  auto_feeder_majestic: 150,   // autopilot (majestic/similar)
+  auto_feeder_adstxt:   120,   // autopilot (ads.txt-graph)
+  auto_feeder_monday:   120,
+  autogoogle:           180,   // carril RESERVADO — nunca lo tapa un JSON
+};
+const DEFAULT_SOURCE_CAP = 150;
+
+async function _countActiveCsvBySource(token, sourceTag) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool,next_day)&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    return parseInt((res.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch { return 0; }
+}
+
 async function _injectIntoCsvQueue(token, domains, sourceTag) {
   if (!domains || domains.length === 0) return 0;
+  // CARRIL de la fuente: si ya llenó su cupo activo, no inyectar más.
+  const laneCap  = PER_SOURCE_ACTIVE_CAP[sourceTag] ?? DEFAULT_SOURCE_CAP;
+  const laneUsed = await _countActiveCsvBySource(token, sourceTag);
+  const laneRoom = Math.max(0, laneCap - laneUsed);
+  if (laneRoom <= 0) { log(`⏸️ ${sourceTag} SKIP inject: carril lleno (${laneUsed}/${laneCap})`); return 0; }
+  if (domains.length > laneRoom) domains = domains.slice(0, laneRoom);
   const pendingNow = await getCsvQueuePendingCountServer(token).catch(() => 0);
   // Waiting count inline (no hay helper dedicado para waiting_pool)
   let waitingNow = 0;
@@ -1307,7 +1353,7 @@ async function _injectIntoCsvQueue(token, domains, sourceTag) {
     waitingNow = parseInt((wr.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
   } catch {}
   const slotsPending = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
-  const slotsWaiting = Math.max(0, 300 - waitingNow);
+  const slotsWaiting = Math.max(0, WAITING_POOL_CAP - waitingNow);
   let _p = 0, _w = 0;
   const payload = domains.map(domain => {
     let status;
