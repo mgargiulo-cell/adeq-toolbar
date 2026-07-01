@@ -840,7 +840,7 @@ const BACKFILL_BATCH = 5;
 const FEEDER_SLOTS = [9, 12, 15, 18, 20];          // hora Madrid L-V
 const FEEDER_DAILY_TARGET = 150;                    // efectivos sumados a review_queue
 const FEEDER_PER_SLOT_TARGET = 30;                  // máx efectivos a meter en 1 slot
-const FEEDER_RQ_SATURATION = 2000;                  // skip si review_queue ya ≥ esto (user 2026-05-29: stock grande, ~2 semanas)
+const FEEDER_RQ_SATURATION = 3000;                  // Maxi 2026-07-01: 2000→3000. Hoy el conteo está inflado por leads SIN email (71%) que se están reprocesando; darle aire para no frenar el feeder mientras drenan.
 const FEEDER_RAPIDAPI_THRESHOLD = 0.95;             // 95% del limit mensual → stop
 const FEEDER_MEASURE_DELAY_MIN = 30;                // medir efectivos N min después
 const FEEDER_DEFAULT_CONVERSION = 0.15;             // sin histórico, 15%
@@ -1246,11 +1246,19 @@ async function _getReviewQueueValidCount(token) {
 // Gate de saturación: el feeder/autopilot/autogoogle NO cargan más mientras este
 // número esté alto → la cola drena antes de volver a llenarse (pedido del user: la
 // cola llegó a ~1500 en espera). Resume recién cuando baja del umbral LOW.
-const CSV_QUEUE_HALT_HIGH = 150; // si el backlog supera esto → frenar inyección
+const CSV_QUEUE_HALT_HIGH = 150; // si el backlog ACTIVO supera esto → frenar inyección
+// Maxi 2026-07-01: BUG que frenaba TODOS los motores (feeder + autopilot + autogoogle).
+// Antes contaba pending+processing+waiting_pool+next_day. waiting_pool (cap 300) y next_day
+// (ILIMITADO) son buffers DIFERIDOS que se promueven solos cuando pending drena — pero al
+// apilarse mantenían el backlog >150 PARA SIEMPRE → el intake quedaba bloqueado y ni el
+// feeder ni AutoGoogle traían webs nuevas (skipped_saturated 25/25, autogoogle 0 búsquedas).
+// Ahora solo cuenta el trabajo ACTIVO (pending+processing): si el worker tiene <150 items
+// para procesar, los motores siguen descubriendo. El crecimiento lo limitan el hard cap de
+// pending (200), el target diario del feeder y el cap mensual de AutoGoogle.
 async function _getCsvQueueBacklog(token) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool,next_day)&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("content-range") || "";
@@ -5133,6 +5141,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     case "auto_feeder_sellers":  source = "sellers_json"; break;
     case "auto_feeder_majestic": source = "autopilot";    break;
     case "auto_feeder_monday":   source = "monday_refresh"; break;
+    case "auto_feeder_adstxt":   source = "autopilot";    break;  // Maxi 2026-07-01: faltaba → caía a "csv" (mal). ads.txt-graph = descubrimiento automático.
     // Maxi 2026-06-22 FIX: los imports MANUALES ya vienen con el source correcto
     // (sellers_json / monday_refresh / csv / autogoogle / autopilot) → PRESERVARLO.
     // Antes caían en default="csv" → el filtro de FUENTE en Prospects no respetaba nada.
@@ -5141,7 +5150,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     case "csv":
     case "autogoogle":
     case "autopilot":           source = item.source; break;
-    default:                     source = "csv"; // desconocido → csv
+    // Maxi 2026-07-01: default HONESTO. Antes enmascaraba TODO source desconocido como
+    // "csv" (mentía: leads del worker aparecían como imports manuales). Ahora preserva el
+    // tag real; solo un source realmente vacío cae a "csv".
+    default:                     source = (item.source && String(item.source).trim()) || "csv";
   }
   let mondayItemId = null;
 
