@@ -1386,9 +1386,15 @@ async function maybeRunAutoGoogleSlot(token) {
   if (!AUTOGOOGLE_SLOTS.includes(hour)) return;
   const slotLabel = `${dateISO}-${hour}:00`;
   if (_autoGoogleLastSlot === slotLabel) return;
-  // Maxi 2026-06-22: gate de backlog — no cargar más si la cola csv está llena.
+  // Maxi 2026-07-01: AutoGoogle tiene VÍA PROPIA más laxa. Trae publishers frescos de
+  // Google (no las listas ad-tech del backlog del feeder) y se autolimita con su cap
+  // mensual (2500 búsquedas). Antes lo frenaba el mismo gate que el feeder (150) → con
+  // el backlog acumulado nunca corría. Ahora solo frena si el trabajo ACTIVO (pending+
+  // processing) está MUY alto (400) — que con el hard cap de pending (200) casi no pasa,
+  // así corre en paralelo al feeder como pediste.
+  const AUTOGOOGLE_HALT = 400;
   const _bl = await _getCsvQueueBacklog(token);
-  if (_bl >= CSV_QUEUE_HALT_HIGH) { log(`🔎 AutoGoogle SKIP: cola csv backlog ${_bl} (>${CSV_QUEUE_HALT_HIGH})`); return; }
+  if (_bl >= AUTOGOOGLE_HALT) { log(`🔎 AutoGoogle SKIP: trabajo activo ${_bl} (>${AUTOGOOGLE_HALT})`); return; }
   _autoGoogleLastSlot = slotLabel;
   try { await _runAutoGoogleSlot(token, slotLabel); }
   catch (e) { log(`⚠️ AutoGoogle slot: ${e.message}`); }
