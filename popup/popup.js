@@ -1874,6 +1874,7 @@ async function renderAdminSourcePerformance() {
       if (s.includes("autogoogle")) return "🔎 AutoGoogle";
       if (s.includes("monday"))     return "🔄 Monday";
       if (s.includes("sellers"))    return "📋 sellers.json";
+      if (s.includes("manual"))     return "✋ Manual";
       if (s.includes("csv"))        return "📥 CSV";
       return "❓ Otro";
     };
@@ -5571,7 +5572,9 @@ async function bindButtons() {
 
       resultEl.textContent = `Uploading ${selected.length} domains to queue...`;
 
-      const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken);
+      // Maxi 2026-07-01: carga HUMANA (no feeder) → source "manual", NO "csv".
+      // Diego se quejó: "sigue diciendo csv cuando no cargó csv". El default "csv" mentía.
+      const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken, "manual");
 
       { const r = formatUploadResult(upload, selected.length); resultEl.textContent = r.msg; resultEl.style.color = r.color; }
       resultEl.className = "push-result ok";
@@ -7096,6 +7099,7 @@ async function initCsvQueue() {
   ];
   const HISTORY_SOURCE_LABEL = {
     csv:          { icon: "📥", label: "CSV upload" },
+    manual:       { icon: "✋", label: "Import manual" },
     sellers_json: { icon: "📋", label: "Sellers.json" },
     monday:       { icon: "🔄", label: "Monday refresh" },
   };
@@ -7418,9 +7422,9 @@ async function initCsvQueue() {
 
       uploadRes.textContent = `Uploading ${_fresh.length} domains${_skippedKnown > 0 ? ` (${_skippedKnown} already in system, skipped)` : ""}...`;
 
-      const result = await uploadCsvDomains(_fresh, state.loginEmail, state.accessToken);
+      const result = await uploadCsvDomains(_fresh, state.loginEmail, state.accessToken, "manual");
       logImportAttempt(state.accessToken, {
-        userEmail: state.loginEmail, source: "csv",
+        userEmail: state.loginEmail, source: "manual",
         sourceDetail: file?.name || "",
         attempted: unique.length, deduped: _skippedKnown, inserted: result?.inserted || 0,
       });
@@ -9328,6 +9332,7 @@ function renderProspectCard(r) {
             const badges = {
               autopilot:      ["🤖", "Auto",     "#6366f1"],
               csv:            ["📥", "CSV",      "#0ea5e9"],
+              manual:         ["✋", "Manual",   "#0ea5e9"],
               monday_refresh: ["🔄", "Monday",   "#f59e0b"],
               sellers_json:   ["📋", "JSON",     "#8b5cf6"],
               autogoogle:     ["🔎", "Google",   "#22c55e"],  // Maxi 2026-06-30: faltaba → caía a "Auto"
