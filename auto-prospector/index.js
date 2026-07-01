@@ -680,16 +680,12 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   // confiaba en que el caller filtraba. Pero rows con NaN/0 se colaban. Ahora se
   // valida ACÁ — si traffic no es número >= MIN, no se guarda.
   const trafficNum = Number(traffic);
+  // Maxi 2026-07-01: FLOOR DURO PARA TODOS. Se SACÓ la excepción monday_refresh/csv — el user
+  // exige "solo pasan los +350K, las de menos ni se analizan", sin importar la fuente (incluidos
+  // imports manuales y re-imports de Monday). Si el tráfico no es número ≥ MIN, no se guarda.
   if (!Number.isFinite(trafficNum) || trafficNum < REVIEW_QUEUE_MIN_TRAFFIC) {
-    // EXCEPCIÓN: monday_refresh (re-import de Ciclo Finalizado) puede pasar con
-    // tráfico 0 si SimilarWeb falló temporalmente — esos se procesan igual porque
-    // ya fueron contactados antes y el MB explícitamente quiere re-prospectarlos.
-    // Maxi 2026-07-01: monday_refresh Y csv (import MANUAL del MB) pueden pasar con
-    // tráfico bajo/0 — el MB los trae explícitamente y NO se re-rechazan por tráfico.
-    if (source !== "monday_refresh" && source !== "csv") {
-      log(`  ⛔ saveToReviewQueue ${domain} REJECTED — traffic ${trafficNum} < ${REVIEW_QUEUE_MIN_TRAFFIC} (source=${source})`);
-      return "floor";
-    }
+    log(`  ⛔ saveToReviewQueue ${domain} REJECTED — traffic ${trafficNum} < ${REVIEW_QUEUE_MIN_TRAFFIC} (source=${source})`);
+    return "floor";
   }
 
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
@@ -3563,7 +3559,10 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
 //   3. Si traffic ≥ APOLLO_UNLOCK_MIN_TRAFFIC y cap < APOLLO_MONTHLY_HARD_CAP
 //      → unlock TOP 1 person via /v1/people/match (1 credit)
 //   4. Si no aplica unlock → return null (caller usa scraping fallback)
-const APOLLO_UNLOCK_MIN_TRAFFIC = 399_000;
+// Maxi 2026-07-01: bajado 399K→350K para alinear con REVIEW_QUEUE_MIN_TRAFFIC. Antes había
+// sitios 350K-399K que pasaban el floor pero NUNCA intentaban unlock de Apollo. Ahora TODO
+// prospect que entra (≥350K pageviews) puede desbloquear Apollo si el HTML no dio email.
+const APOLLO_UNLOCK_MIN_TRAFFIC = 350_000;
 
 // Local-parts genéricos (no son una persona). Si el verified gratis es uno de
 // estos y el sitio califica para unlock, gastamos 1 credit para revelar al
@@ -4382,7 +4381,10 @@ async function runSuspectRejectAnalysis(token) {
   try { const cfg = await getConfig(token); if (cfg.last_suspect_analysis_date === dateISO) { _lastSuspectAnalysisDate = dateISO; return; } } catch {}
   _lastSuspectAnalysisDate = dateISO;
   const trash = await _loadProspectTrashContext(token);
-  if (!trash.rules && trash.dislikedCats.size === 0) { log("🔎 suspect-analysis: sin aprendizaje de rechazos aún — skip"); return; }
+  // Maxi 2026-07-01: el aprendizaje de rechazos es por CONTENIDO/TIPO del sitio (reglas destiladas
+  // de los comentarios del MB), NUNCA por categoría/temática ni geo (regla dura del user). Si no
+  // hay `rules` aún, no hay nada que aprender → skip. dislikedCats YA no gatilla el análisis.
+  if (!trash.rules) { log("🔎 suspect-analysis: sin reglas de rechazo por contenido aún — skip"); return; }
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let rows = [];
   try {
@@ -4395,13 +4397,12 @@ async function runSuspectRejectAnalysis(token) {
   const CONC = 4;
   for (let i = 0; i < rows.length; i += CONC) {
     await Promise.all(rows.slice(i, i + CONC).map(async (row) => {
-      const cat = (row.category || "").toLowerCase().trim();
+      // Maxi 2026-07-01: SOLO por TIPO/contenido (Haiku + reglas destiladas de comentarios de
+      // rechazo). Se sacó el flag por `dislikedCats` (temática) — el user prohíbe descartar por
+      // categoría o geo. La ⚠️ aprende del CONTENIDO del sitio, no de su país ni su temática.
       let reason = "";
-      if (cat && trash.dislikedCats.has(cat)) reason = `categoría rechazada: ${cat}`;
-      else {
-        const type = await _haikuPublisherClass(token, row.domain, { title: row.page_title || "", description: "" }, row.category || "", trash.rules || "");
-        if (type && type !== "publisher") reason = `tipo detectado: ${type}`;
-      }
+      const type = await _haikuPublisherClass(token, row.domain, { title: row.page_title || "", description: "" }, row.category || "", trash.rules || "");
+      if (type && type !== "publisher") reason = `tipo detectado: ${type}`;
       if (!reason) return;
       try {
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${row.id}`, {
@@ -5253,10 +5254,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     case "csv":
     case "autogoogle":
     case "autopilot":           source = item.source; break;
-    // Maxi 2026-07-01: default HONESTO. Antes enmascaraba TODO source desconocido como
-    // "csv" (mentía: leads del worker aparecían como imports manuales). Ahora preserva el
-    // tag real; solo un source realmente vacío cae a "csv".
-    default:                     source = (item.source && String(item.source).trim()) || "csv";
+    // Maxi 2026-07-01: default HONESTO por ORIGEN. El worker NO importa CSV — sus fuentes son
+    // discovery automático. "csv"/"manual" solo son válidos si uploaded_by es un MB humano
+    // (isManualImport). Un source desconocido de un item del worker/autofeeder NUNCA debe quedar
+    // "csv" (mentía: leads del worker aparecían como imports manuales); cae a "autopilot".
+    default:
+      source = (item.source && String(item.source).trim())
+        || (isManualImport ? "csv" : "autopilot");
   }
   let mondayItemId = null;
 
@@ -5283,11 +5287,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // frena el deal Monday activo (chequeado arriba) y la blocklist. El auto-feeder sí filtra.
   const bypassFilters = isManualImport || source === "monday_refresh";
 
-  // 1. Traffic + page content en paralelo
-  const [trafficData, pageContent] = await Promise.all([
-    getTrafficData(domain, rapidapi_key),
-    fetchPageContent(domain),
-  ]);
+  // Maxi 2026-07-01: TRAFFIC PRIMERO, SOLO. El page content (scrape) se difería a
+  // después del floor de 350K para NO gastar scrape/API en sitios que se van a rechazar.
+  // Antes traffic+content corrían en paralelo → todo sitio scrapeaba aunque fuera de 2K.
+  const trafficData = await getTrafficData(domain, rapidapi_key);
   let { visits, pagesPerVisit, topCountry, topCountries3, swCategory } = trafficData;
   if (!topCountry) {
     const inferred = inferCountryFromTLD(domain);
@@ -5393,14 +5396,21 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const scrapePV = (typeof trafficData.pageViews === "number" && trafficData.pageViews > 0) ? trafficData.pageViews : null;
   const effectivePageViews = scrapePV != null ? scrapePV : Math.round(visits * ppvForThreshold);
   const usingFallback = scrapePV == null && !(typeof pagesPerVisit === "number" && pagesPerVisit > 0);
-  if (effectivePageViews < REVIEW_QUEUE_MIN_TRAFFIC && !bypassFilters) {
+  // Maxi 2026-07-01: FLOOR DE 350K SIN EXCEPCIÓN. Antes `!bypassFilters` dejaba pasar imports
+  // manuales y monday_refresh de <350K (aparecían prospects de 2K/12K/67K en la cola). El user
+  // exige: "solo pasan los +350K, las de menos NI SE ANALIZAN". El floor de tráfico ya NO se
+  // bypassa para nadie; los OTROS filtros de calidad (categoría/geo/config) sí siguen bypasseados
+  // para lo que el MB trae explícito. Este check corre ANTES de scrape/Apollo → cero API gastada.
+  if (effectivePageViews < REVIEW_QUEUE_MIN_TRAFFIC) {
     const label = scrapePV != null ? "hypestat pageviews" : (usingFallback ? `visits×${PPV_FALLBACK} fallback` : `visits×${ppvForThreshold.toFixed(2)}`);
     await markCsvItem(token, item.id, "skipped", {
       error_message: `pageviews ${effectivePageViews} (${label}) below min ${REVIEW_QUEUE_MIN_TRAFFIC}`,
     });
-    log(`  ⏭ ${domain} — ${effectivePageViews} pageviews (${visits} visits × ${ppvForThreshold.toFixed(2)}) < ${REVIEW_QUEUE_MIN_TRAFFIC}`);
+    log(`  ⏭ ${domain} — ${effectivePageViews} pageviews (${visits} visits × ${ppvForThreshold.toFixed(2)}) < ${REVIEW_QUEUE_MIN_TRAFFIC} (floor duro, sin bypass)`);
     return;
   }
+  // Floor superado → AHORA sí traemos el HTML (scrape). No se gastó nada en sitios <350K.
+  const pageContent = await fetchPageContent(domain).catch(() => null);
   // FIX 2026-05-26: filtro por categoría SimilarWeb — bloquea marcas/instituciones
   // que pasaron por traffic pero no son publishers. Política user: no quiero ver
   // bancos, universidades, gobierno, marcas de autos, telcos, etc. en Prospects.
@@ -5548,7 +5558,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const apolloChance = haveDM ? remainingPct : 1;
     if (Math.random() < apolloChance) {
       log(`  💎 Apollo ${domain} (haveDM=${haveDM}, pacing=${(remainingPct*100).toFixed(0)}%)`);
-      apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
+      // Maxi 2026-07-01: (a) traffic ahora en PAGEVIEWS (effectivePageViews) para alinear con el
+      // umbral de unlock (350K pageviews), no visits. (b) si NO hay decision-maker del scrape/HTML,
+      // forceUnlock=true → Apollo pago como fallback garantizado (user autorizó pagar cuando el HTML falla).
+      apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: effectivePageViews, allowUnlock: true, forceUnlock: !haveDM })
         .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
         .catch(() => null);
     }
@@ -11747,12 +11760,15 @@ async function main() {
         }).catch(() => {});
 
         // 1. DELETE leads con traffic > 0 AND < MIN (basura conocida — el agente nunca los pickearía)
-        const subRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`, {
+        // Maxi 2026-07-01: se SACÓ la excepción `source=neq.monday_refresh`. El floor de 350K es
+        // duro para TODO (incluido monday_refresh) → los sub-350K de cualquier fuente que ya
+        // quedaron en la cola (los 2K/12K/67K reportados) se limpian también.
+        const subRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`, {
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
         });
         const subCount = parseInt((subRes.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
         if (subCount > 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}`, {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}`, {
             method: "DELETE",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "return=minimal" },
           }).catch(() => {});

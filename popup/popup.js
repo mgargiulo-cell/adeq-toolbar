@@ -8679,24 +8679,29 @@ Object.entries(ISO_TO_NAME_FULL).forEach(([iso, name]) => { NAME_TO_ISO_FULL[nam
 // Además, los nombres en español del mapa global _GEO_NAMES (Brasil/España/...).
 try { Object.entries(_GEO_NAMES || {}).forEach(([iso, name]) => { NAME_TO_ISO_FULL[String(name).toUpperCase()] = iso; }); } catch {}
 
-// Detectar geos (ISO 2-letter) de un lead — soporta geos_all + legacy geo (NAME o ISO).
-// ÚNICA fuente de verdad para contar y para filtrar.
+// Normaliza un valor de geo (NAME o ISO) → ISO de 2 letras, o "" si no resuelve.
+// Maxi 2026-07-01: el fallback slice(0,2) SOLO se aplica cuando el valor parece un
+// código ISO (≤3 chars), NUNCA sobre nombres largos: antes "Indonesia".slice(0,2)="IN"
+// (India) y "United States"→"UN" mapeaban mal el país mostrado por SimilarWeb.
+function _geoToISO(raw) {
+  const g = String(raw || "").trim().toUpperCase();
+  if (!g) return "";
+  if (g.length === 2 && ISO_TO_CONTINENT[g]) return g;
+  if (NAME_TO_ISO_FULL[g])                    return NAME_TO_ISO_FULL[g];
+  if (g.length <= 3 && ISO_TO_CONTINENT[g.slice(0, 2)]) return g.slice(0, 2);
+  return "";
+}
+// Maxi 2026-07-01 (PUNTO 1): el filtro/conteo de GEO debe respetar EL PAÍS QUE MUESTRA
+// LA CARD (el de SimilarWeb = r.geo, "país principal"), NO cualquier geo secundario de
+// geos_all. Bug reportado: al elegir "North America" salían Ecuador/Colombia/Chile/India
+// porque _rowISOs devolvía TODOS los geos_all → un lead de Ecuador con US en geos_all
+// matcheaba NA. Ahora devolvemos SOLO el país primario (r.geo, o geos_all[0] de fallback),
+// que es exactamente el que la card renderiza como "🌎 país principal".
 function _rowISOs(r) {
   const out = new Set();
-  if (Array.isArray(r.geos_all) && r.geos_all.length) {
-    for (const raw of r.geos_all) {
-      const iso = String(raw || "").toUpperCase().slice(0, 2);
-      if (iso) out.add(iso);
-    }
-  }
-  if (r.geo) {
-    const g = String(r.geo).trim().toUpperCase();
-    let iso = "";
-    if (g.length === 2 && ISO_TO_CONTINENT[g]) iso = g;
-    else if (NAME_TO_ISO_FULL[g])              iso = NAME_TO_ISO_FULL[g];
-    else if (g.length >= 2 && ISO_TO_CONTINENT[g.slice(0, 2)]) iso = g.slice(0, 2);
-    if (iso) out.add(iso);
-  }
+  const primary = _geoToISO(r && r.geo)
+    || (Array.isArray(r && r.geos_all) && r.geos_all.length ? _geoToISO(r.geos_all[0]) : "");
+  if (primary) out.add(primary);
   return out;
 }
 // Maxi 2026-07-01: ¿el lead tiene al menos un email válido? Usado para (a) ordenar
