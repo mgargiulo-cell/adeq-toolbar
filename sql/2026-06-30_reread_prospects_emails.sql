@@ -18,6 +18,6 @@ SELECT key, value FROM public.toolbar_config WHERE key = 'agent_reenrich_bad_lea
 -- Para ver el progreso (cuántos pendientes siguen sin email):
 SELECT
   COUNT(*)                                                            AS total_pending,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) = 0)    AS sin_email
+  COUNT(*) FILTER (WHERE NOT (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS sin_email
 FROM public.toolbar_review_queue
 WHERE status = 'pending';

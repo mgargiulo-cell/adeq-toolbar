@@ -24,8 +24,8 @@ WHERE key IN ('autogoogle_serper_used', 'autogoogle_serper_period');
 SELECT
   COALESCE(rq.source, '(sin source)')                                  AS fuente,
   COUNT(*)                                                             AS total_en_prospects,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(rq.emails, 1), 0) > 0)  AS con_email,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE COALESCE(array_length(rq.emails, 1), 0) > 0)
+  COUNT(*) FILTER (WHERE (jsonb_typeof(rq.emails)='array' AND jsonb_array_length(rq.emails) > 0))  AS con_email,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE (jsonb_typeof(rq.emails)='array' AND jsonb_array_length(rq.emails) > 0))
         / NULLIF(COUNT(*), 0), 1)                                      AS pct_con_email,
   COUNT(*) FILTER (WHERE rq.status = 'pending')                        AS pendientes,
   COUNT(DISTINCT st.domain)                                            AS enviados,
@@ -43,7 +43,7 @@ ORDER BY total_en_prospects DESC;
 SELECT
   DATE(created_at)                                                    AS dia,
   COUNT(*)                                                            AS leads,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)    AS con_email,
+  COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS con_email,
   ROUND(AVG(traffic) / 1000)                                          AS traffic_prom_K
 FROM public.toolbar_review_queue
 WHERE source = 'autogoogle'
@@ -58,7 +58,7 @@ ORDER BY dia DESC;
 SELECT
   DATE(created_at)                                                    AS dia,
   COUNT(*)                                                            AS leads,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)    AS con_email,
+  COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS con_email,
   ROUND(AVG(traffic) / 1000)                                          AS traffic_prom_K
 FROM public.toolbar_review_queue
 WHERE source = 'autopilot'
@@ -77,8 +77,8 @@ SELECT
        THEN '🤖 Agent (autónomo)'
        ELSE created_by END                                            AS owner,
   COUNT(*)                                                            AS pendientes,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)    AS con_email,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)
+  COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS con_email,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))
         / NULLIF(COUNT(*), 0), 1)                                     AS pct_con_email
 FROM public.toolbar_review_queue
 WHERE status = 'pending'
@@ -93,7 +93,7 @@ ORDER BY pendientes DESC;
 SELECT
   COALESCE(NULLIF(TRIM(geo), ''), '(sin geo)')                        AS geo,
   COUNT(*)                                                            AS pendientes,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)    AS con_email
+  COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS con_email
 FROM public.toolbar_review_queue
 WHERE status = 'pending'
 GROUP BY 1
@@ -106,9 +106,9 @@ LIMIT 20;
 -- ════════════════════════════════════════════════════════════════
 SELECT
   COUNT(*)                                                            AS total_pending,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)    AS con_email,
-  COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) = 0)    AS sin_email,
-  ROUND(100.0 * COUNT(*) FILTER (WHERE COALESCE(array_length(emails, 1), 0) > 0)
+  COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS con_email,
+  COUNT(*) FILTER (WHERE NOT (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))    AS sin_email,
+  ROUND(100.0 * COUNT(*) FILTER (WHERE (jsonb_typeof(emails)='array' AND jsonb_array_length(emails) > 0))
         / NULLIF(COUNT(*), 0), 1)                                     AS pct_con_email,
   COUNT(*) FILTER (WHERE COALESCE(traffic, 0) = 0)                    AS sin_traffic
 FROM public.toolbar_review_queue

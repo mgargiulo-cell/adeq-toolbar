@@ -2168,11 +2168,13 @@ async function runReenrichBadLeads(token) {
           }
         } catch (e) { log(`  ⚠️ scrape ${lead.domain}: ${e.message}`); }
 
-        // 2) Apollo SOLO si scrape no encontró nada Y hay cupo (ahorra crédito)
+        // 2) Apollo SOLO si scrape no encontró nada Y hay cupo. Maxi 2026-07-01:
+        // forceUnlock — el user pidió PAGAR Apollo cuando el scrape viene vacío (estos
+        // leads ya pasaron el filtro de tráfico). Respeta el cap mensual duro.
         if (!foundEmail && apolloAvailable) {
           try {
             const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
-              traffic: lead.traffic || 0, allowUnlock: true,
+              traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true,
             });
             if (apolloRes?.email) {
               foundEmail = apolloRes.email;
@@ -3509,7 +3511,7 @@ function _isGenericEmail(email) {
   const local = (email || "").split("@")[0] || "";
   return APOLLO_GENERIC_LOCAL.test(local.trim());
 }
-async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allowUnlock = true } = {}) {
+async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allowUnlock = true, forceUnlock = false } = {}) {
   if (!apolloKey || !domain) return null;
   // Audit P2 fix: Apollo espera dominio limpio sin www. Antes lookups con
   // "www.sitio.com" fallaban silenciosamente.
@@ -3556,8 +3558,11 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     };
   }
 
-  // 4. ¿Califica para unlock? Solo si tráfico alto, allowUnlock y bajo cap mensual.
-  const qualifiesUnlock = allowUnlock && traffic >= APOLLO_UNLOCK_MIN_TRAFFIC;
+  // 4. ¿Califica para unlock? Tráfico alto, allowUnlock y bajo cap mensual.
+  // Maxi 2026-07-01: forceUnlock (re-enrich de leads SIN email) bypassa el umbral de
+  // tráfico — el user pidió PAGAR Apollo cuando el scrape no encuentra nada. El cap
+  // mensual duro sigue vigente (no se bypassa NUNCA).
+  const qualifiesUnlock = allowUnlock && (forceUnlock || traffic >= APOLLO_UNLOCK_MIN_TRAFFIC);
 
   // Si hay verified gratis y NO califica, o el gratis ya es una persona (no genérico),
   // nos quedamos con el gratis sin gastar crédito.
@@ -3580,7 +3585,7 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
       log(`  ⚠ Apollo cap ${cap} alcanzado (${used}/${usage.monthLimit}) — skip unlock ${domain}`);
       return freeResult;
     }
-    if (_isAheadOfPace(used, cap)) {
+    if (!forceUnlock && _isAheadOfPace(used, cap)) {
       const tPct = Math.round(_cycleElapsedRatio() * 100);
       const uPct = Math.round((used / cap) * 100);
       log(`  ⏸️ Apollo throttle: usado ${uPct}% pero ciclo va ${tPct}% — skip unlock ${domain} (pacing)`);
@@ -3649,6 +3654,13 @@ async function bumpApolloUnlocks(token, n = 1) {
 // rechazaba .travel/.museum/.online/.agency/.media y emails válidos quedaban afuera.
 const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}(?=\s|$|[^a-zA-Z])/g;
 const IGNORE_EMAIL = ["example.com","domain.com","sentry.io","google.com","w3.org","schema.org","cloudflare.com"];
+
+// Maxi 2026-07-01: email_sources puede guardar un STRING ("scrape") o un OBJETO
+// {url, source} según el path de escritura. Normaliza SIEMPRE a string. Antes se
+// metía el objeto entero en el ranking y en toolbar_response_tracking.source →
+// rompía el análisis por fuente Y el ranking dinámico (cada dominio quedaba como
+// una "fuente" distinta, ej: {"url":"...","source":"scrape"}).
+function _normSrc(v) { return typeof v === "string" ? v : (v && v.source) || ""; }
 
 // Limpieza de prefijo "C" pegado al email — artifact común del scrape de HTML
 // donde "Contato: foo@bar.com" se captura como "Cfoo@bar.com" porque la regex
@@ -7867,7 +7879,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const ranked = candidates
       .map(e => ({
         email: e,
-        source: (manualFutureEmail && e.toLowerCase() === manualFutureEmail) ? "manual" : (_sourcesMap[e.toLowerCase()] || ""),
+        source: (manualFutureEmail && e.toLowerCase() === manualFutureEmail) ? "manual" : _normSrc(_sourcesMap[e.toLowerCase()]),
         score: rankEmail(e, domain, lead.category || ""),
       }))
       // FIX 2026-05-19: manual future_email del MB nunca se filtra por score.
@@ -9877,7 +9889,7 @@ async function runAgentCycle(token, allFlags) {
         }
         const _rankedAll = _emailsClean.map(e => ({
           email:  e,
-          source: _sourcesMap[e.toLowerCase()] || "",
+          source: _normSrc(_sourcesMap[e.toLowerCase()]),
           score:  rankEmail(e, domain, lead.category),
         }));
         const ranked = _rankedAll
