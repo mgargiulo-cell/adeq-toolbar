@@ -1262,7 +1262,7 @@ async function _getReviewQueueValidCount(token) {
 // Gate de saturación: el feeder/autopilot/autogoogle NO cargan más mientras este
 // número esté alto → la cola drena antes de volver a llenarse (pedido del user: la
 // cola llegó a ~1500 en espera). Resume recién cuando baja del umbral LOW.
-const CSV_QUEUE_HALT_HIGH = 150; // si el backlog ACTIVO supera esto → frenar inyección
+const CSV_QUEUE_HALT_HIGH = 250; // Maxi 2026-07-01: 150→250. El backlog activo ahora cuenta solo pending+processing, y pending clava en su tope (200) → con 150 el feeder frenaba SIEMPRE (200>150) aunque hubiera lugar. La regulación real ahora son los carriles por fuente + el tope de waiting_pool (700); este gate solo evita amontonar cuando pending está realmente lleno.
 // Maxi 2026-07-01: BUG que frenaba TODOS los motores (feeder + autopilot + autogoogle).
 // Antes contaba pending+processing+waiting_pool+next_day. waiting_pool (cap 300) y next_day
 // (ILIMITADO) son buffers DIFERIDOS que se promueven solos cuando pending drena — pero al
