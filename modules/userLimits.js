@@ -68,8 +68,8 @@ export async function upsertUserLimit(accessToken, limit) {
           monthly_api_cap:           limit.monthly_api_cap || null,
           daily_emails_cap:          parseInt(limit.daily_emails_cap || 100, 10),
           daily_monday_cap:          parseInt(limit.daily_monday_cap || 100, 10),
-          autopilot_daily_minutes:   parseInt(limit.autopilot_daily_minutes || 60, 10),
-          autopilot_daily_prospects: parseInt(limit.autopilot_daily_prospects || 75, 10),
+          autopilot_daily_minutes:   parseInt(limit.autopilot_daily_minutes || 20, 10),   // Maxi 2026-07-01 (B6): alinear con DEFAULTS (era 60)
+          autopilot_daily_prospects: parseInt(limit.autopilot_daily_prospects || 300, 10), // Maxi 2026-07-01 (B6): alinear con DEFAULTS (era 75)
           updated_at:                new Date().toISOString(),
         }),
       }

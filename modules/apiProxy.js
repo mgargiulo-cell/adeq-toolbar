@@ -103,20 +103,22 @@ async function flushMonthlyCounter(force = false) {
   _monthLastSync   = now;
   _hitsSinceFlush  = 0;
   _monthState.dirty = false;
-  // Re-leer + sumar para no pisar lo que otro MB sumó en paralelo.
-  // Compat con formato viejo: comparamos por YYYY-MM (slice 0,7).
+  // Maxi 2026-07-01 (A2): el contador se persiste ATÓMICAMENTE por hit vía el RPC
+  // bump_api_counter (más abajo en este archivo). Acá SOLO re-leemos el valor real de la
+  // DB para sincronizar el contador local del banner — NO escribimos. Antes el read-max-write
+  // (Math.max + _writeConfigKey) PISABA los incrementos que otros MBs sumaron en paralelo:
+  // dos MBs flusheando a la vez → el menor perdía sus hits → el cap mensual se podía superar.
   try {
     const map = await _readConfigKeys(["rapidapi_calls_month", "rapidapi_calls_month_period"]);
     const period   = currentPeriod();
     const sameMonth = (map.rapidapi_calls_month_period || "").slice(0, 7) === period.slice(0, 7);
     const stored   = sameMonth ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
-    const newTotal = Math.max(stored, _monthState.used);
-    await _writeConfigKey("rapidapi_calls_month", newTotal);
-    await _writeConfigKey("rapidapi_calls_month_period", period);
-    _monthState.used = newTotal;
+    // DB (mantenida por el RPC atómico) = fuente de verdad. Tomamos el mayor por si un hit
+    // local muy reciente aún no se reflejó, pero NO escribimos de vuelta.
+    _monthState.used = Math.max(stored, _monthState.used);
   } catch (e) {
-    console.warn("[apiProxy] flushMonthlyCounter failed:", e.message);
-    _monthState.dirty = true; // reintentar después
+    console.warn("[apiProxy] flushMonthlyCounter sync failed:", e.message);
+    _monthState.dirty = true; // reintentar la SINCRONIZACIÓN después
   }
 }
 
