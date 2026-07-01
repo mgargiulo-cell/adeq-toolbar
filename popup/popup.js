@@ -56,31 +56,8 @@ export function setDemoMode(on) {
 }
 export function isDemoMode() { return _demoModeEnabled; }
 
-async function loadDemoModeFromStorage() {
-  try {
-    const { _demoMode } = await chrome.storage.local.get("_demoMode");
-    setDemoMode(!!_demoMode);
-  } catch {}
-}
-
-// ============================================================
-// QUICK ACCESS — últimos 20 dominios analizados
-// ============================================================
-async function getRecentDomains(n = 20) {
-  try {
-    const { _recentDomains = [] } = await chrome.storage.local.get("_recentDomains");
-    return _recentDomains.slice(0, n);
-  } catch { return []; }
-}
-async function pushRecentDomain(domain) {
-  if (!domain) return;
-  try {
-    const { _recentDomains = [] } = await chrome.storage.local.get("_recentDomains");
-    const filtered = _recentDomains.filter(d => d !== domain);
-    filtered.unshift(domain);
-    await chrome.storage.local.set({ _recentDomains: filtered.slice(0, 20) });
-  } catch {}
-}
+// Maxi 2026-07-01 (B2): loadDemoModeFromStorage / getRecentDomains / pushRecentDomain
+// removidas — código muerto (0 call-sites, verificado en auditoría).
 
 // ============================================================
 // COORDINACIÓN ENTRE MBs (lock + handoff + vacation)
@@ -845,7 +822,7 @@ function buildLimitRow(l, isNew = false) {
   return row;
 }
 
-function addAdminLimitRowExisting(row) { /* placeholder por si se necesita más adelante */ }
+/* addAdminLimitRowExisting removida (B2) — código muerto */
 
 async function saveLimitRow(row) {
   const email = row.querySelector(".lim-email").value.trim().toLowerCase();
@@ -2534,13 +2511,7 @@ if (typeof window !== "undefined" && !window._modalEscWired) {
 // Anti-flicker helper para botones: garantiza que el "loading state" dure al
 // menos 350ms aunque la operación termine antes. Evita el parpadeo
 // "⏳... ↻" que confunde al user porque no llega a leer.
-async function withMinDuration(promise, minMs = 350) {
-  const start = Date.now();
-  const result = await promise;
-  const elapsed = Date.now() - start;
-  if (elapsed < minMs) await new Promise(r => setTimeout(r, minMs - elapsed));
-  return result;
-}
+/* withMinDuration removida (B2) — código muerto */
 
 function showToast(message, kind = "info", durationMs) {
   if (!message) return;
@@ -2812,7 +2783,7 @@ function renderRapidApiUsageBanner({ used, limit, period, scope } = {}) {
 }
 
 // Llamado por apiProxy cuando se llega al cap (100%)
-function showRapidApiCapBanner(state) { renderRapidApiUsageBanner(state); }
+/* showRapidApiCapBanner removida (B2) — código muerto */
 
 // ---- Estado global ----
 const state = {
@@ -4415,33 +4386,7 @@ const _SOCIAL_META = {
   "youtube.com":   { icon: "▶️", label: "YouTube",   color: "#ff0000" },
 };
 
-function _buildSocialMediaChipsHTML(socialLinks) {
-  const unique = [...new Set((socialLinks || []).map(s => (s || "").trim()).filter(Boolean))].slice(0, 6);
-  if (unique.length === 0) return "";
-  const chips = unique.map(url => {
-    const safe = url.startsWith("http") ? url : `https://${url}`;
-    const lower = url.toLowerCase();
-    const key = Object.keys(_SOCIAL_META).find(k => lower.includes(k)) || "";
-    const meta = _SOCIAL_META[key] || { icon: "🔗", label: "Link", color: "#64748b" };
-    const username = url.split("/").filter(Boolean).pop() || meta.label;
-    const displayUser = username.length > 16 ? username.slice(0, 14) + "…" : username;
-    return `<a href="#" data-url="${esc(safe)}" class="social-media-chip" title="${esc(meta.label)}: ${esc(safe)}" style="display:inline-flex;align-items:center;gap:3px;padding:2px 7px;background:${meta.color};color:#fff;border-radius:4px;font-size:11px;text-decoration:none;font-weight:500;margin:2px">${meta.icon} ${esc(displayUser)}</a>`;
-  }).join("");
-  // Label "Social Media" + chips inline
-  return `<div style="margin-top:6px;display:flex;align-items:center;flex-wrap:wrap;gap:4px"><span style="font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:.3px">📱 SOCIAL MEDIA:</span>${chips}</div>`;
-}
-
-function _wireSocialMediaChipClicks(container) {
-  container?.querySelectorAll(".social-media-chip").forEach(a => {
-    if (a.dataset._wired) return;
-    a.dataset._wired = "1";
-    a.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      chrome.tabs.create({ url: a.dataset.url, active: false });
-    });
-  });
-}
+/* _buildSocialMediaChipsHTML / _wireSocialMediaChipClicks removidas (B2) — código muerto */
 
 function renderEmailList(emails) {
   const resultEl = document.getElementById("email-result");
@@ -4662,37 +4607,7 @@ function setEmail(email) {
   renderEmailList(state.emails);
 }
 
-async function verifyCurrentEmail() {
-  const email = document.getElementById("form-email").value.trim();
-  const badge = document.getElementById("email-verify-badge");
-  if (!email || !email.includes("@")) return;
-
-  badge.textContent   = "...";
-  badge.className     = "verify-badge unknown";
-  badge.style.display = "inline-block";
-
-  const result = await verifyEmail(email);
-  const tags   = result.tags || [];
-
-  if (!result.valid || tags.includes("typo") || tags.includes("descartable") ||
-      tags.includes("sin-dns") || tags.includes("sin-mx")) {
-    badge.textContent = "✖ Invalid";
-    badge.className   = "verify-badge fail";
-    badge.title       = result.reason + (result.suggestion ? ` → ${result.suggestion}` : "");
-  } else if (tags.includes("rol")) {
-    badge.textContent = "⚠ Role Address";
-    badge.className   = "verify-badge unknown";
-    badge.title       = result.reason;
-  } else if (result.valid) {
-    badge.textContent = "✔ Valid";
-    badge.className   = "verify-badge ok";
-    badge.title       = result.reason;
-  } else {
-    badge.textContent = "✖ Invalid";
-    badge.className   = "verify-badge fail";
-    badge.title       = result.reason;
-  }
-}
+/* verifyCurrentEmail removida (B2) — código muerto (0 call-sites) */
 
 function showLinkedIn(url) {
   if (!url) return;
@@ -8008,45 +7923,7 @@ function _resolvePitchLang() {
 
 // Render del chip strip — todos los drafts visibles, idioma detectado primero.
 // Reusable: pasale el contenedor, callback de selección, draftId activo.
-function renderDraftChips(containerEl, { activeId = null, preferredLang = null, onPick }) {
-  if (!containerEl) return;
-  const all = _draftsState.all || [];
-  if (all.length === 0) {
-    containerEl.innerHTML = `<div class="draft-chips-empty">No drafts. Create one from 📝 (header).</div>`;
-    return;
-  }
-  // Ordenar: idioma preferido primero (por priority), después el resto agrupado por idioma
-  const lang = preferredLang || "en";
-  const matchLang = all.filter(d => d.language === lang)
-                       .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3));
-  const otherLangs = all.filter(d => d.language !== lang)
-                         .sort((a, b) => {
-                           if (a.language !== b.language) return a.language.localeCompare(b.language);
-                           return (a.priority ?? 3) - (b.priority ?? 3);
-                         });
-  const ordered = [...matchLang, ...otherLangs];
-
-  containerEl.innerHTML = ordered.map(d => {
-    const flag = LANG_FLAG[d.language] || "🌐";
-    const cleanName = (d.name || "Template").replace(/^[A-Z]{2}\s*·\s*/, "");
-    const isActive = String(d.id) === String(activeId);
-    return `<button type="button" class="draft-chip${isActive ? " active" : ""}" data-id="${esc(String(d.id))}" title="${esc(d.subject || cleanName)}">
-      <span class="draft-chip-flag">${flag}</span>${esc(cleanName)}
-    </button>`;
-  }).join("");
-
-  containerEl.querySelectorAll(".draft-chip").forEach(chip => {
-    chip.addEventListener("click", () => {
-      const id = chip.dataset.id;
-      const d  = all.find(x => String(x.id) === id);
-      if (!d) return;
-      // Marcar activo
-      containerEl.querySelectorAll(".draft-chip").forEach(c => c.classList.remove("active"));
-      chip.classList.add("active");
-      onPick?.(d);
-    });
-  });
-}
+/* renderDraftChips removida (B2) — código muerto (0 call-sites) */
 
 // Analysis tab: bandera + nombre del template + chips de idiomas a la derecha.
 // Click bandera → rota dentro del idioma actual.
@@ -8301,34 +8178,8 @@ function initPitchDrafts() {
 
 // Banner global rojo cuando un flag está ON pero Railway no late hace > 5 min.
 // NO auto-apaga el toggle (evita loops). Solo avisa.
-function renderRailwayDeadBanner({ heartbeatAt, autopilotEnabled, csvEnabled }) {
-  const flagOn = autopilotEnabled || csvEnabled;
-  const ageMs  = heartbeatAt ? (Date.now() - heartbeatAt.getTime()) : Infinity;
-  const dead   = flagOn && ageMs > 5 * 60_000;
-  let el = document.getElementById("railway-dead-banner");
-  if (!dead) { el?.remove(); return; }
-  if (!el) {
-    el = document.createElement("div");
-    el.id = "railway-dead-banner";
-    el.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;font-size:12px;padding:8px 12px;text-align:center;border-bottom:2px solid #ef4444;cursor:pointer";
-    el.title = "Click para ocultar (volverá a aparecer en 30s si sigue caído)";
-    el.addEventListener("click", () => el.remove());
-    document.body.prepend(el);
-  }
-  const ageLabel = ageMs === Infinity ? "nunca" : (ageMs > 3600_000 ? `${Math.round(ageMs/3600_000)}h` : `${Math.round(ageMs/60_000)}m`);
-  const which = [autopilotEnabled && "Autopilot", csvEnabled && "Auto Import"].filter(Boolean).join(" + ");
-  el.textContent = `⚠️ ${which} ON but Railway hasn't responded in ${ageLabel}. Toggle OFF and ON, or check Railway dashboard.`;
-}
-
-async function pollRailwayDeadBanner() {
-  try {
-    const [{ enabled: autopilotEnabled, heartbeatAt }, csvSt] = await Promise.all([
-      getAutopilotState(state.accessToken),
-      import("../modules/supabase.js").then(m => m.getCsvQueueState(state.accessToken)).catch(() => ({ enabled: false })),
-    ]);
-    renderRailwayDeadBanner({ heartbeatAt, autopilotEnabled, csvEnabled: !!csvSt?.enabled });
-  } catch {}
-}
+/* renderRailwayDeadBanner / pollRailwayDeadBanner removidas (B1) — código muerto
+   (pollRailwayDeadBanner nunca se llamaba). renderRailwayHeartbeat SÍ se usa, se conserva. */
 
 function renderRailwayHeartbeat(heartbeatAt) {
   const el = document.getElementById("railway-heartbeat");
@@ -8979,28 +8830,8 @@ function _renderCountryPanel(filter = "") {
   list.innerHTML = countriesBlock;
 }
 
-function _rebuildGeoFilterFromRows(rows) {
-  const sel = document.getElementById("prospects-geo-filter");
-  if (!sel) return;
-  const counts = new Map();
-  for (const r of rows || []) {
-    let iso = "";
-    if (Array.isArray(r.geos_all) && r.geos_all.length) iso = String(r.geos_all[0] || "").toUpperCase().slice(0, 2);
-    else if (r.geo) iso = String(r.geo).toUpperCase().slice(0, 2);
-    if (!iso || iso.length !== 2) continue;
-    counts.set(iso, (counts.get(iso) || 0) + 1);
-  }
-  if (counts.size === 0) return;  // no rows → dejar las opciones actuales
-  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const current = sel.value;
-  let html = '<option value="">🌍 All GEOs</option>';
-  for (const [iso, n] of sorted) {
-    const name = _GEO_NAMES[iso] || iso;
-    html += `<option value="${iso}">${_isoToFlag(iso)} ${name} (${n})</option>`;
-  }
-  sel.innerHTML = html;
-  if (current && [...sel.options].some(o => o.value === current)) sel.value = current;
-}
+/* _rebuildGeoFilterFromRows removida (C1/B2) — código muerto (0 call-sites; los GEO chips
+   la reemplazaron con _rebuildGeoChips). */
 
 async function loadProspectsTab(opts = {}) {
   // opts.keepPage: mantener la página actual (lo usa el auto-refresh de 15 min para
@@ -9740,89 +9571,8 @@ function initProspectCard(card, data) {
   });
 
   // Enriquecer: tráfico fresco + Apollo si faltan datos
-  card.querySelector(".pcard-enrich-btn")?.addEventListener("click", async (e) => {
-    const btn = e.currentTarget;
-    const hasTrafficAlready = !!(data.traffic && data.traffic > 0);
-    const hasEmailsAlready  = Array.isArray(data.emails) && data.emails.filter(em => em && !isGarbageEmail(em)).length > 0;
-    // Permitir re-fetch siempre (Apollo cache 7d server-side hace que re-clicks
-    // sean gratis dentro de la semana). El user puede necesitar refrescar si
-    // los emails guardados son garbage o desactualizados.
-    btn.disabled = true; btn.textContent = "⏳ ...";
-    try {
-      // Maxi 2026-06-22: COMPLETAR SOLO LO QUE FALTA — no re-gastar créditos.
-      //   - Tráfico: solo si NO hay (igual el caché 90d lo hace gratis en general).
-      //   - Apollo (el que CUESTA crédito): solo si NO hay emails buenos.
-      //   - Page meta (HTML scrape): gratis → siempre, completa título/idioma/adnets.
-      const [traffic, apollo, pageMeta] = await Promise.all([
-        hasTrafficAlready ? Promise.resolve(null) : getTraffic(data.domain).catch(() => null),
-        hasEmailsAlready  ? Promise.resolve(null) : findDecisionMakerViaApollo(data.domain).catch(() => null),
-        _fetchPageMetaForProspect(data.domain).catch(() => null),
-      ]);
-      let updated = false;
-      const dbPatch = {};
-      // Traffic + GEO + pages_per_visit + category from getTraffic
-      if (traffic && (traffic.pageViews || traffic.rawVisits)) {
-        const newTraffic = traffic.pageViews || traffic.rawVisits;
-        if (data.traffic !== newTraffic) { data.traffic = newTraffic; dbPatch.traffic = newTraffic; updated = true; }
-        const topCountry = traffic.topCountries?.[0];
-        if (topCountry?.name && data.geo !== topCountry.name) {
-          data.geo = topCountry.name; dbPatch.geo = topCountry.name; updated = true;
-        }
-        if (traffic.category && data.category !== traffic.category) {
-          data.category = traffic.category; dbPatch.category = traffic.category; updated = true;
-        }
-      }
-      // Apollo emails + contact name
-      if (apollo?.email && !data.emails?.includes(apollo.email)) {
-        data.emails = [apollo.email, ...(data.emails || [])];
-        dbPatch.emails = data.emails;
-        if (apollo.first_name) {
-          data.contact_name = `${apollo.first_name} ${apollo.last_name || ""}`.trim();
-          dbPatch.contact_name = data.contact_name;
-        }
-        updated = true;
-      }
-      // Page meta: title, language, ad_networks
-      if (pageMeta) {
-        if (pageMeta.title && data.page_title !== pageMeta.title) {
-          data.page_title = pageMeta.title; dbPatch.page_title = pageMeta.title; updated = true;
-        }
-        if (pageMeta.language && data.language !== pageMeta.language) {
-          data.language = pageMeta.language; dbPatch.language = pageMeta.language; updated = true;
-        }
-        if (pageMeta.adNetworks?.length && JSON.stringify(data.ad_networks||[]) !== JSON.stringify(pageMeta.adNetworks)) {
-          data.ad_networks = pageMeta.adNetworks; dbPatch.ad_networks = pageMeta.adNetworks; updated = true;
-        }
-      }
-      // Persist to DB so other MBs see updated data
-      if (Object.keys(dbPatch).length > 0 && state.accessToken) {
-        fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${data.id}`, {
-          method: "PATCH",
-          headers: {
-            "apikey": CONFIG.SUPABASE_ANON_KEY,
-            "Authorization": `Bearer ${state.accessToken}`,
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal",
-          },
-          body: JSON.stringify(dbPatch),
-        }).catch(() => {});
-      }
-      if (updated) {
-        const newHtml = renderProspectCard(data);
-        const tmp = document.createElement("div");
-        tmp.innerHTML = newHtml;
-        const newCard = tmp.firstElementChild;
-        card.replaceWith(newCard);
-        initProspectCard(newCard, data);
-      } else {
-        btn.textContent = "No more data";
-        setTimeout(() => { btn.disabled = false; btn.textContent = "🔍 Completar"; }, 2000);
-      }
-    } catch (err) {
-      console.warn("[pcard enrich]", err);
-      btn.disabled = false; btn.textContent = "🔍 Completar";
-    }
-  });
+  /* handler pcard-enrich-btn ("Completar") removido (B3/M1) — el botón se eliminó; el email
+     lo trae el worker automáticamente (re-enrich). Era código muerto (querySelector null). */
 
   // Expand toggle — al abrir, lock del prospect 30 min para que otros MBs no lo
   // toquen al mismo tiempo. Se libera al cerrar la card o al cerrar la toolbar.
@@ -10409,26 +10159,7 @@ function initProspectCard(card, data) {
   });
 
   // Snooze 21d (solo para este MB, otros MBs siguen viendo el prospect)
-  card.querySelector(".pcard-snooze-btn")?.addEventListener("click", async () => {
-    if (!confirm(`💤 Snooze ${data.domain} for 21 days?\n\nOnly you'll stop seeing it. Other MBs still see it in their batch.`)) return;
-    card.style.opacity = "0.4";
-    try {
-      const until = new Date(Date.now() + 21 * 86400_000).toISOString();
-      const res = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_user_snoozed_prospects`, {
-        method: "POST",
-        headers: {
-          "apikey": CONFIG.SUPABASE_ANON_KEY,
-          "Authorization": `Bearer ${state.accessToken}`,
-          "Content-Type": "application/json",
-          "Prefer": "resolution=merge-duplicates,return=minimal",
-        },
-        body: JSON.stringify({ user_email: state.loginEmail, domain: data.domain, snooze_until: until }),
-      });
-      if (!res.ok) { alert("❌ No se pudo posponer: " + res.status); card.style.opacity = "1"; return; }
-      card.remove();
-      refreshProspectsStats();
-    } catch (e) { alert("❌ " + e.message); card.style.opacity = "1"; }
-  });
+  /* handler pcard-snooze-btn removido (B3) — el botón no existe en la card (código muerto) */
 
   // Reject
   // Maxi 2026-06-22: RECHAZO INTELIGENTE — el MB escribe POR QUÉ no sirve, Claude
@@ -10489,9 +10220,7 @@ function initProspectCard(card, data) {
   });
 
   // Validate (compact) → uses data defaults
-  card.querySelector(".pcard-validate-btn")?.addEventListener("click", async () => {
-    await validateProspect(card, data, true);
-  });
+  /* handler pcard-validate-btn removido (B3) — el botón no existe en la card (código muerto) */
 
   // Validate (expanded)
   card.querySelector(".pcard-validate-expanded")?.addEventListener("click", async () => {
