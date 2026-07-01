@@ -10786,6 +10786,35 @@ async function initProspectsTab() {
     window._selectedGeoChips = new Set();  // sin chips GEO → todas
     window._prospectsTypeFilter = "all";   // Maxi 2026-07-01: filtro Type arranca en All
   } catch {}
+
+  // Maxi 2026-07-01: ATAJOS DE TECLADO sobre la card con hover (menos mouse en 50 cards/día).
+  //   E = expandir/cerrar · R = rechazar · Enter = enviar (solo si ya está expandida y revisada).
+  // Solo actúa en el tab Prospects visible y si NO se está tipeando en un campo.
+  if (!window._prospectsKeyboardBound) {
+    window._prospectsKeyboardBound = true;
+    document.getElementById("prospects-list")?.addEventListener("mouseover", (e) => {
+      const card = e.target.closest?.(".pcard");
+      if (card) window._hoveredProspectCard = card;
+    });
+    document.addEventListener("keydown", (e) => {
+      const tag = (e.target.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || e.target.isContentEditable) return;
+      const list = document.getElementById("prospects-list");
+      if (!list || list.offsetParent === null) return;  // tab Prospects no visible
+      const card = window._hoveredProspectCard;
+      if (!card || !document.body.contains(card)) return;
+      const k = (e.key || "").toLowerCase();
+      if (k === "e") { e.preventDefault(); card.querySelector(".pcard-expand-btn")?.click(); }
+      else if (k === "r") { e.preventDefault(); card.querySelector(".pcard-reject-btn")?.click(); }
+      else if (e.key === "Enter") {
+        const detail  = card.querySelector(".pcard-detail");
+        const sendBtn = card.querySelector(".pcard-validate-expanded");
+        if (detail && detail.style.display !== "none" && sendBtn) { e.preventDefault(); sendBtn.click(); }
+        else { e.preventDefault(); card.querySelector(".pcard-expand-btn")?.click(); }  // colapsada → expandir para revisar
+      }
+    });
+  }
+
   document.getElementById("btn-prospects-refresh")?.addEventListener("click", async () => {
     await loadProspectsTab();
   });
