@@ -11930,11 +11930,16 @@ async function main() {
       }
 
       if (!flags.autopilot && !flags.csvQueue && !flags.agent) {
-        // Auto-exit si llevamos > IDLE_EXIT_MS sin trabajo (Railway corta billing)
-        if (Date.now() - idleSince >= IDLE_EXIT_MS) {
-          log(`💤 Idle ${Math.round(IDLE_EXIT_MS / 60000)} min — exiting. Railway re-arranca cuando se prenda autopilot/csv desde el toolbar.`);
-          process.exit(0);
-        }
+        // Maxi 2026-07-02: NO MÁS idle-exit(0). Bug real detectado: el worker hacía
+        // exit(0) a las 4h idle, pero Railway tiene restart policy ON_FAILURE → un
+        // exit 0 NO reinicia el container. Resultado: al vaciar la cola, el worker se
+        // apagaba y quedaba MUERTO; los imports posteriores (sellers.json de los MB)
+        // nunca se procesaban porque el auto-enable de csv_queue vive DENTRO de este
+        // loop y no corre con el proceso caído. Nada lo despertaba.
+        // Ahora el worker queda SIEMPRE vivo poleando cada IDLE_INTERVAL_MS (120s, CPU
+        // casi nulo). Apenas entran items pending, el auto-enable de arriba prende la
+        // cola y se procesan solos. Off-hours/finde ya duerme en las ramas de arriba
+        // (sleep+continue, sin exit). Confiabilidad > el ahorro de billing del exit.
         await sleep(IDLE_INTERVAL_MS);
         continue;
       }
