@@ -11690,6 +11690,7 @@ async function main() {
   }
 
   let idleSince = Date.now();
+  let _dbDownStreak = 0; // Maxi 2026-07-03: circuit breaker — cuántos chequeos seguidos falló la base
   log("📍 Entrando al main loop...");
   let iterCount = 0;
 
@@ -11713,6 +11714,31 @@ async function main() {
         }
       } catch {}
     }
+
+    // ── CIRCUIT BREAKER (Maxi 2026-07-03) ──────────────────────────
+    // Los logs mostraron al worker MARTILLANDO la base caída: cada ~20s disparaba
+    // queries pesadas (dedup in.() de cientos de dominios, counts, config) que tardan
+    // 20s en timeoutear con 522 y reintentaba al toque → (a) quema IO al pedo y (b)
+    // puede IMPEDIR que la instancia se recupere (retry storm). Ahora un probe barato
+    // (limit=1, timeout 8s) chequea si la base responde; si NO, backoff exponencial
+    // (20s→40s→80s→160s→5min cap) en vez de martillar. Le da aire para recuperarse.
+    let _dbOk = false;
+    try {
+      const _hp = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_config?select=key&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) }
+      );
+      _dbOk = _hp.ok;
+    } catch { _dbOk = false; }
+    if (!_dbOk) {
+      _dbDownStreak++;
+      const backoff = Math.min(300_000, 20_000 * Math.pow(2, Math.min(_dbDownStreak - 1, 4)));
+      if (_dbDownStreak === 1 || _dbDownStreak % 5 === 0)
+        log(`🔴 Base no responde (streak ${_dbDownStreak}) — backoff ${Math.round(backoff / 1000)}s, no martillo mientras se recupera`);
+      await sleep(backoff);
+      continue;
+    }
+    if (_dbDownStreak > 0) { log(`🟢 Base recuperada tras ${_dbDownStreak} intentos fallidos`); _dbDownStreak = 0; }
 
     // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
