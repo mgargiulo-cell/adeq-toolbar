@@ -65,29 +65,60 @@ function bearer(key) { return `Bearer ${_sbAuthToken || key}`; }
 
 // ── Autenticación Supabase ────────────────────────────────────
 
-export async function supabaseSignIn(email, password) {
+// Maxi 2026-07-03: helper de fetch a Supabase Auth con REINTENTO + parseo seguro.
+// Bug real detectado: cuando Supabase se sobrecarga, Cloudflare devuelve una página
+// HTML (HTTP 522/503) y `res.json()` explotaba con "Unexpected token '<'" — mensaje
+// críptico que hacía pensar en la contraseña o la extensión. Ahora:
+//   1) Distingue caídas del server (5xx/522/HTML) de credenciales incorrectas (4xx JSON).
+//   2) Reintenta los errores TRANSITORIOS (el 522 de Supabase es intermitente: en las
+//      pruebas el auth volvía en el 2º intento). 3 intentos con backoff 0.6s/1.5s.
+//   3) Mensaje CLARO: "servidor temporalmente caído, no es tu contraseña".
+async function _supabaseAuthFetch(path, body) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  try {
-    const res = await fetch(`${url}/auth/v1/token?grant_type=password`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "apikey": key },
-      body: JSON.stringify({ email, password }),
-    });
-    const data = await res.json();
-    if (!res.ok) return { error: data?.error_description || data?.msg || "Credenciales incorrectas" };
-    // Devolvemos también el email REAL que Supabase autenticó. El caller debe
-    // verificar que matche con lo tipeado — si no, hubo un mix-up de sesión
-    // o de credenciales y NO debemos asumir la identidad tipeada.
-    return {
-      access_token:  data.access_token,
-      refresh_token: data.refresh_token,
-      expires_in:    data.expires_in,
-      authenticated_email: (data?.user?.email || "").toLowerCase(),
-    };
-  } catch (e) {
-    return { error: "Error de conexión: " + e.message };
+  const delays = [600, 1500, 0]; // 3 intentos
+  let lastServerErr = "";
+  for (let attempt = 0; attempt < delays.length; attempt++) {
+    try {
+      const res = await fetch(`${url}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "apikey": key },
+        body: JSON.stringify(body),
+      });
+      const ct = res.headers.get("content-type") || "";
+      const isJson = ct.includes("application/json");
+      if (isJson) {
+        const data = await res.json().catch(() => null);
+        // 4xx con JSON = respuesta legítima del auth (credenciales, etc.) → NO reintentar.
+        if (data) return { ok: res.ok, status: res.status, data };
+      }
+      // No-JSON (HTML de Cloudflare) o 5xx = caída del server → transitorio, reintentar.
+      lastServerErr = `HTTP ${res.status}`;
+    } catch (e) {
+      lastServerErr = e.message || "network"; // timeout / red caída → reintentar
+    }
+    if (delays[attempt]) await new Promise(r => setTimeout(r, delays[attempt]));
   }
+  return {
+    ok: false, status: 0, data: null,
+    serverDown: `El servidor está temporalmente caído (${lastServerErr}). No es tu contraseña ni la extensión — reintentá en 1-2 minutos.`,
+  };
+}
+
+export async function supabaseSignIn(email, password) {
+  const r = await _supabaseAuthFetch(`/auth/v1/token?grant_type=password`, { email, password });
+  if (r.serverDown) return { error: r.serverDown };
+  const data = r.data || {};
+  if (!r.ok) return { error: data?.error_description || data?.msg || "Credenciales incorrectas" };
+  // Devolvemos también el email REAL que Supabase autenticó. El caller debe
+  // verificar que matche con lo tipeado — si no, hubo un mix-up de sesión
+  // o de credenciales y NO debemos asumir la identidad tipeada.
+  return {
+    access_token:  data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in:    data.expires_in,
+    authenticated_email: (data?.user?.email || "").toLowerCase(),
+  };
 }
 
 // Envía email de recovery. Supabase dispara el correo con el link de reset
@@ -115,24 +146,15 @@ export async function supabaseResetPassword(email) {
 }
 
 export async function supabaseRefresh(refreshToken) {
-  const url = CONFIG.SUPABASE_URL;
-  const key = CONFIG.SUPABASE_ANON_KEY;
-  try {
-    const res = await fetch(`${url}/auth/v1/token?grant_type=refresh_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "apikey": key },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    });
-    const data = await res.json();
-    if (!res.ok) return { error: data?.error_description || "Sesión expirada" };
-    return {
-      access_token:  data.access_token,
-      refresh_token: data.refresh_token,
-      expires_in:    data.expires_in,
-    };
-  } catch (e) {
-    return { error: e.message };
-  }
+  const r = await _supabaseAuthFetch(`/auth/v1/token?grant_type=refresh_token`, { refresh_token: refreshToken });
+  if (r.serverDown) return { error: r.serverDown };
+  const data = r.data || {};
+  if (!r.ok) return { error: data?.error_description || "Sesión expirada" };
+  return {
+    access_token:  data.access_token,
+    refresh_token: data.refresh_token,
+    expires_in:    data.expires_in,
+  };
 }
 
 // ── Pitch feedback RAG (Voyage embeddings + pgvector) ─────────
