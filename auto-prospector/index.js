@@ -818,6 +818,28 @@ async function refreshOneEmptyLead(token, cfg) {
   const rapidapi_key = cfg.rapidapi_key;
   if (!rapidapi_key) return;
 
+  // Maxi 2026-07-03 costo: este job corre CADA iteración del main loop y gasta
+  // RapidAPI (getTrafficData → hit facturado si no está cacheado) por lead. Antes
+  // NO chequeaba el cap mensual/diario — solo confiaba en _rapidCapReached, que se
+  // resetea a false al arrancar cada sesión de csv/autopilot. Con la cola parada
+  // (csv/autopilot OFF) el flag quedaba en false → este loop podía gastar RapidAPI
+  // pasado el cap MENSUAL sin ningún freno = runaway de costo. Ahora gate duro:
+  // si el cap mensual o diario ya está alcanzado, no gasta ni un hit.
+  try {
+    const [rapidMonth, rapidDay] = await Promise.all([
+      getRapidApiUsageThisMonth(token),
+      getRapidApiUsageToday(token),
+    ]);
+    if (rapidMonth.usedThisMonth >= rapidMonth.limit) {
+      log(`⛔ refreshEmpty: cap MENSUAL RapidAPI alcanzado (${rapidMonth.usedThisMonth}/${rapidMonth.limit}) — no gasto hits hasta próximo mes.`);
+      return;
+    }
+    if (rapidDay.usedToday >= rapidDay.limit) {
+      log(`⛔ refreshEmpty: cap DIARIO RapidAPI alcanzado (${rapidDay.usedToday}/${rapidDay.limit}) — no gasto hits hasta mañana.`);
+      return;
+    }
+  } catch { /* si el chequeo falla, el fusible por-minuto de rapidFetchWithRetry sigue protegiendo */ }
+
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(traffic.eq.0,traffic.is.null)&select=id,domain&order=created_at.asc&limit=${REFRESH_EMPTY_BATCH}`,
@@ -3031,6 +3053,21 @@ async function rapidFetchWithRetry(url, headers, timeout = 8000) {
     try {
       // Pre-check del cap diario global (evita facturar si ya pasamos el límite)
       if (_rapidCapReached) return { __error4xx: "daily_cap_reached" };
+      // Maxi 2026-07-03 costo: FUSIBLE global anti-runaway (independiente de la lógica
+      // de negocio). Cuenta hits RapidAPI por ventana de 1 min en memoria. El ritmo
+      // normal es ~24/min (loops secuenciales con DOMAIN_DELAY_MS=2.5s) o ~10/min
+      // (refresh/backfill 3-5 en paralelo cada 30s). Si supera RAPID_PER_MIN_FUSE
+      // (250 = ~10× lo normal) es CLARAMENTE un bug girando en loop → corta TODO
+      // (setea _rapidCapReached) + ALERTA. Es un breaker duro: ningún camino de código
+      // puede facturar miles de hits/min aunque un cap de negocio falle o se saltee.
+      const _fuseNow = Date.now();
+      if (_fuseNow - _rapidFuseWindowStart >= 60_000) { _rapidFuseWindowStart = _fuseNow; _rapidFuseCount = 0; }
+      _rapidFuseCount++;
+      if (_rapidFuseCount > RAPID_PER_MIN_FUSE) {
+        _rapidCapReached = true;
+        log(`🚨 FUSIBLE RapidAPI DISPARADO: ${_rapidFuseCount} llamadas en <1min (límite ${RAPID_PER_MIN_FUSE}) — posible BUG en loop. Corto RapidAPI hasta el próximo reset de sesión.`);
+        return { __error4xx: "per_minute_fuse_tripped" };
+      }
       _rapidGlobalCounter++;
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
       if (res.ok) {
@@ -3057,6 +3094,11 @@ async function rapidFetchWithRetry(url, headers, timeout = 8000) {
 // Se persiste a Supabase periódicamente (toolbar_config.rapidapi_calls_today).
 let _rapidGlobalCounter = 0;
 let _rapidCapReached    = false;
+// Maxi 2026-07-03 costo: fusible por-minuto (ver rapidFetchWithRetry). Umbral
+// altísimo (250/min) que solo se alcanza con un bug en loop; ~10× el ritmo normal.
+const RAPID_PER_MIN_FUSE   = 250;
+let _rapidFuseWindowStart  = 0;
+let _rapidFuseCount        = 0;
 
 // Maxi 2026-06-18: FALLBACK de tráfico — si RapidAPI no devuelve, intentar
 // scrapear de fuentes públicas que estiman tráfico mensual.
