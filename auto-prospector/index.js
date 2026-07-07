@@ -379,18 +379,34 @@ async function supabaseLogin() {
   return data.access_token;
 }
 
+// Maxi 2026-07-03: CACHE de config para bajar Disk IO sobre la base (nano/micro
+// se quedaba sin IO budget → 522 recurrente). getConfig leía la tabla ENTERA en
+// cada llamada, y se llama varias veces por iteración del loop (regla-de-oro +
+// cfgShared + subfunciones). El cache colapsa esos reads redundantes en 1 cada
+// CONFIG_TTL_MS. Se invalida al escribir (setConfigValue) → un valor recién seteado
+// se ve al instante, sin staleness. TTL corto (30s) → los toggles del admin
+// reaccionan en ≤30s, más que suficiente.
+const CONFIG_TTL_MS = 30_000;
+const FLAGS_TTL_MS  = 15_000;
+let _cfgCache   = { at: 0, data: null };
+let _flagsCache = { at: 0, data: null };
+function _invalidateConfigCache() { _cfgCache = { at: 0, data: null }; _flagsCache = { at: 0, data: null }; }
+
 async function getConfig(token) {
+  if (_cfgCache.data && (Date.now() - _cfgCache.at) < CONFIG_TTL_MS) return _cfgCache.data;
   const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?select=key,value`, {
     headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
   });
   const rows = await res.json();
   const cfg = {};
   rows.forEach(r => { cfg[r.key] = r.value; });
+  _cfgCache = { at: Date.now(), data: cfg };
   return cfg;
 }
 
 // Lectura liviana — flags de encendido, para el poll idle
 async function getActiveFlags(token) {
+  if (_flagsCache.data && (Date.now() - _flagsCache.at) < FLAGS_TTL_MS) return _flagsCache.data;
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_prospecting_enabled,csv_queue_enabled,agent_enabled_users,agent_paused_until)&select=key,value`,
@@ -409,12 +425,14 @@ async function getActiveFlags(token) {
       if (!isNaN(parsed)) pausedUntil = parsed;
     }
     const agentActive = agentUsers.length > 0 && Date.now() > pausedUntil;
-    return {
+    const flags = {
       autopilot: map.auto_prospecting_enabled === "true",
       csvQueue:  map.csv_queue_enabled === "true",
       agent:     agentActive,
       agentUsers,
     };
+    _flagsCache = { at: Date.now(), data: flags };
+    return flags;
   } catch { return { autopilot: false, csvQueue: false, agent: false, agentUsers: [] }; }
 }
 
@@ -432,6 +450,7 @@ async function setConfigValue(token, key, value) {
     },
     body: JSON.stringify({ value }),
   });
+  _invalidateConfigCache(); // el worker acaba de cambiar config → próximo getConfig lee fresco
 }
 
 async function getProcessedDomains(token) {
