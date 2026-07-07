@@ -5389,6 +5389,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
                 reason: `3 freeze cycles sin traffic data (último intento ${new Date().toISOString().split("T")[0]})`,
               }),
             });
+            // Maxi 2026-07-03 perf: invalidación de cache — al bloquear un dominio, agregarlo
+            // al set cacheado (si está poblado) para no reprocesarlo hasta el próximo TTL de 5min.
+            if (_adminBlocklistCacheWorker) {
+              _adminBlocklistCacheWorker.add(domain.toLowerCase().replace(/^www\./, ""));
+            }
             log(`  🚫 ${domain} → AUTO-BLOCKLIST 'inoperativo' (3 freeze cycles)`);
           } catch (e) { log(`  ⚠️ auto-blocklist err: ${e.message}`); }
         }
@@ -5795,13 +5800,14 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
       // nada en absoluto). Si es así, apagar el toggle para ahorrar Railway
       // compute. El user lo prende manual cuando suba nuevos imports.
       try {
+        // Maxi 2026-07-03 perf: solo importa "¿hay ≥1 en waiting_pool?" → limit=1 sin count=exact,
+        // evaluado por rows.length (evita el count exacto sobre toda la tabla).
         const wlRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+          `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id&limit=1`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
         );
-        const wlRange = wlRes.headers.get("content-range") || "";
-        const wlCount = parseInt(wlRange.split("/")[1] || "0", 10);
-        if (wlCount === 0) {
+        const wlRows = await wlRes.json();
+        if (Array.isArray(wlRows) && wlRows.length === 0) {
           log("  (cola vacía + waitlist vacía) — apagando csv_queue_enabled para ahorrar Railway");
           await setConfigValue(token, "csv_queue_enabled", "false");
         }
@@ -10126,12 +10132,14 @@ async function runAgentCycle(token, allFlags) {
           try {
             const cutoffTodaySpain = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
             cutoffTodaySpain.setHours(0, 0, 0, 0);
+            // Maxi 2026-07-03 perf: solo importa "¿≥3 fallas hoy?" → limit=3 sin count=exact,
+            // evaluado por rows.length (el número exacto no se usa: log y attempt_count son constantes).
             const cntRes = await fetch(
-              `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=eq.no_email_after_enrichment&domain=eq.${encodeURIComponent(domain)}&created_at=gte.${cutoffTodaySpain.toISOString()}&select=id`,
-              { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+              `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=eq.no_email_after_enrichment&domain=eq.${encodeURIComponent(domain)}&created_at=gte.${cutoffTodaySpain.toISOString()}&select=id&limit=3`,
+              { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
             );
-            const range = cntRes.headers.get("content-range") || "";
-            const failsToday = parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+            const cntRows = await cntRes.json();
+            const failsToday = Array.isArray(cntRows) ? cntRows.length : 0;
             if (failsToday >= 3) {
               // Mark lead as 'frozen' so agent query (status=pending) lo excluye.
               // Y agregalo a toolbar_frozen_leads para retry en 15d.

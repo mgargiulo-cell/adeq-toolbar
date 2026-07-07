@@ -7143,7 +7143,7 @@ async function initCsvQueue() {
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
     const [attemptsRes, feederRes] = await Promise.all([
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_import_attempts?at=gte.${sinceISO}&select=*&order=at.desc&limit=500`, { headers }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_feeder_runs?cron_at=gte.${sinceISO}&select=*&order=cron_at.desc`, { headers }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_feeder_runs?cron_at=gte.${sinceISO}&select=*&order=cron_at.desc&limit=300`, { headers }), // Maxi 2026-07-03 perf: cap de seguridad (ya viene date-bounded, pero evita un scan sin techo)
     ]);
     const attempts = attemptsRes.ok ? await attemptsRes.json() : [];
     const feeders  = feederRes.ok  ? await feederRes.json()  : [];
