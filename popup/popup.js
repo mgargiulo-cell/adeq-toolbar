@@ -2940,8 +2940,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   refreshApolloFooterCounter();
   refreshSerperFooterCounter();
   checkExtensionVersion();
-  setInterval(refreshUsage, 60_000);
-  setInterval(refreshApolloFooterCounter, 60_000);
+  // Maxi 2026-07-03 perf: no pollear footer counters (Supabase) cuando el side-panel
+  // está oculto. Al reabrirlo, el próximo tick (≤60s) refresca. Ahorra queries en
+  // background × 3 MBs con la toolbar cerrada pero la sesión viva.
+  setInterval(() => { if (document.visibilityState !== "hidden") refreshUsage(); }, 60_000);
+  setInterval(() => { if (document.visibilityState !== "hidden") refreshApolloFooterCounter(); }, 60_000);
   // Re-check version cada 30 min en background
   setInterval(checkExtensionVersion, 30 * 60_000);
   document.getElementById("version-badge")?.addEventListener("click", checkExtensionVersion);
@@ -5761,14 +5764,27 @@ function initNotificationBell() {
   // Initial + polling
   refreshNotificationBadge();
   if (_notifPollTimer) clearInterval(_notifPollTimer);
-  _notifPollTimer = setInterval(refreshNotificationBadge, 60_000);
+  // Maxi 2026-07-03 perf: no pollear el badge de notificaciones cuando el panel está oculto.
+  _notifPollTimer = setInterval(() => { if (document.visibilityState !== "hidden") refreshNotificationBadge(); }, 60_000);
 }
 
 async function refreshNotificationBadge() {
   const badge = document.getElementById("notif-bell-badge");
   if (!badge || !state.loginEmail || !state.accessToken) return;
-  const notifs = await fetchNotifications(state.accessToken, state.loginEmail, { limit: 50 });
-  const unread = notifs.filter(n => !n.read_at).length;
+  // Maxi 2026-07-03 perf: el badge solo necesita el COUNT de no-leídas, no las 50
+  // filas completas. Usamos count=exact (Range 0-0) con filtro read_at server-side
+  // → 0 filas de egress en vez de hasta 50 rows con body/message cada 60s × 3 MBs.
+  const mb = (state.loginEmail || "").toLowerCase();
+  let unread = 0;
+  try {
+    const res = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_notifications?mb_email=eq.${encodeURIComponent(mb)}&dismissed_at=is.null&read_at=is.null&select=id`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    if (!res.ok) return;
+    const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
+    unread = m ? parseInt(m[1], 10) : 0;
+  } catch { return; }
   if (unread > 0) {
     badge.textContent = unread > 99 ? "99+" : String(unread);
     badge.style.display = "block";
@@ -7010,6 +7026,13 @@ async function initCsvQueue() {
   const historyRefresh = document.getElementById("btn-csv-history-refresh");
   if (!uploadBtn) return;
 
+  // Maxi 2026-07-03 perf: cache TTL para el breakdown "por qué se descartaron hoy".
+  // El heartbeat (10s con AUTO ON) traía hasta 2000 filas error_message CADA tick.
+  // El breakdown es un diagnóstico de movimiento lento → lo cacheamos 30s. Los contadores
+  // (pending/processing/mis uploads) siguen refrescando en cada tick.
+  let _skipBreakdownCache = { ts: 0, html: "" };
+  const SKIP_BREAKDOWN_TTL = 30_000;
+
   const refreshStats = async () => {
     statsEl.textContent = "Loading...";
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
@@ -7038,7 +7061,9 @@ async function initCsvQueue() {
     // Maxi 2026-06-19: DIAGNÓSTICO "¿por qué 0 en Prospects?". Agrupa el error_message
     // de los descartados HOY (todos: imports + worker) por motivo, para ver el embudo real.
     let skipBreakdownHtml = "";
-    try {
+    if (Date.now() - _skipBreakdownCache.ts < SKIP_BREAKDOWN_TTL) {
+      skipBreakdownHtml = _skipBreakdownCache.html;
+    } else try {
       const r = await fetch(
         `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(skipped,error,frozen)&processed_at=gte.${todayStartIso}&select=error_message&limit=2000`,
         { headers }
@@ -7070,6 +7095,7 @@ async function initCsvQueue() {
             ${sorted.map(([k, n]) => `<div style="margin-left:8px;color:var(--text-muted)">• ${k} — <strong>${n}</strong></div>`).join("")}
           </div>`;
       }
+      _skipBreakdownCache = { ts: Date.now(), html: skipBreakdownHtml };
     } catch {}
 
     // Maxi 2026-06-18: quitada la línea "Prospects (To Review)" — duplicada con el tab counter
@@ -7280,10 +7306,13 @@ async function initCsvQueue() {
   let heartbeatTimer = null;
   const startHeartbeat = () => {
     if (heartbeatTimer) return;
+    // Maxi 2026-07-03 perf: 10s → 20s. Con AUTO ON dispara refreshStats+refreshHistory
+    // (varios count-scans + activity fetch) en cada tick × 3 MBs. 20s corta esa carga a
+    // la mitad sobre la base Micro; la percepción de "live" del import sigue fluida.
     heartbeatTimer = setInterval(() => {
       if (document.visibilityState === "hidden") return;
       refreshStats(); refreshHistory();
-    }, 10_000);
+    }, 20_000);
   };
   const stopHeartbeat = () => { if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; } };
 
@@ -7349,7 +7378,8 @@ async function initCsvQueue() {
     await refreshCsvMutex();
   });
   // Polling cada 30s para refrescar el lock badge si otro MB cambia el toggle
-  setInterval(refreshCsvMutex, 30_000);
+  // Maxi 2026-07-03 perf: skip cuando el panel está oculto (no hay UI que actualizar).
+  setInterval(() => { if (document.visibilityState !== "hidden") refreshCsvMutex(); }, 30_000);
 
   refreshBtn.addEventListener("click", refreshStats);
   historyRefresh?.addEventListener("click", refreshHistory);
@@ -8371,12 +8401,23 @@ async function initAutopilot() {
   // Perf fix: guard module-level para no acumular intervals si initAutopilot
   // se llama varias veces (caso real: re-entrar a Prospects tab).
   if (window._autopilotLiveTimer) clearInterval(window._autopilotLiveTimer);
-  window._autopilotLiveTimer = setInterval(refreshAutopilotLiveStats, 10_000);
+  // Maxi 2026-07-03 perf: el fetch de live-stats (toolbar_config) cada 10s corría SIEMPRE
+  // aunque el panel estuviera oculto o el user en otra solapa. Guardamos por visibilidad +
+  // tab Prospects activa (mismo patrón que el heartbeat de arriba). Al volver, refresca ≤10s.
+  window._autopilotLiveTimer = setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    if (!document.getElementById("tab-prospects")?.classList.contains("active")) return;
+    refreshAutopilotLiveStats();
+  }, 10_000);
 
   // Refresco periódico del estado mutex (cada 30s) para que cuando el dueño
   // apague desde su browser, los demás vean el lock liberado sin reload manual.
   if (window._autopilotMutexTimer) clearInterval(window._autopilotMutexTimer);
   window._autopilotMutexTimer = setInterval(async () => {
+    // Maxi 2026-07-03 perf: no pollear getAutopilotState cuando el panel está oculto o el
+    // user no está en Prospects (el botón que se actualiza vive ahí). Al volver refresca ≤30s.
+    if (document.visibilityState === "hidden") return;
+    if (!document.getElementById("tab-prospects")?.classList.contains("active")) return;
     try {
       const cur = await getAutopilotState(state.accessToken);
       const isMe = cur.sessionUser?.toLowerCase() === (state.loginEmail || "").toLowerCase();

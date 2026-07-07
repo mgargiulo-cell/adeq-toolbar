@@ -1510,7 +1510,10 @@ export async function getCsvQueueStats(accessToken) {
   const stats = { total: 0, pending: 0, processing: 0, done: 0, error: 0, skipped: 0, waiting_pool: 0 };
   try {
     // Usamos HEAD + Prefer: count=exact para obtener totales por status
-    const statuses = Object.keys(stats).filter(k => k !== "total");
+    // Maxi 2026-07-03 perf: los 3 callers (refreshStats heartbeat 10s, pre-check CSV, pre-check
+    // sellers.json) SOLO leen pending/processing/waiting_pool. Antes hacíamos 6 count-scans
+    // (incluyendo done/error/skipped que nadie usa) → mitad de scans a toolbar_csv_queue por llamada.
+    const statuses = ["pending", "processing", "waiting_pool"];
     const results = await Promise.all(statuses.map(async (s) => {
       const res = await fetch(
         `${url}/rest/v1/toolbar_csv_queue?status=eq.${s}&select=id`,

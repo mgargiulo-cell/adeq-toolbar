@@ -24,7 +24,7 @@ const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 const SERPER_API_KEY = (process.env.SERPER_API_KEY || "").trim() || null;  // AutoGoogle: keyword→Google. Sin key = AutoGoogle apagado (no rompe nada).
 
 const SESSION_LIMIT_MS  = 20 * 60 * 1000; // 20 minutos máx por sesión de autopilot — auto-corte
-const POLL_INTERVAL_MS  = 20 * 1000;   // durante sesión activa
+const POLL_INTERVAL_MS  = 30 * 1000;   // Maxi 2026-07-03 perf: 20s→30s. El loop drena TODA la cola por iteración (runCsvQueue con Infinity) y el agent procesa todo su pool, así que este intervalo es entre lulls, NO entre items — subirlo NO frena el drenado, pero baja ~33% la frecuencia de la maintenance por-iteración (getConfig refresh, counts de promoteWaitlist/feeder, heartbeat) = menos Disk IO sobre Supabase
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 4 * 60 * 60 * 1000; // 4h sin trabajo → exit (subido de 30min para evitar restarts frecuentes 2026-05-13)
 const DOMAIN_DELAY_MS  = 2500;
@@ -441,6 +441,9 @@ async function isAutopilotEnabled(token) {
   return f.autopilot;
 }
 
+// Maxi 2026-07-03 perf: keys de las que deriva getActiveFlags — si se escribe una,
+// el flags cache debe refrescarse (invalidación quirúrgica, no del config entero).
+const _FLAG_CFG_KEYS = new Set(["auto_prospecting_enabled", "csv_queue_enabled", "agent_enabled_users", "agent_paused_until"]);
 async function setConfigValue(token, key, value) {
   await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.${key}`, {
     method: "PATCH",
@@ -450,7 +453,17 @@ async function setConfigValue(token, key, value) {
     },
     body: JSON.stringify({ value }),
   });
-  _invalidateConfigCache(); // el worker acaba de cambiar config → próximo getConfig lee fresco
+  // Maxi 2026-07-03 perf: antes _invalidateConfigCache() borraba el cache ENTERO →
+  // el próximo getConfig re-leía toda la tabla toolbar_config. El loop escribe config
+  // varias veces por iteración (heartbeat, review_queue_band_status, slots, counters…),
+  // así que el cache quedaba SIEMPRE frío = full-table read de config en cada getConfig
+  // (varios por iteración). Ahora actualizamos la entrada in-place: el worker ve su
+  // propio write al instante SIN re-leer la tabla. El TTL (30s) igual refresca para
+  // captar writes externos del admin. Ahorro IO/egress ALTO sobre toolbar_config.
+  if (_cfgCache.data) _cfgCache.data[key] = String(value);
+  // Los flags derivan de keys puntuales → invalidar SOLO ese cache barato (15s TTL)
+  // si tocamos una, para no servir un flag viejo tras un toggle del propio worker.
+  if (_FLAG_CFG_KEYS.has(key)) _flagsCache = { at: 0, data: null };
 }
 
 async function getProcessedDomains(token) {
@@ -1256,7 +1269,7 @@ function _currentFeederSlot() {
 async function _getFeederTodayRuns(token, dateISO) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?cron_at=gte.${dateISO}T00:00:00&select=*&order=cron_at.asc`,
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?cron_at=gte.${dateISO}T00:00:00&select=effective_added&order=cron_at.asc`, // Maxi 2026-07-03 perf: select=* → solo effective_added (único campo usado por el caller)
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return [];
@@ -1264,15 +1277,23 @@ async function _getFeederTodayRuns(token, dateISO) {
   } catch { return []; }
 }
 
+// Maxi 2026-07-03 perf: cache TTL 30s. Es un count=exact sobre toolbar_review_queue
+// (tabla grande) que se llamaba en CADA iteración del loop para el band-status + el
+// gate de saturación del feeder. Ese count fuerza scan del índice pending cada 20-30s.
+// El gate/banda toleran 30s de staleness sin problema (son umbrales, no precisión).
+let _rqValidCountCache = { at: 0, n: 0 };
 async function _getReviewQueueValidCount(token) {
+  if (Date.now() - _rqValidCountCache.at < 30_000) return _rqValidCountCache.n;
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("content-range") || "";
-    return parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
-  } catch { return 0; }
+    const n = parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
+    _rqValidCountCache = { at: Date.now(), n };
+    return n;
+  } catch { return _rqValidCountCache.n || 0; }
 }
 
 // Maxi 2026-06-22: BACKLOG de la cola csv (pending+processing+waiting_pool+next_day).
@@ -2601,7 +2622,7 @@ async function getUserLimits(token, userEmail) {
   if (!userEmail) return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null };
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_user_limits?user_email=eq.${encodeURIComponent(userEmail.toLowerCase())}&select=*&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_user_limits?user_email=eq.${encodeURIComponent(userEmail.toLowerCase())}&select=autopilot_enabled,autopilot_daily_minutes,autopilot_daily_prospects,monthly_api_cap&limit=1`, // Maxi 2026-07-03 perf: select=* → solo columnas leídas
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null };
@@ -6973,29 +6994,39 @@ async function findUnopenedSends(token, waitDays = 5) {
     const sends = await res.json();
     if (!Array.isArray(sends) || sends.length === 0) return [];
 
-    // Para cada send, verificar: ¿tiene open_rate hit? ¿tiene re_sent ya?
-    const candidates = [];
-    for (const s of sends) {
-      // Check opens — si abrió, NO re-engaging (mandó al lead, decidió no responder)
-      const opensRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_email_opens?agent_action_id=eq.${s.id}&select=id&limit=1`,
-        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-      );
-      const opens = opensRes.ok ? await opensRes.json() : [];
-      if (Array.isArray(opens) && opens.length > 0) continue; // abrió → skip
+    // Maxi 2026-07-03 perf: antes era N+1 (2 queries por send × hasta 200 sends =
+    // ~400 reads secuenciales por ciclo). Ahora se batchea en 2 queries usando in.(...):
+    // 1 para los opens de todos los agent_action_id, 1 para los re_sent/exhausted de
+    // todos los dominios. Se filtra en memoria. Ahorro IO/egress ALTO en cada ciclo.
+    const _auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const sendIds = sends.map(s => s.id);
+    const sendDomains = [...new Set(sends.map(s => s.domain).filter(Boolean))];
 
-      // Check re_sent / exhausted — ya intentamos re-engaging este dominio (o quedó
-      // agotado por falta de email alternativo)? Maxi 2026-06-22: incluye
-      // reengagement_exhausted para no re-evaluar en loop los que no tienen alt email.
-      const reSentRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(re_sent,reengagement_exhausted)&domain=eq.${encodeURIComponent(s.domain)}&select=id&limit=1`,
-        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    // Set de agent_action_id que SÍ abrieron (para descartarlos)
+    const openedSet = new Set();
+    try {
+      const oRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_email_opens?agent_action_id=in.(${sendIds.join(",")})&select=agent_action_id`,
+        { headers: _auth }
       );
-      const reSents = reSentRes.ok ? await reSentRes.json() : [];
-      if (Array.isArray(reSents) && reSents.length > 0) continue; // ya re-engagéd o agotado
+      if (oRes.ok) (await oRes.json()).forEach(r => openedSet.add(String(r.agent_action_id)));
+    } catch {}
 
-      candidates.push(s);
+    // Set de dominios ya re-engagéd o agotados
+    const handledSet = new Set();
+    if (sendDomains.length) {
+      try {
+        const rRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(re_sent,reengagement_exhausted)&domain=in.(${sendDomains.map(d => encodeURIComponent(d)).join(",")})&select=domain`,
+          { headers: _auth }
+        );
+        if (rRes.ok) (await rRes.json()).forEach(r => handledSet.add(r.domain));
+      } catch {}
     }
+
+    const candidates = sends.filter(s =>
+      !openedSet.has(String(s.id)) && !handledSet.has(s.domain)
+    );
     return candidates;
   } catch (e) {
     log(`⚠️ findUnopenedSends error: ${e.message}`);
@@ -7295,7 +7326,7 @@ async function processManualReengagementQueue(token) {
 
     // 1. Pickear pending vencidos (limit 20 por iteración)
     const nowIso = new Date().toISOString();
-    const url = `${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?status=eq.pending&scheduled_for=lte.${encodeURIComponent(nowIso)}&select=*&order=scheduled_for.asc&limit=20`;
+    const url = `${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?status=eq.pending&scheduled_for=lte.${encodeURIComponent(nowIso)}&select=id,domain,monday_item_id,mb_email,future_email,original_subject,original_body,tracking_action_id,original_email&order=scheduled_for.asc&limit=20`; // Maxi 2026-07-03 perf: select=* → solo columnas destructuradas
     const res = await fetch(url, {
       headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
     });
@@ -7895,7 +7926,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
 
     // 3. Encontrar lead en review_queue
     const leadRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=*&order=created_at.desc&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,monday_item_id,emails,email_sources,category,traffic,pitch,pitch_subject,pitch_subjects&order=created_at.desc&limit=1`, // Maxi 2026-07-03 perf: select=* → solo columnas usadas en el flujo de bounce
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!leadRes.ok) { log(`  ⚠️ ${domain}: query lead failed HTTP ${leadRes.status}`); return; }
@@ -9765,7 +9796,7 @@ async function runAgentCycle(token, allFlags) {
     // Ahora pool grande (300) + el bucket-shuffle por GEO se encarga del orden.
     const POOL_SIZE = 300;
     const queueRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=*&limit=${POOL_SIZE}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone&limit=${POOL_SIZE}`, // Maxi 2026-07-03 perf: select=* → solo columnas usadas (scoreWebsite + pool loop + per-lead loop). Egress ALTO: POOL_SIZE filas de tabla ancha
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const candidatesRaw = await queueRes.json();
@@ -11847,12 +11878,10 @@ async function main() {
       // setea worker_force_restart_at = ISO timestamp. Si es POSTERIOR al inicio
       // de este proceso, exit(0) → Railway re-arranca container limpio.
       try {
-        const fres = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.worker_force_restart_at&select=value`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-        );
-        const rows = await fres.json();
-        const ts = rows?.[0]?.value;
+        // Maxi 2026-07-03 perf: era un read dedicado a toolbar_config cada iteración.
+        // worker_force_restart_at es una key del config → sale de getConfig (cacheado 30s).
+        // Reacción al restart en ≤30s, más que suficiente para el auto-restart de Railway.
+        const ts = (await getConfig(token)).worker_force_restart_at;
         if (ts && new Date(ts).getTime() > _processStartedAt) {
           log(`🔄 Force restart triggered at ${ts} — exiting (code 1) for Railway auto-restart`);
           process.exit(1); // exit code 1 = Railway interpreta como crash y reinicia automático
@@ -11900,13 +11929,10 @@ async function main() {
 
         // Boot-time guarantee: agent_enabled_users siempre con mgargiulo si vacío.
         // Reemplaza al self-activator viejo (sin chequear horario ni manual_off).
-        const flagsRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_enabled_users&select=value`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-        );
-        const flagsRows = await flagsRes.json().catch(() => []);
+        // Maxi 2026-07-03 perf: era un read dedicado a config cada iteración.
+        // agent_enabled_users es una key del config → sale de getConfig (cacheado).
         let agentUsers = [];
-        try { agentUsers = JSON.parse(flagsRows?.[0]?.value || "[]"); } catch {}
+        try { agentUsers = JSON.parse((await getConfig(token)).agent_enabled_users || "[]"); } catch {}
         if (agentUsers.length === 0) {
           await setConfigValue(token, "agent_enabled_users", JSON.stringify(["mgargiulo@adeqmedia.com"]));
           log(`🔛 boot guarantee: agent_enabled_users=[mgargiulo@adeqmedia.com]`);
@@ -11918,23 +11944,20 @@ async function main() {
       // hasta finalizar". Antes el flag se apagaba al vaciar la cola y había
       // que prenderlo manualmente al subir más items.
       try {
+        // Maxi 2026-07-03 perf: solo importa "¿hay ≥1 pending?" → limit=1 sin count=exact
+        // (el count exacto forzaba un scan completo del status index cada iteración).
         const pcRes = await fetch(
           `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id&limit=1`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
         );
-        const range = pcRes.headers.get("content-range") || "";
-        const pendingCount = parseInt(range.match(/\/(\d+)$/)?.[1] || "0", 10);
-        if (pendingCount > 0) {
-          // Lee el flag actual y solo lo prende si está apagado (evita writes vacíos)
-          const fRes = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.csv_queue_enabled&select=value`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-          );
-          const fRows = await fRes.json().catch(() => []);
-          const isOn = (fRows?.[0]?.value || "").toLowerCase() === "true";
+        const pcRows = pcRes.ok ? await pcRes.json().catch(() => []) : [];
+        const hasPending = Array.isArray(pcRows) && pcRows.length > 0;
+        if (hasPending) {
+          // Maxi 2026-07-03 perf: flag actual desde getConfig (cacheado), sin read dedicado
+          const isOn = String((await getConfig(token)).csv_queue_enabled || "").toLowerCase() === "true";
           if (!isOn) {
             await setConfigValue(token, "csv_queue_enabled", "true");
-            log(`🔛 csv_queue auto-encendida: ${pendingCount} items pending detectados`);
+            log(`🔛 csv_queue auto-encendida: items pending detectados`);
           }
         }
       } catch (e) { log(`⚠️ csvQueue auto-enable: ${e.message}`); }
