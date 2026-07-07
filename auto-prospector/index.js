@@ -2142,13 +2142,6 @@ function _currentAgentSlot() {
 }
 
 async function maybeRunAgentSlot(token, allFlags) {
-  // En TEST_MODE bypaseamos slot (para pruebas inmediatas)
-  try {
-    const cfg = await getConfig(token);
-    if (String(cfg.agent_test_mode || "").toLowerCase() === "true") {
-      return await runAgentCycle(token, allFlags);
-    }
-  } catch {}
   const slotInfo = _currentAgentSlot();
   if (!slotInfo) return;
   if (_agentLastSlot === slotInfo.slotLabel) return;
@@ -5799,9 +5792,8 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     log(`⛔ Cap diario GLOBAL CSV alcanzado (${dailyGlobal.csvCount}/${dailyGlobal.csvCap}) — pausa hasta próximo día operativo.`);
     return 0;
   }
-  // Pausa fin de semana — operativo solo Lun-Vie España (override: test mode)
-  const _csvTestMode = String(cfg.agent_test_mode || "").toLowerCase() === "true";
-  if (!_csvTestMode && _isWeekendSpain()) {
+  // Pausa fin de semana — operativo solo Lun-Vie España
+  if (_isWeekendSpain()) {
     log(`⏸ Fin de semana España — CSV queue pausada hasta lunes.`);
     return 0;
   }
@@ -5970,9 +5962,8 @@ async function runSession(token, cfg, sessionStart) {
   }
   log(`Quota del día para ${sessionUser}: ${userTodayCount}/${AUTOPILOT_DAILY_LIMIT}`);
 
-  // GLOBAL safety net + weekend pause (override: agent_test_mode=true)
-  const _autoTestMode = String(cfg.agent_test_mode || "").toLowerCase() === "true";
-  if (!_autoTestMode && _isWeekendSpain()) {
+  // GLOBAL safety net + weekend pause
+  if (_isWeekendSpain()) {
     log(`⏸ Fin de semana España — autopilot pausado hasta lunes.`);
     return;
   }
@@ -9742,10 +9733,8 @@ async function updateMondayEstado(monday_api_key, itemId, boardId, estadoIdx) {
 // Por cada user habilitado, procesa hasta perCycleLimit leads del review_queue
 // que cumplan los thresholds. Para cada uno: pitch → quality gate → push Monday → send Gmail.
 async function runAgentCycle(token, allFlags) {
-  // Pausa fin de semana — operativo solo Lun-Vie España (override: agent_test_mode=true)
-  const _agentEarlyCfg = await getConfig(token).catch(() => ({}));
-  const _agentTestModeEarly = String(_agentEarlyCfg.agent_test_mode || "").toLowerCase() === "true";
-  if (!_agentTestModeEarly && _isWeekendSpain()) {
+  // Pausa fin de semana — operativo solo Lun-Vie España
+  if (_isWeekendSpain()) {
     log(`🤖 Agent: fin de semana España — sin envíos`);
     return;
   }
@@ -9753,14 +9742,12 @@ async function runAgentCycle(token, allFlags) {
   const cfg = await getConfig(token);
   const aCfg = _agentCfg(cfg);
   const monday_api_key_default = cfg.monday_api_key || "";
-  const TEST_MODE = String(cfg.agent_test_mode || "").toLowerCase() === "true";
 
   // Active hours check — fuera de 9-20 España no manda nada (ni Monday, ni mail)
-  if (!TEST_MODE && (_isWeekendSpain() || _isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd))) {
+  if (_isWeekendSpain() || _isOutsideActiveHours(aCfg.activeStart, aCfg.activeEnd)) {
     log(`🤖 Agent: fuera de horario laboral España (lun-vie ${aCfg.activeStart}-${aCfg.activeEnd}, hoy=${_spainWeekday()}, h=${_spainHour()})`);
     return;
   }
-  if (TEST_MODE) log(`🧪 Agent TEST MODE ON — bypass active hours + daily cap + weekly target`);
   log(`🤖 Agent: ciclo iniciando (users=${allFlags.agentUsers.length}, threshold=${aCfg.thresholdTraffic}, maxPerDay=${aCfg.maxPerDay})`);
 
   // Refresh bounced cache + scan INBOX al inicio del ciclo
@@ -9797,19 +9784,19 @@ async function runAgentCycle(token, allFlags) {
     // Daily cap — por usuario (override) o global
     const userMaxPerDay = Number(perUserCap[(userEmail || "").toLowerCase()]) || aCfg.maxPerDay;
     const sentToday = await getAgentDailyCount(token, userEmail);
-    if (!TEST_MODE && sentToday >= userMaxPerDay) {
+    if (sentToday >= userMaxPerDay) {
       log(`🤖 Agent ${userEmail}: cap diario ${userMaxPerDay} alcanzado (${sentToday})`);
       continue;
     }
     // Weekly target (si configurado): cuenta sent en últimos 7 días
-    if (!TEST_MODE && aCfg.focus.weeklyTarget > 0) {
+    if (aCfg.focus.weeklyTarget > 0) {
       const sentWeek = await getAgentWeeklyCount(token, userEmail);
       if (sentWeek >= aCfg.focus.weeklyTarget) {
         log(`🤖 Agent ${userEmail}: weekly target ${aCfg.focus.weeklyTarget} alcanzado (${sentWeek})`);
         continue;
       }
     }
-    const remaining = TEST_MODE ? aCfg.perCycleLimit : (userMaxPerDay - sentToday);
+    const remaining = userMaxPerDay - sentToday;
     const batchSize = Math.min(aCfg.perCycleLimit, remaining);
 
     // Aplicar focus filtros al query.
@@ -11784,10 +11771,9 @@ async function main() {
 
     // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
-    // backfill, refresh, unfreezer. Override: agent_test_mode=true bypasses para testing.
+    // backfill, refresh, unfreezer.
     try {
       const ghCfg = await getConfig(token);
-      const ghTestMode = String(ghCfg.agent_test_mode || "").toLowerCase() === "true";
       const ghStart = parseInt(ghCfg.active_hours_start || "9", 10);
       const ghEnd   = parseInt(ghCfg.active_hours_end   || "23", 10);
       // Manual override del admin: si flag manual_override_until > now, bypass horario.
@@ -11795,7 +11781,7 @@ async function main() {
       // Expira solo (2h default) para que no quede prendido olvidado todo el finde.
       const ghOverrideUntil = ghCfg.manual_override_until ? new Date(ghCfg.manual_override_until).getTime() : 0;
       const ghOverrideActive = ghOverrideUntil > Date.now();
-      if (!ghTestMode && !ghOverrideActive) {
+      if (!ghOverrideActive) {
         if (_isWeekendSpain()) {
           if (iterCount === 1 || iterCount % 30 === 0) {
             log(`💤 Fin de semana en España (weekday=${_spainWeekday()}) — worker dormido hasta lunes`);

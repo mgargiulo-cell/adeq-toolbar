@@ -1277,10 +1277,6 @@ input.form-pv-display { font-weight: 700; }
 .admin-tab-btn.active { background: #fbbf24; color: #0f172a; border-color: #fbbf24; font-weight: 700; }
 .admin-tab-content { display: none; }
 .admin-tab-content.active { display: block; }
-/* 🧪 Agent TEST MODE — bypass active hours + daily cap. Toggle: dblclick en tab Agent. */
-.admin-tab-content.agent-test-mode { background: linear-gradient(180deg, #4c1d95 0%, #5b21b6 100%); border: 2px solid #a78bfa; border-radius: 8px; padding: 12px; box-shadow: 0 0 0 2px rgba(167,139,250,0.25) inset; }
-.admin-tab-content.agent-test-mode::before { content: "🧪 TEST MODE — bypass active hours + daily cap"; display:block; color:#f5f3ff; font-weight:800; font-size:12px; letter-spacing:0.5px; margin-bottom:10px; padding:6px 10px; background:rgba(0,0,0,0.25); border-radius:6px; }
-.admin-tab-btn.agent-test-mode { background: #7c3aed !important; color: #fff !important; border-color: #a78bfa !important; }
 
 .admin-filters { display: flex; gap: 6px; margin-bottom: 10px; }
 .admin-filters .form-select { font-size: 11px; padding: 4px 8px; flex: 1; background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }

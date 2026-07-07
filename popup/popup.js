@@ -502,17 +502,6 @@ function initAdminPanel() {
       if (tab === "limits")    loadAdminLimits();
       if (tab === "blocklist") loadAdminBlocklist();
     });
-    // Doble-click sobre el botón "Agent" → toggle test mode (bypass active hours + caps).
-    // Stop propagation para que el click handler NO corra dos veces antes del dblclick
-    // (sino loadAdminAgent() fetcha config stale antes del write).
-    if (btn.dataset.adminTab === "agent") {
-      btn.addEventListener("dblclick", async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        await _toggleAgentTestMode();
-        await loadAdminAgent(); // re-fetch para que el render use el value nuevo
-      });
-    }
   });
   // Wire activity filters — refresh stats + agent feed (que usa el mismo filtro user)
   document.getElementById("admin-filter-period")?.addEventListener("change", () => { loadAdminActivity(); _refreshAgentFeed(); });
@@ -859,7 +848,7 @@ async function _readAgentConfig() {
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
   try {
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_max_per_day,agent_active_hours_start,agent_active_hours_end,agent_paused_until,agent_paused_reason,agent_focus_config,agent_test_mode)&select=key,value`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(agent_enabled_users,agent_threshold_traffic,agent_max_per_day,agent_active_hours_start,agent_active_hours_end,agent_paused_until,agent_paused_reason,agent_focus_config)&select=key,value`,
       // Maxi 2026-06-19 (fix): timeout. Sin esto, si el fetch se colgaba,
       // loadAdminAgent quedaba congelado en este await → los chips de GEO/Cat
       // nunca se dibujaban y el panel Auto-feeder quedaba en "Loading..." eterno.
@@ -1039,33 +1028,9 @@ function _populateHourSelects() {
   });
 }
 
-async function _toggleAgentTestMode() {
-  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-  let current = "false";
-  try {
-    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_test_mode&select=value`, { headers });
-    const rows = await r.json();
-    if (Array.isArray(rows) && rows[0]) current = String(rows[0].value || "false");
-  } catch {}
-  const next = current.toLowerCase() === "true" ? "false" : "true";
-  await _writeAgentConfig({ agent_test_mode: next });
-  _applyAgentTestModeStyle(next === "true");
-  if (typeof showToast === "function") {
-    showToast(next === "true" ? "🧪 TEST MODE ON — no limit filters" : "✅ TEST MODE OFF", next === "true" ? "warn" : "ok", 4000);
-  }
-}
-
-function _applyAgentTestModeStyle(on) {
-  const panel = document.getElementById("admin-tab-agent");
-  const btn = document.querySelector('.admin-tab-btn[data-admin-tab="agent"]');
-  if (panel) panel.classList.toggle("agent-test-mode", on);
-  if (btn) btn.classList.toggle("agent-test-mode", on);
-}
-
 async function loadAdminAgent() {
   _populateHourSelects();
   const cfg = await _readAgentConfig();
-  _applyAgentTestModeStyle(String(cfg.agent_test_mode || "").toLowerCase() === "true");
   let users = [];
   try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
   const myEmail = (state.loginEmail || "").toLowerCase();
