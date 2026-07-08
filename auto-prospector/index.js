@@ -7102,50 +7102,6 @@ async function findUnopenedSends(token, waitDays = 5) {
   }
 }
 
-// Maxi 2026-07-08: variante por NO-RESPUESTA (en vez de no-apertura). El user quiere
-// re-enviar a otro contacto cuando NO RESPONDIERON (más alineado que no-abrieron).
-// Lee toolbar_response_tracking (se puebla en cada envío; responded_at lo marca el scan
-// real de Gmail — scanRealResponsesForUser). Dedup por dominio (1 candidato, el más viejo)
-// y excluye dominios ya re_sent/agotados.
-async function findUnrespondedSends(token, waitDays = 5) {
-  try {
-    const cutoff  = new Date(Date.now() - waitDays * 86400_000).toISOString();
-    const floor30 = new Date(Date.now() - 30 * 86400_000).toISOString();
-    const _auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?responded_at=is.null&sent_at=lt.${cutoff}&sent_at=gte.${floor30}&select=domain,mb_email,email_sent_to,sent_at&order=sent_at.asc&limit=200`,
-      { headers: _auth }
-    );
-    if (!res.ok) return [];
-    const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) return [];
-    // Dedup por dominio — 1 solo candidato por dominio (el más viejo, orden asc)
-    const byDomain = new Map();
-    for (const r of rows) { if (r.domain && !byDomain.has(r.domain)) byDomain.set(r.domain, r); }
-    const domains = [...byDomain.keys()];
-    // Excluir dominios ya re-engagéd o agotados
-    const handledSet = new Set();
-    if (domains.length) {
-      try {
-        const rRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(re_sent,reengagement_exhausted)&domain=in.(${domains.map(d => encodeURIComponent(d)).join(",")})&select=domain`,
-          { headers: _auth }
-        );
-        if (rRes.ok) (await rRes.json()).forEach(r => handledSet.add(r.domain));
-      } catch {}
-    }
-    return domains
-      .filter(d => !handledSet.has(d))
-      .map(d => {
-        const r = byDomain.get(d);
-        return { domain: d, user_email: r.mb_email, details: { email: (r.email_sent_to || "").toLowerCase() } };
-      });
-  } catch (e) {
-    log(`⚠️ findUnrespondedSends error: ${e.message}`);
-    return [];
-  }
-}
-
 // 2. Para un dominio, contar cuántos sends totales (incluyendo re_sent) hubo
 async function countAttemptsForDomain(token, domain) {
   try {
@@ -7267,13 +7223,8 @@ async function runReengagementCycle(token) {
     const waitDays    = parseInt(cfg.agent_reengagement_wait_days || "5", 10);
     const maxAttempts = parseInt(cfg.agent_reengagement_max_attempts || "3", 10);
 
-    // Maxi 2026-07-08: por default el disparador es NO-RESPUESTA (el user lo pidió — más
-    // alineado que no-apertura). Reversible a no-apertura con agent_reengagement_trigger='open'.
-    const trigger = String(cfg.agent_reengagement_trigger || "response").toLowerCase();
-    log(`🔄 Re-engagement cycle: buscando sends sin ${trigger === "open" ? "opens" : "respuesta"} >= ${waitDays}d...`);
-    const candidates = trigger === "open"
-      ? await findUnopenedSends(token, waitDays)
-      : await findUnrespondedSends(token, waitDays);
+    log(`🔄 Re-engagement cycle: buscando sends sin opens >= ${waitDays}d...`);
+    const candidates = await findUnopenedSends(token, waitDays);
     if (!candidates.length) {
       log(`🔄 Re-engagement: 0 candidatos`);
       return;
@@ -7288,13 +7239,13 @@ async function runReengagementCycle(token) {
       // Cap de attempts
       const attempts = await countAttemptsForDomain(token, domain);
       if (attempts >= maxAttempts) {
-        log(`  🧊 ${domain}: ${attempts} attempts sin ${trigger === "open" ? "opens" : "respuesta"} — freeze 60d`);
+        log(`  🧊 ${domain}: ${attempts} attempts sin opens — freeze 60d`);
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
           method: "POST",
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
           body: JSON.stringify({
             domain, frozen_until: new Date(Date.now() + 60 * 86400_000).toISOString(),
-            attempt_count: attempts, last_error: `re_engagement_max_attempts_${maxAttempts}_no_${trigger === "open" ? "opens" : "response"}`,
+            attempt_count: attempts, last_error: `re_engagement_max_attempts_${maxAttempts}_no_opens`,
             source: "agent_reengagement", uploaded_by: userEmail, updated_at: new Date().toISOString(),
           }),
         }).catch(() => {});
