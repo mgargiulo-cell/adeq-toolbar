@@ -3776,7 +3776,7 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
         source: "unlocked",
         source_url: sourceUrl,
       };
-      if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source_url: sourceUrl, source: "worker_unlocked" }).catch(() => {});
+      if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source_url: sourceUrl, source: "worker_unlocked", title: target.title || "" }).catch(() => {});
       return result;
     } catch { continue; }
   }
