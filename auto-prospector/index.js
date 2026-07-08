@@ -7444,9 +7444,9 @@ async function processManualReengagementQueue(token) {
             body:    original_body,
             agentActionId: null, // worker no inyecta pixel acá; el seguimiento del futuro es out of scope v1
           });
-          if (!sent?.ok) {
+          if (!sent?.id) {   // Maxi 2026-07-08 BUG FIX: Gmail éxito = {id,...}, no {ok:true}
             newStatus = "failed";
-            reason = `gmail send failed: ${sent?.error || "unknown"}`;
+            reason = `gmail send failed: ${sent?.error || "no_message_id"}`;
           } else {
             // 4. Update Monday: email + FU1 (today+5) + FU2 (today+10)
             const upd = await updateMondayReengagementDispatch(monday_api_key, monday_item_id, boardId, future_email);
@@ -8173,8 +8173,12 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       const sent = await sendGmailServer(token, mbEmail, {
         to: retryEmail, subject, body, agentActionId: null,
       });
-      sendOk = sent?.ok === true;
-      if (!sendOk) sendErr = sent?.error || "unknown";
+      // Maxi 2026-07-08 BUG FIX: sendGmailServer devuelve la respuesta CRUDA de Gmail
+      // en éxito ({id, threadId, labelIds}) — NO tiene campo .ok. El check `sent?.ok===true`
+      // daba SIEMPRE false aunque el mail se enviara → 161 re-envíos marcados "failed"
+      // (Monday no se actualizaba, se congelaba el lead habiendo enviado). Éxito = hay `id`.
+      sendOk = !!(sent && sent.id);
+      if (!sendOk) sendErr = sent?.error || "no_message_id";
     } catch (e) {
       sendErr = e.message;
     }
