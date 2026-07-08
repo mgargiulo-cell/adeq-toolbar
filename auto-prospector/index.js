@@ -8075,7 +8075,10 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       const apolloKey = cfg2.apollo_api_key;
       if (apolloKey) {
         try {
-          const apolloRes = await findBestApolloEmail(domain, apolloKey, token, { traffic: lead.traffic || 0, allowUnlock: true });
+          // Maxi 2026-07-08: forceUnlock en el RESCATE por bounce — el email anterior rebotó,
+          // así que vale pagar Apollo para conseguir un decision-maker nuevo aunque el tráfico
+          // esté bajo el umbral. Sigue capado por APOLLO_MONTHLY_HARD_CAP (2400/mes).
+          const apolloRes = await findBestApolloEmail(domain, apolloKey, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true });
           if (apolloRes?.email && apolloRes.email.toLowerCase() !== bouncedEmail.toLowerCase()) {
             newEmails.add(apolloRes.email.toLowerCase());
           }
