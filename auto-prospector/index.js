@@ -3735,16 +3735,21 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
   // aunque el editor/publisher SÍ tuviera. Ahora rankea por CARGO (decision-maker) y prueba
   // hasta 3 empezando por el más senior, parando en el primero que REVELE email. El cap
   // mensual duro corta el gasto igual.
-  const _dmRank = (t) => {
+  // Maxi 2026-07-08: el user SOLO quiere revelar emails de PUBLICIDAD/MARKETING/PROGRAMMATIC/
+  // TECH/DECISIÓN — NUNCA periodistas, editores, fotógrafos ni ops (ahí se quemaba el crédito
+  // en gente sin email ni relevancia). Filtramos ANTES de pagar el reveal.
+  const _CONTENT_OPS_RE = /\b(reporter|report[eé]r|journalist|periodist|redactor|redacc|correspondent|columnist|writer|editor|photograph|fot[oó]graf|graphic|designer|copy|clerk|cashier|mechanic|warehouse|driver|pressroom|circulation|imaging|literacy|custodian|delivery)\b/i;
+  const _RELEVANT_RE = /\b(ceo|founder|co-?founder|owner|president|chief|cmo|cro|cto|publisher|propietari|due[ñn]|director|vp|vice president|head of|general manager|managing|marketing|advertis|publicidad|comercial|commercial|sales|ventas|revenue|monetiz|ad ?ops|ad ?operations|programmatic|program[aá]tic|media buy|inventory|yield|partnership|business development|bizdev|growth|digital|developer|engineer|programador|desarrollador|webmaster|\btech\b)\b/i;
+  const _score = (t) => {
     const s = (t || "").toLowerCase();
-    if (/\b(ceo|founder|co-?founder|owner|president|chief|cmo|cro|publisher|propietari|dueñ)\b/.test(s)) return 4;
-    if (/\b(vp|vice president|head of|director|gerente general|managing)\b/.test(s)) return 3;
-    if (/\b(marketing|commercial|comercial|sales|ventas|revenue|monetiz|ad ?ops|digital|editor in chief|jefe de redacc)\b/.test(s)) return 2;
-    if (/\b(editor|manager|lead|redacc)\b/.test(s)) return 1;
-    return 0;
+    if (_CONTENT_OPS_RE.test(s)) return -1;   // periodista/editor/ops → NUNCA revelar
+    if (!_RELEVANT_RE.test(s))   return -1;   // fuera de interés → NUNCA revelar
+    if (/\b(advertis|publicidad|marketing|programmatic|program[aá]tic|monetiz|ad ?ops|comercial|commercial|revenue)\b/.test(s)) return 3; // core: publi/marketing/programmatic
+    if (/\b(ceo|founder|owner|publisher|president|chief|cmo|cro|director|vp|head)\b/.test(s)) return 2;                                   // decisión
+    return 1; // dev/tech/digital/sales
   };
-  const ranked = people.filter(p => p?.id).sort((a, b) => _dmRank(b.title) - _dmRank(a.title));
-  if (ranked.length === 0) return freeResult;
+  const ranked = people.filter(p => p?.id && _score(p.title) >= 0).sort((a, b) => _score(b.title) - _score(a.title));
+  if (ranked.length === 0) { log(`  ○ Apollo ${domain}: sin roles de publi/marketing/tech → NO gasto crédito`); return freeResult; }
   for (const target of ranked.slice(0, 3)) {
     try {
       // Re-chequear cap antes de CADA reveal pago (no pasarse por probar varios).
