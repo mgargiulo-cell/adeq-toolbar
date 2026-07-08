@@ -3729,38 +3729,53 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     }
   } catch {}
 
-  // 5. Unlock top 1 (decision-maker). Si falla, caemos al gratis (si había).
-  const target = people[0];
-  if (!target?.id) return freeResult;
-  try {
-    const unlock = await fetch("https://api.apollo.io/v1/people/match", {
-      method: "POST",
-      headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
-      body: JSON.stringify({ id: target.id, reveal_personal_emails: true }),
-      signal: AbortSignal.timeout(12000),
-    });
-    if (!unlock.ok) return freeResult;
-    const data = await unlock.json();
-    const person = data?.person;
-    if (!person?.email) return freeResult;
-    // Bump apollo_calls_month +1 (este endpoint cuesta 1 credit)
-    bumpApolloUnlocks(token, 1).catch(() => {});
-    const phone = _extractApolloPhone(person);
-    log(`  💎 Apollo unlock ${domain} → ${person.email}${phone ? " 📞" : ""} (1 credit)`);
-    // Maxi 2026-06-17 (audit #4): preservamos linkedin_url del Apollo profile
-    // para que la UI pueda mostrar de qué fuente Apollo salió el contacto
-    // (no solo "apollo" label, sino link al perfil real de la persona).
-    const sourceUrl = person.linkedin_url || `https://app.apollo.io/people/${person.id || ""}`;
-    const result = {
-      email: person.email,
-      contact_name: `${person.first_name||""} ${person.last_name||""}`.trim(),
-      phone,
-      source: "unlocked",
-      source_url: sourceUrl,
-    };
-    if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source_url: sourceUrl, source: "worker_unlocked" }).catch(() => {});
-    return result;
-  } catch { return freeResult; }
+  // 5. Unlock — Maxi 2026-07-08 BUG FIX: antes unlockeaba people[0] (el PRIMERO de la
+  // lista de Apollo, que suele ser random/junior — ej. "Home & Garden Reporter") y si ese
+  // no tenía email se rendía → gastaba crédito en la persona equivocada y devolvía 0 emails
+  // aunque el editor/publisher SÍ tuviera. Ahora rankea por CARGO (decision-maker) y prueba
+  // hasta 3 empezando por el más senior, parando en el primero que REVELE email. El cap
+  // mensual duro corta el gasto igual.
+  const _dmRank = (t) => {
+    const s = (t || "").toLowerCase();
+    if (/\b(ceo|founder|co-?founder|owner|president|chief|cmo|cro|publisher|propietari|dueñ)\b/.test(s)) return 4;
+    if (/\b(vp|vice president|head of|director|gerente general|managing)\b/.test(s)) return 3;
+    if (/\b(marketing|commercial|comercial|sales|ventas|revenue|monetiz|ad ?ops|digital|editor in chief|jefe de redacc)\b/.test(s)) return 2;
+    if (/\b(editor|manager|lead|redacc)\b/.test(s)) return 1;
+    return 0;
+  };
+  const ranked = people.filter(p => p?.id).sort((a, b) => _dmRank(b.title) - _dmRank(a.title));
+  if (ranked.length === 0) return freeResult;
+  for (const target of ranked.slice(0, 3)) {
+    try {
+      // Re-chequear cap antes de CADA reveal pago (no pasarse por probar varios).
+      const u = await getApolloUsageToday(token).catch(() => ({ usedThisMonth: 0 }));
+      if ((u.usedThisMonth || 0) >= APOLLO_MONTHLY_HARD_CAP) { log(`  ⚠ Apollo cap alcanzado mid-loop ${domain} — stop`); break; }
+      const unlock = await fetch("https://api.apollo.io/v1/people/match", {
+        method: "POST",
+        headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
+        body: JSON.stringify({ id: target.id, reveal_personal_emails: true }),
+        signal: AbortSignal.timeout(12000),
+      });
+      if (!unlock.ok) continue;
+      const data = await unlock.json();
+      const person = data?.person;
+      bumpApolloUnlocks(token, 1).catch(() => {}); // cada match cuesta 1 credit (tenga email o no)
+      if (!person?.email) { log(`  ○ Apollo ${domain}: "${target.title || "?"}" sin email → probar siguiente`); continue; }
+      const phone = _extractApolloPhone(person);
+      log(`  💎 Apollo unlock ${domain} → ${person.email} (${target.title || "?"})`);
+      const sourceUrl = person.linkedin_url || `https://app.apollo.io/people/${person.id || ""}`;
+      const result = {
+        email: person.email,
+        contact_name: `${person.first_name||""} ${person.last_name||""}`.trim(),
+        phone,
+        source: "unlocked",
+        source_url: sourceUrl,
+      };
+      if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source_url: sourceUrl, source: "worker_unlocked" }).catch(() => {});
+      return result;
+    } catch { continue; }
+  }
+  return freeResult;
 }
 
 // Extrae el primer teléfono útil de un objeto Apollo person.
