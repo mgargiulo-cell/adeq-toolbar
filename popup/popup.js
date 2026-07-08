@@ -4791,6 +4791,36 @@ async function bindButtons() {
   // btn-verify-email REMOVIDO — la verificación es automática on-render (autoVerifyEmailChips)
 
   // Apollo
+  // Maxi 2026-07-08: re-escanear el DOM de la página ACTUAL. Resuelve el caso de emails
+  // JS-renderizados (ej. livestly.com/contact tiene los emails por JS → no están en el
+  // fetch, pero SÍ en el DOM). El MB navega a la página de contacto y clickea acá.
+  document.getElementById("btn-rescan-page")?.addEventListener("click", async () => {
+    const btn      = document.getElementById("btn-rescan-page");
+    const resultEl = document.getElementById("apollo-result");
+    const _lbl = btn.textContent;
+    btn.disabled = true; btn.textContent = "⏳ Escaneando...";
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = tab?.id || state.tabId;
+      const pageResult = await scrapeEmailsFromPage(tabId);
+      const found = (Array.isArray(pageResult) ? pageResult : (pageResult?.emails || [])).filter(quickValidateEmail);
+      const before = state.emails.length;
+      addEmailsWithSource(found, "Page", state.domain);
+      const added = state.emails.length - before;
+      renderEmailList(state.emails);
+      if (resultEl) {
+        resultEl.style.display = "block";
+        resultEl.textContent = added > 0
+          ? `✅ ${added} email(s) nuevos de esta página`
+          : (found.length > 0 ? "Ya estaban todos en la lista" : "Sin emails en el DOM de esta página");
+      }
+    } catch (e) {
+      if (resultEl) { resultEl.style.display = "block"; resultEl.textContent = `❌ ${e.message}`; }
+    } finally {
+      btn.disabled = false; btn.textContent = _lbl;
+    }
+  });
+
   document.getElementById("btn-apollo").addEventListener("click", async () => {
     const btn      = document.getElementById("btn-apollo");
     const resultEl = document.getElementById("apollo-result");
