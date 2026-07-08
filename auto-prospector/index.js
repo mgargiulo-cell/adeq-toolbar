@@ -4840,6 +4840,23 @@ const CORPORATE_BLOCKLIST = new Set([
   "walmart.com","target.com","bestbuy.com","homedepot.com","costco.com",
   // ChatGPT / AI giants
   "chatgpt.com","openai.com","chat.openai.com","claude.ai","anthropic.com","perplexity.ai","gemini.google.com",
+  // Adtech / monetización / SSP / ad networks — Maxi 2026-07-08: NO son publishers,
+  // son la infra/competencia de monetización. El user: "no prospectamos empresas de
+  // monetización" (ej. applovin). Rechazar todos.
+  "applovin.com","ironsource.com","is.com","unity.com","unity3d.com","digitalturbine.com",
+  "moloco.com","liftoff.io","vungle.com","adcolony.com","chartboost.com","mopub.com",
+  "inmobi.com","smaato.com","fyber.com","tapjoy.com","pangle.io","mintegral.com",
+  "taboola.com","outbrain.com","criteo.com","revcontent.com","mgid.com","adnow.com",
+  "pubmatic.com","magnite.com","rubiconproject.com","indexexchange.com","openx.com",
+  "smartadserver.com","equativ.com","sovrn.com","adform.com","teads.com","unruly.com",
+  "sharethrough.com","triplelift.com","gumgum.com","primis.tech","connatix.com",
+  "aniview.com","vidoomy.com","coinis.com","verve.com","vervegroup.com","smartyads.com",
+  "epom.com","adpushup.com","setupad.com","freestar.com","playwire.com","snigel.com",
+  "venatus.com","vidazoo.com","ezoic.com","mediavine.com","adthrive.com","raptive.com",
+  "monumetric.com","newor.media","nexx360.io","yieldbird.com","admanager.google.com",
+  "pubgalaxy.com","adhese.com","kevel.com","adpone.com","onetag.com","33across.com",
+  "adagio.io","truvid.com","aps.amazon.com","liveintent.com","lkqd.com","spotx.tv",
+  "spotxchange.com","beachfront.com","telaria.com","springserve.com","publica.tv",
 ]);
 
 // TLDs o subcadenas que SIEMPRE indican sitios no-prospectables.
@@ -8261,6 +8278,65 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
   } catch (e) {
     log(`⚠️ queueBounceRetry ${bouncedEmail}: ${e.message}`);
   }
+}
+
+// ════════════════════════════════════════════════════════════════
+// RECONCILIACIÓN Monday — Maxi 2026-07-08 (one-time cleanup)
+// ────────────────────────────────────────────────────────────────
+// Los bounce_retries con status='failed' y reason='unknown' son FALSOS FALLOS del
+// bug del .ok: el re-envío SÍ se mandó al retry_email, pero como el código creyó que
+// falló, NUNCA actualizó Monday (quedó con el email viejo/rebotado). Esta función pone
+// el retry_email (contacto alternativo válido) en Monday + review_queue y marca la fila
+// 'reconciled' para no re-procesarla. Gate: agent_reconcile_monday_bounces=true. Batch
+// de 30/run; se auto-apaga (flag OFF) cuando no queda nada.
+// ════════════════════════════════════════════════════════════════
+async function reconcileMondayBounces(token) {
+  try {
+    const cfg = await getConfig(token);
+    if (String(cfg.agent_reconcile_monday_bounces || "").toLowerCase() !== "true") return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?status=eq.failed&reason=eq.unknown&retry_email=neq.&monday_item_id=not.is.null&select=id,domain,monday_item_id,retry_email,mb_email&limit=30`,
+      { headers: auth }
+    );
+    if (!res.ok) return;
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      log("✅ reconcile-monday-bounces: nada más que reconciliar → flag OFF");
+      await setConfigValue(token, "agent_reconcile_monday_bounces", "false").catch(() => {});
+      return;
+    }
+    log(`🔧 reconcile-monday-bounces: ${rows.length} items (Monday quedó con email viejo por el bug .ok)`);
+    for (const r of rows) {
+      try {
+        const mondayKey = (cfg[`monday_api_key_${(r.mb_email || "").toLowerCase()}`] || cfg.monday_api_key || "").trim();
+        if (mondayKey && r.monday_item_id && r.retry_email) {
+          await updateMondayItem(r.monday_item_id, { [MONDAY_COL_EMAIL]: { email: r.retry_email, text: r.retry_email } }, mondayKey).catch(() => {});
+        }
+        // Reflejar el email correcto también en review_queue (Prospects)
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(r.domain)}&select=id,emails,email_sources&limit=1`, { headers: auth })
+          .then(rq => rq.ok ? rq.json() : [])
+          .then(async (lrows) => {
+            const lead = Array.isArray(lrows) ? lrows[0] : null;
+            if (!lead?.id) return;
+            const base = (Array.isArray(lead.emails) ? lead.emails : []).filter(e => e && e.toLowerCase() !== r.retry_email.toLowerCase());
+            const newEmails = [r.retry_email, ...base];
+            const newSources = { ...(lead.email_sources || {}) };
+            if (!newSources[r.retry_email.toLowerCase()]) newSources[r.retry_email.toLowerCase()] = "rescue";
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ emails: newEmails, email_sources: newSources }),
+            }).catch(() => {});
+          }).catch(() => {});
+        // Marcar reconciliado para no re-procesar
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?id=eq.${r.id}`, {
+          method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ status: "reconciled" }),
+        }).catch(() => {});
+        log(`  ✅ ${r.domain}: Monday actualizado a ${r.retry_email}`);
+      } catch (e) { log(`  ⚠️ reconcile ${r.domain}: ${e.message}`); }
+    }
+  } catch (e) { log(`⚠️ reconcileMondayBounces: ${e.message}`); }
 }
 
 function extractMessageText(payload) {
@@ -11879,6 +11955,9 @@ async function main() {
       // Re-enrich de leads malos del review_queue (flag agent_reenrich_bad_leads).
       // Sin esto, los 240 leads viejos sin Apollo nunca se actualizan.
       runReenrichBadLeads(token).catch(e => log(`⚠️ reenrich: ${e.message}`));
+      // Reconciliación one-time de Monday para los 161 falsos-fallos del bug .ok
+      // (flag agent_reconcile_monday_bounces; se auto-apaga al terminar).
+      reconcileMondayBounces(token).catch(e => log(`⚠️ reconcile monday: ${e.message}`));
     }
 
     // ── Unfreezer cada 60 iters (~25min) ──
