@@ -3197,9 +3197,11 @@ async function _fetchPageMetaForProspect(domain) {
     if (!["es","en","it","pt","ar"].includes(language)) {
       const sample = (title + " " + html.replace(/<[^>]+>/g, " ").substring(0, 3000)).toLowerCase();
       if (/[؀-ۿ]/.test(html)) language = "ar";
-      else if (/[ñáéíóúü¿¡]|noticias|últimas|fútbol|política|economía/.test(sample)) language = "es";
-      else if (/[ãõçàáâ]|notícias|esportes|cidade/.test(sample)) language = "pt";
-      else if (/[àèéìòù]|notizie|sport|città/.test(sample)) language = "it";
+      // Maxi 2026-07-08: solo chars distintivos (ñ/¿/¡/ã/õ) + stopwords; los acentos
+      // compartidos (á/é/í/ó/ú) los usan idiomas no soportados → no deciden solos.
+      else if (/[ñ¿¡]|noticias|últimas|fútbol|política|economía/.test(sample)) language = "es";
+      else if (/[ãõ]|notícias|esportes|cidade/.test(sample)) language = "pt";
+      else if (/notizie|sport|città/.test(sample)) language = "it";
       else language = detectLangFromDomain(domain) || "en";
     }
     return { title: title.substring(0, 180), language, adNetworks };
@@ -7877,10 +7879,14 @@ function _detectLangFromText(text) {
     scores[lang] = m ? m.length : 0;
     total += scores[lang];
   }
-  // Bonus por caracteres únicos
-  if (/[ñáéíóúü¿¡]/.test(text)) scores.es += 5;
-  if (/[ãõçàáâ]/.test(text))    scores.pt += 5;
-  if (/[àèéìòù]/.test(text))    scores.it += 5;
+  // Bonus por caracteres únicos — Maxi 2026-07-08: gate igual que el worker. Los acentos
+  // compartidos (á/é/í/ó/ú los usan checo/polaco/húngaro/turco) solo suman si el idioma YA
+  // tiene una stopword; solo ñ/¿/¡/ã/õ (realmente distintivos) suman solos.
+  if (/[ñ¿¡]/.test(text)) scores.es += 5;
+  else if (scores.es > 0 && /[áéíóúü]/.test(text)) scores.es += 5;
+  if (/[ãõ]/.test(text)) scores.pt += 5;
+  else if (scores.pt > 0 && /[çàáâ]/.test(text)) scores.pt += 5;
+  if (scores.it > 0 && /[àèéìòù]/.test(text)) scores.it += 5;
 
   if (total < 3) return null; // muy poca señal
   // Ganador con margen de >=2 sobre el segundo (evita empates dudosos)
@@ -9236,9 +9242,10 @@ function renderProspectCard(r) {
     // 4) Heurística sobre title + category — palabras típicas por idioma
     const sample = `${r.page_title || ""} ${r.category || ""} ${r.domain || ""}`.toLowerCase();
     if (sample) {
-      if (/[ñáéíóúü¿¡]|noticias|últimas|video|fútbol|deport|política|economía|ciudad|provincia|país|noticia/.test(sample)) return "es";
-      if (/[ãõçàáâ]|notícias|notícia|últimas|últim|esportes|política|economia|cidade|brasileir/.test(sample)) return "pt";
-      if (/[àèéìòù]|notizie|ultim|sport|politica|economia|città/.test(sample)) return "it";
+      // Maxi 2026-07-08: solo chars distintivos + stopwords (ver _detectLangFromText).
+      if (/[ñ¿¡]|noticias|últimas|video|fútbol|deport|política|economía|ciudad|provincia|país|noticia/.test(sample)) return "es";
+      if (/[ãõ]|notícias|notícia|últimas|últim|esportes|política|economia|cidade|brasileir/.test(sample)) return "pt";
+      if (/notizie|ultim|sport|politica|economia|città/.test(sample)) return "it";
       if (/[؀-ۿ]/.test(r.page_title || "")) return "ar";
     }
     // 5) TLD del dominio (.com.ar / .mx / .br / .it / .pt) — fallback obvio
