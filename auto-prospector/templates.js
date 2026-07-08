@@ -1,270 +1,186 @@
 // ============================================================
 // ADEQ Toolbar Agent — Templates de outreach por idioma
-// 80% de los emails del agente usan template (cost-effective).
-// 20% van a Claude para variedad estilística + A/B test futuro.
+// Los 3 borradores fijos (validados con el user 2026-07-08).
+// El agente los manda 33/33/33 (reparto parejo, pickAnyTemplate uniforme).
 //
 // Cada template:
-//  - Es voz Diego/ADEQ (revshare 80/20, no exclusividad, sin firma).
-//  - Tiene placeholders {{domain}} {{traffic}} {{geo}}.
-//  - Termina con pregunta (no con CTA genérico).
-//  - SIN signature/closing (Gmail aplica firma default).
-// ============================================================
-
-// ============================================================
-// Templates v2 (2026-05-18) — los 3 templates fijos validados con el user.
-//   T1: identificar decision-maker ("¿sos vos?") — usa {{sender_name}}
-//   T2: pitch como partner ("sumarnos al stack") — sin nombre
-//   T3: sondeo de pain points ("¿qué no rinde?")  — sin nombre
-// Cada template repetido en ES/EN/PT/IT/AR con la misma estructura.
+//  - Placeholders {{domain}} {{traffic}} {{geo}} {{sender_name}}.
+//  - SIN signature/closing formal (Gmail aplica firma default).
+//  - MISMO contenido que los defaults de toolbar_pitch_drafts (Analysis) —
+//    ver sql/seed_default_drafts.sql. Mantener ambos sincronizados.
+//
+//   B1: identificar al encargado de los anuncios ("¿este es el correo de...?")
+//   B2: campañas de video (in-stream/out-stream) + pedir contacto/whatsapp
+//   B3: campañas de display y video + pedir contacto del encargado
 // ============================================================
 const TEMPLATES = {
   // ── ESPAÑOL ────────────────────────────────────────────────
   es: [
     {
-      subjects: [
-        "Campañas de Video - ADEQ",
-        "Campañas de Video activas - ADEQ",
-        "Video para {{domain}} - ADEQ",
-      ],
-      body: `Hola, ¿cómo estás?
+      subjects: ["Publicidad en {{domain}} - ADEQ", "¿Quién maneja los anuncios? - ADEQ", "Contacto de publicidad - ADEQ"],
+      body: `Hola!
 
-Vi {{domain}} y antes de armarte un mail largo te hago una consulta corta — ¿sos vos quien maneja la monetización del sitio o me conviene hablar con alguien más?
+Este es el correo de quien maneja los anuncios de la web de {{domain}}?
 
-Soy "{{sender_name}}" de ADEQ, y como trabajamos con publishers ayudando a mejorar la monetizacion me queria poner en contacto con la persona responsable.
+Soy del área de ventas de ADEQ Media, y me quería poner en contacto con la persona encargada para ofrecerles unas campañas que nos gustaría monetizar con ustedes.
 
-Espero tu aviso,`,
+Cualquier cosa avisame.`,
     },
     {
-      subjects: [
-        "Dueño de la monetizacion? Conversar sobre ads",
-        "Sos el dueño de la monetizacion? Hablamos de ads",
-        "Responsable de monetizacion? Conversar sobre ads",
-      ],
-      body: `Buenas.
+      subjects: ["Campañas de video activas - ADEQ", "Video para {{domain}} - ADEQ", "Campañas de video - ADEQ"],
+      body: `Hola, te escribo de ADEQ Media. Tenemos campañas de video activas (in-stream y out-stream) que están funcionando muy bien en websites como el tuyo.
 
-Sé que te llegan muchos mails así que intento ser breve. Queria conversar con la persona encargada de publicidad para poder sumarnos como partner de monetizacion.
+¿Me podrían pasar el whatsapp o contacto de la persona que se encarga de manejar las implementaciones o monetización?
 
-La idea es sumamos al stack actual, no reemplazamos nada. Sin exclusividad, sin permanencia mínima.
+Muchas gracias, espero el dato para escribirles.
 
-¿Cómo lo ves? ¿Te parece que conversemos sobre formatos que podrian llegar a ir para tu website?
-
-Si te interesa, espero tu feedback y conversamos.
-
-Saludos,`,
+Saludos.`,
     },
     {
-      subjects: [
-        "Acuerdos anuales de campañas - ADEQ",
-        "Acuerdo anual de campañas - ADEQ",
-        "Acuerdos anuales para campañas publicitarias - ADEQ",
-      ],
-      body: `Hola,
+      subjects: ["Campañas de display y video - ADEQ", "Contacto del encargado - ADEQ", "Display y video para {{domain}} - ADEQ"],
+      body: `Buen día.
 
-Antes de mandarte un mensaje largo te hago una pregunta, ¿hay algún partner de publicidad o formato hoy en {{domain}} que no esté rindiendo como esperaban, o que ya estén pensando en cambiar?
+¿Me podrían pasar el contacto del encargado del website?
 
-Me gustaria poder conversar para analizar opciones de negocio, realmente creo que podemos hacer buen dinero encontrando entre ambos el formato correcto.
+Es para poder conversar sobre unas campañas de display y video, que nos interesaría poder incluirlas en su sitio web.
 
-Saludos,`,
+Gracias`,
     },
   ],
 
   // ── INGLÉS ─────────────────────────────────────────────────
   en: [
     {
-      subjects: [
-        "Video Campaigns - ADEQ",
-        "Active Video Campaigns - ADEQ",
-        "Video for {{domain}} - ADEQ",
-      ],
-      body: `Hi, how are you?
+      subjects: ["Advertising on {{domain}} - ADEQ", "Who handles the ads? - ADEQ", "Advertising contact - ADEQ"],
+      body: `Hi!
 
-Saw {{domain}} and before sending you a long email, just a quick question — are you the one handling monetization for the site, or should I reach out to someone else?
+Is this the email of the person who handles advertising on {{domain}}?
 
-I'm "{{sender_name}}" from ADEQ, and since we work with publishers helping improve monetization, I wanted to get in touch with whoever's in charge.
+I'm from the sales team at ADEQ Media, and I wanted to get in touch with the person in charge to offer you some campaigns we'd love to monetize with you.
 
-Let me know,`,
+Let me know.`,
     },
     {
-      subjects: [
-        "Monetization owner? Let's talk ads",
-        "Are you the monetization owner? Let's talk ads",
-        "Monetization manager? Let's chat about ads",
-      ],
-      body: `Hi.
+      subjects: ["Active video campaigns - ADEQ", "Video for {{domain}} - ADEQ", "Video campaigns - ADEQ"],
+      body: `Hi, I'm reaching out from ADEQ Media. We have active video campaigns (in-stream and out-stream) that are performing really well on sites like yours.
 
-I know you get a lot of emails so I'll keep this short. I wanted to reach out to whoever handles ad ops to see if we can join as a monetization partner.
+Could you pass me the WhatsApp or contact of the person who handles implementations or monetization?
 
-The idea is to add to your current stack, not replace anything. No exclusivity, no minimum commitment.
+Thanks a lot, I'll wait for the details to get in touch.
 
-How does that sound? Could we chat about formats that might work for your site?
-
-If you're interested, let me know and we'll talk.
-
-Best,`,
+Best.`,
     },
     {
-      subjects: [
-        "Annual Campaign Agreements - ADEQ",
-        "Annual Campaign Agreement - ADEQ",
-        "Annual agreements for ad campaigns - ADEQ",
-      ],
-      body: `Hi,
+      subjects: ["Display and video campaigns - ADEQ", "Site manager contact - ADEQ", "Display & video for {{domain}} - ADEQ"],
+      body: `Good morning.
 
-Before sending you a long message, just one question — is there any ad partner or format on {{domain}} today that's not performing as expected, or that you're already thinking of changing?
+Could you pass me the contact of the person in charge of the website?
 
-I'd love to chat to look at business options, I really believe we can make good money together finding the right format.
+It's to discuss some display and video campaigns that we'd be interested in including on your site.
 
-Best,`,
+Thanks`,
     },
   ],
 
   // ── PORTUGUÉS ──────────────────────────────────────────────
   pt: [
     {
-      subjects: [
-        "Campanhas de Vídeo - ADEQ",
-        "Campanhas de Vídeo ativas - ADEQ",
-        "Vídeo para {{domain}} - ADEQ",
-      ],
-      body: `Olá, tudo bem?
+      subjects: ["Publicidade em {{domain}} - ADEQ", "Quem cuida dos anúncios? - ADEQ", "Contato de publicidade - ADEQ"],
+      body: `Olá!
 
-Vi {{domain}} e antes de te mandar um email longo, faço uma pergunta rápida — você é quem cuida da monetização do site, ou converso com outra pessoa?
+Este é o email de quem cuida da publicidade do site {{domain}}?
 
-Sou o "{{sender_name}}" da ADEQ, e como trabalhamos com publishers ajudando a melhorar a monetização, queria entrar em contato com a pessoa responsável.
+Sou da área de vendas da ADEQ Media, e queria entrar em contato com a pessoa responsável para oferecer algumas campanhas que gostaríamos de monetizar com vocês.
 
-Aguardo seu retorno,`,
+Qualquer coisa, me avisa.`,
     },
     {
-      subjects: [
-        "Responsável pela monetização? Vamos falar sobre ads",
-        "Você é o responsável pela monetização? Vamos falar de ads",
-        "Quem cuida da monetização? Vamos conversar sobre ads",
-      ],
-      body: `Olá.
+      subjects: ["Campanhas de vídeo ativas - ADEQ", "Vídeo para {{domain}} - ADEQ", "Campanhas de vídeo - ADEQ"],
+      body: `Olá, escrevo da ADEQ Media. Temos campanhas de vídeo ativas (in-stream e out-stream) que estão funcionando muito bem em sites como o seu.
 
-Sei que você recebe muitos emails, então vou ser breve. Queria falar com quem cuida da parte publicitária para podermos nos somar como parceiro de monetização.
+Poderiam me passar o WhatsApp ou contato da pessoa que cuida das implementações ou monetização?
 
-A ideia é somar ao stack atual, não substituir nada. Sem exclusividade, sem permanência mínima.
+Muito obrigado, aguardo o dado para entrar em contato.
 
-O que acha? Podemos conversar sobre formatos que poderiam funcionar no seu site?
-
-Se tiver interesse, aguardo seu retorno e conversamos.
-
-Abraços,`,
+Abraços.`,
     },
     {
-      subjects: [
-        "Acordos anuais de campanhas - ADEQ",
-        "Acordo anual de campanhas - ADEQ",
-        "Acordos anuais para campanhas publicitárias - ADEQ",
-      ],
-      body: `Olá,
+      subjects: ["Campanhas de display e vídeo - ADEQ", "Contato do responsável - ADEQ", "Display e vídeo para {{domain}} - ADEQ"],
+      body: `Bom dia.
 
-Antes de te mandar uma mensagem longa, uma pergunta — tem algum parceiro de publicidade ou formato hoje em {{domain}} que não está rendendo como esperavam, ou que já estão pensando em mudar?
+Poderiam me passar o contato do responsável pelo site?
 
-Gostaria muito de conversar para analisar opções de negócio, acredito que podemos fazer um bom dinheiro juntos encontrando o formato certo.
+É para conversar sobre algumas campanhas de display e vídeo que teríamos interesse em incluir no seu site.
 
-Abraços,`,
+Obrigado`,
     },
   ],
 
   // ── ITALIANO ───────────────────────────────────────────────
   it: [
     {
-      subjects: [
-        "Campagne Video - ADEQ",
-        "Campagne Video attive - ADEQ",
-        "Video per {{domain}} - ADEQ",
-      ],
-      body: `Ciao, come stai?
+      subjects: ["Pubblicità su {{domain}} - ADEQ", "Chi gestisce gli annunci? - ADEQ", "Contatto pubblicità - ADEQ"],
+      body: `Ciao!
 
-Ho visto {{domain}} e prima di scriverti una mail lunga, ti faccio una domanda rapida — sei tu chi gestisce la monetizzazione del sito, o conviene parlare con qualcun altro?
+È questa l'email di chi gestisce la pubblicità del sito {{domain}}?
 
-Sono "{{sender_name}}" di ADEQ, e visto che lavoriamo con publisher aiutando a migliorare la monetizzazione, volevo mettermi in contatto con la persona responsabile.
+Sono dell'area vendite di ADEQ Media, e volevo mettermi in contatto con la persona responsabile per proporvi alcune campagne che ci piacerebbe monetizzare con voi.
 
-Aspetto un tuo riscontro,`,
+Fammi sapere.`,
     },
     {
-      subjects: [
-        "Responsabile della monetizzazione? Parliamo di ads",
-        "Sei il responsabile della monetizzazione? Parliamo di ads",
-        "Chi gestisce la monetizzazione? Parliamone",
-      ],
-      body: `Ciao.
+      subjects: ["Campagne video attive - ADEQ", "Video per {{domain}} - ADEQ", "Campagne video - ADEQ"],
+      body: `Ciao, ti scrivo da ADEQ Media. Abbiamo campagne video attive (in-stream e out-stream) che stanno funzionando molto bene su siti come il tuo.
 
-So che ricevi tante mail, quindi cerco di essere breve. Volevo parlare con chi gestisce la parte pubblicitaria per poterci unire come partner di monetizzazione.
+Potresti passarmi il WhatsApp o il contatto della persona che si occupa delle implementazioni o della monetizzazione?
 
-L'idea è di aggiungerci allo stack attuale, senza sostituire nulla. Senza esclusiva, senza permanenza minima.
+Grazie mille, aspetto il contatto per scrivervi.
 
-Cosa ne pensi? Possiamo parlare di formati che potrebbero andare bene per il tuo sito?
-
-Se ti interessa, resto in attesa di un tuo riscontro e ne parliamo.
-
-Saluti,`,
+Saluti.`,
     },
     {
-      subjects: [
-        "Accordi annuali per campagne - ADEQ",
-        "Accordo annuale per campagne - ADEQ",
-        "Accordi annuali per campagne pubblicitarie - ADEQ",
-      ],
-      body: `Ciao,
+      subjects: ["Campagne display e video - ADEQ", "Contatto del responsabile - ADEQ", "Display e video per {{domain}} - ADEQ"],
+      body: `Buongiorno.
 
-Prima di scriverti un messaggio lungo, una domanda — c'è qualche partner pubblicitario o formato oggi su {{domain}} che non sta rendendo come si aspettavano, o che state già pensando di cambiare?
+Potreste passarmi il contatto del responsabile del sito?
 
-Mi piacerebbe parlare per analizzare opzioni di business, credo davvero che possiamo fare buoni soldi insieme trovando il formato giusto.
+È per parlare di alcune campagne display e video che ci interesserebbe includere sul vostro sito.
 
-Saluti,`,
+Grazie`,
     },
   ],
 
   // ── ÁRABE ──────────────────────────────────────────────────
   ar: [
     {
-      subjects: [
-        "حملات فيديو - ADEQ",
-        "حملات فيديو نشطة - ADEQ",
-        "فيديو لـ {{domain}} - ADEQ",
-      ],
-      body: `مرحباً، كيف حالك؟
+      subjects: ["الإعلانات على {{domain}} - ADEQ", "من يدير الإعلانات؟ - ADEQ", "جهة اتصال الإعلانات - ADEQ"],
+      body: `مرحباً!
 
-شاهدت موقع {{domain}}، وقبل أن أرسل لك بريداً مطولاً، لدي سؤال سريع — هل أنت المسؤول عن تحقيق الدخل من الموقع، أم يجدر بي التواصل مع شخص آخر؟
+هل هذا هو بريد الشخص المسؤول عن الإعلانات في موقع {{domain}}؟
 
-أنا "{{sender_name}}" من شركة ADEQ. نظراً لأننا نعمل مع الناشرين لمساعدتهم في تحسين تحقيق الدخل، أردت التواصل مع الشخص المسؤول.
+أنا من قسم المبيعات في ADEQ Media، وأردت التواصل مع الشخص المسؤول لأعرض عليكم بعض الحملات التي يسعدنا تحقيق الدخل منها معكم.
 
-في انتظار ردك،`,
+في انتظار ردك.`,
     },
     {
-      subjects: [
-        "المسؤول عن تحقيق الدخل؟ لنتحدث عن الإعلانات",
-        "هل أنت المسؤول عن تحقيق الدخل؟ لنتحدث عن الإعلانات",
-        "من يدير تحقيق الدخل؟ لنتحدث عن الإعلانات",
-      ],
-      body: `مرحباً.
+      subjects: ["حملات فيديو نشطة - ADEQ", "فيديو لـ {{domain}} - ADEQ", "حملات فيديو - ADEQ"],
+      body: `مرحباً، أكتب إليك من ADEQ Media. لدينا حملات فيديو نشطة (in-stream و out-stream) تحقق نتائج ممتازة على مواقع مثل موقعك.
 
-أعلم أنك تتلقى الكثير من الرسائل، لذا سأكون مختصراً. أردت التحدث مع الشخص المسؤول عن الإعلانات لكي ننضم كشريك في تحقيق الدخل.
+هل يمكنكم تزويدي برقم واتساب أو بيانات التواصل مع الشخص المسؤول عن التنفيذ أو تحقيق الدخل؟
 
-الفكرة هي أن نضيف قيمة إلى المنظومة الحالية، دون استبدال أي شيء. بدون حصرية، بدون التزام بمدة أدنى.
+شكراً جزيلاً، بانتظار المعلومات للتواصل معكم.
 
-ما رأيك؟ هل نتحدث حول الصيغ التي قد تكون مناسبة لموقعك؟
-
-إذا كان الأمر يهمك، أنتظر ردك ونتحدث.
-
-تحياتي،`,
+مع التحية.`,
     },
     {
-      subjects: [
-        "اتفاقيات سنوية للحملات - ADEQ",
-        "اتفاقية سنوية للحملات - ADEQ",
-        "اتفاقيات سنوية للحملات الإعلانية - ADEQ",
-      ],
-      body: `مرحباً،
+      subjects: ["حملات عرض وفيديو - ADEQ", "التواصل مع المسؤول - ADEQ", "عرض وفيديو لـ {{domain}} - ADEQ"],
+      body: `صباح الخير.
 
-قبل أن أرسل لك رسالة مطولة، لدي سؤال — هل يوجد لديك شريك إعلاني أو صيغة إعلانية على {{domain}} حالياً لا تحقق النتائج المتوقعة، أو تفكرون في تغييرها؟
+هل يمكنكم تزويدي ببيانات التواصل مع المسؤول عن الموقع؟
 
-أود التحدث معك لاستكشاف الفرص التجارية، أعتقد حقاً أننا يمكن أن نحقق نتائج جيدة معاً إذا وجدنا الصيغة المناسبة.
+الأمر يتعلق بالتحدث حول بعض حملات العرض (display) والفيديو التي نود تضمينها في موقعكم.
 
-تحياتي،`,
+شكراً`,
     },
   ],
 };

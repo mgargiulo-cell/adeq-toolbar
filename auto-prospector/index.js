@@ -7015,31 +7015,13 @@ async function pickAnyTemplate(token, userEmail, language) {
     source: "db_draft",
   }));
 
-  const pool = [...baked, ...dbDrafts];
+  // Maxi 2026-07-08: el pool del agente = los DB drafts (los MISMOS que el MB ve/edita
+  // en Analysis) — así NO se duplica con los baked. Baked queda solo como fallback si la
+  // DB no tiene drafts. Selección UNIFORME 33/33/33 entre los 3 borradores (el user pidió
+  // reparto parejo, NO ponderado por open-rate). Con 3 defaults → ~33% cada uno.
+  const pool = dbDrafts.length > 0 ? dbDrafts : baked;
   if (pool.length === 0) return { template: null, templateId: null };
-
-  // 2. Scores (open rate Laplace-smoothed + warmup bonus para templates nuevos)
-  // El bonus de exploración hace que templates con <30 envíos reciban más turnos
-  // hasta acumular data confiable. Después de 30 envíos, la fórmula Laplace pura
-  // toma protagonismo y el peso converge al open rate real.
-  const scores = await _getTemplateScores(token).catch(() => new Map());
-  const WARMUP_SENDS = 30;
-  const weighted = pool.map(t => {
-    const s = scores.get(t.id) || { sends: 0, opens: 0 };
-    const smoothedRate = (s.opens + 1) / (s.sends + 2);
-    // Warmup: si tiene < 30 sends, bonus proporcional. Decae linealmente.
-    const warmupBonus = Math.max(0, (WARMUP_SENDS - s.sends) / WARMUP_SENDS) * 0.3;
-    return { ...t, weight: smoothedRate + warmupBonus };
-  });
-
-  // 3. Weighted random pick
-  const totalWeight = weighted.reduce((sum, t) => sum + t.weight, 0);
-  let r = Math.random() * totalWeight;
-  let picked = weighted[weighted.length - 1];
-  for (const t of weighted) {
-    r -= t.weight;
-    if (r <= 0) { picked = t; break; }
-  }
+  const picked = pool[Math.floor(Math.random() * pool.length)];
 
   return {
     template: { body: picked.body, subjects: picked.subjects },

@@ -1,12 +1,11 @@
--- Seed de borradores default (3 × 5 idiomas = 15 templates).
+-- Seed de borradores default (3 × 5 idiomas = 15 templates) — Maxi 2026-07-08.
 -- user_email='_default_' los marca como compartidos para todos los users.
--- Cada usuario los ve en getPitchDrafts() y al editarlos crea su propia copia
--- privada (porque el INSERT/UPDATE va con user_email=su email).
+-- MISMO contenido que auto-prospector/templates.js (baked del agente). Sincronizar ambos.
 --
--- Tono: informal, directo, sin formalidades. {{domain}} se reemplaza al cargar.
--- Priority 1 = el más corto (preguntando por el dueño) → se autocarga.
--- Priority 2 = video.
--- Priority 3 = header bidding.
+-- B1 (priority 1): identificar al encargado de los anuncios ("¿este es el correo de...?")
+-- B2 (priority 2): campañas de video (in-stream/out-stream) + pedir contacto/whatsapp
+-- B3 (priority 3): campañas de display y video + pedir contacto del encargado
+-- {{domain}} se reemplaza al cargar. Priority 1 = se autocarga.
 
 -- Limpieza previa (idempotente — corré este script las veces que quieras)
 DELETE FROM toolbar_pitch_drafts WHERE user_email = '_default_';
@@ -14,116 +13,163 @@ DELETE FROM toolbar_pitch_drafts WHERE user_email = '_default_';
 INSERT INTO toolbar_pitch_drafts (user_email, name, language, subject, body, priority, is_default, updated_at) VALUES
 
 -- ─── ESPAÑOL ─────────────────────────────────────────────────
-('_default_', 'ES · Owner directo',  'es', 'Hablamos?',
- 'Hola! Vi {{domain}} y queria preguntarte si sos vos quien maneja las pautas publicitarias del sitio, o si me podes pasar el contacto del que decide.
+('_default_', 'ES · Encargado anuncios', 'es', 'Publicidad en {{domain}} - ADEQ',
+ 'Hola!
 
-Soy de ADEQ Media, trabajamos con publishers monetizando inventario. Quiero ver si te puedo sumar algo.
+Este es el correo de quien maneja los anuncios de la web de {{domain}}?
+
+Soy del área de ventas de ADEQ Media, y me quería poner en contacto con la persona encargada para ofrecerles unas campañas que nos gustaría monetizar con ustedes.
 
 Cualquier cosa avisame.',
  1, true, NOW()),
 
-('_default_', 'ES · Video',          'es', 'Campañas de video para {{domain}}',
- 'Hola, te escribo de ADEQ Media. Tenemos campañas de video activas (in-stream y out-stream) que andan muy bien con sitios como {{domain}}.
+('_default_', 'ES · Video', 'es', 'Campañas de video para {{domain}} - ADEQ',
+ 'Hola, te escribo de ADEQ Media. Tenemos campañas de video activas (in-stream y out-stream) que están funcionando muy bien en websites como el tuyo.
 
-CPMs decentes, fill alto, sin pisarte la UX. Si te interesa te paso un breakdown rápido.
+¿Me podrían pasar el whatsapp o contacto de la persona que se encarga de manejar las implementaciones o monetización?
 
-Decime y te mando los detalles.',
+Muchas gracias, espero el dato para escribirles.
+
+Saludos.',
  2, true, NOW()),
 
-('_default_', 'ES · Header Bidding', 'es', 'Header bidding en {{domain}}',
- 'Hola, soy de ADEQ. Vi que {{domain}} tiene buen tráfico y queria preguntarte si ya estás corriendo header bidding o si lo manejas todo via Google directo.
+('_default_', 'ES · Display y Video', 'es', 'Campañas de display y video - ADEQ',
+ 'Buen día.
 
-Tenemos un setup que suele levantar 15-30% del eCPM sin tocar la integración actual. Si te quedan minutos te muestro como.',
+¿Me podrían pasar el contacto del encargado del website?
+
+Es para poder conversar sobre unas campañas de display y video, que nos interesaría poder incluirlas en su sitio web.
+
+Gracias',
  3, true, NOW()),
 
 -- ─── ENGLISH ─────────────────────────────────────────────────
-('_default_', 'EN · Owner directo',  'en', 'Quick question about {{domain}}',
- 'Hi! Quick one — are you the person handling ad sales / monetization at {{domain}}, or can you point me to whoever does?
+('_default_', 'EN · Ad manager', 'en', 'Advertising on {{domain}} - ADEQ',
+ 'Hi!
 
-I''m with ADEQ Media, we work with publishers on yield. Want to see if there''s a fit.
+Is this the email of the person who handles advertising on {{domain}}?
 
-Let me know!',
+I''m from the sales team at ADEQ Media, and I wanted to get in touch with the person in charge to offer you some campaigns we''d love to monetize with you.
+
+Let me know.',
  1, true, NOW()),
 
-('_default_', 'EN · Video',          'en', 'Video demand for {{domain}}',
- 'Hey, reaching out from ADEQ Media. We''ve got live video campaigns (in-stream + out-stream) running well on sites like {{domain}}.
+('_default_', 'EN · Video', 'en', 'Active video campaigns for {{domain}} - ADEQ',
+ 'Hi, I''m reaching out from ADEQ Media. We have active video campaigns (in-stream and out-stream) that are performing really well on sites like yours.
 
-Solid CPMs, high fill, no impact on your UX. Happy to share a quick breakdown if it''s useful.
+Could you pass me the WhatsApp or contact of the person who handles implementations or monetization?
 
-Just say the word.',
+Thanks a lot, I''ll wait for the details to get in touch.
+
+Best.',
  2, true, NOW()),
 
-('_default_', 'EN · Header Bidding', 'en', 'Header bidding on {{domain}}',
- 'Hi — ADEQ here. Saw {{domain}} pulls solid traffic, was curious whether you already have header bidding set up or if it''s mostly Google direct.
+('_default_', 'EN · Display & Video', 'en', 'Display and video campaigns - ADEQ',
+ 'Good morning.
 
-We have a stack that usually lifts eCPM 15-30% without touching the existing integration. Can walk you through it in 10 min if relevant.',
- 3, true, NOW()),
+Could you pass me the contact of the person in charge of the website?
 
--- ─── ITALIANO ────────────────────────────────────────────────
-('_default_', 'IT · Owner diretto',  'it', 'Una domanda veloce su {{domain}}',
- 'Ciao! Domanda veloce — sei tu che gestisci la monetizzazione pubblicitaria di {{domain}}, o puoi passarmi il contatto giusto?
+It''s to discuss some display and video campaigns that we''d be interested in including on your site.
 
-Sono di ADEQ Media, lavoriamo con publisher sul rendimento dell''inventario. Vorrei capire se c''è spazio per collaborare.
-
-Fammi sapere!',
- 1, true, NOW()),
-
-('_default_', 'IT · Video',          'it', 'Campagne video per {{domain}}',
- 'Ciao, ti scrivo da ADEQ Media. Abbiamo campagne video attive (in-stream e out-stream) che funzionano bene su siti come {{domain}}.
-
-CPM decenti, fill alto, senza impatto sulla UX. Se ti interessa ti mando un breakdown veloce.
-
-Dimmi tu.',
- 2, true, NOW()),
-
-('_default_', 'IT · Header Bidding', 'it', 'Header bidding su {{domain}}',
- 'Ciao, sono di ADEQ. Ho visto che {{domain}} ha buon traffico, ti volevo chiedere se hai già header bidding attivo o se vai principalmente con Google diretto.
-
-Abbiamo un setup che alza l''eCPM del 15-30% senza toccare l''integrazione attuale. Se hai 10 minuti te lo spiego.',
+Thanks',
  3, true, NOW()),
 
 -- ─── PORTUGUÊS ───────────────────────────────────────────────
-('_default_', 'PT · Owner direto',   'pt', 'Pergunta rápida sobre {{domain}}',
- 'Oi! Pergunta rápida — você é quem gerencia a monetização de anúncios em {{domain}}, ou pode me passar o contato certo?
+('_default_', 'PT · Responsável anúncios', 'pt', 'Publicidade em {{domain}} - ADEQ',
+ 'Olá!
 
-Sou da ADEQ Media, trabalhamos com publishers em yield. Quero ver se faz sentido.
+Este é o email de quem cuida da publicidade do site {{domain}}?
 
-Me avisa!',
+Sou da área de vendas da ADEQ Media, e queria entrar em contato com a pessoa responsável para oferecer algumas campanhas que gostaríamos de monetizar com vocês.
+
+Qualquer coisa, me avisa.',
  1, true, NOW()),
 
-('_default_', 'PT · Video',          'pt', 'Campanhas de vídeo para {{domain}}',
- 'Oi, te escrevo da ADEQ Media. Temos campanhas de vídeo ativas (in-stream e out-stream) rodando bem em sites como {{domain}}.
+('_default_', 'PT · Video', 'pt', 'Campanhas de vídeo para {{domain}} - ADEQ',
+ 'Olá, escrevo da ADEQ Media. Temos campanhas de vídeo ativas (in-stream e out-stream) que estão funcionando muito bem em sites como o seu.
 
-CPMs decentes, fill alto, sem prejudicar a UX. Se te interessar mando um breakdown rápido.
+Poderiam me passar o WhatsApp ou contato da pessoa que cuida das implementações ou monetização?
 
-Me fala.',
+Muito obrigado, aguardo o dado para entrar em contato.
+
+Abraços.',
  2, true, NOW()),
 
-('_default_', 'PT · Header Bidding', 'pt', 'Header bidding em {{domain}}',
- 'Oi, ADEQ aqui. Vi que {{domain}} tem bom tráfego, queria perguntar se você já tem header bidding rodando ou se vai principalmente via Google direto.
+('_default_', 'PT · Display e Video', 'pt', 'Campanhas de display e vídeo - ADEQ',
+ 'Bom dia.
 
-Temos um setup que costuma subir 15-30% do eCPM sem mexer na integração atual. Se tiver 10 min te mostro como.',
+Poderiam me passar o contato do responsável pelo site?
+
+É para conversar sobre algumas campanhas de display e vídeo que teríamos interesse em incluir no seu site.
+
+Obrigado',
+ 3, true, NOW()),
+
+-- ─── ITALIANO ────────────────────────────────────────────────
+('_default_', 'IT · Responsabile ads', 'it', 'Pubblicità su {{domain}} - ADEQ',
+ 'Ciao!
+
+È questa l''email di chi gestisce la pubblicità del sito {{domain}}?
+
+Sono dell''area vendite di ADEQ Media, e volevo mettermi in contatto con la persona responsabile per proporvi alcune campagne che ci piacerebbe monetizzare con voi.
+
+Fammi sapere.',
+ 1, true, NOW()),
+
+('_default_', 'IT · Video', 'it', 'Campagne video per {{domain}} - ADEQ',
+ 'Ciao, ti scrivo da ADEQ Media. Abbiamo campagne video attive (in-stream e out-stream) che stanno funzionando molto bene su siti come il tuo.
+
+Potresti passarmi il WhatsApp o il contatto della persona che si occupa delle implementazioni o della monetizzazione?
+
+Grazie mille, aspetto il contatto per scrivervi.
+
+Saluti.',
+ 2, true, NOW()),
+
+('_default_', 'IT · Display e Video', 'it', 'Campagne display e video - ADEQ',
+ 'Buongiorno.
+
+Potreste passarmi il contatto del responsabile del sito?
+
+È per parlare di alcune campagne display e video che ci interesserebbe includere sul vostro sito.
+
+Grazie',
  3, true, NOW()),
 
 -- ─── ARABIC ──────────────────────────────────────────────────
-('_default_', 'AR · Owner directo',  'ar', 'سؤال سريع عن {{domain}}',
- 'مرحبا! سؤال سريع — هل أنت المسؤول عن تحقيق الدخل من الإعلانات في {{domain}}، أو يمكنك توجيهي للشخص المناسب؟
+('_default_', 'AR · Ad manager', 'ar', 'الإعلانات على {{domain}} - ADEQ',
+ 'مرحباً!
 
-أنا من ADEQ Media، نعمل مع الناشرين على تحسين العائد. أريد أن أرى إن كان هناك توافق.
+هل هذا هو بريد الشخص المسؤول عن الإعلانات في موقع {{domain}}؟
 
-أخبرني!',
+أنا من قسم المبيعات في ADEQ Media، وأردت التواصل مع الشخص المسؤول لأعرض عليكم بعض الحملات التي يسعدنا تحقيق الدخل منها معكم.
+
+في انتظار ردك.',
  1, true, NOW()),
 
-('_default_', 'AR · Video',          'ar', 'حملات فيديو لموقع {{domain}}',
- 'مرحبا، أكتب لك من ADEQ Media. لدينا حملات فيديو نشطة (in-stream و out-stream) تعمل بشكل جيد مع مواقع مثل {{domain}}.
+('_default_', 'AR · Video', 'ar', 'حملات فيديو لموقع {{domain}} - ADEQ',
+ 'مرحباً، أكتب إليك من ADEQ Media. لدينا حملات فيديو نشطة (in-stream و out-stream) تحقق نتائج ممتازة على مواقع مثل موقعك.
 
-CPM جيدة، fill عالٍ، بدون تأثير على تجربة المستخدم. إذا كان يهمك أرسل لك تفاصيل سريعة.
+هل يمكنكم تزويدي برقم واتساب أو بيانات التواصل مع الشخص المسؤول عن التنفيذ أو تحقيق الدخل؟
 
-أخبرني.',
+شكراً جزيلاً، بانتظار المعلومات للتواصل معكم.
+
+مع التحية.',
  2, true, NOW()),
 
-('_default_', 'AR · Header Bidding', 'ar', 'Header bidding في {{domain}}',
- 'مرحبا، ADEQ هنا. لاحظت أن {{domain}} يحقق ترافيك جيد، أردت أن أسألك إذا كان لديك header bidding مفعل أم تعتمد بشكل أساسي على Google المباشر.
+('_default_', 'AR · Display y Video', 'ar', 'حملات عرض وفيديو - ADEQ',
+ 'صباح الخير.
 
-لدينا إعداد يرفع eCPM عادة بنسبة 15-30% دون المساس بالتكامل الحالي. إذا كان لديك 10 دقائق أوضح لك كيف.',
+هل يمكنكم تزويدي ببيانات التواصل مع المسؤول عن الموقع؟
+
+الأمر يتعلق بالتحدث حول بعض حملات العرض (display) والفيديو التي نود تضمينها في موقعكم.
+
+شكراً',
  3, true, NOW());
+
+-- ── 33/33/33 puro: que el agente mande SOLO los 3 borradores, sin el 20% Claude.
+--    (Poné 20 de nuevo si querés reactivar la variedad con IA.)
+UPDATE toolbar_config SET value = '0' WHERE key = 'agent_claude_percent';
+INSERT INTO toolbar_config (key, value)
+  SELECT 'agent_claude_percent', '0'
+  WHERE NOT EXISTS (SELECT 1 FROM toolbar_config WHERE key = 'agent_claude_percent');
