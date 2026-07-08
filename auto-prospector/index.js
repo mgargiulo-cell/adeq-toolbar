@@ -3820,8 +3820,14 @@ function _stripScrapePrefix(email) {
     // Solo limpiar si la versión strip es una palabra reconocible (rol/keyword común)
     // o tiene patrón firstname normal sin la mayúscula al inicio.
     const KNOWN_LOCAL = /^(publicidade|publicidad|contato|contatto|contact|contacto|info|hola|atendimento|suporte|soporte|prensa|press|imprensa|sales|ventas|marketing|comercial|info|hello|hi|news|press|admin|director|gerente|owner|founder|ceo|cto|editor|redaccion|redacao)/i;
-    const FIRSTNAME = /^[a-z]{3,12}$/i; // single lowercase word that could be firstname
-    if (KNOWN_LOCAL.test(stripped) || FIRSTNAME.test(stripped)) {
+    // Maxi 2026-07-08: ELIMINADO el branch FIRSTNAME (/^[a-z]{3,12}$/) — era la CAUSA RAÍZ
+    // de los locals mutilados vistos en prod (Search→earch, Values→alues, Contact→ontact,
+    // Research→esearch): strippeaba la 1ra letra de CUALQUIER palabra capitalizada real, no
+    // solo de un stray "C" pegado de "Contato:". Ahora solo se strippea si el remanente es un
+    // ROL CONOCIDO (Cpublicidade→publicidade, Cinfo→info), único caso inequívoco de prefijo
+    // basura. Un firstname legítimo mal-pegado ("Cluciano") se pierde, pero eso es MUCHO menos
+    // dañino que mutilar palabras válidas (regla del dueño: no mutilar emails reales).
+    if (KNOWN_LOCAL.test(stripped)) {
       return `${stripped}@${domain}`;
     }
   }
@@ -3843,7 +3849,11 @@ const JUNK_LOCAL_RE = /^(dominios?|domainoperations|tldadmin|hostmaster|registra
 // (ej "tenmien.intecom", "admin-domaines-internet", "tdns").
 const JUNK_LOCAL_TOKENS = /(^|[._-])(tenmien|tdns|dns|domain|domains|domaines|hostmaster|registrar|tldadmin|abuse|noc|nic)([._-]|$)/i;
 // Placeholders de plantilla / buzones técnicos que nunca son contacto real.
-const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$)/i;
+// Maxi 2026-07-08: ampliado con placeholders de NOMBRE de plantilla en varios idiomas
+// (vistos en prod, ej vorname.name@weltwoche.ch = "nombre.apellido" en alemán). Separador
+// "." o "_". Un email con local "vorname.name"/"firstname.lastname"/etc. es una plantilla sin
+// rellenar, jamás un contacto real.
+const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$)/i;
 // Dominios de webmail (gmail, hotmail, etc. en cualquier TLD).
 const WEBMAIL_RE = /^(gmail|hotmail|outlook|live|yahoo|ymail|icloud|proton|protonmail|gmx|aol|msn|mail)\./i;
 
@@ -3888,8 +3898,13 @@ function _cleanScrapedEmails(list, leadDomain) {
     // Basura por dominio: registradores/WHOIS
     if (JUNK_EMAIL_DOMAINS.has(dom)) continue;
     const isLeadDomain     = dom === core || dom.endsWith("." + core) || core.endsWith("." + dom);
-    const isPersonalWebmail = WEBMAIL_RE.test(dom) && _looksLikePerson(local);
-    // Solo el dominio del lead, o un webmail que parece persona. Lo demás (ajenos) fuera.
+    // Maxi 2026-07-08: gmail/hotmail/outlook/yahoo/etc. PUEDEN ser el contacto real del sitio
+    // (el dueño lo aclaró explícitamente) → aceptar CUALQUIER webmail no-placeholder, sin
+    // exigir que "parezca persona". Los locals placeholder/junk/registro ya se filtraron arriba
+    // (JUNK_LOCAL_RE / PLACEHOLDER_LOCAL). rankEmail después penaliza webmail/genérico pero NO
+    // lo descarta — así no perdemos un contacto real solo por venir de un dominio genérico.
+    const isPersonalWebmail = WEBMAIL_RE.test(dom);
+    // Solo el dominio del lead, o cualquier webmail no-placeholder. Lo demás (ajenos) fuera.
     if (core && !isLeadDomain && !isPersonalWebmail) continue;
     seen.add(e);
     valid.push(e);
@@ -4583,11 +4598,19 @@ function _detectLangFromText(text) {
     scores[lang] = m ? m.length : 0;
     total += scores[lang];
   }
-  // Bonus por caracteres únicos (señal muy fuerte)
-  if (/[ñáéíóúü¿¡]/.test(text)) scores.es = (scores.es || 0) + 8;
-  if (/[ãõçàáâ]/.test(text))    scores.pt = (scores.pt || 0) + 8;
-  if (/[àèéìòù]/.test(text))    scores.it = (scores.it || 0) + 5;
-  if (/[äöüß]/.test(text))      scores.de = (scores.de || 0) + 5;
+  // Maxi 2026-07-08: bonus de acento GATEADO — solo REFUERZA una señal de stopword ya
+  // existente, NO crea un ganador de la nada. Antes: á/é/í/ó/ú/ü (compartidos por checo,
+  // polaco, eslovaco, húngaro, turco, etc.) inflaban es/pt/it falsos y se volvían el voto
+  // ganador en sitios de idiomas NO soportados. Chars REALMENTE distintivos de un idioma
+  // (ñ/¿/¡ = español; ã/õ = portugués; ß = alemán) mantienen bonus fuerte SIEMPRE porque
+  // casi no existen fuera de ese idioma; los compartidos solo suman si YA hay stopwords.
+  if (/[ñ¿¡]/.test(text))                          scores.es = (scores.es || 0) + 8; // casi únicos del es
+  else if (scores.es > 0 && /[áéíóúü]/.test(text)) scores.es += 8;                    // compartidos: refuerzo
+  if (/[ãõ]/.test(text))                           scores.pt = (scores.pt || 0) + 8; // casi únicos del pt
+  else if (scores.pt > 0 && /[çàáâ]/.test(text))   scores.pt += 8;                    // compartidos: refuerzo
+  if (scores.it > 0 && /[àèéìòù]/.test(text))      scores.it += 5;                    // it no tiene chars únicos
+  if (/ß/.test(text))                              scores.de = (scores.de || 0) + 5; // ß casi único del de
+  else if (scores.de > 0 && /[äöü]/.test(text))    scores.de += 5;                    // compartidos: refuerzo
   if (total < 5) return { lang: null, confidence: "low", scores };
   const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
   const top = sorted[0];
@@ -4682,6 +4705,23 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
     return _domainLangCache.get(cleanDomain);
   }
 
+  // Maxi 2026-07-08: cierre unificado — aplica la REGLA DURA (lang SIEMPRE en
+  // SUPPORTED_AGENT_LANGS, ante cualquier duda → en), cachea y devuelve. Evita duplicar
+  // el cacheo en los múltiples early-returns (incl. el fallback de idioma no soportado).
+  const finish = (result) => {
+    if (!result.lang || !SUPPORTED_AGENT_LANGS.has(result.lang)) {
+      result = { ...result, lang: "en", source: (result.source || "") + "→en_hardrule" };
+    }
+    if (cleanDomain && hasFullData) {
+      if (_domainLangCache.size >= DOMAIN_LANG_CACHE_MAX) {
+        const firstKey = _domainLangCache.keys().next().value;
+        _domainLangCache.delete(firstKey);
+      }
+      _domainLangCache.set(cleanDomain, result);
+    }
+    return result;
+  };
+
   // Recolectar votos: cada signal aporta peso al lang detectado.
   const votes = {}; // lang → puntaje
   const reasons = [];
@@ -4693,6 +4733,16 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
 
   // 1) Texto heurístico (más confiable — lo que el publisher escribió)
   const textRes = _detectLangFromText(textSample || "");
+  // Maxi 2026-07-08: si el TEXTO detecta CLARAMENTE un idioma NO soportado (de/fr/otro)
+  // con confianza media/alta, es señal de que el sitio NO está en uno de nuestros 5 idiomas
+  // → EN directo. Antes: un textRes.lang no soportado lo rechazaba addVote() y el resultado
+  // caía a señales débiles (geo/tld) o al voto de acento equivocado → es/pt/it falso. Regla
+  // del dueño: todo lo que no sea {en,es,pt,ar,it} se manda en INGLÉS.
+  if (textRes.lang && !SUPPORTED_AGENT_LANGS.has(textRes.lang) &&
+      (textRes.confidence === "high" || textRes.confidence === "medium")) {
+    return finish({ lang: "en", source: "unsupported_fallback", confidence: "high",
+                    reasons: [`text_unsupported:${textRes.lang}(${textRes.confidence})`] });
+  }
   if (textRes.lang) {
     const weight = textRes.confidence === "high" ? 10 : textRes.confidence === "medium" ? 6 : 3;
     addVote(textRes.lang, weight, `text(${textRes.confidence})`);
@@ -4745,22 +4795,19 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
       if (claudeAns) {
         result = { lang: claudeAns, source: "claude_arbiter", confidence: "high", reasons: [...reasons, `claude:${claudeAns}`] };
       } else {
-        result = { lang: winner[0], source: "voting", confidence, reasons };
+        // Maxi 2026-07-08: el árbitro devolvió null (Claude dijo un idioma NO soportado —
+        // de/fr/other — o hubo error). En baja confianza NO caemos al winner dudoso (voto de
+        // acento/geo equivocado): el fallback CORRECTO es EN. Antes esto mandaba pt/es/it falso.
+        result = { lang: "en", source: "arbiter_null_fallback", confidence: "low",
+                   reasons: [...reasons, "claude_null→en"] };
       }
     } else {
       result = { lang: winner[0], source: "voting", confidence, reasons };
     }
   }
 
-  // Cache SOLO si fue invocación con full data (textSample) — no las heuristics chea
-  if (cleanDomain && hasFullData) {
-    if (_domainLangCache.size >= DOMAIN_LANG_CACHE_MAX) {
-      const firstKey = _domainLangCache.keys().next().value;
-      _domainLangCache.delete(firstKey);
-    }
-    _domainLangCache.set(cleanDomain, result);
-  }
-  return result;
+  // Maxi 2026-07-08: cierre unificado (regla dura SUPPORTED-only + cache) vía finish().
+  return finish(result);
 }
 
 // ── Blocklist para autopilot — evita dominios que no son targets válidos ───
@@ -8110,6 +8157,11 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       .map(x => (x.source === "manual" && x.score < 0) ? { ...x, score: 0 } : x)
       .filter(x => x.score >= 0)
       .sort((a, b) => {
+        // Maxi 2026-07-08: tier DURO primero — apollo/informer/manual nominal SIEMPRE por
+        // encima de un genérico, ANTES del ranking dinámico. Regla del dueño: decision-maker sí o sí.
+        const ta = _sourceHardTier(a.source);
+        const tb = _sourceHardTier(b.source);
+        if (ta !== tb) return tb - ta;
         const sa = SOURCE_RANK[a.source] || 0;
         const sb = SOURCE_RANK[b.source] || 0;
         if (sa !== sb) return sb - sa;
@@ -10117,10 +10169,16 @@ async function runAgentCycle(token, allFlags) {
         const ranked = _rankedAll
           .filter(x => x.score >= 0)
           .sort((a, b) => {
+            // Maxi 2026-07-08: tier DURO primero — apollo/informer nominal SIEMPRE por encima
+            // de un genérico, ANTES del ranking dinámico aprendido (que podía relegar informer
+            // detrás de un info@ con mejor open-rate). Regla del dueño: usar el decision-maker sí o sí.
+            const ta = _sourceHardTier(a.source);
+            const tb = _sourceHardTier(b.source);
+            if (ta !== tb) return tb - ta;     // nominal > persona > genérico
             const sa = SOURCE_RANK[a.source] || 0;
             const sb = SOURCE_RANK[b.source] || 0;
-            if (sa !== sb) return sb - sa;     // mejor source primero
-            return b.score - a.score;          // dentro del mismo source, mejor rank
+            if (sa !== sb) return sb - sa;     // dentro del tier: ranking dinámico
+            return b.score - a.score;          // desempate final: rankEmail
           });
         let email = ranked[0]?.email;
         const pickedSource = ranked[0]?.source || "";   // attribution para toolbar_source_performance
@@ -10661,6 +10719,23 @@ process.on("SIGINT", () => {
 // ════════════════════════════════════════════════════════════════
 
 const SOURCE_RANK_DEFAULT = { manual: 5, apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+
+// Maxi 2026-07-08: PRIORIDAD DURA de fuente. Un contacto NOMINAL (apollo/informer =
+// decision-maker real, o manual = elección explícita del MB) SIEMPRE se elige antes que un
+// GENÉRICO (info@/contact@), sin importar lo que diga el ranking dinámico aprendido. El 0%
+// de respuesta observado era por IDIOMA equivocado (Fix #1), NO por la fuente. Regla del
+// dueño: si informer/apollo encontró contacto, usarlo sí o sí por encima de genéricos.
+// El ranking dinámico (SOURCE_RANK) sigue operando como DESEMPATE dentro del mismo tier —
+// antes podía relegar un informer detrás de un info@ con mejor open-rate observado.
+//   tier 2 = nominal decision-maker (apollo/informer/manual)
+//   tier 1 = otras fuentes con persona (scrape, redes sociales)
+//   tier 0 = genérico (info@/contact@) y desconocido
+function _sourceHardTier(source) {
+  const s = (source || "").toLowerCase();
+  if (s === "apollo" || s === "informer" || s === "manual") return 2;
+  if (s === "generic" || s === "") return 0;
+  return 1;
+}
 const SOURCE_PERF_WINDOW_DAYS = 30;
 const SOURCE_PERF_MIN_SENT = 50;       // sample mínimo por (mb, source) para usar dinámico
 const SOURCE_PERF_EPSILON = 0.10;      // 10% de las decisiones usan ranking default (exploración)
