@@ -3924,8 +3924,14 @@ function _cleanScrapedEmails(list, leadDomain) {
     // (JUNK_LOCAL_RE / PLACEHOLDER_LOCAL). rankEmail después penaliza webmail/genérico pero NO
     // lo descarta — así no perdemos un contacto real solo por venir de un dominio genérico.
     const isPersonalWebmail = WEBMAIL_RE.test(dom);
-    // Solo el dominio del lead, o cualquier webmail no-placeholder. Lo demás (ajenos) fuera.
-    if (core && !isLeadDomain && !isPersonalWebmail) continue;
+    // Maxi 2026-07-08: aceptar cross-domain si el local es un ROL de contacto de negocio
+    // (publicidade@/comercial@/info@/prensa@...). Los GRUPOS de medios centralizan el contacto
+    // de publicidad en el dominio de la editora — ej. publicidade@caras.com.br para
+    // aventurasnahistoria.com.br (misma Editora Caras). Antes se descartaba → quedaba SIN email.
+    // El junk (noreply/webmaster/registro) ya se filtró arriba; rankEmail después lo puntúa.
+    const isBizRole = GENERIC_LOCAL_RE.test(local);
+    // Solo: dominio del lead, webmail no-placeholder, o rol de negocio cross-domain. El resto fuera.
+    if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole) continue;
     seen.add(e);
     valid.push(e);
   }
