@@ -252,6 +252,8 @@ function resetAnalysisUI() {
   state.pageTitle     = "";
   state.pageDescription = "";
   state.siteFooterText = "";
+  state.nonPublisherType = "";
+  try { renderNonPublisherNotice(); } catch {}   // limpia el aviso del dominio anterior
   state.emails        = [];
   state.pageSocialLinks = []; // Maxi 2026-06-17 v3: limpiar socials del dominio anterior
   state.apolloPeople  = [];
@@ -3248,7 +3250,9 @@ function runAutoFill() {
   }
 
   // ── EMAIL: mejor opción disponible ──────────────────────────
-  const bestEmail = state.emails?.[0] || dup?.email || "";
+  // Maxi 2026-07-09: mejor email por tiering comercial (no el [0] de inserción) → autofill Monday
+  // con publicidad@/comercial@ o el decision-maker de Apollo, según la elección del user (Q4).
+  const bestEmail = _bestEmailByTier(state.emails) || dup?.email || "";
   if (bestEmail) {
     const emailEl = document.getElementById("form-email");
     if (emailEl && !emailEl.value) emailEl.value = bestEmail;
@@ -3808,6 +3812,32 @@ async function runPageContext() {
         // Si no hay footer, usar últimos 3000 chars del body (suelen tener address)
         if (footerText.length < 100) footerText = text.slice(-3000);
 
+        // Maxi 2026-07-09: DETECTOR ESTRUCTURAL de sitio NO-PUBLISHER (por CÓMO está construido).
+        // Solo para AVISAR al MB — no bloquea nada. Paridad con el worker (schema.org @type +
+        // señales de intención: carrito, home-banking, admisiones, reservas, donaciones).
+        let nonPublisherType = "";
+        try {
+          const _h = document.documentElement.innerHTML || "";
+          const cartSel = document.querySelector(
+            '[class*="add-to-cart"],[class*="addtocart"],[id*="add-to-cart"],[href*="/cart"],[href*="/checkout"],[href*="/carrito"],[href*="/carrinho"],[href*="/sepet"]'
+          );
+          if (/"@type"\s*:\s*"(Product|Offer|AggregateOffer|OnlineStore)"/i.test(_h)
+            || /cdn\.shopify\.com|\.myshopify\.com|vtexassets|vteximg|wp-content\/plugins\/woocommerce|nuvemshop|tiendanube|prestashop|bigcommerce|magento_/i.test(_h)
+            || cartSel)
+            nonPublisherType = "online store / e-commerce";
+          else if (/"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i.test(_h)
+            || /online banking|internet banking|home ?banking|banca (en l[íi]nea|online|digital)|abrir (cuenta|conta)|open (a |an |your )?(bank )?account|neobank/i.test(_h))
+            nonPublisherType = "bank / financial services";
+          else if (/"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School)"/i.test(_h)
+            || /admisiones|admissions|matr[íi]cula|vestibular|graduaç|posgrado|pregrado|licenciatura|faculdade|facultad/i.test(_h))
+            nonPublisherType = "university / education";
+          else if (/"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground)"/i.test(_h)
+            || /book (a |your )?(room|stay|hotel|car|flight)|rent a car|car (hire|rental)|alquiler de (coches?|autos?)|reservar (habitaci|hotel|estancia)|pauschalreise|urlaubsangebote/i.test(_h))
+            nonPublisherType = "travel / hotel / car rental";
+          else if (/"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i.test(_h)
+            || /donate now|make a donation|registered charity|hacer una donaci|fundraising|recaudaci[óo]n de fondos/i.test(_h))
+            nonPublisherType = "nonprofit / charity";
+        } catch {}
         return {
           title:    document.title || "",
           lang:     langFull.substring(0, 2),
@@ -3815,6 +3845,7 @@ async function runPageContext() {
           ogLocale: ogLocale.toLowerCase(),
           phoneCodes,
           currencies,
+          nonPublisherType,
           footerText: footerText.slice(0, 5000),
           description: document.querySelector('meta[name="description"]')?.content
                     || document.querySelector('meta[property="og:description"]')?.content
@@ -3830,7 +3861,25 @@ async function runPageContext() {
     state.sitePhoneCodes  = result?.phoneCodes || [];
     state.siteCurrencies  = result?.currencies || [];
     state.siteFooterText  = result?.footerText || "";
+    state.nonPublisherType = result?.nonPublisherType || "";
+    renderNonPublisherNotice();
   } catch { /* sin permisos en esa página */ }
+}
+
+// Maxi 2026-07-09: aviso NO bloqueante — si el sitio abierto NO es un publisher de contenido
+// (tienda/banco/universidad/viajes/ONG), se lo avisa al MB en inglés. El user pidió: "aunque el
+// MB nunca va a abrir bancos, sería bueno que le diga sitio web no recomendado de prospectar".
+function renderNonPublisherNotice() {
+  const el = document.getElementById("nonpub-notice");
+  if (!el) return;
+  const t = state.nonPublisherType;
+  if (t) {
+    el.style.display = "block";
+    el.innerHTML = `⚠️ Website not recommended for prospecting <span style="opacity:.75">(${esc(t)})</span> — not a content publisher.`;
+  } else {
+    el.style.display = "none";
+    el.innerHTML = "";
+  }
 }
 
 // Heurística multi-señal para inferir país cuando SimilarWeb no devuelve nada.
@@ -3923,6 +3972,24 @@ function inferCountryFromPageSignals() {
 function _isGenericEmailLocal(email) {
   const local = String(email || "").split("@")[0].toLowerCase().replace(/[._-]/g, "");
   return /^(info|contact|hello|hi|admin|support|sales|team|press|media|marketing|office|general|ventas|contacto|hola|ayuda|soporte|prensa|comercial|webmaster|enquiries|hr|jobs|careers|noreply|donotreply)$/.test(local);
+}
+// Maxi 2026-07-09: rol de VENTA DE PAUTA/PUBLICIDAD = "mejor opción" para ADEQ (elección user Q4).
+// Regex acotado (no matchea admin/advisor). Paridad con el worker (AD_SALES_LOCAL).
+const _AD_SALES_LOCAL_RE = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|anunci|reklam|iklan|comercial|commercial|ventas|vendas|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|inventory|programmatic|patrocin|sponsor)/i;
+// Tier de SELECCIÓN del email (paridad worker _pickTier): apollo/informer nominal (4) >
+// publicidad@/comercial@/ventas@ scrapeado (3) > persona scrapeada (2) > genérico info@/contacto@ (0).
+function _emailPickTierClient(email) {
+  const src = (state.emailSources.get(email) || "").toLowerCase();
+  if (src === "apollo" || src === "informer") return 4;      // decision-maker verificado
+  const local = String(email || "").toLowerCase().split("@")[0];
+  if (_AD_SALES_LOCAL_RE.test(local)) return 3;              // rol comercial/publicidad
+  if (!_isGenericEmailLocal(email)) return 2;                // persona / rol no-genérico
+  return 0;                                                   // genérico
+}
+function _bestEmailByTier(emails) {
+  const list = (emails || []).filter(Boolean);
+  if (!list.length) return "";
+  return [...list].sort((a, b) => _emailPickTierClient(b) - _emailPickTierClient(a))[0];
 }
 async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
   try {
@@ -4374,13 +4441,10 @@ function renderEmailList(emails) {
     .filter(e => e !== mondayEmail)
     .filter(e => !isGarbageEmail(e));
 
-  // 2. ORDEN: Apollo primero (siempre), después scraping/Gemini/otros.
-  //    Dentro de cada bucket, conservar el orden original.
-  const isApollo = (e) => (state.emailSources.get(e) || "").toLowerCase() === "apollo";
-  const suggested = [
-    ...cleaned.filter(isApollo),
-    ...cleaned.filter(e => !isApollo(e)),
-  ];
+  // 2. ORDEN (Maxi 2026-07-09): tiering comercial (paridad worker). apollo/informer nominal >
+  //    publicidad@/comercial@/ventas@ > persona scrapeada > genérico. Sort estable (Chrome) →
+  //    dentro de cada tier conserva el orden de inserción. Antes solo era "Apollo primero".
+  const suggested = [...cleaned].sort((a, b) => _emailPickTierClient(b) - _emailPickTierClient(a));
 
   // Maxi 2026-06-17 v3: si NO hay emails ni socials, mensaje fallback simple.
   const _socials = Array.isArray(state.pageSocialLinks) ? state.pageSocialLinks : [];

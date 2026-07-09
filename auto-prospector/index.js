@@ -10490,6 +10490,28 @@ async function runAgentCycle(token, allFlags) {
         } else if (email && ranked.length > 1) {
           log(`  ✉️ ${domain}: pickeado ${email} (score=${ranked[0].score}) de ${ranked.length} candidatos`);
         }
+        // Maxi 2026-07-09: BACKUP de TODOS los emails detectados (no solo el elegido) → el MB
+        // compara en SQL qué habría elegido él vs el agente y saca estadísticas para decidir.
+        // Fire-and-forget: NUNCA frena ni rompe el envío. Tabla toolbar_email_picks.
+        if (Array.isArray(emails) && emails.length > 0) {
+          try {
+            const chosenSrc = email ? _normSrc(_sourcesMap[email.toLowerCase()]) : "";
+            const candidates = emails.map(e => {
+              const s = _normSrc(_sourcesMap[e.toLowerCase()]);
+              return { email: e, source: s || "unknown", score: rankEmail(e, domain, lead.category), tier: _pickTier(e, s), bounced: _bouncedSet.has(e.toLowerCase()) };
+            }).sort((a, b) => (b.tier - a.tier) || (b.score - a.score));
+            fetch(`${SUPABASE_URL}/rest/v1/toolbar_email_picks`, {
+              method: "POST",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({
+                domain, lead_id: lead.id || null, mb_email: userEmail || null, category: lead.category || null,
+                chosen_email: email || null, chosen_source: chosenSrc || null,
+                chosen_tier: email ? _pickTier(email, chosenSrc) : null,
+                n_candidates: candidates.length, candidates,
+              }),
+            }).catch(() => {});
+          } catch {}
+        }
         if (!email) {
           log(`  ⏭ ${domain}: SKIP — no_email_after_enrichment (emails encontrados: ${emails.length})`);
           await logAgentAction(token, userEmail, {
