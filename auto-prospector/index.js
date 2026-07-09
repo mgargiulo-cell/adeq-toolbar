@@ -4368,15 +4368,97 @@ async function fetchPageContent(domain) {
     // Sample de texto AMPLIO (10K chars) para análisis heurístico fuerte
     const textSample = (title + " " + desc + " " + html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 10000)).toLowerCase();
 
+    // ── Maxi 2026-07-08: DETECTOR ESTRUCTURAL de TIPO DE SITIO (no-publisher) ────
+    // El user pidió filtrar por CÓMO está construido el sitio (no por categoría/tráfico).
+    // Publishers monetizan con ads; TIENDAS, BANCOS, UNIVERSIDADES y EMPRESAS DE SERVICIOS
+    // NO son targets aunque tengan pixel de retargeting o ads.txt. Se detecta por schema.org
+    // @type (señal FUERTE = 1 basta) + keywords de intención (señal débil = necesita 2).
+    const _hits = (arr) => arr.reduce((n, re) => n + (re.test(html) ? 1 : 0), 0);
+
+    // TIENDA / E-COMMERCE — plataforma + carrito + schema Product/Offer
+    const storeSchema = [
+      /cdn\.shopify\.com|\.myshopify\.com|Shopify\.theme/i,
+      /vteximg|vtexassets|vtexcommercestable|portal\.vtex|\.vtex\./i,
+      /wp-content\/plugins\/woocommerce|woocommerce-/i,
+      /\/skin\/frontend\/|mage\/cookies|Magento_/i,
+      /nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic/i,
+      /"@type"\s*:\s*"(Product|Offer|AggregateOffer|OnlineStore)"/i,
+      /og:type["'][^>]*content=["']product/i,
+    ];
+    const storeKw = [
+      /add[\s-]?to[\s-]?cart|adicionar ao carrinho|a[ñn]adir al carrito|agregar al carrito|sepete ekle|comprar agora|a[ñn]adir a la (cesta|bolsa)|finalizar compra/i,
+      /["'\/](cart|checkout|carrinho|carrito|sepet|basket)["'\/?]/i,
+      /itemprop=["']price["']|class=["'][^"']*(product-price|price-tag|add-to-cart|product-card|product-item)/i,
+    ];
+    // BANCO / FINANCIERA / FINTECH — home-banking, abrir cuenta, productos financieros
+    const bankSchema = [/"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i];
+    const bankKw = [
+      /online banking|internet banking|home ?banking|banca (en l[íi]nea|online|digital|m[óo]vil)|net ?banking|mobile bank|neobank/i,
+      /abr[ai] (sua|tu) conta|abrir (conta|cuenta)|open (a |an |your )?(bank )?account|free bank account|conta corrente|cuenta corriente|acesse sua conta|acceso clientes|ingres[aá] a tu cuenta/i,
+      /tarjeta de cr[ée]dito|cart[ãa]o de cr[ée]dito|debit card|credit card|empr[ée]stimo|pr[ée]stamo|hipoteca|mortgage|financiamento|plazo fijo|caja de ahorro|\bIBAN\b/i,
+    ];
+    // HOTEL / VIAJES / TURISMO / ALQUILER DE AUTOS — reservas
+    // Bucket FUERTE (1 hit = rechazo): schema turístico + frases inequívocas que un publisher
+    // JAMÁS usa (alquiler de autos, paquetes turísticos alemanes, "best rate guarantee").
+    const travelSchema = [
+      /"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i,
+      /car (hire|rental)|rent a car|alquiler de (coches?|autos?|veh[íi]culos?)|alquilar (un |tu )?(coche|auto)/i,
+      /pauschalreise|urlaubsangebote|urlaubsreisen|traumreise|reiseb[üu]ro|hotel buchen|fl[üu]ge (buchen|suchen)/i,
+      /best rate guarantee|mejor tarifa garantizada|book your (stay|room)/i,
+    ];
+    const travelKw = [
+      /book (a |your )?(room|stay|hotel|car|flight)|reserva(r)? (tu |una |ahora)?(habitaci[óo]n|hotel|estancia|coche|auto|vuelo)|check-?in|check-?out|nights? stay|reservar ahora/i,
+      /habitaciones disponibles|disponibilidad de habitaciones|tarifa garantizada|todo incluido|all inclusive|last minute|jetzt buchen/i,
+      /urlaub|reise(n|angebote)?|vacation package|paquete tur[íi]stico|escapada|city break/i,
+    ];
+    // ONG / SIN FINES DE LUCRO — donaciones, causas
+    const npoSchema = [/"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i];
+    const npoKw = [
+      /\bdonate\b|donate now|make a donation|hacer una donaci[óo]n|dona (ahora|hoy)|doe agora|registered charity|charity (number|no)|nº? de registro ben[ée]fico/i,
+      /fundraising|recauda(r|ci[óo]n) de fondos|apoya (nuestra|la) causa|s[ée] voluntario|become a volunteer|nuestra misi[óo]n sin fines de lucro/i,
+    ];
+    // UNIVERSIDAD / EDUCACIÓN — admisiones, carreras, matrícula
+    const eduSchema = [/"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School)"/i];
+    const eduKw = [
+      /admiss[õo]es|admisiones|admissions|matr[íi]cula|vestibular|inscri[çp]/i,
+      /graduaç[ãa]o|p[óo]s-?graduaç[ãa]o|posgrado|pregrado|licenciatura|maestr[íi]a|doctorado|carreras? (universitarias|de grado)|facultad|faculdade/i,
+      /nuestros? (programas|cursos)|oferta acad[ée]mica|vida universitaria|campus (virtual|universitario)|alumnos|estudiantes de grado/i,
+    ];
+    // EMPRESA DE SERVICIOS — presupuesto/demo/contratar servicio (fuzzy → necesita 2)
+    const svcSchema = [/"@type"\s*:\s*"(ProfessionalService|LegalService|Attorney|AccountingService|Dentist|MedicalClinic|HomeAndConstructionBusiness|Plumber|Electrician)"/i];
+    const svcKw = [
+      /solicita(r)? (tu |un )?presupuesto|pide presupuesto|request a (demo|quote)|get a (quote|demo)|solicita una demo|book a (call|demo)/i,
+      /agenda(r)? (una |tu )?(cita|reuni[óo]n|consulta|llamada)|contrata(r)? (nuestros?|el|los) servicios?|contactar? con (un|nuestro) (asesor|comercial|equipo)/i,
+      /nuestros servicios|our services|soluciones (para|empresariales|profesionales)|c[óo]mo trabajamos|casos de [ée]xito|solicita informaci[óo]n|market research|investigaci[óo]n de mercado|consultor[íi]a|consulting (services|firm)|business solutions/i,
+    ];
+
+    let nonPublisherType = null;
+    if (_hits(storeSchema) >= 1 || _hits(storeKw) >= 2) nonPublisherType = "ecommerce";
+    else if (_hits(bankSchema) >= 1 || _hits(bankKw) >= 2) nonPublisherType = "bank";
+    else if (_hits(eduSchema) >= 1 || _hits(eduKw) >= 2) nonPublisherType = "education";
+    else if (_hits(travelSchema) >= 1 || _hits(travelKw) >= 2) nonPublisherType = "travel";
+    else if (_hits(npoSchema) >= 1 || _hits(npoKw) >= 2) nonPublisherType = "nonprofit";
+    // "servicios" es fuzzy: solo rechazo si NO hay señal fuerte de publisher (programmatic).
+    else if ((_hits(svcSchema) >= 1 || _hits(svcKw) >= 2) && !hasProgrammatic) nonPublisherType = "service";
+
     return {
       title: title.slice(0, 100),
       description: desc.slice(0, 280),
       adNetworks, category,
       hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
+      nonPublisherType,                 // tienda/banco/universidad/servicios → rechazar
+      isEcommerce: nonPublisherType === "ecommerce",
       htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
       textSample,
     };
-  } catch { return null; }
+  } catch (e) {
+    // Maxi 2026-07-08: distinguir DOMINIO MUERTO (DNS no resuelve) de un bloqueo transitorio.
+    // ENOTFOUND/EAI_AGAIN = el dominio no existe/no resuelve → dead:true para skipear downstream.
+    // Timeout/403/reset = puede estar VIVO pero bloqueando → null (no lo matamos).
+    const code = String(e?.cause?.code || e?.code || e?.message || "");
+    if (/ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo/i.test(code)) return { dead: true };
+    return null;
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -4421,10 +4503,31 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory, tras
   if (_publisherClassCache.has(ckey)) return _publisherClassCache.get(ckey);
   const title = pageContent?.title || ""; const desc = pageContent?.description || "";
   if (!title && !desc) return null; // sin nada que clasificar
-  // Reglas de basura aprendidas de los rechazos del MB (por CONTENIDO).
-  const sys = "Clasificás sitios web. Un 'publisher' es un medio/blog/revista/portal de CONTENIDO que vive de publicidad display (noticias, deportes, entretenimiento, etc.). NO son publishers: empresas de servicios, gobiernos, universidades, bancos, SaaS, e-commerce, sitios corporativos de marca."
-    + (trashRules ? `\n\nADEMÁS, el media buyer YA rechazó sitios por estos motivos — si este sitio encaja en alguno, NO es publisher (devolvé el tipo correcto o 'other'):\n${trashRules}` : "")
-    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | other.";
+  // Maxi 2026-07-08: taxonomía DESTILADA de los rechazos manuales del MB (los ejemplos que fue
+  // pasando: leroymerlin/defacto/beyoung=tienda, n26/bbva=banco, ipsos=market research,
+  // carwow/holidayautos=alquiler, andalusiaegypt/urlaubsguru=hotel/viajes, tommys.org=ONG,
+  // ouedkniss=marketplace, universidades). Un publisher SOLO es medio de CONTENIDO monetizado
+  // con display/programmatic. Todo lo que VENDE/RESERVA/GESTIONA no va.
+  const sys = "Clasificás sitios web para un ad-network. Un 'publisher' (ÚNICO target válido) es un "
+    + "medio/blog/revista/portal de CONTENIDO editorial que vive de publicidad display/programmatic: "
+    + "noticias, deportes, entretenimiento, farándula, estilo de vida, tecnología, gaming, recetas, etc. "
+    + "El sitio muestra ARTÍCULOS/NOTAS y coloca avisos alrededor.\n\n"
+    + "NO son publishers (descartar SIEMPRE, aunque tengan pixel de retargeting o ads.txt):\n"
+    + "- ecommerce: tiendas online, marcas que venden producto, marketplaces, clasificados (carrito/precio/comprar).\n"
+    + "- bank: bancos, fintech, financieras, seguros, home-banking, tarjetas, préstamos.\n"
+    + "- edu: universidades, colegios, institutos, plataformas de cursos (admisiones/carreras/matrícula).\n"
+    + "- travel: hoteles, agencias de viaje, reservas, alquiler de autos, aerolíneas, turismo.\n"
+    + "- nonprofit: ONGs, fundaciones, sitios .org benéficos (donaciones/causas/voluntariado).\n"
+    + "- saas: software, apps, herramientas, plataformas B2B con demo/pricing/login.\n"
+    + "- service: empresas de servicios, consultoras, market research, agencias, estudios profesionales "
+    + "(presupuesto/demo/'nuestros servicios'/'contacta con un asesor'). Ipsos, por ejemplo, es service.\n"
+    + "- corp: sitios corporativos de marca (institucional, 'quiénes somos', sin contenido editorial).\n"
+    + "- gov: gobiernos, entes públicos, municipios.\n\n"
+    + "Regla de oro: si el objetivo del sitio es VENDER, RESERVAR, GESTIONAR CUENTAS, CAPTAR CLIENTES o "
+    + "RECAUDAR — NO es publisher. Solo si su producto ES el contenido y monetiza con ads → publisher. "
+    + "Ante la duda entre 'publisher' y un tipo comercial, elegí el tipo comercial."
+    + (trashRules ? `\n\nEl media buyer YA rechazó sitios por estos motivos adicionales — si encaja, NO es publisher:\n${trashRules}` : "")
+    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | bank | travel | nonprofit | service | other.";
   let type = null;
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
@@ -4443,7 +4546,7 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory, tras
     if (res.ok) {
       const data = await res.json();
       const t = (data?.content?.[0]?.text || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
-      if (["publisher","corp","gov","edu","saas","ecommerce","other"].includes(t)) type = t;
+      if (["publisher","corp","gov","edu","saas","ecommerce","bank","travel","nonprofit","service","other"].includes(t)) type = t;
     }
   } catch {}
   if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
@@ -4540,6 +4643,11 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   // caído un momento). El guard de "no_emails_and_site_unreachable" downstream
   // maneja los dominios realmente muertos. Evita falsos rechazos.
   if (!pageContent) return { ok: true, reason: "no_pagecontent" };
+  // Maxi 2026-07-08: TIPO DE SITIO no-publisher estructural (tienda/banco/universidad/viajes/
+  // ONG/servicios) → NO es target. Rechazo TEMPRANO, ANTES de la señal positiva de ads, porque
+  // estos sitios corren retargeting/ads.txt y se colaban (leroymerlin, defacto, n26, ipsos,
+  // carwow, urlaubsguru, tommys, etc.). Detectado por schema.org @type + keywords de intención.
+  if (pageContent.nonPublisherType) return { ok: false, reason: `nonpub_${pageContent.nonPublisherType}` };
   const title = (pageContent?.title || "");
   const cat   = (pageContent?.category || "");
   // Maxi 2026-06-19: filtro NO agresivo. Se SACÓ el aprendizaje por contenido
@@ -4550,23 +4658,23 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   // isCategoryBlockedWorker (gov/uni/empresas) y scoreWebsite (adult/streaming/gambling).
   // 1. Negativo fuerte por título (empresa/SaaS/login/gov/uni) → estructural, gratis.
   if (NON_PUBLISHER_TITLE_RE.test(title)) return { ok: false, reason: `title_nonpub:"${title.slice(0,40)}"` };
-  // 2. Señal positiva: publicidad real → publisher.
-  if (pageContent?.hasDisplayAds) return { ok: true, reason: pageContent.hasProgrammatic ? "programmatic_ads" : "partner_ssp" };
-  // 3. Categoría de medios (heurística home / SimilarWeb) → publisher.
+  // 2. Categoría de medios FUERTE (heurística home / SimilarWeb) → publisher directo, sin gastar IA.
   if (PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
   const swc = (swCategory || "").toLowerCase();
   if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
-  // 4. ads.txt como segunda chance → publisher.
-  if (await _hasRealAdsTxt(domain)) return { ok: true, reason: "ads_txt" };
-  // 5. Dudoso → Haiku. Maxi 2026-06-22: ahora SÍ recibe las reglas aprendidas por TIPO
-  //    (destiladas de los comentarios del MB al rechazar, via Claude → prospect_trash_rules).
-  //    Así el "botón rojo + comentario" enseña a evitar TIPOS de web (foro/MFA/agregador/
-  //    e-commerce/etc.), no GEO ni categoría. Haiku decide por sitio (no es bloqueo ciego).
+  // 3. Maxi 2026-07-08: la señal de monetización (display ads / ads.txt) YA NO alcanza por sí
+  //    sola — tiendas/bancos/hoteles/servicios corren retargeting y ads.txt y se colaban. Pedimos
+  //    veredicto de la IA (Haiku) como VETO: si la IA lo tipifica como comercial (tienda/banco/
+  //    edu/viajes/ong/saas/servicio/corp/gov) → rechazo, aunque tenga ads. El user: "si no
+  //    analiza la IA se da cuenta que no va". Haiku recibe además las reglas aprendidas del MB.
+  const monetized = !!pageContent?.hasDisplayAds || await _hasRealAdsTxt(domain);
   const trash = await _loadProspectTrashContext(token).catch(() => ({ rules: "" }));
   const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules || "");
-  if (type === "publisher") return { ok: true, reason: "haiku_publisher" };
-  if (type && type !== "other") return { ok: false, reason: `haiku_${type}` }; // corp/gov/edu/saas/ecommerce/tipo-aprendido
-  // Sin señal / Haiku no respondió / "other" → PASA (no agresivo).
+  if (type && type !== "publisher" && type !== "other") return { ok: false, reason: `haiku_${type}` };
+  if (type === "publisher") return { ok: true, reason: monetized ? "haiku+ads" : "haiku_publisher" };
+  // 4. Haiku no respondió / "other". Si hay monetización real → publisher; si no, PASA (no agresivo)
+  //    y que el MB lo rechace a mano.
+  if (monetized) return { ok: true, reason: pageContent?.hasProgrammatic ? "programmatic_ads" : "ads_monetized" };
   return { ok: true, reason: "classifier_unavailable_pass" };
 }
 
@@ -5605,6 +5713,15 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   }
   // Floor superado → AHORA sí traemos el HTML (scrape). No se gastó nada en sitios <350K.
   const pageContent = await fetchPageContent(domain).catch(() => null);
+  // Maxi 2026-07-08: DOMINIO MUERTO (DNS no resuelve) → skip. El user reportó url caídas que
+  // igual terminaban en Prospects sin email (gdpr.tubi.tv, wwwwwwwwwweb.2chblog.jp,
+  // webtermin.medatixx.de, fr.wix.com). fetchPageContent devuelve {dead:true} SOLO cuando el DNS
+  // falla (ENOTFOUND) — no cuando bloquea/timeout (esos podrían estar vivos). No se gasta Apollo.
+  if (pageContent?.dead) {
+    await markCsvItem(token, item.id, "skipped", { error_message: "dead_domain_dns_fail" });
+    log(`  💀 ${domain} — dominio no resuelve (DNS) → skip, no es prospect`);
+    return;
+  }
   // FIX 2026-05-26: filtro por categoría SimilarWeb — bloquea marcas/instituciones
   // que pasaron por traffic pero no son publishers. Política user: no quiero ver
   // bancos, universidades, gobierno, marcas de autos, telcos, etc. en Prospects.
