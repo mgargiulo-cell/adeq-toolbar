@@ -3815,28 +3815,46 @@ async function runPageContext() {
         // Maxi 2026-07-09: DETECTOR ESTRUCTURAL de sitio NO-PUBLISHER (por CÓMO está construido).
         // Solo para AVISAR al MB — no bloquea nada. Paridad con el worker (schema.org @type +
         // señales de intención: carrito, home-banking, admisiones, reservas, donaciones).
+        // Maxi 2026-07-09: ALTA PRECISIÓN (0 falsos positivos validado). Tienda SOLO por plataforma
+        // real o botón add-to-cart + checkout juntos; el resto por schema.org @type. Las keywords
+        // (banco/viajes/edu/inmobiliaria/servicio/ONG) SOLO cuentan si el sitio NO corre programmatic
+        // (un publisher sí lo corre; un banco/hotel/tienda en su sitio propio no) → evita marcar mal
+        // finance-news / travel-blogs / education-content.
         let nonPublisherType = "";
         try {
           const _h = document.documentElement.innerHTML || "";
-          const cartSel = document.querySelector(
-            '[class*="add-to-cart"],[class*="addtocart"],[id*="add-to-cart"],[href*="/cart"],[href*="/checkout"],[href*="/carrito"],[href*="/carrinho"],[href*="/sepet"]'
-          );
-          if (/"@type"\s*:\s*"(Product|Offer|AggregateOffer|OnlineStore)"/i.test(_h)
-            || /cdn\.shopify\.com|\.myshopify\.com|vtexassets|vteximg|wp-content\/plugins\/woocommerce|nuvemshop|tiendanube|prestashop|bigcommerce|magento_/i.test(_h)
-            || cartSel)
-            nonPublisherType = "online store / e-commerce";
-          else if (/"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i.test(_h)
-            || /online banking|internet banking|home ?banking|banca (en l[íi]nea|online|digital)|abrir (cuenta|conta)|open (a |an |your )?(bank )?account|neobank/i.test(_h))
-            nonPublisherType = "bank / financial services";
-          else if (/"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School)"/i.test(_h)
-            || /admisiones|admissions|matr[íi]cula|vestibular|graduaç|posgrado|pregrado|licenciatura|faculdade|facultad/i.test(_h))
-            nonPublisherType = "university / education";
-          else if (/"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground)"/i.test(_h)
-            || /book (a |your )?(room|stay|hotel|car|flight)|rent a car|car (hire|rental)|alquiler de (coches?|autos?)|reservar (habitaci|hotel|estancia)|pauschalreise|urlaubsangebote/i.test(_h))
-            nonPublisherType = "travel / hotel / car rental";
-          else if (/"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i.test(_h)
-            || /donate now|make a donation|registered charity|hacer una donaci|fundraising|recaudaci[óo]n de fondos/i.test(_h))
-            nonPublisherType = "nonprofit / charity";
+          const _hits = (arr) => arr.reduce((n, re) => n + (re.test(_h) ? 1 : 0), 0);
+          // hasDisplayAds = programmatic O red partner de ADEQ (Taboola/MGID/Ezoic/Seedtag/Teads...).
+          // Si el sitio muestra ads → es publisher → NO se marca por schema/keywords (regla de oro).
+          const hasDisplayAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360)/i.test(_h);
+          // Solo plataformas DEDICADAS (Woo/Magento salieron del 1-hit: medios en WordPress usan Woo).
+          const storePlatform = /cdn\.shopify\.com|\.myshopify\.com|Shopify\.theme|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
+          const storeCartBtn  = /add[\s-]?to[\s-]?cart|a[ñn]adir al carrito|agregar al carr(o|ito)|adicionar ao carrinho|sepete ekle|a[ñn]adir a la (cesta|bolsa)|in den warenkorb/i;
+          const storeCheckout = /\/(checkout|cart\/add|onepage|finalizar-compra|finalizar_compra|sepet|carrinho)\b|class=["'][^"']*(add-to-cart|addtocart|btn-cart|buy-button)/i;
+          const storeOg = /og:type["'][^>]*content=["']product["']/i;
+          const isStore = storePlatform.test(_h) || (storeCartBtn.test(_h) && storeCheckout.test(_h)) || (storeOg.test(_h) && storeCartBtn.test(_h));
+          const bankKw   = [/online banking|internet banking|home ?banking|banca (digital|en l[íi]nea)|neobank|acesse sua conta|abr[ai] (sua|tu) conta/i, /abrir (tu |una )?cuenta( corriente| de ahorro| bancaria)|open (a |your )?bank account|conta corrente/i];
+          const travelKw = [/car (hire|rental)|rent a car|alquiler de (coches?|autos?)|pauschalreise|urlaubsangebote|hotel buchen|best rate guarantee|book your (stay|room)/i, /reserva (tu |una )?(habitaci[óo]n|estancia)|habitaciones disponibles|mejor tarifa garantizada/i];
+          const eduKw    = [/proceso de admisi[óo]n|solicita tu (admisi[óo]n|plaza)|admisiones abiertas/i, /oferta acad[ée]mica|vida universitaria|nuestras? (titulaciones|carreras universitarias)|campus universitario/i];
+          const svcKw    = [/solicita(r)? (tu |un )?presupuesto|pide presupuesto|request a (demo|quote)|solicita una demo|book a demo/i, /nuestros servicios profesionales|market research|investigaci[óo]n de mercado|consultor[íi]a (empresarial|estrat[ée]gica)/i];
+          const npoKw    = [/donate now|make a donation|registered charity|become a volunteer|hacer una donaci[óo]n/i, /recaudaci[óo]n de fondos|fundraising campaign|apoya (nuestra|la) causa/i];
+          const realtyKw = [/pisos? en (venta|alquiler)|propiedades? en (venta|alquiler)|casas? en venta|im[óo]veis (para|à) (venda|alugar)/i, /publica(r)? tu (anuncio|propiedad) gratis|m² (construidos|[úu]tiles)|\d+ dormitorios/i];
+          if (isStore) nonPublisherType = "online store / e-commerce";
+          // schema Y keywords SOLO cuentan si NO hay ads display (un publisher con ads —aunque reseñe
+          // un hotel con schema Hotel— NO se marca). Igual que el worker.
+          else if (!hasDisplayAds) {
+            if (/"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i.test(_h)) nonPublisherType = "bank / financial services";
+            else if (/"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School|University)"/i.test(_h)) nonPublisherType = "university / education";
+            else if (/"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i.test(_h)) nonPublisherType = "travel / hotel / car rental";
+            else if (/"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i.test(_h)) nonPublisherType = "nonprofit / charity";
+            else if (/"@type"\s*:\s*"(RealEstateListing|RealEstateAgent|Residence|Apartment|SingleFamilyResidence)"/i.test(_h)) nonPublisherType = "real estate / listings";
+            else if (_hits(bankKw) >= 2) nonPublisherType = "bank / financial services";
+            else if (_hits(travelKw) >= 2) nonPublisherType = "travel / hotel / car rental";
+            else if (_hits(realtyKw) >= 2) nonPublisherType = "real estate / listings";
+            else if (_hits(eduKw) >= 2) nonPublisherType = "university / education";
+            else if (_hits(svcKw) >= 2) nonPublisherType = "service / agency";
+            else if (_hits(npoKw) >= 2) nonPublisherType = "nonprofit / charity";
+          }
         } catch {}
         return {
           title:    document.title || "",

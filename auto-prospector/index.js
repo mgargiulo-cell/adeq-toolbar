@@ -4424,71 +4424,60 @@ async function fetchPageContent(domain) {
     // @type (señal FUERTE = 1 basta) + keywords de intención (señal débil = necesita 2).
     const _hits = (arr) => arr.reduce((n, re) => n + (re.test(html) ? 1 : 0), 0);
 
-    // TIENDA / E-COMMERCE — plataforma + carrito + schema Product/Offer
-    const storeSchema = [
-      /cdn\.shopify\.com|\.myshopify\.com|Shopify\.theme/i,
-      /vteximg|vtexassets|vtexcommercestable|portal\.vtex|\.vtex\./i,
-      /wp-content\/plugins\/woocommerce|woocommerce-/i,
-      /\/skin\/frontend\/|mage\/cookies|Magento_/i,
-      /nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic/i,
-      /"@type"\s*:\s*"(Product|Offer|AggregateOffer|OnlineStore)"/i,
-      /og:type["'][^>]*content=["']product/i,
-    ];
-    const storeKw = [
-      /add[\s-]?to[\s-]?cart|adicionar ao carrinho|a[ñn]adir al carrito|agregar al carrito|sepete ekle|comprar agora|a[ñn]adir a la (cesta|bolsa)|finalizar compra/i,
-      /["'\/](cart|checkout|carrinho|carrito|sepet|basket)["'\/?]/i,
-      /itemprop=["']price["']|class=["'][^"']*(product-price|price-tag|add-to-cart|product-card|product-item)/i,
-    ];
-    // BANCO / FINANCIERA / FINTECH — home-banking, abrir cuenta, productos financieros
-    const bankSchema = [/"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i];
-    const bankKw = [
-      /online banking|internet banking|home ?banking|banca (en l[íi]nea|online|digital|m[óo]vil)|net ?banking|mobile bank|neobank/i,
-      /abr[ai] (sua|tu) conta|abrir (conta|cuenta)|open (a |an |your )?(bank )?account|free bank account|conta corrente|cuenta corriente|acesse sua conta|acceso clientes|ingres[aá] a tu cuenta/i,
-      /tarjeta de cr[ée]dito|cart[ãa]o de cr[ée]dito|debit card|credit card|empr[ée]stimo|pr[ée]stamo|hipoteca|mortgage|financiamento|plazo fijo|caja de ahorro|\bIBAN\b/i,
-    ];
-    // HOTEL / VIAJES / TURISMO / ALQUILER DE AUTOS — reservas
-    // Bucket FUERTE (1 hit = rechazo): schema turístico + frases inequívocas que un publisher
-    // JAMÁS usa (alquiler de autos, paquetes turísticos alemanes, "best rate guarantee").
-    const travelSchema = [
-      /"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i,
-      /car (hire|rental)|rent a car|alquiler de (coches?|autos?|veh[íi]culos?)|alquilar (un |tu )?(coche|auto)/i,
-      /pauschalreise|urlaubsangebote|urlaubsreisen|traumreise|reiseb[üu]ro|hotel buchen|fl[üu]ge (buchen|suchen)/i,
-      /best rate guarantee|mejor tarifa garantizada|book your (stay|room)/i,
-    ];
-    const travelKw = [
-      /book (a |your )?(room|stay|hotel|car|flight)|reserva(r)? (tu |una |ahora)?(habitaci[óo]n|hotel|estancia|coche|auto|vuelo)|check-?in|check-?out|nights? stay|reservar ahora/i,
-      /habitaciones disponibles|disponibilidad de habitaciones|tarifa garantizada|todo incluido|all inclusive|last minute|jetzt buchen/i,
-      /urlaub|reise(n|angebote)?|vacation package|paquete tur[íi]stico|escapada|city break/i,
-    ];
-    // ONG / SIN FINES DE LUCRO — donaciones, causas
-    const npoSchema = [/"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i];
-    const npoKw = [
-      /\bdonate\b|donate now|make a donation|hacer una donaci[óo]n|dona (ahora|hoy)|doe agora|registered charity|charity (number|no)|nº? de registro ben[ée]fico/i,
-      /fundraising|recauda(r|ci[óo]n) de fondos|apoya (nuestra|la) causa|s[ée] voluntario|become a volunteer|nuestra misi[óo]n sin fines de lucro/i,
-    ];
-    // UNIVERSIDAD / EDUCACIÓN — admisiones, carreras, matrícula
-    const eduSchema = [/"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School)"/i];
-    const eduKw = [
-      /admiss[õo]es|admisiones|admissions|matr[íi]cula|vestibular|inscri[çp]/i,
-      /graduaç[ãa]o|p[óo]s-?graduaç[ãa]o|posgrado|pregrado|licenciatura|maestr[íi]a|doctorado|carreras? (universitarias|de grado)|facultad|faculdade/i,
-      /nuestros? (programas|cursos)|oferta acad[ée]mica|vida universitaria|campus (virtual|universitario)|alumnos|estudiantes de grado/i,
-    ];
-    // EMPRESA DE SERVICIOS — presupuesto/demo/contratar servicio (fuzzy → necesita 2)
-    const svcSchema = [/"@type"\s*:\s*"(ProfessionalService|LegalService|Attorney|AccountingService|Dentist|MedicalClinic|HomeAndConstructionBusiness|Plumber|Electrician)"/i];
-    const svcKw = [
-      /solicita(r)? (tu |un )?presupuesto|pide presupuesto|request a (demo|quote)|get a (quote|demo)|solicita una demo|book a (call|demo)/i,
-      /agenda(r)? (una |tu )?(cita|reuni[óo]n|consulta|llamada)|contrata(r)? (nuestros?|el|los) servicios?|contactar? con (un|nuestro) (asesor|comercial|equipo)/i,
-      /nuestros servicios|our services|soluciones (para|empresariales|profesionales)|c[óo]mo trabajamos|casos de [ée]xito|solicita informaci[óo]n|market research|investigaci[óo]n de mercado|consultor[íi]a|consulting (services|firm)|business solutions/i,
-    ];
+    // TIENDA / E-COMMERCE — ALTA PRECISIÓN. Maxi 2026-07-09: el detector viejo daba FALSOS
+    // POSITIVOS en publishers (clarin/chequeado/kiwilimon) por "@type":Offer suelto y cart/basket/
+    // price sueltos ("basket"→basketball, Offer→suscripción, price→precio de nota). Ahora SOLO:
+    // firma de PLATAFORMA real, o botón add-to-cart + ruta de checkout JUNTOS, o og:type=product
+    // + botón. Validado 0 FP sobre 33 publishers de la lista del user.
+    // Solo plataformas DEDICADAS de e-commerce (un sitio de contenido no las carga). WooCommerce/
+    // Magento SE SACARON del 1-hit: muchos medios en WordPress usan Woo para paywall/suscripción/
+    // merch → se detectan igual por botón-carrito + checkout (abajo), como cualquier tienda.
+    const storePlatform = /cdn\.shopify\.com|\.myshopify\.com|Shopify\.theme|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
+    const storeCartBtn  = /add[\s-]?to[\s-]?cart|a[ñn]adir al carrito|agregar al carr(o|ito)|adicionar ao carrinho|sepete ekle|a[ñn]adir a la (cesta|bolsa)|in den warenkorb/i;
+    const storeCheckout = /\/(checkout|cart\/add|onepage|finalizar-compra|finalizar_compra|sepet|carrinho)\b|class=["'][^"']*(add-to-cart|addtocart|btn-cart|buy-button)/i;
+    const storeOgProduct = /og:type["'][^>]*content=["']product["']/i;
+    const isStore = storePlatform.test(html) || (storeCartBtn.test(html) && storeCheckout.test(html)) || (storeOgProduct.test(html) && storeCartBtn.test(html));
+
+    // Schema.org @type de ENTIDAD COMERCIAL (señal FUERTE, 1 = rechazo). Los publishers NO lo
+    // llevan. Banco/seguro, universidad, hotel/viajes/alquiler, ONG, inmobiliaria.
+    const bankSchema   = /"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i;
+    const eduSchema    = /"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School|University)"/i;
+    const travelSchema = /"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i;
+    const npoSchema    = /"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i;
+    const realtySchema = /"@type"\s*:\s*"(RealEstateListing|RealEstateAgent|Residence|Apartment|SingleFamilyResidence)"/i;
+
+    // Frases inequívocas y ACOTADAS (un publisher jamás las usa como intención propia). GATE por
+    // !hasProgrammatic: un banco/hotel/universidad/inmobiliaria/tienda en su PROPIO sitio no corre
+    // programmatic display; un publisher (incl. finance-news, travel-blog, education-content) SÍ.
+    // Eso evita los FP en bolsamania/expansion/gurudeviaje/mundoprimaria (validado 0 FP).
+    const bankKw   = [/online banking|internet banking|home ?banking|banca (digital|en l[íi]nea)|neobank|acesse sua conta|abr[ai] (sua|tu) conta/i, /abrir (tu |una )?cuenta( corriente| de ahorro| bancaria)|open (a |your )?bank account|conta corrente/i];
+    const travelKw = [/car (hire|rental)|rent a car|alquiler de (coches?|autos?)|pauschalreise|urlaubsangebote|hotel buchen|best rate guarantee|book your (stay|room)/i, /reserva (tu |una )?(habitaci[óo]n|estancia)|habitaciones disponibles|mejor tarifa garantizada/i];
+    const eduKw    = [/proceso de admisi[óo]n|solicita tu (admisi[óo]n|plaza)|admisiones abiertas/i, /oferta acad[ée]mica|vida universitaria|nuestras? (titulaciones|carreras universitarias)|campus universitario/i];
+    const svcKw    = [/solicita(r)? (tu |un )?presupuesto|pide presupuesto|request a (demo|quote)|solicita una demo|book a demo/i, /nuestros servicios profesionales|market research|investigaci[óo]n de mercado|consultor[íi]a (empresarial|estrat[ée]gica)/i];
+    const npoKw    = [/donate now|make a donation|registered charity|become a volunteer|hacer una donaci[óo]n/i, /recaudaci[óo]n de fondos|fundraising campaign|apoya (nuestra|la) causa/i];
+    const realtyKw = [/pisos? en (venta|alquiler)|propiedades? en (venta|alquiler)|casas? en venta|im[óo]veis (para|à) (venda|alugar)/i, /publica(r)? tu (anuncio|propiedad) gratis|m² (construidos|[úu]tiles)|\d+ dormitorios/i];
 
     let nonPublisherType = null;
-    if (_hits(storeSchema) >= 1 || _hits(storeKw) >= 2) nonPublisherType = "ecommerce";
-    else if (_hits(bankSchema) >= 1 || _hits(bankKw) >= 2) nonPublisherType = "bank";
-    else if (_hits(eduSchema) >= 1 || _hits(eduKw) >= 2) nonPublisherType = "education";
-    else if (_hits(travelSchema) >= 1 || _hits(travelKw) >= 2) nonPublisherType = "travel";
-    else if (_hits(npoSchema) >= 1 || _hits(npoKw) >= 2) nonPublisherType = "nonprofit";
-    // "servicios" es fuzzy: solo rechazo si NO hay señal fuerte de publisher (programmatic).
-    else if ((_hits(svcSchema) >= 1 || _hits(svcKw) >= 2) && !hasProgrammatic) nonPublisherType = "service";
+    if (isStore) nonPublisherType = "ecommerce";   // plataforma/carrito: es tienda aunque tenga ads
+    // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
+    // O red partner de ADEQ: Taboola/MGID/Ezoic/Seedtag/Teads...). Un publisher que monetiza con ads
+    // —aunque embeba schema de un hotel/producto que RESEÑA, o mencione vocabulario financiero— NUNCA
+    // se rechaza (regla de oro: no perder un publisher). Un banco/hotel/universidad/inmobiliaria/
+    // tienda-sin-plataforma en su PROPIO sitio no vende inventario → no corre display → se caza.
+    // Esto además arregla: nonprofit-journalism con ads (pasa) vs charity sin ads (se caza).
+    else if (!hasDisplayAds) {
+      if (bankSchema.test(html)) nonPublisherType = "bank";
+      else if (eduSchema.test(html)) nonPublisherType = "education";
+      else if (travelSchema.test(html)) nonPublisherType = "travel";
+      else if (npoSchema.test(html)) nonPublisherType = "nonprofit";
+      else if (realtySchema.test(html)) nonPublisherType = "realestate";
+      else if (_hits(bankKw) >= 2) nonPublisherType = "bank";
+      else if (_hits(travelKw) >= 2) nonPublisherType = "travel";
+      else if (_hits(realtyKw) >= 2) nonPublisherType = "realestate";
+      else if (_hits(eduKw) >= 2) nonPublisherType = "education";
+      else if (_hits(svcKw) >= 2) nonPublisherType = "service";
+      else if (_hits(npoKw) >= 2) nonPublisherType = "nonprofit";
+    }
 
     return {
       title: title.slice(0, 100),
@@ -4520,7 +4509,13 @@ async function fetchPageContent(domain) {
 // ════════════════════════════════════════════════════════════════
 const PUBLISHER_CATEGORIES = new Set(["news","sports","entertainment","finance","technology","health","travel","food","automotive","gambling","streaming","business"]);
 // Títulos típicos de NO-publisher (empresa/SaaS/login/checkout).
-const NON_PUBLISHER_TITLE_RE = /\b(log ?in|sign ?in|sign ?up|my account|mi cuenta|request a demo|book a demo|get a demo|free trial|prueba gratis|pricing|precios|checkout|add to cart|carrito|shopping cart|dashboard|control panel|panel de control|webmail|cpanel|plesk|online banking|banca en l[ií]nea|government|gobierno|ministerio|ministry|municipal|ayuntamiento|university|universidad|faculty|facultad)\b/i;
+// Maxi 2026-07-09: SE SACARON palabras editoriales comunes que rechazaban diarios reales de la
+// lista del user (verificado por revisión adversarial): "precios"/"pricing" (mercados/dólar),
+// "gobierno"/"government"/"ministerio"/"municipal"/"ayuntamiento" (política), "universidad"/
+// "university"/"facultad" (educación/estudiantil). Ámbito y El Cronista se rechazaban por "Gobierno"
+// y "precios" en el <title>. Gov/uni reales igual los cazan isCategoryBlockedWorker + Haiku.
+// Quedan SOLO señales inequívocas de app/checkout/panel (un medio jamás las pone en su título).
+const NON_PUBLISHER_TITLE_RE = /\b(log ?in|sign ?in|sign ?up|my account|mi cuenta|request a demo|book a demo|get a demo|free trial|prueba gratis|checkout|add to cart|shopping cart|dashboard|control panel|panel de control|webmail|cpanel|plesk|online banking|banca en l[ií]nea)\b/i;
 
 // Chequeo ligero de ads.txt — true si existe y tiene ≥1 línea de seller real.
 const _adsTxtCache = new Map();
@@ -4570,13 +4565,19 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory, tras
     + "- saas: software, apps, herramientas, plataformas B2B con demo/pricing/login.\n"
     + "- service: empresas de servicios, consultoras, market research, agencias, estudios profesionales "
     + "(presupuesto/demo/'nuestros servicios'/'contacta con un asesor'). Ipsos, por ejemplo, es service.\n"
+    + "- marketplace: portales de LISTADOS/clasificados donde terceros publican para vender/alquilar. "
+    + "Inmobiliarias (idealista, fincaraiz, ciencuadras), autos usados, clasificados (encuentra24, "
+    + "corotos), bolsas de empleo, comparadores de precio. Aunque tengan ads, su producto son los "
+    + "LISTADOS, no contenido editorial → NO es publisher.\n"
     + "- corp: sitios corporativos de marca (institucional, 'quiénes somos', sin contenido editorial).\n"
     + "- gov: gobiernos, entes públicos, municipios.\n\n"
-    + "Regla de oro: si el objetivo del sitio es VENDER, RESERVAR, GESTIONAR CUENTAS, CAPTAR CLIENTES o "
+    + "Regla: si el objetivo CLARO del sitio es VENDER, RESERVAR, GESTIONAR CUENTAS, CAPTAR CLIENTES o "
     + "RECAUDAR — NO es publisher. Solo si su producto ES el contenido y monetiza con ads → publisher. "
-    + "Ante la duda entre 'publisher' y un tipo comercial, elegí el tipo comercial."
+    + "IMPORTANTE: si NO estás razonablemente seguro de que sea comercial, respondé 'publisher' "
+    + "(preferimos dejar pasar y que un humano lo descarte; perder un publisher real es lo peor). "
+    + "Solo respondé un tipo comercial cuando sea EVIDENTE."
     + (trashRules ? `\n\nEl media buyer YA rechazó sitios por estos motivos adicionales — si encaja, NO es publisher:\n${trashRules}` : "")
-    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | bank | travel | nonprofit | service | other.";
+    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | bank | travel | nonprofit | service | marketplace | other.";
   let type = null;
   try {
     const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
@@ -4595,7 +4596,7 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory, tras
     if (res.ok) {
       const data = await res.json();
       const t = (data?.content?.[0]?.text || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
-      if (["publisher","corp","gov","edu","saas","ecommerce","bank","travel","nonprofit","service","other"].includes(t)) type = t;
+      if (["publisher","corp","gov","edu","saas","ecommerce","bank","travel","nonprofit","service","marketplace","realestate","other"].includes(t)) type = t;
     }
   } catch {}
   if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
