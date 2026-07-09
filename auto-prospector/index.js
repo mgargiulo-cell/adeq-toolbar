@@ -5025,9 +5025,33 @@ function coreDomain(domain) {
   return parts[parts.length - 2]; // sub.foo.com → "foo"
 }
 
+// Maxi 2026-07-08: marcas/plataformas por LABEL de 2do nivel — matchea en CUALQUIER TLD o
+// subdominio (news.google.at → "google", rakuten.tv → "rakuten", fr.wix.com → "wix"). El user
+// reportó que estas se colaban a Prospects porque el blocklist era match EXACTO.
+const BRAND_BLOCKLIST = new Set([
+  "google","bing","yahoo","baidu","yandex","duckduckgo","ask",
+  "facebook","instagram","twitter","tiktok","linkedin","reddit","pinterest","snapchat",
+  "whatsapp","telegram","weibo","vk","quora","tumblr","threads",
+  "wix","wixsite","squarespace","weebly","wordpress","blogger","webflow","godaddy","hostgator",
+  "amazon","aliexpress","alibaba","ebay","mercadolibre","mercadolivre","walmart","target","rakuten",
+  "apple","microsoft","office","live","outlook","windows","meta","alphabet",
+  "netflix","spotify","disney","hulu","primevideo","hbomax","paramount","peacock",
+  "adobe","oracle","sap","salesforce","hubspot","shopify","stripe","paypal","visa","mastercard",
+  "samsung","sony","intel","amd","nvidia","dell","lenovo","huawei","xiaomi",
+  "tesla","uber","lyft","airbnb","booking","expedia","tripadvisor","agoda",
+  "github","gitlab","atlassian","slack","notion","figma","canva","zoom","dropbox","docusign",
+  "youtube","vimeo","twitch","medium","substack","wikipedia","stackoverflow",
+  "applovin","ironsource","criteo","taboola","outbrain","pubmatic","magnite","inmobi",
+  "unity","digitalturbine","vungle","adcolony","mgid","revcontent","teads","vidoomy",
+]);
+
 function isDomainBlocked(domain) {
-  const d = domain.toLowerCase();
+  const d = domain.toLowerCase().replace(/^www\./, "");
   if (CORPORATE_BLOCKLIST.has(d)) return "corporate/brand";
+  // Subdominios de un dominio blocklisteado (ej. m.amazon.com, fr.wix.com si wix.com está)
+  for (const b of CORPORATE_BLOCKLIST) { if (d.endsWith("." + b)) return "corporate/subdomain"; }
+  // Marca por 2do-nivel en cualquier TLD/subdominio (news.google.at, rakuten.tv, fr.wix.com)
+  if (BRAND_BLOCKLIST.has(coreDomain(d))) return "corporate/brand-root";
   if (BLOCKED_TLDS.some(t => d.endsWith(t) || d.includes(t))) return "government/education";
   if (ADULT_TLDS.some(t => d.endsWith(t))) return "adult-tld";
   if (ADULT_KEYWORDS.some(k => d.includes(k))) return "adult-keyword";
@@ -5694,41 +5718,34 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const informerSet = new Set();
   const urlByEmail  = new Map();
   const contactForms = new Set();
-  // Tier 1: Informer (gratis, siempre)
-  const infRes = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
-  const infNonGeneric = infRes.emails.find(e => !_isGenericLocalPart(e));
-  let scrapedNonGeneric = null;
   let _socialOutCsvScope = null;
-  if (infNonGeneric) {
+  // ── WATERFALL de captación (user 2026-07-08) ──────────────────────────────────
+  // 1) INFORMER completo → 2) si vacío, SCRAPE → 3) si vacío, APOLLO pago (último recurso,
+  // regulado por el cap mensual/diario duro). Cada tier corre SOLO si el anterior no encontró
+  // NINGÚN email. Prioriza lo gratis; Apollo (que cuesta) solo cuando no hay otra.
+  // TIER 1: Informer (gratis) — se QUEDA con TODO lo que encuentre (generic o no; antes perdía
+  // los genéricos del informer al saltar a scrape).
+  const infRes = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
+  if (infRes.emails.length > 0) {
     scraperEmails = infRes.emails;
-    infRes.emails.forEach(e => { informerSet.add(e.toLowerCase()); });
-    infRes.urlByEmail.forEach((url, em) => { urlByEmail.set(em, url); });
-    log(`  ✅ Tier 1 INFORMER hit ${domain} → ${infNonGeneric}`);
+    infRes.emails.forEach(e => informerSet.add(e.toLowerCase()));
+    infRes.urlByEmail.forEach((url, em) => urlByEmail.set(em, url));
+    log(`  ✅ Tier 1 INFORMER ${domain} → ${infRes.emails.length} email(s): ${infRes.emails.slice(0,3).join(", ")}`);
   } else {
-    // Tier 2: SIEMPRE scraping (gratis)
+    // TIER 2: Scraping del sitio (gratis) — solo si el informer no encontró NADA.
     const socialOut = new Map();
     scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
-    scrapedNonGeneric = scraperEmails.find(e => !_isGenericLocalPart(e));
-    if (scrapedNonGeneric) log(`  ✅ Tier 2 SCRAPE hit ${domain} → ${scrapedNonGeneric}`);
     _socialOutCsvScope = socialOut;
+    if (scraperEmails.length > 0) log(`  ✅ Tier 2 SCRAPE ${domain} → ${scraperEmails.length} email(s)`);
+    else log(`  ○ ${domain}: informer + scrape SIN emails → Apollo (último recurso)`);
   }
-  // Apollo random forzado por pacing diario (consume cupo)
-  if (canUseApollo) {
-    const haveDM = !!(infNonGeneric || scrapedNonGeneric);
-    const dailyLimit  = Math.max(1, apolloUsage.limit || 1);
-    const usedToday   = apolloUsage.usedToday + apolloCallsThisSessionRef.count;
-    const remainingPct = Math.max(0, Math.min(1, (dailyLimit - usedToday) / dailyLimit));
-    // Si no tenemos decision-maker → 100% Apollo. Si ya tenemos → prob = pacing
-    const apolloChance = haveDM ? remainingPct : 1;
-    if (Math.random() < apolloChance) {
-      log(`  💎 Apollo ${domain} (haveDM=${haveDM}, pacing=${(remainingPct*100).toFixed(0)}%)`);
-      // Maxi 2026-07-01: (a) traffic ahora en PAGEVIEWS (effectivePageViews) para alinear con el
-      // umbral de unlock (350K pageviews), no visits. (b) si NO hay decision-maker del scrape/HTML,
-      // forceUnlock=true → Apollo pago como fallback garantizado (user autorizó pagar cuando el HTML falla).
-      apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: effectivePageViews, allowUnlock: true, forceUnlock: !haveDM })
-        .then(r => { if (r?.source === "unlocked") apolloCallsThisSessionRef.count += 1; return r; })
-        .catch(() => null);
-    }
+  // TIER 3: Apollo PAGO — SOLO si informer Y scrape no encontraron NINGÚN email. forceUnlock
+  // (paga para conseguir un decision-maker), pero el cap duro dentro de findBestApolloEmail
+  // regula el gasto de créditos. Si ya hay CUALQUIER email de las fuentes gratis, NO se paga.
+  if (canUseApollo && scraperEmails.length === 0) {
+    apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: effectivePageViews, allowUnlock: true, forceUnlock: true })
+      .then(r => { if (r?.source === "unlocked") { apolloCallsThisSessionRef.count += 1; log(`  💎 Apollo ${domain} → ${r.email}`); } return r; })
+      .catch(() => null);
   }
   const apolloContactName = apolloRes?.contact_name || "";
   const apolloPhone       = apolloRes?.phone || "";
