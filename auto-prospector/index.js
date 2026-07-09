@@ -4083,6 +4083,12 @@ function _isGenericLocalPart(email) {
   return GENERIC_LOCAL_RE.test(local);
 }
 
+// Maxi 2026-07-09: rol de VENTA DE PAUTA/PUBLICIDAD — el buzón IDEAL para ADEQ (que vende
+// inventario). El user (Q4) lo eligió como "la mejor opción". Módulo-level para compartir entre
+// rankEmail (score +95) y _pickTier (orden de selección). Formas ACOTADAS: nada de `ads?`/`adv`
+// sueltos, que matchearían "admin"/"advisor".
+const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|anunci|reklam|iklan|comercial|commercial|ventas|vendas|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|inventory|programmatic|patrocin|sponsor)/i;
+
 // Maxi 2026-06-17 v4: extrae emails publicados en redes sociales (FB about,
 // YT about, Twitter bio via Nitter). Fallback worker — solo se llama cuando
 // el scrape normal no encontró email NO-genérico. Devuelve Map<email, "Facebook"|"YouTube"|"Twitter">.
@@ -4151,6 +4157,12 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   const emails = new Set();
   // socialLinks detectados durante el scraping para hacer fetch posterior
   const detectedSocialLinks = new Set();
+  // Maxi 2026-07-09: links de contacto/impressum/publicidad REALES cosechados del HTML del home.
+  // El user pidió "garantizar que agarra lo que está escrito en la web". En vez de SOLO adivinar
+  // rutas, seguimos los links que el sitio realmente publica (contacto/kontakt/impressum/aviso
+  // legal/publicidad/media-kit/about/equipo), aunque tengan nombres no estándar.
+  const discovered = new Set();
+  const CONTACT_HINT = /contact|contacto|contatt|kontakt|impress?um|imprint|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|mediadaten|media-?kit|advertis|anunci|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|equipe?|\bteam\b|\bstaff\b|redac|ueber-?uns|über-?uns|impronta/i;
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
   // Chrome real para evitar bloqueos por User-Agent de bot
@@ -4207,6 +4219,21 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
           } catch {}
         }
       }
+      // Maxi 2026-07-09: cosechar links de contacto/impressum/publicidad REALES del HTML
+      // (mismo dominio, cap 16) para seguirlos en la fase 2. Así agarramos la página de
+      // contacto aunque el sitio la nombre distinto (ej. /en/contact-us-2, /kontakt-impressum).
+      if (discovered.size < 16) {
+        for (const m of html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'\s>]+)["'][^>]*>([\s\S]{0,140}?)<\/a>/gi)) {
+          if (discovered.size >= 16) break;
+          const href = m[1];
+          if (!href || /^(mailto:|tel:|javascript:|#)/i.test(href)) continue;
+          const anchor = (m[2] || "").replace(/<[^>]+>/g, " ");
+          if (!CONTACT_HINT.test(href) && !CONTACT_HINT.test(anchor)) continue;
+          let abs; try { abs = new URL(href.split("#")[0], base).href; } catch { continue; }
+          try { const h = new URL(abs).hostname.replace(/^www\./, ""); if (h !== cleanDomain && !h.endsWith("." + cleanDomain)) continue; } catch { continue; }
+          discovered.add(abs);
+        }
+      }
       return; // éxito → no reintentar
     } catch (e) {
       const isTimeout = e?.name === "TimeoutError" || e?.name === "AbortError";
@@ -4216,15 +4243,22 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
    }
   };
 
-  // 20 paths potenciales — sites de news/blogs típicos tienen variantes diversas
+  // Paths de fallback (por si el home no linkeó su página de contacto — SPAs, JS). Cubre
+  // EN/ES/PT/IT/FR/DE. Maxi 2026-07-09: reforzado con Impressum/Kontakt (DE), mentions-légales
+  // (FR), contatti/pubblicita (IT) y media-kit/mediadaten — donde los sitios EU esconden el email.
   const paths = [
     "", // home
     "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos", "/contacto-nos",
+    "/contatti", "/contactez-nous", "/kontakt", "/kontaktformular", "/kontakt-impressum",
     "/about", "/about-us", "/aboutus", "/sobre", "/sobre-nosotros", "/quienes-somos",
+    "/chi-siamo", "/qui-sommes-nous", "/ueber-uns",
     "/team", "/equipo", "/equipe", "/staff", "/nosotros",
-    "/advertise", "/advertising", "/publicidad", "/publicidade", "/anunciantes", "/anunciar",
+    "/advertise", "/advertising", "/advertise-with-us", "/publicidad", "/publicidade",
+    "/anunciantes", "/anunciar", "/publicite", "/regie-publicitaire", "/pubblicita", "/werbung",
+    "/media-kit", "/mediakit", "/mediadaten",
     "/redaccion", "/redacao", "/editorial", "/noticias",
-    "/aviso-legal", "/legal", "/impressum", "/politica-privacidad", "/privacy",
+    "/aviso-legal", "/legal", "/impressum", "/impressum.html", "/imprint",
+    "/mentions-legales", "/note-legali", "/politica-privacidad", "/privacy",
     "/footer", "/site-map", "/sitemap",
   ];
   const internalTargets = paths.map(p => `${base}${p}`);
@@ -4238,21 +4272,36 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     `https://who.is/whois/${cleanDomain}`,
   ];
 
-  // Procesar en chunks de 4 — concurrencia limitada para no saturar Railway
+  // Maxi 2026-07-09: orquestación en 3 FASES para GARANTIZAR captura del email escrito.
+  // El user aceptó que tarde unos segundos más a cambio de agarrar sí o sí lo que está en la web.
   const CONCURRENT = 4;
-  const all = [...internalTargets, ...externalTargets];
-  for (let i = 0; i < all.length; i += CONCURRENT) {
-    const chunk = all.slice(i, i + CONCURRENT);
-    await Promise.all(chunk.map(url => {
-      const isInf = /informer|who\.is/.test(url);
-      // Maxi 2026-06-30: timeouts más largos (sitios lentos = los que más email pierden).
-      return tryFetch(url, isInf ? 8000 : 6000, false, isInf);
-    }));
-    // Maxi 2026-06-30: early-stop cuando ya tenemos un email REAL (no-genérico, =
-    // persona/rol útil) o un buen lote. Antes cortaba a las 10 contando basura de
-    // WHOIS → frenaba antes de llegar a /contacto donde está el email bueno.
-    const _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
-    if (_hasReal || emails.size >= 12) break;
+  // FASE 1 — HOME solo. De su HTML cosechamos los links de contacto/impressum/publicidad REALES
+  // que el sitio publica (llena `discovered`), además de los emails que ya estén en el home.
+  await tryFetch(base, 6000, false, false);
+
+  let _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+  // FASE 2 — seguir los links DESCUBIERTOS primero (el sitio los nombró explícitamente → más
+  // precisos), luego las rutas estáticas de fallback. Early-stop al primer email real / buen lote.
+  if (!_hasReal) {
+    const seenUrl = new Set([base, base + "/"]);
+    const queue = [];
+    for (const u of [...discovered, ...internalTargets]) {
+      if (u === base) continue;
+      const norm = u.replace(/\/+$/, "");
+      if (seenUrl.has(u) || seenUrl.has(norm)) continue;
+      seenUrl.add(u); seenUrl.add(norm);
+      queue.push(u);
+    }
+    for (let i = 0; i < queue.length; i += CONCURRENT) {
+      await Promise.all(queue.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
+      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      if (_hasReal || emails.size >= 14) break;
+    }
+  }
+
+  // FASE 3 — WHOIS/informer SOLO si seguimos con CERO emails (baja calidad, último recurso).
+  if (emails.size === 0) {
+    for (const u of externalTargets) await tryFetch(u, 8000, false, true);
   }
 
   // Última chance — si NADA encontrado, probar mobile UA en home (algunos sites cambian)
@@ -8319,10 +8368,11 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       .map(x => (x.source === "manual" && x.score < 0) ? { ...x, score: 0 } : x)
       .filter(x => x.score >= 0)
       .sort((a, b) => {
-        // Maxi 2026-07-08: tier DURO primero — apollo/informer/manual nominal SIEMPRE por
-        // encima de un genérico, ANTES del ranking dinámico. Regla del dueño: decision-maker sí o sí.
-        const ta = _sourceHardTier(a.source);
-        const tb = _sourceHardTier(b.source);
+        // Maxi 2026-07-09: tier DURO primero (_pickTier): apollo/informer nominal > rol
+        // comercial/publicidad scrapeado > persona scrapeada > genérico. Honra la regla del
+        // dueño (decision-maker verificado manda) Y la elección del user (Q4: rol comercial).
+        const ta = _pickTier(a.email, a.source);
+        const tb = _pickTier(b.email, b.source);
         if (ta !== tb) return tb - ta;
         const sa = SOURCE_RANK[a.source] || 0;
         const sb = SOURCE_RANK[b.source] || 0;
@@ -9452,7 +9502,13 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // Roles comerciales/publicidad — cobertura multi-idioma (EN/ES/PT/IT/PL/ID/DE/FR).
   // Stems como prefijo (sin \b) para agarrar "anuncios", "publicidade", "advertising".
   // bd/head requieren boundary (cortos, evitan falsos positivos tipo "headlines").
-  const COMMERCIAL = /^(?:(?:marketing|comercial|commercial|business|partnership|partner|advertis|advert|adv|ads|publicidad|publicidade|publicite|pubblicit|werbung|reklam|iklan|anunci|propaganda|monetiz|vendas|ventas|sales|sponsor|patrocin|growth|director|gerente|manager|jefe|brand|media)|(?:bd|head)\b)/i;
+  // Maxi 2026-07-09: AD_SALES = buzón de VENTA DE PAUTA/PUBLICIDAD. El user eligió "rol
+  // comercial/publicidad" como la MEJOR opción (ADEQ vende inventario → este buzón va directo
+  // a quien compra/vende espacios). Rankea por ENCIMA de EXEC. Locals específicos de ad-sales
+  // (no el "director/manager" genérico, que queda en COMMERCIAL).
+  // Regex hoisteado a módulo (AD_SALES_LOCAL) — misma fuente de verdad que _pickTier.
+  const AD_SALES   = AD_SALES_LOCAL;
+  const COMMERCIAL = /^(?:(?:business|partnership|partner|propaganda|director|gerente|manager|jefe|brand|media)|(?:bd|head)\b)/i;
   const EDITORIAL  = /^(editor|editor-in-chief|chief-editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
   const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
 
@@ -9462,7 +9518,8 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   const IS_GENERIC = GENERIC_LOCAL_RE;
 
   let matchedRole = "";
-  if (EXEC.test(local))            { score += 90; matchedRole = "EXEC"; }       // CEO/founder = jackpot
+  if (AD_SALES.test(local))        { score += 95; matchedRole = "AD_SALES"; }    // publicidad@/comercial@/ads@ = target ideal ADEQ
+  else if (EXEC.test(local))       { score += 90; matchedRole = "EXEC"; }       // CEO/founder = jackpot
   else if (COMMERCIAL.test(local)) { score += 80; matchedRole = "COMMERCIAL"; }
   else if (EDITORIAL.test(local))  { score += 60; matchedRole = "EDITORIAL"; }
   // Pattern firstname.lastname (juan.perez@x.com) = persona real
@@ -9480,7 +9537,7 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // cross-domain (era -15). Un founder@gmail SÍ es una persona válida.
   // Para cross-corporate (-50): revertir parcialmente (-25) si es EXEC, ya
   // que founder@otra-empresa puede ser advisor/board (real pero menos directo).
-  if (matchedRole && (matchedRole === "EXEC" || matchedRole === "COMMERCIAL" || matchedRole === "EDITORIAL" || matchedRole === "PERSON")) {
+  if (matchedRole && (matchedRole === "AD_SALES" || matchedRole === "EXEC" || matchedRole === "COMMERCIAL" || matchedRole === "EDITORIAL" || matchedRole === "PERSON")) {
     if (isFreeWebmail && cleanSite && dom !== cleanSite) {
       score += 15; // cancela el -15 inicial
     }
@@ -10394,12 +10451,12 @@ async function runAgentCycle(token, allFlags) {
         const ranked = _rankedAll
           .filter(x => x.score >= 0)
           .sort((a, b) => {
-            // Maxi 2026-07-08: tier DURO primero — apollo/informer nominal SIEMPRE por encima
-            // de un genérico, ANTES del ranking dinámico aprendido (que podía relegar informer
-            // detrás de un info@ con mejor open-rate). Regla del dueño: usar el decision-maker sí o sí.
-            const ta = _sourceHardTier(a.source);
-            const tb = _sourceHardTier(b.source);
-            if (ta !== tb) return tb - ta;     // nominal > persona > genérico
+            // Maxi 2026-07-09: tier DURO primero (_pickTier): apollo/informer nominal > rol
+            // comercial/publicidad scrapeado > persona scrapeada > genérico. Honra la regla del
+            // dueño (decision-maker verificado manda) Y la elección del user (Q4: rol comercial).
+            const ta = _pickTier(a.email, a.source);
+            const tb = _pickTier(b.email, b.source);
+            if (ta !== tb) return tb - ta;     // apollo/informer > publicidad@ > persona > genérico
             const sa = SOURCE_RANK[a.source] || 0;
             const sb = SOURCE_RANK[b.source] || 0;
             if (sa !== sb) return sb - sa;     // dentro del tier: ranking dinámico
@@ -10960,6 +11017,23 @@ function _sourceHardTier(source) {
   if (s === "apollo" || s === "informer" || s === "manual") return 2;
   if (s === "generic" || s === "") return 0;
   return 1;
+}
+
+// Maxi 2026-07-09: tier de SELECCIÓN del email final. Combina la confiabilidad de la SOURCE con
+// el ROL comercial del local-part. El user (Q4) eligió "rol comercial/publicidad" como la mejor
+// opción, PERO el decision-maker verificado por Apollo/informer sigue mandando (regla del dueño):
+//   4 = apollo/informer/manual nominal (decision-maker verificado)
+//   3 = publicidad@/comercial@/ventas@ scrapeado (rol de venta de pauta — buzón ideal ADEQ)
+//   2 = otra persona/rol scrapeado (source=scrape)
+//   0 = genérico (info@/contacto@)
+// Así el orden queda: apollo/informer > publicidad@ > persona scrapeada > genérico.
+function _pickTier(email, source) {
+  const st = _sourceHardTier(source);
+  if (st === 2) return 4;                                          // apollo/informer/manual nominal
+  const local = String(email || "").toLowerCase().split("@")[0];
+  if (AD_SALES_LOCAL.test(local)) return 3;                        // rol comercial/publicidad
+  if (st === 1) return 2;                                          // persona scrapeada
+  return 0;                                                        // genérico
 }
 const SOURCE_PERF_WINDOW_DAYS = 30;
 const SOURCE_PERF_MIN_SENT = 50;       // sample mínimo por (mb, source) para usar dinámico
