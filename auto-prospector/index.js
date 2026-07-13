@@ -9504,7 +9504,7 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   //     sistemas.*@, edv@, technik@, infra@, sysadmin@. (Rechazar el EMAIL no pierde el DOMINIO: el lead
   //     queda pending para el MB → respeta la regla de oro.)
   if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return -1;
-  if (/^(domainmanagement|domainadmin|domainname|dominios?|netmanage|net-manage|sysadmin|edv|betrieb|technik|teknik|sistemas?|informatica|infra|infraestructura|infrastructure)([._-]|$)/i.test(local)
+  if (/^(domainmanagement|domainadmin|domainname|dominios?|netmanage|net-manage|sys|sysadmin|systems?|edv|betrieb|technik|teknik|sistemas?|informatica|infra|infraestructura|infrastructure)([._-]|$)/i.test(local)
       || /^it[._-](einkauf|support|admin|team|abteilung|dept|helpdesk|service)/i.test(local)) return -1;
 
   let score = 0;
