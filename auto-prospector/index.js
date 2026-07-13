@@ -4087,7 +4087,10 @@ function _isGenericLocalPart(email) {
 // inventario). El user (Q4) lo eligió como "la mejor opción". Módulo-level para compartir entre
 // rankEmail (score +95) y _pickTier (orden de selección). Formas ACOTADAS: nada de `ads?`/`adv`
 // sueltos, que matchearían "admin"/"advisor".
-const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|anunci|reklam|iklan|comercial|commercial|ventas|vendas|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|inventory|programmatic|patrocin|sponsor)/i;
+// Maxi 2026-07-13 (auditoría): +cobertura del pool europeo — régie(FR), Vermarktung/Anzeigen/Verkauf(DE),
+// verkoop/adverteren(NL), vente(FR), raccolta pubblicitaria(IT), auglýsingar(IS), annons(SE). Todos = venta
+// de pauta/inventario. 'regie\b'/'regiepub' evita matchear 'regierung'(gobierno DE).
+const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor)/i;
 
 // Maxi 2026-06-17 v4: extrae emails publicados en redes sociales (FB about,
 // YT about, Twitter bio via Nitter). Fallback worker — solo se llama cuando
@@ -9495,17 +9498,15 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
   if (/^[a-z0-9]{8,}$/.test(local) && !/[aeiou]{2}/.test(local)) return -1;
 
-  // Maxi 2026-07-13 (auditoría 48h): rechazo DURO de:
-  //  a) PLACEHOLDERS que se colaban como "persona real" (vorname.name@/firstname.lastname@/
-  //     nombre.apellido@ matcheaban el patrón firstname.lastname → +70 → se enviaban). PLACEHOLDER_LOCAL
-  //     y JUNK_LOCAL_* existían pero NO se llamaban desde rankEmail.
-  //  b) contactos TÉCNICOS/WHOIS/DOMINIO/IT que NUNCA compran pauta y queman el dominio:
-  //     domainmanagement@axa, net-manage@jiji, dominios.lantik@bizkaia, it-einkauf@/betrieb.extern@chip,
-  //     sistemas.*@, edv@, technik@, infra@, sysadmin@. (Rechazar el EMAIL no pierde el DOMINIO: el lead
-  //     queda pending para el MB → respeta la regla de oro.)
+  // Maxi 2026-07-13 (auditoría 48h): rechazo DURO SOLO de lo que NUNCA es un contacto real:
+  //  a) PLACEHOLDERS/FALSOS que se colaban como "persona" (vorname.name@/firstname.lastname@/
+  //     nombre.apellido@ matcheaban firstname.lastname → +70 → se enviaban). PLACEHOLDER_LOCAL y
+  //     JUNK_LOCAL_* existían pero NO se llamaban desde rankEmail.
+  //  b) WHOIS/gestión de DOMINIO (domainmanagement@axa, dominios.lantik@bizkaia): son del registrar.
+  // OJO (feedback user 2026-07-13): sistemas@/system@/IT/gmail NO van acá — en un medio chico pueden
+  // ser un contacto real ("sistemas.diariodovale@ no lo veo mal") → van a PENALTY abajo, no a reject.
   if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return -1;
-  if (/^(domainmanagement|domainadmin|domainname|dominios?|netmanage|net-manage|sys|sysadmin|systems?|edv|betrieb|technik|teknik|sistemas?|informatica|infra|infraestructura|infrastructure)([._-]|$)/i.test(local)
-      || /^it[._-](einkauf|support|admin|team|abteilung|dept|helpdesk|service)/i.test(local)) return -1;
+  if (/^(domainmanagement|domainadmin|domainname|dominios?)([._-]|$)/i.test(local)) return -1;
 
   let score = 0;
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
@@ -9598,6 +9599,11 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // Maxi 2026-07-13 (auditoría): departamentos que NO compran pauta (seguridad/casting/quejas/
   // reclamos/RRHH/soporte). No se descartan del todo (por si es el único contacto), pero van bien abajo.
   if (/^(seguridad|seguranca|security|sicherheit|casting|complaints?|reclam|quejas|reclamacoes|helpdesk|helpline|support.?tech|soporte.?tecnico|suporte.?tecnico)/.test(local)) score -= 45;
+  // Roles TÉCNICOS/IT/operaciones/red — rara vez compran pauta, pero en un medio chico pueden ser el
+  // ÚNICO contacto (feedback user 2026-07-13: "sistemas.diariodovale@ no lo veo mal") → penalty fuerte,
+  // NO hard-reject: pierden contra cualquier otro candidato pero sobreviven como último recurso.
+  if (/^(sys|sysadmin|systems?|sistemas?|edv|betrieb|technik|teknik|informatica|infra|infraestructura|infrastructure|netmanage|net-manage)([._-]|$)/.test(local)
+      || /^it[._-](einkauf|support|admin|team|abteilung|dept|helpdesk|service)/.test(local)) score -= 55;
   // Placeholders de CMS (user01, user02, usuario3, guest) — no son personas.
   if (/^(user|usuario|guest|nobody|admin)\d*$/.test(local)) score -= 60;
   // Maxi 2026-06-17 (audit #10): penalty solo si dígitos están AL INICIO

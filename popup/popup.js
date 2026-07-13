@@ -3993,7 +3993,7 @@ function _isGenericEmailLocal(email) {
 }
 // Maxi 2026-07-09: rol de VENTA DE PAUTA/PUBLICIDAD = "mejor opción" para ADEQ (elección user Q4).
 // Regex acotado (no matchea admin/advisor). Paridad con el worker (AD_SALES_LOCAL).
-const _AD_SALES_LOCAL_RE = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|anunci|reklam|iklan|comercial|commercial|ventas|vendas|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|inventory|programmatic|patrocin|sponsor)/i;
+const _AD_SALES_LOCAL_RE = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor)/i;
 // Tier de SELECCIÓN del email (paridad worker _pickTier): apollo/informer nominal (4) >
 // publicidad@/comercial@/ventas@ scrapeado (3) > persona scrapeada (2) > genérico info@/contacto@ (0).
 function _emailPickTierClient(email) {
