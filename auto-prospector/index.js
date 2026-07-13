@@ -4702,6 +4702,61 @@ async function runSuspectRejectAnalysis(token) {
   log(`🔎 suspect-analysis: ${flagged}/${rows.length} marcadas como sospechosas (⚠️)`);
 }
 
+// ════════════════════════════════════════════════════════════════
+// BARRIDO DE PROSPECTS (Maxi 2026-07-13) — el pool VIEJO (pending) entró antes de que
+// endureciera los filtros y NO se re-evalúa solo → cientos de no-publishers conocidos
+// (pinterest/esselunga/bancos/retailers) siguen ahí. Este job los PURGA de a batches usando
+// SOLO señales de ALTA PRECISIÓN (0 falsos positivos): (a) blocklist curada (isDomainBlockedFull),
+// (b) detector estructural (nonPublisherType: ecommerce/bank/edu/gov/travel/realestate). NUNCA
+// borra por Haiku ni por categoría/tema (eso quema publishers). Un publisher real jamás matchea
+// ninguna de las 2 señales → regla de oro intacta. Gated por config purge_blocked_prospects='true';
+// avanza por cursor de created_at y se auto-apaga al terminar el pool.
+async function sweepBlockedFromProspects(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.purge_blocked_prospects || "") !== "true") return;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const BATCH = 60;
+  const cursor = cfg.purge_cursor_ts || "";
+  const cursorClause = cursor ? `&created_at=lt.${encodeURIComponent(cursor)}` : "";
+  let rows = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at&order=created_at.desc&limit=${BATCH}`, { headers: auth });
+    if (r.ok) rows = await r.json();
+  } catch {}
+  if (!Array.isArray(rows) || rows.length === 0) {
+    await setConfigValue(token, "purge_blocked_prospects", "false").catch(() => {});
+    await setConfigValue(token, "purge_cursor_ts", "").catch(() => {});
+    log(`🧹 purge-prospects: pool barrido COMPLETO → flag OFF`);
+    return;
+  }
+  const toDelete = [];
+  const remaining = [];
+  // Fase 1: blocklist curada (sin red, instantáneo)
+  for (const row of rows) {
+    const blocked = await isDomainBlockedFull(row.domain, token);
+    if (blocked) toDelete.push({ id: row.id, domain: row.domain, reason: `blocklist:${blocked}` });
+    else remaining.push(row);
+  }
+  // Fase 2: detector estructural (con red, alta precisión, CONC 5)
+  const CONC = 5;
+  for (let i = 0; i < remaining.length; i += CONC) {
+    await Promise.all(remaining.slice(i, i + CONC).map(async (row) => {
+      const pc = await fetchPageContent(row.domain).catch(() => null);
+      if (pc?.nonPublisherType) toDelete.push({ id: row.id, domain: row.domain, reason: `nonpub_${pc.nonPublisherType}` });
+    }));
+  }
+  // Borrar (fire secuencial para no saturar PostgREST)
+  for (const d of toDelete) {
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${d.id}`, { method: "DELETE", headers: { ...auth, "Prefer": "return=minimal" } });
+      log(`  🗑️ purge ${d.domain} — ${d.reason}`);
+    } catch {}
+  }
+  const lastTs = rows[rows.length - 1].created_at;
+  await setConfigValue(token, "purge_cursor_ts", lastTs).catch(() => {});
+  log(`🧹 purge-prospects: batch=${rows.length} borrados=${toDelete.length} (blocklist=${rows.length - remaining.length}, estructural=${toDelete.length - (rows.length - remaining.length)}) cursor→${lastTs}`);
+}
+
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
 async function classifyPublisher(token, domain, pageContent, swCategory) {
   // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
@@ -5233,6 +5288,13 @@ const BRAND_BLOCKLIST = new Set([
   // Maxi 2026-07-13 (auditoría): marcas-ANUNCIANTE (no venden inventario, son clientes potenciales
   // de pauta, NO prospects). Aparecieron recibiendo mail del agente. Núcleo de 2do nivel inequívoco.
   "adidas","nike","puma","reebok","realmadrid","fcbarcelona","cocacola","pepsico","mcdonalds","ikea","lego",
+  // Maxi 2026-07-13 (barrido pool): plataformas/retailers/bancos/telcos globales que NO son publisher y
+  // que el detector estructural puede no ver por estructura. Núcleos inequívocos (evito ambiguos:
+  // action/but/orange/pepper/cultura). El detector estructural caza el resto de tiendas por carrito.
+  "roblox","dailymotion","deepai","skyscanner","kayak","trivago",
+  "esselunga","mytheresa","oriflame","johnlewis","fnac","noon","subito","njuskalo","chotot","buyma","snkrdunk",
+  "zalando","asos","shein","temu","allegro","cdiscount","mediamarkt","decathlon","wayfair","etsy","taobao","tmall",
+  "bbva","santander","revolut","virginmedia","earthlink","mydealz","promodescuentos","chollometro","nubank","mercadopago",
 ]);
 
 function isDomainBlocked(domain) {
@@ -12441,6 +12503,9 @@ async function main() {
         await maybeRunProspectTrashSynthesis(token).catch(e => log(`⚠️ prospect trash synth: ${e.message}`));
         // Maxi 2026-07-01: análisis 3×/semana (L/X/V) — marca prospects sospechosos de rechazo (⚠️)
         await runSuspectRejectAnalysis(token).catch(e => log(`⚠️ suspect analysis: ${e.message}`));
+        // Maxi 2026-07-13: barrido on-demand del pool (purga no-publishers viejos por blocklist +
+        // detector estructural). Gated por config purge_blocked_prospects='true'; se auto-apaga al terminar.
+        await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
