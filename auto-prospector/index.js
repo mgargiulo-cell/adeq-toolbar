@@ -4449,6 +4449,7 @@ async function fetchPageContent(domain) {
     const travelSchema = /"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i;
     const npoSchema    = /"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i;
     const realtySchema = /"@type"\s*:\s*"(RealEstateListing|RealEstateAgent|Residence|Apartment|SingleFamilyResidence)"/i;
+    const govSchema    = /"@type"\s*:\s*"(GovernmentOrganization|GovernmentService|GovernmentOffice|GovernmentBuilding)"/i;
 
     // Frases inequívocas y ACOTADAS (un publisher jamás las usa como intención propia). GATE por
     // !hasProgrammatic: un banco/hotel/universidad/inmobiliaria/tienda en su PROPIO sitio no corre
@@ -4463,6 +4464,15 @@ async function fetchPageContent(domain) {
 
     let nonPublisherType = null;
     if (isStore) nonPublisherType = "ecommerce";   // plataforma/carrito: es tienda aunque tenga ads
+    // Maxi 2026-07-13 (auditoría 48h): schema de ENTIDAD que un publisher JAMÁS lleva describiéndose
+    // a SÍ MISMO → rechazo AUNQUE tenga ads (un banco/aseguradora/universidad/gobierno mete pixel de
+    // retargeting → "monetizado" → antes se colaba: axa/sympany/wizink/adib/adcb/fernuni/univ-biskra/
+    // has-sante/rki/bizkaia). Un finance-news NO se auto-marca BankOrCreditUnion; un edu-content NO se
+    // auto-marca CollegeOrUniversity → FP casi nulo. El schema DÉBIL (hotel/ONG/inmobiliaria, que un
+    // publisher SÍ puede embeber al RESEÑAR) + keywords quedan gateados por !hasDisplayAds (abajo).
+    else if (bankSchema.test(html)) nonPublisherType = "bank";
+    else if (eduSchema.test(html))  nonPublisherType = "education";
+    else if (govSchema.test(html))  nonPublisherType = "government";
     // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
     // O red partner de ADEQ: Taboola/MGID/Ezoic/Seedtag/Teads...). Un publisher que monetiza con ads
     // —aunque embeba schema de un hotel/producto que RESEÑA, o mencione vocabulario financiero— NUNCA
@@ -4470,9 +4480,7 @@ async function fetchPageContent(domain) {
     // tienda-sin-plataforma en su PROPIO sitio no vende inventario → no corre display → se caza.
     // Esto además arregla: nonprofit-journalism con ads (pasa) vs charity sin ads (se caza).
     else if (!hasDisplayAds) {
-      if (bankSchema.test(html)) nonPublisherType = "bank";
-      else if (eduSchema.test(html)) nonPublisherType = "education";
-      else if (travelSchema.test(html)) nonPublisherType = "travel";
+      if (travelSchema.test(html)) nonPublisherType = "travel";
       else if (npoSchema.test(html)) nonPublisherType = "nonprofit";
       else if (realtySchema.test(html)) nonPublisherType = "realestate";
       else if (_hits(bankKw) >= 2) nonPublisherType = "bank";
@@ -5211,6 +5219,9 @@ const BRAND_BLOCKLIST = new Set([
   "youtube","vimeo","twitch","medium","substack","wikipedia","stackoverflow",
   "applovin","ironsource","criteo","taboola","outbrain","pubmatic","magnite","inmobi",
   "unity","digitalturbine","vungle","adcolony","mgid","revcontent","teads","vidoomy",
+  // Maxi 2026-07-13 (auditoría): marcas-ANUNCIANTE (no venden inventario, son clientes potenciales
+  // de pauta, NO prospects). Aparecieron recibiendo mail del agente. Núcleo de 2do nivel inequívoco.
+  "adidas","nike","puma","reebok","realmadrid","fcbarcelona","cocacola","pepsico","mcdonalds","ikea","lego",
 ]);
 
 function isDomainBlocked(domain) {
@@ -9476,6 +9487,18 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
   if (/^[a-z0-9]{8,}$/.test(local) && !/[aeiou]{2}/.test(local)) return -1;
 
+  // Maxi 2026-07-13 (auditoría 48h): rechazo DURO de:
+  //  a) PLACEHOLDERS que se colaban como "persona real" (vorname.name@/firstname.lastname@/
+  //     nombre.apellido@ matcheaban el patrón firstname.lastname → +70 → se enviaban). PLACEHOLDER_LOCAL
+  //     y JUNK_LOCAL_* existían pero NO se llamaban desde rankEmail.
+  //  b) contactos TÉCNICOS/WHOIS/DOMINIO/IT que NUNCA compran pauta y queman el dominio:
+  //     domainmanagement@axa, net-manage@jiji, dominios.lantik@bizkaia, it-einkauf@/betrieb.extern@chip,
+  //     sistemas.*@, edv@, technik@, infra@, sysadmin@. (Rechazar el EMAIL no pierde el DOMINIO: el lead
+  //     queda pending para el MB → respeta la regla de oro.)
+  if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return -1;
+  if (/^(domainmanagement|domainadmin|domainname|dominios?|netmanage|net-manage|sysadmin|edv|betrieb|technik|teknik|sistemas?|informatica|infra|infraestructura|infrastructure)([._-]|$)/i.test(local)
+      || /^it[._-](einkauf|support|admin|team|abteilung|dept|helpdesk|service)/i.test(local)) return -1;
+
   let score = 0;
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
 
@@ -9564,6 +9587,9 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // dmca@/copyright@/abuse@) — obligatorios por ley (sobre todo en /impressum de sitios DE),
   // NO son comprador y rinden poquísimo. Los dejamos ABAJO de un info@/contact@ normal.
   if (/^(datenschutz|legal|privacy|privacidad|gdpr|dpo|dsb|dmca|copyright|compliance|abuse|recht)/.test(local)) score -= 30;
+  // Maxi 2026-07-13 (auditoría): departamentos que NO compran pauta (seguridad/casting/quejas/
+  // reclamos/RRHH/soporte). No se descartan del todo (por si es el único contacto), pero van bien abajo.
+  if (/^(seguridad|seguranca|security|sicherheit|casting|complaints?|reclam|quejas|reclamacoes|helpdesk|helpline|support.?tech|soporte.?tecnico|suporte.?tecnico)/.test(local)) score -= 45;
   // Placeholders de CMS (user01, user02, usuario3, guest) — no son personas.
   if (/^(user|usuario|guest|nobody|admin)\d*$/.test(local)) score -= 60;
   // Maxi 2026-06-17 (audit #10): penalty solo si dígitos están AL INICIO
@@ -10274,6 +10300,14 @@ async function runAgentCycle(token, allFlags) {
     for (const lead of fresh) {
       if (processed >= batchSize) break;
       const domain = lead.domain;
+      // Maxi 2026-07-13 (auditoría 48h): re-chequear blocklist EN EL ENVÍO, no solo al importar.
+      // applovin.com (adtech, YA en CORPORATE_BLOCKLIST) recibió mail porque entró a review_queue
+      // ANTES de blocklistearse y el ciclo no re-chequeaba. Ahora ningún dominio blocklisteado sale.
+      const _blockReason = await isDomainBlockedFull(domain, token);
+      if (_blockReason) {
+        log(`  ⛔ ${domain}: blocklist (${_blockReason}) — no se envía`);
+        continue;
+      }
       let emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
       let leadTraffic = lead.traffic || 0;
       let leadGeo = lead.geo || "";
@@ -11048,16 +11082,22 @@ function _sourceHardTier(source) {
 
 // Maxi 2026-07-09: tier de SELECCIÓN del email final. Combina la confiabilidad de la SOURCE con
 // el ROL comercial del local-part. El user (Q4) eligió "rol comercial/publicidad" como la mejor
-// opción, PERO el decision-maker verificado por Apollo/informer sigue mandando (regla del dueño):
-//   4 = apollo/informer/manual nominal (decision-maker verificado)
-//   3 = publicidad@/comercial@/ventas@ scrapeado (rol de venta de pauta — buzón ideal ADEQ)
+// opción, PERO el decision-maker verificado por Apollo sigue mandando (regla del dueño):
+//   4 = apollo/manual nominal (decision-maker verificado)
+//   3 = publicidad@/comercial@/ventas@ (rol de venta de pauta — buzón ideal ADEQ)
 //   2 = otra persona/rol scrapeado (source=scrape)
+//   1 = informer NO-comercial (WHOIS/registrar — baja calidad, ver auditoría 2026-07-13)
 //   0 = genérico (info@/contacto@)
-// Así el orden queda: apollo/informer > publicidad@ > persona scrapeada > genérico.
+// Así el orden queda: apollo > publicidad@ > persona scrapeada > informer > genérico.
 function _pickTier(email, source) {
-  const st = _sourceHardTier(source);
-  if (st === 2) return 4;                                          // apollo/informer/manual nominal
+  const src = String(source || "").toLowerCase();
   const local = String(email || "").toLowerCase().split("@")[0];
+  // Maxi 2026-07-13 (auditoría 48h): informer (website.informer/WHOIS) NO es top-tier — da contactos
+  // técnicos/registrar (domainmanagement@, net-manage@…) de baja calidad. Se baja al nivel más bajo
+  // salvo que el local sea un rol comercial explícito. apollo/manual siguen tier 4.
+  if (src === "informer") return AD_SALES_LOCAL.test(local) ? 3 : 1;
+  const st = _sourceHardTier(source);
+  if (st === 2) return 4;                                          // apollo/manual nominal
   if (AD_SALES_LOCAL.test(local)) return 3;                        // rol comercial/publicidad
   if (st === 1) return 2;                                          // persona scrapeada
   return 0;                                                        // genérico
