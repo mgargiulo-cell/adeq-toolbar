@@ -5110,6 +5110,14 @@ const BLOCKED_CATEGORY_KEYWORDS = [
   "software > b2b", "saas", "enterprise software",
   "vehicles > manufacturer", "automotive > manufacturer",
   "consumer goods > manufacturer",
+  // Maxi 2026-07-13 (auditoría 48h): categorías SimilarWeb que NUNCA son publisher de contenido —
+  // se colaban a Prospects (subito/idealista/rabobank/hellowork/olx…). Substring match contra la cat.
+  // ⚠️ NO incluir 'adult' ni 'price_comparison' ni 'marketing_and_advertising': SW mis-clasificó ahí
+  // publishers REALES (fatherly=adult, tweakers=price_comparison, medios de marketing) → los dejamos a
+  // Haiku/revisión manual para no perder publishers (regla de oro).
+  "real_estate", "banking_credit_and_lending", "/insurance", "accounting_and_auditing",
+  "jobs_and_employment", "classifieds", "marketplace",
+  "e-commerce_and_shopping/e-commerce_and_shopping",
 ];
 
 function isCorporatePattern(domain) {
