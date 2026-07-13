@@ -4745,10 +4745,16 @@ async function sweepBlockedFromProspects(token) {
       if (pc?.nonPublisherType) toDelete.push({ id: row.id, domain: row.domain, reason: `nonpub_${pc.nonPublisherType}` });
     }));
   }
-  // Borrar (fire secuencial para no saturar PostgREST)
+  // NO hard-DELETE: pasamos a status='rejected' + motivo 'purge:...'. Desaparecen de Prospects
+  // (el agente solo lee status=pending) pero queda AUDITORÍA — se puede revisar/restaurar si algún
+  // publisher se coló (regla de oro). Query de auditoría: status='rejected' AND suspect_reason LIKE 'purge:%'.
   for (const d of toDelete) {
     try {
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${d.id}`, { method: "DELETE", headers: { ...auth, "Prefer": "return=minimal" } });
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${d.id}`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `purge: ${d.reason}`.slice(0, 200) }),
+      });
       log(`  🗑️ purge ${d.domain} — ${d.reason}`);
     } catch {}
   }
