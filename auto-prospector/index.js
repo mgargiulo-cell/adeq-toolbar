@@ -4432,7 +4432,11 @@ async function fetchPageContent(domain) {
     // Solo plataformas DEDICADAS de e-commerce (un sitio de contenido no las carga). WooCommerce/
     // Magento SE SACARON del 1-hit: muchos medios en WordPress usan Woo para paywall/suscripción/
     // merch → se detectan igual por botón-carrito + checkout (abajo), como cualquier tienda.
-    const storePlatform = /cdn\.shopify\.com|\.myshopify\.com|Shopify\.theme|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
+    // Shopify: exigimos la firma del STOREFRONT (globals JS que solo existen cuando la PÁGINA es la
+    // tienda), NO un link a *.myshopify.com ni un asset cdn.shopify.com — muchos PUBLISHERS enlazan o
+    // embeben una tienda de merch en Shopify (ej. americasvoice.news → realamericasvoice.myshopify.com)
+    // y NO son ecommerce. Shopify.shop/Shopify.theme/window.Shopify/shopify-section = storefront real.
+    const storePlatform = /Shopify\.theme|Shopify\.shop|Shopify\.routes|window\.Shopify|id=["']shopify-section|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
     const storeCartBtn  = /add[\s-]?to[\s-]?cart|a[ñn]adir al carrito|agregar al carr(o|ito)|adicionar ao carrinho|sepete ekle|a[ñn]adir a la (cesta|bolsa)|in den warenkorb/i;
     const storeCheckout = /\/(checkout|cart\/add|onepage|finalizar-compra|finalizar_compra|sepet|carrinho)\b|class=["'][^"']*(add-to-cart|addtocart|btn-cart|buy-button)/i;
     const storeOgProduct = /og:type["'][^>]*content=["']product["']/i;

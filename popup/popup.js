@@ -3828,7 +3828,7 @@ async function runPageContext() {
           // Si el sitio muestra ads → es publisher → NO se marca por schema/keywords (regla de oro).
           const hasDisplayAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360)/i.test(_h);
           // Solo plataformas DEDICADAS (Woo/Magento salieron del 1-hit: medios en WordPress usan Woo).
-          const storePlatform = /cdn\.shopify\.com|\.myshopify\.com|Shopify\.theme|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
+          const storePlatform = /Shopify\.theme|Shopify\.shop|Shopify\.routes|window\.Shopify|id=["']shopify-section|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
           const storeCartBtn  = /add[\s-]?to[\s-]?cart|a[ñn]adir al carrito|agregar al carr(o|ito)|adicionar ao carrinho|sepete ekle|a[ñn]adir a la (cesta|bolsa)|in den warenkorb/i;
           const storeCheckout = /\/(checkout|cart\/add|onepage|finalizar-compra|finalizar_compra|sepet|carrinho)\b|class=["'][^"']*(add-to-cart|addtocart|btn-cart|buy-button)/i;
           const storeOg = /og:type["'][^>]*content=["']product["']/i;

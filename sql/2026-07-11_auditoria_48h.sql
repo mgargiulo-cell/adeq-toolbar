@@ -70,3 +70,62 @@ ORDER BY sent_at DESC;
 -- GROUP BY 1,2 ORDER BY 1 DESC, 3 DESC;
 -- NOTA: toolbar_response_tracking = envíos del AGENTE. Envíos MANUALES (popup) van por otra vía
 -- y NO cuentan para el cap del agente — si Maxi "mandó 21", parte pueden ser manuales.
+
+
+-- ════════════════════════════════════════════════════════════════════════
+-- ⭐ TODO EN UNA SOLA QUERY (pegá SOLO esto y corré) — ventana 7 días.
+-- Supabase SQL Editor muestra solo el ÚLTIMO result set; por eso se unen las
+-- 3 auditorías en un único SELECT. Filtrá/ordená por la columna "seccion":
+--   1_CANCELADA  → ref=dominio · d1=motivo(capa: nonpub_/haiku_/title_)
+--   2_EMAIL      → ref=dominio · d1=candidato · d2=elegido_final · d3=source · d4=tier(+<<<ELEGIDO)
+--   3a_POR_DIA   → ref=dia · d1=mb · d2=enviados · d3=flag_cap(⚠️ si >10)
+--   3b_DETALLE   → ref=dominio · d1=mb · d2=email_enviado · d3=source
+-- ════════════════════════════════════════════════════════════════════════
+SELECT seccion, cuando, ref, d1, d2, d3, d4
+FROM (
+  -- 1) URLs canceladas por contenido (pasaron el mínimo de tráfico)
+  SELECT '1_CANCELADA'::text AS seccion, processed_at AS cuando,
+         domain AS ref,
+         replace(error_message, 'not_publisher: ', '') AS d1,
+         NULL::text AS d2, NULL::text AS d3, NULL::text AS d4
+  FROM toolbar_csv_queue
+  WHERE status = 'skipped' AND error_message LIKE 'not_publisher:%'
+    AND processed_at >= NOW() - INTERVAL '7 days'
+
+  UNION ALL
+  -- 2) Email elegido vs descartados (una fila por candidato)
+  SELECT '2_EMAIL', p.created_at,
+         p.domain,
+         (c->>'email'),
+         p.chosen_email,
+         (c->>'source'),
+         'tier ' || COALESCE(c->>'tier','?') ||
+           CASE WHEN c->>'email' = p.chosen_email THEN '  <<< ELEGIDO' ELSE '' END
+  FROM toolbar_email_picks p, jsonb_array_elements(p.candidates) c
+  WHERE p.n_candidates >= 2
+    AND p.created_at >= NOW() - INTERVAL '7 days'
+
+  UNION ALL
+  -- 3a) Envíos por día y por MB (cap = 10/día)
+  SELECT '3a_POR_DIA', date_trunc('day', sent_at),
+         (sent_at AT TIME ZONE 'Europe/Madrid')::date::text,
+         mb_email,
+         COUNT(*)::text,
+         CASE WHEN COUNT(*) > 10 THEN '⚠️ PASA DE 10' ELSE 'ok' END,
+         NULL::text
+  FROM toolbar_response_tracking
+  WHERE sent_at >= NOW() - INTERVAL '7 days'
+  GROUP BY date_trunc('day', sent_at), (sent_at AT TIME ZONE 'Europe/Madrid')::date, mb_email
+
+  UNION ALL
+  -- 3b) Detalle de cada envío (últimos 3 días)
+  SELECT '3b_DETALLE', sent_at,
+         domain,
+         mb_email,
+         email_sent_to,
+         source,
+         NULL::text
+  FROM toolbar_response_tracking
+  WHERE sent_at >= NOW() - INTERVAL '3 days'
+) z
+ORDER BY seccion, cuando DESC;
