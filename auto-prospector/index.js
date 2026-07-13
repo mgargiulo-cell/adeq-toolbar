@@ -10381,18 +10381,15 @@ async function runAgentCycle(token, allFlags) {
             log(`  🌐 ${domain}: lang=${leadLanguage} (${det.source}/${det.confidence}, sin html)`);
           }
         }
-        // Maxi 2026-06-22: si la página declara CLARAMENTE un idioma SIN template
-        // (de/fr/nl/pl/tr/ru/ja/zh/ko/etc.), NO mandar en inglés (quema el dominio).
-        // Lo dejamos pending para que un MB lo trabaje. Ante la duda (sin señal) → EN.
+        // Maxi 2026-07-13 (DECISIÓN DEL USER): NO se agregan más idiomas de template. CUALQUIER idioma
+        // fuera de {es,en,it,pt,ar} se envía en INGLÉS. Antes (2026-06-22) los idiomas foráneos con
+        // html lang declarado (de/fr/nl/ja/tr/...) se SALTEABAN y quedaban pending; el user prefiere
+        // mandar en inglés a no mandar. Los 5 soportados siguen yendo en su idioma (detección arriba).
         if (!SUPPORTED_AGENT_LANGS.has(leadLanguage)) {
-          const _raw = String(_pageContent?.htmlLang || _pageContent?.ogLocale || "")
-            .toLowerCase().split(/[-_]/)[0];
-          const _foreignNoTemplate = new Set(["de","fr","nl","pl","tr","ru","ja","zh","ko","sv","no","da","fi","cs","hu","ro","el","uk","id","vi","th","he","fa"]);
-          if (_foreignNoTemplate.has(_raw)) {
-            log(`  🌐 ${domain} — idioma "${_raw}" sin template → NO se envía en inglés, queda pending para el MB`);
-            continue;
+          if (leadLanguage && leadLanguage !== "en") {
+            log(`  🌐 ${domain} — idioma "${leadLanguage}" sin template → se envía en INGLÉS (decisión user 2026-07-13)`);
           }
-          leadLanguage = "en"; // desconocido/ambiguo → inglés (puede ser EN real)
+          leadLanguage = "en";
         }
         lead.language = leadLanguage;
 
