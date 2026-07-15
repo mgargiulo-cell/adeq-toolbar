@@ -299,7 +299,7 @@ function resetAnalysisUI() {
     "form-geo":       "",
     "form-idioma":    "",
     "form-ejecutivo": state.mediaBuyer || "",
-    "form-status":    "",
+    "form-estado":    "4",   // Maxi 2026-07-15 (UI#1): era "form-status" (id inexistente) → el <select> de estado Monday NO se reseteaba y arrastraba el valor del dominio anterior. Default "4" = igual que prefillMondayForm.
     "pitch-category": "",
     "pitch-tone":     "informal",
     "pitch-length":   "short",
@@ -1020,7 +1020,10 @@ function _renderCategoryChips() {
 function _populateHourSelects() {
   ["agent-cfg-active-start", "agent-cfg-active-end"].forEach(id => {
     const sel = document.getElementById(id);
-    if (!sel || sel.options.length > 0) return;
+    // Maxi 2026-07-15 (Admin#3): guard por SELECT real. Estos ids pasaron de <select> a <input hidden> el
+    // 2026-05-18 → sel.options era undefined → undefined.length TIRABA TypeError en la 1ra línea de
+    // loadAdminAgent → abortaba TODO el panel del agente (toggle/stats/chips/feeder nunca cargaban).
+    if (!sel || sel.tagName !== "SELECT" || sel.options.length > 0) return;
     for (let h = 0; h < 24; h++) {
       const opt = document.createElement("option");
       opt.value = String(h);
@@ -1364,17 +1367,25 @@ async function saveAgentThresholds() {
   // global gana sobre el override per-usuario.
   updates.agent_max_per_day_by_user = "{}";
 
-  // También persistimos focus (GEOs + categorías + weekly) en el mismo save.
-  const parseList = (id) => (document.getElementById(id).value || "")
-    .split(",").map(s => s.trim()).filter(Boolean);
-  const focus = {
-    geos_priority:       parseList("agent-focus-geos-priority").map(s => s.toUpperCase()),
-    geos_excluded:       parseList("agent-focus-geos-excluded").map(s => s.toUpperCase()),
-    categories_priority: parseList("agent-focus-categories").map(s => s.toLowerCase()),
+  // Maxi 2026-07-15 (Admin#2): capturar el modo activo al store y escribir AMBAS configs (agente Y worker).
+  // Antes leía los inputs RAW y escribía SOLO agent_focus_config → (1) worker_discovery_config no se podía
+  // guardar (su único saver era un botón oculto), y (2) editar en modo 🏭 Worker + "Guardar TODO" metía los
+  // valores del worker DENTRO de agent_focus_config → corrompía el config de envío del agente.
+  _captureFocusInputs();
+  const _fa = window._focusStore?.agent  || {};
+  const _fw = window._focusStore?.worker || {};
+  updates.agent_focus_config = JSON.stringify({
+    geos_priority:       _fa.geos_priority || [],
+    geos_excluded:       _fa.geos_excluded || [],
+    categories_priority: _fa.categories_priority || [],
     daily_override:      parseInt(document.getElementById("agent-focus-daily").value, 10) || 0,
     weekly_target:       parseInt(document.getElementById("agent-focus-weekly").value, 10) || 0,
-  };
-  updates.agent_focus_config = JSON.stringify(focus);
+  });
+  updates.worker_discovery_config = JSON.stringify({
+    geos_priority:       _fw.geos_priority || [],
+    geos_excluded:       _fw.geos_excluded || [],
+    categories_priority: _fw.categories_priority || [],
+  });
 
   await _writeAgentConfig(updates);
   showToast("✅ Configuración guardada (aplica a los 3 MBs)", "info");
@@ -1737,7 +1748,9 @@ async function loadAdminActivity() {
 
   // Comparador de Media Buyers — at-a-glance side-by-side (agente incluído como columna extra)
   renderAdminComparator(combined, usageRes, sessionsRes, agentActions, bounceRetries);
-  renderSourcePerformance().catch(() => {});
+  // Maxi 2026-07-15 (Admin#4): renderSourcePerformance() ELIMINADO — pisaba nondeterministicamente el
+  // contenedor #admin-source-performance que renderAdminSourcePerformance (1697) llena con el panel "por
+  // motor" que la HTML rotula. Su tabla rolling-30d no tenía sección propia (su auto-inject nunca disparaba).
 
   // Resumen narrativo por MB (cards con tips para 1:1)
   renderAdminMBSummaries(combined, usageRes, sessionsRes, agentActions);
@@ -1967,7 +1980,7 @@ function _normalizeUserKey(raw) {
   return lower;
 }
 
-function _aggregateByUser(historial, usage, sessions) {
+function _aggregateByUser(historial, usage, sessions, agentActions) {
   const byUser = new Map();
   TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), {
     sites: 0, autopilotSites: 0, manualSites: 0,
@@ -1982,6 +1995,7 @@ function _aggregateByUser(historial, usage, sessions) {
       geos: {}, categories: {},
       above500k: 0, below500k: 0,
       emails: 0, monday: 0, claude: 0,
+      opens: 0, sitesManual: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0,   // Maxi 2026-07-15 (Admin#1): faltaban → el comparador mostraba 0 en emails/Monday (manual y agente).
       apSec: 0, popupSec: 0,
     });
     return byUser.get(u);
@@ -2011,11 +2025,23 @@ function _aggregateByUser(historial, usage, sessions) {
     if (usageEmails > o.emails) o.emails = usageEmails;
     if (usageMonday > o.monday) o.monday = usageMonday;
     o.claude += parseInt(r.by_provider?.anthropic || 0, 10);
+    // Maxi 2026-07-15 (Admin#1): campos split que el comparador lee (mismo cálculo que renderAdminMBSummaries).
+    o.opens        += parseInt(r.by_provider?._popup_opens    || 0, 10);
+    o.sitesManual  += parseInt(r.by_provider?._sites_analyzed || 0, 10);
+    o.emailsManual += parseInt(r.by_provider?._emails_sent    || 0, 10);
+    o.mondayManual += parseInt(r.by_provider?._monday_pushes  || 0, 10);
   });
   sessions.forEach(s => {
     const o = ensure(_normalizeUserKey(s.user_email));
     if (s.kind === "autopilot") o.apSec   += s.duration_sec || 0;
     if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
+  });
+  // Maxi 2026-07-15 (Admin#1): agent actions → emailsAgent/mondayAgent (excluye los manuales, ya contados).
+  (agentActions || []).forEach(a => {
+    const o = ensure(_normalizeUserKey(a.user_email));
+    const isManual = (a.details?.ui_origin || "") === "toolbar_manual";
+    if (a.action === "sent" && !isManual) o.emailsAgent++;
+    if (a.action === "monday_ok" && !isManual) o.mondayAgent++;
   });
   return byUser;
 }
@@ -2025,7 +2051,7 @@ function _aggregateByUser(historial, usage, sessions) {
 function renderAdminComparator(historial, usage, sessions, agentActions = [], bounceRetries = []) {
   const wrap = document.getElementById("admin-mb-comparator");
   if (!wrap) return;
-  const byUser = _aggregateByUser(historial, usage, sessions);
+  const byUser = _aggregateByUser(historial, usage, sessions, agentActions);  // Maxi 2026-07-15 (Admin#1): pasar agentActions → emailsAgent/mondayAgent
   // Bounces por MB — cada row en toolbar_bounce_retries = 1 bounce atribuido
   // al MB que mandó el email original. % bounce = bounces / emails enviados.
   const bouncesByUser = {};
@@ -2101,7 +2127,7 @@ function renderAdminComparator(historial, usage, sessions, agentActions = [], bo
         { label: "Emails — agente",    get: m => m.emailsAgent || 0, fmt: v => v.toLocaleString() },
         { label: "Monday — agente",    get: m => m.mondayAgent || 0, fmt: v => v.toLocaleString() },
         { label: "Conv. push/site",    get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
-        { label: "% bounce",           get: m => m.emails > 0 ? Math.round((m.bounces / m.emails) * 100) : 0, fmt: (v, m) => m.emails > 0 ? `${v}% (${m.bounces})` : "—", color: v => v <= 3 ? "good" : v <= 8 ? "warn" : "bad", noBar: true },
+        { label: "% bounce",           get: m => m.emailsAgent > 0 ? Math.round((m.bounces / m.emailsAgent) * 100) : 0, fmt: (v, m) => m.emailsAgent > 0 ? `${v}% (${m.bounces})` : "—", color: v => v <= 3 ? "good" : v <= 8 ? "warn" : "bad", noBar: true },   /* Maxi 2026-07-15 (Admin#6): denominador emailsAgent (los bounces son de agente), no m.emails (manual) */
       ],
     },
     {
@@ -2376,6 +2402,9 @@ async function populateUserFilter() {
     opt.value = e; opt.textContent = e;
     sel.appendChild(opt);
   });
+  // Maxi 2026-07-15 (Admin#5): marcar poblado ACÁ (no solo en el success del fetch). Antes, si el fetch de
+  // api_usage fallaba, el flag quedaba false → cada refresh (30s) re-agregaba Maxi/Agus/Diego → duplicados.
+  _userFilterPopulated = true;
   try {
     const res = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?select=user_email&order=user_email`,
@@ -3826,11 +3855,11 @@ async function runPageContext() {
           const _hits = (arr) => arr.reduce((n, re) => n + (re.test(_h) ? 1 : 0), 0);
           // hasDisplayAds = programmatic O red partner de ADEQ (Taboola/MGID/Ezoic/Seedtag/Teads...).
           // Si el sitio muestra ads → es publisher → NO se marca por schema/keywords (regla de oro).
-          const hasDisplayAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360)/i.test(_h);
+          const hasDisplayAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360|viads|vidverto|360playvid|truvid|embimedia|embi\.media|smilewanted|clever-?advertising|ez\.ai)/i.test(_h);
           // Maxi 2026-07-15 (sync con worker): hasPublisherAds = SOLO ad-tech de PUBLISHER (AdSense/GPT/SSP/
           // Taboola — una tienda no muestra ads de terceros; EXCLUYE retargeting criteo/adsrvr/adform) → VETA
           // toda la detección: un medio que vende inventario NUNCA se marca no-publisher (regla de oro).
-          const hasPublisherAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|div-gpt-ad|data-ad-slot|googletag\.cmd|amazon-adsystem|aps\.amazon|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|yieldmo|sharethrough|gumgum|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360)/i.test(_h);
+          const hasPublisherAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|div-gpt-ad|data-ad-slot|googletag\.cmd|amazon-adsystem|aps\.amazon|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|yieldmo|sharethrough|gumgum|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360|viads|vidverto|360playvid|truvid|embimedia|embi\.media|smilewanted|clever-?advertising|ez\.ai)/i.test(_h);
           const storePlatform = /Shopify\.theme|Shopify\.shop|Shopify\.routes|window\.Shopify|id=["']shopify-section|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
           const storeCartBtn  = /add[\s-]?to[\s-]?cart|a[ñn]adir al carrito|agregar al carr(o|ito)|adicionar ao carrinho|sepete ekle|a[ñn]adir a la (cesta|bolsa)|in den warenkorb/i;
           const storeCheckout = /\/(checkout|cart\/add|onepage|finalizar-compra|finalizar_compra|sepet|carrinho)\b|class=["'][^"']*(add-to-cart|addtocart|btn-cart|buy-button)/i;
@@ -4019,8 +4048,12 @@ const _AD_SALES_LOCAL_RE = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|we
 // publicidad@/comercial@/ventas@ scrapeado (3) > persona scrapeada (2) > genérico info@/contacto@ (0).
 function _emailPickTierClient(email) {
   const src = (state.emailSources.get(email) || "").toLowerCase();
-  if (src === "apollo" || src === "informer") return 4;      // decision-maker verificado
   const local = String(email || "").toLowerCase().split("@")[0];
+  // Maxi 2026-07-15 (D1 sync worker _pickTier): informer (WHOIS/registrar) NO es top-tier — baja a 1
+  // (o 3 si el local es rol comercial). Antes estaba en 4 junto a apollo → el popup mostraba como
+  // "mejor contacto" un domainmanagement@ que el worker rankea ÚLTIMO. Ahora coincide con el envío real.
+  if (src === "informer") return _AD_SALES_LOCAL_RE.test(local) ? 3 : 1;
+  if (src === "apollo" || src === "manual") return 4;        // decision-maker verificado
   if (_AD_SALES_LOCAL_RE.test(local)) return 3;              // rol comercial/publicidad
   if (!_isGenericEmailLocal(email)) return 2;                // persona / rol no-genérico
   return 0;                                                   // genérico
@@ -5602,7 +5635,7 @@ async function bindButtons() {
       if (candidates.length === 0) {
         resultEl.textContent = "No URLs found with those filters in Monday.";
         resultEl.className = "push-result error";
-        btn.disabled = false; btn.textContent = "🚀 Importar 15 URLs";
+        btn.disabled = false; btn.textContent = "🚀 Import 15 URLs";
         return;
       }
 
@@ -5632,7 +5665,7 @@ async function bindButtons() {
       resultEl.className = "push-result error";
     }
 
-    btn.disabled = false; btn.textContent = "🚀 Importar 15 URLs";
+    btn.disabled = false; btn.textContent = "🚀 Import 15 URLs";
   });
 
   // ── Import → Auto-prospector Queue ─────────────────────────────
@@ -7254,7 +7287,7 @@ async function initCsvQueue() {
   // (no del campo effective_added que se mide 30 min después del cron y queda
   // NULL en los runs recientes → bug de "0 to Prospects" cuando los runs
   // estaban activos pero sin medir).
-  async function _renderAgentBlock(feeders) {
+  async function _renderAgentBlock(feeders, isToday = true) {
     if (!feeders || feeders.length === 0) {
       return `
         <div style="padding:8px;border:1px solid #6366f1;border-radius:6px;margin-bottom:8px;background:rgba(99,102,241,0.06)">
@@ -7270,17 +7303,24 @@ async function initCsvQueue() {
     // Calcular effectiveTotal en vivo desde review_queue (creados hoy con source del worker)
     // En vez de leer effective_added que puede ser NULL para runs recientes.
     let effectiveTotal = 0;
-    try {
-      const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-      const since = todayStart.toISOString();
-      const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-      const rqRes = await fetch(
-        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&source=in.(csv,autopilot,sellers_json,monday_refresh,autogoogle)&select=id`,
-        { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }
-      );
-      const rangeHdr = rqRes.headers.get("content-range") || "";
-      effectiveTotal = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
-    } catch {}
+    if (isToday) {
+      // HOY: query en vivo (los runs recientes pueden tener effective_added NULL, se mide 30min después).
+      try {
+        const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+        const since = todayStart.toISOString();
+        const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+        const rqRes = await fetch(
+          `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&source=in.(csv,autopilot,sellers_json,monday_refresh,autogoogle)&select=id`,
+          { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }
+        );
+        const rangeHdr = rqRes.headers.get("content-range") || "";
+        effectiveTotal = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch {}
+    } else {
+      // Maxi 2026-07-15 (UI#3A): días PASADOS → usar el effective_added YA MEDIDO de cada run. Antes se
+      // hacía la query live a review_queue de HOY → cada día del histórico mostraba el conteo de hoy.
+      effectiveTotal = okRuns.reduce((s, r) => s + (parseInt(r.effective_added, 10) || 0), 0);
+    }
 
     const conv = grossTotal > 0 ? (effectiveTotal / grossTotal * 100).toFixed(1) : "—";
     const skipped = feeders.length - okRuns.length;
@@ -7336,8 +7376,8 @@ async function initCsvQueue() {
       </div>`;
   }
 
-  async function _renderActivityToday(attempts, feeders) {
-    let html = await _renderAgentBlock(feeders);
+  async function _renderActivityToday(attempts, feeders, isToday = true) {
+    let html = await _renderAgentBlock(feeders, isToday);   // Maxi 2026-07-15 (UI#3A): pasar isToday
     HISTORY_MBS.forEach(mb => { html += _renderMbBlock(mb.name, mb.email, attempts); });
     return html;
   }
@@ -7364,11 +7404,12 @@ async function initCsvQueue() {
     });
     const dates = Object.keys(byDate).sort().reverse();
     if (dates.length === 0) return `<div style="color:var(--text-muted);font-style:italic;padding:8px">No activity in the last 7 days.</div>`;
+    const _todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });  // Maxi 2026-07-15 (UI#3A)
     const blocks = await Promise.all(dates.map(async d => `
       <details style="margin-bottom:6px;border:1px solid var(--border);border-radius:6px;padding:6px" ${d === dates[0] ? "open" : ""}>
         <summary style="cursor:pointer;font-weight:600;font-size:12px">${d}</summary>
         <div style="margin-top:6px">
-          ${await _renderActivityToday(byDate[d].attempts, byDate[d].feeders)}
+          ${await _renderActivityToday(byDate[d].attempts, byDate[d].feeders, d === _todayMadrid)}
         </div>
       </details>
     `));
@@ -7998,12 +8039,13 @@ function _detectLangFromText(text) {
   const hasArabic     = /[؀-ۿ]/.test(text);
   if (hasArabic) return "ar";
 
-  // Conteo de palabras-marcador frecuentes (stopwords muy típicas)
+  // Maxi 2026-07-15 (D3): listas de marcadores AMPLIADAS + bonus 8 + margen 1 (sync con el worker, que
+  // estaba mejorado y el popup quedó atrás → devolvía null en es/pt → sugería inglés en sitios en español).
   const markers = {
-    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|nuestra|nuestro|hola|gracias|hace)\b/g,
-    pt: /\b(que|nao|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|ola|obrigad|dele|dela|voce)\b/g,
-    it: /\b(che|non|per|con|una|del|della|sono|sono|questo|questa|quando|dove|come|perche|sopra|grazie|nostra|nostro|ciao)\b/g,
-    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks)\b/g,
+    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|nuestra|nuestro|hola|gracias|hace|mas|muy|todo|todos|desde|hasta|entre|sin|sus|noticias|politica|ultimas|anos|dia|inicio|servicios|empresa|informacion|contacto|precio|mundo|deportes|economia|ciudad)\b/g,
+    pt: /\b(que|nao|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|ola|obrigad|dele|dela|voce|mais|muito|todos|desde|ate|entre|sem|seus|noticias|politica|ultimas|anos|dia|inicio|servicos|empresa|informacao|contato|preco|mundo|esportes|economia|cidade)\b/g,
+    it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perche|sopra|grazie|nostra|nostro|ciao|piu|molto|tutti|dalla|fino|senza|suoi|noi|notizie|politica|ultime|anni|giorno|inizio|servizi|azienda|informazioni|contatti|prezzo|mondo|sport|economia|citta)\b/g,
+    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks|news|politics|latest|years|home|services|company|information|contact|price|world|sports|economy|city)\b/g,
   };
   const scores = {};
   let total = 0;
@@ -8012,19 +8054,18 @@ function _detectLangFromText(text) {
     scores[lang] = m ? m.length : 0;
     total += scores[lang];
   }
-  // Bonus por caracteres únicos — Maxi 2026-07-08: gate igual que el worker. Los acentos
-  // compartidos (á/é/í/ó/ú los usan checo/polaco/húngaro/turco) solo suman si el idioma YA
-  // tiene una stopword; solo ñ/¿/¡/ã/õ (realmente distintivos) suman solos.
-  if (/[ñ¿¡]/.test(text)) scores.es += 5;
-  else if (scores.es > 0 && /[áéíóúü]/.test(text)) scores.es += 5;
-  if (/[ãõ]/.test(text)) scores.pt += 5;
-  else if (scores.pt > 0 && /[çàáâ]/.test(text)) scores.pt += 5;
+  // Bonus por caracteres únicos — gate: los acentos compartidos (á/é/í/ó/ú los usan checo/polaco/húngaro/
+  // turco) solo suman si el idioma YA tiene una stopword; solo ñ/¿/¡/ã/õ (distintivos) suman solos.
+  if (/[ñ¿¡]/.test(text)) scores.es += 8;
+  else if (scores.es > 0 && /[áéíóúü]/.test(text)) scores.es += 8;
+  if (/[ãõ]/.test(text)) scores.pt += 8;
+  else if (scores.pt > 0 && /[çàáâ]/.test(text)) scores.pt += 8;
   if (scores.it > 0 && /[àèéìòù]/.test(text)) scores.it += 5;
 
   if (total < 3) return null; // muy poca señal
-  // Ganador con margen de >=2 sobre el segundo (evita empates dudosos)
+  // Ganador con margen de >=1 sobre el segundo (antes >=2 → devolvía null en muchos es/pt reales)
   const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  if (sorted[0][1] >= sorted[1][1] + 2) return sorted[0][0];
+  if (sorted[0][1] >= sorted[1][1] + 1 && sorted[0][1] > 0) return sorted[0][0];
   return null;
 }
 
@@ -8423,7 +8464,7 @@ async function initAutopilot() {
     Array.from(geoSel.options).forEach(o => { o.selected = saved.has(o.value); });
   }
   if (catSel)     catSel.value     = target.category   || "";
-  if (trafficSel) trafficSel.value = target.minTraffic || "400000";
+  if (trafficSel) trafficSel.value = target.minTraffic || "350000";
 
   btn.addEventListener("click", async () => {
     if (btn.disabled) return; // locked por otro user
@@ -8551,7 +8592,7 @@ async function initAutopilot() {
       ? Array.from(geoSel.selectedOptions).map(o => o.value).filter(Boolean).join(",")
       : "";
     const cat        = catSel?.value     || "";
-    const minTraffic = trafficSel?.value || "400000";
+    const minTraffic = trafficSel?.value || "350000";
     await setAutopilotTarget(geo, cat, minTraffic, state.accessToken);
     updateTargetLabel({ geo, category: cat, minTraffic }, targetBtn, currentLbl);
     if (panel) panel.style.display = "none";
@@ -8588,7 +8629,7 @@ function clearAutopilotTimer() {
 }
 
 function updateTargetLabel(target, targetBtn, currentLbl) {
-  const trafficNum = parseInt(target.minTraffic || "400000");
+  const trafficNum = parseInt(target.minTraffic || "350000");
   const trafficLbl = trafficNum >= 10000001 ? "+10M+" : trafficNum >= 1000000 ? `+${trafficNum/1000000}M` : `+${trafficNum/1000}K`;
   // Multi-GEO: shorten when many
   const geos = (target.geo || "").split(",").map(s => s.trim()).filter(Boolean);
