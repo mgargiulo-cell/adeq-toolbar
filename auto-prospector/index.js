@@ -445,14 +445,40 @@ async function isAutopilotEnabled(token) {
 // el flags cache debe refrescarse (invalidación quirúrgica, no del config entero).
 const _FLAG_CFG_KEYS = new Set(["auto_prospecting_enabled", "csv_queue_enabled", "agent_enabled_users", "agent_paused_until"]);
 async function setConfigValue(token, key, value) {
-  await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.${key}`, {
-    method: "PATCH",
-    headers: {
-      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ value }),
-  });
+  const _val = String(value);
+  const _auth = {
+    "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+    "Content-Type": "application/json",
+  };
+  // Maxi 2026-07-15 (BUG CRÍTICO): antes era SOLO PATCH. Un PATCH con ?key=eq.X sobre una
+  // key que NO EXISTE matchea 0 filas y NO crea nada → se perdía en silencio (y encima el
+  // cache in-memory de abajo la marcaba "escrita", enmascarando el fallo). Efecto: TODA key
+  // nueva que el worker intenta crear en runtime (auto_heartbeat_at, autogoogle_stats,
+  // auto_session_stats, last_source_perf_run…) nunca se persistía → el popup veía al worker
+  // "muerto" aunque estuviera vivo, y las stats/latido quedaban null para siempre. Ahora:
+  // PATCH (caso común: ya existe) y si matcheó 0 filas → INSERT (crear). return=representation
+  // nos dice cuántas filas tocó el PATCH sin un round-trip extra.
+  let _patched = [];
+  try {
+    const _r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.${encodeURIComponent(key)}`, {
+      method: "PATCH",
+      headers: { ..._auth, "Prefer": "return=representation" },
+      body: JSON.stringify({ value: _val }),
+    });
+    if (_r.ok) _patched = await _r.json().catch(() => []);
+  } catch {}
+  if (!Array.isArray(_patched) || _patched.length === 0) {
+    // No existía → crearla. Solo llegamos acá en el primer write de cada key nueva;
+    // después el PATCH matchea y este INSERT no corre (writes de misma key son secuenciales
+    // en el proceso único del worker, así que no hay carrera de duplicados).
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config`, {
+        method: "POST",
+        headers: { ..._auth, "Prefer": "return=minimal" },
+        body: JSON.stringify({ key, value: _val }),
+      });
+    } catch {}
+  }
   // Maxi 2026-07-03 perf: antes _invalidateConfigCache() borraba el cache ENTERO →
   // el próximo getConfig re-leía toda la tabla toolbar_config. El loop escribe config
   // varias veces por iteración (heartbeat, review_queue_band_status, slots, counters…),
@@ -11581,7 +11607,7 @@ async function aggregateSourcePerformance(token) {
     );
     if (bRes.ok) {
       const brows = await bRes.json().catch(() => []);
-      brows.forEach(b => { if (b.original_email) bouncedEmails.add(b.original_email.toLowerCase()); });
+      brows.forEach(b => { if (typeof b.original_email === "string") bouncedEmails.add(b.original_email.toLowerCase()); });
     }
 
     // 4. Agregar por (mb, source).
@@ -11592,11 +11618,14 @@ async function aggregateSourcePerformance(token) {
       agg.get(k)[field]++;
     };
     for (const s of sends) {
-      const mb  = (s.user_email || "").toLowerCase();
-      const src = (s.details?.source || "").toLowerCase();
+      // Maxi 2026-07-15: guardas de tipo. details es JSONB → source podía venir como objeto/
+      // array/número en algún row viejo → `(x||"").toLowerCase()` tiraba "toLowerCase is not a
+      // function" y abortaba TODO el aggregate (visto en logs Railway). Ahora no-string → "".
+      const mb  = (typeof s.user_email === "string" ? s.user_email : "").toLowerCase();
+      const src = (typeof s.details?.source === "string" ? s.details.source : "").toLowerCase();
       if (!mb || !src) continue;     // sin atribución → skip
       const isOpen   = opensByActionId.has(s.id);
-      const isBounce = s.email_to ? bouncedEmails.has(s.email_to.toLowerCase()) : false;
+      const isBounce = (typeof s.email_to === "string") ? bouncedEmails.has(s.email_to.toLowerCase()) : false;
       bump(mb, src, "sent");
       bump("_global", src, "sent");
       if (isOpen)   { bump(mb, src, "opens");   bump("_global", src, "opens"); }
