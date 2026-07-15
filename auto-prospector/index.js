@@ -4474,6 +4474,9 @@ async function fetchPageContent(domain) {
     const npoSchema    = /"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i;
     const realtySchema = /"@type"\s*:\s*"(RealEstateListing|RealEstateAgent|Residence|Apartment|SingleFamilyResidence)"/i;
     const govSchema    = /"@type"\s*:\s*"(GovernmentOrganization|GovernmentService|GovernmentOffice|GovernmentBuilding)"/i;
+    // Maxi 2026-07-14 (auditoría, casos hpc.org.ar/unitedpharmacy.sa): entidades de SALUD físicas —
+    // un publisher de salud (netdoktor/medical-news) NO se auto-marca Hospital/Pharmacy/Clinic.
+    const healthSchema = /"@type"\s*:\s*"(Hospital|MedicalClinic|Clinic|Pharmacy|Physician|Dentist|DiagnosticLab|MedicalBusiness|MedicalOrganization)"/i;
 
     // Frases inequívocas y ACOTADAS (un publisher jamás las usa como intención propia). GATE por
     // !hasProgrammatic: un banco/hotel/universidad/inmobiliaria/tienda en su PROPIO sitio no corre
@@ -4497,6 +4500,7 @@ async function fetchPageContent(domain) {
     else if (bankSchema.test(html)) nonPublisherType = "bank";
     else if (eduSchema.test(html))  nonPublisherType = "education";
     else if (govSchema.test(html))  nonPublisherType = "government";
+    else if (healthSchema.test(html)) nonPublisherType = "health";
     // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
     // O red partner de ADEQ: Taboola/MGID/Ezoic/Seedtag/Teads...). Un publisher que monetiza con ads
     // —aunque embeba schema de un hotel/producto que RESEÑA, o mencione vocabulario financiero— NUNCA
@@ -5322,6 +5326,7 @@ const BRAND_BLOCKLIST = new Set([
   "esselunga","mytheresa","oriflame","johnlewis","fnac","noon","subito","njuskalo","chotot","buyma","snkrdunk",
   "zalando","asos","shein","temu","allegro","cdiscount","mediamarkt","decathlon","wayfair","etsy","taobao","tmall",
   "bbva","santander","revolut","virginmedia","earthlink","mydealz","promodescuentos","chollometro","nubank","mercadopago",
+  "admiralmarkets","etoro","plus500","xtb","interactivebrokers","binance","coinbase","kraken", // brokers/exchanges (auditoría 2026-07-14)
 ]);
 
 function isDomainBlocked(domain) {
