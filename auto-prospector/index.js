@@ -9596,6 +9596,10 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // ser un contacto real ("sistemas.diariodovale@ no lo veo mal") → van a PENALTY abajo, no a reject.
   if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return -1;
   if (/^(domainmanagement|domainadmin|domainname|dominios?)([._-]|$)/i.test(local)) return -1;
+  // Maxi 2026-07-14 (auditoría rebotes 11-15/07): "owner@" bare = etiqueta de WHOIS/informer, NO un
+  // buzón real → rebotó 4/4 (cnnturk/expansion/arealme/vetogate). El ranking lo tomaba como EXEC (+90)
+  // y lo mandaba primero. Un dueño real escribe desde su nombre, no owner@. Reject (source-agnóstico).
+  if (/^owner$/.test(local)) return -1;
 
   let score = 0;
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
