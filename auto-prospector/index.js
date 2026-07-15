@@ -12564,6 +12564,26 @@ async function main() {
         } else if (iterCount % 30 === 0) {
           log(`💾 Mem iter #${iterCount}: rss=${rssMB}MB, heap=${heapMB}MB`);
         }
+        // Maxi 2026-07-15: caches keyed-by-domain crecen 1 entrada por dominio único y NUNCA evictan →
+        // en un proceso largo que procesa miles de dominios filtran memoria → alimentan el OOM que
+        // reiniciaba el worker cada ~7min (SIGTERM de Railway). Los limpiamos periódicamente / bajo presión.
+        // BARATOS (recomputan de un fetch/DNS → sin costo de API): limpiar seguido.
+        if (rssMB > 450 || iterCount % 40 === 0) {
+          let _freed = 0;
+          for (const _c of [_adsTxtCache, _publisherClassCache, _domainLangCache, _mxCache]) {
+            try { _freed += _c.size; _c.clear(); } catch {}
+          }
+          if (_freed > 0) log(`🧹 caches baratos limpiados (${_freed} entradas) — rss=${rssMB}MB`);
+        }
+        // CAROS (embeddings Voyage + picks de Claude = API paga): SOLO bajo presión real de memoria,
+        // para no re-gastar créditos. Se sacrifican solo si de verdad estamos por OOM.
+        if (rssMB > 550) {
+          let _freedApi = 0;
+          for (const _c of [_voyageWorkerCache, _claudePickCache]) {
+            try { _freedApi += _c.size; _c.clear(); } catch {}
+          }
+          if (_freedApi > 0) log(`🧹 caches API (embeddings/claude) limpiados por presión de memoria (${_freedApi}) — rss=${rssMB}MB`);
+        }
       } catch {}
     }
 
