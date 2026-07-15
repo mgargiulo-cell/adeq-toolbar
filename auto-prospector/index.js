@@ -1445,7 +1445,7 @@ async function _injectIntoCsvQueue(token, domains, sourceTag) {
 // dedup canónico + filtro 350K + filtro basura que todo lo demás. El filtro
 // "AutoGoogle" en Prospects mide cuántos llegan a Prospects desde este motor vs
 // el autopilot. Apagado si no hay SERPER_API_KEY (env de Railway).
-const AUTOGOOGLE_SLOTS = [8, 11, 14, 17, 21];  // 5 slots/día L-V, horarios PROPIOS (distintos al feeder 9/12/15/18/20)
+const AUTOGOOGLE_SLOTS = [10, 11, 14, 17, 21];  // Maxi 2026-07-15 (F4): 8→10 (el slot 8:00 nunca corría por el gate off-hours 9-23). Offset del feeder (9/12/15/18/20).
 const AUTOGOOGLE_MONTHLY_CAP = 2500;           // techo Serper/mes (plan FREE de Serper); el pacing lo reparte por días
 let _autoGoogleLastSlot = "";
 const _AUTOGOOGLE_KEYWORDS = [
@@ -1563,6 +1563,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     else { errCount++; lastStatus = status; }
     if (queriesDone > 0 && queriesDone % 20 === 0) {
       try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
+      try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}  // Maxi 2026-07-15 (F3): heartbeat dentro del loop largo
     }
   }
   try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
@@ -2631,13 +2632,22 @@ function trackAutopilotEvent(kind, domain) {
 }
 
 // Cuenta items de autopilot creados por un user hoy (para quota 75/día)
+// Maxi 2026-07-15 (F6): medianoche de HOY en Madrid, como ISO UTC. Reemplaza el patrón buggy de mezclar
+// la fecha de Buenos Aires con 'Z' (medianoche UTC) → desfase de 3h + inconsistente con el resto del worker
+// (que reset en Madrid). Mismo cálculo que getAgentDailyCount.
+function _madridDayStartUtc() {
+  const todaySpain = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+  const probe = new Date(`${todaySpain}T00:00:00`);
+  const offsetMs = new Date(probe.toLocaleString("en-US", { timeZone: "Europe/Madrid" })).getTime()
+                 - new Date(probe.toLocaleString("en-US", { timeZone: "UTC" })).getTime();
+  return new Date(probe.getTime() - offsetMs).toISOString();
+}
 async function getUserAutopilotCountToday(token, userEmail) {
   if (!userEmail) return 0;
   try {
-    // Argentina local day — quotas reset at 00:00 AR, not 00:00 UTC
-    const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
+    const cutoffUtc = _madridDayStartUtc();  // reset del día en Madrid (F6)
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}&created_at=gte.${todayISO}T00:00:00Z&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_by=eq.${encodeURIComponent(userEmail)}&created_at=gte.${cutoffUtc}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
     );
     const cr = res.headers.get("content-range") || "";
@@ -3484,21 +3494,17 @@ async function findSimilarSites(domain, rapidApiKey) {
   }
   const [swSites, ssSites] = await Promise.all([
     (async () => {
-      if (_rapidCapReached) return [];
+      // Maxi 2026-07-15 (Cost#2): rutear por rapidFetchWithRetry → cap pre-check (_rapidCapReached) +
+      // fusible por minuto + CONTADOR ATÓMICO (bumpApiCounterRPC). Antes hacía fetch directo con solo
+      // _rapidGlobalCounter++ → estas llamadas facturadas NO las veía el meter atómico (subconteo entre
+      // sesiones → el cap se podía superar). Ahora se cuentan igual que getTrafficData.
       try {
-        _rapidGlobalCounter++;
-        const res = await fetch(
+        const data = await rapidFetchWithRetry(
           `https://website-insights.p.rapidapi.com/similar-sites?domain=${encodeURIComponent(domain)}`,
-          {
-            headers: {
-              "x-rapidapi-key":  rapidApiKey,
-              "x-rapidapi-host": "website-insights.p.rapidapi.com",
-            },
-            signal: AbortSignal.timeout(8000),
-          }
+          { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" },
+          8000
         );
-        if (!res.ok) return [];
-        const data = await res.json();
+        if (!data || data.__error4xx || data.__error) return [];
         const raw = data?.similar_sites || data?.similarSites || data?.sites
                   || data?.related_sites || data?.data?.similar_sites || data?.data || [];
         const sites = Array.isArray(raw) ? raw : [];
@@ -3584,7 +3590,7 @@ const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
 
 // Apollo cache (TTL 7d) en Supabase — compartido con popup.
 // Saves cost: si worker o popup ya lo procesaron en los últimos 7d, esta call cuesta 0.
-const APOLLO_CACHE_TTL_DAYS = 7;
+const APOLLO_CACHE_TTL_DAYS = 45;  // Maxi 2026-07-15 (Cost#6): 7→45. Un decision-maker revelado no cambia semana a semana; los leads viven semanas en pending → con 7d se re-pagaba el unlock. Los no-email igual se re-intentan GRATIS (polish/reenrich: scrape+social+informer).
 async function getApolloCacheServer(token, domain) {
   const d = (domain || "").toLowerCase().replace(/^www\./, "");
   if (!d) return null;
@@ -4426,6 +4432,7 @@ async function fetchPageContent(domain) {
     if (/sparteo\.com/i.test(html))                                        adNetworks.push("Sparteo");
     if (/seedtag\.com/i.test(html))                                        adNetworks.push("Seedtag");
     if (/taboola/i.test(html))                                             adNetworks.push("Taboola");
+    if (/outbrain/i.test(html))                                            adNetworks.push("Outbrain");   // Maxi 2026-07-15 (D2): faltaba → un publisher con Outbrain podía purgarse
     if (/missena\.com/i.test(html))                                        adNetworks.push("Missena");
     if (/viads\.com|viads\.io/i.test(html))                               adNetworks.push("Viads");
     if (/mgid\.com/i.test(html))                                           adNetworks.push("MGID");
@@ -4917,6 +4924,7 @@ async function polishPool(token) {
   const _lastTs = leads[leads.length - 1].created_at;
   let blocked = 0, enriched = 0;
   for (let i = 0; i < leads.length; i += POLISH_CONC) {
+    try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}  // Maxi 2026-07-15 (F3): heartbeat por ronda (job largo)
     await Promise.all(leads.slice(i, i + POLISH_CONC).map(async (lead) => {
       const domain = lead.domain;
       try {
@@ -5703,10 +5711,9 @@ const CSV_DAILY_LIMIT_PER_USER = 300; // 300 dominios/día/usuario para CSV (Mon
 // Cuenta cuántos items terminó (done) un usuario específico hoy
 async function getUserCsvDoneToday(token, userEmail) {
   try {
-    // Argentina local day — quotas reset at 00:00 AR, not 00:00 UTC
-    const todayISO = new Date().toLocaleDateString("en-CA", { timeZone: "America/Argentina/Buenos_Aires" });
+    const cutoffUtc = _madridDayStartUtc();  // Maxi 2026-07-15 (F6): reset del día en Madrid (antes BA+Z = -3h e inconsistente)
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_by=eq.${encodeURIComponent(userEmail)}&processed_at=gte.${todayISO}T00:00:00Z&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_by=eq.${encodeURIComponent(userEmail)}&processed_at=gte.${cutoffUtc}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0" } }
     );
     const contentRange = res.headers.get("content-range") || "";
@@ -6447,6 +6454,9 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     processed++;
     userCounts.set(userEmail, inBatch + 1);
     log(`→ [${processed}/${maxItems}] ${item.domain} (${userEmail})`);
+    // Maxi 2026-07-15 (F3): heartbeat cada 5 items — runCsvQueue puede drenar por hasta 20min y antes no
+    // actualizaba el heartbeat → la UI mostraba "worker muerto" mientras trabajaba.
+    if (processed % 5 === 0) { try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {} }
 
     try {
       await processCsvItem(token, item, cfg, apolloUsage, callsRef);
@@ -6475,9 +6485,8 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
 
   const today = new Date().toISOString().split("T")[0];
   await saveApolloUsage(token, callsRef.count, today);
-  await saveRapidApiUsage(token, _rapidGlobalCounter, today);
-  await saveRapidApiMonthlyUsage(token, _rapidGlobalCounter, rapidMonth.period);
-  log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}, rapidapi: ${_rapidGlobalCounter}`);
+  // Maxi 2026-07-15 (Cost#1): RapidAPI ya NO se flushea acá (lo persiste el RPC atómico por hit) → evita doble-conteo.
+  log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}, rapidapi(session): ${_rapidGlobalCounter}`);
   return processed;
 }
 
@@ -7292,8 +7301,7 @@ async function runSession(token, cfg, sessionStart) {
   log(`Sesión completada — ${count} procesados | ${added} guardados | ${skipped} skipped | ${lowScore} bajo score | ${dupOrg} dup-org | ${discovered} descubiertos vía similares`);
   log(`RapidAPI esta sesión: ${_rapidGlobalCounter} hits`);
   await saveApolloUsage(token, apolloCallsThisSession, apolloUsage.today);
-  await saveRapidApiUsage(token, _rapidGlobalCounter, rapidUsage.today);
-  await saveRapidApiMonthlyUsage(token, _rapidGlobalCounter, rapidMonth.period);
+  // Maxi 2026-07-15 (Cost#1): RapidAPI ya NO se flushea acá (lo persiste el RPC atómico por hit) → evita doble-conteo.
   await flushAutopilotStats(token, true).catch(() => {});
 
   // ── PERSIST STATS para ratio adaptativo ──
@@ -8902,7 +8910,9 @@ async function getAgentDailyCount(token, userEmail) {
     // Timeout 5s: si Supabase está lento, no colgamos el worker entero por
     // este conteo. El fail-open de abajo se encarga del retry next cycle.
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,reserved)&created_at=gte.${cutoffUtc}&select=id`,
+      // Maxi 2026-07-15 (F1): +secondary_sent → el 2do email por lead ahora cuenta para el cap diario.
+      // Antes solo (sent,reserved) → el agente mandaba ~2x el tope (1 primario + 1 secundario por lead).
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,reserved,secondary_sent)&created_at=gte.${cutoffUtc}&select=id`,
       {
         headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
         signal: AbortSignal.timeout(5000),
@@ -11069,6 +11079,12 @@ async function runAgentCycle(token, allFlags) {
           }),
         }).catch(() => null);
         reservedId = (await reserveRes?.json().catch(() => null))?.[0]?.id || null;
+        // Maxi 2026-07-15 (F5): si la reserva NO se creó (Supabase caído), NO enviar — un envío sin reserva
+        // NO lo cuenta getAgentDailyCount → bypasea el cap. Mejor saltear y reintentar el próximo ciclo.
+        if (!reservedId) {
+          log(`  ⏭️ ${domain}: no se pudo reservar el slot de envío (Supabase?) — skip para no enviar sin contar`);
+          continue;
+        }
 
         // Defense-in-depth: validar que el email pertenece a la misma MARCA del lead.
         // Algoritmo brand-match (2026-05-15): strip TLD para comparar nombre comercial.
@@ -11619,14 +11635,16 @@ async function aggregateSourcePerformance(token) {
     if (!upRes.ok) {
       const txt = await upRes.text().catch(() => "");
       log(`  ⚠️ upsert ${upRes.status}: ${txt.slice(0, 200)}`);
-      return;
+      return false;   // Maxi 2026-07-15 (F8): señalar fallo → no marcar "corrido hoy"
     }
 
     // 6. Invalidar cache para que el próximo getDynamicSourceRank lea fresh.
     _sourceRankCache.clear();
     log(`  ✅ source perf upsert OK: ${rows.length} filas (${sends.length} sends procesados)`);
+    return true;
   } catch (e) {
     log(`⚠️ aggregateSourcePerformance: ${e.message}`);
+    return false;
   }
 }
 
@@ -11639,8 +11657,10 @@ async function maybeRunSourcePerformanceAggregate(token) {
     const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
     const last = cfg.last_source_perf_run || "";
     if (last === todayMadrid) return;
-    await aggregateSourcePerformance(token);
-    await setConfigValue(token, "last_source_perf_run", todayMadrid).catch(() => {});
+    const _ok = await aggregateSourcePerformance(token);
+    // Maxi 2026-07-15 (F8): solo marcar "corrido hoy" si NO falló (false). Antes se marcaba siempre →
+    // un fallo (Supabase 5xx) quedaba como "hecho" y el ranking dinámico corría sobre data vieja hasta mañana.
+    if (_ok !== false) await setConfigValue(token, "last_source_perf_run", todayMadrid).catch(() => {});
   } catch (e) { log(`⚠️ maybeRunSourcePerformanceAggregate: ${e.message}`); }
 }
 
@@ -12506,6 +12526,11 @@ async function main() {
     }
     if (_dbDownStreak > 0) { log(`🟢 Base recuperada tras ${_dbDownStreak} intentos fallidos`); _dbDownStreak = 0; }
 
+    // Maxi 2026-07-15 (F2): el reporte semanal de frozen es Domingo 20-21 Madrid, pero estaba DESPUÉS del
+    // gate de fin de semana (que hace continue los sáb/dom) → nunca corría. Lo llamamos ANTES del gate
+    // (tiene su propio gate interno Domingo 20-21, así que no molesta el resto de la semana).
+    try { await runFrozenWeeklyReport(token); } catch (e) { log(`⚠️ frozenReport: ${e.message}`); }
+
     // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
     // backfill, refresh, unfreezer.
@@ -12645,19 +12670,10 @@ async function main() {
       } catch (e) { log(`⚠️ cleanup: ${e.message}`); }
     }
 
-    // Flush incremental del counter RapidAPI cada 10 iters — captura hits del
-    // backfill / refresh (que no son parte de runCsvQueue/autopilot).
-    if (iterCount % 10 === 0 && _rapidGlobalCounter > _persistedRapidHits) {
-      const delta = _rapidGlobalCounter - _persistedRapidHits;
-      const today = new Date().toISOString().split("T")[0];
-      const period = _billingCyclePeriod();
-      try {
-        await saveRapidApiUsage(token, delta, today);
-        await saveRapidApiMonthlyUsage(token, delta, period);
-        _persistedRapidHits = _rapidGlobalCounter;
-        log(`💾 Persisted +${delta} RapidAPI hits (total session: ${_rapidGlobalCounter})`);
-      } catch (e) { log(`⚠️ flush rapidapi: ${e.message}`); }
-    }
+    // Maxi 2026-07-15 (Cost#1): flush RapidAPI ELIMINADO. La persistencia la hace SOLO el RPC atómico
+    // bump_api_counter (por hit, en rapidFetchWithRetry). Este flush read-modify-write DOBLE-CONTABA cada
+    // hit (RPC + este RMW) → los caps trip a la mitad del uso real, y el RMW podía PISAR incrementos del
+    // RPC (race → subconteo → overspend). _rapidGlobalCounter queda SOLO como gauge en-memoria del cap live.
 
     try {
       if (Date.now() > tokenExpiry) {
@@ -12771,8 +12787,8 @@ async function main() {
         }
       } catch (e) { log(`⚠️ csvQueue auto-enable: ${e.message}`); }
 
-      // Frozen weekly report — domingo 20-21hs Madrid, 1 vez por semana
-      try { await runFrozenWeeklyReport(token); } catch (e) { log(`⚠️ frozenReport: ${e.message}`); }
+      // Frozen weekly report → Maxi 2026-07-15 (F2): MOVIDO arriba del gate de fin de semana (esta llamada
+      // era inalcanzable los domingos). Ver la llamada en la sección "REGLA DE ORO".
 
       // Poll liviano — lee autopilot + csv_queue + agent flags
       const flags = await getActiveFlags(token);
