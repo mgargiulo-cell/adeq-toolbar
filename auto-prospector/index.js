@@ -2203,8 +2203,9 @@ async function _checkAutoPauseAgent(token) {
 // Procesa 5 leads/run, 1 run cada 60 iters (~5h).
 // ════════════════════════════════════════════════════════════════
 let _lastReenrichRunAt = 0;
-const REENRICH_COOLDOWN_MS = 2 * 60 * 1000;  // Maxi 2026-07-14: 2min (era 15) — re-análisis rápido on-demand
-const REENRICH_BATCH = 20;                    // Maxi 2026-07-14: 20/run (era 10)
+const REENRICH_COOLDOWN_MS = 60 * 1000;      // Maxi 2026-07-14: 60s (re-análisis rápido on-demand de los sin-email)
+const REENRICH_BATCH = 40;                    // Maxi 2026-07-14: 40/run
+const REENRICH_CONC = 5;                      // Maxi 2026-07-14: 5 en paralelo (antes secuencial) → ~5x más rápido
 
 async function runReenrichBadLeads(token) {
   try {
@@ -2264,8 +2265,9 @@ async function runReenrichBadLeads(token) {
     await setConfigValue(token, "reenrich_cursor_ts", _reenrichLastTs).catch(() => {});
     if (candidates.length === 0) { log(`🔄 reenrich: ventana ${leads.length} sin candidatos (cursor→${_reenrichLastTs})`); return; }
 
-    log(`🔄 reenrich: procesando ${candidates.length} leads malos`);
-    for (const lead of candidates) {
+    log(`🔄 reenrich: procesando ${candidates.length} leads (conc ${REENRICH_CONC})`);
+    for (let _ri = 0; _ri < candidates.length; _ri += REENRICH_CONC) {
+     await Promise.all(candidates.slice(_ri, _ri + REENRICH_CONC).map(async (lead) => {
       try {
         // 1) Scrape PRIMERO (gratis) — con CF decoder + JSON-LD nuevos
         let foundEmail = null;
@@ -2321,10 +2323,10 @@ async function runReenrichBadLeads(token) {
         } else {
           log(`  ⏭️ ${lead.domain}: scrape+Apollo sin resultados`);
         }
-        await sleep(700); // anti rate-limit (Maxi 2026-07-14: 1500→700 para re-análisis rápido)
       } catch (e) {
         log(`  ⚠️ reenrich ${lead.domain}: ${e.message}`);
       }
+     }));
     }
   } catch (e) {
     log(`⚠️ runReenrichBadLeads error: ${e.message}`);
