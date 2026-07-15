@@ -4815,6 +4815,108 @@ async function sweepBlockedFromProspects(token) {
   log(`🧹 purge-prospects: batch=${rows.length} borrados=${toDelete.length} (blocklist=${rows.length - remaining.length}, estructural=${toDelete.length - (rows.length - remaining.length)}) cursor→${lastTs}`);
 }
 
+// ════════════════════════════════════════════════════════════════
+// PULIDO DEL POOL (Maxi 2026-07-15) — UN SOLO job que reemplaza a purge + reenrich. Recorre todo el
+// pool pending y con UN fetch por dominio: (1) BLOQUEA (soft-reject) los no-publishers (blocklist +
+// detector estructural con veto publisher-ads) y (2) para los que QUEDAN sin email bueno, busca email
+// (scrape gratis + website-informer + Apollo capado opcional). NO usa RapidAPI. Gated por config
+// polish_pool='true'; cursor polish_cursor_ts; se auto-apaga al terminar. Apollo off con polish_use_apollo='false'.
+async function _softRejectLead(auth, id, reason) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
+      method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `purge: ${reason}`.slice(0, 200) }),
+    });
+  } catch {}
+}
+let _lastPolishRunAt = 0;
+const POLISH_COOLDOWN_MS = 45 * 1000;
+const POLISH_BATCH = 40;
+const POLISH_CONC = 5;
+async function polishPool(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.polish_pool || "") !== "true") return;
+  if (Date.now() - _lastPolishRunAt < POLISH_COOLDOWN_MS) return;
+  _lastPolishRunAt = Date.now();
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  // Apollo capado, opcional (off si polish_use_apollo='false'). NUNCA RapidAPI.
+  const useApollo = String(cfg.polish_use_apollo ?? "true") !== "false";
+  const apollo_api_key = cfg.apollo_api_key;
+  let apolloAvailable = useApollo && !!apollo_api_key;
+  if (apolloAvailable) {
+    const usage = await getApolloUsageToday(token);
+    if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) apolloAvailable = false;
+  }
+  const cursor = cfg.polish_cursor_ts || "";
+  const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
+  let leads = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,emails,email_sources,contact_name,category,traffic,created_at&order=created_at.asc&limit=${POLISH_BATCH}`, { headers: auth });
+    if (r.ok) leads = await r.json();
+  } catch {}
+  if (!Array.isArray(leads) || leads.length === 0) {
+    await setConfigValue(token, "polish_pool", "false").catch(() => {});
+    await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
+    log(`✨ polish: pool COMPLETO pulido → flag OFF`);
+    return;
+  }
+  const _lastTs = leads[leads.length - 1].created_at;
+  let blocked = 0, enriched = 0;
+  for (let i = 0; i < leads.length; i += POLISH_CONC) {
+    await Promise.all(leads.slice(i, i + POLISH_CONC).map(async (lead) => {
+      const domain = lead.domain;
+      try {
+        // 1) blocklist (sin red)
+        const bl = await isDomainBlockedFull(domain, token);
+        if (bl) { await _softRejectLead(auth, lead.id, `blocklist:${bl}`); blocked++; return; }
+        // 2) clasificar por HTML — UN fetch (detector estructural con veto publisher-ads)
+        const pc = await fetchPageContent(domain).catch(() => null);
+        if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
+        // 3) keeper: si ya tiene email bueno, listo
+        const curEmails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
+        const srcMap = lead.email_sources || {};
+        const hasGood = curEmails.some(e => {
+          const raw = srcMap[e.toLowerCase()];
+          const src = (typeof raw === "string" ? raw : (raw?.source || "")).toLowerCase();
+          if (src === "apollo" || src === "informer") return true;
+          return !_isGenericLocalPart(e);
+        });
+        if (hasGood) return;
+        // 4) buscar email: scrape gratis (páginas internas multilingües) + REDES SOCIALES (FB/IG/Twitter)
+        //    + website-informer/WHOIS — todo adentro de scrapeEmailsForDomain — y Apollo capado si vacío.
+        let foundEmail = null, foundSource = null, foundName = "";
+        const _informerOut = new Set(), _socialOut = new Map();
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut }).catch(() => []);
+        if (Array.isArray(scraped) && scraped.length) {
+          const ranked = scraped.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+          if (ranked.length) {
+            foundEmail = ranked[0].email;
+            const _le = foundEmail.toLowerCase();
+            foundSource = _socialOut.has(_le) ? "social" : (_informerOut.has(_le) ? "informer" : "scrape");
+          }
+        }
+        if (!foundEmail && apolloAvailable) {
+          const ap = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true }).catch(() => null);
+          if (ap?.email) { foundEmail = ap.email; foundSource = "apollo"; foundName = ap.contact_name || ""; }
+        }
+        if (foundEmail) {
+          const merged = [foundEmail, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
+          const validated = await validateEmailsBatch(merged);
+          const newSources = { ...(lead.email_sources || {}) };
+          newSources[foundEmail.toLowerCase()] = foundSource;
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ emails: validated, email_sources: newSources, contact_name: foundName || lead.contact_name || "" }),
+          });
+          enriched++;
+        }
+      } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
+    }));
+  }
+  await setConfigValue(token, "polish_cursor_ts", _lastTs).catch(() => {});
+  log(`✨ polish: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_lastTs}`);
+}
+
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
 async function classifyPublisher(token, domain, pageContent, swCategory) {
   // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
@@ -12573,6 +12675,10 @@ async function main() {
         // Maxi 2026-07-13: barrido on-demand del pool (purga no-publishers viejos por blocklist +
         // detector estructural). Gated por config purge_blocked_prospects='true'; se auto-apaga al terminar.
         await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
+        // Maxi 2026-07-15: PULIDO UNIFICADO — 1 fetch/dominio: bloquea no-publishers + busca email
+        // (scrape+social+informer+Apollo) para los que quedan sin email. Reemplaza purge+reenrich.
+        // Gated por config polish_pool='true'; se auto-apaga al terminar. NO usa RapidAPI.
+        await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
