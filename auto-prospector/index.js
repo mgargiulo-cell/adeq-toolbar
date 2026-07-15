@@ -5314,7 +5314,7 @@ const BRAND_BLOCKLIST = new Set([
   "unity","digitalturbine","vungle","adcolony","mgid","revcontent","teads","vidoomy",
   // Maxi 2026-07-13 (auditoría): marcas-ANUNCIANTE (no venden inventario, son clientes potenciales
   // de pauta, NO prospects). Aparecieron recibiendo mail del agente. Núcleo de 2do nivel inequívoco.
-  "adidas","nike","puma","reebok","realmadrid","fcbarcelona","cocacola","pepsico","mcdonalds","ikea","lego",
+  "adidas","nike","puma","reebok","realmadrid","fcbarcelona","fcbayern","cocacola","pepsico","mcdonalds","ikea","lego",
   // Maxi 2026-07-13 (barrido pool): plataformas/retailers/bancos/telcos globales que NO son publisher y
   // que el detector estructural puede no ver por estructura. Núcleos inequívocos (evito ambiguos:
   // action/but/orange/pepper/cultura). El detector estructural caza el resto de tiendas por carrito.
@@ -10593,6 +10593,10 @@ async function runAgentCycle(token, allFlags) {
         }));
         const ranked = _rankedAll
           .filter(x => x.score >= 0)
+          // Maxi 2026-07-14 (auditoría rebotes): informer (WHOIS) + freemail = email del REGISTRANTE
+          // del dominio, NO el contacto comercial → nunca sirve y suele rebotar (caso rudnypc@gmail de
+          // baladag4.com.br). Un gmail SCRAPEADO del sitio sí puede ser real → esto solo aplica a informer.
+          .filter(x => !(x.source === "informer" && /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\.|@mail\.ru\b/i.test(x.email)))
           .sort((a, b) => {
             // Maxi 2026-07-09: tier DURO primero (_pickTier): apollo/informer nominal > rol
             // comercial/publicidad scrapeado > persona scrapeada > genérico. Honra la regla del
