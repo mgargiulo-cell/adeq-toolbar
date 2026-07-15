@@ -3827,7 +3827,10 @@ async function runPageContext() {
           // hasDisplayAds = programmatic O red partner de ADEQ (Taboola/MGID/Ezoic/Seedtag/Teads...).
           // Si el sitio muestra ads → es publisher → NO se marca por schema/keywords (regla de oro).
           const hasDisplayAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360)/i.test(_h);
-          // Solo plataformas DEDICADAS (Woo/Magento salieron del 1-hit: medios en WordPress usan Woo).
+          // Maxi 2026-07-15 (sync con worker): hasPublisherAds = SOLO ad-tech de PUBLISHER (AdSense/GPT/SSP/
+          // Taboola — una tienda no muestra ads de terceros; EXCLUYE retargeting criteo/adsrvr/adform) → VETA
+          // toda la detección: un medio que vende inventario NUNCA se marca no-publisher (regla de oro).
+          const hasPublisherAds = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|div-gpt-ad|data-ad-slot|googletag\.cmd|amazon-adsystem|aps\.amazon|pubmatic|rubiconproject|magnite|openx\.net|prebid|adnxs\.com|appnexus|33across|sovrn|indexexchange|casalemedia|smartadserver|yieldmo|sharethrough|gumgum|fundingchoicesmessages|taboola|outbrain|mgid\.com|ezoic|ezojs|seedtag|teads|vidoomy|sparteo|missena|snigel|clickio|optad360)/i.test(_h);
           const storePlatform = /Shopify\.theme|Shopify\.shop|Shopify\.routes|window\.Shopify|id=["']shopify-section|vteximg|vtexassets|vtexcommercestable|portal\.vtex|\/\/[a-z0-9-]+\.vtex\.|nuvemshop|tiendanube|lojaintegrada|prestashop|bigcommerce|demandware|dwstatic|\/on\/demandware/i;
           const storeCartBtn  = /add[\s-]?to[\s-]?cart|a[ñn]adir al carrito|agregar al carr(o|ito)|adicionar ao carrinho|sepete ekle|a[ñn]adir a la (cesta|bolsa)|in den warenkorb/i;
           const storeCheckout = /\/(checkout|cart\/add|onepage|finalizar-compra|finalizar_compra|sepet|carrinho)\b|class=["'][^"']*(add-to-cart|addtocart|btn-cart|buy-button)/i;
@@ -3839,13 +3842,27 @@ async function runPageContext() {
           const svcKw    = [/solicita(r)? (tu |un )?presupuesto|pide presupuesto|request a (demo|quote)|solicita una demo|book a demo/i, /nuestros servicios profesionales|market research|investigaci[óo]n de mercado|consultor[íi]a (empresarial|estrat[ée]gica)/i];
           const npoKw    = [/donate now|make a donation|registered charity|become a volunteer|hacer una donaci[óo]n/i, /recaudaci[óo]n de fondos|fundraising campaign|apoya (nuestra|la) causa/i];
           const realtyKw = [/pisos? en (venta|alquiler)|propiedades? en (venta|alquiler)|casas? en venta|im[óo]veis (para|à) (venda|alugar)/i, /publica(r)? tu (anuncio|propiedad) gratis|m² (construidos|[úu]tiles)|\d+ dormitorios/i];
-          if (isStore) nonPublisherType = "online store / e-commerce";
-          // schema Y keywords SOLO cuentan si NO hay ads display (un publisher con ads —aunque reseñe
-          // un hotel con schema Hotel— NO se marca). Igual que el worker.
+          const corpKw     = [/\b(wholesale|mayorista|distribuidor|distributor|fabricante|manufacturer|OEM|ISO ?900\d)\b/i, /(our (products|solutions)|nuestros productos|nossos produtos|request a (quote|demo)|solicite (una |un )?cotizaci[óo]n|solutions for your business|soluciones para (tu|su) (empresa|negocio))/i];
+          const svcPlatKw  = [/\b(web hosting|shared hosting|reseller hosting|dedicated server|cpanel|alojamiento web|hospedagem|payment gateway|pasarela de pago|merchant account|no-logs vpn|vpn service)\b/i, /(register (your |a )?domain|registra tu dominio|ssl certificate|certificado ssl|accept payments online|acept[aá] pagos|hide your ip|unblock (streaming|websites)|servers in \d+ countries)/i];
+          const datingKw   = [/\b(dating (site|app|service)|online dating|citas online|encuentra pareja)\b/i, /(find (your )?match|singles (near you|in your area)|create (your )?(free )?profile|crea tu perfil gratis)/i];
+          const personalKw = [/(my portfolio|mi portafolio|meu portf[óo]lio|hire me|contrat[aá]me|available for (hire|freelance)|freelance (designer|developer|writer|photographer|consultant))/i, /(my (resume|cv|work)|view my work|book a (session|shoot)|get in touch to work together)/i];
+          const piracyRe   = /magnet:\?xt=urn:btih|\.torrent["'\s>]|\b(putlocker|123movies|fmovies|solarmovie|thepiratebay|1337x|rarbg|nyaa\.si)\b|read\s+manga\s+online\s+free/i;
+          // isStore vetado por publisher-ads (un medio con tienda de merch NO es tienda). Piratería = brand-safety.
+          if (isStore && !hasPublisherAds) nonPublisherType = "online store / e-commerce";
+          else if (piracyRe.test(_h)) nonPublisherType = "piracy / brand-unsafe";
+          // Schema de entidad no-publisher → VETADO por hasPublisherAds (rechaza aunque tenga retargeting).
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i.test(_h)) nonPublisherType = "bank / financial services";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School|University)"/i.test(_h)) nonPublisherType = "university / education";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(GovernmentOrganization|GovernmentService|GovernmentOffice|GovernmentBuilding)"/i.test(_h)) nonPublisherType = "government";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(Hospital|MedicalClinic|Clinic|Pharmacy|Physician|Dentist|DiagnosticLab|MedicalBusiness|MedicalOrganization)"/i.test(_h)) nonPublisherType = "health / medical";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(LocalBusiness|ProfessionalService|Attorney|LegalService|Notary|AccountingService|Electrician|Plumber|HVACBusiness|RoofingContractor|HousePainter|Locksmith|MovingCompany|GeneralContractor|HomeAndConstructionBusiness|Restaurant|FoodEstablishment|CafeOrCoffeeShop|BarOrPub|Bakery|Brewery|Winery|AutoDealer|AutoRepair|AutoBodyShop|GasStation|HairSalon|BeautySalon|NailSalon|DaySpa|HealthAndBeautyBusiness|TattooParlor|FuneralHome|ChildCare|DryCleaningOrLaundry|EmploymentAgency|SelfStorage|ExerciseGym|HealthClub|SportsClub|SportsActivityLocation|VeterinaryCare|Optician|NightClub|AmusementPark|EntertainmentBusiness)"/i.test(_h)) nonPublisherType = "service / local business";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(Church|Mosque|Synagogue|HinduTemple|BuddhistTemple|PlaceOfWorship|Museum|Library|ArchiveOrganization)"/i.test(_h)) nonPublisherType = "institution";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(SoftwareApplication|WebApplication|MobileApplication)"/i.test(_h)) nonPublisherType = "software / SaaS";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"Corporation"/i.test(_h)) nonPublisherType = "corporate";
+          else if (!hasPublisherAds && /"@type"\s*:\s*"(ProfilePage|ResumeAction)"/i.test(_h)) nonPublisherType = "personal / portfolio";
+          // Schema débil (hotel/ONG/inmobiliaria que un publisher reseña) + keywords → gate por !hasDisplayAds.
           else if (!hasDisplayAds) {
-            if (/"@type"\s*:\s*"(BankOrCreditUnion|FinancialService|InsuranceAgency)"/i.test(_h)) nonPublisherType = "bank / financial services";
-            else if (/"@type"\s*:\s*"(CollegeOrUniversity|EducationalOrganization|School|University)"/i.test(_h)) nonPublisherType = "university / education";
-            else if (/"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i.test(_h)) nonPublisherType = "travel / hotel / car rental";
+            if (/"@type"\s*:\s*"(Hotel|LodgingBusiness|Resort|TravelAgency|AutoRental|RentACar|Campground|BedAndBreakfast)"/i.test(_h)) nonPublisherType = "travel / hotel / car rental";
             else if (/"@type"\s*:\s*"(NGO|NonprofitOrganization|Charity)"/i.test(_h)) nonPublisherType = "nonprofit / charity";
             else if (/"@type"\s*:\s*"(RealEstateListing|RealEstateAgent|Residence|Apartment|SingleFamilyResidence)"/i.test(_h)) nonPublisherType = "real estate / listings";
             else if (_hits(bankKw) >= 2) nonPublisherType = "bank / financial services";
@@ -3854,6 +3871,10 @@ async function runPageContext() {
             else if (_hits(eduKw) >= 2) nonPublisherType = "university / education";
             else if (_hits(svcKw) >= 2) nonPublisherType = "service / agency";
             else if (_hits(npoKw) >= 2) nonPublisherType = "nonprofit / charity";
+            else if (_hits(corpKw) >= 2) nonPublisherType = "corporate";
+            else if (_hits(svcPlatKw) >= 2) nonPublisherType = "service / platform";
+            else if (_hits(datingKw) >= 2) nonPublisherType = "dating";
+            else if (_hits(personalKw) >= 1) nonPublisherType = "personal / portfolio";
           }
         } catch {}
         return {
@@ -8641,7 +8662,7 @@ async function renderProspectsEmptyState(listEl) {
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
 
   const [statsRes, flagsRes, csvCountRes] = await Promise.all([
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_session_stats,auto_prospecting_enabled,csv_queue_enabled,auto_session_user)&select=key,value`, { headers }),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_session_stats,auto_prospecting_enabled,csv_queue_enabled,auto_session_user,auto_heartbeat_at)&select=key,value`, { headers }),
     Promise.resolve(null), // placeholder
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=domain,status,source&limit=5&order=updated_at.desc.nullslast`, { headers }),
   ]);
@@ -8696,7 +8717,17 @@ async function renderProspectsEmptyState(listEl) {
     if (!autopilotOn && !csvQueueOn) {
       html = '<div class="cascade-empty">No activity. Turn on Autopilot or upload a CSV / Monday URL to get started.</div>';
     } else if (autopilotOn && !apActive) {
-      html = `<div class="cascade-empty">🤖 Autopilot ON (${esc(apUser || "?")}), but the worker hasn't reported activity in the last 5 minutes. Check Railway logs if this persists.</div>`;
+      // Maxi 2026-07-15 (auditoría heartbeat): cruzar con auto_heartbeat_at (liveness REAL del worker,
+      // escrito cada iteración). Si el heartbeat está fresco, el worker está VIVO — el autopilot solo
+      // está en cola detrás de otro trabajo (import CSV / pulido) → NO es una falla. Solo alertar si el
+      // heartbeat también está viejo (worker realmente frenado).
+      const _hbAt = cfgMap.auto_heartbeat_at ? Date.parse(cfgMap.auto_heartbeat_at) : 0;
+      const _hbFresh = _hbAt && (Date.now() - _hbAt < 3 * 60 * 1000);
+      if (_hbFresh) {
+        html = `<div class="cascade-empty" style="background:#dbeafe;border:1px solid #3b82f6;color:#1e3a8a;padding:10px;border-radius:8px;text-align:left"><div style="font-weight:700;margin-bottom:3px">🤖 Worker activo</div><div style="font-size:11px">El autopilot (${esc(apUser || "?")}) está en cola detrás de otro trabajo (import CSV / pulido del pool). Todo OK — no hace falta acción.</div></div>`;
+      } else {
+        html = `<div class="cascade-empty">⚠️ Autopilot ON (${esc(apUser || "?")}) pero el worker no reporta actividad (heartbeat viejo). Revisá los logs de Railway si persiste.</div>`;
+      }
     } else if (csvQueueOn && csvPendingCount === 0) {
       html = '<div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:12px;border-radius:8px;text-align:left"><div style="font-weight:700;margin-bottom:4px">✅ Work finished</div><div style="font-size:11px">All imports processed. Pending prospects went through filtering. Upload a new CSV or Monday URL refresh to add more.</div></div>';
     } else {
@@ -8988,9 +9019,12 @@ async function loadProspectsTab(opts = {}) {
   // (`_C_EU`) o "Sin GEO" (`_NONE_`) NO existe como valor de `geo` en la tabla → si se
   // mandaba al server (Maxi 2026-06-30 bug) devolvía 0 rows / no filtraba. Ahora esos
   // casos se traen completos y los resuelve el filtro client-side de abajo.
-  const _singleChip = geoChipsSet.size === 1 ? [...geoChipsSet][0] : "";
-  const _singleIsCountry = _singleChip.length === 2 && !_singleChip.startsWith("_");
-  const effectiveGeoForServer = _singleIsCountry ? _singleChip : (geoChipsSet.size === 0 ? geoFilter : "");
+  // Maxi 2026-07-15 (BUG 4 auditoría filtros): NO mandar el país del chip al server. Antes, con 1 país
+  // seleccionado, se mandaba al server → rows (y allRowsForChips) traían SOLO ese país → los chips de
+  // los demás continentes se iban a 0 (contradecía "siempre ves los países disponibles"). Ahora se trae
+  // geo-UNFILTERED y TODO el filtro de geo es client-side → los contadores de chips quedan correctos.
+  // (Nota: el server capa a 3000 filas; con pool >3000 los counts de geo undercount — usar el total global.)
+  const effectiveGeoForServer = geoChipsSet.size === 0 ? geoFilter : "";
   let rows = [];
   let allRowsForChips = [];     // sin filtros client-side, para repoblar chips
   let dailyCount = 0;
@@ -9179,6 +9213,15 @@ async function loadProspectsTab(opts = {}) {
   // tomó ownership de algún row después del slot, sacarlo del bucket "other").
   const rowsById = new Map(rows.map(r => [r.id, r]));
   cachedOtherIds = cachedOtherIds.filter(id => rowsById.has(id) && !mineIds.has(id));
+
+  // Maxi 2026-07-15 (BUG 5 auditoría): agregar al cache los "other" NUEVOS del mismo slot de 30min.
+  // Antes solo se podaban los muertos y el round-robin se reconstruía SOLO con el cache vacío → los
+  // leads agregados durante el slot NO aparecían y el contador del tab no cuadraba con "X leads".
+  if (cachedOtherIds.length > 0) {
+    const _cachedSet = new Set(cachedOtherIds);
+    const _newOther = rows.filter(r => !mineIds.has(r.id) && !_cachedSet.has(r.id)).map(r => r.id);
+    if (_newOther.length) { cachedOtherIds = cachedOtherIds.concat(_newOther); try { await chrome.storage.local.set({ [slotKey]: cachedOtherIds }); } catch {} }
+  }
 
   if (cachedOtherIds.length === 0) {
     const other = rows.filter(r => !mineIds.has(r.id));

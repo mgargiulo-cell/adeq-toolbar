@@ -663,30 +663,30 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
       return new Date(d.getTime() - diff * 86400000);
     };
     if (dateFilter === "today") {
-      dateClause = `&created_at=gte.${tzDay(now)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(now)}T00:00:00-03:00`;
     } else if (dateFilter === "yesterday") {
       const y = new Date(now.getTime() - 86400000);
-      dateClause = `&created_at=gte.${tzDay(y)}T00:00:00&created_at=lt.${tzDay(now)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(y)}T00:00:00-03:00&created_at=lt.${tzDay(now)}T00:00:00-03:00`;
     } else if (dateFilter === "this_week") {
       const sow = startOfWeek(now);
-      dateClause = `&created_at=gte.${tzDay(sow)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(sow)}T00:00:00-03:00`;
     } else if (dateFilter === "last_week") {
       const sow = startOfWeek(now);
       const sowLast = new Date(sow.getTime() - 7 * 86400000);
-      dateClause = `&created_at=gte.${tzDay(sowLast)}T00:00:00&created_at=lt.${tzDay(sow)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(sowLast)}T00:00:00-03:00&created_at=lt.${tzDay(sow)}T00:00:00-03:00`;
     } else if (dateFilter === "this_month") {
       const som = new Date(now.getFullYear(), now.getMonth(), 1);
-      dateClause = `&created_at=gte.${tzDay(som)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(som)}T00:00:00-03:00`;
     } else if (dateFilter === "last_month") {
       const som = new Date(now.getFullYear(), now.getMonth(), 1);
       const somLast = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      dateClause = `&created_at=gte.${tzDay(somLast)}T00:00:00&created_at=lt.${tzDay(som)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(somLast)}T00:00:00-03:00&created_at=lt.${tzDay(som)}T00:00:00-03:00`;
     } else if (dateFilter === "last7") {
       const d7 = new Date(now.getTime() - 7 * 86400000);
-      dateClause = `&created_at=gte.${tzDay(d7)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(d7)}T00:00:00-03:00`;
     } else if (dateFilter === "last30") {
       const d30 = new Date(now.getTime() - 30 * 86400000);
-      dateClause = `&created_at=gte.${tzDay(d30)}T00:00:00`;
+      dateClause = `&created_at=gte.${tzDay(d30)}T00:00:00-03:00`;
     }
   }
   const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
