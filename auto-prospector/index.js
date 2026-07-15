@@ -4928,9 +4928,12 @@ async function _softRejectLead(auth, id, reason) {
   } catch {}
 }
 let _lastPolishRunAt = 0;
-const POLISH_COOLDOWN_MS = 45 * 1000;
-const POLISH_BATCH = 40;
-const POLISH_CONC = 5;
+// Maxi 2026-07-15: ritmo subido para pulir el pool grande (1133 pendientes) en horas, no días.
+// Seguro ahora que (a) el cursor commitea por wave (sobrevive restarts) y (b) se arregló el OOM.
+// Es red-bound (fetch+scrape), no memoria → más concurrencia impacta poco en RSS.
+const POLISH_COOLDOWN_MS = 20 * 1000;  // 45→20s: corre más seguido por loop
+const POLISH_BATCH = 60;               // 40→60: más dominios por corrida (commit incremental lo hace seguro)
+const POLISH_CONC = 8;                 // 5→8: más dominios en paralelo por wave
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
