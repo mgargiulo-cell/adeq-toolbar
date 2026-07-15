@@ -2203,8 +2203,8 @@ async function _checkAutoPauseAgent(token) {
 // Procesa 5 leads/run, 1 run cada 60 iters (~5h).
 // ════════════════════════════════════════════════════════════════
 let _lastReenrichRunAt = 0;
-const REENRICH_COOLDOWN_MS = 15 * 60 * 1000; // 15min entre runs (era 1h)
-const REENRICH_BATCH = 10;                    // procesar 10 por run (era 5)
+const REENRICH_COOLDOWN_MS = 2 * 60 * 1000;  // Maxi 2026-07-14: 2min (era 15) — re-análisis rápido on-demand
+const REENRICH_BATCH = 20;                    // Maxi 2026-07-14: 20/run (era 10)
 
 async function runReenrichBadLeads(token) {
   try {
@@ -2229,35 +2229,40 @@ async function runReenrichBadLeads(token) {
       log("ℹ️ reenrich: sin APOLLO_API_KEY → solo scrape (gratis)");
     }
 
-    // Leads que necesitan re-enrich:
-    // - 0 emails
-    // - Solo emails generic (info@/contact@) sin source apollo/informer
+    // Leads que necesitan re-enrich: 0 emails, o solo generic (info@/contact@) sin apollo/informer.
+    // Maxi 2026-07-14: BARRIDO COMPLETO por cursor (antes miraba SIEMPRE los 50 más viejos con
+    // order=created_at.asc&limit=50 sin cursor → se apagaba antes de recorrer todo el pool y dejaba
+    // cientos sin re-analizar). Ahora avanza por reenrich_cursor_ts hasta agotar el pool. +traffic al
+    // select (faltaba → Apollo recibía traffic=0).
+    const cursor = cfg.reenrich_cursor_ts || "";
+    const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=id,domain,emails,email_sources,contact_name,category&order=created_at.asc&limit=50`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,emails,email_sources,contact_name,category,traffic,created_at&order=created_at.asc&limit=${REENRICH_BATCH}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return;
     const leads = await res.json();
-    if (!Array.isArray(leads)) return;
-
-    // Filtrar los que necesitan re-enrich
+    if (!Array.isArray(leads) || leads.length === 0) {
+      log("✅ reenrich: pool COMPLETO re-analizado → flag OFF");
+      await setConfigValue(token, "agent_reenrich_bad_leads", "false").catch(() => {});
+      await setConfigValue(token, "reenrich_cursor_ts", "").catch(() => {});
+      return;
+    }
+    // Avanzar cursor al último de la ventana (procesemos o no cada uno → sweep monotónico)
+    const _reenrichLastTs = leads[leads.length - 1].created_at;
     const candidates = leads.filter(l => {
       const emails = Array.isArray(l.emails) ? l.emails : [];
       if (emails.length === 0) return true;  // sin email → re-leer
       const sources = l.email_sources || {};
-      // Maxi 2026-06-30: el lead ya está "resuelto" si tiene un email de apollo/informer
-      // O un email NO-genérico de cualquier fuente (persona/rol real, no info@/contact@).
-      // Así los resueltos SALEN de la cola y el re-enrich avanza por TODAS las webs
-      // (antes solo apollo/informer contaban → re-procesaba siempre los mismos 10 viejos).
       const hasGood = emails.some(e => {
         const src = (sources[e.toLowerCase()] || "").toLowerCase();
         if (src === "apollo" || src === "informer") return true;
         return !_isGenericLocalPart(e);
       });
       return !hasGood;
-    }).slice(0, REENRICH_BATCH);
-
-    if (candidates.length === 0) { log("✅ reenrich: todos los leads ya tienen email apollo/informer — flag OFF"); await setConfigValue(token, "agent_reenrich_bad_leads", "false"); return; }
+    });
+    await setConfigValue(token, "reenrich_cursor_ts", _reenrichLastTs).catch(() => {});
+    if (candidates.length === 0) { log(`🔄 reenrich: ventana ${leads.length} sin candidatos (cursor→${_reenrichLastTs})`); return; }
 
     log(`🔄 reenrich: procesando ${candidates.length} leads malos`);
     for (const lead of candidates) {
@@ -2316,7 +2321,7 @@ async function runReenrichBadLeads(token) {
         } else {
           log(`  ⏭️ ${lead.domain}: scrape+Apollo sin resultados`);
         }
-        await sleep(1500); // anti rate-limit
+        await sleep(700); // anti rate-limit (Maxi 2026-07-14: 1500→700 para re-análisis rápido)
       } catch (e) {
         log(`  ⚠️ reenrich ${lead.domain}: ${e.message}`);
       }
@@ -4165,7 +4170,9 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // rutas, seguimos los links que el sitio realmente publica (contacto/kontakt/impressum/aviso
   // legal/publicidad/media-kit/about/equipo), aunque tengan nombres no estándar.
   const discovered = new Set();
-  const CONTACT_HINT = /contact|contacto|contatt|kontakt|impress?um|imprint|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|mediadaten|media-?kit|advertis|anunci|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|equipe?|\bteam\b|\bstaff\b|redac|ueber-?uns|über-?uns|impronta/i;
+  // Maxi 2026-07-14: +portugués BR (contato/fale-conosco/anuncie) — faltaba y en .br el email suele
+  // estar en /contato → el worker nunca lo visitaba y el lead quedaba SIN email (caso sorteador.com.br).
+  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontakt|impress?um|imprint|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|mediadaten|media-?kit|advertis|anunci|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|equipe?|\bteam\b|\bstaff\b|redac|ueber-?uns|über-?uns|impronta/i;
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
   // Chrome real para evitar bloqueos por User-Agent de bot
@@ -4253,7 +4260,8 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     "", // home
     "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos", "/contacto-nos",
     "/contatti", "/contactez-nous", "/kontakt", "/kontaktformular", "/kontakt-impressum",
-    "/about", "/about-us", "/aboutus", "/sobre", "/sobre-nosotros", "/quienes-somos",
+    "/contato", "/fale-conosco", "/faleconosco", "/fale-conosco.html", "/anuncie", "/anuncie-conosco", // BR (Maxi 2026-07-14)
+    "/about", "/about-us", "/aboutus", "/sobre", "/sobre-nos", "/sobre-nosotros", "/quienes-somos",
     "/chi-siamo", "/qui-sommes-nous", "/ueber-uns",
     "/team", "/equipo", "/equipe", "/staff", "/nosotros",
     "/advertise", "/advertising", "/advertise-with-us", "/publicidad", "/publicidade",
