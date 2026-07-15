@@ -4485,6 +4485,15 @@ async function fetchPageContent(domain) {
     // Maxi 2026-07-14 (auditoría, casos hpc.org.ar/unitedpharmacy.sa): entidades de SALUD físicas —
     // un publisher de salud (netdoktor/medical-news) NO se auto-marca Hospital/Pharmacy/Clinic.
     const healthSchema = /"@type"\s*:\s*"(Hospital|MedicalClinic|Clinic|Pharmacy|Physician|Dentist|DiagnosticLab|MedicalBusiness|MedicalOrganization)"/i;
+    // Maxi 2026-07-15 (taxonomía confirmada por el user): servicios profesionales/local-business,
+    // instituciones (iglesias/museos/bibliotecas) y SaaS/apps. Un publisher NO se auto-marca así.
+    // El user PIDIÓ NO bloquear: herramientas online, marketplaces de assets, developer/técnico.
+    const serviceSchema = /"@type"\s*:\s*"(LocalBusiness|ProfessionalService|Attorney|LegalService|Notary|AccountingService|Electrician|Plumber|HVACBusiness|RoofingContractor|HousePainter|Locksmith|MovingCompany|GeneralContractor|HomeAndConstructionBusiness|Restaurant|FoodEstablishment|CafeOrCoffeeShop|BarOrPub|Bakery|Brewery|Winery|AutoDealer|AutoRepair|AutoBodyShop|GasStation|HairSalon|BeautySalon|NailSalon|DaySpa|HealthAndBeautyBusiness|TattooParlor|FuneralHome|ChildCare|DryCleaningOrLaundry|EmploymentAgency|SelfStorage|ExerciseGym|HealthClub|SportsClub|SportsActivityLocation|VeterinaryCare|Optician|NightClub|AmusementPark|EntertainmentBusiness)"/i;
+    const instSchema    = /"@type"\s*:\s*"(Church|Mosque|Synagogue|HinduTemple|BuddhistTemple|PlaceOfWorship|Museum|Library|ArchiveOrganization)"/i;
+    const saasSchema    = /"@type"\s*:\s*"(SoftwareApplication|WebApplication|MobileApplication)"/i;
+    // Piratería / brand-unsafe: se excluye AUNQUE tenga ads (decisión de brand-safety, no de monetización).
+    // Señales fuertes y específicas para no pegar un artículo que MENCIONE el tema.
+    const piracyRe = /magnet:\?xt=urn:btih|\.torrent["'\s>]|\b(putlocker|123movies|fmovies|solarmovie|thepiratebay|1337x|rarbg|nyaa\.si)\b|read\s+manga\s+online\s+free/i;
 
     // Frases inequívocas y ACOTADAS (un publisher jamás las usa como intención propia). GATE por
     // !hasProgrammatic: un banco/hotel/universidad/inmobiliaria/tienda en su PROPIO sitio no corre
@@ -4507,10 +4516,18 @@ async function fetchPageContent(domain) {
     // has-sante/rki/bizkaia). Un finance-news NO se auto-marca BankOrCreditUnion; un edu-content NO se
     // auto-marca CollegeOrUniversity → FP casi nulo. El schema DÉBIL (hotel/ONG/inmobiliaria, que un
     // publisher SÍ puede embeber al RESEÑAR) + keywords quedan gateados por !hasDisplayAds (abajo).
-    else if (bankSchema.test(html)) nonPublisherType = "bank";
-    else if (eduSchema.test(html))  nonPublisherType = "education";
-    else if (govSchema.test(html))  nonPublisherType = "government";
-    else if (healthSchema.test(html)) nonPublisherType = "health";
+    // Brand-safety: piratería fuera aunque tenga ads (no es tema de monetización).
+    else if (piracyRe.test(html)) nonPublisherType = "piracy";
+    // Maxi 2026-07-15: TODO el schema de entidad no-publisher lo VETA el ad-tech de PUBLISHER
+    // (hasPublisherAds: AdSense/GPT/SSP/Taboola). Un banco/servicio/institución/SaaS NO corre publisher-ads;
+    // un medio que SÍ vende inventario (aunque tenga schema raro o tienda de merch) queda protegido.
+    else if (!hasPublisherAds && bankSchema.test(html)) nonPublisherType = "bank";
+    else if (!hasPublisherAds && eduSchema.test(html))  nonPublisherType = "education";
+    else if (!hasPublisherAds && govSchema.test(html))  nonPublisherType = "government";
+    else if (!hasPublisherAds && healthSchema.test(html)) nonPublisherType = "health";
+    else if (!hasPublisherAds && serviceSchema.test(html)) nonPublisherType = "service";
+    else if (!hasPublisherAds && instSchema.test(html)) nonPublisherType = "institution";
+    else if (!hasPublisherAds && saasSchema.test(html)) nonPublisherType = "saas";
     // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
     // O red partner de ADEQ: Taboola/MGID/Ezoic/Seedtag/Teads...). Un publisher que monetiza con ads
     // —aunque embeba schema de un hotel/producto que RESEÑA, o mencione vocabulario financiero— NUNCA
