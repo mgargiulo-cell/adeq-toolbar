@@ -4958,11 +4958,12 @@ async function polishPool(token) {
     log(`✨ polish: pool COMPLETO pulido → flag OFF`);
     return;
   }
-  const _lastTs = leads[leads.length - 1].created_at;
   let blocked = 0, enriched = 0;
+  let _committedTs = cursor;
   for (let i = 0; i < leads.length; i += POLISH_CONC) {
     try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}  // Maxi 2026-07-15 (F3): heartbeat por ronda (job largo)
-    await Promise.all(leads.slice(i, i + POLISH_CONC).map(async (lead) => {
+    const _wave = leads.slice(i, i + POLISH_CONC);
+    await Promise.all(_wave.map(async (lead) => {
       const domain = lead.domain;
       try {
         // 1) blocklist (sin red)
@@ -5011,9 +5012,14 @@ async function polishPool(token) {
         }
       } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
     }));
+    // Maxi 2026-07-15: commitear el cursor DESPUÉS DE CADA WAVE (antes solo al final del batch). Si el
+    // worker se reinicia a mitad (OOM/redeploy), el progreso queda guardado y el próximo run resume desde
+    // acá en vez de re-empezar el MISMO batch → garantiza avance aunque haya restarts. (leads viene
+    // ordenado created_at asc → el último de cada wave es el created_at máximo procesado hasta ahora.)
+    _committedTs = _wave[_wave.length - 1].created_at;
+    await setConfigValue(token, "polish_cursor_ts", _committedTs).catch(() => {});
   }
-  await setConfigValue(token, "polish_cursor_ts", _lastTs).catch(() => {});
-  log(`✨ polish: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_lastTs}`);
+  log(`✨ polish: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_committedTs}`);
 }
 
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
