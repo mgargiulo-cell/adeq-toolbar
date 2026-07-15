@@ -4491,6 +4491,9 @@ async function fetchPageContent(domain) {
     const serviceSchema = /"@type"\s*:\s*"(LocalBusiness|ProfessionalService|Attorney|LegalService|Notary|AccountingService|Electrician|Plumber|HVACBusiness|RoofingContractor|HousePainter|Locksmith|MovingCompany|GeneralContractor|HomeAndConstructionBusiness|Restaurant|FoodEstablishment|CafeOrCoffeeShop|BarOrPub|Bakery|Brewery|Winery|AutoDealer|AutoRepair|AutoBodyShop|GasStation|HairSalon|BeautySalon|NailSalon|DaySpa|HealthAndBeautyBusiness|TattooParlor|FuneralHome|ChildCare|DryCleaningOrLaundry|EmploymentAgency|SelfStorage|ExerciseGym|HealthClub|SportsClub|SportsActivityLocation|VeterinaryCare|Optician|NightClub|AmusementPark|EntertainmentBusiness)"/i;
     const instSchema    = /"@type"\s*:\s*"(Church|Mosque|Synagogue|HinduTemple|BuddhistTemple|PlaceOfWorship|Museum|Library|ArchiveOrganization)"/i;
     const saasSchema    = /"@type"\s*:\s*"(SoftwareApplication|WebApplication|MobileApplication)"/i;
+    // Maxi 2026-07-15 (user "corregilo"): corporate-brochure y personal/portfolio por schema.
+    const corpSchema    = /"@type"\s*:\s*"Corporation"/i;                    // Corporation (NO Organization, que usan publishers)
+    const personalSchema = /"@type"\s*:\s*"(ProfilePage|ResumeAction)"/i;
     // Piratería / brand-unsafe: se excluye AUNQUE tenga ads (decisión de brand-safety, no de monetización).
     // Señales fuertes y específicas para no pegar un artículo que MENCIONE el tema.
     const piracyRe = /magnet:\?xt=urn:btih|\.torrent["'\s>]|\b(putlocker|123movies|fmovies|solarmovie|thepiratebay|1337x|rarbg|nyaa\.si)\b|read\s+manga\s+online\s+free/i;
@@ -4505,6 +4508,12 @@ async function fetchPageContent(domain) {
     const svcKw    = [/solicita(r)? (tu |un )?presupuesto|pide presupuesto|request a (demo|quote)|solicita una demo|book a demo/i, /nuestros servicios profesionales|market research|investigaci[óo]n de mercado|consultor[íi]a (empresarial|estrat[ée]gica)/i];
     const npoKw    = [/donate now|make a donation|registered charity|become a volunteer|hacer una donaci[óo]n/i, /recaudaci[óo]n de fondos|fundraising campaign|apoya (nuestra|la) causa/i];
     const realtyKw = [/pisos? en (venta|alquiler)|propiedades? en (venta|alquiler)|casas? en venta|im[óo]veis (para|à) (venda|alugar)/i, /publica(r)? tu (anuncio|propiedad) gratis|m² (construidos|[úu]tiles)|\d+ dormitorios/i];
+    // Maxi 2026-07-15 (user "corregilo"): corporate-brochure, transaccionales (hosting/pago/VPN/citas),
+    // personal/portfolio. Keywords FP-prone → gate por !hasDisplayAds (abajo). Requieren 2 hits (personal 1, muy específico).
+    const corpKw     = [/\b(wholesale|mayorista|distribuidor|distributor|fabricante|manufacturer|OEM|ISO ?900\d)\b/i, /(our (products|solutions)|nuestros productos|nossos produtos|request a (quote|demo)|solicite (una |un )?cotizaci[óo]n|solutions for your business|soluciones para (tu|su) (empresa|negocio))/i];
+    const svcPlatKw  = [/\b(web hosting|shared hosting|reseller hosting|dedicated server|cpanel|alojamiento web|hospedagem|payment gateway|pasarela de pago|merchant account|no-logs vpn|vpn service)\b/i, /(register (your |a )?domain|registra tu dominio|ssl certificate|certificado ssl|accept payments online|acept[aá] pagos|hide your ip|unblock (streaming|websites)|servers in \d+ countries)/i];
+    const datingKw   = [/\b(dating (site|app|service)|online dating|citas online|encuentra pareja)\b/i, /(find (your )?match|singles (near you|in your area)|create (your )?(free )?profile|crea tu perfil gratis)/i];
+    const personalKw = [/(my portfolio|mi portafolio|meu portf[óo]lio|hire me|contrat[aá]me|available for (hire|freelance)|freelance (designer|developer|writer|photographer|consultant))/i, /(my (resume|cv|work)|view my work|book a (session|shoot)|get in touch to work together)/i];
 
     let nonPublisherType = null;
     // Maxi 2026-07-15: isStore ya NO es "aunque tenga ads" — si el sitio corre ad-tech de PUBLISHER
@@ -4528,6 +4537,8 @@ async function fetchPageContent(domain) {
     else if (!hasPublisherAds && serviceSchema.test(html)) nonPublisherType = "service";
     else if (!hasPublisherAds && instSchema.test(html)) nonPublisherType = "institution";
     else if (!hasPublisherAds && saasSchema.test(html)) nonPublisherType = "saas";
+    else if (!hasPublisherAds && corpSchema.test(html)) nonPublisherType = "corporate";
+    else if (!hasPublisherAds && personalSchema.test(html)) nonPublisherType = "personal";
     // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
     // O red partner de ADEQ: Taboola/MGID/Ezoic/Seedtag/Teads...). Un publisher que monetiza con ads
     // —aunque embeba schema de un hotel/producto que RESEÑA, o mencione vocabulario financiero— NUNCA
@@ -4544,6 +4555,10 @@ async function fetchPageContent(domain) {
       else if (_hits(eduKw) >= 2) nonPublisherType = "education";
       else if (_hits(svcKw) >= 2) nonPublisherType = "service";
       else if (_hits(npoKw) >= 2) nonPublisherType = "nonprofit";
+      else if (_hits(corpKw) >= 2) nonPublisherType = "corporate";
+      else if (_hits(svcPlatKw) >= 2) nonPublisherType = "service";
+      else if (_hits(datingKw) >= 2) nonPublisherType = "service";
+      else if (_hits(personalKw) >= 1) nonPublisherType = "personal";
     }
 
     return {
