@@ -1462,8 +1462,11 @@ const _AUTOGOOGLE_KEYWORDS = [
 const _AUTOGOOGLE_GL = ["mx", "ar", "br", "cl", "co", "pe", "uy", "es", "it", "fr", "de", "nl", "pt", "pl", "tr", "gr", "se", "be", "ch"];
 
 // Pega una keyword a Serper (con país de búsqueda gl) y devuelve los dominios orgánicos.
+// Maxi 2026-07-15 (auditoría AutoGoogle): devuelve {domains, ok, status} para que el caller distinga
+// éxito de error (antes tragaba todo a [] → "cero silencioso"). + timeout 10s (era el ÚNICO fetch del
+// hot-path sin timeout → un cuelgue de Serper bloqueaba el loop y starvaba el heartbeat).
 async function _serperSearch(query, num = 20, gl = "") {
-  if (!SERPER_API_KEY) return [];
+  if (!SERPER_API_KEY) return { domains: [], ok: false, status: 0 };
   try {
     const body = { q: query, num };
     if (gl) body.gl = gl;  // país de búsqueda → prioriza publishers de ese país (targeting GEO)
@@ -1471,8 +1474,9 @@ async function _serperSearch(query, num = 20, gl = "") {
       method: "POST",
       headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) { log(`  ⚠️ Serper ${res.status} para "${query}"`); return []; }
+    if (!res.ok) { log(`  ⚠️ Serper ${res.status} para "${query}"`); return { domains: [], ok: false, status: res.status }; }
     const data = await res.json();
     const out = [];
     for (const r of (Array.isArray(data.organic) ? data.organic : [])) {
@@ -1481,8 +1485,8 @@ async function _serperSearch(query, num = 20, gl = "") {
         if (h && h.includes(".")) out.push(h);
       } catch {}
     }
-    return [...new Set(out)];
-  } catch (e) { log(`  ⚠️ Serper error "${query}": ${e.message}`); return []; }
+    return { domains: [...new Set(out)], ok: true, status: 200 };
+  } catch (e) { log(`  ⚠️ Serper error "${query}": ${e.message}`); return { domains: [], ok: false, status: -1 }; }
 }
 
 async function maybeRunAutoGoogleSlot(token) {
@@ -1535,22 +1539,29 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const kws = [...pool].sort(() => Math.random() - 0.5).slice(0, N);
   log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (mes ${used}/${AUTOGOOGLE_MONTHLY_CAP}, ${daysLeft}d restantes)...`);
   const found = new Set();
-  let queriesDone = 0;
+  let queriesDone = 0, errCount = 0, lastStatus = 0;
   for (const kw of kws) {
     // País de búsqueda rotado (targeting GEO no-Anglo) → trae publishers del país objetivo.
     const gl = _AUTOGOOGLE_GL[Math.floor(Math.random() * _AUTOGOOGLE_GL.length)];
-    const domains = await _serperSearch(kw, 20, gl);
-    queriesDone++;
-    domains.forEach(d => found.add(d));
-    // Maxi 2026-06-22: persistir el contador CADA 20 búsquedas (no solo al final).
-    // Antes, si el worker crasheaba/reiniciaba a mitad, esas búsquedas ya facturadas
-    // no se contaban → el próximo slot las re-gastaba y reventaba el cap free de Serper.
-    if (queriesDone % 20 === 0) {
+    const { domains, ok, status } = await _serperSearch(kw, 20, gl);
+    // Maxi 2026-07-15: contar SOLO las búsquedas EXITOSAS. Antes queriesDone++ corría siempre → las
+    // fallidas (Serper 403/429 por créditos agotados) igual gastaban el "cap mensual" → se auto-bloqueaba.
+    if (ok) { queriesDone++; domains.forEach(d => found.add(d)); }
+    else { errCount++; lastStatus = status; }
+    if (queriesDone > 0 && queriesDone % 20 === 0) {
       try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
     }
   }
   try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
-  if (found.size === 0) { log("🔎 AutoGoogle: 0 dominios (¿key inválida o sin resultados?)"); return; }
+  // Maxi 2026-07-15: surfacar el error de Serper a config (antes se tragaba → "cero silencioso" por semanas).
+  if (errCount > 0) {
+    const _emsg = `Serper status=${lastStatus} en ${errCount}/${kws.length} búsquedas`;
+    try { await setConfigValue(token, "autogoogle_last_error", _emsg); } catch {}
+    log(`🔎 AutoGoogle: ${errCount}/${kws.length} búsquedas FALLARON (${_emsg}) — revisar créditos/key de Serper`);
+  } else {
+    try { await setConfigValue(token, "autogoogle_last_error", ""); } catch {}
+  }
+  if (found.size === 0) { log("🔎 AutoGoogle: 0 dominios (revisar autogoogle_last_error: créditos/key de Serper)"); return; }
   // Pre-filtro TLD Anglo deprio + dedup canónico (cola activa + Prospects).
   let cands = [...found].filter(d => !DEPRIO_TLD_RE.test(d));
   const known = await _findKnownDomainsWorker(token, cands);
