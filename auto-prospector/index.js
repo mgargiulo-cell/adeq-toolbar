@@ -4170,9 +4170,12 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // rutas, seguimos los links que el sitio realmente publica (contacto/kontakt/impressum/aviso
   // legal/publicidad/media-kit/about/equipo), aunque tengan nombres no estándar.
   const discovered = new Set();
-  // Maxi 2026-07-14: +portugués BR (contato/fale-conosco/anuncie) — faltaba y en .br el email suele
-  // estar en /contato → el worker nunca lo visitaba y el lead quedaba SIN email (caso sorteador.com.br).
-  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontakt|impress?um|imprint|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|mediadaten|media-?kit|advertis|anunci|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|equipe?|\bteam\b|\bstaff\b|redac|ueber-?uns|über-?uns|impronta/i;
+  // Maxi 2026-07-14: cobertura MULTILINGÜE del link de contacto/publicidad/about. El email vive en la
+  // página de contacto y su slug depende del idioma (no todos son /contacto). Cubre PT-BR (contato/
+  // fale-conosco), TR (iletisim/reklam/hakkimizda), HU (kapcsolat/hirdet), ID (kontak/hubungi/iklan),
+  // VN (lien-he/quang-cao), FI (yhtey/maino), GR (epikoin), SE/NO (annons/om-oss), IS (auglys), PL/CZ/RU
+  // (kontak/kontakty/reklam/o-nas), RO (despre). Caso testigo: sorteador.com.br → /contato.
+  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impress?um|imprint|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|advertis|anunci|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|despre|tentang|om-?oss|equipe?|\bteam\b|\bstaff\b|redac|ueber-?uns|über-?uns|impronta/i;
   const base   = `https://${domain}`;
   const cleanDomain = domain.replace(/^www\./, "");
   // Chrome real para evitar bloqueos por User-Agent de bot
@@ -4260,7 +4263,17 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     "", // home
     "/contact", "/contact-us", "/contactus", "/contacto", "/contactanos", "/contacto-nos",
     "/contatti", "/contactez-nous", "/kontakt", "/kontaktformular", "/kontakt-impressum",
-    "/contato", "/fale-conosco", "/faleconosco", "/fale-conosco.html", "/anuncie", "/anuncie-conosco", // BR (Maxi 2026-07-14)
+    "/contato", "/fale-conosco", "/faleconosco", "/fale-conosco.html", "/fale-connosco", "/anuncie", "/anuncie-conosco", // BR/PT (Maxi 2026-07-14)
+    // Maxi 2026-07-14: contacto/publicidad localizados por idioma (el email vive acá y el slug cambia).
+    "/iletisim", "/reklam", "/hakkimizda",                 // TR
+    "/kapcsolat", "/hirdetes", "/rolunk",                  // HU
+    "/kontak", "/hubungi-kami", "/hubungi", "/iklan", "/pasang-iklan", "/tentang-kami", // ID
+    "/lien-he", "/lienhe", "/quang-cao", "/gioi-thieu",    // VN
+    "/yhteystiedot", "/ota-yhteytta", "/mainonta",         // FI
+    "/kontakty", "/reklama", "/o-nas",                     // PL/CZ/RU
+    "/contacte", "/despre-noi", "/publicitate",            // RO
+    "/epikoinonia",                                        // GR
+    "/annonsera", "/om-oss", "/auglysingar",               // SE/NO/IS
     "/about", "/about-us", "/aboutus", "/sobre", "/sobre-nos", "/sobre-nosotros", "/quienes-somos",
     "/chi-siamo", "/qui-sommes-nous", "/ueber-uns",
     "/team", "/equipo", "/equipe", "/staff", "/nosotros",
