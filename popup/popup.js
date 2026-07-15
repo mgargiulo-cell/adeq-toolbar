@@ -9086,6 +9086,12 @@ async function loadProspectsTab(opts = {}) {
   if (tabCount) tabCount.textContent = rows.length > 0 ? `(${rows.length})` : "";
 
   if (!rows.length) {
+    // Maxi 2026-07-15 (BUG 2 auditoría filtros): limpiar la barra de paginación al quedar 0 resultados.
+    // Antes la nav (sibling de #prospects-list) quedaba con "1000 leads · pág 1/20" del render anterior →
+    // "No pending candidates" arriba y "1000 leads" abajo al mismo tiempo.
+    const _navEmpty = document.getElementById("prospects-pagination");
+    if (_navEmpty) { _navEmpty.innerHTML = ""; _navEmpty.style.display = "none"; }
+    window._prospectsSample = [];
     // Empty state inteligente: si hay actividad activa del worker, mostrar qué
     // está procesando; si todo está apagado, mostrar el mensaje genérico.
     listEl.innerHTML = '<div class="cascade-empty">⏳ Verificando actividad del worker...</div>';
