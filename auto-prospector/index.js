@@ -1515,16 +1515,24 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const period = dateISO.slice(0, 7);  // YYYY-MM
   // ── PACING MENSUAL: reparte el cap (20k búsquedas) entre los días/slots que faltan
   //    del mes, para NO agotar todo en un día (clave para el costo de server). ──
-  let used = 0;
+  // Maxi 2026-07-15: cap mensual CONFIGURABLE (autogoogle_monthly_cap) sin deploy — con 50k créditos
+  // pagos, el user regula el ritmo de gasto. + freshRate = rolling de dominios NUEVOS por búsqueda,
+  // usado abajo para NO gastar créditos cuando el pool está saturado (spend inteligente).
+  let used = 0, monthlyCap = AUTOGOOGLE_MONTHLY_CAP, freshRate = 1.0;
   try {
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period)&select=key,value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period,autogoogle_monthly_cap,autogoogle_fresh_rate)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
-    if (r.ok) { const map = {}; (await r.json()).forEach(x => { map[x.key] = x.value; }); if (map.autogoogle_serper_period === period) used = parseInt(map.autogoogle_serper_used || "0", 10) || 0; }
+    if (r.ok) {
+      const map = {}; (await r.json()).forEach(x => { map[x.key] = x.value; });
+      if (map.autogoogle_serper_period === period) used = parseInt(map.autogoogle_serper_used || "0", 10) || 0;
+      if (map.autogoogle_monthly_cap) monthlyCap = Math.max(100, parseInt(map.autogoogle_monthly_cap, 10) || AUTOGOOGLE_MONTHLY_CAP);
+      if (map.autogoogle_fresh_rate) freshRate = Math.max(0, Math.min(3, parseFloat(map.autogoogle_fresh_rate) || 1.0));
+    }
   } catch {}
-  const remaining = Math.max(0, AUTOGOOGLE_MONTHLY_CAP - used);
-  if (remaining <= 0) { log(`🔎 AutoGoogle: cap mensual ${AUTOGOOGLE_MONTHLY_CAP} alcanzado (${used}) — skip`); return; }
+  const remaining = Math.max(0, monthlyCap - used);
+  if (remaining <= 0) { log(`🔎 AutoGoogle: cap mensual ${monthlyCap} alcanzado (${used}) — skip`); return; }
   const [yy, mm, dd] = dateISO.split("-").map(Number);
   const daysInMonth = new Date(yy, mm, 0).getDate();
   const daysLeft = Math.max(1, daysInMonth - dd + 1);                                  // incluye hoy
@@ -1532,12 +1540,17 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const budgetToday = Math.ceil(remaining / daysLeft);
   let N = Math.ceil(budgetToday / slotsLeftToday);
   N = Math.max(1, Math.min(200, N, remaining));                                        // tope de seguridad 200/slot
+  // Maxi 2026-07-15 SPEND INTELIGENTE: escalar por rendimiento reciente. freshRate = dominios NUEVOS por
+  // búsqueda (rolling). Pool saturado (freshRate bajo) → MENOS búsquedas (no quemar créditos); piso 8 para
+  // seguir sondeando cuando el pool se renueve; freshRate alto → hasta el budget completo.
+  const _throttle = Math.max(0.15, Math.min(1, freshRate));
+  N = Math.min(remaining, 200, Math.max(8, Math.round(N * _throttle)));
   // Pool = TODAS las frases de cascade (3490, 12 idiomas) desde keywordsData.js; fallback inline.
   let pool;
   try { pool = Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s); } catch { pool = []; }
   if (!pool || pool.length < 50) pool = _AUTOGOOGLE_KEYWORDS;
   const kws = [...pool].sort(() => Math.random() - 0.5).slice(0, N);
-  log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (mes ${used}/${AUTOGOOGLE_MONTHLY_CAP}, ${daysLeft}d restantes)...`);
+  log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
   const found = new Set();
   let queriesDone = 0, errCount = 0, lastStatus = 0;
   for (const kw of kws) {
@@ -1561,14 +1574,29 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   } else {
     try { await setConfigValue(token, "autogoogle_last_error", ""); } catch {}
   }
-  if (found.size === 0) { log("🔎 AutoGoogle: 0 dominios (revisar autogoogle_last_error: créditos/key de Serper)"); return; }
-  // Pre-filtro TLD Anglo deprio + dedup canónico (cola activa + Prospects).
-  let cands = [...found].filter(d => !DEPRIO_TLD_RE.test(d));
-  const known = await _findKnownDomainsWorker(token, cands);
-  const fresh = cands.filter(d => !known.has(d));
-  if (fresh.length === 0) { log(`🔎 AutoGoogle: ${found.size} encontrados, 0 nuevos tras dedup`); return; }
-  const inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
-  log(`🔎 AutoGoogle: ${found.size} dominios de ${kws.length} keywords → ${fresh.length} nuevos → ${inserted} encolados (source=autogoogle)`);
+  // Dedup canónico (cola activa + Prospects) + inject, si hubo resultados.
+  let freshCount = 0, inserted = 0;
+  if (found.size > 0) {
+    const cands = [...found].filter(d => !DEPRIO_TLD_RE.test(d));   // pre-filtro TLD Anglo deprio
+    const known = await _findKnownDomainsWorker(token, cands);
+    const fresh = cands.filter(d => !known.has(d));
+    freshCount = fresh.length;
+    if (fresh.length > 0) inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
+  }
+  // Maxi 2026-07-15 SPEND INTELIGENTE: actualizar el rolling freshRate (dominios NUEVOS por búsqueda) —
+  // SIEMPRE que hubo búsquedas exitosas, incluso con 0 nuevos (pool saturado → baja el rate → menos
+  // búsquedas el próximo slot). Si todo falló (créditos/key) NO se ajusta (no es señal de saturación).
+  if (queriesDone > 0) {
+    const _slotRate = freshCount / queriesDone;
+    const _newRate = Math.round((0.6 * freshRate + 0.4 * _slotRate) * 1000) / 1000;
+    try {
+      await setConfigValue(token, "autogoogle_fresh_rate", String(_newRate));
+      await setConfigValue(token, "autogoogle_stats", JSON.stringify({ slot: slotLabel, searches: queriesDone, found: found.size, fresh: freshCount, inserted, freshRate: _newRate, at: new Date().toISOString().slice(0, 16) }));
+    } catch {}
+    log(`🔎 AutoGoogle: ${found.size} dominios de ${queriesDone} búsquedas → ${freshCount} nuevos → ${inserted} encolados · freshRate ${_newRate} (spend inteligente)`);
+  } else {
+    log(`🔎 AutoGoogle: 0 búsquedas exitosas (revisar autogoogle_last_error) — freshRate sin cambios`);
+  }
 }
 
 async function _getMondayApiKeyForFeeder(token) {
