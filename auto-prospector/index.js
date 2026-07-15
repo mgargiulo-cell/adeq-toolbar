@@ -4410,6 +4410,12 @@ async function fetchPageContent(domain) {
     const PROGRAMMATIC_RE = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|securepubads\.g\.doubleclick|googletag\.cmd|div-gpt-ad|data-ad-slot|doubleclick\.net|amazon-adsystem|aps\.amazon|criteo|pubmatic|rubiconproject|magnite|openx\.net|prebid\.js|prebidjs|adnxs\.com|appnexus|33across|sovrn\.com|indexexchange|casalemedia|smartadserver|adform\.net|yieldmo|sharethrough|gumgum|adsrvr\.org|adservice\.google|fundingchoicesmessages)/i;
     const hasProgrammatic = PROGRAMMATIC_RE.test(html);
     const hasDisplayAds   = hasProgrammatic || adNetworks.length > 0;
+    // Maxi 2026-07-15 (caso allhiphop.com purgado como ecommerce): ad-tech de PUBLISHER = vende su
+    // inventario a TERCEROS (AdSense/GPT/SSP/Taboola). Una TIENDA NO corre esto (mostrar ads de otros en
+    // sus product pages mandaría tráfico afuera) — a lo sumo tiene retargeting (criteo/adsrvr/adform), que
+    // NO cuenta acá. Un publisher con tienda de merch (allhiphop) SÍ tiene publisher-ads → vetea isStore.
+    const PUBLISHER_ADS_RE = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|div-gpt-ad|data-ad-slot|googletag\.cmd|amazon-adsystem|aps\.amazon|pubmatic|rubiconproject|magnite|openx\.net|prebid\.js|prebidjs|adnxs\.com|appnexus|33across|sovrn\.com|indexexchange|casalemedia|smartadserver|yieldmo|sharethrough|gumgum|fundingchoicesmessages)/i;
+    const hasPublisherAds = PUBLISHER_ADS_RE.test(html) || adNetworks.length > 0;
 
     // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
     // Adult/Streaming PRIMERO porque scoreWebsite los usa como gates duros (descarte total).
@@ -4492,7 +4498,9 @@ async function fetchPageContent(domain) {
     const realtyKw = [/pisos? en (venta|alquiler)|propiedades? en (venta|alquiler)|casas? en venta|im[óo]veis (para|à) (venda|alugar)/i, /publica(r)? tu (anuncio|propiedad) gratis|m² (construidos|[úu]tiles)|\d+ dormitorios/i];
 
     let nonPublisherType = null;
-    if (isStore) nonPublisherType = "ecommerce";   // plataforma/carrito: es tienda aunque tenga ads
+    // Maxi 2026-07-15: isStore ya NO es "aunque tenga ads" — si el sitio corre ad-tech de PUBLISHER
+    // (AdSense/GPT/SSP/Taboola) es un medio con tienda de merch (allhiphop.com), NO una tienda. Veto.
+    if (isStore && !hasPublisherAds) nonPublisherType = "ecommerce";
     // Maxi 2026-07-13 (auditoría 48h): schema de ENTIDAD que un publisher JAMÁS lleva describiéndose
     // a SÍ MISMO → rechazo AUNQUE tenga ads (un banco/aseguradora/universidad/gobierno mete pixel de
     // retargeting → "monetizado" → antes se colaba: axa/sympany/wizink/adib/adcb/fernuni/univ-biskra/
