@@ -41,7 +41,7 @@ export const CONFIG = {
     // Reengagement / Email Futuro — el agente actualiza estas dos al disparar
     // el envío automático del email_futuro (today+5 y today+10).
     // Verificar IDs en Monday si el push falla.
-    fecha_fu1:       "fecha2_8",          // Fecha FU1 (today + 5 días)
+    fecha_fu1:       "fecha2",            // Fecha FU1 (today + 5 días) — Maxi 2026-07-15: era "fecha2_8" (id inexistente en board → "This column ID doesn't exist"); id real verificado contra el board = "fecha2"
     fecha_fu2:       "fecha_1",           // Fecha FU2 (today + 10 días)
   },
 

@@ -1559,6 +1559,14 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   } catch {}
   const remaining = Math.max(0, monthlyCap - used);
   if (remaining <= 0) { log(`🔎 AutoGoogle: cap mensual ${monthlyCap} alcanzado (${used}) — skip`); return; }
+  // Maxi 2026-07-15: PRE-CHECK del carril ANTES de gastar Serper. Bug en logs: se hacían las 200
+  // búsquedas (200 créditos) y RECIÉN al inyectar aparecía "carril lleno (180/180) → 0 encolados"
+  // = créditos quemados al pedo. Ahora: si el carril autogoogle ya está lleno, NO gasto ni una
+  // búsqueda; si queda poco lugar, capo N abajo para no buscar más de lo que puedo inyectar.
+  const _laneCap  = PER_SOURCE_ACTIVE_CAP.autogoogle ?? DEFAULT_SOURCE_CAP;
+  const _laneUsed = await _countActiveCsvBySource(token, "autogoogle");
+  const _laneRoom = Math.max(0, _laneCap - _laneUsed);
+  if (_laneRoom <= 0) { log(`🔎 AutoGoogle: carril lleno (${_laneUsed}/${_laneCap}) — NO gasto créditos Serper este slot`); return; }
   const [yy, mm, dd] = dateISO.split("-").map(Number);
   const daysInMonth = new Date(yy, mm, 0).getDate();
   const daysLeft = Math.max(1, daysInMonth - dd + 1);                                  // incluye hoy
@@ -1571,6 +1579,9 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // seguir sondeando cuando el pool se renueve; freshRate alto → hasta el budget completo.
   const _throttle = Math.max(0.15, Math.min(1, freshRate));
   N = Math.min(remaining, 200, Math.max(8, Math.round(N * _throttle)));
+  // Cap por lugar en el carril: no buscar más de lo que entra. freshRate = dominios nuevos por
+  // búsqueda → para llenar _laneRoom slots alcanzan ~_laneRoom/freshRate búsquedas (piso 8).
+  N = Math.min(N, Math.max(8, Math.ceil(_laneRoom / Math.max(0.2, freshRate))));
   // Pool = TODAS las frases de cascade (3490, 12 idiomas) desde keywordsData.js; fallback inline.
   let pool;
   try { pool = Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s); } catch { pool = []; }
@@ -8452,6 +8463,26 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       }
     } catch {}
 
+    // 0a. Maxi 2026-07-15: si el dominio YA está frozen (frozen_until > now), skip TODO.
+    // Bug visto en logs: un soft-bounce recurrente (ej. info@evima.gr) que ya llegó a max retries
+    // y quedó frozen 60d se re-detectaba en CADA scan de Gmail y volvía a entrar acá → re-freeze +
+    // "Monday email column limpiada" en loop (spam a Monday + trabajo al pedo + reclear repetido).
+    // Un dominio frozen no se toca hasta que el unfreezer lo libere.
+    try {
+      const _nowIso = new Date().toISOString();
+      const _frRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?domain=eq.${encodeURIComponent(domain)}&frozen_until=gt.${encodeURIComponent(_nowIso)}&select=domain&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (_frRes.ok) {
+        const _fr = await _frRes.json().catch(() => []);
+        if (Array.isArray(_fr) && _fr.length > 0) {
+          log(`  🧊 ${domain}: ya frozen — skip bounce retry (no re-freeze ni re-clear Monday)`);
+          return;
+        }
+      }
+    } catch {}
+
     // 0b. Maxi 2026-06-18: AUTO-PROMOTE en Monday.
     // Si el dominio recibió OTROS envíos del mismo MB en últimos 7d (vía
     // response_tracking — los adicionales que mandamos día 0 con el original),
@@ -10407,7 +10438,7 @@ const MONDAY_COL_PITCH   = "texto";           // Comentarios (text)
 const MONDAY_COL_PHONE   = "tel_fono_1";      // Telefono (phone column)
 // Reengagement / Email Futuro — el agente al disparar el email B actualiza
 // estas dos fechas con hoy+5 y hoy+10. Verificar IDs en Monday si el push falla.
-const MONDAY_COL_FU1     = "fecha2_8";        // Fecha FU1 (today + 5)
+const MONDAY_COL_FU1     = "fecha2";          // Fecha FU1 (today + 5) — Maxi 2026-07-15: era "fecha2_8" (id inexistente en board 1420268379 → "This column ID doesn't exist" en cada dispatch); id real verificado = "fecha2"
 const MONDAY_COL_FU2     = "fecha_1";         // Fecha FU2 (today + 10)
 
 // Update Monday item estado (después de enviar mail)
