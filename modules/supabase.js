@@ -733,11 +733,20 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
     // → primero los más frescos (mejor para que vean los recién agregados).
     const res = await fetch(
       `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}${geoClause}&order=created_at.desc&limit=3000&select=${cols}`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact" } }
     );
     if (!res.ok) return [];
     const rows = await res.json();
-    return Array.isArray(rows) ? rows : [];
+    const out = Array.isArray(rows) ? rows : [];
+    // Maxi 2026-07-16: total REAL desde Content-Range. El count=exact devuelve "0-999/1325" aunque el
+    // server cape las filas en 1000 → el contador de la pestaña usaba rows.length y se clavaba en 1000.
+    // Adjuntamos el total como propiedad para mostrar el número real (aunque solo se rendericen 1000/pág).
+    try {
+      const cr = res.headers.get("content-range") || res.headers.get("Content-Range") || "";
+      const t = parseInt((cr.match(/\/(\d+)$/) || [])[1] || "0", 10);
+      if (t > 0) out.total = t;
+    } catch {}
+    return out;
   } catch { return []; }
 }
 

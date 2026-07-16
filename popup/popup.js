@@ -9172,10 +9172,13 @@ async function loadProspectsTab(opts = {}) {
   _rebuildGeoChips(allRowsForChips, geoChipsSet);
 
   updateProspectsDailyBar(dailyCount);
-  if (statsEl) statsEl.textContent = rows.length ? `${rows.length} pending candidate${rows.length === 1 ? "" : "s"}` : "No pending candidates";
+  // Maxi 2026-07-16: usar el total REAL (rows.total del count=exact) para el contador, no rows.length
+  // (que se clava en 1000 por el max-rows del server). Se ven 1000/página pero el número dice el real.
+  const _realCount = (typeof rows.total === "number" && rows.total > 0) ? rows.total : rows.length;
+  if (statsEl) statsEl.textContent = _realCount ? `${_realCount.toLocaleString()} pending candidate${_realCount === 1 ? "" : "s"}` : "No pending candidates";
   // Tab counter — vista de pajaro de cuánto hay para revisar.
   const tabCount = document.getElementById("tab-prospects-count");
-  if (tabCount) tabCount.textContent = rows.length > 0 ? `(${rows.length})` : "";
+  if (tabCount) tabCount.textContent = _realCount > 0 ? `(${_realCount.toLocaleString()})` : "";
 
   if (!rows.length) {
     // Maxi 2026-07-15 (BUG 2 auditoría filtros): limpiar la barra de paginación al quedar 0 resultados.
