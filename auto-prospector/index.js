@@ -1618,9 +1618,26 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   let pool;
   try { pool = Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s); } catch { pool = []; }
   if (!pool || pool.length < 50) pool = _AUTOGOOGLE_KEYWORDS;
-  const kws = [...pool].sort(() => Math.random() - 0.5).slice(0, N);
-  log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
+  // Maxi 2026-07-16: SELECCIÓN POR YIELD (antes 100% random). ~65% de las frases que históricamente
+  // traen más dominios FRESCOS (toolbar_keyword_yield) + ~35% exploración random (para seguir descubriendo
+  // frases buenas y no encasillarse). Sube la calidad de URLs sin gastar más búsquedas.
+  let _topPhrases = [];
+  try {
+    const _yr = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&order=fresh.desc&select=phrase&limit=600`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (_yr.ok) _topPhrases = (await _yr.json()).map(r => r.phrase).filter(p => typeof p === "string");
+  } catch {}
+  const _poolSet = new Set(pool);
+  const _topInPool = _topPhrases.filter(p => _poolSet.has(p));
+  const _pickTop = [..._topInPool].sort(() => Math.random() - 0.5).slice(0, Math.round(N * 0.65));
+  const _pickTopSet = new Set(_pickTop);
+  const _explore = pool.filter(p => !_pickTopSet.has(p)).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
+  const kws = [..._pickTop, ..._explore].sort(() => Math.random() - 0.5);
+  log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (${_pickTop.length} top-yield + ${_explore.length} explore · mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
   const found = new Set();
+  const kwDomains = new Map();  // Maxi 2026-07-16: keyword → dominios que trajo (para calcular el yield)
   let queriesDone = 0, errCount = 0, lastStatus = 0;
   for (const kw of kws) {
     // País de búsqueda rotado (targeting GEO no-Anglo) → trae publishers del país objetivo.
@@ -1628,7 +1645,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     const { domains, ok, status } = await _serperSearch(kw, 20, gl);
     // Maxi 2026-07-15: contar SOLO las búsquedas EXITOSAS. Antes queriesDone++ corría siempre → las
     // fallidas (Serper 403/429 por créditos agotados) igual gastaban el "cap mensual" → se auto-bloqueaba.
-    if (ok) { queriesDone++; domains.forEach(d => found.add(d)); }
+    if (ok) { queriesDone++; domains.forEach(d => found.add(d)); kwDomains.set(kw, domains); }
     else { errCount++; lastStatus = status; }
     if (queriesDone > 0 && queriesDone % 20 === 0) {
       try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
@@ -1645,14 +1662,27 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     try { await setConfigValue(token, "autogoogle_last_error", ""); } catch {}
   }
   // Dedup canónico (cola activa + Prospects) + inject, si hubo resultados.
-  let freshCount = 0, inserted = 0;
+  let freshCount = 0, inserted = 0, _freshSet = new Set();
   if (found.size > 0) {
     const cands = [...found].filter(d => !DEPRIO_TLD_RE.test(d));   // pre-filtro TLD Anglo deprio
     const known = await _findKnownDomainsWorker(token, cands);
     const fresh = cands.filter(d => !known.has(d));
+    _freshSet = new Set(fresh);
     freshCount = fresh.length;
     if (fresh.length > 0) inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
   }
+  // Maxi 2026-07-16: registrar el YIELD por keyword (frescos que trajo cada frase) → la selección futura
+  // se sesga hacia las que rinden. RPC atómico bump_keyword_yield (incrementa searches/found/fresh).
+  try {
+    await Promise.all([...kwDomains].map(([kw, doms]) => {
+      const _f = doms.filter(d => _freshSet.has(d)).length;
+      return fetch(`${SUPABASE_URL}/rest/v1/rpc/bump_keyword_yield`, {
+        method: "POST",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ p_phrase: String(kw).slice(0, 300), p_searches: 1, p_found: doms.length, p_fresh: _f }),
+      }).catch(() => {});
+    }));
+  } catch {}
   // Maxi 2026-07-15 SPEND INTELIGENTE: actualizar el rolling freshRate (dominios NUEVOS por búsqueda) —
   // SIEMPRE que hubo búsquedas exitosas, incluso con 0 nuevos (pool saturado → baja el rate → menos
   // búsquedas el próximo slot). Si todo falló (créditos/key) NO se ajusta (no es señal de saturación).
