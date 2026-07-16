@@ -5003,6 +5003,9 @@ async function _softRejectLead(auth, id, reason) {
   } catch {}
 }
 let _lastPolishRunAt = 0;
+// Maxi 2026-07-16: control de gasto del fallback de contacto por Google (Serper). Cap DIARIO + dedup
+// para no quemar créditos (el user vio ~1500/día → a ese ritmo 50k no duran). Reset al cambiar el día Madrid.
+let _serperContactCount = 0, _serperContactDay = "", _serperContactTried = new Set();
 // Maxi 2026-07-15: ritmo subido para pulir el pool grande (1133 pendientes) en horas, no días.
 // Seguro ahora que (a) el cursor commitea por wave (sobrevive restarts) y (b) se arregló el OOM.
 // Es red-bound (fetch+scrape), no memoria → más concurrencia impacta poco en RSS.
@@ -5096,18 +5099,30 @@ async function polishPool(token) {
           const ap = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true }).catch(() => null);
           if (ap?.email) { foundEmail = ap.email; foundSource = "apollo"; foundName = ap.contact_name || ""; }
         }
-        // 5) Maxi 2026-07-16 FALLBACK Google (Serper): si SIGUE sin email, 1 búsqueda "<dom> contato" →
-        //    email (mismo dominio) + teléfono + WhatsApp de los snippets. Solo acá se gasta 1 crédito.
-        if (!foundEmail) {
-          const g = await _serperContactSearch(domain).catch(() => null);
-          if (g) {
-            if (g.emails.length) {
-              const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
-              if (gr.length) { foundEmail = gr[0].email; foundSource = "google_contact"; }
-            }
-            if (!foundPhone) {
-              if (g.whatsapps.length) foundPhone = "wa:" + g.whatsapps[0];
-              else if (g.phones.length) foundPhone = g.phones[0];
+        // 5) Maxi 2026-07-16 FALLBACK Google (Serper) OPTIMIZADO: gasta 1 crédito SOLO si el dominio quedó
+        //    con CERO email (NO en los que ya tienen uno genérico → esos ya son contactables). Con CAP
+        //    DIARIO (serper_contact_daily_cap, default 250) + dedup (no re-buscar el mismo dominio en el
+        //    día) + metrado en config (serper_contact_used) → el user vio ~1500/día sin control, ahora
+        //    ~250/día = junto con AutoGoogle (~150) tus 50k duran ~4 meses. Es un consumidor SEPARADO de
+        //    AutoGoogle (que sigue buscando DOMINIOS nuevos para el cascade).
+        if (!foundEmail && curEmails.length === 0) {
+          const _mDay = _madridNowParts().dateISO;
+          if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+          const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
+          if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
+            _serperContactTried.add(domain);
+            _serperContactCount++;
+            if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+            const g = await _serperContactSearch(domain).catch(() => null);
+            if (g) {
+              if (g.emails.length) {
+                const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+                if (gr.length) { foundEmail = gr[0].email; foundSource = "google_contact"; }
+              }
+              if (!foundPhone) {
+                if (g.whatsapps.length) foundPhone = "wa:" + g.whatsapps[0];
+                else if (g.phones.length) foundPhone = g.phones[0];
+              }
             }
           }
         }
