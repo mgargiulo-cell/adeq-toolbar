@@ -3875,6 +3875,11 @@ async function runPageContext() {
           const svcPlatKw  = [/\b(web hosting|shared hosting|reseller hosting|dedicated server|cpanel|alojamiento web|hospedagem|payment gateway|pasarela de pago|merchant account|no-logs vpn|vpn service)\b/i, /(register (your |a )?domain|registra tu dominio|ssl certificate|certificado ssl|accept payments online|acept[aá] pagos|hide your ip|unblock (streaming|websites)|servers in \d+ countries)/i];
           const datingKw   = [/\b(dating (site|app|service)|online dating|citas online|encuentra pareja)\b/i, /(find (your )?match|singles (near you|in your area)|create (your )?(free )?profile|crea tu perfil gratis)/i];
           const personalKw = [/(my portfolio|mi portafolio|meu portf[óo]lio|hire me|contrat[aá]me|available for (hire|freelance)|freelance (designer|developer|writer|photographer|consultant))/i, /(my (resume|cv|work)|view my work|book a (session|shoot)|get in touch to work together)/i];
+          // Maxi 2026-07-16: espejo del worker (ejemplos del user): cripto/dev-tool/app/tienda.
+          const cryptoKw   = [/\b(buy|sell|trade|comprar|vender|compr[aá]|vend[eé]) (bitcoin|btc|ethereum|eth|crypto|cripto|criptomonedas?|usdt|tokens?)\b/i, /\b(crypto|cripto) ?(exchange|wallet|trading|broker)\b|casa de cambio (de )?cripto|spot trading|futures trading|derivatives exchange|(deposit|withdraw|retir[aá]|deposit[aá]) (crypto|usdt|fondos)|conect[aá] tu wallet|connect wallet/i];
+          const devToolKw  = [/\b(npm install|yarn add|pnpm add|pip install|composer require|go get |cargo add)\b/i, /\b(api reference|getting started|read the docs|open[- ]?source (library|framework|tool)|github stars?|available on (npm|pypi|packagist|crates)|sdk for developers|contribute on github)\b/i];
+          const appKw      = [/\b(download (the |our |your )?app|descarg[aá] (la |nuestra )?app|baixe (o |nosso )?app|get the app|t[ée]l[ée]charge[rz] (l'?|notre )app)\b/i, /\b(on the app ?store|on google play|download on the app store|get it on google play|disponible en (el )?app ?store|disponible en google play|available for (ios|android)|para (ios|android))\b/i];
+          const shopKw     = [/\b(add to (cart|basket|bag)|a[ñn]adir al carrito|agregar al carrito|adicionar ao carrinho|aggiungi al carrello|comprar ahora|buy now|comprar agora|finalizar compra|mi carrito|shopping cart|free shipping|env[íi]o gratis|frete gr[áa]tis)\b/i, /\b(online shop|tienda online|loja online|negozio online|boutique en ligne|our (store|shop)|nuestra tienda|nossa loja|(in|out of) stock|sold out|agotado)\b/i];
           const piracyRe   = /magnet:\?xt=urn:btih|\.torrent["'\s>]|\b(putlocker|123movies|fmovies|solarmovie|thepiratebay|1337x|rarbg|nyaa\.si)\b|read\s+manga\s+online\s+free/i;
           // isStore vetado por publisher-ads (un medio con tienda de merch NO es tienda). Piratería = brand-safety.
           if (isStore && !hasPublisherAds) nonPublisherType = "online store / e-commerce";
@@ -3903,6 +3908,10 @@ async function runPageContext() {
             else if (_hits(corpKw) >= 2) nonPublisherType = "corporate";
             else if (_hits(svcPlatKw) >= 2) nonPublisherType = "service / platform";
             else if (_hits(datingKw) >= 2) nonPublisherType = "dating";
+            else if (_hits(cryptoKw) >= 2) nonPublisherType = "crypto / exchange";
+            else if (_hits(devToolKw) >= 2) nonPublisherType = "dev tool / library";
+            else if (_hits(appKw) >= 2) nonPublisherType = "app";
+            else if (_hits(shopKw) >= 2) nonPublisherType = "online store / e-commerce";
             else if (_hits(personalKw) >= 1) nonPublisherType = "personal / portfolio";
           }
         } catch {}
