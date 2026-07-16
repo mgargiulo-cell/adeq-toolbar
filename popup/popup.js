@@ -9576,6 +9576,9 @@ function renderProspectCard(r) {
               monday_refresh: ["🔄", "Monday",   "#f59e0b"],
               sellers_json:   ["📋", "JSON",     "#8b5cf6"],
               autogoogle:     ["🔎", "Google",   "#22c55e"],  // Maxi 2026-06-30: faltaba → caía a "Auto"
+              majestic:       ["🌐", "Majestic", "#14b8a6"],  // Maxi 2026-07-16: feeder Majestic 1M (antes lumped en Auto)
+              adstxt:         ["📑", "ads.txt",  "#a855f7"],  // Maxi 2026-07-16: feeder ads.txt-graph
+              similar:        ["🔗", "Similar",  "#ec4899"],  // Maxi 2026-07-16: expansión por similares desde Prospects
             };
             const [icon, label, color] = badges[src] || badges.autopilot;
             return `<span title="Tipo de búsqueda: ${label}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">${icon} ${label}</span>`;
