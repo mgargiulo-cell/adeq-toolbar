@@ -1515,6 +1515,38 @@ async function _serperSearch(query, num = 20, gl = "") {
   } catch (e) { log(`  ⚠️ Serper error "${query}": ${e.message}`); return { domains: [], ok: false, status: -1 }; }
 }
 
+// Maxi 2026-07-16: FALLBACK de contacto por Google. El user mostró que muchos sitios (BR/GR/…) tienen
+// SOLO un formulario "fale conosco"/contato (sin email visible: massa.com.br), pero Google indexa el
+// email/teléfono/WhatsApp en los snippets. Cuando el scraping normal NO encontró email, gastamos 1
+// búsqueda Serper "<dominio> contato/publicidade/email/telefone" y extraemos email (mismo dominio) +
+// teléfono + WhatsApp de los organic/knowledgeGraph/answerBox. Cost-control: SOLO se llama si no hay email.
+async function _serperContactSearch(domain) {
+  if (!SERPER_API_KEY) return { emails: [], phones: [], whatsapps: [] };
+  const clean = String(domain || "").replace(/^www\./, "").toLowerCase();
+  const base = clean.split(".")[0];
+  try {
+    const res = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: `${clean} contato OR contacto OR contact OR publicidade OR email OR telefone OR whatsapp`, num: 10 }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) { log(`  ⚠️ Serper contact ${res.status} ${clean}`); return { emails: [], phones: [], whatsapps: [] }; }
+    const data = await res.json();
+    let text = "";
+    for (const r of (Array.isArray(data.organic) ? data.organic : [])) text += ` ${r.title || ""} ${r.snippet || ""} ${r.link || ""}`;
+    if (data.knowledgeGraph) { const kg = data.knowledgeGraph; text += ` ${kg.title || ""} ${kg.description || ""} ${kg.phoneNumber || ""} ${kg.website || ""} ${JSON.stringify(kg.attributes || {})}`; }
+    if (data.answerBox) text += ` ${data.answerBox.snippet || ""} ${data.answerBox.answer || ""}`;
+    // Emails: SOLO del mismo dominio registrable (evita agarrar mails de otros sitios del ranking).
+    const emails = extractEmailsFromHtml(text).filter(e => {
+      const host = (e.split("@")[1] || "").toLowerCase();
+      return host === clean || host.endsWith("." + clean) || host === base + "." + clean.split(".").slice(1).join(".") || (base.length >= 4 && host.split(".")[0] === base);
+    });
+    const { phones, whatsapps } = extractPhonesFromHtml(text);
+    return { emails: [...new Set(emails)], phones, whatsapps };
+  } catch (e) { log(`  ⚠️ Serper contact error ${clean}: ${e.message}`); return { emails: [], phones: [], whatsapps: [] }; }
+}
+
 async function maybeRunAutoGoogleSlot(token) {
   if (!SERPER_API_KEY) return;  // sin key → AutoGoogle apagado
   const { hour, weekday, dateISO } = _madridNowParts();
@@ -4101,6 +4133,29 @@ function extractEmailsFromHtml(html) {
   });
 }
 
+// Maxi 2026-07-16: extrae teléfonos + WhatsApp de HTML/texto. El user pidió capturar tel/WhatsApp
+// (muy común en BR/otros: "fale conosco" con form + WhatsApp, ej. massa.com.br; footer con tel, ej.
+// trikalaola.gr). Prioridad ALTA precisión: wa.me y tel: son señales fuertes; el número visible es
+// más ruidoso → conservador. Devuelve { phones:[], whatsapps:[] } (WhatsApp = solo dígitos con país).
+function extractPhonesFromHtml(text) {
+  if (!text) return { phones: [], whatsapps: [] };
+  const phones = new Set(), whatsapps = new Set();
+  // WhatsApp: wa.me/<num>, api.whatsapp.com/send?phone=<num>, whatsapp://send?phone=<num>
+  for (const m of text.matchAll(/(?:wa\.me\/|(?:api\.)?whatsapp\.com\/send\/?\?phone=|whatsapp:\/\/send\?phone=)(\+?\d[\d\s\-]{6,17}\d)/gi)) {
+    const n = m[1].replace(/[^\d]/g, ""); if (n.length >= 8 && n.length <= 15) whatsapps.add(n);
+  }
+  // tel: hrefs (alta precisión)
+  for (const m of text.matchAll(/tel:(\+?\d[\d\s().\-]{6,18}\d)/gi)) {
+    const n = m[1].replace(/[^\d+]/g, ""); if (n.replace(/\D/g, "").length >= 8) phones.add(n);
+  }
+  // Números visibles con estructura de teléfono: +cc, (área) y separadores. Conservador (bajo ruido).
+  for (const m of text.matchAll(/(?:\+\d{1,3}[\s.\-]?)?\(?\d{2,4}\)?[\s.\-]\d{3,4}[\s.\-]?\d{3,4}/g)) {
+    const raw = m[0].trim(); const digits = raw.replace(/\D/g, "");
+    if (digits.length >= 8 && digits.length <= 14 && !/^\d{4}[.\-]\d{2}[.\-]\d{2}$/.test(raw)) phones.add(raw.replace(/\s+/g, " "));
+  }
+  return { phones: [...phones].slice(0, 5), whatsapps: [...whatsapps].slice(0, 3) };
+}
+
 // Maxi 2026-06-17: Informer-only fetch. CHEAP, sin Apollo credit.
 // Maxi 2026-06-18 fix bug thewordfinder.com: timeout 6s→12s, headers más
 // realistas, URLs adicionales de WHOIS, deobfuscation reforzada.
@@ -4658,6 +4713,7 @@ async function fetchPageContent(domain) {
       hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
       nonPublisherType,                 // tienda/banco/universidad/servicios → rechazar
       isEcommerce: nonPublisherType === "ecommerce",
+      ...extractPhonesFromHtml(html),   // Maxi 2026-07-16: phones[] + whatsapps[] del home (footer, wa.me, tel:)
       htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
       textSample,
     };
@@ -4964,7 +5020,7 @@ async function polishPool(token) {
   const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
   let leads = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,emails,email_sources,contact_name,category,traffic,created_at&order=created_at.asc&limit=${POLISH_BATCH}`, { headers: auth });
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,emails,email_sources,contact_name,contact_phone,category,traffic,created_at&order=created_at.asc&limit=${POLISH_BATCH}`, { headers: auth });
     if (r.ok) leads = await r.json();
   } catch {}
   if (!Array.isArray(leads) || leads.length === 0) {
@@ -4997,7 +5053,21 @@ async function polishPool(token) {
           if (src === "apollo" || src === "informer") return true;
           return !_isGenericLocalPart(e);
         });
-        if (hasGood) return;
+        // Maxi 2026-07-16: teléfono/WhatsApp del home (ya fetcheamos pc → gratis). "wa:" marca WhatsApp.
+        let foundPhone = "";
+        if (pc?.whatsapps?.length) foundPhone = "wa:" + pc.whatsapps[0];
+        else if (pc?.phones?.length) foundPhone = pc.phones[0];
+        const _curPhone = String(lead.contact_phone || "").trim();
+        const _savePhone = async () => {
+          if (foundPhone && !_curPhone) {
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ contact_phone: foundPhone }),
+            }).catch(() => {});
+          }
+        };
+        // keeper: ya tiene email bueno → solo guardamos el tel si es nuevo, y listo.
+        if (hasGood) { await _savePhone(); return; }
         // 4) buscar email: scrape gratis (páginas internas multilingües) + REDES SOCIALES (FB/IG/Twitter)
         //    + website-informer/WHOIS — todo adentro de scrapeEmailsForDomain — y Apollo capado si vacío.
         let foundEmail = null, foundSource = null, foundName = "";
@@ -5015,16 +5085,38 @@ async function polishPool(token) {
           const ap = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true }).catch(() => null);
           if (ap?.email) { foundEmail = ap.email; foundSource = "apollo"; foundName = ap.contact_name || ""; }
         }
-        if (foundEmail) {
-          const merged = [foundEmail, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
-          const validated = await validateEmailsBatch(merged);
-          const newSources = { ...(lead.email_sources || {}) };
-          newSources[foundEmail.toLowerCase()] = foundSource;
+        // 5) Maxi 2026-07-16 FALLBACK Google (Serper): si SIGUE sin email, 1 búsqueda "<dom> contato" →
+        //    email (mismo dominio) + teléfono + WhatsApp de los snippets. Solo acá se gasta 1 crédito.
+        if (!foundEmail) {
+          const g = await _serperContactSearch(domain).catch(() => null);
+          if (g) {
+            if (g.emails.length) {
+              const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+              if (gr.length) { foundEmail = gr[0].email; foundSource = "google_contact"; }
+            }
+            if (!foundPhone) {
+              if (g.whatsapps.length) foundPhone = "wa:" + g.whatsapps[0];
+              else if (g.phones.length) foundPhone = g.phones[0];
+            }
+          }
+        }
+        // Guardar email (si hay) y/o teléfono (si es nuevo) en UN solo PATCH.
+        if (foundEmail || (foundPhone && !_curPhone)) {
+          const _patch = {};
+          if (foundEmail) {
+            const merged = [foundEmail, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
+            _patch.emails = await validateEmailsBatch(merged);
+            const newSources = { ...(lead.email_sources || {}) };
+            newSources[foundEmail.toLowerCase()] = foundSource;
+            _patch.email_sources = newSources;
+            _patch.contact_name = foundName || lead.contact_name || "";
+          }
+          if (foundPhone && !_curPhone) _patch.contact_phone = foundPhone;
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ emails: validated, email_sources: newSources, contact_name: foundName || lead.contact_name || "" }),
+            body: JSON.stringify(_patch),
           });
-          enriched++;
+          if (foundEmail) enriched++;
         }
       } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
     }));
