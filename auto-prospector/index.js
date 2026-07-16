@@ -4999,9 +4999,13 @@ let _lastPolishRunAt = 0;
 // Maxi 2026-07-15: ritmo subido para pulir el pool grande (1133 pendientes) en horas, no días.
 // Seguro ahora que (a) el cursor commitea por wave (sobrevive restarts) y (b) se arregló el OOM.
 // Es red-bound (fetch+scrape), no memoria → más concurrencia impacta poco en RSS.
-const POLISH_COOLDOWN_MS = 20 * 1000;  // 45→20s: corre más seguido por loop
-const POLISH_BATCH = 60;               // 40→60: más dominios por corrida (commit incremental lo hace seguro)
-const POLISH_CONC = 8;                 // 5→8: más dominios en paralelo por wave
+// Maxi 2026-07-16: RITMO MÁXIMO para el re-barrido (el user pidió re-analizar todo lo más rápido).
+// Seguro por: (a) guard de memoria (limpia caches si rss sube), (b) commit incremental (si lo reinician
+// no pierde progreso). El fallback Google (Serper) agrega ~10s por dominio sin email → más concurrencia
+// compensa. Tradeoff: el agente se pacea un poco (polishPool corre antes en el loop) pero sigue enviando.
+const POLISH_COOLDOWN_MS = 8 * 1000;   // 20→8s: corre casi cada loop
+const POLISH_BATCH = 120;              // 60→120: más dominios por corrida (commit incremental por wave lo hace seguro)
+const POLISH_CONC = 12;                // 8→12: más dominios en paralelo por wave
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
