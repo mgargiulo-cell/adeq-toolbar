@@ -1569,7 +1569,50 @@ async function maybeRunAutoGoogleSlot(token) {
   catch (e) { log(`⚠️ AutoGoogle slot: ${e.message}`); }
 }
 
+// Maxi 2026-07-16: reconcilia la atribución de AutoGoogle. Para los dominios inyectados en slots previos,
+// chequea si llegaron a review_queue con source=autogoogle (= CALIFICARON: pasaron piso 350K + detector) →
+// bump `qualified` de su keyword. Borra los reconciliados + los viejos (>10d) que nunca calificaron. Así el
+// yield mide "frases que traen publishers GRANDES", no solo dominios nuevos. Corre aparte del pipeline core.
+async function _reconcileAutogoogleAttribution(token) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  let rows = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?select=domain,phrase,injected_at&order=injected_at.asc&limit=500`, { headers: auth });
+    if (r.ok) rows = await r.json();
+  } catch {}
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  const domains = rows.map(r => r.domain);
+  const qualified = new Set();
+  for (let i = 0; i < domains.length; i += 150) {
+    const slice = domains.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+    try {
+      const q = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?source=eq.autogoogle&domain=in.(${encodeURIComponent(slice)})&select=domain`, { headers: auth });
+      if (q.ok) (await q.json()).forEach(x => x.domain && qualified.add(x.domain.toLowerCase()));
+    } catch {}
+  }
+  const _now = Date.now();
+  const toDelete = [], bumps = [];
+  for (const row of rows) {
+    const isQual = qualified.has(String(row.domain).toLowerCase());
+    const old = row.injected_at && (_now - Date.parse(row.injected_at)) > 10 * 86400000;
+    if (isQual) {
+      bumps.push(fetch(`${SUPABASE_URL}/rest/v1/rpc/bump_keyword_yield`, {
+        method: "POST", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ p_phrase: row.phrase, p_searches: 0, p_found: 0, p_fresh: 0, p_qualified: 1 }),
+      }).catch(() => {}));
+      toDelete.push(row.domain);
+    } else if (old) { toDelete.push(row.domain); }
+  }
+  await Promise.all(bumps);
+  for (let i = 0; i < toDelete.length; i += 150) {
+    const slice = toDelete.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+    try { await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?domain=in.(${encodeURIComponent(slice)})`, { method: "DELETE", headers: auth }); } catch {}
+  }
+  if (qualified.size) log(`🎯 autogoogle-attrib: ${qualified.size} calificaron a Prospects → +qualified · limpiados ${toDelete.length}`);
+}
+
 async function _runAutoGoogleSlot(token, slotLabel) {
+  await _reconcileAutogoogleAttribution(token).catch(() => {});  // Maxi 2026-07-16: bump qualified de slots previos
   const { hour, dateISO } = _madridNowParts();
   const period = dateISO.slice(0, 7);  // YYYY-MM
   // ── PACING MENSUAL: reparte el cap (20k búsquedas) entre los días/slots que faltan
@@ -1627,7 +1670,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   let _topPhrases = [];
   try {
     const _yr = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&order=fresh.desc&select=phrase&limit=600`,
+      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&order=qualified.desc,fresh.desc&select=phrase&limit=600`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (_yr.ok) _topPhrases = (await _yr.json()).map(r => r.phrase).filter(p => typeof p === "string");
@@ -1672,7 +1715,21 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     const fresh = cands.filter(d => !known.has(d));
     _freshSet = new Set(fresh);
     freshCount = fresh.length;
-    if (fresh.length > 0) inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
+    if (fresh.length > 0) {
+      inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
+      // Maxi 2026-07-16: guardar domain→keyword para reconciliar después (¿llegó a Prospects? → +qualified).
+      const _attr = fresh.map(d => {
+        const _kw = [...kwDomains].find(([, doms]) => doms.includes(d))?.[0] || "";
+        return _kw ? { domain: d, phrase: String(_kw).slice(0, 300) } : null;
+      }).filter(Boolean);
+      if (_attr.length) {
+        fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?on_conflict=domain`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(_attr),
+        }).catch(() => {});
+      }
+    }
   }
   // Maxi 2026-07-16: registrar el YIELD por keyword (frescos que trajo cada frase) → la selección futura
   // se sesga hacia las que rinden. RPC atómico bump_keyword_yield (incrementa searches/found/fresh).
