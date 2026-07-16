@@ -2672,7 +2672,7 @@ async function refreshSerperFooterCounter() {
   if (!el || !state.accessToken) return;
   try {
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period)&select=key,value`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period,autogoogle_monthly_cap)&select=key,value`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } }
     );
     if (!res.ok) return;
@@ -2682,7 +2682,7 @@ async function refreshSerperFooterCounter() {
     const period = new Date().toISOString().slice(0, 7);
     const sameMonth = (map.autogoogle_serper_period || "").slice(0, 7) === period;
     const used = sameMonth ? parseInt(map.autogoogle_serper_used || "0", 10) : 0;
-    const limit = 2500;
+    const limit = parseInt(map.autogoogle_monthly_cap || "10000", 10) || 10000;  // Maxi 2026-07-16: cap real (era 2500 hardcodeado)
     const pct = limit > 0 ? (used / limit) * 100 : 0;
     el.classList.remove("usage-warning", "usage-danger", "usage-reached");
     if (pct >= 100)     el.classList.add("usage-reached");
@@ -2918,6 +2918,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Seed the shared Supabase auth token so every supabase.js request uses the user JWT (not anon)
   setSupabaseAuth(auth.accessToken);
   setTrafficAuthToken(auth.accessToken);
+  // Maxi 2026-07-16 FIX: state.accessToken NO se seteaba en el login (solo en el refresh de token, 2min
+  // antes de expirar) → los contadores Apollo/AutoGoogle del footer (que lo usan) hacían early-return y
+  // quedaban en "--" para siempre. Lo seteamos acá, antes de los refresh de contadores de abajo.
+  state.accessToken = auth.accessToken;
   // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
   setProxyAuth(auth.accessToken, auth.user);
 
@@ -2944,6 +2948,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   // background × 3 MBs con la toolbar cerrada pero la sesión viva.
   setInterval(() => { if (document.visibilityState !== "hidden") refreshUsage(); }, 60_000);
   setInterval(() => { if (document.visibilityState !== "hidden") refreshApolloFooterCounter(); }, 60_000);
+  setInterval(() => { if (document.visibilityState !== "hidden") refreshSerperFooterCounter(); }, 60_000);  // Maxi 2026-07-16: le faltaba el intervalo → si el 1er intento fallaba, quedaba en "--"
   // Re-check version cada 30 min en background
   setInterval(checkExtensionVersion, 30 * 60_000);
   document.getElementById("version-badge")?.addEventListener("click", checkExtensionVersion);
