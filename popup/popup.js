@@ -9595,6 +9595,9 @@ function renderProspectCard(r) {
           ${r.category ? `<span title="Categoría del sitio">📁 ${esc(r.category)}</span>` : ""}
           ${r.language ? `<span title="Idioma">🗣 ${esc(langName)}</span>` : ""}
           ${r.contact_name ? `<span title="Contacto detectado">👤 ${esc(r.contact_name)}</span>` : ""}
+          ${r.contact_phone ? (String(r.contact_phone).startsWith("wa:")
+            ? `<span title="WhatsApp detectado — click para abrir el chat">💬 <a href="https://wa.me/${esc(String(r.contact_phone).slice(3).replace(/[^\d]/g, ""))}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline">WhatsApp</a></span>`
+            : `<span title="Teléfono detectado">📞 ${esc(String(r.contact_phone))}</span>`) : ""}
           ${adNetRow}
         </div>
       </div>

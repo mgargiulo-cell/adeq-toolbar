@@ -648,7 +648,7 @@ export async function setAutopilotTarget(geo, category, minTraffic, accessToken)
 export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFilter = "", userFilter = "", geoFilter = "" } = {}) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,emails,email_sources,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by,suspect_reject,suspect_reason";
+  const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,contact_phone,emails,email_sources,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by,suspect_reject,suspect_reason";
   // Date filter (Maxi 2026-06-18 v2): "today" | "yesterday" |
   //   "this_week" | "last_week" | "this_month" | "last_month" |
   //   (legacy) "last7" | "last30"
