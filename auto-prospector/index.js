@@ -1407,6 +1407,7 @@ const PER_SOURCE_ACTIVE_CAP = {
   auto_feeder_adstxt:   120,   // autopilot (ads.txt-graph)
   auto_feeder_monday:   120,
   autogoogle:           180,   // carril RESERVADO — nunca lo tapa un JSON
+  auto_feeder_similar:  150,   // Maxi 2026-07-16: expansión por similares desde Prospects
 };
 const DEFAULT_SOURCE_CAP = 150;
 
@@ -1618,6 +1619,8 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   let pool;
   try { pool = Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s); } catch { pool = []; }
   if (!pool || pool.length < 50) pool = _AUTOGOOGLE_KEYWORDS;
+  // Maxi 2026-07-16: sumar las keywords FRESCAS generadas por Claude (si el flag está prendido).
+  try { const _fk = JSON.parse((await getConfig(token)).autogoogle_fresh_keywords || "[]"); if (Array.isArray(_fk) && _fk.length) pool = [...new Set([...pool, ..._fk.filter(k => typeof k === "string" && k)])]; } catch {}
   // Maxi 2026-07-16: SELECCIÓN POR YIELD (antes 100% random). ~65% de las frases que históricamente
   // traen más dominios FRESCOS (toolbar_keyword_yield) + ~35% exploración random (para seguir descubriendo
   // frases buenas y no encasillarse). Sube la calidad de URLs sin gastar más búsquedas.
@@ -3719,6 +3722,10 @@ async function saveSimilarSitesCacheServer(domain, sites) {
 }
 
 const APOLLO_GOOD_STATUSES = new Set(["verified", "likely", "guessed"]);
+// Maxi 2026-07-16: prioridad por confiabilidad del email de Apollo. "guessed" es el que MÁS rebota →
+// se ordena ÚLTIMO (fallback). Preferir verified > likely > guessed baja rebotes SIN perder cobertura
+// (un dominio que solo tiene guessed igual lo usa). Reduce el 10-12% de rebotes de forma segura.
+const _APOLLO_STATUS_RANK = { verified: 3, likely: 2, guessed: 1 };
 
 // Apollo cache (TTL 7d) en Supabase — compartido con popup.
 // Saves cost: si worker o popup ya lo procesaron en los últimos 7d, esta call cuesta 0.
@@ -3766,7 +3773,8 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
     if (cached) {
       if (Array.isArray(cached.emails)) return _attach(cached.emails.slice(), cached.contact_name);
       if (Array.isArray(cached.people)) {
-        const goods = cached.people.filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status));
+        const goods = cached.people.filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status))
+          .sort((a, b) => (_APOLLO_STATUS_RANK[b.email_status] || 0) - (_APOLLO_STATUS_RANK[a.email_status] || 0));  // verified > likely > guessed
         if (goods.length) {
           const first = goods[0];
           const name  = `${first.first_name || ""} ${first.last_name || ""}`.trim();
@@ -3796,11 +3804,12 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
     if (res.ok) {
       const data   = await res.json();
       const people = Array.isArray(data?.people) ? data.people : [];
-      for (const p of people) {
-        if (p.email && APOLLO_GOOD_STATUSES.has(p.email_status)) {
-          emails.push(p.email);
-          if (!firstContactName) firstContactName = `${p.first_name || ""} ${p.last_name || ""}`.trim();
-        }
+      // Maxi 2026-07-16: ordenar verified > likely > guessed → el primero (preferido) es el más confiable.
+      const goods = people.filter(p => p.email && APOLLO_GOOD_STATUSES.has(p.email_status))
+        .sort((a, b) => (_APOLLO_STATUS_RANK[b.email_status] || 0) - (_APOLLO_STATUS_RANK[a.email_status] || 0));
+      for (const p of goods) {
+        emails.push(p.email);
+        if (!firstContactName) firstContactName = `${p.first_name || ""} ${p.last_name || ""}`.trim();
       }
     }
   } catch {}
@@ -5264,7 +5273,7 @@ async function runProspectSimilarExpansion(token) {
       const known = await _findKnownDomainsWorker(token, cands);
       const fresh = cands.filter(d => !known.has(d) && !sessionKnown.has(d));
       fresh.forEach(d => sessionKnown.add(d));
-      if (fresh.length) injected += await _injectIntoCsvQueue(token, fresh, "auto_feeder_majestic");
+      if (fresh.length) injected += await _injectIntoCsvQueue(token, fresh, "auto_feeder_similar");
     } catch (e) { log(`  ⚠️ similar-exp ${s.domain}: ${e.message}`); }
     try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
   }
@@ -6197,16 +6206,19 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   switch (item.source) {
     // Alias del feeder automático → source de Prospects
     case "auto_feeder_sellers":  source = "sellers_json"; break;
-    case "auto_feeder_majestic": source = "autopilot";    break;
+    case "auto_feeder_majestic": source = "majestic";     break;  // Maxi 2026-07-16: era "autopilot" (lumped) → label propio para MEDIR por feeder
     case "auto_feeder_monday":   source = "monday_refresh"; break;
-    case "auto_feeder_adstxt":   source = "autopilot";    break;  // Maxi 2026-07-01: faltaba → caía a "csv" (mal). ads.txt-graph = descubrimiento automático.
-    // Maxi 2026-06-22 FIX: los imports MANUALES ya vienen con el source correcto
-    // (sellers_json / monday_refresh / csv / autogoogle / autopilot) → PRESERVARLO.
+    case "auto_feeder_adstxt":   source = "adstxt";       break;  // Maxi 2026-07-16: era "autopilot" (lumped) → label propio
+    case "auto_feeder_similar":  source = "similar";      break;  // Maxi 2026-07-16: expansión por similares desde Prospects
+    // Maxi 2026-06-22 FIX: los imports MANUALES ya vienen con el source correcto → PRESERVARLO.
     // Antes caían en default="csv" → el filtro de FUENTE en Prospects no respetaba nada.
     case "sellers_json":
     case "monday_refresh":
     case "csv":
     case "autogoogle":
+    case "majestic":
+    case "adstxt":
+    case "similar":
     case "autopilot":           source = item.source; break;
     // Maxi 2026-07-01: default HONESTO por ORIGEN. El worker NO importa CSV — sus fuentes son
     // discovery automático. "csv"/"manual" solo son válidos si uploaded_by es un MB humano
@@ -12133,6 +12145,57 @@ async function maybeRunProspectTrashSynthesis(token) {
   } catch (e) { log(`⚠️ maybeRunProspectTrashSynthesis: ${e.message}`); }
 }
 
+// Maxi 2026-07-16: KEYWORDS FRESCAS por Claude para AutoGoogle. El pool de cascade (3490) es estático;
+// esto suma frases nuevas/geo generadas por Haiku (barato) 1×/semana → AutoGoogle no se encasilla y
+// descubre publishers que las frases fijas no traen. Gated por autogoogle_fresh_keywords_enabled='true'.
+// Se guardan en config autogoogle_fresh_keywords (JSON, cap 300) y el slot las suma al pool.
+async function generateFreshKeywords(token) {
+  const cfg = await getConfig(token);
+  let wd = {}; try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
+  const geos = (wd.geos_priority || []).join(", ") || "LatAm, Europa (no-Anglo), Turquía, Grecia, Indonesia, Brasil";
+  const userMsg = `Sos un media buyer que busca en Google PUBLISHERS de contenido (diarios, revistas, blogs, portales de noticias/deportes/farándula/tecnología/estilo de vida) para comprarles publicidad. Generá 40 FRASES de búsqueda de Google (como las tipearía un humano real) que hagan APARECER esos publishers en los resultados orgánicos, apuntando a estos países/idiomas: ${geos}.
+- Variá temas: noticias, deportes, farándula/celebridades, tecnología, salud, recetas, finanzas, autos, viajes, entretenimiento, clima, loterías, horóscopo, música, cine.
+- Escribí cada frase EN EL IDIOMA del país (es/pt/it/fr/de/tr/el/id...), NO en inglés (salvo país anglo).
+- NADA de marcas ni sitios puntuales. NADA de e-commerce/tiendas/bancos/gobierno/apps.
+- Frases cortas y naturales (2 a 5 palabras), como una búsqueda real.
+Devolveme SOLO JSON: { "keywords": ["frase 1", "frase 2", ...] }`;
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "anthropic", path: "/v1/messages", method: "POST",
+        body: { model: "claude-haiku-4-5", max_tokens: 1200, system: "Generás frases de búsqueda de Google para encontrar publishers de contenido. Devolvés SOLO JSON válido.", messages: [{ role: "user", content: userMsg }] },
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    const m = (data?.content?.[0]?.text || "").match(/\{[\s\S]*\}/);
+    if (!m) return 0;
+    const parsed = JSON.parse(m[0]);
+    const kws = Array.isArray(parsed.keywords) ? parsed.keywords.filter(k => typeof k === "string" && k.trim().length >= 3 && k.trim().length <= 60).map(k => k.trim()) : [];
+    if (!kws.length) return 0;
+    let existing = []; try { existing = JSON.parse(cfg.autogoogle_fresh_keywords || "[]"); } catch {}
+    const merged = [...new Set([...kws, ...existing])].slice(0, 300);
+    await setConfigValue(token, "autogoogle_fresh_keywords", JSON.stringify(merged)).catch(() => {});
+    log(`🧠 AutoGoogle fresh keywords: +${kws.length} generadas por Claude (pool fresco=${merged.length})`);
+    return kws.length;
+  } catch (e) { log(`⚠️ generateFreshKeywords: ${e.message}`); return 0; }
+}
+
+async function maybeGenerateFreshKeywords(token) {
+  try {
+    const cfg = await getConfig(token);
+    if (String(cfg.autogoogle_fresh_keywords_enabled || "") !== "true") return;
+    const todayMadrid = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/Madrid" });
+    const last = cfg.autogoogle_fresh_keywords_date || "";
+    if (last) { const days = (Date.parse(todayMadrid) - Date.parse(last)) / 86400000; if (days < 7) return; }  // 1×/semana
+    await generateFreshKeywords(token);
+    await setConfigValue(token, "autogoogle_fresh_keywords_date", todayMadrid).catch(() => {});
+  } catch (e) { log(`⚠️ maybeGenerateFreshKeywords: ${e.message}`); }
+}
+
 // Lee las reglas destiladas del MB y las formatea como bloque para el prompt.
 // Cache 10min en memoria para no pegarle a config en cada generación.
 const _pitchRulesCache = new Map();
@@ -13080,6 +13143,8 @@ async function main() {
         await maybeRunPitchRulesSynthesis(token).catch(e => log(`⚠️ pitch rules synth: ${e.message}`));
         // Síntesis de reglas de basura desde los rechazos (botón rojo enseña al filtro)
         await maybeRunProspectTrashSynthesis(token).catch(e => log(`⚠️ prospect trash synth: ${e.message}`));
+        // Maxi 2026-07-16: keywords frescas por Claude para AutoGoogle (1×/semana, gated).
+        await maybeGenerateFreshKeywords(token).catch(e => log(`⚠️ fresh keywords: ${e.message}`));
         // Maxi 2026-07-01: análisis 3×/semana (L/X/V) — marca prospects sospechosos de rechazo (⚠️)
         await runSuspectRejectAnalysis(token).catch(e => log(`⚠️ suspect analysis: ${e.message}`));
         // Maxi 2026-07-13: barrido on-demand del pool (purga no-publishers viejos por blocklist +
