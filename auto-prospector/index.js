@@ -1769,29 +1769,62 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
 // siguen pasando (SimilarWeb decide después si son USA-heavy).
 const DEPRIO_TLD_RE = /\.(us|uk|co\.uk|ca|au|com\.au|nz|co\.nz|ie)$/i;
 
+// Maxi 2026-07-16: código de país → sufijos de TLD, para SESGAR Majestic hacia los GEOs objetivo
+// (worker_discovery_config.geos_priority) en vez de random global (que trae mucho USA/marca).
+const _CC_TO_TLD = {
+  mx:[".mx"], ar:[".ar"], br:[".br"], cl:[".cl"], co:[".co"], pe:[".pe"], uy:[".uy"], ve:[".ve"], ec:[".ec"], bo:[".bo"], py:[".py"], cr:[".cr"], gt:[".gt"], do:[".do"], pa:[".pa"], hn:[".hn"], sv:[".sv"], ni:[".ni"],
+  es:[".es"], it:[".it"], fr:[".fr"], de:[".de"], nl:[".nl"], pt:[".pt"], pl:[".pl"], tr:[".tr"], gr:[".gr"], se:[".se"], be:[".be"], ch:[".ch"], at:[".at"], ro:[".ro"], cz:[".cz"], hu:[".hu"], dk:[".dk"], fi:[".fi"], no:[".no"], sk:[".sk"], bg:[".bg"], hr:[".hr"], rs:[".rs"], si:[".si"],
+  id:[".id"], my:[".my"], th:[".th"], vn:[".vn"], ph:[".ph"], jp:[".jp"], kr:[".kr"], in:[".in"], sg:[".sg"], hk:[".hk"], tw:[".tw"],
+  za:[".za"], eg:[".eg"], dz:[".dz"], ma:[".ma"], ng:[".ng"], ke:[".ke"], tn:[".tn"],
+};
+// Pre-filtro por NOMBRE de dominio: descartar no-publishers OBVIOS ANTES de gastar RapidAPI.
+// CONSERVADOR (regla de oro: no matar un publisher real) → solo señales muy fuertes: TLDs gov/edu/mil,
+// y tokens de comercio/casino/adulto como SEGMENTO del dominio (no substring suelto — "bankrate" no matchea).
+const _MAJESTIC_NAME_SKIP_RE = /(\.gov(\.|$)|\.gob(\.|$)|\.gouv\.|\.edu(\.|$)|\.ac\.|\.mil(\.|$)|\.gov\.)|(^|[.\-])(shop|store|tienda|loja|negozio|boutique|webshop|onlineshop|casino|apuestas|betting|sportsbook|onlyfans|escort)([.\-]|$)/i;
+
 async function _feederPullMajestic(token, targetCount, sessionKnown) {
   try {
     const pool = await loadDomainPool();
     if (!pool || pool.length === 0) return 0;
-    // Sampleamos más para compensar el descarte por TLD deprio (~20% rate típico).
-    const sampleSize = Math.min(pool.length, targetCount * 8);
-    const sample = [];
-    const seen = new Set();
-    while (sample.length < sampleSize && seen.size < pool.length) {
-      const idx = Math.floor(Math.random() * pool.length);
-      const d = pool[idx];
-      if (!seen.has(d)) { seen.add(d); sample.push(d); }
+    // Maxi 2026-07-16: CURSOR SECUENCIAL (antes random). Recorre el 1M EN ORDEN (garantiza dominios
+    // nuevos sin re-rolear + menos gasto de dedup), persiste el índice (majestic_cursor) y da la vuelta
+    // al llegar al final. + SESGO GEO/TLD hacia geos_priority + PRE-FILTRO por nombre (gov/edu/shop/casino)
+    // ANTES de gastar RapidAPI.
+    const cfg = await getConfig(token);
+    let cursor = parseInt(cfg.majestic_cursor || "0", 10) || 0;
+    if (cursor < 0 || cursor >= pool.length) cursor = 0;
+    // TLDs preferidos según geos_priority del worker_discovery_config (vacío = sin sesgo → puro secuencial).
+    let wd = {}; try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
+    const preferTlds = (wd.geos_priority || []).flatMap(cc => _CC_TO_TLD[String(cc).toLowerCase()] || []);
+    // Ventana secuencial ~12× el target para compensar los filtros de abajo.
+    const WINDOW = Math.min(pool.length, Math.max(targetCount * 12, 300));
+    const win = [];
+    for (let i = 0; i < WINDOW; i++) win.push(pool[(cursor + i) % pool.length]);
+    cursor = (cursor + WINDOW) % pool.length;
+    // Filtros BARATOS (sin red): TLD deprio Anglo + nombre obvio no-publisher + corporate/brand.
+    let cands = win.filter(d =>
+      d && !DEPRIO_TLD_RE.test(d) && !_MAJESTIC_NAME_SKIP_RE.test(d) &&
+      !isCorporatePattern(d) && !BRAND_BLOCKLIST.has(d)
+    );
+    // SESGO GEO: poner los dominios de los TLDs objetivo ADELANTE (no exclusivo: si no alcanzan, se
+    // completa con el resto de la ventana → nunca frena el feeder por falta de match GEO).
+    if (preferTlds.length) {
+      const pref = cands.filter(d => preferTlds.some(t => d.endsWith(t)));
+      const rest = cands.filter(d => !preferTlds.some(t => d.endsWith(t)));
+      cands = [...pref, ...rest];
     }
-    // Pre-filtrar TLD deprio ANTES de gastar quota RapidAPI (audit #1).
-    const beforeTld = sample.length;
-    const tldFiltered = sample.filter(d => !DEPRIO_TLD_RE.test(d));
-    const known = await _findKnownDomainsWorker(token, tldFiltered);
-    const fresh = tldFiltered.filter(d => !known.has(d) && !sessionKnown.has(d));
-    if (fresh.length === 0) return 0;
-    const slice = fresh.slice(0, targetCount);
-    slice.forEach(d => sessionKnown.add(d));
-    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_majestic");
-    log(`  🌱 majestic: sample=${beforeTld}, post-TLD=${tldFiltered.length}, frescos=${fresh.length} → insertados=${inserted}`);
+    // Dedup vs lo ya visto (cola + Prospects) + sesión — sobre el frente de candidatos.
+    const checkSet = cands.slice(0, Math.max(targetCount * 6, 120));
+    const known = await _findKnownDomainsWorker(token, checkSet);
+    const fresh = checkSet.filter(d => !known.has(d) && !sessionKnown.has(d));
+    let inserted = 0;
+    if (fresh.length > 0) {
+      const slice = fresh.slice(0, targetCount);
+      slice.forEach(d => sessionKnown.add(d));
+      inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_majestic");
+    }
+    await setConfigValue(token, "majestic_cursor", String(cursor)).catch(() => {});
+    log(`  🌱 majestic[cursor]: ventana=${WINDOW} post-filtros=${cands.length} frescos=${fresh.length} pref=${preferTlds.length ? preferTlds.join("/") : "—"} → insertados=${inserted} (cursor→${cursor}/${pool.length})`);
     return inserted;
   } catch (e) {
     log(`  ⚠️ majestic feeder error: ${e.message}`);
