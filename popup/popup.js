@@ -615,9 +615,12 @@ async function loadAdminGlobalCaps() {
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
     const [cfgRes, pendingRes, waitingRes, nextDayRes, bandLiveRes] = await Promise.all([
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(csv_queue_daily_cap,autopilot_daily_cap_global,csv_daily_count,csv_daily_count_date,autopilot_daily_count,autopilot_daily_count_date,review_queue_band_status)&select=key,value`, { headers }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      // Maxi 2026-07-16: filtrar por source=csv → el contador "CSV" solo cuenta CARGAS MANUALES del MB.
+      // Antes contaba TODO el csv_queue (autogoogle/auto_feeder/monday inyectan ahí) → mostraba URLs
+      // aunque nadie subió un CSV (los next_day de autogoogle/feeders inflaban el número).
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending&source=eq.csv&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&source=eq.csv&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&source=eq.csv&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
       // Band count LIVE — query directo a review_queue en vez de leer el cache de config
       // (que puede estar stale si worker no corrió hace rato)
       fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&select=id`, { headers: { ...headers, "Prefer": "count=exact", "Range": "0-0" } }),
