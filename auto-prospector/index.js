@@ -5219,6 +5219,59 @@ async function polishPool(token) {
   log(`✨ polish: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_committedTs}`);
 }
 
+// Maxi 2026-07-16: EXPANSIÓN POR SIMILARES desde los Prospects. El user pidió "que busque similares de
+// los que están en Prospects" como otra fuente de descubrimiento (además de likes+validados que ya seedea
+// el autopilot). Toma los Prospects pending de MÁS tráfico (≥500K = publishers grandes ya calificados →
+// sus similares suelen ser también buenos), trae sus similar-sites (SimilarWeb, con cache 90d = muchos sin
+// costo), dedup + pre-filtro por nombre, e inyecta los frescos a la cola → pasan la MISMA calificación
+// (350K pageviews + detector publisher). Gated por similar_expansion_enabled='true'. Cursor por created_at.
+// RapidAPI-gated (no gasta si estamos cerca del cap mensual) + cooldown + lote chico (control de costo).
+let _lastSimilarExpAt = 0;
+const SIMILAR_EXP_COOLDOWN_MS = 5 * 60 * 1000;
+const SIMILAR_EXP_BATCH = 6;
+async function runProspectSimilarExpansion(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.similar_expansion_enabled || "") !== "true") return;
+  if (Date.now() - _lastSimilarExpAt < SIMILAR_EXP_COOLDOWN_MS) return;
+  _lastSimilarExpAt = Date.now();
+  const rapidapi_key = cfg.rapidapi_key;
+  if (!rapidapi_key) return;
+  // Gate RapidAPI: SimilarWeb cuesta hits → no expandir si estamos cerca del cap mensual.
+  try {
+    const { usedThisMonth, limit } = await getRapidApiUsageThisMonth(token);
+    if (usedThisMonth >= limit * FEEDER_RAPIDAPI_THRESHOLD) { log(`🛑 similar-exp SKIP: RapidAPI ${usedThisMonth}/${limit} (≥${FEEDER_RAPIDAPI_THRESHOLD * 100}%)`); return; }
+  } catch {}
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const cursor = cfg.similar_expansion_cursor || "";
+  const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
+  let seeds = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.500000${cursorClause}&select=domain,created_at&order=created_at.asc&limit=${SIMILAR_EXP_BATCH}`, { headers: auth });
+    if (r.ok) seeds = await r.json();
+  } catch {}
+  if (!Array.isArray(seeds) || seeds.length === 0) {
+    await setConfigValue(token, "similar_expansion_cursor", "").catch(() => {});  // fin → reset (los Prospects cambian)
+    return;
+  }
+  const _lastTs = seeds[seeds.length - 1].created_at;
+  const sessionKnown = new Set();
+  let injected = 0;
+  for (const s of seeds) {
+    try {
+      const sims = await findSimilarSites(s.domain, rapidapi_key).catch(() => []);
+      if (!Array.isArray(sims) || sims.length === 0) continue;
+      const cands = sims.filter(d => d && !DEPRIO_TLD_RE.test(d) && !_MAJESTIC_NAME_SKIP_RE.test(d) && !isCorporatePattern(d) && !BRAND_BLOCKLIST.has(d));
+      const known = await _findKnownDomainsWorker(token, cands);
+      const fresh = cands.filter(d => !known.has(d) && !sessionKnown.has(d));
+      fresh.forEach(d => sessionKnown.add(d));
+      if (fresh.length) injected += await _injectIntoCsvQueue(token, fresh, "auto_feeder_majestic");
+    } catch (e) { log(`  ⚠️ similar-exp ${s.domain}: ${e.message}`); }
+    try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
+  }
+  await setConfigValue(token, "similar_expansion_cursor", _lastTs).catch(() => {});
+  log(`🔗 similar-exp: semillas=${seeds.length} → ${injected} similares frescos inyectados (cursor→${_lastTs})`);
+}
+
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
 async function classifyPublisher(token, domain, pageContent, swCategory) {
   // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
@@ -13036,6 +13089,8 @@ async function main() {
         // (scrape+social+informer+Apollo) para los que quedan sin email. Reemplaza purge+reenrich.
         // Gated por config polish_pool='true'; se auto-apaga al terminar. NO usa RapidAPI.
         await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
+        // Maxi 2026-07-16: expansión por similares desde los Prospects grandes (gated similar_expansion_enabled).
+        await runProspectSimilarExpansion(token).catch(e => log(`⚠️ similar-exp: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
