@@ -4597,6 +4597,11 @@ async function fetchPageContent(domain) {
     const svcPlatKw  = [/\b(web hosting|shared hosting|reseller hosting|dedicated server|cpanel|alojamiento web|hospedagem|payment gateway|pasarela de pago|merchant account|no-logs vpn|vpn service)\b/i, /(register (your |a )?domain|registra tu dominio|ssl certificate|certificado ssl|accept payments online|acept[aá] pagos|hide your ip|unblock (streaming|websites)|servers in \d+ countries)/i];
     const datingKw   = [/\b(dating (site|app|service)|online dating|citas online|encuentra pareja)\b/i, /(find (your )?match|singles (near you|in your area)|create (your )?(free )?profile|crea tu perfil gratis)/i];
     const personalKw = [/(my portfolio|mi portafolio|meu portf[óo]lio|hire me|contrat[aá]me|available for (hire|freelance)|freelance (designer|developer|writer|photographer|consultant))/i, /(my (resume|cv|work)|view my work|book a (session|shoot)|get in touch to work together)/i];
+    // Maxi 2026-07-16 (ejemplos del user): cripto compra/venta/exchange (blockchaincenter.net) y
+    // dev-tool/librería/docs (vueuse.org) NO son publishers. Gateados por !hasDisplayAds abajo (un
+    // medio de cripto/tech CON ads pasa; solo el sitio que ES el exchange/la herramienta sin ads se caza).
+    const cryptoKw   = [/\b(buy|sell|trade|comprar|vender|compr[aá]|vend[eé]) (bitcoin|btc|ethereum|eth|crypto|cripto|criptomonedas?|usdt|tokens?)\b/i, /\b(crypto|cripto) ?(exchange|wallet|trading|broker)\b|casa de cambio (de )?cripto|spot trading|futures trading|derivatives exchange|(deposit|withdraw|retir[aá]|deposit[aá]) (crypto|usdt|fondos)|conect[aá] tu wallet|connect wallet/i];
+    const devToolKw  = [/\b(npm install|yarn add|pnpm add|pip install|composer require|go get |cargo add)\b/i, /\b(api reference|getting started|read the docs|open[- ]?source (library|framework|tool)|github stars?|available on (npm|pypi|packagist|crates)|sdk for developers|contribute on github)\b/i];
 
     let nonPublisherType = null;
     // Maxi 2026-07-15: isStore ya NO es "aunque tenga ads" — si el sitio corre ad-tech de PUBLISHER
@@ -4641,6 +4646,8 @@ async function fetchPageContent(domain) {
       else if (_hits(corpKw) >= 2) nonPublisherType = "corporate";
       else if (_hits(svcPlatKw) >= 2) nonPublisherType = "service";
       else if (_hits(datingKw) >= 2) nonPublisherType = "service";
+      else if (_hits(cryptoKw) >= 2) nonPublisherType = "crypto";
+      else if (_hits(devToolKw) >= 2) nonPublisherType = "devtool";
       else if (_hits(personalKw) >= 1) nonPublisherType = "personal";
     }
 
@@ -4659,7 +4666,11 @@ async function fetchPageContent(domain) {
     // ENOTFOUND/EAI_AGAIN = el dominio no existe/no resuelve → dead:true para skipear downstream.
     // Timeout/403/reset = puede estar VIVO pero bloqueando → null (no lo matamos).
     const code = String(e?.cause?.code || e?.code || e?.message || "");
-    if (/ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo/i.test(code)) return { dead: true };
+    // Maxi 2026-07-16: DOMINIO MUERTO/INSERVIBLE = DNS no resuelve, conexión rechazada, o error DURO de
+    // TLS/SSL/certificado. El user pasó ejemplos: zd.blog.jp (privacy error), gamepress.gg (can't be
+    // reached), eiga.com (ERR_SSL_VERSION_OR_CIPHER_MISMATCH). Esos NO se pueden servir → dead:true → se
+    // descartan downstream. Timeout/reset/403 se dejan en null (puede estar VIVO bloqueando un bot → no lo matamos).
+    if (/ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo|ECONNREFUSED|CERT|SSL|TLS|EPROTO|SELF_SIGNED|UNABLE_TO_VERIFY|HANDSHAKE|WRONG_VERSION|ALTNAME|unsupported protocol/i.test(code)) return { dead: true, deadReason: code.slice(0, 60) };
     return null;
   }
 }
@@ -4892,7 +4903,8 @@ async function sweepBlockedFromProspects(token) {
   for (let i = 0; i < remaining.length; i += CONC) {
     await Promise.all(remaining.slice(i, i + CONC).map(async (row) => {
       const pc = await fetchPageContent(row.domain).catch(() => null);
-      if (pc?.nonPublisherType) toDelete.push({ id: row.id, domain: row.domain, reason: `nonpub_${pc.nonPublisherType}` });
+      if (pc?.dead) toDelete.push({ id: row.id, domain: row.domain, reason: `unreachable` });  // Maxi 2026-07-16: muerto/SSL/cert
+      else if (pc?.nonPublisherType) toDelete.push({ id: row.id, domain: row.domain, reason: `nonpub_${pc.nonPublisherType}` });
     }));
   }
   // NO hard-DELETE: pasamos a status='rejected' + motivo 'purge:...'. Desaparecen de Prospects
@@ -4974,6 +4986,7 @@ async function polishPool(token) {
         if (bl) { await _softRejectLead(auth, lead.id, `blocklist:${bl}`); blocked++; return; }
         // 2) clasificar por HTML — UN fetch (detector estructural con veto publisher-ads)
         const pc = await fetchPageContent(domain).catch(() => null);
+        if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
         if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
         // 3) keeper: si ya tiene email bueno, listo
         const curEmails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
@@ -5030,6 +5043,10 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
   // caído un momento). El guard de "no_emails_and_site_unreachable" downstream
   // maneja los dominios realmente muertos. Evita falsos rechazos.
+  // Maxi 2026-07-16: sitio MUERTO/inservible (DNS no resuelve, conexión rechazada, TLS/SSL/cert roto) →
+  // NO pasa (antes con !pageContent devolvía ok:true = "beneficio de la duda" y estos se colaban a Prospects:
+  // zd.blog.jp, gamepress.gg, eiga.com). fetchPageContent marca dead:true solo en fallas DURAS (no timeouts).
+  if (pageContent?.dead) return { ok: false, reason: `unreachable:${pageContent.deadReason || "dead"}` };
   if (!pageContent) return { ok: true, reason: "no_pagecontent" };
   // Maxi 2026-07-08: TIPO DE SITIO no-publisher estructural (tienda/banco/universidad/viajes/
   // ONG/servicios) → NO es target. Rechazo TEMPRANO, ANTES de la señal positiva de ads, porque
