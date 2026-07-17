@@ -9585,9 +9585,10 @@ async function rescueFailedMondayPushes(token) {
   try {
     const cfg = await getConfig(token);
     if (String(cfg.monday_rescue_enabled || "") !== "true") return;  // flag: prender cuando se quiera correr
-    const mondayKey = await _getMondayApiKeyForFeeder(token);
-    if (!mondayKey) return;
-
+    // La key se resuelve POR MB con getMondayKeyForUser (igual que el agente): per-user →
+    // monday_api_key. Maxi 2026-07-17 BUG FIX: acá se usaba _getMondayApiKeyForFeeder, que
+    // SOLO mira monday_api_key_default / monday_api_key_<mail> y NO cae a monday_api_key →
+    // devolvía null y el rescate hacía return EN SILENCIO. Los 18 leads no se movieron nunca.
     const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.monday_failed&created_at=gte.${since}&select=id,domain,user_email,details,created_at&order=created_at.asc&limit=100`,
@@ -9597,10 +9598,13 @@ async function rescueFailedMondayPushes(token) {
     const rows = await r.json();
     if (!Array.isArray(rows) || !rows.length) return;
 
-    let ok = 0, skip = 0, fail = 0;
+    log(`🛟 rescate Monday: ${rows.length} monday_failed a revisar...`);
+    let ok = 0, skip = 0, fail = 0, noKey = 0, noPayload = 0;
     for (const row of rows) {
       const p = row.details?.retry_payload;
-      if (!p?.domain || !p?.email) { skip++; continue; }
+      if (!p?.domain || !p?.email) { noPayload++; skip++; continue; }
+      const mondayKey = getMondayKeyForUser(cfg, p.sender_user || row.user_email);
+      if (!mondayKey) { noKey++; skip++; continue; }
 
       // ── CLAIM ATÓMICO (compare-and-swap) ─────────────────────────────────────────
       // Esto ESCRIBE EN UN CRM REAL de 9.457 items: duplicar es peor que no rescatar.
@@ -9669,7 +9673,9 @@ async function rescueFailedMondayPushes(token) {
         log(`  ⚠️ rescate Monday ${row.domain}: ${e.message}`);
       }
     }
-    if (ok || fail) log(`🛟 rescate Monday: ${ok} leads recuperados al CRM · ${skip} salteados · ${fail} fallaron`);
+    // Log SIEMPRE (no solo si hubo trabajo): un rescate que "no hace nada" tiene que decir
+    // POR QUÉ. La versión anterior salía en silencio y parecía que el flag no estaba puesto.
+    log(`🛟 rescate Monday: ${ok} recuperados · ${fail} fallaron · ${skip} salteados (${noPayload} sin retry_payload, ${noKey} sin API key de Monday)`);
   } catch (e) { log(`⚠️ rescueFailedMondayPushes: ${e.message}`); }
 }
 
