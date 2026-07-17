@@ -9575,16 +9575,22 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
 // existió ese mecanismo: 15 leads quedaron colgados el 16/07 por el bug de countryShortName.
 // Esto los re-pushea solo. Es idempotente por dos vías: se saltea si el dominio YA está en
 // Monday (findMondayItem) y loguea monday_recovered para no reintentar el mismo nunca más.
-const MONDAY_RESCUE_COOLDOWN_MS = 10 * 60_000;
+// Maxi 2026-07-17: el cooldown DEBE ser menor al intervalo de llamada (loop: cada 15 iters ×
+// POLL_INTERVAL_MS 30s = 7,5 min). Estaba en 10 min → toda llamada caía dentro del cooldown y
+// una de cada dos se descartaba: corría cada ~22 min en vez de cada 7,5.
+const MONDAY_RESCUE_COOLDOWN_MS = 5 * 60_000;
 let _lastMondayRescueAt = 0;
 
 async function rescueFailedMondayPushes(token) {
   if (Date.now() - _lastMondayRescueAt < MONDAY_RESCUE_COOLDOWN_MS) return;
-  _lastMondayRescueAt = Date.now();
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   try {
     const cfg = await getConfig(token);
+    // El flag se chequea ANTES de marcar el cooldown. Maxi 2026-07-17 BUG FIX: al revés, una
+    // corrida que salía por el flag apagado igual consumía el cooldown → cuando el user lo
+    // prendía, la siguiente llamada quedaba bloqueada 10 min más. Los 18 leads no se movieron.
     if (String(cfg.monday_rescue_enabled || "") !== "true") return;  // flag: prender cuando se quiera correr
+    _lastMondayRescueAt = Date.now();   // solo las corridas REALES gastan cooldown
     // La key se resuelve POR MB con getMondayKeyForUser (igual que el agente): per-user →
     // monday_api_key. Maxi 2026-07-17 BUG FIX: acá se usaba _getMondayApiKeyForFeeder, que
     // SOLO mira monday_api_key_default / monday_api_key_<mail> y NO cae a monday_api_key →
@@ -13580,12 +13586,13 @@ async function main() {
     }
 
     // Rescate de leads que recibieron el mail pero cuyo push a Monday falló (quedan
-    // invisibles en el CRM). Flag monday_rescue_enabled + cooldown propio de 10 min.
-    // Maxi 2026-07-17: FUERA del bloque `% 60` — cada deploy reinicia iterCount, así que
-    // con pushes seguidos nunca llegaba a 60 iters y el rescate no corría nunca.
-    if (iterCount % 15 === 0) {
-      rescueFailedMondayPushes(token).catch(e => log(`⚠️ rescate monday: ${e.message}`));
-    }
+    // invisibles en el CRM). Se llama en CADA iteración: el flag + el cooldown propio de
+    // 5 min ya lo pacean, y si el flag está apagado sale en microsegundos.
+    // Maxi 2026-07-17: antes dependía de `iterCount % 60` y después de `% 15`. Con
+    // POLL_INTERVAL=30s eso son 7,5-30 min de espera, y CADA DEPLOY resetea iterCount →
+    // en una tarde de pushes seguidos no corrió NUNCA. Un job de recuperación no puede
+    // depender de que el worker sobreviva N iteraciones sin deploys.
+    rescueFailedMondayPushes(token).catch(e => log(`⚠️ rescate monday: ${e.message}`));
 
     // ── Unfreezer cada 60 iters (~25min) ──
     // Mueve toolbar_frozen_leads.frozen_until ≤ now() de vuelta a csv_queue.pending
