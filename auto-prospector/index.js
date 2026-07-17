@@ -190,6 +190,24 @@ const COUNTRY_NAME_TO_CODE = Object.fromEntries(
   Object.entries(COUNTRY_CODES).map(([code, name]) => [name, code])
 );
 
+// ISO2 para la columna `phone` de Monday, que lo EXIGE válido (no acepta ""). El geo del lead
+// puede venir como nombre ("United States", y de SimilarWeb a veces en MAYÚSCULAS) o ya como
+// ISO. Devuelve "" si no se puede resolver → el caller omite la columna en vez de romper el
+// item entero. Maxi 2026-07-17 (ver createMondayItem).
+const _COUNTRY_NAME_TO_CODE_LC = Object.fromEntries(
+  Object.entries(COUNTRY_CODES).map(([code, name]) => [String(name).toLowerCase(), code])
+);
+function _mondayPhoneIso(geo) {
+  const g = String(geo || "").trim();
+  if (!g) return "";
+  const up = g.toUpperCase();
+  // 2 letras NO significa ISO válido: "UK" circula como geo en este archivo (ver _isWorkerDeprioGeo
+  // y el slice(0,2) de _isGeoOverrepresentedInPool) y NO es ISO2 — el código real es GB. Mandarlo
+  // tal cual reventaría el item igual que countryShortName:"" → validar contra COUNTRY_CODES.
+  if (/^[A-Z]{2}$/.test(up)) return COUNTRY_CODES[up] ? up : "";
+  return _COUNTRY_NAME_TO_CODE_LC[g.toLowerCase()] || "";
+}
+
 // ── Monday GEO label canonical (Spanish, no accents, first cap) ──
 // El campo texto6 "Top Geo" en Monday espera nombres en español SIN tildes.
 // Mapeo desde ISO code O nombre inglés → label Monday válido.
@@ -9502,6 +9520,111 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
 // 'reconciled' para no re-procesarla. Gate: agent_reconcile_monday_bounces=true. Batch
 // de 30/run; se auto-apaga (flag OFF) cuando no queda nada.
 // ════════════════════════════════════════════════════════════════
+// ── RESCATE DE LEADS PERDIDOS EN MONDAY (Maxi 2026-07-17) ───────────────────────────
+// Cuando el push a Monday falla, el mail YA SE MANDÓ (Gmail va antes) → el lead recibió el
+// pitch y no quedó en el CRM: invisible para el MB, sin FU1/FU2, imposible de seguir.
+// El worker guardaba `details.retry_payload` "para que admin re-pushee manual", pero nunca
+// existió ese mecanismo: 15 leads quedaron colgados el 16/07 por el bug de countryShortName.
+// Esto los re-pushea solo. Es idempotente por dos vías: se saltea si el dominio YA está en
+// Monday (findMondayItem) y loguea monday_recovered para no reintentar el mismo nunca más.
+const MONDAY_RESCUE_COOLDOWN_MS = 10 * 60_000;
+let _lastMondayRescueAt = 0;
+
+async function rescueFailedMondayPushes(token) {
+  if (Date.now() - _lastMondayRescueAt < MONDAY_RESCUE_COOLDOWN_MS) return;
+  _lastMondayRescueAt = Date.now();
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  try {
+    const cfg = await getConfig(token);
+    if (String(cfg.monday_rescue_enabled || "") !== "true") return;  // flag: prender cuando se quiera correr
+    const mondayKey = await _getMondayApiKeyForFeeder(token);
+    if (!mondayKey) return;
+
+    const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.monday_failed&created_at=gte.${since}&select=id,domain,user_email,details,created_at&order=created_at.asc&limit=100`,
+      { headers: auth }
+    );
+    if (!r.ok) return;
+    const rows = await r.json();
+    if (!Array.isArray(rows) || !rows.length) return;
+
+    let ok = 0, skip = 0, fail = 0;
+    for (const row of rows) {
+      const p = row.details?.retry_payload;
+      if (!p?.domain || !p?.email) { skip++; continue; }
+
+      // ── CLAIM ATÓMICO (compare-and-swap) ─────────────────────────────────────────
+      // Esto ESCRIBE EN UN CRM REAL de 9.457 items: duplicar es peor que no rescatar.
+      // El filtro `action=eq.monday_failed` hace el CAS: si otra instancia (o esta misma
+      // antes de un restart) ya lo tomó, la fila ya no está en ese estado → 0 rows → skip.
+      // Se reclama ANTES de pushear: si el worker muere entre el push y el log, el lead
+      // NO se re-pushea (queda reclamado). Marcador durable, no un Set en memoria.
+      let claimed = false;
+      try {
+        const cr = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${row.id}&action=eq.monday_failed`,
+          {
+            method: "PATCH",
+            headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=representation" },
+            body: JSON.stringify({ action: "monday_rescue_claimed" }),
+          }
+        );
+        if (cr.ok) {
+          // PostgREST devuelve 200 + [] si el CAS no matcheó (otro ya lo reclamó).
+          // Solo con EXACTAMENTE 1 fila modificada tenemos el derecho a pushear.
+          const patched = await cr.json().catch(() => []);
+          claimed = Array.isArray(patched) && patched.length === 1;
+        }
+      } catch { claimed = false; }
+      if (!claimed) { skip++; continue; }
+
+      try {
+        // Guarda secundaria: ¿ya está en el board? (lo pudo cargar el MB a mano).
+        // OJO: findMondayItem devuelve null tanto si NO existe como si Monday erroró
+        // (rate-limit/complexity) → no alcanza como única defensa. Por eso el claim de arriba.
+        const existing = await findMondayItem(p.domain, mondayKey).catch(() => null);
+        if (existing?.id) {
+          await logAgentAction(token, p.sender_user || row.user_email, {
+            domain: p.domain, action: "monday_recovered", reason: "already_in_board",
+            details: { monday_item_id: existing.id, original_action_id: row.id },
+          }).catch(() => {});
+          skip++;
+          continue;
+        }
+        const itemId = await pushToMondayServer(mondayKey, {
+          domain: p.domain, email: p.email, geo: p.geo,
+          traffic_text: formatTrafficForMonday(p.traffic),
+          phone: p.contact_phone || "",
+          idioma_idx: ({ en: 0, es: 1, it: 2, pt: 3, ar: 6 })[p.language] ?? 0,
+          // El MB original SÍ está en el payload (sender_user) → asignarlo, si no el lead
+          // rescatado cae sin dueño y sigue invisible para él (que es el problema a resolver).
+          monday_user_id: MONDAY_USER_IDS[String(p.sender_user || row.user_email || "").toLowerCase()] || null,
+          estado_idx: 3,          // Propuesta Vigente (T) — igual que el push normal
+        }, AGENT_DEFAULTS.monday_board_id);
+        if (!itemId) throw new Error("push devolvió item vacío");
+        await logAgentAction(token, p.sender_user || row.user_email, {
+          domain: p.domain, action: "monday_recovered", reason: "repushed_ok",
+          details: { monday_item_id: itemId, original_action_id: row.id, sent_at: p.sent_at },
+        }).catch(() => {});
+        ok++;
+      } catch (e) {
+        fail++;
+        // NO se revierte a monday_failed: si el push llegó a crear el item y falló al
+        // responder (timeout), reintentar duplicaría. Queda visible como rescue_failed
+        // para revisarlo a mano. Prioridad: nunca duplicar en el CRM.
+        fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${row.id}`, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ action: "monday_rescue_failed", reason: String(e.message).slice(0, 200) }),
+        }).catch(() => {});
+        log(`  ⚠️ rescate Monday ${row.domain}: ${e.message}`);
+      }
+    }
+    if (ok || fail) log(`🛟 rescate Monday: ${ok} leads recuperados al CRM · ${skip} salteados · ${fail} fallaron`);
+  } catch (e) { log(`⚠️ rescueFailedMondayPushes: ${e.message}`); }
+}
+
 async function reconcileMondayBounces(token) {
   try {
     const cfg = await getConfig(token);
@@ -11037,9 +11160,19 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_IDIOMA]:  { index: payload.idioma_idx || 0 },
     [MONDAY_COL_ESTADO]:  { label: "Propuesta Vigente (T)" },
     ...(payload.monday_user_id ? { [MONDAY_COL_OWNER]: { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] } } : {}),
-    ...(payload.phone ? { [MONDAY_COL_PHONE]: { phone: String(payload.phone), countryShortName: "" } } : {}),
+    // Maxi 2026-07-17 BUG FIX: se mandaba countryShortName:"" y la columna phone de Monday
+    // EXIGE un ISO2 válido → "invalid value ... for this column" y REVENTABA EL ITEM ENTERO.
+    // Como el mail se manda ANTES del push, el lead recibía el pitch y no quedaba en el CRM:
+    // 15 leads perdidos el 16/07 (justo cuando entró la captura de teléfono). Ahora derivamos
+    // el ISO del GEO; si no se puede, se OMITE la columna: mejor perder el teléfono que el lead.
+    ...(payload.phone && _mondayPhoneIso(payload.geo)
+      ? { [MONDAY_COL_PHONE]: { phone: String(payload.phone), countryShortName: _mondayPhoneIso(payload.geo) } }
+      : {}),
     // NO incluir Comentarios — el user no quiere el pitch ahí.
   };
+  if (payload.phone && !_mondayPhoneIso(payload.geo)) {
+    log(`  ℹ️ Monday ${payload.domain}: sin ISO para el GEO "${payload.geo || "?"}" → push SIN teléfono (el lead entra igual)`);
+  }
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
     create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: true) { id }
   }`;
@@ -11949,6 +12082,7 @@ async function runAgentCycle(token, allFlags) {
               retry_payload: {
                 domain, email, geo: leadGeo, traffic: leadTraffic,
                 language: lead.language, contact_name: lead.contact_name || "",
+                contact_phone: lead.contact_phone || "",   // Maxi 2026-07-17: faltaba → el rescate nunca podía restaurar el teléfono
                 pitch_subject: subject,
                 pitch_body: pitch.body?.substring(0, 5000) || "",
                 sent_at: new Date().toISOString(),
@@ -13344,6 +13478,9 @@ async function main() {
       // Reconciliación one-time de Monday para los 161 falsos-fallos del bug .ok
       // (flag agent_reconcile_monday_bounces; se auto-apaga al terminar).
       reconcileMondayBounces(token).catch(e => log(`⚠️ reconcile monday: ${e.message}`));
+      // Rescate de leads que recibieron el mail pero cuyo push a Monday falló (quedan
+      // invisibles en el CRM). Flag monday_rescue_enabled. Maxi 2026-07-17.
+      rescueFailedMondayPushes(token).catch(e => log(`⚠️ rescate monday: ${e.message}`));
     }
 
     // ── Unfreezer cada 60 iters (~25min) ──
