@@ -764,9 +764,10 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-// Apollo monthly cap (plan = 2,500; cap conservador 2,400 con margen 100).
+// Apollo monthly cap (plan = 2,500; margen 10% → corta en 2,250). Maxi 2026-07-17.
 // Si llegado, callers (Apollo en popup) deben skipear y caer a scraping.
-export const APOLLO_MONTHLY_HARD_CAP = 2400;
+// Debe coincidir con APOLLO_MONTHLY_HARD_CAP del worker (auto-prospector/index.js).
+export const APOLLO_MONTHLY_HARD_CAP = 2250;
 
 // Caps de la cola de procesamiento (csv_queue):
 // - pending: max 200 items esperando ser procesados por el worker (throttle del worker)
@@ -782,11 +783,19 @@ export async function getApolloMonthlyUsage(accessToken) {
   if (!accessToken) return { used: 0, limit: APOLLO_MONTHLY_HARD_CAP, remaining: APOLLO_MONTHLY_HARD_CAP };
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
-  // Billing cycle 6→6 (igual que RapidAPI). Calcula período actual.
+  // Billing cycle REAL de Apollo: 12→12 (renew Aug 12, 2026). Maxi 2026-07-17: antes usaba
+  // el ancla 6 de RapidAPI → nunca matcheaba el período que escribe el worker ("YYYY-MM-12")
+  // y esta función devolvía siempre used=0 (la extensión creía que Apollo estaba intacto).
+  // UTC obligatorio: el worker escribe el período en UTC. Con hora local, el día 12 entre
+  // 00:00 y 02:00 Madrid (= 11 en UTC) el cliente calculaba un ciclo distinto al del worker
+  // → volvía a fallar el match y a reportar used=0 (el mismo bug, movido de mes a huso).
   const now = new Date();
-  let year = now.getFullYear(), month = now.getMonth() + 1;
-  if (now.getDate() < 6) { month -= 1; if (month === 0) { month = 12; year -= 1; } }
-  const period = `${year}-${String(month).padStart(2, "0")}-06`;
+  const anchor = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCDate() < 12 ? now.getUTCMonth() - 1 : now.getUTCMonth(),
+    12
+  ));
+  const period = anchor.toISOString().slice(0, 10);
   try {
     const res = await fetch(
       `${url}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_calls_month_period,apollo_monthly_limit)&select=key,value`,

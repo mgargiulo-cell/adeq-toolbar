@@ -1421,14 +1421,118 @@ async function _countActiveCsvBySource(token, sourceTag) {
   } catch { return 0; }
 }
 
-async function _injectIntoCsvQueue(token, domains, sourceTag) {
+// ── PRE-LISTADO DE DESCUBRIMIENTO (Maxi 2026-07-17, pedido del user) ─────────────────
+// Estaciona dominios frescos que NO entraron al carril (cupo lleno) en vez de tirarlos.
+// Solo para fuentes que CUESTAN PLATA (autogoogle=Serper, similar=RapidAPI): recuperarlos
+// después es gratis, re-descubrirlos costaría créditos otra vez. Así priorizar hispano no
+// implica perder una web buena de otro país: queda acá y la levanta un slot no-hispano.
+const BACKLOG_MAX      = 5000;   // techo duro por tanda (no crecer sin límite)
+const BACKLOG_TTL_DAYS = 30;     // más viejo que esto ya no es "fresco" → se limpia
+
+async function _parkInBacklog(token, domains, sourceTag, phraseByDomain) {
+  const list = [...new Set((domains || []).filter(d => typeof d === "string" && d))];
+  if (!list.length) return 0;
+  try {
+    const payload = list.slice(0, BACKLOG_MAX).map(domain => ({
+      domain, source: sourceTag,
+      phrase: String(phraseByDomain?.get?.(domain) || "").slice(0, 300) || null,
+    }));
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_discovery_backlog?on_conflict=domain`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=minimal",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) { log(`  ⚠️ pre-listado: no pude estacionar (${res.status})`); return 0; }
+    log(`  📦 pre-listado: +${payload.length} ${sourceTag} estacionados (los levanta un slot no-hispano, gratis)`);
+    return payload.length;
+  } catch (e) { log(`  ⚠️ pre-listado: ${e.message}`); return 0; }
+}
+
+// Drena el pre-listado hacia el carril. GRATIS: el descubrimiento ya se pagó. Se llama en los
+// slots NO hispanos ANTES de gastar créditos nuevos → si el pre-listado llena el carril, el slot
+// no gasta ni una búsqueda de Serper. Devuelve cuántos se inyectaron.
+async function _drainBacklog(token, sourceTag, room) {
+  if (room <= 0) return 0;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  try {
+    // TTL: limpiar lo viejo (ya no es fresco; conviene re-descubrirlo).
+    const _cut = new Date(Date.now() - BACKLOG_TTL_DAYS * 86_400_000).toISOString();
+    fetch(`${SUPABASE_URL}/rest/v1/toolbar_discovery_backlog?found_at=lt.${_cut}`, { method: "DELETE", headers: auth }).catch(() => {});
+
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_discovery_backlog?source=eq.${encodeURIComponent(sourceTag)}&order=found_at.asc&limit=${Math.min(room * 3, 600)}&select=domain,phrase`,
+      { headers: auth }
+    );
+    if (!r.ok) return 0;
+    const rows = await r.json();
+    if (!Array.isArray(rows) || !rows.length) return 0;
+
+    // Re-dedup: pudo haber entrado por otra vía desde que se estacionó.
+    const cands = rows.map(x => x.domain).filter(Boolean);
+    const known = await _findKnownDomainsWorker(token, cands);
+    const usable = cands.filter(d => !known.has(d)).slice(0, room);
+
+    // returnDomains: necesito saber CUÁLES entraron, no cuántos. Si me guiara por el count y
+    // borrara todos los `usable`, un carril que se llenó entre el conteo y el insert haría que
+    // _injectIntoCsvQueue descarte el resto Y yo los borre del pre-listado = pérdida definitiva
+    // de dominios ya pagados. Con la lista real solo borro lo que de verdad entró.
+    let insertedDomains = [];
+    if (usable.length) insertedDomains = await _injectIntoCsvQueue(token, usable, sourceTag, { returnDomains: true });  // sin parkOverflow → no re-estacionar
+    const inserted = insertedDomains.length;
+
+    // Restaurar la ATRIBUCIÓN domain→keyword de los recuperados. Sin esto el yield no le
+    // acreditaría el `qualified` a la frase que realmente encontró el dominio (Maxi 2026-07-17).
+    if (inserted > 0 && sourceTag === "autogoogle") {
+      const _usableSet = new Set(insertedDomains);
+      const _attr = rows
+        .filter(x => x.phrase && _usableSet.has(x.domain))
+        .map(x => ({ domain: x.domain, phrase: String(x.phrase).slice(0, 300) }));
+      if (_attr.length) {
+        fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?on_conflict=domain`, {
+          method: "POST",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(_attr),
+        }).catch(() => {});
+      }
+    }
+
+    // Sacar del pre-listado: los ya conocidos SIEMPRE; los usables solo si de verdad entraron
+    // (si el carril se llenó mientras tanto, quedan estacionados para el próximo slot).
+    const consumed = [...new Set([...cands.filter(d => known.has(d)), ...insertedDomains])];
+    for (let i = 0; i < consumed.length; i += 150) {
+      const slice = consumed.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+      try { await fetch(`${SUPABASE_URL}/rest/v1/toolbar_discovery_backlog?domain=in.(${encodeURIComponent(slice)})`, { method: "DELETE", headers: auth }); } catch {}
+    }
+    if (inserted) log(`  📦 pre-listado: ${inserted} ${sourceTag} recuperados GRATIS (0 créditos)${known.size ? ` · ${known.size} ya conocidos, limpiados` : ""}`);
+    return inserted;
+  } catch (e) { log(`  ⚠️ drain pre-listado: ${e.message}`); return 0; }
+}
+
+async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
   if (!domains || domains.length === 0) return 0;
   // CARRIL de la fuente: si ya llenó su cupo activo, no inyectar más.
   const laneCap  = PER_SOURCE_ACTIVE_CAP[sourceTag] ?? DEFAULT_SOURCE_CAP;
   const laneUsed = await _countActiveCsvBySource(token, sourceTag);
   const laneRoom = Math.max(0, laneCap - laneUsed);
-  if (laneRoom <= 0) { log(`⏸️ ${sourceTag} SKIP inject: carril lleno (${laneUsed}/${laneCap})`); return 0; }
-  if (domains.length > laneRoom) domains = domains.slice(0, laneRoom);
+  // Maxi 2026-07-17 (pedido del user): PRE-LISTADO. Antes el excedente del carril se DESCARTABA
+  // en silencio (`domains.slice(0, laneRoom)`) — dominios frescos ya PAGADOS con créditos de Serper
+  // que se tiraban a la basura. Ahora, si la fuente cuesta plata (opts.parkOverflow), el excedente
+  // se estaciona en toolbar_discovery_backlog y lo drena un slot posterior GRATIS.
+  // opts.returnDomains → devuelve la LISTA de dominios que entraron (no el count). Lo usa
+  // _drainBacklog para borrar del pre-listado solo lo que realmente se inyectó.
+  const _empty = () => (opts.returnDomains ? [] : 0);
+  if (laneRoom <= 0) {
+    if (opts.parkOverflow) await _parkInBacklog(token, domains, sourceTag, opts.phraseByDomain);
+    log(`⏸️ ${sourceTag} SKIP inject: carril lleno (${laneUsed}/${laneCap})${opts.parkOverflow ? ` → ${domains.length} al pre-listado` : ""}`);
+    return _empty();
+  }
+  if (domains.length > laneRoom) {
+    if (opts.parkOverflow) await _parkInBacklog(token, domains.slice(laneRoom), sourceTag, opts.phraseByDomain);
+    domains = domains.slice(0, laneRoom);
+  }
   const pendingNow = await getCsvQueuePendingCountServer(token).catch(() => 0);
   // Waiting count inline (no hay helper dedicado para waiting_pool)
   let waitingNow = 0;
@@ -1459,10 +1563,11 @@ async function _injectIntoCsvQueue(token, domains, sourceTag) {
       },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) return 0;
+    if (!res.ok) return _empty();
     const rows = await res.json().catch(() => []);
-    return Array.isArray(rows) ? rows.length : 0;
-  } catch { return 0; }
+    const _inserted = Array.isArray(rows) ? rows.map(r => r.domain).filter(Boolean) : [];
+    return opts.returnDomains ? _inserted : _inserted.length;
+  } catch { return _empty(); }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1487,6 +1592,34 @@ const _AUTOGOOGLE_KEYWORDS = [
 // Países de búsqueda (Serper `gl`) para targeting GEO — NO-Anglo (LATAM + EU + TR/GR).
 // Simula buscar DESDE ese país → Google prioriza publishers de/para ese país.
 const _AUTOGOOGLE_GL = ["mx", "ar", "br", "cl", "co", "pe", "uy", "es", "it", "fr", "de", "nl", "pt", "pl", "tr", "gr", "se", "be", "ch"];
+
+// ── TURNO HISPANO (Maxi 2026-07-17, pedido del user) ────────────────────────────────
+// Garantiza que TODOS los días haya crons dedicados a webs de HABLA HISPANA: LATAM +
+// Sudamérica + Centroamérica + España. Brasil queda AFUERA a propósito (es portugués);
+// igual sigue entrando por los slots normales, que no se tocan.
+// Por qué: el pool de keywords es random sobre 12 idiomas y el español es solo ~9%
+// (672 de 7549 frases) → LATAM/España quedaba diluido y aparecía poco.
+// En estos slots: keywords SOLO en español + país de búsqueda SOLO hispano (AutoGoogle),
+// y el sesgo de TLD forzado a TLDs hispanos (Majestic).
+const HISPANIC_GL = ["mx", "ar", "cl", "co", "pe", "uy", "es", "ve", "ec", "bo", "py", "cr", "gt", "do", "pa", "hn", "sv", "ni"];
+const HISPANIC_TLDS = [".mx", ".ar", ".cl", ".co", ".pe", ".uy", ".es", ".ve", ".ec", ".bo", ".py", ".cr", ".gt", ".do", ".pa", ".hn", ".sv", ".ni", ".pr", ".cu"];
+
+// Índice de día absoluto (UTC) — para alternar el turno hispano día a día.
+function _dayIndex(dateISO) {
+  const [y, m, d] = String(dateISO).split("-").map(Number);
+  return Math.floor(Date.UTC(y, (m || 1) - 1, d || 1) / 86_400_000);
+}
+
+// ¿Este slot es hispano? Alterna slot-por-slot y ROTA por día → ~50% de los crons del día
+// son hispanos y el otro ~50% queda random como venía funcionando (Maxi 2026-07-17).
+// Con 5 slots: días pares 3 hispanos (índices 0,2,4), impares 2 (índices 1,3) → promedio
+// exacto 50%, y NUNCA un día sin barrido hispano. La rotación además evita que el turno
+// hispano caiga siempre en la misma hora (mismos resultados de Google).
+function _isHispanicSlot(hour, slots, dateISO) {
+  const idx = slots.indexOf(hour);
+  if (idx < 0) return false;
+  return (idx + _dayIndex(dateISO)) % 2 === 0;
+}
 
 // Pega una keyword a Serper (con país de búsqueda gl) y devuelve los dominios orgánicos.
 // Maxi 2026-07-15 (auditoría AutoGoogle): devuelve {domains, ok, status} para que el caller distinga
@@ -1640,9 +1773,27 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // = créditos quemados al pedo. Ahora: si el carril autogoogle ya está lleno, NO gasto ni una
   // búsqueda; si queda poco lugar, capo N abajo para no buscar más de lo que puedo inyectar.
   const _laneCap  = PER_SOURCE_ACTIVE_CAP.autogoogle ?? DEFAULT_SOURCE_CAP;
-  const _laneUsed = await _countActiveCsvBySource(token, "autogoogle");
-  const _laneRoom = Math.max(0, _laneCap - _laneUsed);
+  let   _laneUsed = await _countActiveCsvBySource(token, "autogoogle");
+  let   _laneRoom = Math.max(0, _laneCap - _laneUsed);
   if (_laneRoom <= 0) { log(`🔎 AutoGoogle: carril lleno (${_laneUsed}/${_laneCap}) — NO gasto créditos Serper este slot`); return; }
+  // ── TURNO HISPANO (Maxi 2026-07-17) ──────────────────────────────────────────────
+  // ~50% de los slots del día son hispanos (es-only + países hispanos); el otro ~50%
+  // sigue random como venía. Ver _isHispanicSlot: alterna y rota por día.
+  const _hispanicSlot = _isHispanicSlot(hour, AUTOGOOGLE_SLOTS, dateISO);
+  // Slot NO hispano → primero consumo el PRE-LISTADO: dominios ya PAGADOS que no entraron
+  // al carril en slots anteriores (típicamente los no-hispanos que encontró un turno hispano).
+  // Si con eso lleno el carril, este slot no gasta un solo crédito de Serper.
+  if (!_hispanicSlot) {
+    const _recovered = await _drainBacklog(token, "autogoogle", _laneRoom);
+    if (_recovered > 0) {
+      _laneUsed = await _countActiveCsvBySource(token, "autogoogle");
+      _laneRoom = Math.max(0, _laneCap - _laneUsed);
+      if (_laneRoom <= 0) {
+        log(`🔎 AutoGoogle: carril llenado con el pre-listado (${_recovered} recuperados) — 0 créditos gastados este slot 💰`);
+        return;
+      }
+    }
+  }
   const [yy, mm, dd] = dateISO.split("-").map(Number);
   const daysInMonth = new Date(yy, mm, 0).getDate();
   const daysLeft = Math.max(1, daysInMonth - dd + 1);                                  // incluye hoy
@@ -1658,12 +1809,21 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Cap por lugar en el carril: no buscar más de lo que entra. freshRate = dominios nuevos por
   // búsqueda → para llenar _laneRoom slots alcanzan ~_laneRoom/freshRate búsquedas (piso 8).
   N = Math.min(N, Math.max(8, Math.ceil(_laneRoom / Math.max(0.2, freshRate))));
-  // Pool = TODAS las frases de cascade (3490, 12 idiomas) desde keywordsData.js; fallback inline.
+  // Pool = TODAS las frases de cascade (7549, 12 idiomas) desde keywordsData.js; fallback inline.
+  // Maxi 2026-07-17 TURNO HISPANO: en los slots hispanos el pool se restringe al español
+  // (672 frases) → descubrimiento LATAM/Centroamérica/España garantizado todos los días.
   let pool;
-  try { pool = Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s); } catch { pool = []; }
+  try {
+    pool = _hispanicSlot
+      ? (_AG_KEYWORDS.es || []).filter(s => typeof s === "string" && s)
+      : Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s);
+  } catch { pool = []; }
   if (!pool || pool.length < 50) pool = _AUTOGOOGLE_KEYWORDS;
   // Maxi 2026-07-16: sumar las keywords FRESCAS generadas por Claude (si el flag está prendido).
-  try { const _fk = JSON.parse((await getConfig(token)).autogoogle_fresh_keywords || "[]"); if (Array.isArray(_fk) && _fk.length) pool = [...new Set([...pool, ..._fk.filter(k => typeof k === "string" && k)])]; } catch {}
+  // En el turno hispano NO se mezclan: vienen en varios idiomas y ensuciarían el barrido.
+  if (!_hispanicSlot) {
+    try { const _fk = JSON.parse((await getConfig(token)).autogoogle_fresh_keywords || "[]"); if (Array.isArray(_fk) && _fk.length) pool = [...new Set([...pool, ..._fk.filter(k => typeof k === "string" && k)])]; } catch {}
+  }
   // Maxi 2026-07-16: SELECCIÓN POR YIELD (antes 100% random). ~65% de las frases que históricamente
   // traen más dominios FRESCOS (toolbar_keyword_yield) + ~35% exploración random (para seguir descubriendo
   // frases buenas y no encasillarse). Sube la calidad de URLs sin gastar más búsquedas.
@@ -1681,13 +1841,15 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const _pickTopSet = new Set(_pickTop);
   const _explore = pool.filter(p => !_pickTopSet.has(p)).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
   const kws = [..._pickTop, ..._explore].sort(() => Math.random() - 0.5);
-  log(`🔎 AutoGoogle slot ${slotLabel} — ${kws.length} búsquedas (${_pickTop.length} top-yield + ${_explore.length} explore · mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
+  log(`🔎 AutoGoogle slot ${slotLabel}${_hispanicSlot ? " 🌎 HISPANO (es-only)" : ""} — ${kws.length} búsquedas (${_pickTop.length} top-yield + ${_explore.length} explore · mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
   const found = new Set();
   const kwDomains = new Map();  // Maxi 2026-07-16: keyword → dominios que trajo (para calcular el yield)
   let queriesDone = 0, errCount = 0, lastStatus = 0;
   for (const kw of kws) {
     // País de búsqueda rotado (targeting GEO no-Anglo) → trae publishers del país objetivo.
-    const gl = _AUTOGOOGLE_GL[Math.floor(Math.random() * _AUTOGOOGLE_GL.length)];
+    // Turno hispano → rotación SOLO entre países de habla hispana (Maxi 2026-07-17).
+    const _glPool = _hispanicSlot ? HISPANIC_GL : _AUTOGOOGLE_GL;
+    const gl = _glPool[Math.floor(Math.random() * _glPool.length)];
     const { domains, ok, status } = await _serperSearch(kw, 20, gl);
     // Maxi 2026-07-15: contar SOLO las búsquedas EXITOSAS. Antes queriesDone++ corría siempre → las
     // fallidas (Serper 403/429 por créditos agotados) igual gastaban el "cap mensual" → se auto-bloqueaba.
@@ -1716,10 +1878,16 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     _freshSet = new Set(fresh);
     freshCount = fresh.length;
     if (fresh.length > 0) {
-      inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle");
+      // domain → keyword que lo trajo. Se arma UNA vez y lo usan la atribución (yield) y el
+      // pre-listado (antes era un .find() por dominio dentro del map = O(n×m) al pedo).
+      const _phraseByDomain = new Map();
+      for (const [kw, doms] of kwDomains) for (const d of doms) if (!_phraseByDomain.has(d)) _phraseByDomain.set(d, kw);
+      // parkOverflow: lo que NO entre al carril se estaciona en el pre-listado en vez de tirarse
+      // (ya se pagó con créditos de Serper). Lo levanta gratis un slot no-hispano. Maxi 2026-07-17.
+      inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle", { parkOverflow: true, phraseByDomain: _phraseByDomain });
       // Maxi 2026-07-16: guardar domain→keyword para reconciliar después (¿llegó a Prospects? → +qualified).
       const _attr = fresh.map(d => {
-        const _kw = [...kwDomains].find(([, doms]) => doms.includes(d))?.[0] || "";
+        const _kw = _phraseByDomain.get(d) || "";
         return _kw ? { domain: d, phrase: String(_kw).slice(0, 300) } : null;
       }).filter(Boolean);
       if (_attr.length) {
@@ -1739,7 +1907,12 @@ async function _runAutoGoogleSlot(token, slotLabel) {
       return fetch(`${SUPABASE_URL}/rest/v1/rpc/bump_keyword_yield`, {
         method: "POST",
         headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({ p_phrase: String(kw).slice(0, 300), p_searches: 1, p_found: doms.length, p_fresh: _f }),
+        // Maxi 2026-07-17 BUG FIX: pasar p_qualified SIEMPRE. La migración del 16 agregó el 5º
+        // parámetro con CREATE OR REPLACE → como cambió la firma, Postgres creó una SOBRECARGA
+        // en vez de reemplazar. Llamando con 4 args las dos candidatas matcheaban ("function is
+        // not unique") → el RPC tiraba 500, el .catch lo tragaba y el yield quedaba SIEMPRE vacío
+        // (→ AutoGoogle elegía keywords 100% random). Con los 5 args la resolución es unívoca.
+        body: JSON.stringify({ p_phrase: String(kw).slice(0, 300), p_searches: 1, p_found: doms.length, p_fresh: _f, p_qualified: 0 }),
       }).catch(() => {});
     }));
   } catch {}
@@ -1872,7 +2045,11 @@ const _CC_TO_TLD = {
 // y tokens de comercio/casino/adulto como SEGMENTO del dominio (no substring suelto — "bankrate" no matchea).
 const _MAJESTIC_NAME_SKIP_RE = /(\.gov(\.|$)|\.gob(\.|$)|\.gouv\.|\.edu(\.|$)|\.ac\.|\.mil(\.|$)|\.gov\.)|(^|[.\-])(shop|store|tienda|loja|negozio|boutique|webshop|onlineshop|casino|apuestas|betting|sportsbook|onlyfans|escort)([.\-]|$)/i;
 
-async function _feederPullMajestic(token, targetCount, sessionKnown) {
+// hispanicSlot lo decide el CALLER a partir del slot que disparó el cron. Maxi 2026-07-17:
+// NO recalcularlo acá con el reloj — Majestic es el 3er pull del slot (después de sellers y
+// monday), así que puede arrancar pasada la hora (ej. slot 20:00 corriendo 21:0x). Ahí
+// FEEDER_SLOTS.indexOf(21) === -1 y el turno hispano se perdía en silencio.
+async function _feederPullMajestic(token, targetCount, sessionKnown, hispanicSlot = false) {
   try {
     const pool = await loadDomainPool();
     if (!pool || pool.length === 0) return 0;
@@ -1884,8 +2061,15 @@ async function _feederPullMajestic(token, targetCount, sessionKnown) {
     let cursor = parseInt(cfg.majestic_cursor || "0", 10) || 0;
     if (cursor < 0 || cursor >= pool.length) cursor = 0;
     // TLDs preferidos según geos_priority del worker_discovery_config (vacío = sin sesgo → puro secuencial).
+    // Maxi 2026-07-17 TURNO HISPANO: en los slots reservados el sesgo se FUERZA a TLDs de habla
+    // hispana (ignora geos_priority) → barrido LATAM/Centroamérica/España garantizado cada día.
+    // El sesgo es no-exclusivo (ver abajo): si no hay suficientes, completa con el resto de la
+    // ventana → nunca frena el feeder por falta de match GEO.
     let wd = {}; try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
-    const preferTlds = (wd.geos_priority || []).flatMap(cc => _CC_TO_TLD[String(cc).toLowerCase()] || []);
+    const preferTlds = hispanicSlot
+      ? HISPANIC_TLDS
+      : (wd.geos_priority || []).flatMap(cc => _CC_TO_TLD[String(cc).toLowerCase()] || []);
+    if (hispanicSlot) log("  🌎 Majestic: turno HISPANO — sesgo forzado a TLDs de habla hispana");
     // Ventana secuencial ~12× el target para compensar los filtros de abajo.
     const WINDOW = Math.min(pool.length, Math.max(targetCount * 12, 300));
     const win = [];
@@ -2141,6 +2325,10 @@ async function maybeRunFeederSlot(token) {
 
 async function _runFeederSlot(token, slotLabel) {
   log(`🌱 FEEDER cron ${slotLabel} fired`);
+  // Turno hispano decidido por el SLOT que disparó (parseado del label "YYYY-MM-DD-HH:00"),
+  // no por el reloj: el pull de Majestic corre minutos después y podría caer en otra hora.
+  const _sm = /^(\d{4}-\d{2}-\d{2})-(\d{2}):00$/.exec(slotLabel);
+  const _slotHispanic = _sm ? _isHispanicSlot(parseInt(_sm[2], 10), FEEDER_SLOTS, _sm[1]) : false;
 
   // 1. Daily target check
   const today = _madridNowParts().dateISO;
@@ -2220,7 +2408,7 @@ async function _runFeederSlot(token, slotLabel) {
   const sessionKnown = new Set();
   const fromSellers  = await _feederPullSellers(token, allocSellers, sessionKnown);
   const fromMonday   = await _feederPullMonday(token, allocMonday, sessionKnown);
-  const fromMajestic = await _feederPullMajestic(token, allocMajestic, sessionKnown);
+  const fromMajestic = await _feederPullMajestic(token, allocMajestic, sessionKnown, _slotHispanic);
   // BONUS renovable: ads.txt → sellers.json (descubre redes/publishers nuevos, $0).
   // Va ENCIMA del split de las 3 (no compite por el yield) — supply extra que
   // crece sola con el tiempo. Cap modesto por slot para acotar el HTTP.
@@ -2901,9 +3089,12 @@ async function getUserLimits(token, userEmail) {
   } catch { return { autopilot_enabled: true, autopilot_daily_minutes: 20, autopilot_daily_prospects: 300, monthly_api_cap: null }; }
 }
 
-// Cap MENSUAL Apollo (plan = 2,500 credits/mes; cap conservador 2,400 con margen 100).
+// Cap MENSUAL Apollo. Plan = 2,500 credits/ciclo. Maxi 2026-07-17: margen 10% (antes
+// era ~4%: cap fijo 2400) → corta en 2,250 y deja 250 de colchón real.
 // Si llega → fallback a scraping/page-emails (no rompe flujos, solo no usa Apollo).
-const APOLLO_MONTHLY_HARD_CAP = 2400;
+const APOLLO_PLAN_CREDITS  = 2500;
+const APOLLO_SAFETY_MARGIN = 0.10;
+const APOLLO_MONTHLY_HARD_CAP = Math.floor(APOLLO_PLAN_CREDITS * (1 - APOLLO_SAFETY_MARGIN)); // 2250
 
 // Techo de seguridad por día (protege contra rate-limit de Apollo y errores).
 const APOLLO_DAILY_BURST_MAX = 250;
@@ -2911,20 +3102,20 @@ const APOLLO_DAILY_BURST_MAX = 250;
 // Guard para no re-disparar el reset del contador mensual en cada lectura.
 let _apolloPeriodReset = "";
 
-// Días que faltan en el ciclo (mes calendario), incluyendo hoy. Mínimo 1.
-function _daysLeftInCycle() {
-  const now = new Date();
-  const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate();
-  return Math.max(1, daysInMonth - now.getUTCDate() + 1);
+// Días que faltan en el ciclo REAL de Apollo (12→12), incluyendo hoy. Mínimo 1.
+// Maxi 2026-07-17 BUG FIX: antes contaba mes calendario (daysInMonth - hoy + 1). El 17/07
+// daba 15 días cuando faltaban 26 hasta el 12/08 → repartía ~el doble por día y dejaba
+// la cuenta seca semanas antes de renovar.
+function _daysLeftInApolloCycle() {
+  return Math.max(1, Math.ceil((_apolloCycleEnd().getTime() - Date.now()) / 86_400_000));
 }
 
-// Presupuesto diario dinámico: reparte los créditos que quedan del cap mensual
-// entre los días que faltan del ciclo (+15% de margen para recuperar días en que
-// el cron no corrió). Así no se quema todo a principio de mes ni quedan créditos
-// sin usar al final. Nunca supera lo que queda ni el techo de seguridad diario.
+// Presupuesto diario dinámico: reparte los créditos que quedan del cap entre los días
+// que faltan del ciclo, con 10% de margen HACIA ABAJO para cortar antes (Maxi 2026-07-17:
+// antes era ×1.15, que adelantaba el gasto). Nunca supera lo que queda ni el techo diario.
 function _apolloPacedDailyCap(monthRemaining) {
   if (monthRemaining <= 0) return 0;
-  const paced = Math.ceil((monthRemaining / _daysLeftInCycle()) * 1.15);
+  const paced = Math.floor((monthRemaining / _daysLeftInApolloCycle()) * (1 - APOLLO_SAFETY_MARGIN));
   return Math.max(1, Math.min(monthRemaining, APOLLO_DAILY_BURST_MAX, paced));
 }
 
@@ -2943,8 +3134,8 @@ async function getApolloUsageToday(token) {
     const storedCount = parseInt(map.apollo_calls_today || "0", 10);
     const usedToday = storedDate === today ? storedCount : 0;
 
-    // Mensual — alineado con billing cycle 6→6 (igual que RapidAPI)
-    const period       = _billingCyclePeriod();
+    // Mensual — alineado con el billing cycle REAL de Apollo (12→12). Maxi 2026-07-17.
+    const period       = _apolloCyclePeriod();
     const storedPeriod = map.apollo_calls_month_period || "";
     const storedMonth  = parseInt(map.apollo_calls_month || "0", 10);
     const monthLimit   = parseInt(map.apollo_monthly_limit || String(APOLLO_MONTHLY_HARD_CAP), 10);
@@ -3078,19 +3269,38 @@ async function _isGeoOverrepresentedInPool(token, topCountryName, geosAll) {
 // es del día 6 de un mes al día 6 del próximo. Por eso anclamos el período
 // al día 6: si hoy >= 6 → este mes-06. Si hoy < 6 → mes anterior-06.
 // Formato "YYYY-MM-06" (también compat con el legacy "YYYY-MM" via slice(0,7)).
-function _billingCyclePeriod() {
+// Inicio del ciclo de facturación para un ancla de día dado. Cada proveedor factura
+// en su propia fecha: RapidAPI 6→6, Apollo 12→12 (Maxi 2026-07-17).
+function _cycleStartForAnchor(anchorDay) {
   const d = new Date();
-  const isBeforeDay6 = d.getUTCDate() < 6;
-  const month = isBeforeDay6 ? d.getUTCMonth() - 1 : d.getUTCMonth();
-  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, 6));
-  return anchor.toISOString().slice(0, 10); // "2026-06-06"
+  const beforeAnchor = d.getUTCDate() < anchorDay;
+  const month = beforeAnchor ? d.getUTCMonth() - 1 : d.getUTCMonth();
+  return new Date(Date.UTC(d.getUTCFullYear(), month, anchorDay));
+}
+
+// RapidAPI: ciclo 6→6.
+function _billingCyclePeriod() {
+  return _cycleStartForAnchor(6).toISOString().slice(0, 10); // "2026-06-06"
+}
+
+// Apollo: ciclo 12→12 (verificado en el panel — renew Aug 12, 2026). Maxi 2026-07-17.
+// Antes compartía el ancla 6 de RapidAPI → el contador mensual se reseteaba 6 días
+// antes de tiempo y el pacing calculaba sobre un ciclo que no existía.
+const APOLLO_CYCLE_ANCHOR_DAY = 12;
+function _apolloCyclePeriod() {
+  return _cycleStartForAnchor(APOLLO_CYCLE_ANCHOR_DAY).toISOString().slice(0, 10);
+}
+function _apolloCycleEnd() {
+  const end = _cycleStartForAnchor(APOLLO_CYCLE_ANCHOR_DAY);
+  end.setUTCMonth(end.getUTCMonth() + 1);
+  return end;
 }
 
 // Calcula % del ciclo transcurrido — 0 = recién empezó, 1 = está por terminar.
 // Usado para throttle dinámico: si gastamos al 80% pero solo va 30% del ciclo,
-// pisamos el freno.
-function _cycleElapsedRatio() {
-  const start = new Date(_billingCyclePeriod() + "T00:00:00Z");
+// pisamos el freno. startISO permite pasar el ciclo del proveedor (default: RapidAPI 6→6).
+function _cycleElapsedRatio(startISO) {
+  const start = new Date((startISO || _billingCyclePeriod()) + "T00:00:00Z");
   const end   = new Date(start.getTime());
   end.setUTCMonth(end.getUTCMonth() + 1);
   const total   = end.getTime() - start.getTime();
@@ -3099,15 +3309,17 @@ function _cycleElapsedRatio() {
 }
 
 // Throttle dinámico: devuelve true si usamos MÁS rápido que el tiempo que pasó.
-// Sirve para Apollo (cap 2400/mes) y RapidAPI (cap 40K/mes). Si ratio gastado
-// > ratio transcurrido × 1.10 (10% margen), bloqueamos hasta que el tiempo
-// se ponga al día. Evita quemar la cuota al día 20 y quedarse sin créditos
-// hasta el próximo ciclo (Maxi 2026-06-17).
-function _isAheadOfPace(used, limit) {
+// Sirve para Apollo (cap 2250/ciclo 12→12) y RapidAPI (cap 40K/ciclo 6→6). Si ratio
+// gastado > ratio transcurrido, bloqueamos hasta que el tiempo se ponga al día. Evita
+// quemar la cuota al día 20 y quedarse sin créditos hasta el próximo ciclo (Maxi 2026-06-17).
+// startISO = inicio del ciclo del proveedor (default RapidAPI 6→6).
+// tolerance = cuánto se le permite adelantarse antes de frenar (default 0.10, sin cambios
+// para RapidAPI). Apollo pasa 0 → frena apenas se adelanta (Maxi 2026-07-17).
+function _isAheadOfPace(used, limit, startISO, tolerance = 0.10) {
   if (limit <= 0) return false;
   const spentRatio = used / limit;
-  const timeRatio  = _cycleElapsedRatio();
-  return spentRatio > (timeRatio + 0.10);
+  const timeRatio  = _cycleElapsedRatio(startISO);
+  return spentRatio > (timeRatio + tolerance);
 }
 
 async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {
@@ -3971,8 +4183,11 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
       log(`  ⚠ Apollo cap ${cap} alcanzado (${used}/${usage.monthLimit}) — skip unlock ${domain}`);
       return freeResult;
     }
-    if (!forceUnlock && _isAheadOfPace(used, cap)) {
-      const tPct = Math.round(_cycleElapsedRatio() * 100);
+    // Tolerancia 0.10 (la de siempre): con 0 el throttle se activaba desde el primer unlock del
+    // ciclo (spentRatio > timeRatio≈0) y Apollo quedaba en goteo permanente, sin poder alcanzar
+    // ni el cap diario pautado. El margen del 10% que pidió el user ya lo da APOLLO_MONTHLY_HARD_CAP.
+    if (!forceUnlock && _isAheadOfPace(used, cap, _apolloCyclePeriod())) {
+      const tPct = Math.round(_cycleElapsedRatio(_apolloCyclePeriod()) * 100);
       const uPct = Math.round((used / cap) * 100);
       log(`  ⏸️ Apollo throttle: usado ${uPct}% pero ciclo va ${tPct}% — skip unlock ${domain} (pacing)`);
       return freeResult;
@@ -5302,6 +5517,17 @@ async function runProspectSimilarExpansion(token) {
   _lastSimilarExpAt = Date.now();
   const rapidapi_key = cfg.rapidapi_key;
   if (!rapidapi_key) return;
+  // PRE-LISTADO primero: recuperar similares ya PAGADOS que no entraron al carril antes de
+  // gastar RapidAPI nuevo. Si llenan el carril, esta corrida no cuesta un hit. Maxi 2026-07-17.
+  try {
+    const _cap  = PER_SOURCE_ACTIVE_CAP.auto_feeder_similar ?? DEFAULT_SOURCE_CAP;
+    const _room = Math.max(0, _cap - await _countActiveCsvBySource(token, "auto_feeder_similar"));
+    if (_room <= 0) { log("🔗 similar-exp SKIP: carril lleno — 0 hits RapidAPI"); return; }
+    if (await _drainBacklog(token, "auto_feeder_similar", _room) >= _room) {
+      log("🔗 similar-exp: carril llenado con el pre-listado — 0 hits RapidAPI gastados 💰");
+      return;
+    }
+  } catch {}
   // Gate RapidAPI: SimilarWeb cuesta hits → no expandir si estamos cerca del cap mensual.
   try {
     const { usedThisMonth, limit } = await getRapidApiUsageThisMonth(token);
@@ -5330,7 +5556,9 @@ async function runProspectSimilarExpansion(token) {
       const known = await _findKnownDomainsWorker(token, cands);
       const fresh = cands.filter(d => !known.has(d) && !sessionKnown.has(d));
       fresh.forEach(d => sessionKnown.add(d));
-      if (fresh.length) injected += await _injectIntoCsvQueue(token, fresh, "auto_feeder_similar");
+      // parkOverflow: los similares cuestan RapidAPI → si el carril está lleno, al pre-listado
+      // en vez de tirarlos (re-descubrirlos costaría otra llamada). Maxi 2026-07-17.
+      if (fresh.length) injected += await _injectIntoCsvQueue(token, fresh, "auto_feeder_similar", { parkOverflow: true });
     } catch (e) { log(`  ⚠️ similar-exp ${s.domain}: ${e.message}`); }
     try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
   }

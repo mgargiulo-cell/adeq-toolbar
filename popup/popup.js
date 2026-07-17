@@ -2639,6 +2639,15 @@ function _semverCompare(a, b) {
   return 0;
 }
 
+// Inicio del ciclo de facturación de Apollo (12→12, renew Aug 12 2026). Devuelve
+// "YYYY-MM-12" — mismo formato que escribe el worker en apollo_calls_month_period.
+function apolloCyclePeriod() {
+  const d = new Date();
+  const beforeAnchor = d.getUTCDate() < 12;
+  const month = beforeAnchor ? d.getUTCMonth() - 1 : d.getUTCMonth();
+  return new Date(Date.UTC(d.getUTCFullYear(), month, 12)).toISOString().slice(0, 10);
+}
+
 async function refreshApolloFooterCounter() {
   const el = document.getElementById("apollo-monthly-counter");
   if (!el || !state.accessToken) return;
@@ -2651,10 +2660,13 @@ async function refreshApolloFooterCounter() {
     const rows = await res.json();
     const map = {};
     rows.forEach(r => { map[r.key] = r.value; });
-    const period = new Date().toISOString().slice(0, 7);
-    const sameMonth = (map.apollo_calls_month_period || "").slice(0, 7) === period;
-    const used = sameMonth ? parseInt(map.apollo_calls_month || "0", 10) : 0;
-    const limit = parseInt(map.apollo_monthly_limit || "2400", 10);
+    // Ciclo REAL de Apollo: 12→12. Maxi 2026-07-17: antes comparaba por mes calendario
+    // (YYYY-MM) → del 1 al 11 de cada mes el ciclo vigente (que arrancó el 12 anterior)
+    // no matcheaba y el contador mostraba 0 aunque se estuvieran gastando créditos.
+    const period = apolloCyclePeriod();
+    const used = (map.apollo_calls_month_period || "") === period
+      ? parseInt(map.apollo_calls_month || "0", 10) : 0;
+    const limit = parseInt(map.apollo_monthly_limit || "2250", 10);
     const pct = limit > 0 ? (used / limit) * 100 : 0;
     el.classList.remove("usage-warning", "usage-danger", "usage-reached");
     if (pct >= 100)     el.classList.add("usage-reached");
@@ -4093,7 +4105,7 @@ async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
     const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_monthly_limit)&select=key,value`, { headers, signal: AbortSignal.timeout(6000) });
     const rows = r.ok ? await r.json() : [];
     const map = {}; (rows || []).forEach(x => { map[x.key] = x.value; });
-    const limit = parseInt(map.apollo_monthly_limit || "2400", 10) || 2400;
+    const limit = parseInt(map.apollo_monthly_limit || "2250", 10) || 2250;
     const used  = parseInt(map.apollo_calls_month   || "0", 10) || 0;
     const remaining = Math.max(0, limit - used);
     if (remaining <= 0) return; // tope mensual alcanzado → no gastar
