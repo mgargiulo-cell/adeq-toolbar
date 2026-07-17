@@ -11,9 +11,13 @@ WITH v AS (
 ),
 
 -- 1. SALUD DEL WORKER ────────────────────────────────────────────────────
+-- OJO: toolbar_config es solo (key, value) — NO tiene updated_at. La antigüedad se
+-- calcula del propio valor cuando es un timestamp ISO (heartbeat / cursores).
 salud AS (
   SELECT 1 AS orden, '1. SALUD' AS seccion, key AS metrica, value AS valor,
-         COALESCE(round(EXTRACT(epoch FROM (now() - updated_at))/60)::text || ' min atrás', '—') AS detalle
+         CASE WHEN value ~ '^\d{4}-\d{2}-\d{2}T'
+              THEN round(EXTRACT(epoch FROM (now() - value::timestamptz))/60)::text || ' min atrás'
+              ELSE '' END AS detalle
   FROM toolbar_config
   WHERE key IN ('auto_heartbeat_at','polish_cursor_ts','majestic_cursor',
                 'apollo_calls_month','apollo_calls_month_period','apollo_daily_limit',

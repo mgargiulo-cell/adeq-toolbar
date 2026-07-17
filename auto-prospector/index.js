@@ -3278,9 +3278,14 @@ function _cycleStartForAnchor(anchorDay) {
   return new Date(Date.UTC(d.getUTCFullYear(), month, anchorDay));
 }
 
-// RapidAPI: ciclo 6→6.
+// RapidAPI (SimilarWeb): ciclo 7→7. Maxi 2026-07-17: estaba anclado al 6 — el user confirmó
+// que la cuota se resetea el 7. Con el ancla en 6, el día 6 de cada mes el worker daba por
+// empezado un ciclo nuevo y reseteaba el contador 24h ANTES de que RapidAPI repusiera la
+// cuota → ese día podía gastar sobre el cupo viejo creyendo que tenía 40k frescos.
+// El chequeo de reset compara por YYYY-MM (ver getRapidApiUsageThisMonth), así que mover el
+// ancla al 7 corre el límite del ciclo al día correcto sin romper los contadores guardados.
 function _billingCyclePeriod() {
-  return _cycleStartForAnchor(6).toISOString().slice(0, 10); // "2026-06-06"
+  return _cycleStartForAnchor(7).toISOString().slice(0, 10); // "2026-06-07"
 }
 
 // Apollo: ciclo 12→12 (verificado en el panel — renew Aug 12, 2026). Maxi 2026-07-17.
@@ -8698,6 +8703,60 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
   }
 }
 
+// ── DEDUP POR MENSAJE DE GMAIL (Maxi 2026-07-17) ────────────────────────────────────
+// BUG que arregla: el dedup del scan era `if (!isBouncedSync(failed))`, o sea la tabla de
+// bounced_emails. Pero los SOFT bounces a propósito NO se marcan ahí (son transitorios, no
+// se blacklistean) → nunca entraban a la tabla → CADA pasada del scan volvía a "descubrir"
+// el mismo mensaje durante los 7 días de ventana de Gmail. Efectos medidos el 17/07:
+//   · evima.gr loguedo 64 veces (10/07→17/07), mail.gmail.com 61, gmail.com 22
+//   · y lo grave: queueBounceRetry se re-disparaba en cada pasada → REENVÍOS de más
+//     (34 bounce_retry_sent sobre 20 dominios) quemando reputación del dominio.
+// Ahora el dedup es por ID de mensaje: un rebote se procesa UNA vez y listo, sin importar
+// si es hard, soft o unknown.
+const _bounceSeenCache = { set: new Set(), ts: 0 };
+const BOUNCE_SEEN_TTL = 5 * 60_000;
+
+async function loadSeenBounceMsgs(token) {
+  if (Date.now() - _bounceSeenCache.ts < BOUNCE_SEEN_TTL) return _bounceSeenCache.set;
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_seen?select=msg_id&limit=20000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (res.ok) {
+      _bounceSeenCache.set = new Set((await res.json() || []).map(r => r.msg_id));
+      _bounceSeenCache.ts = Date.now();
+    }
+  } catch {}
+  return _bounceSeenCache.set;
+}
+
+async function markBounceMsgSeen(token, msgId) {
+  if (!msgId) return;
+  _bounceSeenCache.set.add(msgId);
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_seen?on_conflict=msg_id`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=minimal",
+      },
+      body: JSON.stringify({ msg_id: msgId }),
+    });
+  } catch {}
+}
+
+// Dominios de INFRAESTRUCTURA de correo — jamás son el destinatario que rebotó.
+// El fallback que parsea el body agarraba CUALQUIER email del cuerpo y solo excluía
+// mailer-daemon/postmaster → los rebotes de Google traen sus propias direcciones
+// (mail.gmail.com, gmail.com, google.com) y se marcaban como publishers rebotados.
+const BOUNCE_INFRA_DOMAINS = new Set([
+  "gmail.com", "mail.gmail.com", "googlemail.com", "google.com", "mail.google.com",
+  "gsuite.google.com", "support.google.com", "accounts.google.com", "gstatic.com",
+  "outlook.com", "hotmail.com", "microsoft.com", "office365.com", "protection.outlook.com",
+  "yahoo.com", "yahoodns.net", "amazonses.com", "sendgrid.net", "mailgun.org",
+]);
+
 // Worker job: escanea INBOX por mailer-daemon en últimos 24h, parsea destinatario
 // que rebotó, persiste en toolbar_bounced_emails. Corre 1 vez por loop iter.
 async function scanBouncesForUser(token, userEmail) {
@@ -8746,8 +8805,15 @@ async function scanBouncesForUser(token, userEmail) {
       return 0;
     }
     const list = await listRes.json();
-    const ids = (list.messages || []).map(m => m.id);
-    if (!ids.length) return 0;
+    const allIds = (list.messages || []).map(m => m.id);
+    if (!allIds.length) return 0;
+
+    // Maxi 2026-07-17: saltear los mensajes YA procesados (dedup por ID de mensaje). Antes se
+    // re-abría y re-procesaba cada rebote en CADA pasada del scan — ver loadSeenBounceMsgs.
+    // Además ahorra una llamada ?format=full a Gmail por cada mensaje ya visto.
+    const seen = await loadSeenBounceMsgs(token);
+    const ids = allIds.filter(id => !seen.has(id));
+    if (!ids.length) { log(`📬 scanBounces ${userEmail}: ${allIds.length} msgs Gmail · 0 nuevos (todos ya procesados)`); return 0; }
 
     let detected = 0;
     for (const id of ids) {
@@ -8769,9 +8835,16 @@ async function scanBouncesForUser(token, userEmail) {
           const body = extractMessageText(msg.payload || {});
           const emailMatches = body.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
           // Filtrar el email del propio user y de daemons
+          // Maxi 2026-07-17: filtrar la INFRAESTRUCTURA de correo. Antes solo se excluía
+          // mailer-daemon/postmaster/el propio user → los rebotes de Google traen sus
+          // direcciones (mail.gmail.com, gmail.com…) y se marcaban como el publisher que
+          // rebotó: 61 detecciones de "mail.gmail.com" y 22 de "gmail.com" en 7 días,
+          // cada una disparando un retry contra un dominio que no existe.
           failedEmails = [...new Set(emailMatches
             .map(e => e.toLowerCase())
             .filter(e => !e.includes("mailer-daemon") && !e.includes("postmaster") && e !== userEmail.toLowerCase())
+            .filter(e => !BOUNCE_INFRA_DOMAINS.has(e.split("@")[1] || ""))
+            .filter(e => (e.split("@")[1] || "") !== (userEmail.split("@")[1] || "").toLowerCase())
           )].slice(0, 3); // top 3
         }
         // Hard vs soft bounce detection del body — el hard amerita retry inmediato
@@ -8810,12 +8883,15 @@ async function scanBouncesForUser(token, userEmail) {
             }).catch(() => {});
           }
         }
+        // Procesado (haya o no dado bounces útiles) → nunca más se re-abre. Va acá, DESPUÉS
+        // del parseo, para que un fallo de red arriba deje el mensaje pendiente de reintento.
+        await markBounceMsgSeen(token, id);
       } catch {}
     }
     // Maxi 2026-06-17: log SIEMPRE — visibilidad de cuántos msgs encontró el
     // scan, no solo cuando detecta nuevo. Si ids.length > 0 pero detected = 0,
     // significa que todos ya estaban marcados (bueno) o el parser falló (malo).
-    log(`📬 scanBounces ${userEmail}: ${ids.length} msgs Gmail · ${detected} bounces nuevos`);
+    log(`📬 scanBounces ${userEmail}: ${allIds.length} msgs Gmail (${ids.length} sin procesar) · ${detected} bounces nuevos`);
     if (detected) {
       // Audit P1 fix: invalidar cache de bounced para que el próximo
       // rankEmail use la lista actualizada. Antes la cache TTL 5min podía

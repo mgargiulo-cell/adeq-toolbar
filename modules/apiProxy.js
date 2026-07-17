@@ -32,15 +32,17 @@ const FLUSH_EVERY_HITS = 10;    // o cada 10 hits, lo que ocurra antes
 let _hitsSinceFlush = 0;
 
 // Período de facturación: ciclo del 6 al 6 (Maxi 2026-06-17). RapidAPI cobra
-// del día 6 al día 6 del mes siguiente. Si hoy >= día 6 → período empieza este
-// mes-06. Si hoy < día 6 → empezó el mes pasado-06. Formato "YYYY-MM-06" para
+// del día 7 al día 7 del mes siguiente. Si hoy >= día 7 → período empieza este
+// mes-07. Si hoy < día 7 → empezó el mes pasado-07. Formato "YYYY-MM-07" para
 // que matchee con el worker (también compat con slice(0,7) legacy).
+// Maxi 2026-07-17: era el día 6. El user confirmó que SimilarWeb repone la cuota el 7.
+// Debe seguir igual que _billingCyclePeriod() del worker (auto-prospector/index.js).
 function currentPeriod() {
   const d = new Date();
-  const isBeforeDay6 = d.getUTCDate() < 6;
-  const month = isBeforeDay6 ? d.getUTCMonth() - 1 : d.getUTCMonth();
-  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, 6));
-  return anchor.toISOString().slice(0, 10); // "2026-06-06"
+  const isBeforeDay7 = d.getUTCDate() < 7;
+  const month = isBeforeDay7 ? d.getUTCMonth() - 1 : d.getUTCMonth();
+  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, 7));
+  return anchor.toISOString().slice(0, 10); // "2026-06-07"
 }
 
 async function _readConfigKeys(keys) {
