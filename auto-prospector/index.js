@@ -11136,6 +11136,30 @@ function _ensureWwwPrefix(domain) {
   return "www." + d;
 }
 
+// Conteo de envíos por GEO en los últimos N días — para la rotación día a día del agente.
+// La fila se crea con action:"reserved" y details.geo, y al confirmar el envío solo se
+// PATCHea el action → los details (con el geo) sobreviven en las filas sent/re_sent.
+// La clave se normaliza igual que _geoKey del selector (upper + slice(0,3)) para que matchee
+// los buckets. Falla suave: si no se puede leer, devuelve vacío → orden random como antes.
+async function _recentGeoSendCounts(token, userEmail, days = 7) {
+  const out = new Map();
+  try {
+    const since = new Date(Date.now() - days * 86_400_000).toISOString();
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,secondary_sent)&user_email=eq.${encodeURIComponent(userEmail)}&created_at=gte.${since}&select=details&limit=1000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!r.ok) return out;
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return out;
+    for (const row of rows) {
+      const g = String(row?.details?.geo || "?").toUpperCase().slice(0, 3);
+      out.set(g, (out.get(g) || 0) + 1);
+    }
+  } catch {}
+  return out;
+}
+
 async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
   // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
@@ -11398,11 +11422,20 @@ async function runAgentCycle(token, allFlags) {
     // Round-robin entre GEOs — 1 de cada país por vuelta hasta vaciar
     const mixed = [];
     const geoKeys = [...geoBuckets.keys()];
-    // Orden inicial de GEOs random también para que no caiga siempre BR primero
+    // Orden inicial de GEOs random para que no caiga siempre BR primero...
     for (let i = geoKeys.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [geoKeys[i], geoKeys[j]] = [geoKeys[j], geoKeys[i]];
     }
+    // ...y ROTACIÓN DÍA A DÍA (Maxi 2026-07-17, pedido del user): los GEOs menos enviados
+    // en los últimos 7 días van ADELANTE. El round-robin ya mezclaba países DENTRO de la
+    // tanda, pero no tenía memoria entre ciclos → un país con mucho pool (ej. USA, 43% de
+    // los pendientes) encabezaba día tras día. No excluye a NADIE: solo cambia el orden,
+    // así todos los países entran pero no se repiten los mismos todos los días.
+    // El shuffle de arriba queda como desempate: el sort de JS es estable, así que los GEOs
+    // con el mismo conteo conservan el orden random en vez de quedar fijos alfabéticamente.
+    const recentGeo = await _recentGeoSendCounts(token, userEmail);
+    geoKeys.sort((a, b) => (recentGeo.get(a) || 0) - (recentGeo.get(b) || 0));
     let safety = scored.length * 2;
     while (mixed.length < scored.length && safety-- > 0) {
       let progressed = false;
