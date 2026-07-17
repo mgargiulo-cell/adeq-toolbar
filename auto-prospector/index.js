@@ -3265,18 +3265,56 @@ async function _refreshGeoPoolCache(token) {
     _geoPoolCache.byGeo = byGeo;
   } catch {}
 }
-async function _isGeoOverrepresentedInPool(token, topCountryName, geosAll) {
-  await _refreshGeoPoolCache(token);
-  if (_geoPoolCache.totalPending < 50) return false; // pool chico, no aplicar
-  // Determinar ISO del lead actual
+// ISO del lead a partir de geos_all (ya ISO) o del topCountry (nombre). Extraído para que
+// la cuota Anglo use EXACTAMENTE la misma resolución que la saturación de pool.
+function _leadIso(topCountryName, geosAll) {
   let iso = "";
   if (Array.isArray(geosAll) && geosAll.length) iso = String(geosAll[0] || "").toUpperCase().slice(0, 2);
   if (!iso && topCountryName) {
-    // NAME → ISO
     const found = Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === topCountryName);
     if (found) iso = found;
     else iso = String(topCountryName).toUpperCase().slice(0, 2);
   }
+  return iso;
+}
+
+// ── CUOTA ANGLO EN EL DESCUBRIMIENTO (Maxi 2026-07-17, pedido del user) ──────────────
+// USA/UK/Canadá/Oceanía deben ser <10% de lo que ENTRA a Prospects por día: es el GEO que
+// el user menos trabaja y el que MÁS URLs tiene, así que sin cuota inunda el pool (llegó a
+// 43% = 788 de 1825 pendientes) y le tapa el lugar a LATAM.
+// Se mide sobre lo insertado en las últimas 24h ("el día a día", no el pool histórico, que
+// ya está contaminado). Marca next_day, NO skipped: mañana hay cuota nueva y el lead vuelve.
+const ANGLO_ISO = new Set(["US", "GB", "UK", "CA", "AU", "NZ", "IE"]);
+const ANGLO_DAILY_MAX_PCT = 0.10;
+const _angloCache = { ts: 0, total: 0, anglo: 0 };
+const _ANGLO_TTL = 5 * 60 * 1000;
+
+async function _isAngloOverDailyQuota(token, topCountryName, geosAll) {
+  const iso = _leadIso(topCountryName, geosAll);
+  if (!iso || !ANGLO_ISO.has(iso)) return false;   // no es Anglo → la cuota no aplica
+  if (Date.now() - _angloCache.ts > _ANGLO_TTL) {
+    try {
+      const since = new Date(Date.now() - 86_400_000).toISOString();
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&select=geo,geos_all&limit=3000`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (!r.ok) return false;                      // falla suave: no bloquear por un error de red
+      const rows = await r.json();
+      if (!Array.isArray(rows)) return false;
+      _angloCache.total = rows.length;
+      _angloCache.anglo = rows.filter(x => ANGLO_ISO.has(_leadIso(x.geo, x.geos_all))).length;
+      _angloCache.ts = Date.now();
+    } catch { return false; }
+  }
+  if (_angloCache.total < 20) return false;         // muestra chica → no aplicar (arranque del día)
+  return (_angloCache.anglo / _angloCache.total) >= ANGLO_DAILY_MAX_PCT;
+}
+
+async function _isGeoOverrepresentedInPool(token, topCountryName, geosAll) {
+  await _refreshGeoPoolCache(token);
+  if (_geoPoolCache.totalPending < 50) return false; // pool chico, no aplicar
+  const iso = _leadIso(topCountryName, geosAll);
   if (!iso) return false;
   const count = _geoPoolCache.byGeo.get(iso) || 0;
   const pct = count / _geoPoolCache.totalPending;
@@ -6736,6 +6774,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         error_message: `geo_saturated_in_pool: ${topCountry || "?"} >25% del pool (reintenta mañana)`,
       });
       log(`  ⚖️ ${domain} — GEO ${topCountry} saturado (>25%) → next_day (reintenta, no se pierde)`);
+      return;
+    }
+    // CUOTA ANGLO <10% del día (Maxi 2026-07-17). Va acá: es el primer punto donde ya
+    // conocemos el país (viene de SimilarWeb) y todavía NO gastamos el detector de Claude.
+    // El hit de RapidAPI ya está pago — es inevitable, el GEO no se sabe antes de pedirlo.
+    if (await _isAngloOverDailyQuota(token, topCountry, geosAllIso).catch(() => false)) {
+      await markCsvItem(token, item.id, "next_day", {
+        error_message: `anglo_daily_quota: ${topCountry || "?"} — Anglo ya es ≥${ANGLO_DAILY_MAX_PCT * 100}% de lo que entró hoy (reintenta mañana)`,
+      });
+      log(`  🌎 ${domain} — ${topCountry} (Anglo) fuera de cuota diaria ≥${ANGLO_DAILY_MAX_PCT * 100}% → next_day`);
       return;
     }
   }
@@ -11136,6 +11184,14 @@ function _ensureWwwPrefix(domain) {
   return "www." + d;
 }
 
+// Claves de bucket Anglo para el selector del agente. OJO: _geoKey hace upper+slice(0,3)
+// sobre geos_all[0] (que ya es ISO2 → "US") o sobre geo (que es NOMBRE → "UNI"), así que el
+// mismo país cae en claves distintas según qué campo tenga cargado el lead. Por eso se
+// contemplan las dos formas. "UNI" cubre United States y United Kingdom — ambos son Anglo,
+// así que la colisión no molesta para este uso. Maxi 2026-07-17.
+const _ANGLO_GEO_KEYS = new Set(["US", "GB", "UK", "CA", "AU", "NZ", "IE", "UNI", "CAN", "AUS", "NEW", "IRE"]);
+function _isAngloGeoKey(k) { return _ANGLO_GEO_KEYS.has(String(k || "").toUpperCase()); }
+
 // Conteo de envíos por GEO en los últimos N días — para la rotación día a día del agente.
 // La fila se crea con action:"reserved" y details.geo, y al confirmar el envío solo se
 // PATCHea el action → los details (con el geo) sobreviven en las filas sent/re_sent.
@@ -11436,6 +11492,10 @@ async function runAgentCycle(token, allFlags) {
     // con el mismo conteo conservan el orden random en vez de quedar fijos alfabéticamente.
     const recentGeo = await _recentGeoSendCounts(token, userEmail);
     geoKeys.sort((a, b) => (recentGeo.get(a) || 0) - (recentGeo.get(b) || 0));
+    // ANGLO AL FINAL (Maxi 2026-07-17, pedido del user): USA es el país que menos trabaja y
+    // el que más URLs tiene en el pool. NO se excluye —entra si sobra cupo del día— pero
+    // nunca encabeza. Sort estable → dentro de cada tramo se respeta la rotación de arriba.
+    geoKeys.sort((a, b) => (_isAngloGeoKey(a) ? 1 : 0) - (_isAngloGeoKey(b) ? 1 : 0));
     let safety = scored.length * 2;
     while (mixed.length < scored.length && safety-- > 0) {
       let progressed = false;
@@ -13511,8 +13571,13 @@ async function main() {
       // Reconciliación one-time de Monday para los 161 falsos-fallos del bug .ok
       // (flag agent_reconcile_monday_bounces; se auto-apaga al terminar).
       reconcileMondayBounces(token).catch(e => log(`⚠️ reconcile monday: ${e.message}`));
-      // Rescate de leads que recibieron el mail pero cuyo push a Monday falló (quedan
-      // invisibles en el CRM). Flag monday_rescue_enabled. Maxi 2026-07-17.
+    }
+
+    // Rescate de leads que recibieron el mail pero cuyo push a Monday falló (quedan
+    // invisibles en el CRM). Flag monday_rescue_enabled + cooldown propio de 10 min.
+    // Maxi 2026-07-17: FUERA del bloque `% 60` — cada deploy reinicia iterCount, así que
+    // con pushes seguidos nunca llegaba a 60 iters y el rescate no corría nunca.
+    if (iterCount % 15 === 0) {
       rescueFailedMondayPushes(token).catch(e => log(`⚠️ rescate monday: ${e.message}`));
     }
 
