@@ -4399,7 +4399,10 @@ const JUNK_LOCAL_TOKENS = /(^|[._-])(tenmien|tdns|dns|domain|domains|domaines|ho
 // (vistos en prod, ej vorname.name@weltwoche.ch = "nombre.apellido" en alemán). Separador
 // "." o "_". Un email con local "vorname.name"/"firstname.lastname"/etc. es una plantilla sin
 // rellenar, jamás un contacto real.
-const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$)/i;
+const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$|^(john|jane)[._]?doe$|^(john|jane)doe$|^doe$|^first$|^firstname$|^second$|^lastname$|^apellido$|^surname$|^prenom$|^vorname$|^insertname$|^changeme$)/i;
+// Maxi 2026-07-21 (auditoría 5 días): se estaban ENVIANDO placeholders reales que el regex no
+// cubría — jane.doe@pacoelchato.com (nombre de ejemplo), first@duic.nl ("first" suelto),
+// firstname/lastname/apellido sueltos. Todos rebote seguro → suman a los 68 rebotes del período.
 // Dominios de webmail (gmail, hotmail, etc. en cualquier TLD).
 const WEBMAIL_RE = /^(gmail|hotmail|outlook|live|yahoo|ymail|icloud|proton|protonmail|gmx|aol|msn|mail)\./i;
 
@@ -7431,6 +7434,21 @@ async function runSession(token, cfg, sessionStart) {
     pool = majesticFullPool;
     poolSource = "majestic-global";
   }
+  // Maxi 2026-07-21 (pedido del user: ≥50% LATAM): cuando el pool NO tiene target GEO (cae al
+  // 1M global, mayoría anglo → pool 36% anglo / 9,6% hispano), REORDENAR hispano-primero. Es un
+  // SESGO, no un filtro: nada se excluye, pero los dominios de TLD hispano se procesan ANTES, así
+  // entran a Prospects antes de que la sesión corte. Junto con la cuota Anglo <10% empuja el mix
+  // hacia LATAM. NO se puede garantizar 50% (depende de cuántos dominios hispanos tenga el 1M).
+  if (!hasTargetGeo && Array.isArray(pool) && pool.length > 1) {
+    const _isHisp = (d) => HISPANIC_TLDS.some(t => d.endsWith(t));
+    const _hisp = [], _rest = [];
+    for (const d of pool) (_isHisp(d) ? _hisp : _rest).push(d);
+    if (_hisp.length) {
+      pool = [..._hisp, ..._rest];
+      poolSource = "majestic-global-hispanic-first";
+      log(`  🌎 pool reordenado hispano-primero: ${_hisp.length.toLocaleString()} hispanos al frente de ${pool.length.toLocaleString()}`);
+    }
+  }
   log(`Fuente del pool: ${poolSource} (${pool.length.toLocaleString()} dominios totales)`);
 
   let apolloCallsThisSession = 0;
@@ -7943,6 +7961,12 @@ async function runSession(token, cfg, sessionStart) {
       adNetworks,
       pageTitle,
       createdBy:     sessionUser,
+      // Maxi 2026-07-21 FIX ATRIBUCIÓN: runSession NO pasaba source → TODO caía al default
+      // "autopilot" (875 Prospects en 5 días sin distinguir de dónde venían) y el yield de
+      // AutoGoogle marcaba 0 calificados. Ahora se etiqueta por el ORIGEN real del dominio:
+      // similar (de la API de similares), radar (Cloudflare Radar por país) o majestic.
+      source:        likedSimilarDomains.has(domain) ? "similar"
+                       : (poolSource.startsWith("radar") ? "radar" : "majestic"),
     });
     if (saveOk === "ok") {
       await markProcessed(token, [domain], "added_to_review");
@@ -11682,12 +11706,42 @@ async function runAgentCycle(token, allFlags) {
               });
             }
             const apolloEmail = apolloRes?.email ? [apolloRes.email] : [];
-            const merged = [...new Set([...apolloEmail, ...emails, ...scraped])];
+            // PASO 3 (Maxi 2026-07-21): FALLBACK Serper/Google contact. Es tu MEJOR fuente de
+            // email (google_contact = 32.6% de los envíos) pero SOLO corría en el qualify de
+            // runSession — nunca al enviar. Si ese día se topeó el cap de Serper, el Prospect
+            // llegaba acá sin email y el agente se rendía (no_email_after_enrichment = 210 en 5d,
+            // el 74% de los intentos). Ahora se reintenta acá, con el MISMO cap diario (250) y
+            // dedup compartido, SOLO si scrape+apollo no trajeron nada usable.
+            let serperEmails = [], serperPhone = "";
+            if (apolloEmail.length === 0 && scraped.length === 0) {
+              const _mDay = _madridNowParts().dateISO;
+              if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+              const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
+              if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
+                _serperContactTried.add(domain);
+                _serperContactCount++;
+                if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+                const g = await _serperContactSearch(domain).catch(() => null);
+                if (g?.emails?.length) serperEmails = g.emails;
+                if (g && !serperPhone) {
+                  if (g.whatsapps?.length) serperPhone = "wa:" + g.whatsapps[0];
+                  else if (g.phones?.length) serperPhone = g.phones[0];
+                }
+              }
+            }
+            const merged = [...new Set([...apolloEmail, ...emails, ...scraped, ...serperEmails])];
             const validated = await validateEmailsBatch(merged);
             if (validated.length > emails.length) {
               emails = validated;
               const patch = { emails: validated };
               if (apolloRes?.contact_name && !lead.contact_name) patch.contact_name = apolloRes.contact_name;
+              if (serperPhone && !lead.contact_phone) patch.contact_phone = serperPhone;
+              // Registrar la fuente de los emails de Serper para el ranking/atribución.
+              if (serperEmails.length) {
+                const _es = { ...(lead.email_sources || {}) };
+                for (const e of serperEmails) if (!_es[e.toLowerCase()]) _es[e.toLowerCase()] = "google_contact";
+                patch.email_sources = _es;
+              }
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
                 method: "PATCH",
                 headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },

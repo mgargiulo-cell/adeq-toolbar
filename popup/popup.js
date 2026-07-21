@@ -1983,6 +1983,11 @@ function _normalizeUserKey(raw) {
   return lower;
 }
 
+// Fuentes de import MANUAL (humano). Todo lo demás (autopilot/majestic/radar/similar/adstxt/
+// sellers_json/autogoogle/monday_refresh) es descubrimiento AUTÓNOMO del worker. Maxi 2026-07-21.
+const _MANUAL_SOURCES = new Set(["csv", "manual"]);
+function _isManualSource(s) { return _MANUAL_SOURCES.has(String(s || "").toLowerCase().trim()); }
+
 function _aggregateByUser(historial, usage, sessions, agentActions) {
   const byUser = new Map();
   TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), {
@@ -2007,7 +2012,11 @@ function _aggregateByUser(historial, usage, sessions, agentActions) {
     const u = _normalizeUserKey(h.user_email || h.created_by || h.media_buyer);
     const o = ensure(u);
     o.sites++;
-    if (h.source === "autopilot") o.autopilotSites++; else o.manualSites++;
+    // Maxi 2026-07-21: autónomo = TODA fuente de descubrimiento del worker (autopilot, majestic,
+    // radar, similar, adstxt, sellers_json, autogoogle, monday_refresh). Manual = solo import humano
+    // (csv/manual). Antes se comparaba === "autopilot" → al etiquetar por feeder real, los leads del
+    // worker caían mal en "manual".
+    if (_isManualSource(h.source)) o.manualSites++; else o.autopilotSites++;
     const g = (h.geo || "").trim();
     if (g) o.geos[g] = (o.geos[g] || 0) + 1;
     const c = (h.category || "").trim();
@@ -2272,7 +2281,7 @@ function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
     if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
     const o = byUser.get(u);
     o.sites++;
-    if (h.source === "autopilot") o.autopilotSites++;
+    if (!_isManualSource(h.source)) o.autopilotSites++;   // Maxi 2026-07-21: ver _isManualSource
     const g = (h.geo || "").trim();
     if (g) o.geos[g] = (o.geos[g] || 0) + 1;
     const c = (h.category || "").trim();
