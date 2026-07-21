@@ -3284,14 +3284,37 @@ function _leadIso(topCountryName, geosAll) {
 // 43% = 788 de 1825 pendientes) y le tapa el lugar a LATAM.
 // Se mide sobre lo insertado en las últimas 24h ("el día a día", no el pool histórico, que
 // ya está contaminado). Marca next_day, NO skipped: mañana hay cuota nueva y el lead vuelve.
-const ANGLO_ISO = new Set(["US", "GB", "UK", "CA", "AU", "NZ", "IE"]);
+// ── PRIORIDAD GEO POR NIVELES (Maxi 2026-07-21, pedido del user) ─────────────────────
+// Orden preestablecido para BÚSQUEDA y ENVÍO. Es una CASCADA: si no hay del nivel 1, pasa al
+// 2, y así hasta el último. El nivel 5 (Oceanía/USA/Norteamérica) además está CAPADO al 10%.
+//   1 LATAM (todo Sudamérica + México)    2 Centroamérica    3 España
+//   4 Europa (incl. UK) / Asia / África / MENA    5 Oceanía / USA / Canadá  (cap 10%)
+const GEO_TIER1_LATAM   = new Set(["AR","BR","CO","CL","PE","EC","VE","UY","PY","BO","MX"]);
+const GEO_TIER2_CENTRAL = new Set(["CR","PA","GT","HN","NI","SV","DO","CU","PR"]);
+const GEO_TIER3_SPAIN   = new Set(["ES"]);
+const GEO_TIER5_ANGLO   = new Set(["US","CA","AU","NZ"]);   // Oceanía + Norteamérica anglo → cap 10%
+// Tier 4 = TODO lo demás (Europa continental + UK/IE, Asia, África, MENA): fluye sin cap, pero
+// DESPUÉS de LATAM/Centroamérica/España. Un GEO desconocido cae acá (neutro, no capado).
+function _geoTier(iso) {
+  const c = String(iso || "").toUpperCase();
+  if (GEO_TIER1_LATAM.has(c))   return 1;
+  if (GEO_TIER2_CENTRAL.has(c)) return 2;
+  if (GEO_TIER3_SPAIN.has(c))   return 3;
+  if (GEO_TIER5_ANGLO.has(c))   return 5;
+  return 4;
+}
+
+// Cuota del nivel 5 (antes "Anglo"): USA/Canadá/Oceanía deben ser <10% de lo que ENTRA a
+// Prospects por día. Es el GEO que el user menos trabaja y el que MÁS URLs tiene (llegó a 43%
+// del pool). Se mide sobre lo insertado en las últimas 24h ("el día a día", no el pool histórico
+// ya contaminado). Marca next_day, NO skipped: mañana hay cuota nueva y el lead vuelve.
 const ANGLO_DAILY_MAX_PCT = 0.10;
 const _angloCache = { ts: 0, total: 0, anglo: 0 };
 const _ANGLO_TTL = 5 * 60 * 1000;
 
 async function _isAngloOverDailyQuota(token, topCountryName, geosAll) {
   const iso = _leadIso(topCountryName, geosAll);
-  if (!iso || !ANGLO_ISO.has(iso)) return false;   // no es Anglo → la cuota no aplica
+  if (!iso || _geoTier(iso) !== 5) return false;   // no es nivel 5 → la cuota no aplica
   if (Date.now() - _angloCache.ts > _ANGLO_TTL) {
     try {
       const since = new Date(Date.now() - 86_400_000).toISOString();
@@ -3303,7 +3326,7 @@ async function _isAngloOverDailyQuota(token, topCountryName, geosAll) {
       const rows = await r.json();
       if (!Array.isArray(rows)) return false;
       _angloCache.total = rows.length;
-      _angloCache.anglo = rows.filter(x => ANGLO_ISO.has(_leadIso(x.geo, x.geos_all))).length;
+      _angloCache.anglo = rows.filter(x => _geoTier(_leadIso(x.geo, x.geos_all)) === 5).length;
       _angloCache.ts = Date.now();
     } catch { return false; }
   }
@@ -11235,19 +11258,12 @@ function _ensureWwwPrefix(domain) {
   return "www." + d;
 }
 
-// Claves de bucket Anglo para el selector del agente. OJO: _geoKey hace upper+slice(0,3)
-// sobre geos_all[0] (que ya es ISO2 → "US") o sobre geo (que es NOMBRE → "UNI"), así que el
-// mismo país cae en claves distintas según qué campo tenga cargado el lead. Por eso se
-// contemplan las dos formas. "UNI" cubre United States y United Kingdom — ambos son Anglo,
-// así que la colisión no molesta para este uso. Maxi 2026-07-17.
-const _ANGLO_GEO_KEYS = new Set(["US", "GB", "UK", "CA", "AU", "NZ", "IE", "UNI", "CAN", "AUS", "NEW", "IRE"]);
-function _isAngloGeoKey(k) { return _ANGLO_GEO_KEYS.has(String(k || "").toUpperCase()); }
-
-// Conteo de envíos por GEO en los últimos N días — para la rotación día a día del agente.
+// Conteo de envíos por GEO (ISO2) en los últimos N días — para la rotación día a día del agente.
 // La fila se crea con action:"reserved" y details.geo, y al confirmar el envío solo se
 // PATCHea el action → los details (con el geo) sobreviven en las filas sent/re_sent.
-// La clave se normaliza igual que _geoKey del selector (upper + slice(0,3)) para que matchee
-// los buckets. Falla suave: si no se puede leer, devuelve vacío → orden random como antes.
+// Clave = ISO2 vía _leadIso (misma que _geoKey del selector) para que matcheen los buckets.
+// Maxi 2026-07-21: antes era el nombre truncado a 3 chars; ahora ISO2 canónico (prioridad por nivel).
+// Falla suave: si no se puede leer, devuelve vacío → orden random como antes.
 async function _recentGeoSendCounts(token, userEmail, days = 7) {
   const out = new Map();
   try {
@@ -11260,7 +11276,7 @@ async function _recentGeoSendCounts(token, userEmail, days = 7) {
     const rows = await r.json();
     if (!Array.isArray(rows)) return out;
     for (const row of rows) {
-      const g = String(row?.details?.geo || "?").toUpperCase().slice(0, 3);
+      const g = _leadIso(row?.details?.geo, row?.details?.geos_all) || "??";
       out.set(g, (out.get(g) || 0) + 1);
     }
   } catch {}
@@ -11509,10 +11525,10 @@ async function runAgentCycle(token, allFlags) {
     //
     // Ejemplo: si pool tiene [50 BR, 30 AR, 20 ES, 10 IT], el agente del día
     // sale con 6 BR + 6 AR + 6 ES + 6 IT + 1 más (= 25 emails balanceados).
-    const _geoKey = (c) => {
-      if (Array.isArray(c.geos_all) && c.geos_all.length) return String(c.geos_all[0] || "?").toUpperCase().slice(0,3);
-      return String(c.geo || "?").toUpperCase().slice(0,3);
-    };
+    // Maxi 2026-07-21: clave = ISO2 canónico (antes nombre truncado a 3 chars, que colisionaba
+    // y no se podía mapear a nivel). Así el bucket, la rotación (_recentGeoSendCounts) y el nivel
+    // (_geoTier) hablan el mismo idioma.
+    const _geoKey = (c) => _leadIso(c.geo, c.geos_all) || "??";
     const geoBuckets = new Map();
     for (const c of scored) {
       const g = _geoKey(c);
@@ -11534,19 +11550,19 @@ async function runAgentCycle(token, allFlags) {
       const j = Math.floor(Math.random() * (i + 1));
       [geoKeys[i], geoKeys[j]] = [geoKeys[j], geoKeys[i]];
     }
-    // ...y ROTACIÓN DÍA A DÍA (Maxi 2026-07-17, pedido del user): los GEOs menos enviados
-    // en los últimos 7 días van ADELANTE. El round-robin ya mezclaba países DENTRO de la
-    // tanda, pero no tenía memoria entre ciclos → un país con mucho pool (ej. USA, 43% de
-    // los pendientes) encabezaba día tras día. No excluye a NADIE: solo cambia el orden,
-    // así todos los países entran pero no se repiten los mismos todos los días.
-    // El shuffle de arriba queda como desempate: el sort de JS es estable, así que los GEOs
-    // con el mismo conteo conservan el orden random en vez de quedar fijos alfabéticamente.
+    // PRIORIDAD POR NIVELES + rotación (Maxi 2026-07-21, pedido del user). Orden final del
+    // round-robin, en CASCADA: nivel 1 (LATAM) → 2 (Centroamérica) → 3 (España) → 4 (Europa/
+    // Asia/África) → 5 (Oceanía/USA/Canadá). Como el round-robin saca 1 país por vuelta en este
+    // orden, si un nivel se agota sigue con el siguiente (fallback natural), y el nivel 5 queda
+    // último (además capado al 10% en el descubrimiento). DENTRO de cada nivel, desempata la
+    // rotación 7d: el país menos enviado va antes → no se repiten los mismos día a día. El
+    // shuffle de arriba desempata lo que quede igual (sort estable → no queda fijo alfabético).
     const recentGeo = await _recentGeoSendCounts(token, userEmail);
-    geoKeys.sort((a, b) => (recentGeo.get(a) || 0) - (recentGeo.get(b) || 0));
-    // ANGLO AL FINAL (Maxi 2026-07-17, pedido del user): USA es el país que menos trabaja y
-    // el que más URLs tiene en el pool. NO se excluye —entra si sobra cupo del día— pero
-    // nunca encabeza. Sort estable → dentro de cada tramo se respeta la rotación de arriba.
-    geoKeys.sort((a, b) => (_isAngloGeoKey(a) ? 1 : 0) - (_isAngloGeoKey(b) ? 1 : 0));
+    geoKeys.sort((a, b) => {
+      const ta = _geoTier(a), tb = _geoTier(b);
+      if (ta !== tb) return ta - tb;                                   // nivel manda
+      return (recentGeo.get(a) || 0) - (recentGeo.get(b) || 0);        // dentro del nivel: rotación 7d
+    });
     let safety = scored.length * 2;
     while (mixed.length < scored.length && safety-- > 0) {
       let progressed = false;
