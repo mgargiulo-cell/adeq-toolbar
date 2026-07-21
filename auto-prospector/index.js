@@ -9402,6 +9402,21 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           }
         } catch {}
       }
+      // Maxi 2026-07-21: FALLBACK Serper/Google contact también en el rescate del REBOTE. Es tu
+      // mejor fuente de email (google_contact 32.6%) y acá faltaba — si scrape+apollo no dieron un
+      // alternativo, Serper suele encontrarlo. Mismo cap diario (250) y dedup compartido.
+      if (newEmails.size === 0) {
+        const _mDay = _madridNowParts().dateISO;
+        if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+        const _ccap = parseInt((cfg2.serper_contact_daily_cap) || "250", 10) || 250;
+        if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
+          _serperContactTried.add(domain);
+          _serperContactCount++;
+          if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+          const g = await _serperContactSearch(domain).catch(() => null);
+          if (g?.emails?.length) g.emails.forEach(e => { if (e && e.toLowerCase() !== bouncedEmail.toLowerCase()) newEmails.add(e.toLowerCase()); });
+        }
+      }
       // Filtrar lo que ya bounced o garbage
       const rescued = [...newEmails].filter(e => !isBouncedSync(e) && rankEmail(e, domain, lead.category || "") >= 0);
       if (rescued.length > 0) {
