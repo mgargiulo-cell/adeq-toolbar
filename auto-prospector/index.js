@@ -10735,19 +10735,34 @@ const CATEGORY_TARGET_ROLES = {
 // API: GET https://api.millionverifier.com/api/v3/?api=KEY&email=EMAIL
 const _mvCache = new Map();
 const MV_CACHE_MAX = 8000;
+// TECHO ABSOLUTO hardcoded (Maxi 2026-07-24, pedido del user): ni la config ni un leak pueden pasar
+// de esto. 10.500 créditos / 90 días = 116/día break-even → 100 garantiza los 3 meses con margen.
+// Para subirlo hace falta un deploy (fuerza intención, no se cambia por accidente desde la DB).
+const MV_ABS_DAILY_MAX = 100;
 let _mvDay = "", _mvCount = 0;
 async function _verifyEmailMV(token, cfg, email) {
-  const key = String(cfg?.millionverifier_api_key || "").trim();
+  // Key: ENV de Railway PRIMERO (nunca toca la DB, no la lee la extensión/anon) → luego config.
+  // Igual que SERPER_API_KEY. Recomendado: ponerla en env y sacarla de toolbar_config.
+  const key = String(process.env.MILLIONVERIFIER_API_KEY || cfg?.millionverifier_api_key || "").trim();
   if (!key) return true;                                   // DORMIDA: sin key = enviar (hoy)
   const lower = String(email || "").toLowerCase();
   if (!lower.includes("@")) return true;
   if (_mvCache.has(lower)) return _mvCache.get(lower);
   const day = _madridNowParts().dateISO;
-  if (_mvDay !== day) { _mvDay = day; _mvCount = 0; }
-  const cap = parseInt(cfg.millionverifier_daily_cap || "300", 10) || 300;   // control de costo
-  if (_mvCount >= cap) return true;                        // cap diario → fail-open
+  // Cap DURABLE: al cambiar de día O tras un RESTART (_mvDay arranca ""), re-siembra el contador desde
+  // el valor PERSISTIDO (millionverifier_used="YYYY-MM-DD:N"). Sin esto, cada reinicio del worker
+  // reseteaba _mvCount a 0 → el cap se podía reventar N veces al día (el leak interno que preocupaba).
+  if (_mvDay !== day) {
+    _mvDay = day;
+    const persisted = String(cfg.millionverifier_used || "");
+    _mvCount = persisted.startsWith(day + ":") ? (parseInt(persisted.split(":")[1], 10) || 0) : 0;
+  }
+  // Cap efectivo = min(config, techo absoluto). El techo hardcoded manda aunque la config quede alta.
+  const cap = Math.min(parseInt(cfg.millionverifier_daily_cap || "100", 10) || 100, MV_ABS_DAILY_MAX);
+  if (_mvCount >= cap) return true;                        // cap diario → fail-open (NO gasta)
   _mvCount++;
-  if (_mvCount % 20 === 0) setConfigValue(token, "millionverifier_used", `${day}:${_mvCount}`).catch(() => {});
+  // Persistir SIEMPRE (no cada 20) → un restart no pierde la cuenta del día. ~60 writes/día = nada.
+  setConfigValue(token, "millionverifier_used", `${day}:${_mvCount}`).catch(() => {});
   try {
     const r = await fetch(`https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(key)}&email=${encodeURIComponent(lower)}&timeout=10`, { signal: AbortSignal.timeout(12000) });
     if (!r.ok) return true;                                // error API → fail-open
@@ -10756,6 +10771,13 @@ async function _verifyEmailMV(token, cfg, email) {
     const deliverable = !(res === "invalid" || res === "disposable");  // bloquea SOLO lo claramente malo
     if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
     _mvCache.set(lower, deliverable);
+    // Maxi 2026-07-24: registrar el resultado de CADA verificación → medir el ROI (¿cuánta basura
+    // real agarra vs plata tirada?). Fire-and-forget, no frena el envío.
+    fetch(`${SUPABASE_URL}/rest/v1/toolbar_mv_results`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ domain: lower.split("@")[1] || "", email: lower, result: res, quality: String(j?.quality || "").toLowerCase(), blocked: !deliverable }),
+    }).catch(() => {});
     if (!deliverable) log(`  🚫 MV: ${lower} = ${res} (no entregable) → skip envío`);
     return deliverable;
   } catch { return true; }                                 // timeout/red → fail-open
