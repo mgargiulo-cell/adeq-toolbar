@@ -10726,6 +10726,41 @@ const CATEGORY_TARGET_ROLES = {
   automotive:   /^(marketing|comercial|publicidad|sales|director|gerente)/,
 };
 
+// ── VERIFICACIÓN DE ENTREGABILIDAD (MillionVerifier) — Maxi 2026-07-24 ────────────────
+// DORMIDA por default: sin `millionverifier_api_key` en config devuelve true (= comportamiento
+// de hoy, no cambia nada). Cuando el user cargue la key, se activa sola y verifica el buzón
+// ANTES de enviar. Objetivo: matar el rebote que quema la reputación del dominio (bounce 17%→~0).
+// FAIL-OPEN en TODO lo dudoso (sin key, cap alcanzado, timeout, error, catch_all, unknown) →
+// enviar igual. Solo BLOQUEA lo confirmado malo: result "invalid" o "disposable".
+// API: GET https://api.millionverifier.com/api/v3/?api=KEY&email=EMAIL
+const _mvCache = new Map();
+const MV_CACHE_MAX = 8000;
+let _mvDay = "", _mvCount = 0;
+async function _verifyEmailMV(token, cfg, email) {
+  const key = String(cfg?.millionverifier_api_key || "").trim();
+  if (!key) return true;                                   // DORMIDA: sin key = enviar (hoy)
+  const lower = String(email || "").toLowerCase();
+  if (!lower.includes("@")) return true;
+  if (_mvCache.has(lower)) return _mvCache.get(lower);
+  const day = _madridNowParts().dateISO;
+  if (_mvDay !== day) { _mvDay = day; _mvCount = 0; }
+  const cap = parseInt(cfg.millionverifier_daily_cap || "300", 10) || 300;   // control de costo
+  if (_mvCount >= cap) return true;                        // cap diario → fail-open
+  _mvCount++;
+  if (_mvCount % 20 === 0) setConfigValue(token, "millionverifier_used", `${day}:${_mvCount}`).catch(() => {});
+  try {
+    const r = await fetch(`https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(key)}&email=${encodeURIComponent(lower)}&timeout=10`, { signal: AbortSignal.timeout(12000) });
+    if (!r.ok) return true;                                // error API → fail-open
+    const j = await r.json().catch(() => null);
+    const res = String(j?.result || "").toLowerCase();
+    const deliverable = !(res === "invalid" || res === "disposable");  // bloquea SOLO lo claramente malo
+    if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
+    _mvCache.set(lower, deliverable);
+    if (!deliverable) log(`  🚫 MV: ${lower} = ${res} (no entregable) → skip envío`);
+    return deliverable;
+  } catch { return true; }                                 // timeout/red → fail-open
+}
+
 function rankEmail(email, siteDomain, leadCategory = "") {
   if (!email || typeof email !== "string" || !email.includes("@")) return -1;
   const lower = email.toLowerCase();
@@ -12213,6 +12248,21 @@ async function runAgentCycle(token, allFlags) {
             }).catch(() => {});
           }
           continue; // próximo lead
+        }
+        // Maxi 2026-07-24: verificación de entregabilidad (MillionVerifier). DORMIDA hasta que
+        // el user cargue millionverifier_api_key → sin key devuelve true y NO cambia nada. Con
+        // key: si el buzón es invalid/disposable, NO enviamos (evita el rebote) y marcamos el
+        // email como bounced local para que NO se re-elija y el re-enrich busque otro contacto.
+        if (!(await _verifyEmailMV(token, cfg, email))) {
+          if (reservedId) {
+            fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ action: "skipped", reason: "mv_undeliverable" }),
+            }).catch(() => {});
+          }
+          markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+          continue; // próximo lead — el re-enrich le buscará otro email
         }
         await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId });
 
