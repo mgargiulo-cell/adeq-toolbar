@@ -10820,6 +10820,13 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   else if (EXEC.test(local))       { score += 90; matchedRole = "EXEC"; }       // CEO/founder = jackpot
   else if (COMMERCIAL.test(local)) { score += 80; matchedRole = "COMMERCIAL"; }
   else if (EDITORIAL.test(local))  { score += 60; matchedRole = "EDITORIAL"; }
+  // Maxi 2026-07-24 (auditoría respuestas 22-24): direcciones de DEPARTAMENTO / atención al
+  // cliente que NO son contacto de venta de pauta y ni rebotan ni responden a un pitch de
+  // inventario (denuncias@, soporte.epaper@, bok@, cskh@, rrhh@, cobranzas@…). Antes caían en
+  // PERSON (+70, por el punto en "soporte.epaper") o PERSON_LIKELY (+55, "denuncias") y le
+  // GANABAN a un contacto real. Ahora +8: sendables como ÚLTIMO recurso (North Star: ≥1 email),
+  // pero pierden contra cualquier persona/rol comercial. Chequeado ANTES del patrón nombre.apellido.
+  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|denuncias?|reclamos?|reclama[cç][õo]es|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|legal|privacy|privacidad|privacidade|\bdpo\b|abuse|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|servicios?|servico|service|helpdesk|help)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
   // Pattern firstname.lastname (juan.perez@x.com) = persona real
   else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) { score += 70; matchedRole = "PERSON"; }
   // Pattern firstinitial+lastname (jperez@x.com, mgarcia@x.com) = común corp
