@@ -2742,6 +2742,27 @@ async function runReenrichBadLeads(token) {
           } catch (e) { log(`  ⚠️ apollo ${lead.domain}: ${e.message}`); }
         }
 
+        // 3) Maxi 2026-07-24: FALLBACK Serper/Google contact — la MEJOR fuente (google_contact
+        // 32.6%) faltaba en el re-barrido, por eso los ~375 sin email nunca la probaron. Ahora,
+        // si scrape+Apollo no encontraron nada, se reintenta con Serper (mismo cap 250/día y dedup
+        // compartido con qualify/envío/rescate). Esto es lo que "sofistica la identificación": las
+        // 4 vías que buscan email ya usan las mismas 3 fuentes.
+        if (!foundEmail) {
+          const _mDay = _madridNowParts().dateISO;
+          if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+          const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
+          if (_serperContactCount < _ccap && !_serperContactTried.has(lead.domain)) {
+            _serperContactTried.add(lead.domain);
+            _serperContactCount++;
+            if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+            const g = await _serperContactSearch(lead.domain).catch(() => null);
+            if (g?.emails?.length) {
+              const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, lead.domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+              if (gr.length) { foundEmail = gr[0].email; foundSource = "google_contact"; }
+            }
+          }
+        }
+
         if (foundEmail) {
           const existing = Array.isArray(lead.emails) ? lead.emails : [];
           const merged = [foundEmail, ...existing.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
@@ -6846,11 +6867,14 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       log(`  🏭 ${domain} — GEO ${topCountry || iso} EXCLUIDO por config del worker`);
       return;
     }
-    if (geoPri.length && !geoMatches(geoPri)) {
-      await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_not_priority:${topCountry || iso}` });
-      log(`  🏭 ${domain} — GEO ${topCountry || iso} no está en la prioridad del worker`);
-      return;
-    }
+    // Maxi 2026-07-24 BUG FIX: geos_priority YA NO es un filtro DURO acá. Estaba descartando TODO
+    // lo que no fuera LATAM+Europa (699 skips en 3 días, "worker_geo_not_priority") — incluyendo
+    // Asia/África/MENA, que son NIVEL 4 y el user SÍ los quiere (abajo de LATAM, arriba de Anglo).
+    // La prioridad ahora la maneja el sistema de niveles: la cuota nivel-5 (_isAngloOverDailyQuota,
+    // <10%) frena USA/Canadá/Oceanía, la cascada _geoTier ordena el ENVÍO (LATAM primero), y el
+    // turno hispano + el sesgo de Majestic empujan LATAM en el descubrimiento. geos_priority queda
+    // SOLO como sesgo blando del feeder Majestic (front-load), no como excluyente.
+    // (geoExcluded sigue vivo: si el user EXPLÍCITAMENTE excluye un GEO, se respeta arriba.)
     if (catPri.length && category && !catPri.some(c => category.toLowerCase().includes(c))) {
       await markCsvItem(token, item.id, "skipped", { error_message: `worker_cat_not_priority:${category}` });
       log(`  🏭 ${domain} — categoría "${category}" no está en la prioridad del worker`);
@@ -10733,6 +10757,17 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // buzón real → rebotó 4/4 (cnnturk/expansion/arealme/vetogate). El ranking lo tomaba como EXEC (+90)
   // y lo mandaba primero. Un dueño real escribe desde su nombre, no owner@. Reject (source-agnóstico).
   if (/^owner$/.test(local)) return -1;
+  // Maxi 2026-07-24 (auditoría 22-24/07): casos basura que SÍ se enviaron.
+  //  a) local de UNA sola letra ("a@olm.vn") → scrape roto, nunca un buzón real.
+  if (/^[a-z0-9]$/i.test(local)) return -1;
+  //  b) roles genéricos que NO son contacto comercial: cuenta/account (corotos.com.do → cuenta@gmail),
+  //     alumno/student/estudiante (sportlife → alumno@), socio/member, cliente/customer. Reject duro.
+  if (/^(cuenta|account|alumno|alumna|student|estudiante|aluno|socio|member|miembro|cliente|customer|usuario|user|abonado|suscriptor|subscriber|lector|reader|visitante|visitor)s?$/i.test(local)) return -1;
+  //  c) FREEMAIL (gmail/hotmail/…) cuyo local es una palabra genérica de contacto — un negocio real
+  //     no usa cuenta@gmail/info@gmail para vender. Si es freemail Y el local es genérico → reject.
+  //     (Un freemail con NOMBRE de persona —juanperez@gmail— sigue pasando: puede ser un medio chico.)
+  //     Regex inline: la const isFreeWebmail se declara más abajo (evita TDZ).
+  if (/^(gmail|yahoo|ymail|hotmail|outlook|live|aol|icloud|protonmail|gmx|yandex)\.|^mail\.ru$/i.test(dom) && _isGenericLocalPart(`${local}@x.com`)) return -1;
 
   let score = 0;
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
