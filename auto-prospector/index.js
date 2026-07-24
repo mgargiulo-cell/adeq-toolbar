@@ -11315,7 +11315,12 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     ...(payload.phone && _mondayPhoneIso(payload.geo)
       ? { [MONDAY_COL_PHONE]: { phone: String(payload.phone), countryShortName: _mondayPhoneIso(payload.geo) } }
       : {}),
-    // NO incluir Comentarios — el user no quiere el pitch ahí.
+    // Maxi 2026-07-21 (pedido del user): marcar Comentarios="Agente" en TODO item del agente,
+    // para diferenciar sus negociaciones de las que carga un MB a mano (el push manual —
+    // modules/monday.js pushToMonday— deja Comentarios en blanco). NO es el pitch: es solo la
+    // etiqueta de origen. El MB puede editar el comentario después sin que se re-sobrescriba
+    // (esto solo corre al CREAR el item).
+    [MONDAY_COL_PITCH]: "Agente",
   };
   if (payload.phone && !_mondayPhoneIso(payload.geo)) {
     log(`  ℹ️ Monday ${payload.domain}: sin ISO para el GEO "${payload.geo || "?"}" → push SIN teléfono (el lead entra igual)`);
