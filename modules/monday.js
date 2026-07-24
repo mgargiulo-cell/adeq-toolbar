@@ -114,8 +114,11 @@ export async function pushToMonday(data) {
 
   const personId = resolveMondayPerson(ejecutivo, loginEmail);
 
-  // Comentarios: NO se incluye pitch — decisión user 2026-05-12 (igual que agente).
+  // Comentarios = ORIGEN del lead (Maxi 2026-07-21, pedido del user): push MANUAL del MB → "Manual".
+  // El push del AGENTE (auto-prospector: pushToMondayServer) escribe "Agente". Desde hoy TODO item
+  // lleva identificación en Comentarios. NO es el pitch (eso el user no lo quiere ahí).
   const columnValues = {
+    [CONFIG.MONDAY_COLUMNS.comentarios]:   "Manual",
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
