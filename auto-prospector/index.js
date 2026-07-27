@@ -4443,7 +4443,16 @@ const JUNK_LOCAL_TOKENS = /(^|[._-])(tenmien|tdns|dns|domain|domains|domaines|ho
 // (vistos en prod, ej vorname.name@weltwoche.ch = "nombre.apellido" en alemán). Separador
 // "." o "_". Un email con local "vorname.name"/"firstname.lastname"/etc. es una plantilla sin
 // rellenar, jamás un contacto real.
-const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$|^(john|jane)[._]?doe$|^(john|jane)doe$|^doe$|^first$|^firstname$|^second$|^lastname$|^apellido$|^surname$|^prenom$|^vorname$|^insertname$|^changeme$)/i;
+const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$|^(john|jane)[._]?doe$|^(john|jane)doe$|^doe$|^first$|^firstname$|^second$|^lastname$|^apellido$|^surname$|^prenom$|^vorname$|^insertname$|^changeme$|etunimi[._]sukunimi|imie[._]nazwisko|keresztnev[._]vezeteknev|^cuenta$|^conta$|^correo$|^utente$|^alumn[oa]s?$|^alun[oa]s?$|^estudiantes?$|^students?$|^matricula$|^android$|^ios$|^apk$|^app$|^apps$|^appstore$|^playstore$)/i;
+// Maxi 2026-07-27 (auditoría de envíos reales 21-27): los términos agregados arriba son casos
+// TEXTUALES que recibieron un pitch en esta tanda y que el regex original no cubría:
+//   etunimi.sukunimi@sanoma.com → "nombre.apellido" en FINLANDÉS: es el ejemplo que la propia web
+//                                 publica para explicar su formato de casilla. La dirección no existe.
+//   cuenta@gmail.com            → literalmente eso, copiado de un instructivo del sitio
+//   alumno@sportlife.cl         → buzón de alumnado, jamás compra pauta (y encima cross-dominio)
+//   android@eurosport.com       → buzón de la app móvil, no es contacto comercial
+// Todos entraban como PERSON (+70) o SINGLE_NAME (+30) y le ganaban a un contacto real del sitio.
+// + variantes de "nombre.apellido" en polaco (imie.nazwisko) y húngaro, que están en el pool N4.
 // Maxi 2026-07-21 (auditoría 5 días): se estaban ENVIANDO placeholders reales que el regex no
 // cubría — jane.doe@pacoelchato.com (nombre de ejemplo), first@duic.nl ("first" suelto),
 // firstname/lastname/apellido sueltos. Todos rebote seguro → suman a los 68 rebotes del período.
@@ -10492,6 +10501,7 @@ const _GL_LOCAL_PARTS = [
   "monitoring","alerts?","incident","incidents",
 ];
 const GARBAGE_LOCAL = new RegExp("^(?:" + _GL_LOCAL_PARTS.join("|") + ")@", "i");
+
 // Cualquier ocurrencia dentro del local-part también descarta. Captura variantes
 // nuevas tipo "trustandsafety", "gdpr-mask-2025", "protect-domain", etc.
 const GARBAGE_LOCAL_CONTAINS = new RegExp([
@@ -10829,6 +10839,9 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
+  // Local-part de 1-2 caracteres ("a@olm.vn", "66@manhuaren.com") = artefacto de scrape,
+  // nunca un contacto real. Se permiten 2 chars solo si son iniciales con punto (j.p@).
+  if (local.replace(/[._-]/g, "").length <= 2) return -1;
   if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) return -1; // Capa 3: keywords/subdominios garbage
 
   // Malformed local-part: contiene TLD (.com/.net/.io/etc) → scrape artifact
@@ -11766,9 +11779,24 @@ async function runAgentCycle(token, allFlags) {
         const _hintDisagrees = _hintDet.lang !== "en"
           && _hintDet.lang !== leadLanguage
           && SUPPORTED_AGENT_LANGS.has(_hintDet.lang);
+        // Maxi 2026-07-27 (auditoría de envíos reales) BUG GRAVE: el cross-check de arriba solo
+        // se dispara si el HINT sugiere un idioma ≠ inglés. Cuando el idioma guardado está mal y
+        // el GEO no está en GEO_TO_LANG_AGENT, el hint devuelve "en" por la regla dura, con lo cual
+        // _hintDisagrees=false y NO se re-detecta: el idioma erróneo sale tal cual.
+        // Casos reales de esta tanda: pieseauto.ro y didactic.ro (Rumania) y raketa.hu (Hungría)
+        // recibieron el pitch en PORTUGUÉS; nownews.com (Taiwán) también. Mail en idioma
+        // equivocado quema el dominio para siempre.
+        // Ahora: si el lead dice un idioma específico (es/pt/it/ar) y el GEO/TLD NO lo respalda,
+        // no hay una sola señal que confirme ese idioma → verificar contra la página real.
+        // No agrega fetches en el caso sano (España→es, Brasil→pt: el hint coincide y no entra).
+        const _storedNotBackedByGeo = leadLanguage
+          && leadLanguage !== "en"
+          && SUPPORTED_AGENT_LANGS.has(leadLanguage)
+          && _hintDet.lang !== leadLanguage;
         const needLangFetch = !leadLanguage
           || !SUPPORTED_AGENT_LANGS.has(leadLanguage)
-          || _hintDisagrees;
+          || _hintDisagrees
+          || _storedNotBackedByGeo;
         if (needLangFetch) {
           _pageContent = await fetchPageContent(domain).catch(() => null);
           if (_pageContent) {
