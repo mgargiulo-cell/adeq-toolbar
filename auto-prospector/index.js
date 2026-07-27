@@ -11896,7 +11896,21 @@ async function runAgentCycle(token, allFlags) {
             // el 74% de los intentos). Ahora se reintenta acá, con el MISMO cap diario (250) y
             // dedup compartido, SOLO si scrape+apollo no trajeron nada usable.
             let serperEmails = [], serperPhone = "";
-            if (apolloEmail.length === 0 && scraped.length === 0) {
+            // Maxi 2026-07-27 (auditoría 23-27) BUG: la condición era
+            //   `apolloEmail.length === 0 && scraped.length === 0`
+            // o sea, se medía CANTIDAD y no CALIDAD. Si el scrape devolvía UN solo email inservible
+            // (noreply@, un webmaster@, un mail que rankEmail puntúa negativo), `scraped.length > 0`
+            // y Serper —la mejor fuente, 32.6% de los envíos— NO se ejecutaba nunca. Después el
+            // ranking filtra por `score >= 0`, se queda sin candidatos y el lead muere en
+            // no_email_after_enrichment CON emails_count > 0. Era el caso más común de los 173 skips.
+            // Ahora se dispara por CALIDAD: si nada de lo que tenemos llega a score 50
+            // (commercial-grade), pedimos Serper igual. Sigue capeado a 250/día y deduplicado
+            // por dominio, así que el techo de gasto no cambia.
+            const _bestBeforeSerper = Math.max(
+              ...[...apolloEmail, ...emails, ...scraped].map(e => rankEmail(e, domain, lead.category)),
+              -100
+            );
+            if (_bestBeforeSerper < 50) {
               const _mDay = _madridNowParts().dateISO;
               if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
               const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
@@ -11914,7 +11928,14 @@ async function runAgentCycle(token, allFlags) {
             }
             const merged = [...new Set([...apolloEmail, ...emails, ...scraped, ...serperEmails])];
             const validated = await validateEmailsBatch(merged);
-            if (validated.length > emails.length) {
+            // Maxi 2026-07-27 (auditoría 23-27) BUG: el gate era `validated.length > emails.length`,
+            // o sea comparaba TAMAÑO de array. Si el enrichment encontraba un email NUEVO y bueno
+            // (publicidad@) pero la validación descartaba uno viejo, el array quedaba del mismo
+            // largo y se tiraba TODO el enrichment a la basura — incluido el email bueno. Ahora el
+            // gate es "¿apareció algún email que no teníamos?", que es la pregunta real.
+            const _lowerOld = new Set(emails.map(e => e.toLowerCase()));
+            const _newFound = validated.filter(v => !_lowerOld.has(v.toLowerCase()));
+            if (_newFound.length > 0) {
               emails = validated;
               const patch = { emails: validated };
               if (apolloRes?.contact_name && !lead.contact_name) patch.contact_name = apolloRes.contact_name;
