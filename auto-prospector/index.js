@@ -5709,7 +5709,21 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   // NO pasa (antes con !pageContent devolvía ok:true = "beneficio de la duda" y estos se colaban a Prospects:
   // zd.blog.jp, gamepress.gg, eiga.com). fetchPageContent marca dead:true solo en fallas DURAS (no timeouts).
   if (pageContent?.dead) return { ok: false, reason: `unreachable:${pageContent.deadReason || "dead"}` };
-  if (!pageContent) return { ok: true, reason: "no_pagecontent" };
+  // Maxi 2026-07-27 (auditoría del pool): ACÁ SE COLABA LA BASURA. Si no pudimos bajar la home
+  // (Cloudflare, sitio 100% JS, timeout), esto devolvía ok:true y el dominio entraba al pool SIN
+  // NINGUNA clasificación — ni título, ni schema, ni IA. Medido: 39,4% del pool quedó en categoría
+  // "other" (1.194 leads) y ahí adentro viven akamai.com, abanca.pt, bccr.fi.cr (Banco Central de
+  // Costa Rica), cerballiance.fr (laboratorios), 10federalstorage.com (self-storage).
+  // El dato de SimilarWeb SÍ lo teníamos, pero el chequeo estaba más abajo y nunca se alcanzaba.
+  // Ahora: sin home, decidimos con lo único que tenemos. Si SimilarWeb dice que es medio → pasa;
+  // si dice cualquier otra cosa, o no dice nada, NO entra a ciegas.
+  if (!pageContent) {
+    const _swc = (swCategory || "").toLowerCase();
+    if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(_swc)) {
+      return { ok: true, reason: `no_pagecontent_but_sw_pub:${_swc.slice(0, 20)}` };
+    }
+    return { ok: false, reason: `no_pagecontent_unverifiable${_swc ? `:sw_${_swc.slice(0, 20)}` : ""}` };
+  }
   // Maxi 2026-07-08: TIPO DE SITIO no-publisher estructural (tienda/banco/universidad/viajes/
   // ONG/servicios) → NO es target. Rechazo TEMPRANO, ANTES de la señal positiva de ads, porque
   // estos sitios corren retargeting/ads.txt y se colaban (leroymerlin, defacto, n26, ipsos,
@@ -5742,6 +5756,16 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   // 4. Haiku no respondió / "other". Si hay monetización real → publisher; si no, PASA (no agresivo)
   //    y que el MB lo rechace a mano.
   if (monetized) return { ok: true, reason: pageContent?.hasProgrammatic ? "programmatic_ads" : "ads_monetized" };
+  // Maxi 2026-07-27: SEGUNDA puerta por la que se colaba basura. Acá llegamos con CERO evidencia
+  // de que sea publisher: no matcheó categoría de medios, no matcheó SimilarWeb, no tiene display
+  // ads ni ads.txt real. Antes igual devolvía ok:true ("ante la duda, pasa y que el MB lo rechace
+  // a mano") — pero el MB no da abasto y el pool terminó con 70% de no-publishers.
+  // Distingo los dos casos, que NO son lo mismo:
+  //   · type === "other" → Haiku SÍ corrió y no encontró que fuera un medio. Sumado a cero ads,
+  //     no hay ninguna razón para meterlo al pool → rechazo.
+  //   · type === null    → Haiku falló (timeout/API caída). Es un problema NUESTRO, no del
+  //     dominio: mantengo el pase para no descartar publishers buenos por una caída de la IA.
+  if (type === "other") return { ok: false, reason: "no_publisher_evidence (haiku:other + sin ads)" };
   return { ok: true, reason: "classifier_unavailable_pass" };
 }
 
