@@ -11632,7 +11632,18 @@ async function runAgentCycle(token, allFlags) {
     // Kill switch check
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
     // Daily cap — por usuario (override) o global
-    const userMaxPerDay = Number(perUserCap[(userEmail || "").toLowerCase()]) || aCfg.maxPerDay;
+    // Maxi 2026-07-27: el cap diario sale de TRES fuentes y la más específica gana en silencio.
+    // El user pidió que cambiarlo desde el admin funcione y se note, así que dejamos explícito
+    // CUÁL está mandando. Precedencia:
+    //   1. agent_max_per_day_by_user  → JSON {"mail@adeq":N}, override por MB (el popup lo limpia al guardar)
+    //   2. agent_focus_config.daily_override → si es > 0 PISA a agent_max_per_day
+    //   3. agent_max_per_day          → el campo "max" del panel de admin
+    // Si tocás el campo del admin y el cap no cambia, es porque daily_override quedó en algo != 0.
+    const _capPerUser = Number(perUserCap[(userEmail || "").toLowerCase()]) || 0;
+    const userMaxPerDay = _capPerUser || aCfg.maxPerDay;
+    const _capSource = _capPerUser ? "agent_max_per_day_by_user"
+                     : (aCfg.focus.dailyOverride ? "agent_focus_config.daily_override (PISA al campo del admin)"
+                                                 : "agent_max_per_day (campo del admin)");
     const sentToday = await getAgentDailyCount(token, userEmail);
     if (sentToday >= userMaxPerDay) {
       log(`🤖 Agent ${userEmail}: cap diario ${userMaxPerDay} alcanzado (${sentToday})`);
@@ -11647,7 +11658,7 @@ async function runAgentCycle(token, allFlags) {
     // setear agent_max_total_sends_per_day en config; en 0 o sin la fila = sin límite.
     const maxTotalPerDay = parseInt(cfg.agent_max_total_sends_per_day || "0", 10) || 0;
     const totalToday = await getAgentDailyTotalSends(token, userEmail);
-    log(`🤖 Agent ${userEmail}: ${sentToday}/${userMaxPerDay} primer contacto · ${totalToday} mails totales hoy (re-trabajo sin límite)`);
+    log(`🤖 Agent ${userEmail}: ${sentToday}/${userMaxPerDay} primer contacto [cap desde ${_capSource}] · ${totalToday} mails totales hoy (re-trabajo aparte, sin límite)`);
     if (maxTotalPerDay > 0 && totalToday >= maxTotalPerDay) {
       log(`🤖 Agent ${userEmail}: techo total ${maxTotalPerDay} alcanzado (${totalToday}) — pausa hasta mañana`);
       continue;
