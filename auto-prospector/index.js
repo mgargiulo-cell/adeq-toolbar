@@ -4688,6 +4688,23 @@ function _isGenericLocalPart(email) {
 // de pauta/inventario. 'regie\b'/'regiepub' evita matchear 'regierung'(gobierno DE).
 const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor)/i;
 
+// Maxi 2026-07-27 (auditoría respuestas 23-27): SEGMENTOS de local-part que identifican un buzón
+// de IT / infraestructura / dominios / registrar / seguridad. Nunca son contacto de venta de pauta.
+// Se testea por segmento (local partido por . _ -) para agarrarlos también al final del local-part
+// ("reliancedomains.admin"), no solo como prefijo. Usado por rankEmail → matchedRole="IT_INFRA".
+// Deliberadamente NO incluye 2 letras ambiguas (ti, si) ni "media"/"web" (falsos positivos obvios).
+const IT_INFRA_SEGMENT = new Set([
+  "it", "itsec", "itsupport", "informatica", "informatique", "informatik", "informatics",
+  "sistemas", "sistema", "sistemi", "systemes", "systems", "system", "sysadmin", "sysop",
+  "admin", "administrator", "administracion", "administracao",
+  "tecnico", "tecnica", "tecnologia", "technique", "technik", "tech", "helpdesk",
+  "seguranca", "seguridad", "seguretat", "security", "infosec", "cybersecurity",
+  "redes", "network", "networking", "noc", "infra", "infraestructura", "infrastructure",
+  "hosting", "hostmaster", "postmaster", "webmaster", "dns", "servidor", "server", "servers",
+  "dominios", "dominio", "domeny", "domains", "domain", "domaine", "registrar", "whois",
+  "wsparcie", "podpora", "poparcie", "tugi", "destek",
+]);
+
 // Maxi 2026-06-17 v4: extrae emails publicados en redes sociales (FB about,
 // YT about, Twitter bio via Nitter). Fallback worker — solo se llama cuando
 // el scrape normal no encontró email NO-genérico. Devuelve Map<email, "Facebook"|"YouTube"|"Twitter">.
@@ -8722,6 +8739,27 @@ async function processManualReengagementQueue(token) {
             newStatus = "failed";
             reason = `gmail send failed: ${sent?.error || "no_message_id"}`;
           } else {
+            // Maxi 2026-07-27 (auditoría 23-27): AGUJERO DE LOGGING. Este path enviaba por Gmail
+            // y solo actualizaba toolbar_reengagement_queue — NUNCA escribía en agent_actions. Los
+            // envíos de "future email" eran invisibles para TODA la métrica (GEO, tipo de email,
+            // fuente, ROI, auditoría). Los días 25 y 26/07 no tienen una sola fila de envío en la
+            // base y sin embargo salieron ~76 mails: este era el path ciego.
+            // action='future_sent' (no 'sent') a propósito: getAgentDailyCount cuenta
+            // sent/reserved/secondary_sent, así que esto NO cambia el cap diario — solo lo hace
+            // visible. Si se decide que deben consumir cupo, agregar 'future_sent' a esa query.
+            await logAgentAction(token, mb_email, {
+              domain,
+              action:   "future_sent",
+              email_to: future_email,
+              pitch_subject: original_subject,
+              details: {
+                email:  future_email,
+                source: "future_email",
+                reengagement_queue_id: id,
+                original_action_id:    tracking_action_id || null,
+              },
+            });
+
             // 4. Update Monday: email + FU1 (today+5) + FU2 (today+10)
             const upd = await updateMondayReengagementDispatch(monday_api_key, monday_item_id, boardId, future_email);
             if (!upd) {
@@ -10884,6 +10922,16 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // GANABAN a un contacto real. Ahora +8: sendables como ÚLTIMO recurso (North Star: ≥1 email),
   // pero pierden contra cualquier persona/rol comercial. Chequeado ANTES del patrón nombre.apellido.
   else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|denuncias?|reclamos?|reclama[cç][õo]es|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|legal|privacy|privacidad|privacidade|\bdpo\b|abuse|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|servicios?|servico|service|helpdesk|help)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
+  // Maxi 2026-07-27 (auditoría respuestas 23-27): buzones de IT / infraestructura / dominios /
+  // registrar. NO son contacto de venta de pauta y jamás responden un pitch de inventario; peor,
+  // varios son direcciones técnicas donde el mail se archiva o abre un ticket. Casos reales de
+  // esta tanda: reliancedomains.admin@ril.com y drc.seguranca@cuf.pt caían en PERSON (+70, por el
+  // punto en el local-part) y informatique@ / domeny@ / wsparcie@ en PERSON_LIKELY (+55) — le
+  // GANABAN a cualquier contacto comercial del mismo dominio. Chequeo por SEGMENTO (partiendo por
+  // . _ -) para agarrarlos también cuando van al final ("...domains.admin"). Score +5: sendables
+  // como último recurso (North Star: ≥1 email), pero pierden contra todo lo demás.
+  // Va ANTES del patrón nombre.apellido, igual que DEPARTMENT.
+  else if (local.split(/[._-]+/).some(seg => IT_INFRA_SEGMENT.has(seg))) { score += 5; matchedRole = "IT_INFRA"; }
   // Pattern firstname.lastname (juan.perez@x.com) = persona real
   else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) { score += 70; matchedRole = "PERSON"; }
   // Pattern firstinitial+lastname (jperez@x.com, mgarcia@x.com) = común corp
@@ -12295,14 +12343,25 @@ async function runAgentCycle(token, allFlags) {
           const _patchBody = pitch._templateId
             ? { action: "sent", template_id: pitch._templateId }
             : { action: "sent" };
-          fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
-            method: "PATCH",
-            headers: {
-              "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-              "Content-Type": "application/json", "Prefer": "return=minimal",
-            },
-            body: JSON.stringify(_patchBody),
-          }).catch(() => {});
+          // Maxi 2026-07-27 (auditoría 23-27): este PATCH era fire-and-forget (sin await, catch
+          // vacío). El worker reinicia cada ~7min; si el reinicio caía entre el send de Gmail y
+          // este PATCH, el mail SALÍA pero la fila quedaba en 'reserved' y el cleanup de arranque
+          // la pasaba a 'failed' → envío real invisible en toda la métrica (GEO, tipo de email,
+          // cap diario, ROI). Ahora se espera y se reintenta 2 veces; si igual falla, queda un
+          // log 🔴 explícito en vez de un agujero silencioso.
+          for (let _a = 0; _a < 3; _a++) {
+            const _ok = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+              method: "PATCH",
+              headers: {
+                "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+                "Content-Type": "application/json", "Prefer": "return=minimal",
+              },
+              body: JSON.stringify(_patchBody),
+            }).then(r => r.ok).catch(() => false);
+            if (_ok) break;
+            if (_a === 2) log(`🔴 ${domain}: mail ENVIADO pero no se pudo confirmar reserved→sent (id=${reservedId}) — quedará como huérfano`);
+            else await new Promise(r => setTimeout(r, 400 * (_a + 1)));
+          }
         }
 
         // Maxi 2026-06-18: registrar envío en response_tracking para medir
