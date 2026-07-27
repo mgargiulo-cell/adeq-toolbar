@@ -12169,44 +12169,6 @@ async function runAgentCycle(token, allFlags) {
             }).catch(() => {});
           } catch {}
         }
-        // ── SALTO INSTANTÁNEO A LA SIGUIENTE DIRECCIÓN (Maxi 2026-07-27, regla del user) ──
-        // Regla: "envío instantáneo a un nuevo email si el primero se detecta rechazado o inválido".
-        // Antes NO era así: si MillionVerifier marcaba el #1 como invalid, o si ya estaba en la
-        // lista de bounced, el código hacía `continue` y ABANDONABA EL LEAD ENTERO hasta el próximo
-        // ciclo — teniendo 2, 3 o 4 direcciones más ya rankeadas y listas en `ranked`.
-        // Ahora recorremos los candidatos en orden y nos quedamos con el primero entregable.
-        // Tope de 3 verificaciones MV por lead: MV se paga por consulta y un lead con 6 direcciones
-        // basura no debe vaciar el cupo diario. Las respuestas de MV van a _mvCache, así que los
-        // chequeos que vienen más abajo (defensa en profundidad) no vuelven a gastar crédito.
-        if (email && ranked.length > 0) {
-          const MAX_MV_PER_LEAD = 3;
-          let mvUsed = 0, chosen = null, descartados = 0;
-          for (const cand of ranked) {
-            if (isBouncedSync(cand.email)) { descartados++; continue; }   // ya rebotó antes
-            if (mvUsed < MAX_MV_PER_LEAD) {
-              mvUsed++;
-              if (!(await _verifyEmailMV(token, cfg, cand.email))) {
-                // No entregable → marcar para que no se re-elija y seguir con el siguiente
-                markEmailBounced(token, {
-                  email: cand.email, reason: "mv_undeliverable",
-                  originalDomain: cand.email.split("@")[1] || "",
-                }).catch(() => {});
-                descartados++;
-                continue;
-              }
-            }
-            chosen = cand;
-            break;
-          }
-          if (chosen && chosen.email !== email) {
-            log(`  ↪️ ${domain}: ${email} no entregable → salto instantáneo a ${chosen.email} (descartados: ${descartados})`);
-          }
-          if (!chosen && descartados > 0) {
-            log(`  ⏭ ${domain}: los ${descartados} candidatos son no entregables — sin dirección válida`);
-          }
-          email = chosen?.email || null;
-          if (chosen) pickedSource = chosen.source || "";
-        }
         if (!email) {
           log(`  ⏭ ${domain}: SKIP — no_email_after_enrichment (emails encontrados: ${emails.length})`);
           await logAgentAction(token, userEmail, {
@@ -12409,6 +12371,63 @@ async function runAgentCycle(token, allFlags) {
             }
           }
         } catch (e) { log(`  ⚠️ sendtrack guard ${domain}: ${e.message}`); }
+
+        // ── SALTO INSTANTÁNEO A LA SIGUIENTE DIRECCIÓN (Maxi 2026-07-27, regla del user) ──
+        // Regla: "envío instantáneo a un nuevo email si el primero se detecta rechazado o inválido".
+        // Antes NO era así: si MillionVerifier marcaba el #1 como invalid, o si ya estaba en la
+        // lista de bounced, el código hacía `continue` y ABANDONABA EL LEAD ENTERO hasta el próximo
+        // ciclo — teniendo 2, 3 o 4 direcciones más ya rankeadas y listas en `ranked`.
+        // Ahora recorremos los candidatos en orden y nos quedamos con el primero entregable.
+        // Tope de 3 verificaciones MV por lead: MV se paga por consulta y un lead con 6 direcciones
+        // basura no debe vaciar el cupo diario. Las respuestas de MV van a _mvCache, así que los
+        // chequeos que vienen más abajo (defensa en profundidad) no vuelven a gastar crédito.
+        if (email && ranked.length > 0) {
+          const MAX_MV_PER_LEAD = 3;
+          let mvUsed = 0, chosen = null, descartados = 0;
+          // Arrancar por el email YA elegido (puede no ser ranked[0]: el 2do pass de Claude lo
+          // pudo haber cambiado). Sin esto el loop volvía a empezar por ranked[0] y pisaba
+          // silenciosamente la elección de Claude.
+          const _orden = [
+            ...ranked.filter(c => c.email === email),
+            ...ranked.filter(c => c.email !== email),
+          ];
+          for (const cand of _orden) {
+            if (isBouncedSync(cand.email)) { descartados++; continue; }   // ya rebotó antes
+            if (mvUsed < MAX_MV_PER_LEAD) {
+              mvUsed++;
+              if (!(await _verifyEmailMV(token, cfg, cand.email))) {
+                // No entregable → marcar para que no se re-elija y seguir con el siguiente
+                markEmailBounced(token, {
+                  email: cand.email, reason: "mv_undeliverable",
+                  originalDomain: cand.email.split("@")[1] || "",
+                }).catch(() => {});
+                descartados++;
+                continue;
+              }
+            }
+            chosen = cand;
+            break;
+          }
+          if (chosen && chosen.email !== email) {
+            log(`  ↪️ ${domain}: ${email} no entregable → salto instantáneo a ${chosen.email} (descartados: ${descartados})`);
+          }
+          if (!chosen && descartados > 0) {
+            log(`  ⏭ ${domain}: los ${descartados} candidatos son no entregables — sin dirección válida`);
+          }
+          email = chosen?.email || null;
+          if (chosen) pickedSource = chosen.source || "";
+          // Si NINGÚN candidato resultó entregable, no hay a quién escribirle. El chequeo
+          // genérico de `!email` ya quedó más arriba (antes del guard de 30d), así que hace
+          // falta cortar acá o seguiríamos hasta la reserva con email=null.
+          if (!email) {
+            log(`  ⏭ ${domain}: SKIP — todos los candidatos no entregables (${descartados} descartados)`);
+            await logAgentAction(token, userEmail, {
+              domain, action: "skipped", reason: "all_candidates_undeliverable",
+              details: { traffic: leadTraffic, geo: leadGeo, emails_count: emails.length, descartados },
+            });
+            continue; // próximo lead
+          }
+        }
 
         // RESERVA en counter ANTES del send. Si Railway crashea entre send y log,
         // el counter ya tiene el slot reservado → próximo arranque no over-sends.
