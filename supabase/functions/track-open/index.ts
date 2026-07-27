@@ -36,7 +36,20 @@ Deno.serve(async (req) => {
   try {
     const url = new URL(req.url);
     const aid = url.searchParams.get("aid");
-    if (aid && /^\d+$/.test(aid)) {
+    // Maxi 2026-07-27 (auditoría de aperturas): descartar el PREFETCH.
+    // El worker ahora firma el pixel con &t=<epoch del envío>. Medición sobre 30 días:
+    //   · 19,8% de las "aperturas" llegaban a menos de 30 seg del envío
+    //   ·  3,4% más entre 30 seg y 2 min
+    // Nadie abre un cold email en 30 segundos: eso es Google/Outlook precargando la imagen y
+    // los escáneres de seguridad corporativos (Proofpoint, Mimecast) abriendo todo lo que entra.
+    // Inflaba el open rate y, peor, el agente lo usa para decidir: getDynamicSourceRank rankea
+    // fuentes por open rate y el re-engagement NO vuelve a insistir si cree que ya lo abrieron.
+    // Filtramos por TIEMPO y no por user-agent a propósito: el 24,8% de los hits viene de
+    // GoogleImageProxy y ahí adentro hay aperturas reales (Gmail siempre proxea imágenes),
+    // así que descartar ese UA borraría el dato bueno junto con el malo.
+    const sentAt = parseInt(url.searchParams.get("t") || "0", 10);
+    const isPrefetch = sentAt > 0 && (Date.now() - sentAt) < 120_000;
+    if (aid && /^\d+$/.test(aid) && !isPrefetch) {
       const ua = req.headers.get("user-agent") || "";
       const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim()
               || req.headers.get("x-real-ip") || "";

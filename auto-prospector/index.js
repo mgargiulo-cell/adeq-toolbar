@@ -6696,7 +6696,18 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // y hasta lo mandaban a blocklist. Solo se cuenta como intento fallido cuando la API
     // respondió de verdad (0 visitas o 404 "sin data"). Transitorio → reintento limpio.
     const _errStr = String(trafficData.error || "");
-    const _transient = /429|timeout|timed out|\b5\d\d\b|network|fetch failed|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket|aborted/i.test(_errStr);
+    // Maxi 2026-07-27 (auditoría): ESTA ERA LA FÁBRICA DE LEADS CONGELADOS — 2.011 dominios con
+    // last_error='no_traffic_data_after_3_attempts', el 91% de todo lo congelado.
+    // rapidFetchWithRetry devuelve __error4xx = "daily_cap_reached" / "per_minute_fuse_tripped"
+    // cuando el que se quedó sin cupo somos NOSOTROS, y "HTTP 401/402/403" cuando el plan de
+    // RapidAPI está vencido o sin suscripción. Ninguna de esas cadenas matcheaba el regex de
+    // transitorio (solo cubría 429 y 5xx), así que cada lead procesado durante una ventana sin
+    // cupo se llevaba un "intento fallido". A los 3 → FREEZE 15/30/60d, y a los 3 ciclos de
+    // freeze → BLOCKLIST PERMANENTE como "inoperativo".
+    // O sea: quedarnos sin cuota de API borraba inventario bueno para siempre.
+    // Estas condiciones son estado NUESTRO, no un defecto del dominio → reintento sin penalizar.
+    const _transient = /429|timeout|timed out|\b5\d\d\b|network|fetch failed|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket|aborted/i.test(_errStr)
+      || /daily_cap_reached|per_minute_fuse_tripped|HTTP 40[0123]|quota|exceeded|not subscribed|rate limit/i.test(_errStr);
     if (_transient) {
       await markCsvItem(token, item.id, "pending", {
         error_message: `traffic_api_transient (reintento sin penalizar): ${_errStr.slice(0, 50)}`,
@@ -11343,7 +11354,12 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
   const signatureHtml = await getGmailSignatureHtmlServer(userEmail);
   // Open-rate tracking pixel — solo si tenemos un agent_action_id (envíos del agente)
   const trackingPixel = agentActionId
-    ? `<img src="${SUPABASE_URL}/functions/v1/track-open?aid=${agentActionId}" width="1" height="1" alt="" style="display:block;border:0;width:1px;height:1px"/>`
+    // Maxi 2026-07-27 (auditoría): se agrega &t=<epoch del envío>. La edge function descarta las
+    // "aperturas" que llegan en los primeros 2 min, que son el prefetch de imágenes de Google/
+    // Outlook y los escáneres de seguridad — medido: 23,2% de todos los eventos. Filtrar por
+    // user-agent NO sirve: el 24,8% viene de GoogleImageProxy y ahí adentro hay aperturas REALES
+    // de usuarios de Gmail (Gmail siempre proxea las imágenes), así que descartarlo mataría el dato bueno.
+    ? `<img src="${SUPABASE_URL}/functions/v1/track-open?aid=${agentActionId}&t=${Date.now()}" width="1" height="1" alt="" style="display:block;border:0;width:1px;height:1px"/>`
     : "";
 
   // Subject RFC 2047 encoded para soportar acentos (ej. "monetización")
