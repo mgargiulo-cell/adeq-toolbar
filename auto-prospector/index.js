@@ -4443,7 +4443,7 @@ const JUNK_LOCAL_TOKENS = /(^|[._-])(tenmien|tdns|dns|domain|domains|domaines|ho
 // (vistos en prod, ej vorname.name@weltwoche.ch = "nombre.apellido" en alemán). Separador
 // "." o "_". Un email con local "vorname.name"/"firstname.lastname"/etc. es una plantilla sin
 // rellenar, jamás un contacto real.
-const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$|^(john|jane)[._]?doe$|^(john|jane)doe$|^doe$|^first$|^firstname$|^second$|^lastname$|^apellido$|^surname$|^prenom$|^vorname$|^insertname$|^changeme$|etunimi[._]sukunimi|imie[._]nazwisko|keresztnev[._]vezeteknev|^cuenta$|^conta$|^correo$|^utente$|^alumn[oa]s?$|^alun[oa]s?$|^estudiantes?$|^students?$|^matricula$|^android$|^ios$|^apk$|^app$|^apps$|^appstore$|^playstore$)/i;
+const PLACEHOLDER_LOCAL = /(youremail|yourname|tuemail|tucorreo|webmail|noreply|no-reply|^email$|^e-mail$|^name$|^nombre$|^test$|^example$|^ejemplo$|placeholder|^user\d*$|^usuario\d*$|^guest\d*$|^demo$|^sample$|vorname[._]name|nombre[._]apellido|firstname[._]lastname|prenom[._]nom|nome[._]cognome|name[._]surname|ime[._]prezime|nome[._]sobrenome|max[._]mustermann|^mustermann$|^(john|jane)[._]?doe$|^(john|jane)doe$|^doe$|^first$|^firstname$|^second$|^lastname$|^apellido$|^surname$|^prenom$|^vorname$|^insertname$|^changeme$|etunimi[._]sukunimi|imie[._]nazwisko|keresztnev[._]vezeteknev|^cuenta$|^conta$|^alumn[oa]s?$|^alun[oa]s?$|^estudiantes?$|^students?$|^matricula$|^android$|^ios$|^apk$|^app$|^apps$|^appstore$|^playstore$)/i;
 // Maxi 2026-07-27 (auditoría de envíos reales 21-27): los términos agregados arriba son casos
 // TEXTUALES que recibieron un pitch en esta tanda y que el regex original no cubría:
 //   etunimi.sukunimi@sanoma.com → "nombre.apellido" en FINLANDÉS: es el ejemplo que la propia web
@@ -11359,7 +11359,9 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
     // Outlook y los escáneres de seguridad — medido: 23,2% de todos los eventos. Filtrar por
     // user-agent NO sirve: el 24,8% viene de GoogleImageProxy y ahí adentro hay aperturas REALES
     // de usuarios de Gmail (Gmail siempre proxea las imágenes), así que descartarlo mataría el dato bueno.
-    ? `<img src="${SUPABASE_URL}/functions/v1/track-open?aid=${agentActionId}&t=${Date.now()}" width="1" height="1" alt="" style="display:block;border:0;width:1px;height:1px"/>`
+    // &amp; y no & suelto: es un atributo HTML y hay clientes de correo con sanitizadores
+    // estrictos que rompen o recortan la query string si ven un & sin escapar.
+    ? `<img src="${SUPABASE_URL}/functions/v1/track-open?aid=${agentActionId}&amp;t=${Date.now()}" width="1" height="1" alt="" style="display:block;border:0;width:1px;height:1px"/>`
     : "";
 
   // Subject RFC 2047 encoded para soportar acentos (ej. "monetización")
