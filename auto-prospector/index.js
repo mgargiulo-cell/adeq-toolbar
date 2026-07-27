@@ -9906,51 +9906,72 @@ async function getAgentWeeklyCount(token, userEmail) {
 // Cambio: antes era 24h rolling — eso permitía "13/10" si los envíos se
 // distribuían en torno a la medianoche. Ahora es estricto día calendario
 // España: 00:00 → 23:59 reset.
-async function getAgentDailyCount(token, userEmail) {
+// Medianoche de HOY en España, en ISO UTC. Compartido por los dos contadores diarios.
+function _madridMidnightUtcISO() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit"
+  });
+  const todaySpain = fmt.format(new Date()); // "YYYY-MM-DD"
+  // Offset de Madrid (CEST = +02 verano, CET = +01 invierno) resuelto contra UTC.
+  const probe = new Date(`${todaySpain}T00:00:00`);
+  const madridStr = probe.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
+  const utcStr = probe.toLocaleString("en-US", { timeZone: "UTC" });
+  const offsetMs = new Date(madridStr).getTime() - new Date(utcStr).getTime();
+  return new Date(probe.getTime() - offsetMs).toISOString();
+}
+
+// Contador genérico de acciones del día (calendario España) para un buzón.
+async function _countAgentActionsToday(token, userEmail, actions, label) {
   try {
-    // Calcular medianoche España de HOY.
-    const fmt = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit"
-    });
-    const todaySpain = fmt.format(new Date()); // "YYYY-MM-DD"
-    // Madrid timezone offset (CEST = +02 verano, CET = +01 invierno)
-    // Construimos el ISO de medianoche Madrid → UTC. Aproximación: usar
-    // toLocaleString para verificar offset actual.
-    const probe = new Date(`${todaySpain}T00:00:00`);
-    const madridStr = probe.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
-    const utcStr = probe.toLocaleString("en-US", { timeZone: "UTC" });
-    const offsetMs = new Date(madridStr).getTime() - new Date(utcStr).getTime();
-    const cutoffUtc = new Date(probe.getTime() - offsetMs).toISOString();
-    // Cuenta tanto 'sent' (confirmado) como 'reserved' (pre-send) — la reserva
-    // protege contra crashes mid-send: si el worker reinicia entre reserve y
-    // confirmación, el slot queda apartado y el next iter no over-sends.
-    // Timeout 5s: si Supabase está lento, no colgamos el worker entero por
-    // este conteo. El fail-open de abajo se encarga del retry next cycle.
+    const cutoffUtc = _madridMidnightUtcISO();
+    // Timeout 5s: si Supabase está lento, no colgamos el worker entero por este conteo.
     const res = await fetch(
-      // Maxi 2026-07-15 (F1): +secondary_sent → el 2do email por lead ahora cuenta para el cap diario.
-      // Antes solo (sent,reserved) → el agente mandaba ~2x el tope (1 primario + 1 secundario por lead).
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,reserved,secondary_sent)&created_at=gte.${cutoffUtc}&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(${actions.join(",")})&created_at=gte.${cutoffUtc}&select=id`,
       {
         headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
         signal: AbortSignal.timeout(5000),
       }
     );
     if (!res.ok) {
-      // Fail-open: si no podemos contar, asumimos 0 y seguimos. El riesgo es
-      // sobre-enviar si la query falla repetidamente, pero el sendtrack 30d
-      // guard + reserved slots + per_cycle_limit limitan el daño (peor caso:
-      // 5-15 envíos extra durante una caída sostenida de Supabase). El costo
-      // del fail-closed previo era perder el día entero por un glitch.
-      log(`⚠️ getAgentDailyCount HTTP ${res.status} — fail-open (assume 0, retry next cycle)`);
+      // Fail-open: si no podemos contar, asumimos 0 y seguimos. El sendtrack 30d guard +
+      // reserved slots + per_cycle_limit limitan el daño. Fail-closed perdía el día entero
+      // por un glitch de Supabase.
+      log(`⚠️ ${label} HTTP ${res.status} — fail-open (assume 0, retry next cycle)`);
       return 0;
     }
-    const range = res.headers.get("content-range") || "";
-    const m = range.match(/\/(\d+)$/);
+    const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
     return m ? parseInt(m[1]) : 0;
   } catch (e) {
-    log(`⚠️ getAgentDailyCount error: ${e.message} — fail-open (assume 0)`);
+    log(`⚠️ ${label} error: ${e.message} — fail-open (assume 0)`);
     return 0;
   }
+}
+
+// CAP DE PRIMER CONTACTO — es el "20 por día" que configura el MB.
+// Maxi 2026-07-27 (decisión del user): el user confirmó que sus 20/día son de PRIMER EMAIL.
+// El 15/07 se había metido 'secondary_sent' acá para frenar un 2x de volumen, pero eso hacía
+// que la 2ª dirección de un lead te comiera un slot de prospecto NUEVO: pedías 20 empresas
+// nuevas y recibías menos. Vuelve a contar solo (sent, reserved) = primer contacto real.
+// El volumen total ya no queda suelto: lo acota getAgentDailyTotalSends (abajo).
+// 'reserved' sigue contando porque es el slot pre-envío que protege contra crashes mid-send.
+async function getAgentDailyCount(token, userEmail) {
+  return _countAgentActionsToday(token, userEmail, ["sent", "reserved"], "getAgentDailyCount");
+}
+
+// TECHO DE VOLUMEN TOTAL — todo mail real que sale del buzón, sea primer contacto o no.
+// Maxi 2026-07-27: protege la reputación del dominio, que es lo que el cap del 15/07 buscaba
+// sin querer. Necesario ahora por un efecto de segundo orden: el re-engagement se dispara
+// cuando un envío NO fue abierto, y hasta hoy el pixel contaba el prefetch de Google como
+// apertura (80% inflado). Al arreglar el pixel las aperturas reales caen a ~33%, así que el
+// agente va a encontrar MUCHOS más mails sin abrir y va a re-enviar bastante más seguido.
+// Como 're_sent' no consume el cap de primer contacto, sin este techo el volumen se dispara solo.
+// Default: 2× el cap de primer contacto. Configurable con agent_max_total_sends_per_day.
+async function getAgentDailyTotalSends(token, userEmail) {
+  return _countAgentActionsToday(
+    token, userEmail,
+    ["sent", "reserved", "secondary_sent", "re_sent", "bounce_retry_sent", "future_sent"],
+    "getAgentDailyTotalSends"
+  );
 }
 
 // Kill switch: si en la última hora hay > N fails consecutivos, auto-pausa 1h.
@@ -11617,6 +11638,17 @@ async function runAgentCycle(token, allFlags) {
       log(`🤖 Agent ${userEmail}: cap diario ${userMaxPerDay} alcanzado (${sentToday})`);
       continue;
     }
+    // Maxi 2026-07-27: segundo freno, por VOLUMEN TOTAL del buzón. El cap de arriba cuenta solo
+    // primer contacto (decisión del user); este cuenta TODO mail real que sale (2ª dirección,
+    // re-engagement, reintento por rebote, future email). Sin esto, arreglar el pixel de aperturas
+    // dispara el re-engagement —que no consume el cap de primer contacto— y el volumen del buzón
+    // se va solo, justo cuando estamos tratando de recuperar reputación por el 63% de rebote.
+    const maxTotalPerDay = parseInt(cfg.agent_max_total_sends_per_day || "0", 10) || (userMaxPerDay * 2);
+    const totalToday = await getAgentDailyTotalSends(token, userEmail);
+    if (totalToday >= maxTotalPerDay) {
+      log(`🤖 Agent ${userEmail}: techo de volumen total ${maxTotalPerDay} alcanzado (${totalToday} mails hoy, ${sentToday} de primer contacto) — pausa hasta mañana`);
+      continue;
+    }
     // Weekly target (si configurado): cuenta sent en últimos 7 días
     if (aCfg.focus.weeklyTarget > 0) {
       const sentWeek = await getAgentWeeklyCount(token, userEmail);
@@ -11626,7 +11658,9 @@ async function runAgentCycle(token, allFlags) {
       }
     }
     const remaining = userMaxPerDay - sentToday;
-    const batchSize = Math.min(aCfg.perCycleLimit, remaining);
+    // El batch se acota por AMBOS presupuestos: si quedan 8 de primer contacto pero solo 3 de
+    // volumen total, mandamos 3. Sin esto un solo ciclo podía pasarse del techo total.
+    const batchSize = Math.min(aCfg.perCycleLimit, remaining, maxTotalPerDay - totalToday);
 
     // Aplicar focus filtros al query.
     // geos_priority son ISO 2-letter codes (AR, UY, ES...). Matchea contra
