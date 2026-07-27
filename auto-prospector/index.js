@@ -11638,15 +11638,18 @@ async function runAgentCycle(token, allFlags) {
       log(`🤖 Agent ${userEmail}: cap diario ${userMaxPerDay} alcanzado (${sentToday})`);
       continue;
     }
-    // Maxi 2026-07-27: segundo freno, por VOLUMEN TOTAL del buzón. El cap de arriba cuenta solo
-    // primer contacto (decisión del user); este cuenta TODO mail real que sale (2ª dirección,
-    // re-engagement, reintento por rebote, future email). Sin esto, arreglar el pixel de aperturas
-    // dispara el re-engagement —que no consume el cap de primer contacto— y el volumen del buzón
-    // se va solo, justo cuando estamos tratando de recuperar reputación por el 63% de rebote.
-    const maxTotalPerDay = parseInt(cfg.agent_max_total_sends_per_day || "0", 10) || (userMaxPerDay * 2);
+    // VOLUMEN TOTAL — visibilidad, no freno (REGLA DEL USER 2026-07-27).
+    // El cap de arriba cuenta SOLO primer contacto: los 20/día son 20 empresas nuevas.
+    // El resto (2ª dirección, re-engagement por no-apertura, reintento por rebote, future email)
+    // va APARTE y SIN LÍMITE: es re-trabajo de algo que salió mal la primera vez, no prospección
+    // nueva, y no debe robarle cupo. Acá solo lo contamos y lo dejamos en el log para poder
+    // auditarlo. Si algún día hace falta ponerle techo (p.ej. reputación del buzón), basta con
+    // setear agent_max_total_sends_per_day en config; en 0 o sin la fila = sin límite.
+    const maxTotalPerDay = parseInt(cfg.agent_max_total_sends_per_day || "0", 10) || 0;
     const totalToday = await getAgentDailyTotalSends(token, userEmail);
-    if (totalToday >= maxTotalPerDay) {
-      log(`🤖 Agent ${userEmail}: techo de volumen total ${maxTotalPerDay} alcanzado (${totalToday} mails hoy, ${sentToday} de primer contacto) — pausa hasta mañana`);
+    log(`🤖 Agent ${userEmail}: ${sentToday}/${userMaxPerDay} primer contacto · ${totalToday} mails totales hoy (re-trabajo sin límite)`);
+    if (maxTotalPerDay > 0 && totalToday >= maxTotalPerDay) {
+      log(`🤖 Agent ${userEmail}: techo total ${maxTotalPerDay} alcanzado (${totalToday}) — pausa hasta mañana`);
       continue;
     }
     // Weekly target (si configurado): cuenta sent en últimos 7 días
@@ -11658,9 +11661,11 @@ async function runAgentCycle(token, allFlags) {
       }
     }
     const remaining = userMaxPerDay - sentToday;
-    // El batch se acota por AMBOS presupuestos: si quedan 8 de primer contacto pero solo 3 de
-    // volumen total, mandamos 3. Sin esto un solo ciclo podía pasarse del techo total.
-    const batchSize = Math.min(aCfg.perCycleLimit, remaining, maxTotalPerDay - totalToday);
+    // El batch lo acota el cupo de PRIMER CONTACTO. Solo si hay un techo total configurado
+    // (opt-in, normalmente apagado) se acota además por lo que quede de ese presupuesto.
+    const batchSize = maxTotalPerDay > 0
+      ? Math.min(aCfg.perCycleLimit, remaining, maxTotalPerDay - totalToday)
+      : Math.min(aCfg.perCycleLimit, remaining);
 
     // Aplicar focus filtros al query.
     // geos_priority son ISO 2-letter codes (AR, UY, ES...). Matchea contra
@@ -12080,7 +12085,7 @@ async function runAgentCycle(token, allFlags) {
             return b.score - a.score;          // desempate final: rankEmail
           });
         let email = ranked[0]?.email;
-        const pickedSource = ranked[0]?.source || "";   // attribution para toolbar_source_performance
+        let pickedSource = ranked[0]?.source || "";   // attribution para toolbar_source_performance (se reasigna si hay salto a otra dirección)
         // Log diagnóstico — ver qué pasó con cada candidate
         if (emails.length > 0) {
           const summary = _rankedAll.slice(0, 5).map(x => `${x.email}=${x.score}`).join(", ");
@@ -12128,6 +12133,44 @@ async function runAgentCycle(token, allFlags) {
               }),
             }).catch(() => {});
           } catch {}
+        }
+        // ── SALTO INSTANTÁNEO A LA SIGUIENTE DIRECCIÓN (Maxi 2026-07-27, regla del user) ──
+        // Regla: "envío instantáneo a un nuevo email si el primero se detecta rechazado o inválido".
+        // Antes NO era así: si MillionVerifier marcaba el #1 como invalid, o si ya estaba en la
+        // lista de bounced, el código hacía `continue` y ABANDONABA EL LEAD ENTERO hasta el próximo
+        // ciclo — teniendo 2, 3 o 4 direcciones más ya rankeadas y listas en `ranked`.
+        // Ahora recorremos los candidatos en orden y nos quedamos con el primero entregable.
+        // Tope de 3 verificaciones MV por lead: MV se paga por consulta y un lead con 6 direcciones
+        // basura no debe vaciar el cupo diario. Las respuestas de MV van a _mvCache, así que los
+        // chequeos que vienen más abajo (defensa en profundidad) no vuelven a gastar crédito.
+        if (email && ranked.length > 0) {
+          const MAX_MV_PER_LEAD = 3;
+          let mvUsed = 0, chosen = null, descartados = 0;
+          for (const cand of ranked) {
+            if (isBouncedSync(cand.email)) { descartados++; continue; }   // ya rebotó antes
+            if (mvUsed < MAX_MV_PER_LEAD) {
+              mvUsed++;
+              if (!(await _verifyEmailMV(token, cfg, cand.email))) {
+                // No entregable → marcar para que no se re-elija y seguir con el siguiente
+                markEmailBounced(token, {
+                  email: cand.email, reason: "mv_undeliverable",
+                  originalDomain: cand.email.split("@")[1] || "",
+                }).catch(() => {});
+                descartados++;
+                continue;
+              }
+            }
+            chosen = cand;
+            break;
+          }
+          if (chosen && chosen.email !== email) {
+            log(`  ↪️ ${domain}: ${email} no entregable → salto instantáneo a ${chosen.email} (descartados: ${descartados})`);
+          }
+          if (!chosen && descartados > 0) {
+            log(`  ⏭ ${domain}: los ${descartados} candidatos son no entregables — sin dirección válida`);
+          }
+          email = chosen?.email || null;
+          if (chosen) pickedSource = chosen.source || "";
         }
         if (!email) {
           log(`  ⏭ ${domain}: SKIP — no_email_after_enrichment (emails encontrados: ${emails.length})`);
