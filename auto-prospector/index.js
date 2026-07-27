@@ -10786,7 +10786,13 @@ const MV_CACHE_MAX = 8000;
 // TECHO ABSOLUTO hardcoded (Maxi 2026-07-24, pedido del user): ni la config ni un leak pueden pasar
 // de esto. 10.500 créditos / 90 días = 116/día break-even → 100 garantiza los 3 meses con margen.
 // Para subirlo hace falta un deploy (fuerza intención, no se cambia por accidente desde la DB).
-const MV_ABS_DAILY_MAX = 100;
+// Maxi 2026-07-27 (auditoría): el techo era 100 y la config estaba en 20, o sea que solo se
+// verificaba ~1 de cada 2 envíos y el resto salía a ciegas (el cap hace fail-open: si se agotó,
+// ENVÍA sin verificar). Medición de 14d: ~250 bounces duros sobre ~400 envíos = 63%, con
+// direcciones que MillionVerifier habría marcado invalid. Con 10.000 créditos comprados y ~40
+// envíos/día, verificar el 100% cuesta ~250 días de crédito: no hay razón para racionarlo.
+// El techo sube a 500; el valor efectivo lo sigue mandando millionverifier_daily_cap en config.
+const MV_ABS_DAILY_MAX = 500;
 let _mvDay = "", _mvCount = 0;
 async function _verifyEmailMV(token, cfg, email) {
   // Key: ENV de Railway PRIMERO (nunca toca la DB, no la lee la extensión/anon) → luego config.
