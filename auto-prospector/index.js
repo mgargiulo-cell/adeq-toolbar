@@ -36,6 +36,10 @@ const DOMAIN_DELAY_MS  = 2500;
 // pageviews; ese era el bug de "queued → 0 to Prospects").
 const MIN_TRAFFIC      = 350_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
 const REVIEW_QUEUE_MIN_TRAFFIC = 350_000; // Floor absoluto en review_queue (en PAGEVIEWS). Items debajo se auto-borran.
+// Maxi 2026-07-28 (decisión del user): TECHO de 50M pageviews. Arriba de eso son los top-500 del
+// mundo (chess.com, fandom, disneyplus, espn, usps, qq, cnn...): tienen equipo comercial propio y
+// se venden por trato directo, no contestan un cold email. Override con threshold_traffic_max.
+const REVIEW_QUEUE_MAX_TRAFFIC = 50_000_000;
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
@@ -4409,6 +4413,23 @@ function _brandStripTld(d) {
   if (TWO_LEVEL.has(last2)) return parts[parts.length - 3] || "";
   return parts[parts.length - 2] || "";
 }
+// Raíz registrable (eTLD+1) de un dominio: casavogue.globo.com → globo.com
+function _rootDomain(d) {
+  const dom = String(d || "").toLowerCase().replace(/^www\./, "").split("/")[0];
+  const parts = dom.split(".");
+  if (parts.length <= 2) return dom;
+  const last2 = parts.slice(-2).join(".");
+  const TWO_LEVEL = new Set([
+    "com.ar","com.br","com.mx","com.co","com.pe","com.cl","com.ve","com.ec","com.uy",
+    "com.py","com.bo","com.gt","com.sv","com.hn","com.ni","com.cr","com.pa","com.do",
+    "co.uk","co.za","co.nz","co.jp","co.kr","co.id","co.in",
+    "com.tr","com.tw","com.hk","com.sg","com.my","com.au","com.eg","com.sa","com.ng",
+    "org.uk","ac.uk","gov.uk","com.pt","org.br","gov.br","edu.br","ne.jp","or.jp","go.jp",
+  ]);
+  if (TWO_LEVEL.has(last2)) return parts.slice(-3).join(".");
+  return last2;
+}
+
 function _brandMatches(email, leadDomain) {
   const recipientDom = (String(email || "").split("@")[1] || "").toLowerCase();
   const leadDom      = String(leadDomain || "").toLowerCase().replace(/^www\./, "");
@@ -5458,7 +5479,7 @@ async function sweepBlockedFromProspects(token) {
   const cursorClause = cursor ? `&created_at=lt.${encodeURIComponent(cursor)}` : "";
   let rows = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at&order=created_at.desc&limit=${BATCH}`, { headers: auth });
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at,traffic,category&order=created_at.desc&limit=${BATCH}`, { headers: auth });
     if (r.ok) rows = await r.json();
   } catch {}
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -5475,13 +5496,59 @@ async function sweepBlockedFromProspects(token) {
     if (blocked) toDelete.push({ id: row.id, domain: row.domain, reason: `blocklist:${blocked}` });
     else remaining.push(row);
   }
-  // Fase 2: detector estructural (con red, alta precisión, CONC 5)
+  // Fase 1b (Maxi 2026-07-28): filtros GRATIS que no tocan la red — techo de tráfico y subdominios
+  // duplicados. Se resuelven con lo que ya está guardado en la fila, cero API, cero scrape.
+  const _maxPVSweep = parseInt(cfg.threshold_traffic_max || "0", 10) || REVIEW_QUEUE_MAX_TRAFFIC;
+  const _rootsVistos = new Set();
+  const remaining2 = [];
+  for (const row of remaining) {
+    if (_maxPVSweep > 0 && Number(row.traffic || 0) > _maxPVSweep) {
+      toDelete.push({ id: row.id, domain: row.domain, reason: `gigante_${row.traffic}pv` });
+      continue;
+    }
+    const _dom = String(row.domain || "").toLowerCase().replace(/^www\./, "");
+    const _r = _rootDomain(_dom);
+    // Solo los SUBDOMINIOS pueden ser duplicados; la raíz siempre se queda.
+    if (_r && _r !== _dom) {
+      if (_rootsVistos.has(_r)) {   // hermano ya visto en ESTE lote
+        toDelete.push({ id: row.id, domain: row.domain, reason: `subdominio_duplicado_de:${_r}` });
+        continue;
+      }
+      // Hermano en OTRO lote (los 5 de globo.com entraron el 21, 24 y 27/07) → hay que ir a la base.
+      // 1 query solo para subdominios, no para todo el pool.
+      try {
+        const _sibRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=like.*${encodeURIComponent(_r)}&select=domain,created_at&order=created_at.asc&limit=1`,
+          { headers: auth }
+        );
+        const _sib = _sibRes.ok ? await _sibRes.json() : [];
+        const _primero = Array.isArray(_sib) && _sib[0]?.domain;
+        if (_primero && String(_primero).toLowerCase().replace(/^www\./, "") !== _dom) {
+          toDelete.push({ id: row.id, domain: row.domain, reason: `subdominio_duplicado_de:${_primero}` });
+          continue;
+        }
+      } catch {}
+    }
+    if (_r) _rootsVistos.add(_r);
+    remaining2.push(row);
+  }
+
+  // Fase 2: CLASIFICACIÓN COMPLETA (Maxi 2026-07-28 — pedido del user: "releerlos todos sin gastar
+  // créditos de similar ni apollo"). Antes esta fase solo miraba `pc.nonPublisherType`, el detector
+  // estructural, y dejaba pasar bancos/universidades/gobiernos que sí caza classifyPublisher.
+  // Ahora corre la clasificación entera, que es la misma que arreglé el 27/07:
+  //   título → categoría de medios → SimilarWeb category (la GUARDADA en la fila, sin llamar a la API)
+  //   → ads/ads.txt → veto de Haiku.
+  // Coste: 1 scrape gratis por dominio (ya se hacía) + Haiku SOLO cuando lo barato no resuelve
+  // (~$0.0005 la consulta). CERO RapidAPI/SimilarWeb, CERO Apollo.
   const CONC = 5;
-  for (let i = 0; i < remaining.length; i += CONC) {
-    await Promise.all(remaining.slice(i, i + CONC).map(async (row) => {
+  for (let i = 0; i < remaining2.length; i += CONC) {
+    await Promise.all(remaining2.slice(i, i + CONC).map(async (row) => {
       const pc = await fetchPageContent(row.domain).catch(() => null);
-      if (pc?.dead) toDelete.push({ id: row.id, domain: row.domain, reason: `unreachable` });  // Maxi 2026-07-16: muerto/SSL/cert
-      else if (pc?.nonPublisherType) toDelete.push({ id: row.id, domain: row.domain, reason: `nonpub_${pc.nonPublisherType}` });
+      if (pc?.dead) { toDelete.push({ id: row.id, domain: row.domain, reason: `unreachable` }); return; }
+      // row.category es la categoría YA guardada → se la pasamos como swCategory (sin costo).
+      const verdict = await classifyPublisher(token, row.domain, pc, row.category || "").catch(() => null);
+      if (verdict && !verdict.ok) toDelete.push({ id: row.id, domain: row.domain, reason: verdict.reason });
     }));
   }
   // NO hard-DELETE: pasamos a status='rejected' + motivo 'purge:...'. Desaparecen de Prospects
@@ -6870,6 +6937,48 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  ⏭ ${domain} — ${effectivePageViews} pageviews (${visits} visits × ${ppvForThreshold.toFixed(2)}) < ${REVIEW_QUEUE_MIN_TRAFFIC} (floor duro, sin bypass)`);
     return;
   }
+  // ── TECHO DE TRÁFICO (Maxi 2026-07-28, decisión del user: 50M pageviews) ──────────────
+  // El pool tenía piso pero NO techo, así que se llenaba por arriba con los top-500 del mundo y
+  // el agente los priorizaba por score/tráfico. Casos reales de la lista del user: chess.com
+  // (5.117M pageviews), fandom.com (3.502M), pixiv.net (2.438M), aol.com, disneyplus.com,
+  // t.me, espn.com, usps.com (¡el correo de EEUU!), qq.com, foxnews, mlb, nba, nfl, cnn,
+  // reuters, bloomberg, aljazeera, sky, itv. Ninguno contesta un cold email para un video
+  // slider: tienen equipo comercial propio y se venden por trato directo.
+  // Configurable con threshold_traffic_max; en 0 = sin techo.
+  const _maxPV = parseInt(cfg.threshold_traffic_max || "0", 10) || REVIEW_QUEUE_MAX_TRAFFIC;
+  if (_maxPV > 0 && effectivePageViews > _maxPV) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: `pageviews ${effectivePageViews} above max ${_maxPV} (gigante — venta directa, no prospección)`,
+    });
+    log(`  🐘 ${domain} — ${effectivePageViews} pageviews > techo ${_maxPV} → skip (gigante)`);
+    return;
+  }
+
+  // ── DEDUPE DE SUBDOMINIOS (Maxi 2026-07-28, decisión del user) ────────────────────────
+  // Un subdominio heredaba el tráfico del padre y entraba como lead INDEPENDIENTE. En la lista
+  // del user: globo.com + revistacasaejardim + casavogue + revistaquem + autoesporte = 5 leads,
+  // los 5 con traffic=1.610.116.623. Idem repubblica.it (5), elperiodico.com (5), as.com (5),
+  // corriere.it (4), ilsole24ore (4). Dos daños: el pool se infla con duplicados, y como el guard
+  // de "no recontactar en 30d" es POR DOMINIO, se le podían mandar 5 mails a la misma empresa.
+  // Si ya existe CUALQUIER lead de la misma raíz, este subdominio no entra.
+  const _root = _rootDomain(domain);
+  if (_root && _root !== String(domain).toLowerCase().replace(/^www\./, "")) {
+    try {
+      const _dupRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=like.*${encodeURIComponent(_root)}&select=domain&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      const _dup = _dupRes.ok ? await _dupRes.json() : [];
+      if (Array.isArray(_dup) && _dup.length > 0) {
+        await markCsvItem(token, item.id, "skipped", {
+          error_message: `duplicate_subdomain_of:${_dup[0].domain}`,
+        });
+        log(`  👯 ${domain} — ya hay un lead de la misma raíz (${_dup[0].domain}) → skip duplicado`);
+        return;
+      }
+    } catch (e) { log(`  ⚠️ dedupe subdominio ${domain}: ${e.message}`); }
+  }
+
   // Floor superado → AHORA sí traemos el HTML (scrape). No se gastó nada en sitios <350K.
   const pageContent = await fetchPageContent(domain).catch(() => null);
   // Maxi 2026-07-08: DOMINIO MUERTO (DNS no resuelve) → skip. El user reportó url caídas que
