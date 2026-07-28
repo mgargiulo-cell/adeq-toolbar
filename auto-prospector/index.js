@@ -5395,6 +5395,69 @@ const NON_PUBLISHER_TITLE_RE = /\b(log ?in|sign ?in|sign ?up|my account|mi cuent
 
 // Chequeo ligero de ads.txt — true si existe y tiene ≥1 línea de seller real.
 const _adsTxtCache = new Map();
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// ads.txt — PUERTA DE ENTRADA (Maxi 2026-07-28, regla del user)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Regla del user: "sitios que no tienen ads.txt no entran a Prospects". Es el estándar de IAB:
+// sin ads.txt nadie puede vender programática, así que un sitio sin el archivo NO es monetizable.
+// Va PRIMERO en el proceso, antes de gastar un hit de RapidAPI para saber el tráfico.
+//
+// TRES ESTADOS, no dos. Esto es deliberado: la función vieja (_hasRealAdsTxt) devuelve false
+// tanto para "no tiene" como para "no pude chequear", y usarla así como filtro duro repetiría
+// el bug que hoy nos costó 2.011 leads (quedarnos sin cuota se leía como "el dominio es malo").
+//   "yes"     → tiene ads.txt válido con líneas de sellers        → entra
+//   "no"      → 404, o 200 con HTML/vacío (soft-404)              → descarta, es definitivo
+//   "unknown" → timeout, DNS, 403 de Cloudflare, 429, 5xx         → NO descarta, reintenta
+//
+// Fallbacks antes de dictar "no": www., y la RAÍZ del dominio (el spec de IAB pone ads.txt en
+// el dominio raíz, así que casavogue.globo.com se valida contra globo.com/ads.txt).
+const _adsTxtStateCache = new Map();
+
+function _parseAdsTxtBody(txt, contentType) {
+  const ct = (contentType || "").toLowerCase();
+  const body = String(txt || "").slice(0, 20000);
+  if (/<html|<!doctype/i.test(body) || ct.includes("text/html")) return 0;   // soft-404
+  return (body.match(/^[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || []).length;
+}
+
+async function _fetchAdsTxtOnce(host) {
+  try {
+    const res = await fetch(`https://${host}/ads.txt`, { signal: AbortSignal.timeout(8000), redirect: "follow" });
+    if (res.status === 404 || res.status === 410) return { state: "no", lines: 0 };
+    if (res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0 };
+    if (!res.ok) return { state: "unknown", lines: 0 };
+    const lines = _parseAdsTxtBody(await res.text(), res.headers.get("content-type"));
+    return lines >= 1 ? { state: "yes", lines } : { state: "no", lines: 0 };
+  } catch {
+    return { state: "unknown", lines: 0 };   // DNS, timeout, TLS, red
+  }
+}
+
+async function checkAdsTxt(domain) {
+  const d = String(domain || "").toLowerCase().replace(/^www\./, "").split("/")[0];
+  if (!d) return { state: "no", lines: 0, checked: "" };
+  if (_adsTxtStateCache.has(d)) return _adsTxtStateCache.get(d);
+
+  const root = _rootDomain(d);
+  const hosts = [d, `www.${d}`];
+  if (root && root !== d) hosts.push(root, `www.${root}`);   // subdominio → validar contra la raíz
+
+  let out = { state: "no", lines: 0, checked: d };
+  let huboUnknown = false;
+  for (const h of hosts) {
+    const r = await _fetchAdsTxtOnce(h);
+    if (r.state === "yes") { out = { state: "yes", lines: r.lines, checked: h }; break; }
+    if (r.state === "unknown") huboUnknown = true;
+  }
+  // Si ningún host dio "yes" pero alguno falló por red/bloqueo, NO afirmamos que no tiene.
+  if (out.state !== "yes" && huboUnknown) out = { state: "unknown", lines: 0, checked: d };
+
+  if (_adsTxtStateCache.size > 5000) _adsTxtStateCache.clear();
+  _adsTxtStateCache.set(d, out);
+  return out;
+}
+
 async function _hasRealAdsTxt(domain) {
   if (_adsTxtCache.has(domain)) return _adsTxtCache.get(domain);
   let ok = false;
@@ -5963,72 +6026,118 @@ async function runProspectSimilarExpansion(token) {
 }
 
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
-async function classifyPublisher(token, domain, pageContent, swCategory) {
-  // Si no pudimos bajar la home, NO filtrar acá (podría ser publisher con el sitio
-  // caído un momento). El guard de "no_emails_and_site_unreachable" downstream
-  // maneja los dominios realmente muertos. Evita falsos rechazos.
-  // Maxi 2026-07-16: sitio MUERTO/inservible (DNS no resuelve, conexión rechazada, TLS/SSL/cert roto) →
-  // NO pasa (antes con !pageContent devolvía ok:true = "beneficio de la duda" y estos se colaban a Prospects:
-  // zd.blog.jp, gamepress.gg, eiga.com). fetchPageContent marca dead:true solo en fallas DURAS (no timeouts).
-  if (pageContent?.dead) return { ok: false, reason: `unreachable:${pageContent.deadReason || "dead"}` };
-  // Maxi 2026-07-27 (auditoría del pool): ACÁ SE COLABA LA BASURA. Si no pudimos bajar la home
-  // (Cloudflare, sitio 100% JS, timeout), esto devolvía ok:true y el dominio entraba al pool SIN
-  // NINGUNA clasificación — ni título, ni schema, ni IA. Medido: 39,4% del pool quedó en categoría
-  // "other" (1.194 leads) y ahí adentro viven akamai.com, abanca.pt, bccr.fi.cr (Banco Central de
-  // Costa Rica), cerballiance.fr (laboratorios), 10federalstorage.com (self-storage).
-  // El dato de SimilarWeb SÍ lo teníamos, pero el chequeo estaba más abajo y nunca se alcanzaba.
-  // Ahora: sin home, decidimos con lo único que tenemos. Si SimilarWeb dice que es medio → pasa;
-  // si dice cualquier otra cosa, o no dice nada, NO entra a ciegas.
-  if (!pageContent) {
-    const _swc = (swCategory || "").toLowerCase();
-    if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(_swc)) {
-      return { ok: true, reason: `no_pagecontent_but_sw_pub:${_swc.slice(0, 20)}` };
-    }
-    return { ok: false, reason: `no_pagecontent_unverifiable${_swc ? `:sw_${_swc.slice(0, 20)}` : ""}` };
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// VEREDICTO PROSPECTABLE — puntaje multi-señal (Maxi 2026-07-28)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// POR QUÉ EXISTE: hasta hoy la decisión era una CADENA DE IFs con returns tempranos. Bastaba
+// que un eslabón fallara para que el dominio entrara sin analizar: `!pageContent` devolvía
+// ok:true, y `classifier_unavailable_pass` también. Por eso el pool terminó con 39,4% en
+// categoría "other" lleno de bancos, ministerios y hasta akamai.com. Arreglar un if a la vez
+// no alcanza: el diseño mismo permitía que "no sé" significara "sí".
+//
+// AHORA: se juntan TODAS las señales y se decide por puntaje. "No sé" ya no es "sí" — si no
+// hay evidencia POSITIVA de monetización, no entra. Y ninguna señal aislada puede abrir la
+// puerta sola.
+//
+// REGLA DURA DEL USER (2026-07-28): sin ads.txt no se monetiza → no entra. Con la salvedad de
+// que "no pude chequear" (Cloudflare/timeout) NO es "no tiene": eso se reintenta, no se descarta.
+const PROSPECT_SCORE_MIN = 30;
+
+function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType }) {
+  const señales = [];
+  let score = 0;
+  const add = (pts, txt) => { score += pts; señales.push(`${pts >= 0 ? "+" : ""}${pts} ${txt}`); };
+
+  // ── VETOS DUROS: ninguna suma los compensa ──
+  if (urlVerdict && !urlVerdict.ok) {
+    return { ok: false, score: -999, reason: urlVerdict.reason, señales: [urlVerdict.reason] };
   }
-  // Maxi 2026-07-08: TIPO DE SITIO no-publisher estructural (tienda/banco/universidad/viajes/
-  // ONG/servicios) → NO es target. Rechazo TEMPRANO, ANTES de la señal positiva de ads, porque
-  // estos sitios corren retargeting/ads.txt y se colaban (leroymerlin, defacto, n26, ipsos,
-  // carwow, urlaubsguru, tommys, etc.). Detectado por schema.org @type + keywords de intención.
-  if (pageContent.nonPublisherType) return { ok: false, reason: `nonpub_${pageContent.nonPublisherType}` };
-  const title = (pageContent?.title || "");
-  const cat   = (pageContent?.category || "");
-  // Maxi 2026-06-19: filtro NO agresivo. Se SACÓ el aprendizaje por contenido
-  // (dislikedCats / trash rules): hasta confirmar que todo está 100%, NO rechazamos
-  // por "categoría que el MB no quiso". Solo descartamos no-publishers ESTRUCTURALES
-  // (empresas/SaaS/gobierno/universidades/adultos/streaming). Ante la duda, PASA y que
-  // el MB lo rechace a mano (el botón rojo). Lo estructural lo cubren también
-  // isCategoryBlockedWorker (gov/uni/empresas) y scoreWebsite (adult/streaming/gambling).
-  // 1. Negativo fuerte por título (empresa/SaaS/login/gov/uni) → estructural, gratis.
-  if (NON_PUBLISHER_TITLE_RE.test(title)) return { ok: false, reason: `title_nonpub:"${title.slice(0,40)}"` };
-  // 2. Categoría de medios FUERTE (heurística home / SimilarWeb) → publisher directo, sin gastar IA.
-  if (PUBLISHER_CATEGORIES.has(cat)) return { ok: true, reason: `pub_cat:${cat}` };
+  if (adsTxt?.state === "no") {
+    return { ok: false, score: -999, reason: "sin_ads_txt", señales: ["sin ads.txt = no puede monetizar"] };
+  }
+  if (pageContent?.dead) {
+    return { ok: false, score: -999, reason: `unreachable:${pageContent.deadReason || "dead"}`, señales: ["sitio caído"] };
+  }
+  if (pageContent?.nonPublisherType) {
+    return { ok: false, score: -999, reason: `nonpub_${pageContent.nonPublisherType}`, señales: [`estructural: ${pageContent.nonPublisherType}`] };
+  }
+  if (haikuType && haikuType !== "publisher" && haikuType !== "other") {
+    return { ok: false, score: -999, reason: `haiku_${haikuType}`, señales: [`IA: ${haikuType}`] };
+  }
+  const title = pageContent?.title || "";
+  if (title && NON_PUBLISHER_TITLE_RE.test(title)) {
+    return { ok: false, score: -999, reason: `title_nonpub:"${title.slice(0, 40)}"`, señales: ["título de empresa/SaaS"] };
+  }
+
+  // ── EVIDENCIA DE MONETIZACIÓN (sin al menos una, no entra) ──
+  let monetiza = false;
+  if (adsTxt?.state === "yes") {
+    monetiza = true;
+    add(adsTxt.lines >= 20 ? 45 : 30, `ads.txt (${adsTxt.lines} sellers)`);
+  }
+  if (pageContent?.hasDisplayAds)     { monetiza = true; add(30, "display ads en la home"); }
+  if (pageContent?.hasProgrammatic)   { monetiza = true; add(15, "programmatic"); }
+  const nets = Array.isArray(pageContent?.adNetworks) ? pageContent.adNetworks.length : 0;
+  if (nets > 0)                       { monetiza = true; add(Math.min(nets * 8, 20), `${nets} ad networks`); }
+
+  // ── EVIDENCIA DE QUE ES UN MEDIO ──
+  const cat = (pageContent?.category || "");
+  if (PUBLISHER_CATEGORIES.has(cat)) add(25, `categoría de medios (${cat})`);
   const swc = (swCategory || "").toLowerCase();
-  if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) return { ok: true, reason: `sw_pub_cat:${swc.slice(0,20)}` };
-  // 3. Maxi 2026-07-08: la señal de monetización (display ads / ads.txt) YA NO alcanza por sí
-  //    sola — tiendas/bancos/hoteles/servicios corren retargeting y ads.txt y se colaban. Pedimos
-  //    veredicto de la IA (Haiku) como VETO: si la IA lo tipifica como comercial (tienda/banco/
-  //    edu/viajes/ong/saas/servicio/corp/gov) → rechazo, aunque tenga ads. El user: "si no
-  //    analiza la IA se da cuenta que no va". Haiku recibe además las reglas aprendidas del MB.
-  const monetized = !!pageContent?.hasDisplayAds || await _hasRealAdsTxt(domain);
-  const trash = await _loadProspectTrashContext(token).catch(() => ({ rules: "" }));
-  const type = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules || "");
-  if (type && type !== "publisher" && type !== "other") return { ok: false, reason: `haiku_${type}` };
-  if (type === "publisher") return { ok: true, reason: monetized ? "haiku+ads" : "haiku_publisher" };
-  // 4. Haiku no respondió / "other". Si hay monetización real → publisher; si no, PASA (no agresivo)
-  //    y que el MB lo rechace a mano.
-  if (monetized) return { ok: true, reason: pageContent?.hasProgrammatic ? "programmatic_ads" : "ads_monetized" };
-  // Maxi 2026-07-27: SEGUNDA puerta por la que se colaba basura. Acá llegamos con CERO evidencia
-  // de que sea publisher: no matcheó categoría de medios, no matcheó SimilarWeb, no tiene display
-  // ads ni ads.txt real. Antes igual devolvía ok:true ("ante la duda, pasa y que el MB lo rechace
-  // a mano") — pero el MB no da abasto y el pool terminó con 70% de no-publishers.
-  // Distingo los dos casos, que NO son lo mismo:
-  //   · type === "other" → Haiku SÍ corrió y no encontró que fuera un medio. Sumado a cero ads,
-  //     no hay ninguna razón para meterlo al pool → rechazo.
-  //   · type === null    → Haiku falló (timeout/API caída). Es un problema NUESTRO, no del
-  //     dominio: mantengo el pase para no descartar publishers buenos por una caída de la IA.
-  if (type === "other") return { ok: false, reason: "no_publisher_evidence (haiku:other + sin ads)" };
-  return { ok: true, reason: "classifier_unavailable_pass" };
+  if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) add(20, `SimilarWeb: ${swc.slice(0, 20)}`);
+  if (haikuType === "publisher") add(35, "IA lo tipifica como medio");
+  if (urlVerdict?.reason === "url_ok_hint_medio") add(10, "el nombre del dominio dice medio");
+
+  // ── LA REGLA QUE FALTABA: sin evidencia positiva de monetización, NO ENTRA ──
+  // Esto es lo que cierra el agujero de "no sé" → "pasa". Antes, un dominio sin ads.txt, sin
+  // ads en la home y sin veredicto de IA igual entraba por classifier_unavailable_pass.
+  if (!monetiza) {
+    return {
+      ok: false, score,
+      reason: adsTxt?.state === "unknown" ? "sin_evidencia_monetizacion (ads.txt no verificable)" : "sin_evidencia_monetizacion",
+      señales: señales.length ? señales : ["ninguna señal de monetización"],
+    };
+  }
+
+  const ok = score >= PROSPECT_SCORE_MIN;
+  return {
+    ok, score,
+    reason: ok ? `score_${score}` : `score_bajo_${score}`,
+    señales,
+  };
+}
+
+async function classifyPublisher(token, domain, pageContent, swCategory) {
+  // Maxi 2026-07-28: esta función pasó de ser una cadena de ifs con returns tempranos (donde
+  // "no pude verificar" terminaba siendo "pasa") a juntar todas las señales y decidir por
+  // puntaje en scoreProspectable(). Acá solo se RECOLECTA; la decisión vive allá.
+  // Orden pensado para gastar lo mínimo: lo gratis primero, la IA al final y solo si hace falta.
+
+  // 1. URL (gratis, sin red)
+  const urlVerdict = classifyByUrlOnly(domain, swCategory || "", 0);
+  if (!urlVerdict.ok) return { ok: false, reason: urlVerdict.reason, score: -999 };
+
+  // 2. ads.txt — la regla dura del user. Una request, sin API paga.
+  const adsTxt = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
+  if (adsTxt.state === "no") return { ok: false, reason: "sin_ads_txt", score: -999 };
+
+  // 3. Señales de la página (ya viene bajada por el caller; si no, no gastamos otra request)
+  if (pageContent?.dead) return { ok: false, reason: `unreachable:${pageContent.deadReason || "dead"}`, score: -999 };
+
+  // 4. IA (Haiku, ~$0.0005) SOLO si lo barato no alcanzó para confirmar que es un medio.
+  //    Si ya hay ads.txt gordo + categoría de medios, no gastamos ni eso.
+  const catOk = PUBLISHER_CATEGORIES.has(pageContent?.category || "")
+             || /news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test((swCategory || "").toLowerCase());
+  let haikuType = null;
+  if (!(catOk && adsTxt.state === "yes" && adsTxt.lines >= 20)) {
+    const trash = await _loadProspectTrashContext(token).catch(() => ({ rules: "" }));
+    haikuType = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules || "").catch(() => null);
+  }
+
+  const v = scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType });
+  if (!v.ok) log(`  ⚖️ ${domain} NO prospectable (${v.reason}) — ${v.señales.join(" · ")}`);
+  return { ok: v.ok, reason: v.reason, score: v.score, señales: v.señales };
 }
 
 // ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
@@ -6961,6 +7070,28 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Maxi 2026-07-01: TRAFFIC PRIMERO, SOLO. El page content (scrape) se difería a
   // después del floor de 350K para NO gastar scrape/API en sitios que se van a rechazar.
   // Antes traffic+content corrían en paralelo → todo sitio scrapeaba aunque fuera de 2K.
+  // ── PUERTA 0: ads.txt (Maxi 2026-07-28, regla del user) ───────────────────────────────
+  // "Sitios que no tienen ads.txt no entran a Prospects. Quien no tiene txt no puede monetizar."
+  // Va ANTES de getTrafficData a propósito: es 1 request gratis y evita gastar un hit de
+  // RapidAPI (que se factura) en un dominio que igual se iba a descartar.
+  // OJO con los tres estados: "unknown" (Cloudflare 403, timeout, DNS) NO es "no tiene" →
+  // vuelve a la cola en vez de descartarse. Descartar por fallas nuestras es exactamente el bug
+  // que hoy nos costó 2.011 leads congelados.
+  {
+    const _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
+    if (_ads.state === "no") {
+      await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: sin_ads_txt` });
+      log(`  📄 ${domain} — SIN ads.txt → no monetiza, descartado (0 API gastada)`);
+      return;
+    }
+    if (_ads.state === "unknown") {
+      await markCsvItem(token, item.id, "pending", { error_message: `ads_txt_no_verificable (reintento, NO penaliza)` });
+      log(`  📄❓ ${domain} — ads.txt no verificable (bloqueo/timeout) → reintento, no se descarta`);
+      return;
+    }
+    log(`  📄✅ ${domain} — ads.txt OK (${_ads.lines} sellers, vía ${_ads.checked})`);
+  }
+
   const trafficData = await getTrafficData(domain, rapidapi_key);
   let { visits, pagesPerVisit, topCountry, topCountries3, swCategory } = trafficData;
   if (!topCountry) {
