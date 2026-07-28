@@ -6246,48 +6246,108 @@ const GEO_TO_LANG_AGENT = {
   AE:"ar", SA:"ar", EG:"ar", MA:"ar",
 };
 
+
+// ── ALFABETO DEL SITIO (Maxi 2026-07-28) ──────────────────────────────────────────────────
+// Caso real reportado por el user: wanfangdata.com.cn (título 万方数据知识服务平台…, GEO China)
+// quedó guardado con idioma "pt". El sistema de votos está pensado para idiomas de alfabeto
+// LATINO: ante un sitio en chino ninguna señal aplica, y basta un voto suelto (bonus de acento
+// por mojibake, un geo/tld mal mapeado, el árbitro adivinando) para que gane con 1-2 puntos.
+// La regla del user es determinista y no depende de adivinar: si el sitio NO está en alfabeto
+// latino y no es árabe (el único no-latino con template), el mail sale en INGLÉS.
+// Cubre: chino, japonés, coreano, cirílico, griego, hebreo, tailandés, devanagari (hindi),
+// bengalí, tamil, armenio, georgiano.
+function _scriptNoLatino(text) {
+  const t = String(text || "");
+  if (!t) return null;
+  if (/[\u0600-\u06FF\u0750-\u077F]/.test(t)) return "ar";       // árabe → SÍ soportado
+  if (/[\u4E00-\u9FFF\u3400-\u4DBF]/.test(t)) return "zh";
+  if (/[\u3040-\u309F\u30A0-\u30FF]/.test(t)) return "ja";
+  if (/[\uAC00-\uD7AF\u1100-\u11FF]/.test(t)) return "ko";
+  if (/[\u0400-\u04FF]/.test(t))                 return "cyrillic";
+  if (/[\u0370-\u03FF\u1F00-\u1FFF]/.test(t))  return "el";
+  if (/[\u0590-\u05FF]/.test(t))                 return "he";
+  if (/[\u0E00-\u0E7F]/.test(t))                 return "th";
+  if (/[\u0900-\u097F]/.test(t))                 return "hi";
+  if (/[\u0980-\u09FF]/.test(t))                 return "bn";
+  if (/[\u0B80-\u0BFF]/.test(t))                 return "ta";
+  if (/[\u0530-\u058F]/.test(t))                 return "hy";
+  if (/[\u10A0-\u10FF]/.test(t))                 return "ka";
+  return null;
+}
+// TLDs de países cuyo idioma NO usa alfabeto latino y NO tenemos template → inglés directo.
+// Sirve cuando no pudimos bajar la página y no hay texto que analizar.
+const TLD_NO_LATINO = new Set(["cn","jp","kr","tw","hk","th","ru","ua","by","kz","gr","il","in","bd","lk","np","mm","kh","la","ge","am","rs","bg","mk"]);
+
+// ── DETECTOR DE IDIOMA POR TEXTO (reescrito 2026-07-28, planteo del user) ─────────────────
+// El user: "no hay nada más fácil que coger 200 palabras del texto de una web y detectar el
+// idioma". Tiene razón, y el diseño anterior lo hacía al revés: el texto era UN voto (peso 10)
+// entre ocho señales, compitiendo con el TLD (peso 2) y el GEO (peso 3). Un sitio rumano con
+// GEO mal leído terminaba con pitch en portugués.
+// AHORA: el texto MANDA. Y para que pueda mandar, tiene que saber reconocer los idiomas que NO
+// soportamos — antes solo conocía es/pt/it/en/fr/de, así que ante un sitio polaco o rumano
+// encontraba 2 stopwords sueltas y devolvía cualquier cosa. Ahora reconoce 20 idiomas: los 5
+// que enviamos y 15 más que sirven para decir "no es ninguno de los nuestros → inglés".
+const LANG_MARKERS = {
+  // ── Los 5 que SÍ enviamos ──
+  es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|también|nuestra|nuestro|hola|gracias|hace|noticias|últimas|más|años|días|nuevo|nueva|desde|entre|hasta|muy|todo|puede)\b/gi,
+  pt: /\b(que|não|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|você|notícias|últimas|mais|anos|dias|nova|desde|entre|até|muito|tudo|pode|são|está|fazer)\b/gi,
+  it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perché|grazie|nostra|nostro|notizie|ultim|anni|giorni|nuovo|nuova|più|molto|tutto|essere|anche|dopo)\b/gi,
+  en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|news|latest|more|years|days|new|very|all|can|has|not|are)\b/gi,
+  ar: /[\u0600-\u06FF]{3,}/g,
+  // ── Los que NO enviamos: reconocerlos es lo que evita el falso es/pt/it ──
+  fr: /\b(que|les|des|pour|avec|une|sur|cette|mais|quand|où|comme|parce|notre|votre|bonjour|merci|nouvelles|plus|ans|jours|nouveau|très|tout|être|dans|sont|aussi)\b/gi,
+  de: /\b(der|die|das|und|für|mit|ein|eine|nicht|auch|aber|wenn|wie|weil|über|unsere|unser|nachrichten|mehr|jahre|tage|neue|sehr|alle|sind|haben|wird|noch|nach)\b/gi,
+  nl: /\b(de|het|een|van|voor|met|niet|maar|ook|wanneer|waar|hoe|omdat|onze|nieuws|meer|jaar|dagen|nieuwe|zeer|alle|zijn|hebben|wordt|naar|door|over)\b/gi,
+  pl: /\b(nie|się|jest|dla|przez|jako|który|która|ale|kiedy|gdzie|jak|ponieważ|nasze|nasza|wiadomości|więcej|lata|dni|nowe|bardzo|wszystko|są|mają|oraz|tylko)\b/gi,
+  ro: /\b(nu|este|pentru|prin|care|dar|când|unde|cum|pentru că|nostru|noastră|știri|mai|ani|zile|nou|nouă|foarte|toate|sunt|au|și|din|cu|despre)\b/gi,
+  tr: /\b(bir|bu|için|ile|ve|değil|ama|zaman|nerede|nasıl|çünkü|bizim|haber|daha|yıl|gün|yeni|çok|tüm|var|olan|olarak|sonra|kadar)\b/gi,
+  cs: /\b(není|je|pro|přes|který|ale|když|kde|jak|protože|naše|náš|zprávy|více|roky|dny|nové|velmi|všechno|jsou|mají|nebo|také|což)\b/gi,
+  sv: /\b(inte|är|för|med|som|men|när|var|hur|eftersom|vår|våra|nyheter|mer|år|dagar|nya|mycket|alla|har|kan|och|det|att|den)\b/gi,
+  da: /\b(ikke|er|for|med|som|men|når|hvor|hvordan|fordi|vores|nyheder|mere|år|dage|nye|meget|alle|har|kan|og|det|at|den)\b/gi,
+  no: /\b(ikke|er|for|med|som|men|når|hvor|hvordan|fordi|vår|våre|nyheter|mer|år|dager|nye|mye|alle|har|kan|og|det|som)\b/gi,
+  fi: /\b(ei|on|että|kuin|mutta|kun|missä|miten|koska|meidän|uutiset|lisää|vuotta|päivää|uusi|hyvin|kaikki|ovat|voi|ja|se|tämä)\b/gi,
+  hu: /\b(nem|van|hogy|mint|de|amikor|hol|hogyan|mert|mi|hírek|több|év|nap|új|nagyon|minden|vannak|lehet|és|ez|az|egy)\b/gi,
+  id: /\b(tidak|adalah|untuk|dengan|yang|tetapi|ketika|di mana|bagaimana|karena|kami|berita|lebih|tahun|hari|baru|sangat|semua|dan|ini|itu)\b/gi,
+  vi: /\b(không|là|cho|với|mà|nhưng|khi|ở đâu|thế nào|bởi vì|chúng tôi|tin tức|hơn|năm|ngày|mới|rất|tất cả|và|này|đó)\b/gi,
+  ca: /\b(que|els|les|per|amb|una|del|aquest|aquesta|però|quan|on|com|perquè|nostra|nostre|notícies|més|anys|dies|nou|molt|tot|són)\b/gi,
+};
+const LANGS_ENVIABLES = new Set(["es", "pt", "it", "en", "ar"]);
+
 function _detectLangFromText(text) {
-  if (!text || text.length < 30) return { lang: null, confidence: "none", scores: {} };
-  const t = text.toLowerCase();
-  // Caracteres únicos = señal fuerte
-  if (/[؀-ۿ]/.test(text)) return { lang: "ar", confidence: "high", scores: { ar: 999 } };
-  // Stopwords + palabras frecuentes — listas EXTENDIDAS para mayor precisión
-  const markers = {
-    es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|tambien|también|nuestra|nuestro|hola|gracias|hace|noticias|últimas|video|videos|fútbol|política|economía|deportes|mundo|inicio|contacto|sobre[\s-]?nosotros|aviso|legal|política[\s-]?de[\s-]?privacidad|términos|condiciones|últim|hoy|ayer|mañana|años|días|nuevo|nueva|gran|millones)\b/g,
-    pt: /\b(que|não|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|olá|obrigad|dele|dela|você|notícias|notícia|últimas|últim|esportes|política|economia|cidade|brasileir|portuguesa|português|política[\s-]?de[\s-]?privacidade|termos|condições|hoje|ontem|amanhã|anos|dias|nova|grande|milhões)\b/g,
-    it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perché|sopra|grazie|nostra|nostro|ciao|notizie|ultim|sport|politica|economia|città|italiano|italiana|chi[\s-]?siamo|contatti|privacy|termini|condizioni|oggi|ieri|domani|anni|giorni|nuovo|nuova|grande|milioni)\b/g,
-    en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|hello|thanks|news|latest|video|videos|football|politics|economy|sports|world|home|contact|about[\s-]?us|privacy|terms|conditions|today|yesterday|tomorrow|years|days|new|great|millions)\b/g,
-    fr: /\b(que|les|des|pour|avec|une|sur|cette|cet|mais|quand|où|comme|parce|notre|votre|bonjour|merci|nouvelles|aujourd'hui|hier|demain)\b/g,
-    de: /\b(der|die|das|und|für|mit|ein|eine|nicht|auch|aber|wenn|wo|wie|weil|über|unsere|unser|hallo|danke|nachrichten|heute|gestern|morgen)\b/g,
-  };
+  const raw = String(text || "");
+  // El alfabeto se chequea PRIMERO, antes del mínimo de longitud: en chino/japonés/coreano 30
+  // caracteres ya son un párrafo entero, y el umbral pensado para texto latino los descartaba
+  // como "muy corto" (caso wanfangdata.com.cn, título de 35 chars).
+  const script = _scriptNoLatino(raw);
+  if (script === "ar") return { lang: "ar", confidence: "high", scores: { ar: 999 } };
+  if (script)          return { lang: script, confidence: "high", scores: {}, noLatino: true };
+  if (raw.length < 40) return { lang: null, confidence: "none", scores: {} };
+
+  // Muestra amplia: ~200 palabras es más que suficiente y evita decidir sobre un menú de 5 items.
+  const t = raw.slice(0, 4000).toLowerCase();
+  const palabras = (t.match(/[\p{L}]+/gu) || []).length;
+  if (palabras < 15) return { lang: null, confidence: "low", scores: {} };
+
   const scores = {};
-  let total = 0;
-  for (const [lang, re] of Object.entries(markers)) {
-    const m = t.match(re);
-    scores[lang] = m ? m.length : 0;
-    total += scores[lang];
+  for (const [lang, re] of Object.entries(LANG_MARKERS)) {
+    scores[lang] = (t.match(re) || []).length;
   }
-  // Maxi 2026-07-08: bonus de acento GATEADO — solo REFUERZA una señal de stopword ya
-  // existente, NO crea un ganador de la nada. Antes: á/é/í/ó/ú/ü (compartidos por checo,
-  // polaco, eslovaco, húngaro, turco, etc.) inflaban es/pt/it falsos y se volvían el voto
-  // ganador en sitios de idiomas NO soportados. Chars REALMENTE distintivos de un idioma
-  // (ñ/¿/¡ = español; ã/õ = portugués; ß = alemán) mantienen bonus fuerte SIEMPRE porque
-  // casi no existen fuera de ese idioma; los compartidos solo suman si YA hay stopwords.
-  if (/[ñ¿¡]/.test(text))                          scores.es = (scores.es || 0) + 8; // casi únicos del es
-  else if (scores.es > 0 && /[áéíóúü]/.test(text)) scores.es += 8;                    // compartidos: refuerzo
-  if (/[ãõ]/.test(text))                           scores.pt = (scores.pt || 0) + 8; // casi únicos del pt
-  else if (scores.pt > 0 && /[çàáâ]/.test(text))   scores.pt += 8;                    // compartidos: refuerzo
-  if (scores.it > 0 && /[àèéìòù]/.test(text))      scores.it += 5;                    // it no tiene chars únicos
-  if (/ß/.test(text))                              scores.de = (scores.de || 0) + 5; // ß casi único del de
-  else if (scores.de > 0 && /[äöü]/.test(text))    scores.de += 5;                    // compartidos: refuerzo
-  if (total < 5) return { lang: null, confidence: "low", scores };
-  const sorted = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  const top = sorted[0];
-  const second = sorted[1] || ["", 0];
-  const gap = top[1] - second[1];
-  // High = gap >= 8 (claro ganador). Medium = gap 3-7. Low = ambiguo.
-  const conf = gap >= 8 ? "high" : gap >= 3 ? "medium" : "low";
-  return { lang: top[0], confidence: conf, scores, gap };
+  // Caracteres muy distintivos: sólo desempatan, no crean un ganador de la nada.
+  if (/[ñ¿¡]/.test(raw) && scores.es > 0) scores.es += 5;
+  if (/[ãõ]/.test(raw)  && scores.pt > 0) scores.pt += 5;
+  if (/[ăâîșț]/.test(raw) && scores.ro > 0) scores.ro += 5;
+  if (/[ąćęłńóśźż]/.test(raw) && scores.pl > 0) scores.pl += 5;
+  if (/[ğışçö]/.test(raw) && scores.tr > 0) scores.tr += 5;
+  if (/ß/.test(raw) && scores.de > 0) scores.de += 5;
+
+  const orden = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+  const [top, segundo] = [orden[0], orden[1] || ["", 0]];
+  // Densidad: cuántas de las palabras del texto son stopwords del ganador.
+  const densidad = top[1] / Math.max(palabras, 1);
+  if (top[1] < 4 || densidad < 0.01) return { lang: null, confidence: "low", scores };
+  const margen = top[1] - segundo[1];
+  const confidence = margen >= 6 ? "high" : margen >= 3 ? "medium" : "low";
+  return { lang: top[0], confidence, scores, gap: margen, densidad };
 }
 
 // Cache de detección por dominio — evita re-pagar Claude/re-fetchear HTML
@@ -6399,6 +6459,42 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
     votes[lang] = (votes[lang] || 0) + weight;
     reasons.push(`${source}:${lang}+${weight}`);
   };
+
+  // ── REGLA DURA DEL ALFABETO (Maxi 2026-07-28) — va ANTES de cualquier voto ──
+  // Si el sitio está escrito en un alfabeto que no es latino, ningún voto de stopwords/acentos
+  // tiene sentido. Árabe es la única excepción (tenemos template); todo el resto → INGLÉS.
+  // Esto cierra de raíz el caso wanfangdata.com.cn → "pt".
+  const _script = _scriptNoLatino(textSample || "");
+  if (_script === "ar") {
+    return finish({ lang: "ar", source: "script_arabe", confidence: "high", reasons: ["alfabeto árabe"] });
+  }
+  if (_script) {
+    return finish({ lang: "en", source: `script_${_script}_→en`, confidence: "high",
+                    reasons: [`alfabeto ${_script} sin template → inglés (regla del user)`] });
+  }
+  // Sin texto para analizar: el TLD del país ya nos dice que no es un idioma que manejemos.
+  if (!textSample && TLD_NO_LATINO.has((cleanDomain.split(".").pop() || ""))) {
+    return finish({ lang: "en", source: "tld_no_latino_→en", confidence: "medium",
+                    reasons: [`TLD .${cleanDomain.split(".").pop()} sin template → inglés`] });
+  }
+
+  // ── EL TEXTO DECIDE (Maxi 2026-07-28, planteo del user) ───────────────────────────────
+  // Antes el texto era UN voto entre ocho, y el TLD/GEO podían darlo vuelta. Ahora, si tenemos
+  // texto y el detector está seguro, ESE es el idioma y no se vota nada más. Es la única señal
+  // que mira lo que el publisher realmente escribió.
+  //   · detecta uno de los 5 que enviamos  → ese
+  //   · detecta otro idioma (pl, ro, tr, nl, de, fr…) → INGLÉS (regla del user: fuera de
+  //     {es,en,it,pt,ar} se manda en inglés)
+  // Solo si el texto NO alcanza para decidir se cae al sistema de votos de abajo.
+  const _txt = _detectLangFromText(textSample || "");
+  if (_txt.lang && (_txt.confidence === "high" || _txt.confidence === "medium")) {
+    if (LANGS_ENVIABLES.has(_txt.lang)) {
+      return finish({ lang: _txt.lang, source: `texto(${_txt.confidence})`, confidence: _txt.confidence,
+                      reasons: [`texto→${_txt.lang} (gap ${_txt.gap ?? "?"})`] });
+    }
+    return finish({ lang: "en", source: `texto_${_txt.lang}_→en`, confidence: "high",
+                    reasons: [`el texto está en ${_txt.lang}, sin template → inglés`] });
+  }
 
   // 1) Texto heurístico (más confiable — lo que el publisher escribió)
   const textRes = _detectLangFromText(textSample || "");
