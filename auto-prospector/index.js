@@ -5414,11 +5414,21 @@ const _adsTxtCache = new Map();
 // el dominio raíz, así que casavogue.globo.com se valida contra globo.com/ads.txt).
 const _adsTxtStateCache = new Map();
 
+// Verificado contra el ads.txt real de ole.com.ar (421 líneas): tolera comentarios #, líneas en
+// minúscula (reseller), con y sin ID de certificación, comas faltantes, IDs con sufijo (-OB, -EB),
+// comentarios pegados al final (…fafdf38b16bf6b2b#SOVRN) y los registros especiales del spec
+// (ownerdomain=, managerdomain=, inventorypartnerdomain=) que NO son líneas de seller.
 function _parseAdsTxtBody(txt, contentType) {
   const ct = (contentType || "").toLowerCase();
-  const body = String(txt || "").slice(0, 20000);
-  if (/<html|<!doctype/i.test(body) || ct.includes("text/html")) return 0;   // soft-404
-  return (body.match(/^[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || []).length;
+  const body = String(txt || "").slice(0, 200000);
+  if (/<html|<!doctype/i.test(body) || ct.includes("text/html")) return { lines: 0, systems: 0, owner: "" };
+  const matches = body.match(/^[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || [];
+  // Exchanges DISTINTOS: mejor señal de calidad que el conteo bruto. Un archivo con 400 líneas de
+  // un solo sistema monetiza menos que uno con 30 exchanges reales (rubicon, pubmatic, google,
+  // appnexus, openx, indexexchange...). ole.com.ar tiene ~150 sistemas distintos.
+  const systems = new Set(matches.map(l => l.split(",")[0].trim().toLowerCase()).filter(Boolean));
+  const owner = (body.match(/^ownerdomain=(.+)$/im) || [])[1] || "";
+  return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase() };
 }
 
 async function _fetchAdsTxtOnce(host) {
@@ -5427,8 +5437,8 @@ async function _fetchAdsTxtOnce(host) {
     if (res.status === 404 || res.status === 410) return { state: "no", lines: 0 };
     if (res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0 };
     if (!res.ok) return { state: "unknown", lines: 0 };
-    const lines = _parseAdsTxtBody(await res.text(), res.headers.get("content-type"));
-    return lines >= 1 ? { state: "yes", lines } : { state: "no", lines: 0 };
+    const p = _parseAdsTxtBody(await res.text(), res.headers.get("content-type"));
+    return p.lines >= 1 ? { state: "yes", ...p } : { state: "no", lines: 0, systems: 0 };
   } catch {
     return { state: "unknown", lines: 0 };   // DNS, timeout, TLS, red
   }
@@ -5447,7 +5457,7 @@ async function checkAdsTxt(domain) {
   let huboUnknown = false;
   for (const h of hosts) {
     const r = await _fetchAdsTxtOnce(h);
-    if (r.state === "yes") { out = { state: "yes", lines: r.lines, checked: h }; break; }
+    if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", checked: h }; break; }
     if (r.state === "unknown") huboUnknown = true;
   }
   // Si ningún host dio "yes" pero alguno falló por red/bloqueo, NO afirmamos que no tiene.
@@ -6074,7 +6084,10 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   let monetiza = false;
   if (adsTxt?.state === "yes") {
     monetiza = true;
-    add(adsTxt.lines >= 20 ? 45 : 30, `ads.txt (${adsTxt.lines} sellers)`);
+    const sys = adsTxt.systems || 0;
+    // Puntúa por EXCHANGES DISTINTOS, no por líneas: 400 líneas de un solo sistema monetiza
+    // mucho menos que 30 exchanges reales.
+    add(sys >= 15 ? 45 : sys >= 5 ? 35 : 25, `ads.txt (${adsTxt.lines} líneas, ${sys} exchanges)`);
   }
   if (pageContent?.hasDisplayAds)     { monetiza = true; add(30, "display ads en la home"); }
   if (pageContent?.hasProgrammatic)   { monetiza = true; add(15, "programmatic"); }
