@@ -4386,6 +4386,42 @@ const IGNORE_EMAIL = ["example.com","domain.com","sentry.io","google.com","w3.or
 // metía el objeto entero en el ranking y en toolbar_response_tracking.source →
 // rompía el análisis por fuente Y el ranking dinámico (cada dominio quedaba como
 // una "fuente" distinta, ej: {"url":"...","source":"scrape"}).
+// ── BRAND-MATCH: ¿el email pertenece a la MARCA del lead? (hoisteado 2026-07-28) ──
+// Vivía inline en el loop de envío. Lo saco a módulo para poder usarlo TAMBIÉN en la
+// selección de candidato: antes, un email de otra marca abortaba el envío y marcaba el lead
+// como 'rejected' para siempre, teniendo otras direcciones válidas en la lista. Ahora ese
+// candidato se descarta y se prueba el siguiente, igual que con los no entregables.
+// Algoritmo (2026-05-15): strip TLD para comparar nombre comercial.
+//   eltribuno.com ↔ eltribuno.com.ar    → match (mismo brand)
+//   midilibre.fr  ↔ midilibre.com        → match
+//   tudogostoso.com.br ↔ webedia-group.com → no match (matriz distinta)
+function _brandStripTld(d) {
+  const parts = String(d || "").split(".");
+  if (parts.length <= 2) return parts[0] || "";
+  const last2 = parts.slice(-2).join(".");
+  const TWO_LEVEL = new Set([
+    "com.ar","com.br","com.mx","com.co","com.pe","com.cl","com.ve","com.ec","com.uy",
+    "com.py","com.bo","com.gt","com.sv","com.hn","com.ni","com.cr","com.pa","com.do",
+    "co.uk","co.za","co.nz","co.jp","co.kr","co.id","co.in",
+    "com.tr","com.tw","com.hk","com.sg","com.my","com.au","com.eg","com.sa","com.ng",
+    "org.uk","ac.uk","gov.uk","com.pt","org.br","gov.br","edu.br",
+  ]);
+  if (TWO_LEVEL.has(last2)) return parts[parts.length - 3] || "";
+  return parts[parts.length - 2] || "";
+}
+function _brandMatches(email, leadDomain) {
+  const recipientDom = (String(email || "").split("@")[1] || "").toLowerCase();
+  const leadDom      = String(leadDomain || "").toLowerCase().replace(/^www\./, "");
+  if (!recipientDom || !leadDom) return false;
+  const isWebmail = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/.test(recipientDom);
+  const rb = _brandStripTld(recipientDom), lb = _brandStripTld(leadDom);
+  return recipientDom === leadDom
+      || recipientDom.endsWith("." + leadDom)
+      || leadDom.endsWith("." + recipientDom)
+      || (rb && rb === lb && rb.length >= 4)
+      || isWebmail;
+}
+
 function _normSrc(v) { return typeof v === "string" ? v : (v && v.source) || ""; }
 
 // Limpieza de prefijo "C" pegado al email — artifact común del scrape de HTML
@@ -10588,6 +10624,15 @@ const _GARBAGE_DOMAIN_KEYWORDS = [
   "dominio","dominios","dominiosecuador","jewellaprivacy","cscinfo","cscglobal",
   "n2v","markmonitor","godaddyguard","gandi\\.net","enom","netim","epag",
   "porkbun","namebright","key-systems","onlinenic","ovhcloud","ovh\\.net",
+  // Maxi 2026-07-28: WHOIS proxies / brand-protection vistos EN EL POOL REAL. Ninguno matcheaba
+  // las keywords de arriba y quedaban como email #1 del lead. Casos textuales:
+  //   domain-contact.org → pixiv.net, globo.com y sus 4 subdominios, store.playstation.com,
+  //                        miro.com, eneba.com, outdooractive.com, parasut.com (8+ leads)
+  //   ccireg.com → blog.bancolombia.com · iptwins.com → location.carrefour.fr
+  //   istmanagement.com → los 3 blogs de fc2.com · psi-japan.co.jp → au.com
+  // No son el publisher: son el agente que le administra el dominio. Escribirles es 100% desperdicio.
+  "domain-?contact","ccireg","iptwins","istmanagement","psi-japan",
+  "brandprotect","brand-protect","corporatedomains","netnames","safenames","comlaude","ipmirror",
   // Privacy proxies
   "privacyprotect","privacyguard","domainprotect","protecteddomain","whoisprotect",
   "whoisguard","contactprivacy","withheldforprivacy","perfectprivacy",
@@ -12393,6 +12438,16 @@ async function runAgentCycle(token, allFlags) {
           ];
           for (const cand of _orden) {
             if (isBouncedSync(cand.email)) { descartados++; continue; }   // ya rebotó antes
+            // Maxi 2026-07-28: marca distinta → descartar ESTE candidato, no el lead.
+            // Antes el chequeo vivía después de la reserva y hacía `continue` del lead entero,
+            // marcándolo 'rejected' PARA SIEMPRE aunque tuviera otras direcciones buenas. Casos
+            // reales del pool: info@domain-contact.org como email #1 de pixiv.net y de los 4
+            // subdominios de globo.com (es el WHOIS proxy, no el publisher).
+            if (!_brandMatches(cand.email, domain)) {
+              log(`  🚫 ${domain}: ${cand.email} es de otra marca — se descarta el email, NO el lead`);
+              descartados++;
+              continue;
+            }
             if (mvUsed < MAX_MV_PER_LEAD) {
               mvUsed++;
               if (!(await _verifyEmailMV(token, cfg, cand.email))) {
