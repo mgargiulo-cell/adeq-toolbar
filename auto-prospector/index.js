@@ -41,6 +41,108 @@ const REVIEW_QUEUE_MIN_TRAFFIC = 350_000; // Floor absoluto en review_queue (en 
 // se venden por trato directo, no contestan un cold email. Override con threshold_traffic_max.
 const REVIEW_QUEUE_MAX_TRAFFIC = 50_000_000;
 
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// CLASIFICADOR POR URL — "sirve" vs "no sirve" SIN RED Y SIN CRÉDITOS (Maxi 2026-07-28)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Pedido del user: "reprocesar todo solo mirando las urls sin gastar créditos, con la info que
+// ya tenemos". Decide con (dominio, categoría guardada, tráfico guardado) — cero fetch, cero
+// RapidAPI, cero Apollo, cero IA. Corre sobre 3.000 leads en segundos.
+// Dos usos:
+//   1. Barrido del pool existente (job purgeByUrlOnly) → limpieza masiva instantánea.
+//   2. Pre-filtro en la calificación de leads NUEVOS, ANTES de gastar un solo hit de API.
+// Todas las reglas salen de basura REAL encontrada en el pool del user el 28/07.
+// Filosofía: solo rechaza lo que es ESTRUCTURALMENTE no-publisher. Ante la duda → pasa y que
+// decida el clasificador caro (classifyPublisher, con página + Haiku).
+const URL_REJECT_RULES = [
+  // ── Institucional: gobierno, ejército, escuelas, universidades ──
+  [/(^|\.)(gov|gob|mil|gouv)(\.|$)|\.(gov|gob|mil)\.[a-z]{2}$|\.go\.(id|jp|kr|th|ug|ke)$|\.gouv\.fr$|\.gc\.ca$/i, "gobierno"],
+  [/(^|\.)(edu|ac)(\.|$)|\.edu\.[a-z]{2}$|\.ac\.(uk|jp|kr|id|nz|za|in)$|\.k12\.[a-z]{2}$|\.meb\.k12\./i, "educacion"],
+  [/(^|\.)(uni-|univ-|uni\.|universidad|universita|universite|university|college|escuela|schule|facultad|facmed)/i, "universidad"],
+  // Universidades y centros de investigación SIN TLD académico — vistos en el pool del user:
+  // epfl.ch, lu.se, lth.se, moocs.unige.ch, enseignement.uliege.be, ehess.fr, bsc.es, tec.mx,
+  // dialnet.unirioja.es, gredos.usal.es, observatoriovacunascovid19.unam.mx, cirad.fr, inrae.fr.
+  [/(^|\.)(epfl|ethz|unam|usal|unige|uliege|ehess|unirioja|kuleuven|sorbonne|tec|udp|uc|uba|unal|javeriana|anahuac|itesm)\.[a-z]{2,3}$|^(lu|lth|bsc|cnrs|inrae|inrs|cirad|ifo|diw|dagstuhl|csic|conicet|conicyt)\./i, "universidad"],
+  // Subdominio que delata vida académica aunque la raíz no lo diga (ejemplo del user:
+  // posgrados.udp.cl). También catedra/biblioteca/campus/admision/alumnos/matricula.
+  [/^(posgrados?|postgrados?|pregrado|maestrias?|doctorados?|catedra|biblioteca|campus|admisi[oó]n|admissions|alumnos?|egresados?|matricula|facultad|investigacion|extension)\./i, "universidad"],
+  // ── Acortadores y dominios de plataforma: nunca son un publisher ──
+  [/^(goo\.gl|bit\.ly|t\.me|wa\.me|youtu\.be|zalo\.me|social-plugins\.line\.me|maps\.app\.goo\.gl|amzn\.to|tinyurl\.com|ow\.ly|buff\.ly|lnkd\.in)$/i, "acortador"],
+  [/(^|\.)(googleusercontent|gstatic|pinimg|fbcdn|cloudfront|akamaized|cdn77|jsdelivr|unpkg)\./i, "cdn"],
+  // ── Infraestructura / dev tools / open source ──
+  [/^(nodejs|nginx|apache|httpd\.apache|mariadb|freebsd|fedoraproject|mozilla|debian|ubuntu|python|golang|rust-lang|kernel|gnu|perl|php|ruby-lang)\./i, "devtool"],
+  [/(^|\.)(github|gitlab|jihulab|bitbucket|stackoverflow|npmjs|pypi|dockerhub|visualstudio|source\.android|developer\.(apple|android|mozilla))\./i, "devtool"],
+  [/(^|\.)(pastebin|gravatar|disqus|imgur|photobucket|flickr|shutterstock|thingiverse|namebright|hackertarget|arcgis)\./i, "plataforma"],
+  // ── SaaS / herramientas de trabajo ──
+  [/^(asana|miro|mailchimp|pipedrive|brevo|freshdesk|squareup|padlet|chatwork|gamma\.app|capcut|heyzine|feedly|surveymonkey|slideshare|canva|notion|airtable|zapier|hubspot|salesforce|zendesk|intercom|calendly|typeform|wetransfer|dropbox|docusign|grammarly|deepseek|openai|anthropic)\./i, "saas"],
+  [/(^|\.)(wordwall|quizlet|datacamp|edx|coursera|udemy|openclassrooms|alison|edutin|mooc|fun-mooc|my-mooc|khanacademy)\./i, "elearning"],
+  // ── Ciencia / academia / referencia (no venden pauta) ──
+  [/^(doi|nature|biorxiv|arxiv|econstor|dialnet|sciencedirect|springer|elsevier|jstor|pubmed|researchgate|scielo)\./i, "academico"],
+  [/(^|\.)(wikipedia|wiktionary|wikiloc|wikidata|wikimedia)\./i, "wiki"],
+  // ── Religión y ONG ──
+  [/^(jw|churchofjesuschrist|bible|biblegateway|vatican|iglesia|caritas|greenpeace|unicef|cruzroja|redcross|oxfam|amnesty)\./i, "religion_ong"],
+  [/(^|\.)fundacion|(^|\.)foundation\.|\.ngo$|\.org\.(ar|mx|co)$/i, "ong"],
+  // ── Retail / e-commerce / marketplaces ──
+  [/^(nordstrom|petco|lowes|kaufland|darty|worten|pccomponentes|carousell|blinkit|yodobashi|vevor|idealo|ceneo|tweakers|leroymerlin|carrefour|walmart|amazon|ebay|aliexpress|mercadolibre|shein|temu|zalando|asos|ikea|decathlon|fnac|mediamarkt|coppel|falabella|liverpool)\./i, "ecommerce"],
+  [/(^|\.)(shop|tienda|store|loja|boutique)\.[a-z]+$|(^|\.)(precios?|preise|prezzi|price)-?compar/i, "ecommerce"],
+  // ── Bancos, seguros, fintech, brokers ──
+  [/^(schwab|creditmutuel|poste|macro|santander|bbva|bancolombia|banorte|itau|bradesco|caixa|abanca|bankinter|ing|abp|agipi|knappschaft|mapfre|allianz|axa|generali|zurich|principal|omint|baccredomatic|banistmo|trustpilot|marketwatch|justetf|admiralmarkets|ironfx|libertex|etoro|plus500|xtb)\./i, "finanzas"],
+  [/(^|\.)(banco|bank|banca|seguros|insurance|assurance|versicherung)[a-z-]*\./i, "finanzas"],
+  // ── Telcos, ISPs, correo postal, utilities ──
+  [/^(proximus|spectrum|freenet|so-net|au\.com|usps|correos|dhl|fedex|ups|movistar|vodafone|orange|telefonica|claro|entel|tim|tigo|endesa|iberdrola|naturgy|edp)\./i, "telco_utility"],
+  // ── Operadores de apuestas (no son medios: son el anunciante) ──
+  // Maxi 2026-07-28 (ejemplos del user: bwin.es). Lista ampliada + patrón genérico: casi todos los
+  // operadores llevan "bet"/"casino"/"apuestas"/"poker"/"bingo" en el dominio. Son el ANUNCIANTE,
+  // no el medio — ADEQ les vende a ellos, no les compra inventario.
+  [/^(ladbrokes|williamhill|paddypower|snai|sisal|betflag|totalcasino|wplay|doradobet|codere|fanduel|betfair|bet365|betsson|winamax|pokerstars|1xbet|betano|rivalo|bwin|unibet|betway|sportingbet|bodog|leovegas|casumo|mrgreen|betclic|tipico|bet-at-home|888|stake|rushbet|zamba|betplay|coolbet|teapuesto|jugabet|betsafe|nordicbet|expekt)\./i, "casa_apuestas"],
+  // OJO: nada de un genérico tipo /^bet[a-z]+/ — se llevaba puesto betevecom.cat (betevé, la TV
+  // de Barcelona) y bethemedia.com. Solo stems inequívocos + la lista explícita de arriba.
+  [/(^|\.)[a-z-]*(casino|apuest|betting|bookmaker|poker|bingo)[a-z-]*\./i, "casa_apuestas"],
+  // ── Plataformas de streaming (tienen su propio inventario) ──
+  [/^(disneyplus|netflix|primevideo|hbomax|paramountplus|pluto|roku|sling|fubo|plex|tubitv|viki|mxplayer|crunchyroll|spotify|deezer|tidal|apple|itunes)\./i, "plataforma_streaming"],
+  // ── Viajes / aerolíneas / hoteles ──
+  [/^(jetsmart|lastminute|hotels|booking|expedia|despegar|kayak|trivago|airbnb|latam|avianca|aeromexico|iberia|ryanair|easyjet|jetstar|air-)\./i, "viajes"],
+  // ── Ligas y clubes deportivos (venden su propio inventario) ──
+  [/^(mlb|nba|nfl|nhl|fifa|uefa|laliga|premierleague|rolandgarros|olympics|atptour|wtatennis)\./i, "liga_deportiva"],
+  // ── Marcas / corporativos / industria ──
+  [/^(siemens|kaspersky|nivea|panadol|loreal|abbott|nestle|unilever|pg|coca-?cola|pepsi|samsung|lg|sony|philips|bosch|brabus|ricoh|canon|epson|hp|dell|lenovo|asus|acer|intel|amd|nvidia|cisco|oracle|sap|ibm)\./i, "marca"],
+  // ── WHOIS proxies / registrars (ya cubierto en emails, acá por si el dominio mismo entra) ──
+  [/(^|\.)(domain-?contact|ccireg|iptwins|istmanagement|markmonitor|cscglobal|netnames|safenames|comlaude)\./i, "registrar"],
+  // ── Placeholders y artefactos de scrape ──
+  [/^(example|none|test|localhost|invalid|domain)\.(com|org|net)$/i, "placeholder"],
+  [/\.(hostingersite|000webhost|blogspot\.com\.[a-z]{2})$/i, "hosting_gratuito"],
+];
+
+// Señales POSITIVAS: si el dominio grita "medio", no lo rechazamos por reglas blandas.
+const URL_PUBLISHER_HINT = /(^|[.\-])(news|noticias?|diario|jornal|journal|times|post|gazette|herald|tribune|press|prensa|imprensa|radio|tv|canal|revista|magazine|deporte|sport|futbol|football|cronica|informa|actualidad|reporte|observador|nacion|mundo|clarin|pagina|periodic|zeitung|kurier|corriere|gazzetta)([.\-]|$)/i;
+
+// Devuelve { ok:boolean, reason:string }. NO hace red. NO gasta un centavo.
+function classifyByUrlOnly(domain, category = "", traffic = 0) {
+  const d = String(domain || "").toLowerCase().replace(/^www\./, "").split("/")[0];
+  if (!d) return { ok: false, reason: "dominio_vacio" };
+
+  // 1. Techo de tráfico — los gigantes se venden por trato directo, no por cold email.
+  const pv = Number(traffic || 0);
+  if (REVIEW_QUEUE_MAX_TRAFFIC > 0 && pv > REVIEW_QUEUE_MAX_TRAFFIC) {
+    return { ok: false, reason: `gigante_${Math.round(pv / 1e6)}M_pageviews` };
+  }
+  // 2. Piso de tráfico (por si quedó algo viejo debajo del floor).
+  if (pv > 0 && pv < REVIEW_QUEUE_MIN_TRAFFIC) {
+    return { ok: false, reason: `bajo_trafico_${pv}` };
+  }
+  // 3. Reglas estructurales por dominio.
+  const esMedioPorNombre = URL_PUBLISHER_HINT.test(d);
+  for (const [re, tipo] of URL_REJECT_RULES) {
+    if (!re.test(d)) continue;
+    // Excepción: "elpais.com.gov"? no existe. Pero sí existen medios con "tv"/"radio" que
+    // podrían chocar con reglas de plataforma. Gobierno/edu/mil NO tienen excepción posible.
+    const duro = /gobierno|educacion|universidad|acortador|cdn|placeholder|registrar/.test(tipo);
+    if (!duro && esMedioPorNombre) continue;   // el nombre dice medio → que lo juzgue el caro
+    return { ok: false, reason: `url_${tipo}` };
+  }
+  return { ok: true, reason: esMedioPorNombre ? "url_ok_hint_medio" : "url_ok" };
+}
+
+
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
 
@@ -5470,6 +5572,63 @@ async function runSuspectRejectAnalysis(token) {
 // borra por Haiku ni por categoría/tema (eso quema publishers). Un publisher real jamás matchea
 // ninguna de las 2 señales → regla de oro intacta. Gated por config purge_blocked_prospects='true';
 // avanza por cursor de created_at y se auto-apaga al terminar el pool.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// BARRIDO POR URL — limpia TODO el pool sin red y sin créditos (Maxi 2026-07-28)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Pedido textual del user: "reprocesar todo solo mirando las urls sin gastar créditos, con la
+// info que ya tenemos". Aplica classifyByUrlOnly() a cada lead pending usando SOLO lo que ya
+// está en la fila (domain, category, traffic). CERO fetch, CERO RapidAPI, CERO Apollo, CERO IA.
+// Los 3.000 leads se resuelven en segundos, no en horas.
+// Gated por url_purge_enabled='true'; se auto-apaga al terminar. NO borra: pasa a
+// status='rejected' con suspect_reason='urlpurge: <motivo>' para poder auditar y revertir.
+// Corre ANTES del sweep caro (sweepBlockedFromProspects), así ese solo gasta scrape/Haiku en
+// los que sobrevivieron a lo gratis.
+async function purgeByUrlOnly(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.url_purge_enabled || "") !== "true") return;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const BATCH = 1000;
+  const cursor = cfg.url_purge_cursor || "";
+  const cursorClause = cursor ? `&created_at=lt.${encodeURIComponent(cursor)}` : "";
+  let rows = [];
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at,traffic,category&order=created_at.desc&limit=${BATCH}`,
+      { headers: auth }
+    );
+    if (r.ok) rows = await r.json();
+  } catch {}
+  if (!Array.isArray(rows) || rows.length === 0) {
+    await setConfigValue(token, "url_purge_enabled", "false").catch(() => {});
+    await setConfigValue(token, "url_purge_cursor", "").catch(() => {});
+    log(`🧹 url-purge: pool barrido COMPLETO → flag OFF`);
+    return;
+  }
+  const rechazados = [];
+  const porMotivo = {};
+  for (const row of rows) {
+    const v = classifyByUrlOnly(row.domain, row.category || "", row.traffic || 0);
+    if (!v.ok) {
+      rechazados.push({ id: row.id, domain: row.domain, reason: v.reason });
+      porMotivo[v.reason.replace(/_\d.*$/, "")] = (porMotivo[v.reason.replace(/_\d.*$/, "")] || 0) + 1;
+    }
+  }
+  // PATCH por lotes de 50 ids (un request por lote, no uno por lead).
+  for (let i = 0; i < rechazados.length; i += 50) {
+    const slice = rechazados.slice(i, i + 50);
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${slice.map(x => x.id).join(",")})`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `urlpurge: ${slice[0].reason}`.slice(0, 200) }),
+      });
+    } catch (e) { log(`⚠️ url-purge patch: ${e.message}`); }
+  }
+  const lastTs = rows[rows.length - 1].created_at;
+  await setConfigValue(token, "url_purge_cursor", lastTs).catch(() => {});
+  log(`🧹 url-purge: lote=${rows.length} rechazados=${rechazados.length} · ${Object.entries(porMotivo).map(([k, v]) => `${k}:${v}`).join(" · ")} · cursor→${lastTs}`);
+}
+
 async function sweepBlockedFromProspects(token) {
   const cfg = await getConfig(token);
   if (String(cfg.purge_blocked_prospects || "") !== "true") return;
@@ -6937,6 +7096,17 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  ⏭ ${domain} — ${effectivePageViews} pageviews (${visits} visits × ${ppvForThreshold.toFixed(2)}) < ${REVIEW_QUEUE_MIN_TRAFFIC} (floor duro, sin bypass)`);
     return;
   }
+  // ── PRE-FILTRO GRATIS POR URL (Maxi 2026-07-28) ───────────────────────────────────────
+  // Mismo clasificador que barre el pool existente, acá aplicado a los leads NUEVOS. Corre
+  // antes de gastar scrape/Haiku: si la URL ya dice que no sirve (gobierno, universidad, casa
+  // de apuestas, banco, SaaS, acortador, gigante), no se gasta nada más en este dominio.
+  const _urlV = classifyByUrlOnly(domain, swCategory || "", effectivePageViews);
+  if (!_urlV.ok) {
+    await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${_urlV.reason}` });
+    log(`  🚯 ${domain} — descartado por URL (${_urlV.reason}) → sin gastar API`);
+    return;
+  }
+
   // ── TECHO DE TRÁFICO (Maxi 2026-07-28, decisión del user: 50M pageviews) ──────────────
   // El pool tenía piso pero NO techo, así que se llenaba por arriba con los top-500 del mundo y
   // el agente los priorizaba por score/tráfico. Casos reales de la lista del user: chess.com
@@ -14389,6 +14559,9 @@ async function main() {
         await runSuspectRejectAnalysis(token).catch(e => log(`⚠️ suspect analysis: ${e.message}`));
         // Maxi 2026-07-13: barrido on-demand del pool (purga no-publishers viejos por blocklist +
         // detector estructural). Gated por config purge_blocked_prospects='true'; se auto-apaga al terminar.
+        // Maxi 2026-07-28: PRIMERO el barrido gratis por URL (sin red, sin créditos). Lo que
+        // sobreviva pasa al sweep caro, que gasta scrape + Haiku solo en los dudosos.
+        await purgeByUrlOnly(token).catch(e => log(`⚠️ url-purge: ${e.message}`));
         await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Maxi 2026-07-15: PULIDO UNIFICADO — 1 fetch/dominio: bloquea no-publishers + busca email
         // (scrape+social+informer+Apollo) para los que quedan sin email. Reemplaza purge+reenrich.
