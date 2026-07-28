@@ -36,10 +36,11 @@ const DOMAIN_DELAY_MS  = 2500;
 // pageviews; ese era el bug de "queued → 0 to Prospects").
 const MIN_TRAFFIC      = 350_000;  // pageViews mínimos para AUTOPILOT Majestic (descubrimiento)
 const REVIEW_QUEUE_MIN_TRAFFIC = 350_000; // Floor absoluto en review_queue (en PAGEVIEWS). Items debajo se auto-borran.
-// Maxi 2026-07-28 (decisión del user): TECHO de 50M pageviews. Arriba de eso son los top-500 del
-// mundo (chess.com, fandom, disneyplus, espn, usps, qq, cnn...): tienen equipo comercial propio y
-// se venden por trato directo, no contestan un cold email. Override con threshold_traffic_max.
-const REVIEW_QUEUE_MAX_TRAFFIC = 50_000_000;
+// Maxi 2026-07-28 (decisión del user): TECHO de 40M pageviews (bajado de 50M el mismo día).
+// Arriba de eso son los top-500 del mundo (chess.com, fandom, disneyplus, espn, usps, qq, cnn...):
+// tienen equipo comercial propio y se venden por trato directo, no contestan un cold email.
+// Override con threshold_traffic_max.
+const REVIEW_QUEUE_MAX_TRAFFIC = 40_000_000;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════
 // CLASIFICADOR POR URL — "sirve" vs "no sirve" SIN RED Y SIN CRÉDITOS (Maxi 2026-07-28)
@@ -7310,7 +7311,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     return;
   }
 
-  // ── TECHO DE TRÁFICO (Maxi 2026-07-28, decisión del user: 50M pageviews) ──────────────
+  // ── TECHO DE TRÁFICO (Maxi 2026-07-28, decisión del user: 40M pageviews) ──────────────
   // El pool tenía piso pero NO techo, así que se llenaba por arriba con los top-500 del mundo y
   // el agente los priorizaba por score/tráfico. Casos reales de la lista del user: chess.com
   // (5.117M pageviews), fandom.com (3.502M), pixiv.net (2.438M), aol.com, disneyplus.com,
