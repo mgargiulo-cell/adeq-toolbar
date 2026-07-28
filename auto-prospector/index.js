@@ -6326,7 +6326,7 @@ function _detectLangFromText(text) {
   // Muestra amplia: ~200 palabras es más que suficiente y evita decidir sobre un menú de 5 items.
   const t = raw.slice(0, 4000).toLowerCase();
   const palabras = (t.match(/[\p{L}]+/gu) || []).length;
-  if (palabras < 15) return { lang: null, confidence: "low", scores: {} };
+  if (palabras < 8) return { lang: null, confidence: "low", scores: {} };
 
   const scores = {};
   for (const [lang, re] of Object.entries(LANG_MARKERS)) {
@@ -6486,14 +6486,37 @@ async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, 
   //   · detecta otro idioma (pl, ro, tr, nl, de, fr…) → INGLÉS (regla del user: fuera de
   //     {es,en,it,pt,ar} se manda en inglés)
   // Solo si el texto NO alcanza para decidir se cae al sistema de votos de abajo.
+  // REGLA DEL USER (2026-07-28), textual:
+  //   web hispanohablante → español · italiana → italiano · Portugal/Brasil → portugués
+  //   árabe → árabe · cualquier otra cosa → INGLÉS
+  // Y: "no te bases siempre en SimilarWeb que puede fallar; toma el idioma del TEXTO +
+  // SimilarWeb y compará ambos".
   const _txt = _detectLangFromText(textSample || "");
+  const _geoLang = GEO_TO_LANG_AGENT[geo] || GEO_TO_LANG_AGENT[(geo || "").trim()] || null;
+  const _tldLang = TLD_TO_LANG_AGENT[cleanDomain.split(".").pop() || ""] || null;
+
   if (_txt.lang && (_txt.confidence === "high" || _txt.confidence === "medium")) {
-    if (LANGS_ENVIABLES.has(_txt.lang)) {
-      return finish({ lang: _txt.lang, source: `texto(${_txt.confidence})`, confidence: _txt.confidence,
-                      reasons: [`texto→${_txt.lang} (gap ${_txt.gap ?? "?"})`] });
-    }
-    return finish({ lang: "en", source: `texto_${_txt.lang}_→en`, confidence: "high",
-                    reasons: [`el texto está en ${_txt.lang}, sin template → inglés`] });
+    const _final = LANGS_ENVIABLES.has(_txt.lang) ? _txt.lang : "en";
+    // CRUCE explícito texto ⨯ GEO. El texto manda siempre (es lo que el publisher realmente
+    // escribió; el GEO de SimilarWeb viene mal seguido: windguru.cz figuraba como Argentina).
+    // Pero cuando discrepan lo dejamos asentado en el log, que es como se detectan los casos
+    // raros sin tener que salir a buscarlos.
+    const _cruce = !_geoLang ? "geo sin dato"
+                 : _geoLang === _final ? `geo coincide (${geo})`
+                 : `⚠️ geo dice ${_geoLang} (${geo}) y el texto dice ${_txt.lang} → mando ${_final} (manda el texto)`;
+    return finish({
+      lang: _final,
+      source: LANGS_ENVIABLES.has(_txt.lang) ? `texto(${_txt.confidence})` : `texto_${_txt.lang}_→en`,
+      confidence: _txt.confidence,
+      reasons: [`texto→${_txt.lang}`, _cruce],
+    });
+  }
+
+  // El texto NO alcanzó para decidir (poca cantidad, o empate). Ahí SÍ usamos GEO y TLD, que
+  // es exactamente para lo que sirven: desempatar cuando no hay contenido que leer.
+  if (_geoLang && _tldLang && _geoLang === _tldLang) {
+    return finish({ lang: _geoLang, source: "geo+tld_coinciden", confidence: "medium",
+                    reasons: [`sin texto útil; geo(${geo}) y tld coinciden en ${_geoLang}`] });
   }
 
   // 1) Texto heurístico (más confiable — lo que el publisher escribió)
