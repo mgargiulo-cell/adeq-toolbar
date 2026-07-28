@@ -5873,7 +5873,9 @@ async function sweepBlockedFromProspects(token) {
       if (pc?.dead) { toDelete.push({ id: row.id, domain: row.domain, reason: `unreachable` }); return; }
       // row.category es la categoría YA guardada → se la pasamos como swCategory (sin costo).
       const verdict = await classifyPublisher(token, row.domain, pc, row.category || "").catch(() => null);
-      if (verdict && !verdict.ok) { toDelete.push({ id: row.id, domain: row.domain, reason: verdict.reason }); return; }
+      // retry=true → no pudimos juzgarlo (ads.txt y home bloqueados). Queda pending intacto.
+      if (verdict && !verdict.ok && !verdict.retry) { toDelete.push({ id: row.id, domain: row.domain, reason: verdict.reason }); return; }
+      if (verdict?.retry) return;
 
       // ── RE-DETECCIÓN DE IDIOMA (Maxi 2026-07-28, pedido del user) ──────────────────────
       // El lead SOBREVIVE al filtro → aprovechamos que la página YA está bajada para recalcular
@@ -6231,10 +6233,17 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   // Esto es lo que cierra el agujero de "no sé" → "pasa". Antes, un dominio sin ads.txt, sin
   // ads en la home y sin veredicto de IA igual entraba por classifier_unavailable_pass.
   if (!monetiza) {
+    // Maxi 2026-07-28: distinguir "no monetiza" de "NO PUDIMOS VERIFICAR". Si el ads.txt quedó
+    // en unknown (Cloudflare/timeout) Y encima no pudimos leer la home, no tenemos UNA sola
+    // señal: rechazar ahí es descartar por una falla NUESTRA, el mismo error que costó 2.011
+    // leads congelados por cuota de API. Devolvemos retry:true y el barrido lo deja pending.
+    const sinDatos = adsTxt?.state === "unknown" && !pageContent;
     return {
-      ok: false, score,
-      reason: adsTxt?.state === "unknown" ? "sin_evidencia_monetizacion (ads.txt no verificable)" : "sin_evidencia_monetizacion",
-      señales: señales.length ? señales : ["ninguna señal de monetización"],
+      ok: false, retry: sinDatos, score,
+      reason: sinDatos ? "sin_datos_reintentar"
+            : adsTxt?.state === "unknown" ? "sin_evidencia_monetizacion (ads.txt no verificable)"
+            : "sin_evidencia_monetizacion",
+      señales: señales.length ? señales : [sinDatos ? "no pudimos leer ni ads.txt ni la home" : "ninguna señal de monetización"],
     };
   }
 
@@ -6274,8 +6283,9 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   }
 
   const v = scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType });
-  if (!v.ok) log(`  ⚖️ ${domain} NO prospectable (${v.reason}) — ${v.señales.join(" · ")}`);
-  return { ok: v.ok, reason: v.reason, score: v.score, señales: v.señales };
+  if (!v.ok && !v.retry) log(`  ⚖️ ${domain} NO prospectable (${v.reason}) — ${v.señales.join(" · ")}`);
+  if (v.retry) log(`  ⏳ ${domain} sin datos para juzgar (ads.txt y home bloqueados) → se reintenta, NO se descarta`);
+  return { ok: v.ok, retry: !!v.retry, reason: v.reason, score: v.score, señales: v.señales };
 }
 
 // ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
