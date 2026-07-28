@@ -5872,7 +5872,9 @@ async function sweepBlockedFromProspects(token) {
       const pc = await fetchPageContent(row.domain).catch(() => null);
       if (pc?.dead) { toDelete.push({ id: row.id, domain: row.domain, reason: `unreachable` }); return; }
       // row.category es la categoría YA guardada → se la pasamos como swCategory (sin costo).
-      const verdict = await classifyPublisher(token, row.domain, pc, row.category || "").catch(() => null);
+      // Le pasamos la categoría GUARDADA de SimilarWeb (sin costo). Si el sitio nos bloquea,
+      // classifyPublisher la usa para dictaminar en vez de dejarlo en el limbo.
+      const verdict = await classifyPublisher(token, row.domain, pc, row.category || "", { traffic: row.traffic || 0, geo: row.geo || "" }).catch(() => null);
       // retry=true → no pudimos juzgarlo (ads.txt y home bloqueados). Queda pending intacto.
       if (verdict && !verdict.ok && !verdict.retry) { toDelete.push({ id: row.id, domain: row.domain, reason: verdict.reason }); return; }
       if (verdict?.retry) return;
@@ -6256,6 +6258,33 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
 }
 
 
+
+// ── VEREDICTO POR DATOS DE SIMILARWEB (Maxi 2026-07-28, pedido del user) ──────────────────
+// "Más que a Claude, pasarlo por SimilarWeb y ver con toda la config que tenemos si es
+// prospectable o no."
+// Para un sitio que nos bloquea el scraper, SimilarWeb es data REAL (categoría, país, tráfico)
+// en vez de una adivinanza. Y para los leads que YA están en Prospects no cuesta un centavo:
+// category/traffic/geo ya están guardados en la fila desde que entraron.
+// Devuelve "publisher" | "no" | "duda".
+function _veredictoPorSimilarWeb({ category = "", traffic = 0, geo = "" } = {}) {
+  const cat = String(category || "").toLowerCase().trim();
+  const pv = Number(traffic || 0);
+  if (!cat || cat === "other" || cat === "?") return "duda";   // sin categoría no hay veredicto
+
+  // Categorías que SÍ son medios monetizables con display.
+  if (/news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|tv|streaming|gaming|games|blog|recipe|food|health(?!care)|travel_and_tourism\/travel|automotive|science_and_education\/(?!education)|arts_and_entertainment/.test(cat)) {
+    // Aun siendo medio, el techo y el piso de tráfico mandan.
+    if (pv > 0 && REVIEW_QUEUE_MAX_TRAFFIC > 0 && pv > REVIEW_QUEUE_MAX_TRAFFIC) return "no";
+    if (pv > 0 && pv < REVIEW_QUEUE_MIN_TRAFFIC) return "no";
+    return "publisher";
+  }
+  // Categorías que NO son medios — mismas reglas que el clasificador de URL, pero por categoría.
+  if (/finance|bank|insurance|e-?commerce|shopping|marketplace|business_and_consumer_services|computers_electronics_and_technology\/(programming|web_hosting|computer_security)|science_and_education\/education|law_and_government|community_and_society\/religion|gambling|adult|jobs_and_career|real_estate|heavy_industry|home_and_garden\/home_improvement|pets_and_animals\/pet_food|vehicles\/(?!motorsports)/.test(cat)) {
+    return "no";
+  }
+  return "duda";
+}
+
 // ── VEREDICTO DE LA IA CUANDO NOS BLOQUEAN TODO (Maxi 2026-07-28, pedido del user) ────────
 // "Si nos bloquea el txt, que nuestra inteligencia intente determinar si funciona o no, para no
 // descartarlo de antemano al pedo."
@@ -6307,7 +6336,7 @@ async function _iaJuzgaBloqueado(token, domain, { category = "", geo = "", traff
   } catch { return null; }
 }
 
-async function classifyPublisher(token, domain, pageContent, swCategory) {
+async function classifyPublisher(token, domain, pageContent, swCategory, swData = {}) {
   // Maxi 2026-07-28: esta función pasó de ser una cadena de ifs con returns tempranos (donde
   // "no pude verificar" terminaba siendo "pasa") a juntar todas las señales y decidir por
   // puntaje en scoreProspectable(). Acá solo se RECOLECTA; la decisión vive allá.
@@ -6338,7 +6367,18 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   // preguntamos a la IA. Es el pedido del user: que la inteligencia dictamine en vez de
   // descartar —o postergar para siempre— a ciegas.
   if (adsTxt.state === "unknown" && !pageContent) {
-    const ia = await _iaJuzgaBloqueado(token, domain, { category: swCategory, geo: "" }).catch(() => null);
+    // 1º SimilarWeb: es data real, no una adivinanza. Para los leads del pool ya está guardada.
+    const sw = _veredictoPorSimilarWeb({ category: swCategory, traffic: swData.traffic || 0, geo: swData.geo || "" });
+    if (sw === "no") {
+      log(`  📊 ${domain}: bloqueado, pero SimilarWeb lo categoriza "${swCategory}" → no es medio, descartado`);
+      return { ok: false, reason: `sw_no_publisher:${String(swCategory).slice(0, 30)} (sitio bloqueado)`, score: -999 };
+    }
+    if (sw === "publisher") {
+      log(`  📊 ${domain}: bloqueado, SimilarWeb lo categoriza "${swCategory}" → medio, pasa`);
+      return { ok: true, reason: `sw_publisher:${String(swCategory).slice(0, 30)}`, score: 30, señales: ["sitio bloqueado; categoría de SimilarWeb"] };
+    }
+    // 2º Solo si SimilarWeb no alcanza (categoría vacía u "other"), le preguntamos a la IA.
+    const ia = await _iaJuzgaBloqueado(token, domain, { category: swCategory, geo: swData.geo || "", traffic: swData.traffic || 0 }).catch(() => null);
     if (ia === "no") {
       log(`  🤖 ${domain}: bloqueado, pero la IA dice que NO es un medio → descartado`);
       return { ok: false, reason: "ia_no_publisher (sitio bloqueado)", score: -999 };
@@ -7420,11 +7460,14 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       return;
     }
     if (_ads.state === "unknown") {
-      await markCsvItem(token, item.id, "pending", { error_message: `ads_txt_no_verificable (reintento, NO penaliza)` });
-      log(`  📄❓ ${domain} — ads.txt no verificable (bloqueo/timeout) → reintento, no se descarta`);
-      return;
+      // Maxi 2026-07-28 (pedido del user): antes volvía a la cola sin veredicto y podía quedar
+      // dando vueltas para siempre. Ahora SIGUE el flujo: pide SimilarWeb y se juzga con la
+      // categoría/tráfico/país reales + la config, que es data dura y no una adivinanza.
+      // El hit de RapidAPI se gasta solo en los bloqueados, que son una minoría.
+      log(`  📄❓ ${domain} — ads.txt bloqueado → sigue a SimilarWeb para juzgarlo por datos`);
+    } else {
+      log(`  📄✅ ${domain} — ads.txt OK (${_ads.lines} sellers, vía ${_ads.checked})`);
     }
-    log(`  📄✅ ${domain} — ads.txt OK (${_ads.lines} sellers, vía ${_ads.checked})`);
   }
 
   const trafficData = await getTrafficData(domain, rapidapi_key);
