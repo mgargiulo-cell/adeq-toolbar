@@ -6255,6 +6255,58 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   };
 }
 
+
+// ── VEREDICTO DE LA IA CUANDO NOS BLOQUEAN TODO (Maxi 2026-07-28, pedido del user) ────────
+// "Si nos bloquea el txt, que nuestra inteligencia intente determinar si funciona o no, para no
+// descartarlo de antemano al pedo."
+// Caso: sitio detrás de Cloudflare que nos tira 403 tanto en /ads.txt como en la home. Sin esto
+// el lead quedaba en un limbo — no se descartaba, pero tampoco se resolvía nunca.
+// Claude Haiku conoce la mayoría de los medios del mundo por el dominio. Le damos lo poco que
+// tenemos (dominio, categoría, país, tráfico) y que dictamine.
+// Costo: ~$0.0005 por consulta, y SOLO en los bloqueados (una minoría). Cero API paga.
+const _iaMonetizaCache = new Map();
+async function _iaJuzgaBloqueado(token, domain, { category = "", geo = "", traffic = 0 } = {}) {
+  if (!domain || !token) return null;
+  if (_iaMonetizaCache.has(domain)) return _iaMonetizaCache.get(domain);
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        provider: "anthropic",
+        path: "/v1/messages",
+        method: "POST",
+        body: {
+          model: "claude-haiku-4-5",
+          max_tokens: 12,
+          system: [
+            "Sos un analista de medios digitales. Te dan un dominio que NO pudimos inspeccionar (nos bloquea el scraper).",
+            "Decidí si es un MEDIO DE CONTENIDO que monetiza con publicidad display/programática (diario, revista,",
+            "portal de noticias, deportes, entretenimiento, blog grande, sitio de recetas/tecnología con ads).",
+            "NO son medios: bancos, seguros, gobiernos, universidades, e-commerce, SaaS, casas de apuestas,",
+            "aerolíneas, marcas corporativas, plataformas de streaming, herramientas, redes sociales.",
+            "Respondé UNA sola palabra: 'publisher' si estás razonablemente seguro de que es un medio con ads,",
+            "'no' si estás razonablemente seguro de que no lo es, 'duda' si no lo conocés o no estás seguro.",
+            "Ante la duda respondé 'duda'. Sin explicación.",
+          ].join(" "),
+          messages: [{ role: "user", content: `Dominio: ${domain}\nCategoría: ${category || "?"}\nPaís: ${geo || "?"}\nPageviews: ${traffic || "?"}` }],
+        },
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const txt = (data?.content?.[0]?.text || "").trim().toLowerCase();
+    const out = /publisher/.test(txt) ? "publisher" : /^no\b|no_publisher/.test(txt) ? "no" : "duda";
+    if (_iaMonetizaCache.size > 3000) _iaMonetizaCache.clear();
+    _iaMonetizaCache.set(domain, out);
+    return out;
+  } catch { return null; }
+}
+
 async function classifyPublisher(token, domain, pageContent, swCategory) {
   // Maxi 2026-07-28: esta función pasó de ser una cadena de ifs con returns tempranos (donde
   // "no pude verificar" terminaba siendo "pasa") a juntar todas las señales y decidir por
@@ -6280,6 +6332,22 @@ async function classifyPublisher(token, domain, pageContent, swCategory) {
   if (!(catOk && adsTxt.state === "yes" && adsTxt.lines >= 20)) {
     const trash = await _loadProspectTrashContext(token).catch(() => ({ rules: "" }));
     haikuType = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules || "").catch(() => null);
+  }
+
+  // Si nos bloquearon TODO (ads.txt unknown + home ilegible), antes de dejarlo en el limbo le
+  // preguntamos a la IA. Es el pedido del user: que la inteligencia dictamine en vez de
+  // descartar —o postergar para siempre— a ciegas.
+  if (adsTxt.state === "unknown" && !pageContent) {
+    const ia = await _iaJuzgaBloqueado(token, domain, { category: swCategory, geo: "" }).catch(() => null);
+    if (ia === "no") {
+      log(`  🤖 ${domain}: bloqueado, pero la IA dice que NO es un medio → descartado`);
+      return { ok: false, reason: "ia_no_publisher (sitio bloqueado)", score: -999 };
+    }
+    if (ia === "publisher") {
+      log(`  🤖 ${domain}: bloqueado, la IA lo reconoce como medio → pasa (marcado para revisar)`);
+      return { ok: true, reason: "ia_publisher_bloqueado", score: 30, señales: ["sitio bloqueado; veredicto de la IA por dominio"] };
+    }
+    // "duda" o la IA no respondió → recién ahí lo dejamos para reintentar.
   }
 
   const v = scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType });
