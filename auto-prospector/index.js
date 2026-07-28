@@ -5778,16 +5778,27 @@ async function purgeByUrlOnly(token) {
       porMotivo[v.reason.replace(/_\d.*$/, "")] = (porMotivo[v.reason.replace(/_\d.*$/, "")] || 0) + 1;
     }
   }
-  // PATCH por lotes de 50 ids (un request por lote, no uno por lead).
-  for (let i = 0; i < rechazados.length; i += 50) {
-    const slice = rechazados.slice(i, i + 50);
-    try {
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${slice.map(x => x.id).join(",")})`, {
-        method: "PATCH",
-        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `urlpurge: ${slice[0].reason}`.slice(0, 200) }),
-      });
-    } catch (e) { log(`⚠️ url-purge patch: ${e.message}`); }
+  // PATCH agrupado POR MOTIVO (Maxi 2026-07-28 — bug encontrado en la primera corrida).
+  // Antes se hacía de a 50 ids con `slice[0].reason`, o sea que las 50 filas del lote se
+  // llevaban el motivo de la PRIMERA. La decisión de purgar cada dominio era individual y
+  // correcta, pero la etiqueta quedaba mezclada y el audit trail era inservible: aparecían
+  // fandom.com y zeit.de bajo "url_casa_apuestas", globo.com bajo "url_placeholder".
+  // Ahora se agrupa por motivo y cada grupo recibe SU motivo — un request por motivo, no por lead.
+  const porRazon = new Map();
+  for (const r of rechazados) {
+    if (!porRazon.has(r.reason)) porRazon.set(r.reason, []);
+    porRazon.get(r.reason).push(r.id);
+  }
+  for (const [reason, ids] of porRazon) {
+    for (let i = 0; i < ids.length; i += 100) {
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${ids.slice(i, i + 100).join(",")})`, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `urlpurge: ${reason}`.slice(0, 200) }),
+        });
+      } catch (e) { log(`⚠️ url-purge patch: ${e.message}`); }
+    }
   }
   const lastTs = rows[rows.length - 1].created_at;
   await setConfigValue(token, "url_purge_cursor", lastTs).catch(() => {});
