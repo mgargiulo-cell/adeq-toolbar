@@ -6271,16 +6271,20 @@ function _veredictoPorSimilarWeb({ category = "", traffic = 0, geo = "" } = {}) 
   const pv = Number(traffic || 0);
   if (!cat || cat === "other" || cat === "?") return "duda";   // sin categoría no hay veredicto
 
+  // ORDEN IMPORTANTE: los NO se chequean PRIMERO. Al revés, "gambling/sports_betting" matcheaba
+  // "sport" y salía como publisher; "vehicles/vehicles" y "finance" también corrían ese riesgo.
+  // Los negativos son más específicos, así que mandan.
+  if (/gambling|betting|casino|lottery|adult|porn/.test(cat)) return "no";
+  if (/finance|bank|insurance|e-?commerce|shopping|marketplace|^business$|business_and_consumer_services|law_and_government|jobs_and_career|real_estate|heavy_industry|manufactur|construction/.test(cat)) return "no";
+  if (/science_and_education\/education|reference_materials|computers_electronics_and_technology\/(programming|web_hosting|computer_security|computers_electronics)/.test(cat)) return "no";
+  if (/community_and_society\/(religion|philanthropy)|health\/(?:health$)|home_and_garden\/home_improvement|pets_and_animals\/pet_food|vehicles\/vehicles|travel_and_tourism\/(accommodation|airlines)/.test(cat)) return "no";
+
   // Categorías que SÍ son medios monetizables con display.
-  if (/news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|tv|streaming|gaming|games|blog|recipe|food|health(?!care)|travel_and_tourism\/travel|automotive|science_and_education\/(?!education)|arts_and_entertainment/.test(cat)) {
+  if (/news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|\btv\b|streaming|gaming|games|blog|recipe|food|arts_and_entertainment|motorsports|automotive/.test(cat)) {
     // Aun siendo medio, el techo y el piso de tráfico mandan.
     if (pv > 0 && REVIEW_QUEUE_MAX_TRAFFIC > 0 && pv > REVIEW_QUEUE_MAX_TRAFFIC) return "no";
     if (pv > 0 && pv < REVIEW_QUEUE_MIN_TRAFFIC) return "no";
     return "publisher";
-  }
-  // Categorías que NO son medios — mismas reglas que el clasificador de URL, pero por categoría.
-  if (/finance|bank|insurance|e-?commerce|shopping|marketplace|business_and_consumer_services|computers_electronics_and_technology\/(programming|web_hosting|computer_security)|science_and_education\/education|law_and_government|community_and_society\/religion|gambling|adult|jobs_and_career|real_estate|heavy_industry|home_and_garden\/home_improvement|pets_and_animals\/pet_food|vehicles\/(?!motorsports)/.test(cat)) {
-    return "no";
   }
   return "duda";
 }
