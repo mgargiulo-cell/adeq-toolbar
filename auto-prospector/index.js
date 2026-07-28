@@ -1657,6 +1657,34 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
     if (opts.parkOverflow) await _parkInBacklog(token, domains.slice(laneRoom), sourceTag, opts.phraseByDomain);
     domains = domains.slice(0, laneRoom);
   }
+  // ── PUERTA ads.txt EN LA ENTRADA (Maxi 2026-07-28, regla del user) ────────────────────
+  // "Cuando se hace el autogoogle, autopilot e import, lo primero que debe mirar es el txt; si
+  // no tiene, lo debe descartar. Así evitamos gastar crédito en URLs que no son monetizables."
+  // Acá pasan TODOS los feeders (autogoogle, autopilot, similar-expansion, majestic, csv), así
+  // que es el punto único donde se filtra antes de ocupar un slot de cola.
+  // Solo se descarta el "no" DEFINITIVO; el "unknown" (anti-bot, timeout) entra igual y se
+  // vuelve a chequear en processCsvItem — nunca descartamos por una falla nuestra.
+  // Es gratis: 1 request HTTP por dominio, cero API paga. Concurrencia 8.
+  if (domains.length > 0) {
+    const sinAds = new Set();
+    const CONC_ADS = 8;
+    for (let i = 0; i < domains.length; i += CONC_ADS) {
+      await Promise.all(domains.slice(i, i + CONC_ADS).map(async (dom) => {
+        const r = await checkAdsTxt(dom).catch(() => ({ state: "unknown" }));
+        if (r.state === "no") sinAds.add(dom);
+      }));
+    }
+    if (sinAds.size > 0) {
+      const antes = domains.length;
+      domains = domains.filter(d => !sinAds.has(d));
+      log(`📄 ${sourceTag}: ${sinAds.size}/${antes} descartados SIN ads.txt antes de entrar a la cola (0 API gastada) — ej: ${[...sinAds].slice(0, 5).join(", ")}`);
+    }
+    if (domains.length === 0) {
+      log(`📄 ${sourceTag}: ningún dominio del lote tiene ads.txt → nada que encolar`);
+      return _empty();
+    }
+  }
+
   const pendingNow = await getCsvQueuePendingCountServer(token).catch(() => 0);
   // Waiting count inline (no hay helper dedicado para waiting_pool)
   let waitingNow = 0;
@@ -5431,13 +5459,33 @@ function _parseAdsTxtBody(txt, contentType) {
   return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase() };
 }
 
-async function _fetchAdsTxtOnce(host) {
+// Headers de navegador REAL. Sin esto, muchísimos servidores y CDNs devuelven 403 o un 404
+// genérico a un cliente que se identifica como "node" — y eso nos hacía dictar "no tiene ads.txt"
+// sobre publishers que SÍ lo tienen. Era la principal fuente de falsos negativos.
+const _ADS_TXT_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+  "Accept": "text/plain,text/*;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+};
+
+// Páginas de desafío/anti-bot que devuelven HTTP 200 con HTML. Sin detectarlas, el parser las
+// leía como "HTML → soft-404 → no tiene ads.txt". Cloudflare, DataDome, PerimeterX, Imperva.
+const _ANTIBOT_RE = /just a moment|checking your browser|cf-browser-verification|cf_chl|challenge-platform|datadome|perimeterx|px-captcha|incapsula|imperva|enable javascript and cookies|attention required/i;
+
+async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt" } = {}) {
   try {
-    const res = await fetch(`https://${host}/ads.txt`, { signal: AbortSignal.timeout(8000), redirect: "follow" });
+    const res = await fetch(`${proto}://${host}${path}`, {
+      signal: AbortSignal.timeout(12000),      // 8s era corto para servidores lentos
+      redirect: "follow",
+      headers: _ADS_TXT_HEADERS,
+    });
     if (res.status === 404 || res.status === 410) return { state: "no", lines: 0 };
-    if (res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0 };
+    if (res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0 };
     if (!res.ok) return { state: "unknown", lines: 0 };
-    const p = _parseAdsTxtBody(await res.text(), res.headers.get("content-type"));
+    const body = await res.text();
+    // Desafío anti-bot con 200 → NO sabemos si tiene ads.txt. Nunca "no".
+    if (_ANTIBOT_RE.test(body.slice(0, 3000))) return { state: "unknown", lines: 0 };
+    const p = _parseAdsTxtBody(body, res.headers.get("content-type"));
     return p.lines >= 1 ? { state: "yes", ...p } : { state: "no", lines: 0, systems: 0 };
   } catch {
     return { state: "unknown", lines: 0 };   // DNS, timeout, TLS, red
@@ -5456,7 +5504,18 @@ async function checkAdsTxt(domain) {
   let out = { state: "no", lines: 0, checked: d };
   let huboUnknown = false;
   for (const h of hosts) {
-    const r = await _fetchAdsTxtOnce(h);
+    let r = await _fetchAdsTxtOnce(h);
+    // Si https no resolvió, probar http:// — hay sitios viejos con TLS roto o sin redirect.
+    if (r.state === "unknown") {
+      const rHttp = await _fetchAdsTxtOnce(h, { proto: "http" });
+      if (rHttp.state !== "unknown") r = rHttp;
+    }
+    // Fallback app-ads.txt: publishers app-first a veces solo publican ese. Que exista prueba
+    // igual que monetizan programáticamente, que es lo que nos importa.
+    if (r.state === "no") {
+      const rApp = await _fetchAdsTxtOnce(h, { path: "/app-ads.txt" });
+      if (rApp.state === "yes") r = rApp;
+    }
     if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", checked: h }; break; }
     if (r.state === "unknown") huboUnknown = true;
   }
