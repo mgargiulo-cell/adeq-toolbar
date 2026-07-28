@@ -5803,7 +5803,7 @@ async function sweepBlockedFromProspects(token) {
   const cursorClause = cursor ? `&created_at=lt.${encodeURIComponent(cursor)}` : "";
   let rows = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at,traffic,category&order=created_at.desc&limit=${BATCH}`, { headers: auth });
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at,traffic,category,geo,language&order=created_at.desc&limit=${BATCH}`, { headers: auth });
     if (r.ok) rows = await r.json();
   } catch {}
   if (!Array.isArray(rows) || rows.length === 0) {
