@@ -4556,6 +4556,7 @@ function _rootDomain(d) {
     "co.uk","co.za","co.nz","co.jp","co.kr","co.id","co.in",
     "com.tr","com.tw","com.hk","com.sg","com.my","com.au","com.eg","com.sa","com.ng",
     "org.uk","ac.uk","gov.uk","com.pt","org.br","gov.br","edu.br","ne.jp","or.jp","go.jp",
+    "com.ph","com.ua","co.il","com.vn","co.th","com.pk","com.bd","com.gh","net.au","org.au","com.pl","com.ru","com.cn","org.mx","com.py","com.bo",
   ]);
   if (TWO_LEVEL.has(last2)) return parts.slice(-3).join(".");
   return last2;
@@ -5443,23 +5444,6 @@ const _adsTxtCache = new Map();
 // el dominio raíz, así que casavogue.globo.com se valida contra globo.com/ads.txt).
 const _adsTxtStateCache = new Map();
 
-// Verificado contra el ads.txt real de ole.com.ar (421 líneas): tolera comentarios #, líneas en
-// minúscula (reseller), con y sin ID de certificación, comas faltantes, IDs con sufijo (-OB, -EB),
-// comentarios pegados al final (…fafdf38b16bf6b2b#SOVRN) y los registros especiales del spec
-// (ownerdomain=, managerdomain=, inventorypartnerdomain=) que NO son líneas de seller.
-function _parseAdsTxtBody(txt, contentType) {
-  const ct = (contentType || "").toLowerCase();
-  const body = String(txt || "").slice(0, 200000);
-  if (/<html|<!doctype/i.test(body) || ct.includes("text/html")) return { lines: 0, systems: 0, owner: "" };
-  const matches = body.match(/^[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || [];
-  // Exchanges DISTINTOS: mejor señal de calidad que el conteo bruto. Un archivo con 400 líneas de
-  // un solo sistema monetiza menos que uno con 30 exchanges reales (rubicon, pubmatic, google,
-  // appnexus, openx, indexexchange...). ole.com.ar tiene ~150 sistemas distintos.
-  const systems = new Set(matches.map(l => l.split(",")[0].trim().toLowerCase()).filter(Boolean));
-  const owner = (body.match(/^ownerdomain=(.+)$/im) || [])[1] || "";
-  return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase() };
-}
-
 // Headers de navegador REAL. Sin esto, muchísimos servidores y CDNs devuelven 403 o un 404
 // genérico a un cliente que se identifica como "node" — y eso nos hacía dictar "no tiene ads.txt"
 // sobre publishers que SÍ lo tienen. Era la principal fuente de falsos negativos.
@@ -5469,14 +5453,42 @@ const _ADS_TXT_HEADERS = {
   "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
 };
 
-// Páginas de desafío/anti-bot que devuelven HTTP 200 con HTML. Sin detectarlas, el parser las
-// leía como "HTML → soft-404 → no tiene ads.txt". Cloudflare, DataDome, PerimeterX, Imperva.
-const _ANTIBOT_RE = /just a moment|checking your browser|cf-browser-verification|cf_chl|challenge-platform|datadome|perimeterx|px-captcha|incapsula|imperva|enable javascript and cookies|attention required/i;
+// Muros anti-bot / anti-adblock / parking que devuelven HTTP 200 con HTML. Sin detectarlos el
+// parser los lee como soft-404 → "no tiene ads.txt". Lista ampliada tras auditoría 2026-07-28:
+// correo.pe devuelve un muro con `data-adblockkey` que no matcheaba ninguna firma anterior.
+const _ANTIBOT_RE = /just a moment|checking your browser|cf-browser-verification|cf_chl|challenge-platform|datadome|perimeterx|px-captcha|incapsula|imperva|enable javascript and cookies|attention required|data-adblockkey|sucuri|ddos-guard|awswaf|vercel security checkpoint|request unsuccessful|access denied|radware|reference #\d/i;
 
-async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt" } = {}) {
+// Verificado contra ads.txt reales (ole.com.ar 1562 líneas, ~370 medios auditados): tolera
+// comentarios #, minúsculas, con y sin ID de certificación, comas faltantes, sufijos -OB/-EB,
+// comentarios pegados al final y los registros especiales del spec (ownerdomain=, managerdomain=,
+// inventorypartnerdomain=) que NO son líneas de seller.
+function _parseAdsTxtBody(txt, contentType) {
+  // BOM UTF-8: en JS \s incluye U+FEFF, así que un BOM mataba la PRIMERA línea del archivo.
+  // Medido en producción: elsalvador.com, atarde.com.br, hurriyet.com.tr, milliyet.com.tr,
+  // kompas.com. Con un ads.txt de 1-2 líneas (diariodemocracia.com, elcomercial.com.ar,
+  // lasillavacia.com) eso era el descarte del lead entero.
+  const body = String(txt || "").replace(/^\uFEFF/, "").slice(0, 1000000);
+  // 200 con cuerpo vacío o encoding roto (UTF-16 sin charset, brotli mal declarado) NO es prueba
+  // de que no tenga ads.txt. Medido: salamanca24horas.com devuelve 200 text/plain con 0 bytes.
+  if (body.trim().length < 20) return { lines: -1, systems: 0, owner: "" };   // -1 = "no sé"
+  // El soft-404 siempre está al principio. Buscar <html en los 200KB enteros hacía que UN token
+  // suelto matara el archivo: 7 de 370 ads.txt válidos traen "<" dentro de un campo de seller
+  // (adnradio.cl, crhoy.com, listindiario.com: "spotxchange.com, <148395>, RESELLER").
+  if (/<html|<!doctype/i.test(body.slice(0, 1000))) return { lines: 0, systems: 0, owner: "" };
+  // El Content-Type YA no vetea: el chequeo del cuerpo caza todos los soft-404 reales, y un
+  // servidor que etiqueta mal un ads.txt perfecto no debe costarnos el lead.
+  // [ \t]* al inicio: hay publishers que indentan las líneas de seller. Medido en 12 dominios
+  // (larepublica.pe, eleconomista.com.mx, diariolibre.com, 20minutes.fr, sabah.com.tr, youm7.com…).
+  const matches = body.match(/^[ \t]*[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || [];
+  const systems = new Set(matches.map(l => l.trim().split(",")[0].trim().toLowerCase()).filter(Boolean));
+  const owner = (body.match(/^ownerdomain=(.+)$/im) || [])[1] || "";
+  return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase() };
+}
+
+async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _redirDepth = 0 } = {}) {
   try {
     const res = await fetch(`${proto}://${host}${path}`, {
-      signal: AbortSignal.timeout(12000),      // 8s era corto para servidores lentos
+      signal: AbortSignal.timeout(12000),
       redirect: "follow",
       headers: _ADS_TXT_HEADERS,
     });
@@ -5484,18 +5496,34 @@ async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt" } = {
     if (res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0 };
     if (!res.ok) return { state: "unknown", lines: 0 };
     const body = await res.text();
-    // Desafío anti-bot con 200 → NO sabemos si tiene ads.txt. Nunca "no".
-    if (_ANTIBOT_RE.test(body.slice(0, 3000))) return { state: "unknown", lines: 0 };
+    if (_ANTIBOT_RE.test(body.slice(0, 20000))) return { state: "unknown", lines: 0 };
     const p = _parseAdsTxtBody(body, res.headers.get("content-type"));
-    return p.lines >= 1 ? { state: "yes", ...p } : { state: "no", lines: 0, systems: 0 };
+    if (p.lines > 0) return { state: "yes", ...p };
+    if (p.lines === -1) return { state: "unknown", lines: 0 };   // cuerpo vacío / encoding roto
+
+    // REDIRECT ENTRE DOMINIOS (auditoría 2026-07-28): el spec de IAB lo contempla, pero con
+    // redirect:"follow" caíamos en la HOME del destino → HTML → "no tiene". Perdimos publishers
+    // reales confirmados: pulso.cl y paula.cl → latercera.com (787 líneas), laprensa.com.pa →
+    // prensa.com (186), alertapaisa.com → paisa.alerta.com.co (569).
+    // Si terminamos en otro host, reintentamos /ads.txt ALLÍ.
+    if (_redirDepth < 1) {
+      try {
+        const finalHost = new URL(res.url).host.replace(/^www\./, "");
+        if (finalHost && finalHost !== host.replace(/^www\./, "")) {
+          return await _fetchAdsTxtOnce(finalHost, { path, _redirDepth: _redirDepth + 1 });
+        }
+      } catch {}
+    }
+    return { state: "no", lines: 0, systems: 0 };
   } catch {
     return { state: "unknown", lines: 0 };   // DNS, timeout, TLS, red
   }
 }
 
 async function checkAdsTxt(domain) {
-  const d = String(domain || "").toLowerCase().replace(/^www\./, "").split("/")[0];
-  if (!d) return { state: "no", lines: 0, checked: "" };
+  // Dominio vacío o malformado NO es prueba de ausencia de ads.txt.
+  const d = String(domain || "").toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0];
+  if (!d || !d.includes(".")) return { state: "unknown", lines: 0, checked: "" };
   if (_adsTxtStateCache.has(d)) return _adsTxtStateCache.get(d);
 
   const root = _rootDomain(d);
@@ -5506,21 +5534,25 @@ async function checkAdsTxt(domain) {
   let huboUnknown = false;
   for (const h of hosts) {
     let r = await _fetchAdsTxtOnce(h);
-    // Si https no resolvió, probar http:// — hay sitios viejos con TLS roto o sin redirect.
+    // http:// SOLO puede PROMOVER a "yes", nunca degradar a "no". Antes aceptaba cualquier
+    // veredicto de http, así que un fallo transitorio de TLS en https + un 404 en http daba un
+    // "no" DEFINITIVO. Reproducido: tiempodesanjuan.com → https 200 con 118 líneas, http 404.
     if (r.state === "unknown") {
       const rHttp = await _fetchAdsTxtOnce(h, { proto: "http" });
-      if (rHttp.state !== "unknown") r = rHttp;
-    }
-    // Fallback app-ads.txt: publishers app-first a veces solo publican ese. Que exista prueba
-    // igual que monetizan programáticamente, que es lo que nos importa.
-    if (r.state === "no") {
-      const rApp = await _fetchAdsTxtOnce(h, { path: "/app-ads.txt" });
-      if (rApp.state === "yes") r = rApp;
+      if (rHttp.state === "yes") r = rHttp;
     }
     if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", checked: h }; break; }
     if (r.state === "unknown") huboUnknown = true;
   }
-  // Si ningún host dio "yes" pero alguno falló por red/bloqueo, NO afirmamos que no tiene.
+  // app-ads.txt UNA sola vez al final (no por host): publishers app-first a veces solo publican
+  // ese. Antes corría por cada host → hasta 12 fetches × 12s por dominio (medido: paginasiete.bo
+  // tardaba 48s).
+  if (out.state !== "yes" && !huboUnknown) {
+    const rApp = await _fetchAdsTxtOnce(d, { path: "/app-ads.txt" });
+    if (rApp.state === "yes") out = { state: "yes", lines: rApp.lines, systems: rApp.systems || 0, owner: rApp.owner || "", checked: `${d}/app-ads.txt` };
+    else if (rApp.state === "unknown") huboUnknown = true;
+  }
+  // Si nadie dio "yes" pero algo falló por red/bloqueo, NO afirmamos que no tiene.
   if (out.state !== "yes" && huboUnknown) out = { state: "unknown", lines: 0, checked: d };
 
   if (_adsTxtStateCache.size > 5000) _adsTxtStateCache.clear();
@@ -5834,14 +5866,47 @@ async function sweepBlockedFromProspects(token) {
   // Coste: 1 scrape gratis por dominio (ya se hacía) + Haiku SOLO cuando lo barato no resuelve
   // (~$0.0005 la consulta). CERO RapidAPI/SimilarWeb, CERO Apollo.
   const CONC = 5;
+  const idiomaFix = [];
   for (let i = 0; i < remaining2.length; i += CONC) {
     await Promise.all(remaining2.slice(i, i + CONC).map(async (row) => {
       const pc = await fetchPageContent(row.domain).catch(() => null);
       if (pc?.dead) { toDelete.push({ id: row.id, domain: row.domain, reason: `unreachable` }); return; }
       // row.category es la categoría YA guardada → se la pasamos como swCategory (sin costo).
       const verdict = await classifyPublisher(token, row.domain, pc, row.category || "").catch(() => null);
-      if (verdict && !verdict.ok) toDelete.push({ id: row.id, domain: row.domain, reason: verdict.reason });
+      if (verdict && !verdict.ok) { toDelete.push({ id: row.id, domain: row.domain, reason: verdict.reason }); return; }
+
+      // ── RE-DETECCIÓN DE IDIOMA (Maxi 2026-07-28, pedido del user) ──────────────────────
+      // El lead SOBREVIVE al filtro → aprovechamos que la página YA está bajada para recalcular
+      // el idioma con el detector nuevo (texto manda, 20 idiomas, alfabeto no latino → inglés).
+      // Costo extra: CERO — el fetch ya se hizo para clasificar.
+      // Arregla los guardados por el detector viejo: medyafaresi.com (turco) figuraba "pt",
+      // wanfangdata.com.cn (chino) figuraba "pt".
+      if (pc) {
+        try {
+          const det = await detectLanguageRobust({
+            htmlLang: pc.htmlLang, ogLocale: pc.ogLocale, hreflang: pc.hreflang,
+            jsonLdLang: pc.jsonLdLang, pathLang: pc.pathLang, textSample: pc.textSample,
+            geo: row.geo || "", domain: row.domain,
+          }, { token });
+          if (det?.lang && det.lang !== row.language) {
+            idiomaFix.push({ id: row.id, domain: row.domain, de: row.language || "(vacío)", a: det.lang, src: det.source });
+          }
+        } catch {}
+      }
     }));
+  }
+  // Aplicar las correcciones de idioma en lotes.
+  for (const f of idiomaFix) {
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${f.id}`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ language: f.a }),
+      });
+    } catch {}
+  }
+  if (idiomaFix.length) {
+    log(`🗣 idioma corregido en ${idiomaFix.length} leads · ej: ${idiomaFix.slice(0, 5).map(f => `${f.domain} ${f.de}→${f.a}`).join(" · ")}`);
   }
   // NO hard-DELETE: pasamos a status='rejected' + motivo 'purge:...'. Desaparecen de Prospects
   // (el agente solo lee status=pending) pero queda AUDITORÍA — se puede revisar/restaurar si algún
