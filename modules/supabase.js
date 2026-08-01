@@ -1327,6 +1327,63 @@ export async function logImportAttempt(accessToken, { userEmail, source, sourceD
   } catch {}
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════
+// PRIORIDAD DEL MEDIA BUYER SOBRE EL AGENTE (Maxi 2026-08-01)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// Problema: el agente (feeder / autopilot / autogoogle) llena los 200 slots de `pending` y
+// cuando el MB sube un CSV le salía "System saturated… wait for worker". El MB quedaba
+// rehén de un proceso automático que puede esperar perfectamente.
+// Regla nueva: los imports del MB SIEMPRE entran. Hay un carril reservado de MB_PRIORITY_SLOTS
+// dentro de `pending` que el agente no puede ocupar: si está lleno de filas del agente, esas
+// filas se BAJAN a waiting_pool (no se pierden, se pausan) y el MB toma su lugar. El worker,
+// además, procesa primero lo del MB (ver getNextCsvItem en auto-prospector/index.js).
+// Contrapeso pedido por el user: el MB tampoco puede cargar miles → tope por tirada y por día.
+export const AGENT_UPLOADER      = "worker@autofeeder";  // uploaded_by que usa el worker
+export const MB_PRIORITY_SLOTS   = 100;   // slots de `pending` reservados para los MBs
+export const MB_IMPORT_BATCH_MAX = 200;   // máximo de dominios por tirada de un MB
+export const MB_IMPORT_DAILY_MAX = 300;   // máximo de dominios por día por MB
+
+// Cuántos dominios encoló HOY este MB (para el tope diario). Cuenta cualquier status.
+export async function getMbImportedToday(accessToken, userEmail) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  try {
+    const startMadrid = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid" }));
+    startMadrid.setHours(0, 0, 0, 0);
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_csv_queue?uploaded_by=eq.${encodeURIComponent(userEmail)}&uploaded_at=gte.${startMadrid.toISOString()}&select=id`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
+    return m ? parseInt(m[1], 10) : 0;
+  } catch { return 0; }
+}
+
+// Baja a waiting_pool las filas del AGENTE que están en `pending` para hacerle lugar al MB.
+// Se bajan las MÁS NUEVAS primero (uploaded_at desc): las viejas ya vienen esperando y algunas
+// pueden estar por procesarse. No se borra nada — vuelven solas cuando el carril se libera.
+async function _demoteAgentPending(accessToken, howMany) {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (howMany <= 0) return 0;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_csv_queue?status=eq.pending&uploaded_by=eq.${encodeURIComponent(AGENT_UPLOADER)}&order=uploaded_at.desc&limit=${howMany}&select=id`,
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+    );
+    if (!res.ok) return 0;
+    const rows = await res.json().catch(() => []);
+    if (!Array.isArray(rows) || rows.length === 0) return 0;
+    const ids = rows.map(r => r.id);
+    await fetch(`${url}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})&status=eq.pending`, {
+      method: "PATCH",
+      headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: "waiting_pool" }),
+    });
+    return ids.length;
+  } catch { return 0; }
+}
+
 export async function uploadCsvDomains(domains, userEmail, accessToken, source = "csv") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
@@ -1336,15 +1393,18 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
   // - pending (cap 200): cola activa, worker procesa de acá
   // - waiting_pool (cap 300): cola intermedia, promote a pending cuando libera
   // - next_day: excedente del budget diario (1000/día total), rollover medianoche Madrid
-  let pendingNow = 0, waitingNow = 0, dailyCount = 0, dailyCap = 1000;
+  let pendingNow = 0, waitingNow = 0, dailyCount = 0, dailyCap = 1000, mbPendingNow = 0;
   try {
-    const [rPending, rWaiting, rCfg] = await Promise.all([
+    const [rPending, rWaiting, rCfg, rMbPending] = await Promise.all([
       fetch(`${url}/rest/v1/toolbar_csv_queue?status=eq.pending&select=id`,
         { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }),
       fetch(`${url}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`,
         { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }),
       fetch(`${url}/rest/v1/toolbar_config?key=in.(csv_daily_count,csv_daily_count_date,csv_queue_daily_cap)&select=key,value`,
         { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }),
+      // Cuánto del carril del MB está ocupado AHORA (todo lo que no subió el worker)
+      fetch(`${url}/rest/v1/toolbar_csv_queue?status=eq.pending&uploaded_by=neq.${encodeURIComponent(AGENT_UPLOADER)}&select=id`,
+        { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact", "Range": "0-0" } }),
     ]);
     const parseCount = (r) => {
       const range = r.headers.get("content-range") || r.headers.get("Content-Range") || "";
@@ -1353,6 +1413,7 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
     };
     pendingNow = parseCount(rPending);
     waitingNow = parseCount(rWaiting);
+    mbPendingNow = parseCount(rMbPending);
     const cfgRows = await rCfg.json().catch(() => []);
     const cfgMap = {}; cfgRows.forEach(r => { cfgMap[r.key] = r.value; });
     const todaySpain = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Madrid" })).toISOString().split("T")[0];
@@ -1362,9 +1423,23 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
     dailyCap = parseInt(cfgMap.csv_queue_daily_cap || "1000", 10);
   } catch {}
 
-  const pendingSlots  = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
+  // ── Carril reservado del MB ────────────────────────────────────────────────────────
+  // Lo que le queda libre al MB dentro de su carril, sin importar cuánto ocupó el agente.
+  const mbLaneFree = Math.max(0, MB_PRIORITY_SLOTS - mbPendingNow);
+  const quiereEnPending = Math.min(domains.length, mbLaneFree);
+  // Espacio real que hay hoy en `pending`. Si no alcanza, se lo sacamos al agente.
+  let pendingSlots = Math.max(0, CSV_QUEUE_HARD_CAP - pendingNow);
+  let demoted = 0;
+  if (quiereEnPending > pendingSlots) {
+    demoted = await _demoteAgentPending(accessToken, quiereEnPending - pendingSlots);
+    pendingSlots += demoted;
+  }
+  // El MB nunca ocupa más que su carril de una: el resto va a waiting_pool y entra solo.
+  pendingSlots = Math.min(pendingSlots, mbLaneFree);
   const waitingSlots  = Math.max(0, CSV_WAITING_POOL_CAP - waitingNow);
-  const todayBudget   = Math.max(0, dailyCap - dailyCount); // cuántos más caben en el budget de hoy
+  // El tope diario global (1000) es del agente, no del MB. Un import manual NO puede quedar
+  // bloqueado porque el feeder se comió el budget del día — para eso está el tope por MB.
+  const todayBudget   = Math.max(domains.length, dailyCap - dailyCount);
 
   // Distribución: pending (limitado por pendingSlots Y todayBudget) → waiting_pool (limitado por waitingSlots Y todayBudget) → next_day (sin cap)
   const BATCH = 500;
@@ -1407,7 +1482,7 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
       console.warn("uploadCsvDomains batch failed:", e.message);
     }
   }
-  return { inserted, attempted: domains.length, intoPending, intoWaiting, intoNextDay };
+  return { inserted, attempted: domains.length, intoPending, intoWaiting, intoNextDay, demoted };
 }
 
 // Re-export for callers

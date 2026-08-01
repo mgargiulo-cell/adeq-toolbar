@@ -836,14 +836,23 @@ async function promoteWaitlist(token) {
     const pendingCount = await getCsvQueuePendingCountServer(token);
     const slots = CSV_QUEUE_HARD_CAP - pendingCount;
     if (slots <= 0) return 0;
-    // Trae hasta `slots` items waiting_pool, los promueve a pending (FIFO)
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&order=uploaded_at.asc&limit=${slots}&select=id`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return 0;
-    const items = await res.json();
-    if (!Array.isArray(items) || items.length === 0) return 0;
+    // Trae hasta `slots` items waiting_pool, los promueve a pending (FIFO).
+    // Maxi 2026-08-01: primero los de los MBs. Si no fuera así, las filas que el propio
+    // import del MB le bajó al agente volverían a colarse antes que lo que el MB dejó
+    // esperando — y el carril de prioridad no serviría de nada.
+    const traer = async (extra, limit) => {
+      if (limit <= 0) return [];
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool${extra}&order=uploaded_at.asc&limit=${limit}&select=id`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (!r.ok) return [];
+      const j = await r.json().catch(() => []);
+      return Array.isArray(j) ? j : [];
+    };
+    const mbItems = await traer(`&uploaded_by=neq.${encodeURIComponent(AGENT_UPLOADER)}`, slots);
+    const items = mbItems.concat(await traer("", slots - mbItems.length));
+    if (items.length === 0) return 0;
     const ids = items.map(i => i.id);
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})`, {
       method: "PATCH",
@@ -1671,8 +1680,14 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
     const CONC_ADS = 8;
     for (let i = 0; i < domains.length; i += CONC_ADS) {
       await Promise.all(domains.slice(i, i + CONC_ADS).map(async (dom) => {
-        const r = await checkAdsTxt(dom).catch(() => ({ state: "unknown" }));
+        const r = await checkAdsTxt(dom).catch(() => ({ state: "unknown", why: "error" }));
         if (r.state === "no") sinAds.add(dom);
+        // Maxi 2026-08-01: dejar RASTRO. Antes este descarte no generaba ninguna fila —
+        // el dominio desaparecía y solo quedaba una línea de log. Ahora queda auditable,
+        // y separado por motivo: 'no' (no tiene) vs 'unknown' (no pudimos leerlo).
+        if (r.state === "no" || r.state === "unknown") {
+          await _auditAdsTxt(token, dom, r.state, r.state === "no" ? "sin ads.txt" : (r.why || "desconocido"), sourceTag, "entrada");
+        }
       }));
     }
     if (sinAds.size > 0) {
@@ -5413,7 +5428,31 @@ async function fetchPageContent(domain) {
 // ads.txt NO es obligatorio (muchos publishers buenos no lo tienen) — es UNA
 // señal más. La señal fuerte es la publicidad real en el HTML.
 // ════════════════════════════════════════════════════════════════
-const PUBLISHER_CATEGORIES = new Set(["news","sports","entertainment","finance","technology","health","travel","food","automotive","gambling","streaming","business"]);
+// Maxi 2026-08-01: SE SACARON finance / technology / health / travel / automotive / business /
+// gambling. Esta categoría NO viene de SimilarWeb: la calcula fetchPageContent buscando palabras
+// en el texto de la home. O sea que la home de un BANCO ("banco", "finanzas", "invertí") caía en
+// "finance" y cobraba +25 "categoría de medios"; la de una clínica caía en "health"; la de una
+// universidad con carrera de sistemas, en "technology". Era el motor de que se colaran.
+// Quedan solo las que un no-publisher no puede fingir con las palabras de su home.
+const PUBLISHER_CATEGORIES = new Set(["news","sports","entertainment","streaming","food"]);
+
+// ── CATEGORÍAS QUE NO VAN — VETO, NO PUNTAJE (Maxi 2026-08-01) ────────────────────────
+// Pedido textual: "si es de las categorías que no van y encima no tiene ads.txt, no se debe sumar".
+// Estas son categorías REALES de SimilarWeb (data, no adivinanza). Si el sitio cae en una de
+// éstas no se puntúa nada: se va. Un banco, una universidad, una ONG o un ministerio no son un
+// medio ni con ads.txt ni con display ads en la home.
+// OJO con el orden y la especificidad: un diario de finanzas es "news_and_media/financial_news"
+// en SimilarWeb, NO "finance/banking" → los medios de nicho no caen acá.
+function _categoriaNoPublisher(cat) {
+  const c = String(cat || "").toLowerCase().trim();
+  if (!c || c === "other" || c === "?") return false;   // sin categoría no hay veto
+  if (/news|media|magazine|newspaper|journal|gossip|celebrit|arts_and_entertainment/.test(c)) return false;
+  if (/gambling|betting|casino|lottery|adult|porn/.test(c)) return true;
+  if (/finance|bank|insurance|e-?commerce|shopping|marketplace|^business$|business_and_consumer_services|law_and_government|jobs_and_career|real_estate|heavy_industry|manufactur|construction/.test(c)) return true;
+  if (/science_and_education\/education|reference_materials|computers_electronics_and_technology\/(programming|web_hosting|computer_security|computers_electronics)/.test(c)) return true;
+  if (/community_and_society\/(religion|philanthropy)|health\/(?:health$)|home_and_garden\/home_improvement|pets_and_animals\/pet_food|vehicles\/vehicles|travel_and_tourism\/(accommodation|airlines)/.test(c)) return true;
+  return false;
+}
 // Títulos típicos de NO-publisher (empresa/SaaS/login/checkout).
 // Maxi 2026-07-09: SE SACARON palabras editoriales comunes que rechazaban diarios reales de la
 // lista del user (verificado por revisión adversarial): "precios"/"pricing" (mercados/dólar),
@@ -5492,14 +5531,17 @@ async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _red
       redirect: "follow",
       headers: _ADS_TXT_HEADERS,
     });
+    // Maxi 2026-08-01: cada "unknown" ahora dice POR QUÉ. Se guarda en toolbar_adstxt_audit
+    // para poder revisar el listado agrupado por tipo de falla (si son todos 403 es anti-bot;
+    // si son todos timeout es otra cosa) en vez de tener un montón de "no sé" indistinguibles.
     if (res.status === 404 || res.status === 410) return { state: "no", lines: 0 };
-    if (res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0 };
-    if (!res.ok) return { state: "unknown", lines: 0 };
+    if (res.status === 401 || res.status === 403 || res.status === 429 || res.status >= 500) return { state: "unknown", lines: 0, why: `http_${res.status}` };
+    if (!res.ok) return { state: "unknown", lines: 0, why: `http_${res.status}` };
     const body = await res.text();
-    if (_ANTIBOT_RE.test(body.slice(0, 20000))) return { state: "unknown", lines: 0 };
+    if (_ANTIBOT_RE.test(body.slice(0, 20000))) return { state: "unknown", lines: 0, why: "anti_bot" };
     const p = _parseAdsTxtBody(body, res.headers.get("content-type"));
     if (p.lines > 0) return { state: "yes", ...p };
-    if (p.lines === -1) return { state: "unknown", lines: 0 };   // cuerpo vacío / encoding roto
+    if (p.lines === -1) return { state: "unknown", lines: 0, why: "cuerpo_vacio_o_encoding" };   // cuerpo vacío / encoding roto
 
     // REDIRECT ENTRE DOMINIOS (auditoría 2026-07-28): el spec de IAB lo contempla, pero con
     // redirect:"follow" caíamos en la HOME del destino → HTML → "no tiene". Perdimos publishers
@@ -5515,8 +5557,10 @@ async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _red
       } catch {}
     }
     return { state: "no", lines: 0, systems: 0 };
-  } catch {
-    return { state: "unknown", lines: 0 };   // DNS, timeout, TLS, red
+  } catch (e) {
+    // DNS, timeout, TLS, red. El nombre del error es suficiente para agrupar en la auditoría.
+    const _n = String(e?.name || e?.code || e?.message || "red").slice(0, 40);
+    return { state: "unknown", lines: 0, why: /timeout|abort/i.test(_n) ? "timeout" : _n };
   }
 }
 
@@ -5532,6 +5576,7 @@ async function checkAdsTxt(domain) {
 
   let out = { state: "no", lines: 0, checked: d };
   let huboUnknown = false;
+  let porQue = "";                     // Maxi 2026-08-01: primer motivo de fallo, para la auditoría
   for (const h of hosts) {
     let r = await _fetchAdsTxtOnce(h);
     // http:// SOLO puede PROMOVER a "yes", nunca degradar a "no". Antes aceptaba cualquier
@@ -5542,7 +5587,7 @@ async function checkAdsTxt(domain) {
       if (rHttp.state === "yes") r = rHttp;
     }
     if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", checked: h }; break; }
-    if (r.state === "unknown") huboUnknown = true;
+    if (r.state === "unknown") { huboUnknown = true; if (!porQue) porQue = r.why || "desconocido"; }
   }
   // app-ads.txt UNA sola vez al final (no por host): publishers app-first a veces solo publican
   // ese. Antes corría por cada host → hasta 12 fetches × 12s por dominio (medido: paginasiete.bo
@@ -5550,14 +5595,112 @@ async function checkAdsTxt(domain) {
   if (out.state !== "yes" && !huboUnknown) {
     const rApp = await _fetchAdsTxtOnce(d, { path: "/app-ads.txt" });
     if (rApp.state === "yes") out = { state: "yes", lines: rApp.lines, systems: rApp.systems || 0, owner: rApp.owner || "", checked: `${d}/app-ads.txt` };
-    else if (rApp.state === "unknown") huboUnknown = true;
+    else if (rApp.state === "unknown") { huboUnknown = true; if (!porQue) porQue = rApp.why || "desconocido"; }
   }
   // Si nadie dio "yes" pero algo falló por red/bloqueo, NO afirmamos que no tiene.
-  if (out.state !== "yes" && huboUnknown) out = { state: "unknown", lines: 0, checked: d };
+  if (out.state !== "yes" && huboUnknown) out = { state: "unknown", lines: 0, checked: d, why: porQue || "desconocido" };
 
   if (_adsTxtStateCache.size > 5000) _adsTxtStateCache.clear();
   _adsTxtStateCache.set(d, out);
   return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+// AUDITORÍA DE ads.txt (Maxi 2026-08-01)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// Pedido: "auditar los rechazados por error de lectura de txt por un lado, y los que no
+// tienen txt por otro, para poder revisar el listado cada x semanas".
+// Antes, los descartes de la puerta de entrada no dejaban NINGUNA fila — solo un log que
+// se pierde en el próximo deploy. Ahora cada veredicto negativo queda registrado y separado:
+//   · 'no'      → no tiene ads.txt. Decisión correcta; se revisa por si lo publica después.
+//   · 'unknown' → NO pudimos leerlo (Cloudflare/timeout/DNS). No es un descarte: es deuda
+//                 nuestra, y de acá la levanta el re-chequeo de abajo.
+// Tabla: sql/2026-08-01_adstxt_audit.sql
+async function _auditAdsTxt(token, domain, verdict, reason, source, gate) {
+  try {
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?on_conflict=domain`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({
+        domain: String(domain || "").toLowerCase().replace(/^www\./, ""),
+        verdict, reason: String(reason || "").slice(0, 80),
+        source: String(source || "").slice(0, 40),
+        gate,
+        last_checked_at: new Date().toISOString(),
+      }),
+    });
+  } catch {}   // la auditoría NUNCA puede romper el flujo principal
+}
+
+// ── RE-CHEQUEO DE LOS "NO PUDIMOS LEERLO" ────────────────────────────────────────────
+// Un dominio que nos bloqueó el ads.txt quedaba en el limbo para siempre: nunca se
+// descartaba (bien) pero tampoco se volvía a intentar (mal). Si mañana deja de bloquearnos,
+// no nos enterábamos. Este job los reintenta 1×/día, de a 200. Costo: $0 — es un fetch al
+// sitio, cero API paga. Gated por adstxt_recheck_enabled.
+//   · ahora tiene ads.txt  → se marca resuelto y el dominio VUELVE a la cola para analizarse
+//   · sigue sin poder leerse → suma un intento y espera al próximo ciclo
+//   · resulta que no tiene  → pasa a 'no' (ya no se reintenta más)
+let _lastAdsRecheckDay = "";
+async function recheckAdsTxtUnknowns(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.adstxt_recheck_enabled || "") !== "true") return;
+  const hoy = _madridDayStartUtc().slice(0, 10);
+  if (_lastAdsRecheckDay === hoy) return;          // 1 vez por día
+  _lastAdsRecheckDay = hoy;
+
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const minDias = parseInt(cfg.adstxt_recheck_min_days || "7", 10) || 7;
+  const corte = new Date(Date.now() - minDias * 86400000).toISOString();
+  let filas = [];
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?verdict=eq.unknown&resolved_at=is.null&last_checked_at=lt.${encodeURIComponent(corte)}&order=last_checked_at.asc&limit=200&select=domain,checks,source`,
+      { headers: auth }
+    );
+    if (r.ok) filas = await r.json();
+  } catch {}
+  if (!Array.isArray(filas) || filas.length === 0) return;
+
+  // El caché de ads.txt es por proceso: si el dominio ya se miró en esta corrida devolvería
+  // el mismo veredicto viejo. Se limpia para que el re-chequeo sea real.
+  _adsTxtStateCache.clear();
+
+  let recuperados = 0, siguenSinLeerse = 0, confirmadosSinAds = 0;
+  const CONC = 6;
+  for (let i = 0; i < filas.length; i += CONC) {
+    await Promise.all(filas.slice(i, i + CONC).map(async (f) => {
+      const r = await checkAdsTxt(f.domain).catch(() => ({ state: "unknown", why: "error" }));
+      const patch = { checks: (f.checks || 1) + 1, last_checked_at: new Date().toISOString() };
+      if (r.state === "yes") {
+        patch.resolved_at = new Date().toISOString();
+        recuperados++;
+        // Vuelve a la cola: el dominio SÍ monetiza, merece analizarse.
+        try {
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+            method: "POST",
+            headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+            body: JSON.stringify([{ domain: f.domain, status: "pending", uploaded_by: AGENT_UPLOADER, source: f.source || "adstxt_recheck", uploaded_at: new Date().toISOString() }]),
+          });
+        } catch {}
+      } else if (r.state === "no") {
+        patch.verdict = "no";
+        patch.reason = "confirmado en re-chequeo";
+        confirmadosSinAds++;
+      } else {
+        patch.reason = String(r.why || "desconocido").slice(0, 80);
+        siguenSinLeerse++;
+      }
+      try {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?domain=eq.${encodeURIComponent(f.domain)}`, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify(patch),
+        });
+      } catch {}
+    }));
+  }
+  log(`🔁 ads.txt re-chequeo: ${filas.length} revisados · ✅ ${recuperados} recuperados (vuelven a la cola) · ❌ ${confirmadosSinAds} confirmados sin ads.txt · ❓ ${siguenSinLeerse} siguen bloqueados`);
 }
 
 async function _hasRealAdsTxt(domain) {
@@ -6215,6 +6358,19 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   if (haikuType && haikuType !== "publisher" && haikuType !== "other") {
     return { ok: false, score: -999, reason: `haiku_${haikuType}`, señales: [`IA: ${haikuType}`] };
   }
+  // Maxi 2026-08-01: la categoría REAL de SimilarWeb manda. Si el sitio es banca, seguros,
+  // e-commerce, educación, gobierno, religión o beneficencia → se va acá, SIN puntuar.
+  // Antes esto solo se miraba para sitios que nos bloqueaban el scraper; el resto llegaba al
+  // score y podía compensar con "display ads" + "categoría de medios" mal detectada.
+  if (_categoriaNoPublisher(swCategory)) {
+    return { ok: false, score: -999, reason: `categoria_no_publisher:${String(swCategory).slice(0, 40)}`, señales: [`SimilarWeb: ${swCategory}`] };
+  }
+  // Y el equivalente barato: la IA dice "other" (no es un medio) y encima NO hay ads.txt.
+  // Sin ads.txt no puede monetizar display; sin veredicto de medio no hay a qué agarrarse.
+  // No se puntúa: se va.
+  if (haikuType === "other" && adsTxt?.state !== "yes") {
+    return { ok: false, score: -999, reason: "ia_other_sin_ads_txt", señales: ["la IA no lo reconoce como medio y no tiene ads.txt"] };
+  }
   const title = pageContent?.title || "";
   if (title && NON_PUBLISHER_TITLE_RE.test(title)) {
     return { ok: false, score: -999, reason: `title_nonpub:"${title.slice(0, 40)}"`, señales: ["título de empresa/SaaS"] };
@@ -6241,6 +6397,32 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   if (/news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test(swc)) add(20, `SimilarWeb: ${swc.slice(0, 20)}`);
   if (haikuType === "publisher") add(35, "IA lo tipifica como medio");
   if (urlVerdict?.reason === "url_ok_hint_medio") add(10, "el nombre del dominio dice medio");
+
+  // ── SIN ads.txt CONFIRMADO HACE FALTA VEREDICTO POSITIVO DE MEDIO (Maxi 2026-08-01) ──
+  // Este era el agujero por el que seguían colándose bancos, ONGs y universidades sin ads.txt:
+  //   · el mínimo para entrar es 30 y "display ads en la home" suma exactamente 30 → alcanzaba
+  //     con UN script publicitario (un pixel de retargeting, un tag de marketing) para pasar sin
+  //     una sola señal de que el sitio fuera un medio;
+  //   · encima PUBLISHER_CATEGORIES incluía "finance"/"business"/"health"/"travel" (ya se sacaron),
+  //     así que a un banco el scraper le sumaba +25 más por "categoría de medios".
+  //   · y un veredicto "other" de la IA se dejaba pasar (solo se vetaban los tipos explícitos).
+  // Regla nueva: si el ads.txt no está CONFIRMADO, alguien tiene que decir que es un medio —
+  // la IA ("publisher") o SimilarWeb/categoría estrictamente editorial. "Other" ya no alcanza.
+  // Si no pudimos juzgarlo (ni IA ni categoría), NO se descarta: se reintenta (regla de oro —
+  // nunca tirar un lead por una falla nuestra).
+  const evidenciaDeMedio = haikuType === "publisher"
+    || PUBLISHER_CATEGORIES.has(cat)   // ya es la lista estricta (news/sports/entertainment/streaming/food)
+    || /news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|\btv\b|streaming|gaming|blog|recipe|arts_and_entertainment/.test(swc);
+  if (adsTxt?.state !== "yes" && !evidenciaDeMedio) {
+    const pudimosJuzgar = !!haikuType || !!swc;
+    return {
+      ok: false, retry: !pudimosJuzgar, score,
+      reason: pudimosJuzgar ? `sin_ads_txt_ni_evidencia_de_medio${haikuType ? `:ia_${haikuType}` : ""}` : "sin_datos_reintentar",
+      señales: pudimosJuzgar
+        ? [...señales, "ads.txt no confirmado y nadie lo tipifica como medio"]
+        : ["no pudimos verificar ads.txt ni obtener veredicto — se reintenta"],
+    };
+  }
 
   // ── LA REGLA QUE FALTABA: sin evidencia positiva de monetización, NO ENTRA ──
   // Esto es lo que cierra el agujero de "no sé" → "pasa". Antes, un dominio sin ads.txt, sin
@@ -6285,10 +6467,10 @@ function _veredictoPorSimilarWeb({ category = "", traffic = 0, geo = "" } = {}) 
   // ORDEN IMPORTANTE: los NO se chequean PRIMERO. Al revés, "gambling/sports_betting" matcheaba
   // "sport" y salía como publisher; "vehicles/vehicles" y "finance" también corrían ese riesgo.
   // Los negativos son más específicos, así que mandan.
-  if (/gambling|betting|casino|lottery|adult|porn/.test(cat)) return "no";
-  if (/finance|bank|insurance|e-?commerce|shopping|marketplace|^business$|business_and_consumer_services|law_and_government|jobs_and_career|real_estate|heavy_industry|manufactur|construction/.test(cat)) return "no";
-  if (/science_and_education\/education|reference_materials|computers_electronics_and_technology\/(programming|web_hosting|computer_security|computers_electronics)/.test(cat)) return "no";
-  if (/community_and_society\/(religion|philanthropy)|health\/(?:health$)|home_and_garden\/home_improvement|pets_and_animals\/pet_food|vehicles\/vehicles|travel_and_tourism\/(accommodation|airlines)/.test(cat)) return "no";
+  // Maxi 2026-08-01: la lista vive en _categoriaNoPublisher() — una sola fuente de verdad,
+  // compartida con el veto duro de scoreProspectable (antes estaban duplicadas y se iban a
+  // desincronizar en cuanto tocáramos una).
+  if (_categoriaNoPublisher(cat)) return "no";
 
   // Categorías que SÍ son medios monetizables con display.
   if (/news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|\btv\b|streaming|gaming|games|blog|recipe|food|arts_and_entertainment|motorsports|automotive/.test(cat)) {
@@ -7232,6 +7414,13 @@ async function getUserCsvDoneToday(token, userEmail) {
   } catch { return 0; }
 }
 
+// Maxi 2026-08-01: PRIORIDAD DEL MB. Antes esto era FIFO puro por uploaded_at, así que un
+// import manual caía detrás de los 200 dominios que el feeder había encolado horas antes:
+// el MB subía su CSV y no veía nada durante horas ("el agente está trabajando").
+// Ahora se busca en DOS pasadas: primero cualquier fila que NO haya subido el worker
+// (= carga humana), y solo si no hay ninguna se sigue con la cola del agente. Dentro de cada
+// grupo se mantiene el FIFO de siempre.
+const AGENT_UPLOADER = "worker@autofeeder";
 async function getNextCsvItem(token, blockedUsers = new Set()) {
   try {
     let filter = "";
@@ -7240,13 +7429,22 @@ async function getNextCsvItem(token, blockedUsers = new Set()) {
       const list = [...blockedUsers].map(u => `"${u}"`).join(",");
       filter = `&uploaded_by=not.in.(${list})`;
     }
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}&order=uploaded_at.asc&limit=1&select=id,domain,uploaded_by,error_message`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const pedir = async (extra) => {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}${extra}&order=uploaded_at.asc&limit=1&select=id,domain,uploaded_by,error_message`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      const j = await r.json().catch(() => []);
+      return Array.isArray(j) ? j : [];
+    };
+    // 1ª pasada: cargas de MBs (todo lo que no subió el worker). 2ª: el resto.
+    let rows = await pedir(`&uploaded_by=neq.${encodeURIComponent(AGENT_UPLOADER)}`);
+    if (rows.length === 0) rows = await pedir("");
+    if (rows.length === 0) return null;
     const item = rows[0];
+    if (item.uploaded_by && item.uploaded_by !== AGENT_UPLOADER) {
+      log(`⚡ prioridad MB: ${item.domain} (${item.uploaded_by}) — se procesa antes que la cola del agente`);
+    }
 
     // Marcar como processing (claim atómico)
     const claim = await fetch(
@@ -7471,10 +7669,14 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
     if (_ads.state === "no") {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: sin_ads_txt` });
+      await _auditAdsTxt(token, domain, "no", "sin ads.txt", source, "proceso");
       log(`  📄 ${domain} — SIN ads.txt → no monetiza, descartado (0 API gastada)`);
       return;
     }
     if (_ads.state === "unknown") {
+      // No se descarta, pero SÍ se registra: es el listado que Maxi revisa cada X semanas
+      // para ver si entre los bloqueados quedó algún medio real.
+      await _auditAdsTxt(token, domain, "unknown", _ads.why || "desconocido", source, "proceso");
       // Maxi 2026-07-28 (pedido del user): antes volvía a la cola sin veredicto y podía quedar
       // dando vueltas para siempre. Ahora SIGUE el flujo: pide SimilarWeb y se juzga con la
       // categoría/tráfico/país reales + la config, que es data dura y no una adivinanza.
@@ -15085,6 +15287,9 @@ async function main() {
         // detector estructural). Gated por config purge_blocked_prospects='true'; se auto-apaga al terminar.
         // Maxi 2026-07-28: PRIMERO el barrido gratis por URL (sin red, sin créditos). Lo que
         // sobreviva pasa al sweep caro, que gasta scrape + Haiku solo en los dudosos.
+        // Maxi 2026-08-01: reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout).
+        // 1×/día, gratis. Los que ahora sí tienen vuelven solos a la cola.
+        await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
         await purgeByUrlOnly(token).catch(e => log(`⚠️ url-purge: ${e.message}`));
         await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Maxi 2026-07-15: PULIDO UNIFICADO — 1 fetch/dominio: bloquea no-publishers + busca email

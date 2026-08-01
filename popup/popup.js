@@ -15,6 +15,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          loadKeywordsFromDB, importKeywordsToDB, clearKeywordsDB, countKeywordsDB,
          searchKeywordsInDB, supabaseSignIn, supabaseRefresh, supabaseResetPassword, fetchApiKeys, setSupabaseAuth,
          uploadCsvDomains, getCsvQueueStats, getCsvQueueHistory, clearCsvQueue, getCsvQueueEnabled, setCsvQueueEnabled, logImportAttempt,
+         getMbImportedToday, MB_IMPORT_BATCH_MAX, MB_IMPORT_DAILY_MAX, MB_PRIORITY_SLOTS,
          getPitchDrafts, savePitchDraft, deletePitchDraft,
          getAutopilotEnabled, getAutopilotState, setAutopilotEnabled, saveAutopilotFeedback,
          fetchRejectedSignatures, trafficBucketLabel,
@@ -656,6 +657,7 @@ async function loadAdminGlobalCaps() {
       stEl.innerHTML = `
         <div>📦 CSV ${csvCount}/${csvCap} · 🤖 Autopilot ${apCount}/${apCap}</div>
         <div>⚙️ pending ${pendingCount}/200 · ⏳ waiting ${waitingCount}/300 · 🌅 next_day ${nextDayCount}</div>
+        <div style="color:#0ea5e9">⚡ ${MB_PRIORITY_SLOTS} slots de pending reservados para imports de MBs (el agente cede el lugar)</div>
         <div style="color:${bandColor}">📊 Review queue: ${bandValid} (saturates at 500)</div>
       `;
     }
@@ -753,10 +755,15 @@ function formatUploadResult(result, attempted) {
     if (dup > 0) return { msg: `ℹ️ Los ${dup} ya estaban en el sistema (no es error, son repetidos)`, color: "#0ea5e9" };
     return { msg: `⏸ 0 nuevos para agregar`, color: "#94a3b8" };
   }
-  let parts = [`✅ ${ins} agregados — aparecen primero en Prospects`];
+  const pending = result?.intoPending || 0;
+  const demoted = result?.demoted || 0;
+  let parts = [`✅ ${ins} agregados`];
+  if (pending > 0)  parts.push(`${pending} se procesan YA (prioridad sobre el agente)`);
   if (waiting > 0)  parts.push(`${waiting} en espera`);
   if (nextDay > 0)  parts.push(`${nextDay} para mañana`);
   if (dup > 0)      parts.push(`${dup} repetidos`);
+  // Transparencia: el MB tiene que ver que el agente se corrió, no que "algo pasó".
+  if (demoted > 0)  parts.push(`⏸ ${demoted} del agente pausados para darte lugar`);
   return { msg: parts.join(" · "), color: "#16a34a" };
 }
 
@@ -2975,27 +2982,35 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("version-badge")?.addEventListener("click", checkExtensionVersion);
 
   // Auto-refresh 2 min before expiry so long-lived panels stay authenticated
+  // Maxi 2026-08-01: antes esto se re-armaba SOLO cuando el refresh salía bien. Un fallo suelto
+  // (wifi que se cae 3 segundos) dejaba el panel sin próxima renovación → el token vencía y a
+  // partir de ahí todo daba 401 hasta cerrar y abrir la toolbar. Ahora se re-arma siempre:
+  // si falló, reintenta en 60s; si salió bien, se agenda para 2 min antes del próximo vencimiento.
   const scheduleRefresh = () => {
-    const msUntil = (auth.expiresAt || 0) - Date.now() - 2 * 60 * 1000;
-    if (msUntil <= 0) return;
+    const msUntil = Math.max(5_000, (auth.expiresAt || 0) - Date.now() - 2 * 60 * 1000);
     setTimeout(async () => {
-      try {
-        const r = await supabaseRefresh(auth.refreshToken);
-        if (!r.error && r.access_token) {
-          auth.accessToken  = r.access_token;
-          auth.refreshToken = r.refresh_token;
-          auth.expiresAt    = Date.now() + (r.expires_in * 1000);
-          state.accessToken = r.access_token;
-          await chrome.storage.local.set({ auth });
-          setSupabaseAuth(r.access_token);
-          setProxyAuth(r.access_token, auth.user);
-          setTrafficAuthToken(r.access_token);
-          scheduleRefresh();
-        }
-      } catch (e) { console.warn("[AuthRefresh]", e.message); }
+      const t = await ensureFreshToken();
+      if (t) {
+        const { auth: stored } = await chrome.storage.local.get("auth");
+        if (stored?.expiresAt) auth.expiresAt = stored.expiresAt;
+        if (stored?.accessToken) { auth.accessToken = stored.accessToken; auth.refreshToken = stored.refreshToken; }
+        scheduleRefresh();
+      } else {
+        setTimeout(scheduleRefresh, 60_000);   // reintento, no nos quedamos sin renovación
+      }
     }, msUntil);
   };
   scheduleRefresh();
+
+  // La notebook que duerme es el otro caso: el setTimeout no corre suspendido y al despertar
+  // el token ya venció. Al volver a mostrarse el panel, chequeamos y renovamos si hace falta.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") ensureFreshToken().catch(() => {});
+  });
+
+  // Marcas de "validado" que quedaron colgadas de una sesión anterior (mail enviado, marca sin
+  // entrar). Se reintentan al abrir la toolbar.
+  flushPendingMarks().catch(() => {});
 
   // ── Cargar API keys desde Supabase (requiere JWT válido) ──
   const apiKeys = await fetchApiKeys(auth.accessToken);
@@ -7591,20 +7606,22 @@ async function initCsvQueue() {
       // Dedupe
       const unique = [...new Set(domains)];
 
-      // Cap por tirada actualizado a 500 (user 2026-05-13: 200 csv_queue + 300 waitlist).
-      // Pre-check de capacidad real (queue + waitlist) se hace abajo en getCsvQueueStats.
-      if (unique.length > 500) {
-        uploadRes.innerHTML = `❌ <strong>Too many domains:</strong> ${unique.length} found. Per-batch limit is <strong>500 domains</strong> (200 queue + 300 waitlist). Split your CSV into smaller files.`;
+      // Maxi 2026-08-01: el import del MB YA NO se bloquea porque la cola esté llena. Tiene
+      // carril propio y, si hace falta, se le baja lugar al agente (ver uploadCsvDomains).
+      // Lo único que lo limita son SUS propios topes: por tirada y por día.
+      if (unique.length > MB_IMPORT_BATCH_MAX) {
+        uploadRes.innerHTML = `❌ <strong>Demasiados dominios:</strong> ${unique.length}. El máximo por tirada es <strong>${MB_IMPORT_BATCH_MAX}</strong> — partí el CSV en archivos más chicos.`;
         uploadRes.className = "push-result error";
         return;
       }
-      // Pre-check capacity: csv pending (max 200) + waitlist (max 300) = 500 total
-      const _stats = await getCsvQueueStats(state.accessToken);
-      const _pending = _stats?.pending || 0;
-      const _waiting = _stats?.waiting_pool || 0;
-      const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 1000
-      if (_pending + _waiting + unique.length > _capacityTotal) {
-        uploadRes.innerHTML = `❌ <strong>System saturated:</strong> ${_pending}/${CSV_PENDING_CAP} processing + ${_waiting}/${WAITLIST_CAP} waiting. Cannot add ${unique.length} more. Wait for worker.`;
+      const _yaHoy = await getMbImportedToday(state.accessToken, state.loginEmail);
+      if (_yaHoy >= MB_IMPORT_DAILY_MAX) {
+        uploadRes.innerHTML = `❌ <strong>Tope diario alcanzado:</strong> ya cargaste ${_yaHoy}/${MB_IMPORT_DAILY_MAX} dominios hoy. Mañana se resetea.`;
+        uploadRes.className = "push-result error";
+        return;
+      }
+      if (_yaHoy + unique.length > MB_IMPORT_DAILY_MAX) {
+        uploadRes.innerHTML = `❌ <strong>Te pasás del tope diario:</strong> llevás ${_yaHoy}/${MB_IMPORT_DAILY_MAX} hoy y este archivo trae ${unique.length}. Te entran ${MB_IMPORT_DAILY_MAX - _yaHoy}.`;
         uploadRes.className = "push-result error";
         return;
       }
@@ -7872,17 +7889,14 @@ async function initSellersJsonImport(refreshAll) {
     const cap = Math.max(1, Math.min(SELLERS_QUEUE_CAP_PER_RUN, userCap));
     if (userCap > SELLERS_QUEUE_CAP_PER_RUN) capInput.value = String(cap);
 
-    // Pre-check: waitlist (csv_queue pending + waiting_pool) capacity
-    const stats = await import("../modules/supabase.js").then(m => m.getCsvQueueStats(state.accessToken));
-    const _csvPending = stats?.pending || 0;
-    const _csvWaiting = stats?.waiting_pool || 0;
-    const _capacityTotal = CSV_PENDING_CAP + WAITLIST_CAP; // 1000
-    const space = _capacityTotal - _csvPending - _csvWaiting;
-    if (space <= 0) {
-      resEl.innerHTML = `<span style="color:#dc2626">❌ System saturated: ${_csvPending}/${CSV_PENDING_CAP} processing + ${_csvWaiting}/${WAITLIST_CAP} waiting. Wait for worker before adding more.</span>`;
+    // Maxi 2026-08-01: sellers.json también es una carga del MB → mismo criterio que el CSV.
+    // No se bloquea por cola llena (tiene carril propio); lo limita el tope diario del MB.
+    const _yaHoySellers = await getMbImportedToday(state.accessToken, state.loginEmail);
+    if (_yaHoySellers >= MB_IMPORT_DAILY_MAX) {
+      resEl.innerHTML = `<span style="color:#dc2626">❌ Tope diario alcanzado: ya cargaste ${_yaHoySellers}/${MB_IMPORT_DAILY_MAX} dominios hoy.</span>`;
       return;
     }
-    const allowed = Math.min(cap, space);
+    const allowed = Math.min(cap, MB_IMPORT_DAILY_MAX - _yaHoySellers);
 
     fetchBtn.disabled = true;
     resEl.innerHTML = `⏳ Fetching ${company.url}...`;
@@ -9131,6 +9145,13 @@ async function loadProspectsTab(opts = {}) {
     // se aplicaban POR-MB → Diego/Agus/Maxi veían conteos distintos. Ahora NO se filtran
     // del listado (se mantiene la data por si se reactiva). El pool es el mismo para todos.
     // (snooze + X-learn desactivados del filtro visible — Maxi 2026-06-22)
+    // Maxi 2026-08-01: leads a los que YA se les mandó el mail pero cuya marca "validated"
+    // no entró (401/red). Se reintenta la marca y, mientras tanto, se sacan del listado →
+    // el MB no los ve de nuevo y no hay riesgo de mandar dos veces al mismo contacto.
+    flushPendingMarks().catch(() => {});
+    const _pendingMarkIds = await getPendingMarkIds();
+    if (_pendingMarkIds.size) rows = rows.filter(r => !_pendingMarkIds.has(String(r.id)));
+
     allRowsForChips = rows.slice();
     // ── Client-side filters: multi-GEO chips + traffic range + name ──
     // (Estos NO pueden ir en URL PostgREST de forma simple, así que filtramos
@@ -9228,6 +9249,27 @@ async function loadProspectsTab(opts = {}) {
   // su propio tope en validateProspect (corta a 50), así que el gate de 30 solo molestaba.
   // Ahora la lista SIEMPRE se muestra; el progreso se ve en el stats line de abajo.
 
+  // ══════════════════════════════════════════════════════════════════════════════
+  // ORDEN (Maxi 2026-08-01) — dos modos, pedido del user
+  // ══════════════════════════════════════════════════════════════════════════════
+  // A) FILTRO DE USUARIO puesto (un MB concreto): sus leads en ORDEN DE EJECUCIÓN,
+  //    el último import arriba. Sin mezcla — acá el MB quiere ver exactamente lo que
+  //    acaba de cargar, en el orden en que se cargó.
+  // B) VISTA NORMAL (sin filtro de usuario): TODO MEZCLADO, página a página. Antes los
+  //    propios se clavaban arriba en bloque → el MB se comía 100 sitios parecidos del
+  //    mismo import seguidos. Ahora entran al mismo round-robin por GEO que el resto.
+  const _userFilterActive = !!userFilter && userFilter !== "_AGENT_";
+  if (_userFilterActive) {
+    const ordered = rows.slice().sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+    window._prospectsSample = ordered;
+    if (statsEl) {
+      const globalPool = window._prospectsGlobalPool || rows.length;
+      statsEl.innerHTML = `<strong>${ordered.length}</strong> de ${esc(userFilter)} (último import arriba) · <strong>${globalPool}</strong> en pool global · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy`;
+    }
+    renderProspectsPage(_keepPage);
+    return;
+  }
+
   // ── Sample 100 random ROTANDO cada 30 minutos por MB ──
   // Maxi 2026-06-18: SIN cap visible — todos los MBs ven la totalidad de
   // disponibles. El shuffle por slot garantiza orden distinto entre MBs.
@@ -9251,7 +9293,6 @@ async function loadProspectsTab(opts = {}) {
   //      el tope, sin esperar 30 min al próximo slot.
   //   B) Para los `other`, GEOs deprioritizados (US/GB/CA/AU/NZ/IE) van al
   //      final. LATAM + Europa continental + resto del mundo arriba.
-  const me = (state.loginEmail || "").toLowerCase();
   const DEPRIO_ISO   = new Set(["US","USA","GB","UK","CA","AU","NZ","IE"]);
   const DEPRIO_NAMES = ["united states","usa","united kingdom","uk","britain","england","canada","australia","new zealand","ireland"];
   const _geoKey = (r) => {
@@ -9276,12 +9317,13 @@ async function loadProspectsTab(opts = {}) {
     return arr;
   };
 
-  // Maxi 2026-06-22: orden ESTABLE (por fecha desc, nuevos arriba) en vez de shuffle
-  // aleatorio → el listado NO se reordena en cada refresh/click. Antes el shuffle hacía
-  // que el orden cambiara solo y se "perdiera" al actualizar.
-  const mineAll = rows.filter(r => (r.created_by || "").toLowerCase() === me)
-    .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
-  const mineIds = new Set(mineAll.map(r => r.id));
+  // Maxi 2026-08-01: los propios YA NO se pinean arriba en la vista normal — van a la
+  // mezcla como todos (ver bloque "ORDEN" más arriba). Para verlos aparte está el filtro
+  // de usuario, que los muestra en orden de ejecución. `mineAll` queda vacío a propósito:
+  // así el round-robin por GEO recibe el pool COMPLETO y no quedan bloques del mismo import.
+  // El orden sigue siendo ESTABLE dentro del slot de 30 min (no se reordena solo al refrescar).
+  const mineAll = [];
+  const mineIds = new Set();
 
   // Cache solo el sample de los "other" (no-mine) por slot. `mine` se overlay
   // siempre fresco arriba.
@@ -10514,6 +10556,80 @@ function getSelectedEmail(card) {
   return radio?.value || "";
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════
+// TOKEN FRESCO A DEMANDA (Maxi 2026-08-01) — arregla el "❌ Could not mark validated: HTTP 401"
+// ══════════════════════════════════════════════════════════════════════════════════
+// El JWT de Supabase dura 1 hora. La renovación vivía SOLO en un setTimeout armado al abrir el
+// panel, y ese timeout tiene dos agujeros: (a) no corre mientras la notebook duerme —al despertar
+// el token ya venció—, y (b) si el refresh fallaba UNA vez no se re-armaba, así que el panel se
+// quedaba con un token muerto para siempre y TODA escritura devolvía 401.
+// Se veía justo en el paso final del envío (el mail YA había salido) → el lead no se marcaba,
+// volvía a aparecer en Prospects y se podía mandar dos veces al mismo contacto.
+// Ahora: antes de cada operación crítica se mira el vencimiento y se renueva si falta poco.
+// Si el token está sano no cuesta ni una request.
+let _refreshInFlight = null;
+async function ensureFreshToken(marginMs = 2 * 60 * 1000) {
+  try {
+    const { auth } = await chrome.storage.local.get("auth");
+    if (!auth?.accessToken) return null;
+    if ((auth.expiresAt || 0) - Date.now() > marginMs) return auth.accessToken;
+    if (!auth.refreshToken) return null;
+    if (!_refreshInFlight) {
+      // Un solo refresh en vuelo aunque lo pidan 5 cards a la vez (el refresh_token de Supabase
+      // es de un solo uso: dos llamadas en paralelo invalidan la sesión).
+      _refreshInFlight = (async () => {
+        const r = await supabaseRefresh(auth.refreshToken);
+        if (r?.error || !r?.access_token) return null;
+        auth.accessToken  = r.access_token;
+        auth.refreshToken = r.refresh_token;
+        auth.expiresAt    = Date.now() + (r.expires_in * 1000);
+        await chrome.storage.local.set({ auth });
+        state.accessToken = r.access_token;
+        setSupabaseAuth(r.access_token);
+        setProxyAuth(r.access_token, auth.user);
+        setTrafficAuthToken(r.access_token);
+        return r.access_token;
+      })().finally(() => { _refreshInFlight = null; });
+    }
+    return await _refreshInFlight;
+  } catch { return null; }
+}
+
+// ── MARCAS PENDIENTES ────────────────────────────────────────────────────────────
+// Si el mail salió pero el "marcar como validado" no entró (401, caída de red, Supabase
+// lento), guardamos el id acá y lo reintentamos al abrir Prospects. Mientras tanto la card
+// se saca de la lista igual → el MB NUNCA vuelve a ver un lead al que ya le mandó el mail.
+const PENDING_MARKS_KEY = "pending_validated_marks";
+async function queuePendingMark(id, by) {
+  try {
+    const { [PENDING_MARKS_KEY]: q = [] } = await chrome.storage.local.get(PENDING_MARKS_KEY);
+    if (!q.some(m => String(m.id) === String(id))) q.push({ id, by, at: Date.now() });
+    await chrome.storage.local.set({ [PENDING_MARKS_KEY]: q });
+  } catch {}
+}
+async function getPendingMarkIds() {
+  try {
+    const { [PENDING_MARKS_KEY]: q = [] } = await chrome.storage.local.get(PENDING_MARKS_KEY);
+    return new Set(q.map(m => String(m.id)));
+  } catch { return new Set(); }
+}
+async function flushPendingMarks() {
+  try {
+    const { [PENDING_MARKS_KEY]: q = [] } = await chrome.storage.local.get(PENDING_MARKS_KEY);
+    if (!q.length) return;
+    const token = await ensureFreshToken();
+    if (!token) return;
+    const quedan = [];
+    for (const m of q) {
+      const r = await validateReviewItem(token, m.id, m.by || state.loginEmail);
+      // Se descarta también lo que lleva más de 7 días intentando (la fila ya no existe).
+      if (!r.ok && Date.now() - (m.at || 0) < 7 * 24 * 3600 * 1000) quedan.push(m);
+    }
+    await chrome.storage.local.set({ [PENDING_MARKS_KEY]: quedan });
+    if (q.length !== quedan.length) console.log(`[PendingMarks] recuperadas ${q.length - quedan.length}`);
+  } catch {}
+}
+
 async function validateProspect(card, data, doSendEmail) {
   const resultEl = card.querySelector(".pcard-result");
   const setResult = (msg, ok = true) => {
@@ -10613,6 +10729,10 @@ async function validateProspect(card, data, doSendEmail) {
   // Disable buttons during processing
   card.querySelectorAll("button").forEach(b => { b.disabled = true; });
   setResult("⏳ Processing...", true);
+
+  // Token fresco ANTES de tocar Monday/Gmail/Supabase. Si el JWT venció con el panel abierto,
+  // el mail salía igual (Gmail usa su propio token) y recién moría el último paso con 401.
+  await ensureFreshToken();
 
   try {
     // 1. Push to Monday — UPDATE si vino de Monday Refresh (tiene monday_item_id),
@@ -10724,12 +10844,27 @@ async function validateProspect(card, data, doSendEmail) {
     });
 
     // 4. Mark validated in review queue
-    const mark = await validateReviewItem(state.accessToken, data.id, state.loginEmail);
-    if (!mark.ok) throw new Error(`Could not mark validated: ${mark.error}`);
+    // Maxi 2026-08-01: acá es donde saltaba el 401. Ahora: 1 reintento con token nuevo y, si
+    // aun así falla, NO se tira error — el mail ya salió, y tirar error dejaba la card viva
+    // con los botones habilitados (= reenvío al mismo contacto). Se encola la marca y se
+    // saca la card igual; flushPendingMarks() la reintenta al volver a abrir Prospects.
+    let mark = await validateReviewItem(state.accessToken, data.id, state.loginEmail);
+    if (!mark.ok) {
+      const fresh = await ensureFreshToken(Infinity);   // fuerza renovación del JWT
+      if (fresh) mark = await validateReviewItem(fresh, data.id, state.loginEmail);
+    }
+    if (!mark.ok) {
+      await queuePendingMark(data.id, state.loginEmail);
+      console.warn("[Prospects] mark validated falló, encolado:", data.id, mark.error);
+    }
 
     // 5. Update UI — desaparece inmediato (200ms para mostrar el ✅)
     card.style.opacity = "0.3";
-    setResult(doSendEmail && email ? "✅ Monday + Email sent!" : "✅ Pushed to Monday");
+    setResult(
+      mark.ok
+        ? (doSendEmail && email ? "✅ Monday + Email sent!" : "✅ Pushed to Monday")
+        : (doSendEmail && email ? "✅ Email enviado (la marca se reintenta sola)" : "✅ Cargado en Monday (la marca se reintenta sola)")
+    );
     setTimeout(() => { card.remove(); refreshProspectsStats(); }, 200);
 
   } catch (err) {
