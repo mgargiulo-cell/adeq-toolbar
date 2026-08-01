@@ -7653,7 +7653,14 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Maxi 2026-07-01: bypass de los filtros de CALIDAD para lo que el MB trae explícitamente
   // (import manual o Monday refresh). Estos NO se re-rechazan por "ya analizada"; solo los
   // frena el deal Monday activo (chequeado arriba) y la blocklist. El auto-feeder sí filtra.
-  const bypassFilters = isManualImport || source === "monday_refresh";
+  // Maxi 2026-08-01: "lo que un MB importa a mano TODO debe pasar el filtro siempre".
+  // Antes esta variable salteaba SEIS puertas para los imports manuales, mezclando dos cosas
+  // distintas: filtros de CALIDAD (¿es un medio?) y preferencias de GEO (¿nos conviene gastar
+  // acá?). Un banco cargado a mano entraba a Prospects igual.
+  // Ahora los de calidad (classifyPublisher + categoría bloqueada) corren SIEMPRE, para todos.
+  // Las de GEO se siguen salteando a propósito: si el MB importa a mano un medio de USA lo hace
+  // deliberadamente — rechazárselo en silencio por "no prioritario" sería sacarle la decisión.
+  const bypassGeoPrefs = isManualImport || source === "monday_refresh";
 
   // Maxi 2026-07-01: TRAFFIC PRIMERO, SOLO. El page content (scrape) se difería a
   // después del floor de 350K para NO gastar scrape/API en sitios que se van a rechazar.
@@ -7702,7 +7709,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // - traffic < 400K → skip (no entra)
   // - traffic = 0 / null / error → after 3 failed attempts, FREEZE 15d/30d/60d
   // - traffic ≥ 400K → entra al pool
-  if ((!visits || visits <= 0) && !bypassFilters) {
+  if ((!visits || visits <= 0) && !bypassGeoPrefs) {
     // Maxi 2026-06-22 FIX: NO penalizar/congelar por fallas TRANSITORIAS de la API
     // (429/5xx/timeout/red). Antes 3 timeouts seguidos congelaban un lead bueno 15-60d
     // y hasta lo mandaban a blocklist. Solo se cuenta como intento fallido cuando la API
@@ -7890,7 +7897,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // que pasaron por traffic pero no son publishers. Política user: no quiero ver
   // bancos, universidades, gobierno, marcas de autos, telcos, etc. en Prospects.
   const blockedCat = isCategoryBlockedWorker(swCategory);
-  if (blockedCat && !bypassFilters) {
+  // Maxi 2026-08-01: SIN excepción para imports manuales. Una categoría que vos bloqueaste
+  // en la config es una decisión tuya — no la pisa el hecho de que el lead venga de un CSV.
+  if (blockedCat) {
     await markCsvItem(token, item.id, "skipped", {
       error_message: `category-blocked: "${swCategory}" matchea "${blockedCat}"`,
     });
@@ -7901,7 +7910,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // skipear ANTES de gastar Apollo + Claude. Hay demasiado USA y no nos sirve.
   // Excepción: si el lead vino de Monday refresh, lo procesamos igual (es un
   // re-engage del usuario, no descubrimiento aleatorio).
-  if (!bypassFilters && _isWorkerDeprioGeo(topCountry, geosAllIso)) {
+  if (!bypassGeoPrefs && _isWorkerDeprioGeo(topCountry, geosAllIso)) {
     await markCsvItem(token, item.id, "skipped", {
       error_message: `deprio-geo: ${topCountry || geosAllIso[0] || "?"} (USA/UK/CA/AU/NZ/IE no procesados)`,
     });
@@ -7913,7 +7922,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // hay MUCHOS de un mismo país (>25% del pool), skipear este lead para
   // priorizar diversidad. Excepción: monday_refresh + Weekly Focus específico.
   // Esto evita que el feeder llene Prospects con 200 sitios de Brasil.
-  if (!bypassFilters) {
+  if (!bypassGeoPrefs) {
     const overrepresented = await _isGeoOverrepresentedInPool(token, topCountry, geosAllIso).catch(() => false);
     if (overrepresented) {
       // Maxi 2026-06-22 FIX: saturación de GEO es TRANSITORIA (el pool se rebalancea).
@@ -7938,7 +7947,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   }
   // ── FILTRO DE BASURA (Maxi 2026-06-19) — descartar gov/uni/empresa/SaaS antes
   // de gastar Apollo+Claude. Excepción: monday_refresh (re-prospect explícito del MB).
-  if (!bypassFilters) {
+  // Maxi 2026-08-01: EL FILTRO DE CALIDAD CORRE SIEMPRE, venga de donde venga.
+  // Antes los imports manuales lo salteaban y un banco cargado a mano entraba a Prospects.
+  // Regla del user: "lo que un MB importa a mano, todo debe pasar el filtro siempre".
+  {
     const pub = await classifyPublisher(token, domain, pageContent, swCategory);
     if (!pub.ok) {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${pub.reason}` });
@@ -7955,7 +7967,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // (default: solo el bajo tráfico descarta). Si el admin setea prioridades/exclusiones
   // de GEO o categoría, el worker las respeta para lo que TRAE a Prospects.
   // monday_refresh se exceptúa (re-prospect explícito del MB).
-  if (!bypassFilters) {
+  if (!bypassGeoPrefs) {
     let wd = {};
     try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
     const geoPri = (wd.geos_priority || []).map(s => String(s).toUpperCase());
