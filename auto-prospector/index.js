@@ -12676,6 +12676,48 @@ const SEC_AUTO_RECUPERACION_MIN = 30;
 
 async function securityWatchdog(token) {
   const cfg = await getConfig(token);
+
+  // ── PRUEBA DEL ALERTADO (Maxi 2026-08-04) ──────────────────────────────────────────────
+  // El mail de alerta solo se dispara ante un incidente real, así que no había forma de saber
+  // si llega hasta que pasara algo — justo cuando no querés enterarte de que no funcionaba.
+  // Poniendo security_alert_test='true' en config, el próximo ciclo manda un mail de prueba y
+  // apaga la bandera solo. Ignora el anti-spam de 60 min a propósito.
+  if (String(cfg.security_alert_test || "") === "true") {
+    await setConfigValue(token, "security_alert_test", "false").catch(() => {});
+    const dest = (cfg.security_alert_email || "mgargiulo@adeqmedia.com").trim();
+    try {
+      await sendGmailServer(token, dest, {
+        to: dest,
+        subject: "✅ ADEQ Toolbar — prueba del alertado de seguridad",
+        body: [
+          `Si estás leyendo esto, el canal de alertas FUNCIONA.`,
+          ``,
+          `Esto es una prueba que disparaste vos poniendo security_alert_test='true'.`,
+          `La bandera ya se apagó sola, no hace falta que hagas nada.`,
+          ``,
+          `A partir de ahora, si el vigilante detecta algo raro (gasto disparado, alguien`,
+          `intentando entrar, flood, envíos desbocados) te va a llegar un mail como este con`,
+          `el detalle, qué frenó solo, y las dos líneas para revertirlo.`,
+          ``,
+          `Tu botón de pánico:`,
+          `  UPDATE toolbar_config SET value='true' WHERE key='kill_switch';   -- frenar`,
+          `  UPDATE toolbar_config SET value='false' WHERE key='kill_switch';  -- soltar`,
+          ``,
+          `Estado ahora: freno ${String(cfg.kill_switch || "false") === "true" ? "🛑 ACTIVO" : "✅ normal"}`,
+          `Defensa automática: ${String(cfg.defensa_automatica || "true") !== "false" ? "encendida" : "APAGADA"}`,
+          ``,
+          `— Vigilante de la ADEQ Toolbar · ${new Date().toISOString()}`,
+        ].join("\n"),
+        agentActionId: null,
+      });
+      log(`✅ mail de PRUEBA del alertado enviado a ${dest}`);
+      await _secLog(token, "alerta_prueba_ok", "info", "watchdog", { dest });
+    } catch (e) {
+      log(`🔴 FALLÓ el mail de prueba del alertado: ${e.message}`);
+      await _secLog(token, "alerta_prueba_fallo", "critical", "watchdog", { error: String(e.message).slice(0, 200) });
+    }
+  }
+
   if (String(cfg.security_watchdog_enabled || "true") === "false") return;
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const hallazgos = [];

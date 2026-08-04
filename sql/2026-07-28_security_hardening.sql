@@ -273,3 +273,10 @@ create trigger trg_bloquear_signups
   for each row execute function public.bloquear_signups_no_autorizados();
 -- OJO a futuro: si sumás un MB nuevo, agregalo PRIMERO a agent_enabled_users y después que se
 -- registre. Si no, el trigger le rechaza el alta.
+
+-- ── 13. PROBAR EL ALERTADO ─────────────────────────────────────────────────────────────
+-- El mail de alerta solo se dispara ante un incidente real. Esta bandera fuerza uno de prueba
+-- en el próximo ciclo del worker (~1-2 min) y se apaga sola.
+insert into toolbar_config (key, value) values ('security_alert_test','false')
+on conflict (key) do nothing;
+-- Para probar:  UPDATE toolbar_config SET value='true' WHERE key='security_alert_test';
