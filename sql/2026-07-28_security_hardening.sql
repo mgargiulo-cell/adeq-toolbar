@@ -76,16 +76,6 @@ on conflict (key) do nothing;
 insert into toolbar_config (key, value) values ('security_alert_email','mgargiulo@adeqmedia.com')
 on conflict (key) do nothing;
 
--- ── 5. RLS: verificar qué tablas quedaron expuestas ────────────────────────────────────
--- Este SELECT no cambia nada: lista las toolbar_* SIN row level security. Cualquiera con la
--- anon key (que viaja dentro de la extensión y es pública) puede leerlas y escribirlas.
-select tablename,
-       case when rowsecurity then 'RLS ON' else '⚠️ RLS OFF — EXPUESTA' end as estado,
-       (select count(*) from pg_policies p where p.tablename = t.tablename) as politicas
-from pg_tables t
-where schemaname = 'public' and tablename like 'toolbar_%'
-order by rowsecurity asc, tablename;
-
 -- ═══════════════════════════════════════════════════════════════════════════════════════
 -- PARTE 2 — LO CRÍTICO (auditoría 2026-08-04). Correr TODO junto.
 -- ═══════════════════════════════════════════════════════════════════════════════════════
@@ -153,16 +143,6 @@ drop trigger if exists trg_log_config_change on public.toolbar_config;
 create trigger trg_log_config_change after update on public.toolbar_config
   for each row execute function public.log_config_change();
 
--- ── 9. CHEQUEO: ¿quién usó el proxy hoy y está fuera de la allowlist? ──────────────────
--- Detecta el abuso al PRIMER uso, no al llegar a un umbral de volumen.
-select u.user_email, u.total, u.by_provider
-from toolbar_api_usage u
-where u.day = current_date
-  and u.user_email not in (
-    select lower(jsonb_array_elements_text(value::jsonb))
-    from toolbar_config where key = 'agent_enabled_users'
-  );
-
 -- ── 10. BOTÓN DE PÁNICO DESDE EL PANEL ─────────────────────────────────────────────────
 -- Tras el punto 7, `kill_switch` ya no es escribible por usuarios autenticados — que es lo
 -- correcto, pero deja al botón del panel sin poder tocarlo. Este RPC es la puerta controlada:
@@ -215,3 +195,27 @@ $$;
 grant execute on function public.kill_switch_estado() to authenticated;
 
 insert into toolbar_config (key, value) values ('kill_switch_auto_at','') on conflict (key) do nothing;
+
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+-- DIAGNÓSTICO — no cambian nada, van al final para poder ver el resultado
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+
+-- ── 5. RLS: verificar qué tablas quedaron expuestas ────────────────────────────────────
+-- Este SELECT no cambia nada: lista las toolbar_* SIN row level security. Cualquiera con la
+-- anon key (que viaja dentro de la extensión y es pública) puede leerlas y escribirlas.
+select tablename,
+       case when rowsecurity then 'RLS ON' else '⚠️ RLS OFF — EXPUESTA' end as estado,
+       (select count(*) from pg_policies p where p.tablename = t.tablename) as politicas
+from pg_tables t
+where schemaname = 'public' and tablename like 'toolbar_%'
+order by rowsecurity asc, tablename;
+
+-- ── 9. CHEQUEO: ¿quién usó el proxy hoy y está fuera de la allowlist? ──────────────────
+-- Detecta el abuso al PRIMER uso, no al llegar a un umbral de volumen.
+select u.user_email, u.total, u.by_provider
+from toolbar_api_usage u
+where u.day = current_date
+  and u.user_email not in (
+    select lower(jsonb_array_elements_text(value::jsonb))
+    from toolbar_config where key = 'agent_enabled_users'
+  );
