@@ -9754,6 +9754,9 @@ async function runReengagementCycle(token) {
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=representation" },
           body: JSON.stringify({
             user_email: userEmail, domain, action: "reserved",
+            // email_to faltaba (auditoría 2026-08-04): los re_sent aparecían con destinatario
+            // NULL en el listado y no se podían cruzar contra los rebotes.
+            email_to: newEmail,
             pitch_subject: subject,
             details: { email: newEmail, source: "reengagement", original_email: originalEmail, attempt: attempts + 1, language: lead.language },
           }),
@@ -14079,8 +14082,14 @@ async function runAgentCycle(token, allFlags) {
             }).catch(() => {});
             logAgentAction(token, userEmail, {
               domain, action: "secondary_sent",
+              // email_to faltaba (auditoría 2026-08-04): en el listado de envíos los
+              // secondary_sent salían con el destinatario en NULL, así que no había forma de
+              // auditar a quién se le escribió ni de cruzarlos contra los rebotes. La dirección
+              // estaba en details.secondary pero ninguna consulta mira ahí.
+              email_to: secondCandidate.email,
               reason: "agent_2nd_email_parallel",
-              details: { primary: email, secondary: secondCandidate.email, score: secondCandidate.score, source: secondCandidate.source },
+              details: { primary: email, secondary: secondCandidate.email, score: secondCandidate.score, source: secondCandidate.source,
+                         geo: leadGeo, language: lead.language, traffic: leadTraffic },
             }).catch(() => {});
           }
         } catch (e) { log(`  ⚠️ agente 2do email ${domain}: ${e.message}`); }
