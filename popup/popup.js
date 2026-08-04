@@ -11282,8 +11282,14 @@ async function secCopiarReporte() {
   if (btn) btn.textContent = "…";
   try {
     const h = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}` };
+    // Vía RPC y no lectura directa: toolbar_security_events queda sin políticas de RLS a
+    // propósito (nadie con anon/authenticated la toca). security_report valida el mail contra
+    // la allowlist y devuelve solo lo necesario.
     const [evR, estR] = await Promise.all([
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_security_events?select=created_at,kind,severity,actor,detail&order=created_at.desc&limit=60`, { headers: h }),
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/security_report`, {
+        method: "POST", headers: { ...h, "Content-Type": "application/json" },
+        body: JSON.stringify({ p_limit: 60 }),
+      }),
       secEstado(),
     ]);
     const ev = evR.ok ? await evR.json() : [];

@@ -219,3 +219,26 @@ where u.day = current_date
     select lower(jsonb_array_elements_text(value::jsonb))
     from toolbar_config where key = 'agent_enabled_users'
   );
+
+-- ── 11. REPORTE DE SEGURIDAD PARA EL PANEL ─────────────────────────────────────────────
+-- toolbar_security_events queda SIN políticas a propósito: nadie con anon/authenticated la
+-- toca. Pero el botón "Copiar reporte" del panel necesita leerla. Misma solución que el botón
+-- de pánico: un RPC security definer que valida que el mail esté en la allowlist.
+create or replace function public.security_report(p_limit int default 60)
+returns table (created_at timestamptz, kind text, severity text, actor text, detail jsonb)
+language plpgsql security definer set search_path = public as $$
+declare v_email text; v_permitidos jsonb;
+begin
+  v_email := lower(coalesce(current_setting('request.jwt.claim.email', true), ''));
+  select value::jsonb into v_permitidos from toolbar_config where key = 'agent_enabled_users';
+  if v_email = '' or v_permitidos is null
+     or not exists (select 1 from jsonb_array_elements_text(v_permitidos) e where lower(e) = v_email)
+  then raise exception 'no autorizado'; end if;
+
+  return query
+    select e.created_at, e.kind, e.severity, e.actor, e.detail
+    from toolbar_security_events e
+    order by e.created_at desc
+    limit least(coalesce(p_limit, 60), 200);
+end $$;
+grant execute on function public.security_report(int) to authenticated;
