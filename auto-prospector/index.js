@@ -12047,6 +12047,88 @@ async function _verifyEmailMV(token, cfg, email) {
   } catch { return true; }                                 // timeout/red → fail-open
 }
 
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// DETECCIÓN DE EMAILS FALSOS / PHISHING (Maxi 2026-08-04, pedido del user)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Un email scrapeado de una web ajena puede ser una trampa: sitios comprometidos, comentarios
+// de spam indexados, o dominios lookalike puestos justamente para que un bot les escriba.
+// Escribirle a uno de esos no solo se desperdicia: nos mete en listas de spam y ensucia la
+// reputación de los buzones, que es lo que venimos peleando.
+// Devuelve "" si está limpio, o el motivo si es sospechoso.
+const _TLD_ALTO_RIESGO = /\.(tk|ml|ga|cf|gq|top|xyz|click|link|work|loan|men|date|racing|win|bid|stream|download|review|country|kim|science|party|gdn|mom|rest|fit|cyou|icu|sbs|buzz|monster|quest)$/i;
+const _MARCAS_SUPLANTADAS = /(paypal|apple|micros0ft|microsofl|goog1e|gooogle|faceb00k|arnazon|amaz0n|netfIix|whatsapp|binance|coinbase|metamask|bancolombia|santander|bbva|mercadopago|correos|dhl|fedex)/i;
+
+function detectarEmailSospechoso(email, siteDomain = "") {
+  const lower = String(email || "").toLowerCase().trim();
+  const [local, dom] = lower.split("@");
+  if (!local || !dom) return "malformado";
+
+  // 1. TLD de alto riesgo: gratuitos o históricamente abusados por phishing.
+  if (_TLD_ALTO_RIESGO.test(dom)) return `tld_riesgoso:${dom.split(".").pop()}`;
+
+  // 2. Suplantación de marca conocida — el dominio IMITA a una marca grande con typos.
+  //    Un publisher legítimo nunca tiene un email en un dominio así.
+  //    Normalizamos homóglifos ANTES de comparar: "paypaI-secure.com" usa una I mayúscula que al
+  //    pasar a minúscula queda "i" y esquivaba el patrón. Lo mismo con 0→o, 1→l, 5→s.
+  // Normalización de homóglifos: los pares que el ojo confunde en un renglón de texto.
+  //   1/i/| → l   ·   0 → o   ·   rn → m (el clásico)   ·   vv → w   ·   5/$ → s
+  // Solo se usa para comparar contra la lista fija de marcas grandes, así que el riesgo de
+  // falso positivo es mínimo: un dominio legítimo tendría que normalizar EXACTAMENTE a una marca.
+  // Casos que caza: paypaI-secure.com (i mayúscula) y bancolornbia.com (rn por m).
+  // Se prueban VARIAS normalizaciones por separado, no una sola encadenada: aplicar todas juntas
+  // se pisa a sí misma. Ej: "bancolornbia" → rn→m da "bancolombia" (correcto), pero si después
+  // corre i→l queda "bancolombla" y ya no matchea. Cada variante ataca un tipo de homóglifo.
+  const _variantes = [
+    dom,
+    dom.replace(/rn/g, "m").replace(/vv/g, "w"),                       // rn→m, vv→w
+    dom.replace(/[1|]/g, "l").replace(/0/g, "o").replace(/5/g, "s")
+       .replace(/3/g, "e").replace(/4/g, "a"),                          // dígitos por letras
+    dom.replace(/i/g, "l"),                                            // I mayúscula leída como i
+    dom.replace(/rn/g, "m").replace(/[1|]/g, "l").replace(/0/g, "o"),  // combinada
+  ];
+  if (_variantes.some(v => _MARCAS_SUPLANTADAS.test(v))) return `marca_suplantada:${dom}`;
+
+  // 3. Lookalike del PROPIO sitio: el dominio del email se parece al del lead pero no es igual.
+  //    Es la trampa clásica: en el sitio real ponen un contacto en un dominio casi idéntico.
+  //    Ej: lead=clarin.com, email=@clar1n.com o @clarin-noticias.com
+  const site = String(siteDomain || "").toLowerCase().replace(/^www\./, "");
+  if (site && dom !== site && !dom.endsWith("." + site) && !site.endsWith("." + dom)) {
+    const marcaSitio = (site.split(".")[0] || "");
+    const marcaMail  = (dom.split(".")[0] || "");
+    if (marcaSitio.length >= 5 && marcaMail.length >= 5 && marcaSitio !== marcaMail) {
+      // Distancia de edición chica entre las marcas = imitación, no otra empresa.
+      const dist = (a, b) => {
+        const m = Array.from({ length: b.length + 1 }, (_, i) => [i, ...Array(a.length).fill(0)]);
+        for (let j = 1; j <= a.length; j++) m[0][j] = j;
+        for (let i = 1; i <= b.length; i++) for (let j = 1; j <= a.length; j++)
+          m[i][j] = Math.min(m[i-1][j] + 1, m[i][j-1] + 1, m[i-1][j-1] + (a[j-1] === b[i-1] ? 0 : 1));
+        return m[b.length][a.length];
+      };
+      const d = dist(marcaSitio, marcaMail);
+      if (d > 0 && d <= 2) return `lookalike_del_sitio:${dom}_vs_${site}`;
+      // Typosquat por añadido: la marca del sitio está DENTRO del dominio del email junto con una
+      // palabra de cebo ("clarin-noticia.com" para clarin.com). Solo se marca si el agregado es
+      // una palabra de las que usa el phishing — un "lanacionmas.com" legítimo no cae acá.
+      const _cebo = /(noticia|noticias|news|oficial|official|secure|seguro|login|verify|soporte|support|help|account|cuenta|pago|pay|billing|update|alerta|alert|premium|vip|online)/i;
+      if ((marcaMail.includes(marcaSitio) || marcaSitio.includes(marcaMail)) && marcaMail !== marcaSitio && _cebo.test(marcaMail))
+        return `typosquat_con_cebo:${dom}_vs_${site}`;
+    }
+  }
+
+  // 4. Caracteres no ASCII en el dominio (homógrafos: cirílico "а" que parece latina "a").
+  if (/[^\x00-\x7F]/.test(dom)) return "homografo_no_ascii";
+
+  // 5. Local-part con pinta de cebo automatizado.
+  if (/^(abuse|phish|spam|fraud|scam|verify|verification|secure|security-?alert|account-?update|billing-?update|confirm|unlock|suspended)([._-]|$)/i.test(local))
+    return `local_cebo:${local.slice(0, 20)}`;
+
+  // 6. Dominio muy largo con muchos guiones: patrón típico de dominio desechable de campaña.
+  if (dom.length >= 32 && (dom.match(/-/g) || []).length >= 3) return "dominio_sospechoso_largo";
+
+  return "";
+}
+
 function rankEmail(email, siteDomain, leadCategory = "") {
   if (!email || typeof email !== "string" || !email.includes("@")) return -1;
   const lower = email.toLowerCase();
@@ -12055,15 +12137,30 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
+  // Veto por phishing / suplantación (pedido del user 2026-08-04). Escribirle a una trampa nos
+  // mete en listas de spam, que es justo lo que venimos peleando.
+  const _sosp = detectarEmailSospechoso(lower, siteDomain);
+  if (_sosp) return -1;
   // Local-part de 1-2 caracteres ("a@olm.vn", "66@manhuaren.com") = artefacto de scrape,
   // nunca un contacto real. Se permiten 2 chars solo si son iniciales con punto (j.p@).
-  if (local.replace(/[._-]/g, "").length <= 2) return -1;
+  // Maxi 2026-08-04: la regla original rechazaba TODO local de ≤2 caracteres y se llevaba
+  // puestos `hi@thevocket.com` y `tu@fpt.com`, que son direcciones de contacto reales (muy
+  // comunes en sitios chicos y startups). Ahora solo cae 1 carácter, o 2 si trae dígitos
+  // (`a1@`, `66@` = artefacto de scrape).
+  const _localSinSep = local.replace(/[._-]/g, "");
+  if (_localSinSep.length <= 1) return -1;
+  if (_localSinSep.length === 2 && /\d/.test(_localSinSep)) return -1;
   if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) return -1; // Capa 3: keywords/subdominios garbage
 
   // Malformed local-part: contiene TLD (.com/.net/.io/etc) → scrape artifact
   // Caso real 2026-05-13: "lindaikejisblog.com@protecteddomainservices.com"
   // donde el scraper agarro "site.com@registrar.com" como un solo email.
-  if (/\.(com|net|org|io|co|tv|me|info|biz|us|uk|de|es|fr|it|br|ar|mx)$/i.test(local)) return -1;
+  // Maxi 2026-08-04: EXCEPCIÓN — "el dominio del sitio como local-part de un freemail" es un
+  // patrón REAL en publishers chicos: brainberries.co@gmail.com, ajnn.net@gmail.com. La regla
+  // existe para cazar artefactos de scrape tipo "site.com@registrar.com", así que solo aplica
+  // cuando el destinatario NO es un webmail.
+  if (/\.(com|net|org|io|co|tv|me|info|biz|us|uk|de|es|fr|it|br|ar|mx)$/i.test(local)
+      && !/^(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\./i.test(dom)) return -1;
 
   // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
   // Maxi 2026-08-04 — ESTA LÍNEA ERA EL BUG MÁS CARO DEL RANKING.
@@ -12126,6 +12223,16 @@ function rankEmail(email, siteDomain, leadCategory = "") {
       // penalty (un founder@gmail NO merece -15 — es una persona real). Por
       // eso aplicamos -15 aquí y abajo lo cancelamos si role matchea.
       score -= 15;
+    } else if (_brandMatches(lower, cleanSite)) {
+      // Maxi 2026-08-04: MISMA MARCA, otro TLD. No es "otra empresa": es el mismo publisher con
+      // su sitio de otro país. Antes se llevaba -50 y quedaba descartado, y en varios casos era
+      // el ÚNICO email del lead, así que el lead entero se perdía. Casos reales medidos:
+      //   pepper.com        → contato@pepper.com.br
+      //   altalex.com       → info@altalex.es
+      //   giga.de           → contato@giga.com.br
+      //   voetbalprimeur.be → info@voetbalprimeur.nl
+      // Usa el mismo _brandMatches que ya valida el envío, así los dos criterios coinciden.
+      score += 25;
     } else {
       // Cross-domain a OTRO dominio corporativo — penalidad fuerte. Marcamos
       // para revertir parcialmente si es EXEC (founder@otra-empresa puede ser
