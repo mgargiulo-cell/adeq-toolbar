@@ -11253,7 +11253,7 @@ async function secEstado() {
   try {
     const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/kill_switch_estado`, {
       method: "POST",
-      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}`, "Content-Type": "application/json" },
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json" },
       body: "{}",
     });
     if (!r.ok) return null;
@@ -11290,7 +11290,7 @@ async function secToggle() {
   try {
     const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/toggle_kill_switch`, {
       method: "POST",
-      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}`, "Content-Type": "application/json" },
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ p_on: encender, p_motivo: "desde el panel" }),
     });
     if (!r.ok) throw new Error(await r.text());
@@ -11307,7 +11307,7 @@ async function secCopiarReporte() {
   const orig = btn ? btn.textContent : "";
   if (btn) btn.textContent = "…";
   try {
-    const h = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}` };
+    const h = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
     // Vía RPC y no lectura directa: toolbar_security_events queda sin políticas de RLS a
     // propósito (nadie con anon/authenticated la toca). security_report valida el mail contra
     // la allowlist y devuelve solo lo necesario.
@@ -11343,16 +11343,76 @@ async function secCopiarReporte() {
 async function secToggleDefensa(e) {
   const on = !!e.target.checked;
   // defensa_automatica NO está en la lista protegida de RLS: se puede escribir directo.
+  // Upsert por lo mismo que polishSetear: la key puede no existir todavía.
   try {
-    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.defensa_automatica`, {
-      method: "PATCH",
-      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-      body: JSON.stringify({ value: on ? "true" : "false" }),
-    });
+    await polishSetear({ defensa_automatica: on ? "true" : "false" });
   } catch {}
 }
 
+// ── 🔁 REPASO DEL POOL (Maxi 2026-08-04) ─────────────────────────────────────────────────────
+// El worker ya tenía polishPool, pero solo se prendía escribiendo config a mano. Cada vez que se
+// mejora el scraper hay que volver a pasarlo por los leads que quedaron sin email, así que tiene
+// que ser un botón. `polish_pool` y `polish_cursor_ts` NO están en la lista protegida de RLS.
+async function polishSetear(valores) {
+  // UPSERT y no PATCH: un PATCH sobre una key que todavía no existe afecta 0 filas y devuelve
+  // 204, así que el botón "funcionaba" sin hacer nada. polish_cursor_ts es exactamente ese caso
+  // (solo lo crea el worker cuando ya empezó a pulir).
+  const h = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+              "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" };
+  for (const [key, value] of Object.entries(valores)) {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config`, {
+      method: "POST", headers: h, body: JSON.stringify({ key, value: String(value) }),
+    });
+    if (!r.ok) throw new Error(`${key}: ${r.status}`);
+  }
+}
+
+async function polishEstado() {
+  const el = document.getElementById("polish-estado");
+  const btn = document.getElementById("polish-btn");
+  if (!el) return;
+  try {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(polish_pool,polish_cursor_ts)&select=key,value`, {
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` },
+    });
+    const filas = r.ok ? await r.json() : [];
+    const map = Object.fromEntries(filas.map(f => [f.key, f.value]));
+    const corriendo = String(map.polish_pool || "") === "true";
+    el.textContent = corriendo ? "corriendo…" : "en reposo";
+    el.style.color = corriendo ? "#34d399" : "#94a3b8";
+    if (btn) {
+      btn.textContent = corriendo ? "⏸️ Frenar el repaso" : "▶️ Repasar el pool entero";
+      btn.style.background = corriendo ? "#7c2d12" : "#0f766e";
+      btn.dataset.corriendo = corriendo ? "1" : "";
+    }
+  } catch { el.textContent = "—"; }
+}
+
+async function polishToggle() {
+  const btn = document.getElementById("polish-btn");
+  const corriendo = !!btn?.dataset.corriendo;
+  const orig = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  try {
+    if (corriendo) {
+      await polishSetear({ polish_pool: "false" });
+    } else {
+      // El cursor vacío es lo que hace que arranque desde el principio del pool. Sin esto,
+      // retoma donde había quedado la última corrida y se saltea todo lo ya visitado —
+      // justo los leads que el scraper viejo dejó sin email.
+      await polishSetear({ polish_cursor_ts: "", polish_pool: "true" });
+    }
+  } catch (e) {
+    if (btn) { btn.textContent = `⚠️ ${e.message}`; setTimeout(() => { btn.textContent = orig; }, 3000); }
+  }
+  if (btn) btn.disabled = false;
+  await polishEstado();
+}
+
 function secInit() {
+  const p = document.getElementById("polish-btn");
+  if (p && !p.dataset.wired) { p.dataset.wired = "1"; p.addEventListener("click", polishToggle); }
+  polishEstado();
   const b = document.getElementById("sec-panic-btn");
   const r = document.getElementById("sec-report-btn");
   const t = document.getElementById("sec-auto-toggle");

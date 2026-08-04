@@ -202,6 +202,22 @@
       </div>
     </div>
 
+    <!-- 🔁 REPASO DEL POOL — Maxi 2026-08-04. Vuelve a pasar el scraper (el nuevo, con MX/DMARC,
+         Certificate Transparency y Google Play) por los leads que quedaron SIN email. No gasta
+         RapidAPI; Apollo solo si está habilitado y hay cuota. Se auto-apaga al terminar. -->
+    <div id="polish-panel" style="background:#1e293b;border:1px solid #475569;border-radius:8px;padding:10px 12px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">
+        <div style="font-weight:700;color:#e2e8f0;font-size:13px">🔁 Repasar el pool</div>
+        <span id="polish-estado" style="font-size:11px;color:#94a3b8;flex:1;text-align:right">—</span>
+      </div>
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:8px">
+        Busca el contacto otra vez en los leads que quedaron sin email. Sin gastar créditos de SimilarWeb.
+      </div>
+      <button id="polish-btn" class="btn" style="width:100%;background:#0f766e;color:#fff;font-weight:700;padding:9px;border:none;border-radius:8px;cursor:pointer;font-size:12px">
+        ▶️ Repasar el pool entero
+      </button>
+    </div>
+
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
       <div class="stat-card"><div class="stat-num" id="agent-stat-sent">--</div><div class="stat-label">Sent today</div></div>
       <div class="stat-card"><div class="stat-num" id="agent-stat-skipped">--</div><div class="stat-label">Skipped 24h</div></div>
