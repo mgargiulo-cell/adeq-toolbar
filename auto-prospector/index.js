@@ -2318,11 +2318,19 @@ async function _adsTxtSystems(domain) {
 }
 
 async function _publishersFromSellersJson(networkDomain) {
+  // ⚠️ networkDomain sale del ads.txt de un TERCERO: es el vector de SSRF más directo que tiene
+  // el worker. Cualquier sitio del pool puede poner "169.254.169.254, 1, DIRECT" en su ads.txt
+  // público y hacernos pegarle a la metadata del cloud o a redis.railway.internal, con la
+  // respuesta terminando en nuestra base. Guardia antes de salir a la red.
+  if (!hostSeguroParaFetch(networkDomain)) {
+    log(`  🛡️ sellers.json: host bloqueado por guardia SSRF → ${String(networkDomain).slice(0, 60)}`);
+    return [];
+  }
   for (const url of [`https://${networkDomain}/sellers.json`, `https://www.${networkDomain}/sellers.json`]) {
     try {
-      const res = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "Accept": "application/json" } });
+      const res = await fetchExternoSeguro(url, { redirect: "follow", signal: AbortSignal.timeout(15000), headers: { "Accept": "application/json" } });
       if (!res.ok) continue;
-      const text = await res.text();
+      const text = (await res.text()).slice(0, 5 * 1024 * 1024);   // tope 5MB: un sellers.json gigante tumbaba el worker
       if (/^\s*<!doctype|<html/i.test(text.trim())) continue;
       const data = JSON.parse(text);
       const pubs = (data?.sellers || [])
@@ -2904,7 +2912,7 @@ async function runReenrichBadLeads(token) {
           if (_serperContactCount < _ccap && !_serperContactTried.has(lead.domain)) {
             _serperContactTried.add(lead.domain);
             _serperContactCount++;
-            if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+            setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
             const g = await _serperContactSearch(lead.domain).catch(() => null);
             if (g?.emails?.length) {
               const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, lead.domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
@@ -5526,7 +5534,8 @@ function _parseAdsTxtBody(txt, contentType) {
 
 async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _redirDepth = 0 } = {}) {
   try {
-    const res = await fetch(`${proto}://${host}${path}`, {
+    // fetchExternoSeguro valida el host contra SSRF antes de salir a la red.
+    const res = await fetchExternoSeguro(`${proto}://${host}${path}`, {
       signal: AbortSignal.timeout(12000),
       redirect: "follow",
       headers: _ADS_TXT_HEADERS,
@@ -5562,6 +5571,48 @@ async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _red
     const _n = String(e?.name || e?.code || e?.message || "red").slice(0, 40);
     return { state: "unknown", lines: 0, why: /timeout|abort/i.test(_n) ? "timeout" : _n };
   }
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// GUARDIA ANTI-SSRF (auditoría 2026-08-04) — validar TODO host antes de fetchearlo
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// El worker fetchea hosts que salen de datos de TERCEROS: el dominio de un lead y, peor, los
+// nombres de ad system que vienen dentro del ads.txt de otro (para pedirles su sellers.json).
+// Sin validar, cualquier sitio ya en el pool agrega una línea a su ads.txt público:
+//     169.254.169.254, 1, DIRECT
+// y el worker le pega a la metadata del cloud, o a redis.railway.internal, y guarda la respuesta
+// en la base — un canal de lectura contra nuestra propia red interna.
+// Bloqueamos: IPs (v4 y v6), rangos privados y link-local, localhost, .internal/.local,
+// credenciales en el host (evil.com@169.254.169.254), puertos explícitos y hosts sin punto.
+const _SSRF_HOST_OK = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+const _SSRF_TLD_PROHIBIDO = /\.(internal|local|localdomain|localhost|home|lan|corp|intranet)$/i;
+function hostSeguroParaFetch(host) {
+  const h = String(host || "").trim().toLowerCase();
+  if (!h || h.length > 253) return false;
+  if (h.includes("@") || h.includes(":") || h.includes("/") || h.includes("\\")) return false; // credenciales/puerto/path
+  if (!_SSRF_HOST_OK.test(h)) return false;              // exige hostname DNS con al menos un punto
+  if (_SSRF_TLD_PROHIBIDO.test(h)) return false;
+  // Literal IPv4 → fuera. Un publisher legítimo nunca es una IP.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return false;
+  // Hex/octal/decimal disfrazados de dominio (0x7f000001, 2130706433)
+  if (/^(0x[0-9a-f]+|\d{8,})$/i.test(h.replace(/\./g, ""))) return false;
+  return true;
+}
+// Envoltorio de fetch con guardia + tope de tamaño. Un ads.txt de varios GB tumbaba el worker
+// (ya hubo OOM en este proceso) porque se hacía res.text() del cuerpo entero.
+const _SSRF_MAX_BYTES = 2 * 1024 * 1024;   // 2 MB
+async function fetchExternoSeguro(url, opts = {}) {
+  let u;
+  try { u = new URL(url); } catch { throw new Error("url_invalida"); }
+  if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error("protocolo_no_permitido");
+  if (u.port && u.port !== "80" && u.port !== "443") throw new Error("puerto_no_permitido");
+  if (!hostSeguroParaFetch(u.hostname)) throw new Error(`host_bloqueado:${u.hostname}`);
+  const res = await fetch(u.toString(), opts);
+  // Cortar por Content-Length cuando viene declarado.
+  const len = parseInt(res.headers.get("content-length") || "0", 10);
+  if (len > _SSRF_MAX_BYTES) throw new Error("respuesta_demasiado_grande");
+  return res;
 }
 
 async function checkAdsTxt(domain) {
@@ -6208,7 +6259,7 @@ async function polishPool(token) {
           if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
             _serperContactTried.add(domain);
             _serperContactCount++;
-            if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+            setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
             const g = await _serperContactSearch(domain).catch(() => null);
             if (g) {
               if (g.emails.length) {
@@ -10594,7 +10645,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
           _serperContactTried.add(domain);
           _serperContactCount++;
-          if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+          setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
           const g = await _serperContactSearch(domain).catch(() => null);
           if (g?.emails?.length) g.emails.forEach(e => { if (e && e.toLowerCase() !== bouncedEmail.toLowerCase()) newEmails.add(e.toLowerCase()); });
         }
@@ -12549,6 +12600,17 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
 //   3. AVISA — un mail con lo que pasó, lo que hizo solo y cómo revertirlo en un clic.
 //
 // Anti-spam: máximo un mail por tipo de incidente cada 60 min (security_last_alert_<kind>).
+// Techos DUROS de los caps que viven en toolbar_config. Esa tabla es escribible por usuarios
+// autenticados, así que un cap "de configuración" no es una defensa: es una sugerencia. Estos
+// valores están en el código y el vigilante corrige la DB si alguien los sube.
+const SEC_TECHOS_DUROS = {
+  rapidapi_daily_limit:          600,
+  serper_contact_daily_cap:      300,
+  autogoogle_serper_daily_cap:   300,
+  agent_max_total_sends_per_day: 200,
+  millionverifier_daily_cap:     500,
+};
+
 const SEC_UMBRALES = {
   proxy_llamadas_dia:      1500,   // uso total del proxy en el día (tope duro: 2000)
   proxy_no_autorizados_h:     3,   // intentos de un mail fuera de la allowlist, por hora
@@ -12633,8 +12695,11 @@ async function securityWatchdog(token) {
   // ── 2. ALGUIEN INTENTANDO ENTRAR AL PROXY ──────────────────────────────────────────────
   const noAutorizados = await _count(`${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&created_at=gte.${hace(1)}&select=id`);
   if (noAutorizados >= SEC_UMBRALES.proxy_no_autorizados_h) {
-    critico = true;
-    hallazgos.push(`• ${noAutorizados} intentos de acceso NO AUTORIZADO al proxy en la última hora. Alguien está probando entrar.`);
+    // AVISA pero NO frena (auditoría 2026-08-04). Si el kill switch se disparara con intentos
+    // de auth fallidos, cualquier tercero podría APAGARNOS EL AGENTE a propósito martillando el
+    // proxy con tokens inválidos — un DoS gratis contra nosotros mismos. El freno automático se
+    // reserva para señales de GASTO REAL, que es lo único que cuesta plata cada minuto.
+    hallazgos.push(`• ${noAutorizados} intentos de acceso NO AUTORIZADO al proxy en la última hora. Alguien está probando entrar (no freno el agente por esto: sería el DoS que busca).`);
   }
 
   // ── 3. INUNDACIÓN DEL PIXEL ────────────────────────────────────────────────────────────
@@ -12660,6 +12725,23 @@ async function securityWatchdog(token) {
   // ── 6. MILLIONVERIFIER CAÍDO = envíos a ciegas ─────────────────────────────────────────
   if (!cfg.millionverifier_api_key) {
     hallazgos.push(`• MillionVerifier SIN KEY: los envíos están saliendo sin verificar entregabilidad.`);
+  }
+
+  // Housekeeping: la tabla del rate limit del pixel crece sin freno.
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_pixel_ratelimit?updated_at=lt.${hace(48)}`,
+      { method: "DELETE", headers: { ...auth, "Prefer": "return=minimal" } });
+  } catch {}
+
+  // AUTO-REMEDIACIÓN SEGURA: si un cap de gasto de la DB superó su techo duro, lo bajamos.
+  // Es puramente sustractivo — no puede romper la operación normal, solo evitar un gasto.
+  for (const [key, techo] of Object.entries(SEC_TECHOS_DUROS)) {
+    const v = parseInt(cfg[key] || "0", 10);
+    if (v > techo) {
+      await setConfigValue(token, key, String(techo)).catch(() => {});
+      await _secLog(token, "cap_excedido_corregido", "warn", "watchdog", { key, era: v, ahora: techo });
+      hallazgos.push(`• El cap "${key}" estaba en ${v}, por encima del techo duro (${techo}). Lo bajé solo.`);
+    }
   }
 
   if (hallazgos.length === 0) return;
@@ -13275,12 +13357,22 @@ async function runAgentCycle(token, allFlags) {
             );
             if (_bestBeforeSerper < 50) {
               const _mDay = _madridNowParts().dateISO;
-              if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+              // Cap DURABLE (auditoría 2026-08-04): el contador vivía SOLO en memoria y el worker
+              // reinicia cada ~7 min por el fix de OOM, así que el tope de 250/día se re-armaba
+              // ~200 veces por día. Medido: ~1500 llamadas reales contra un cap de 250.
+              // Mismo patrón que ya usa _verifyEmailMV: al cambiar de día O tras un restart
+              // (_serperContactDay arranca vacío), re-sembrar desde el valor persistido.
+              if (_serperContactDay !== _mDay) {
+                _serperContactDay = _mDay;
+                const _persist = String(cfg.serper_contact_used || "");
+                _serperContactCount = _persist.startsWith(_mDay + ":") ? (parseInt(_persist.split(":")[1], 10) || 0) : 0;
+                _serperContactTried.clear();
+              }
               const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
               if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
                 _serperContactTried.add(domain);
                 _serperContactCount++;
-                if (_serperContactCount % 10 === 0) setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});
+                setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
                 const g = await _serperContactSearch(domain).catch(() => null);
                 if (g?.emails?.length) serperEmails = g.emails;
                 if (g && !serperPhone) {

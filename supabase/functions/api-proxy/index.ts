@@ -48,7 +48,7 @@ const PROVIDERS = {
     authMode: "header-rapidapi",
     keyEnv: "RAPIDAPI_KEY",
     hostHeader: "similarweb-insights.p.rapidapi.com",
-    allow: /^\/(all-insights|traffic|ai-traffic|rank|seo|website-details|similar-sites|country-metadata|engagement|countries|similar|category|description|keywords|general|website-analysis)\b/,
+    allow: /^\/(all-insights|traffic|ai-traffic|rank|seo|website-details|similar-sites|country-metadata|engagement|countries|similar|category|description|keywords|general|website-analysis)$/,
   },
   anthropic: {
     base: "https://api.anthropic.com",
@@ -68,7 +68,7 @@ const PROVIDERS = {
 // Maxi 2026-07-28 (blindaje): CORS ya no es "*". Solo la extensión y el dashboard. Con "*"
 // cualquier página web podía invocar el proxy desde el navegador de un usuario logueado.
 const ORIGENES_OK = [
-  /^chrome-extension:\/\/[a-p]{32}$/,          // la extensión (cualquier ID, formato Chrome)
+  /^chrome-extension:\/\/[a-p]{32}$/,          // extensión Chrome (ver nota: conviene fijar el ID real)
   /^https:\/\/([a-z0-9-]+\.)*adeqmedia\.com$/, // dashboards propios
   /^https:\/\/([a-z0-9-]+\.)*vercel\.app$/,    // previews de Vercel
 ];
@@ -130,8 +130,12 @@ serve(async (req) => {
 
   // ── BLINDAJE 2026-07-28 ──────────────────────────────────────────────────────────────
   // Leemos config una sola vez: kill switch + allowlist de usuarios.
-  const { data: cfgRows } = await supabase.from("toolbar_config")
+  // FAIL-CLOSED (auditoría 2026-08-04): antes el error de lectura no se chequeaba. Si Supabase
+  // fallaba, cfg quedaba vacío → el kill switch quedaba inerte JUSTO cuando más se lo necesita, y
+  // la allowlist se saltaba entera. Ahora un fallo de config corta el servicio.
+  const { data: cfgRows, error: cfgErr } = await supabase.from("toolbar_config")
     .select("key,value").in("key", ["kill_switch", "agent_whitelist", "agent_enabled_users", "proxy_extra_users"]);
+  if (cfgErr) return json(503, { error: "config no disponible — se corta por precaución" }, origin);
   const cfg: Record<string,string> = {};
   for (const r of (cfgRows || [])) cfg[r.key] = r.value;
 
@@ -155,7 +159,9 @@ serve(async (req) => {
       raw.split(/[,;\s]+/).forEach(e => e && permitidos.add(e.toLowerCase()));
     }
   }
-  if (permitidos.size > 0 && !permitidos.has(userEmail)) {
+  // Sin el `size > 0`: si las tres keys están vacías, la lista vacía tiene que RECHAZAR a todos,
+  // no dejar pasar a todos. Fallar abierto acá equivale a no tener allowlist.
+  if (!permitidos.has(userEmail)) {
     await registrarIncidente(supabase, "proxy_usuario_no_autorizado", "critical", userEmail, { origin, ip: ipHash });
     return json(403, { error: "Usuario no autorizado para el proxy" }, origin);
   }
@@ -169,7 +175,7 @@ serve(async (req) => {
 
   // ── Parse body ──────────────────────────────────────────────
   let payload: any;
-  try { payload = await req.json(); } catch { return json(400, { error: "Invalid JSON" }); }
+  try { payload = await req.json(); } catch { return json(400, { error: "Invalid JSON" }, origin); }
   const { provider, path, method = "GET", headers: extraHeaders = {}, body = null, query = "" } = payload || {};
 
   const pcfg = PROVIDERS[provider];
@@ -183,6 +189,20 @@ serve(async (req) => {
     return json(405, { error: `Método ${method} no permitido para ${provider}` }, origin);
   // El querystring lo arma el cliente: acotarlo evita que metan parámetros caros o rarezas.
   if (String(query || "").length > 500) return json(400, { error: "query demasiado larga" }, origin);
+
+  // El BODY también lo elegía el cliente: podía pedir el modelo más caro con max_tokens enorme.
+  // Con el techo global de 2000 llamadas/día, 8k tokens de salida en el modelo grande son ~US$400
+  // por día. Acá se acota a los modelos que el proyecto realmente usa.
+  const MODELOS_OK = new Set(["claude-haiku-4-5", "claude-sonnet-5"]);
+  if (provider === "anthropic") {
+    if (!MODELOS_OK.has(String(body?.model || ""))) {
+      await registrarIncidente(supabase, "proxy_modelo_no_permitido", "critical", userEmail, { modelo: body?.model });
+      return json(400, { error: "modelo no permitido", permitidos: [...MODELOS_OK] }, origin);
+    }
+    if (Number(body?.max_tokens || 0) > 4096) return json(400, { error: "max_tokens > 4096" }, origin);
+  }
+  if (provider === "voyage" && JSON.stringify(body || {}).length > 100_000)
+    return json(400, { error: "body demasiado grande" }, origin);
 
   // ── CUOTA ATÓMICA (Maxi 2026-07-28) ─────────────────────────────────────────────────
   // Antes era leer-y-después-escribir: 50 requests en paralelo leían el mismo contador y

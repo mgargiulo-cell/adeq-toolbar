@@ -3023,7 +3023,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const userMondayKey = apiKeys[`monday_api_key_${loginEmail}`];
   CONFIG.MONDAY_API_KEY = userMondayKey || apiKeys.monday_api_key || "";
   CONFIG.RAPIDAPI_KEY   = apiKeys.rapidapi_key    || "";
-  CONFIG.GEMINI_API_KEY = apiKeys.gemini_api_key  || "";
+  // GEMINI_API_KEY eliminada (auditoría 2026-08-04): se descargaba al navegador y NUNCA se usaba
+  // — modules/gemini.js no tiene un solo fetch. Una key menos viviendo en memoria del cliente.
   CONFIG.APOLLO_API_KEY = apiKeys.apollo_api_key  || "";
 
   // Usuario autenticado — ocultar login y mostrar app
@@ -6951,7 +6952,7 @@ async function runDiagnostic() {
     try {
       const r = await callProxy("rapidapi", `/similar-sites?domain=${encodeURIComponent(domain)}`, { method: "GET" });
       const quota = r.quota?.providerRemaining != null ? ` · ${r.quota.providerRemaining} quota left` : "";
-      if (!r.ok) return { ok: false, msg: `HTTP ${r.status}${quota}` };
+      if (!r.ok) return { ok: false, msg: `HTTP ${esc(String(r.status ?? ''))}${quota}` };
       const d = r.data || {};
       if (d.error || !d.Visits) return { ok: false, msg: `No data for ${domain}${quota}` };
       return { ok: true, msg: `${Math.round(d.Visits / 1000)}K visits/mo${quota}` };
@@ -6973,7 +6974,7 @@ async function runDiagnostic() {
       });
       if (!r.ok) {
         const err = r.data || {};
-        return { ok: false, msg: `HTTP ${r.status}: ${err?.message || r.text?.substring(0, 80) || ""}` };
+        return { ok: false, msg: `HTTP ${esc(String(r.status ?? ''))}: ${err?.message || r.text?.substring(0, 80) || ""}` };
       }
       const d      = r.data || {};
       const people = Array.isArray(d?.people) ? d.people : [];
@@ -7408,7 +7409,7 @@ async function initCsvQueue() {
       grouped[src].deduped   += parseInt(a.deduped_count,   10) || 0;
       grouped[src].inserted  += parseInt(a.inserted_count,  10) || 0;
       grouped[src].batches++;
-      if (a.source_detail) grouped[src].details.add(a.source_detail);
+      if (a.source_detail) grouped[src].details.add(esc(String(a.source_detail)));  // esc acá: el detalle viene de datos scrapeados y se pinta como HTML
     });
     const totalAtt = mine.reduce((s, a) => s + (parseInt(a.attempted_count, 10) || 0), 0);
     const totalIns = mine.reduce((s, a) => s + (parseInt(a.inserted_count,  10) || 0), 0);
@@ -9996,9 +9997,9 @@ function initProspectCard(card, data) {
       if (srcObj.source) {
         const meta = SOURCE_LABEL[srcObj.source] || { txt: srcObj.source, color: "#64748b" };
         if (srcObj.url) {
-          srcChip = `<a href="#" class="email-src-link" data-url="${esc(srcObj.url)}" title="Origen: ${esc(srcObj.url)}" style="font-size:9px;color:${meta.color};text-decoration:underline;margin-left:4px">(${meta.txt})</a>`;
+          srcChip = `<a href="#" class="email-src-link" data-url="${esc(srcObj.url)}" title="Origen: ${esc(srcObj.url)}" style="font-size:9px;color:${esc(String(meta.color || ""))};text-decoration:underline;margin-left:4px">(${esc(meta.txt)})</a>`;
         } else {
-          srcChip = `<span title="Origen: ${esc(meta.txt)}" style="font-size:9px;color:${meta.color};margin-left:4px">(${meta.txt})</span>`;
+          srcChip = `<span title="Origen: ${esc(meta.txt)}" style="font-size:9px;color:${esc(String(meta.color || ''))};margin-left:4px">(${esc(meta.txt)})</span>`;
         }
       }
       const curSlot = slotIdxByEmail(e);
