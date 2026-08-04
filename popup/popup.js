@@ -2842,6 +2842,23 @@ const state = {
 const autoPushReady = { traffic: false, notDup: false, email: false };
 
 // ── HTML sanitizer — prevents XSS in innerHTML ────────────────
+
+// URL navegable a partir de un dominio guardado (Maxi 2026-08-04).
+// Antes se hacía `https://www.${domain}` a lo bruto y eso ROMPE los subdominios: el user
+// reportó que la toolbar abría https://www.mafraslovakia.hnonline.sk/ (no resuelve) cuando el
+// sitio real es https://mafraslovakia.hnonline.sk/. Agregar "www." a algo que ya es un
+// subdominio inventa un host que no existe.
+// Se usa el dominio TAL CUAL: el apex de un sitio que solo anda con www redirige solo, mientras
+// que el error inverso no tiene arreglo. También se limpia esquema, barras y espacios por si el
+// dato guardado viene sucio del scrape.
+function urlDeDominio(dom) {
+  const d = String(dom || "").trim().toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^\/+/, "")
+    .split(/[\/?#]/)[0];
+  return d ? `https://${d}` : "#";
+}
+
 function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;")
@@ -6512,7 +6529,7 @@ async function loadHistoryTab() {
     const visible = history.slice(start, end);
 
     listEl.innerHTML = visible.map(h => `
-      <div class="history-item" data-url="https://${esc(h.domain)}">
+      <div class="history-item" data-url="${esc(urlDeDominio(h.domain))}">
         <img class="history-favicon" loading="lazy" src="https://www.google.com/s2/favicons?domain=${esc(h.domain)}&sz=16" onerror="this.style.display='none'" />
         <span class="history-domain">${esc(h.domain)}</span>
         <span class="history-traffic">${esc(h.traffic || formatTraffic(h.pageViews) || "--")}</span>
@@ -9669,7 +9686,7 @@ function renderProspectCard(r) {
             else                        { name = email.split("@")[0]; color = "#64748b"; icon = "👤"; }
             return `<span title="Origen del item: ${esc(email || "agente autónomo (sin owner manual)")}" style="font-size:10px;font-weight:700;color:#fff;background:${color};border-radius:4px;padding:1px 6px;flex-shrink:0">${icon} ${esc(name)}</span>`;
           })()}
-          <a class="pcard-domain-link" href="#" data-url="https://www.${esc(r.domain)}"
+          <a class="pcard-domain-link" href="#" data-url="${esc(urlDeDominio(r.domain))}"
              style="font-weight:700;font-size:12px;color:var(--primary);text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3;flex:1;min-width:0"
              title="${esc(r.domain)}">
             ${esc(r.domain)} ↗
