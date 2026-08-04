@@ -2733,8 +2733,18 @@ let _agentLastSlot = "";
 function _currentAgentSlot() {
   const { hour, weekday, dateISO } = _madridNowParts();
   if (weekday === "Sat" || weekday === "Sun") return null;
-  if (!AGENT_SLOTS.includes(hour)) return null;
-  return { slot: hour, slotLabel: `agent-${dateISO}-${String(hour).padStart(2, "0")}:00` };
+  // Maxi 2026-08-04: RECUPERACIÓN DE SLOTS PERDIDOS.
+  // Antes exigía que la hora fuera EXACTAMENTE una de las del array. Si durante esa hora el
+  // worker estaba ocupado con otra cosa —los barridos del pool, que recorren 3.000 dominios con
+  // red— la hora pasaba y ese slot se perdía para siempre. Medido el 03/08: corrieron 12, 15,
+  // 18 y 20 pero NO el de las 9, o sea 12 envíos menos en el día entre los tres MBs.
+  // Ahora se toma el ÚLTIMO slot vencido del día. Como el label lleva la hora del slot y se
+  // persiste en agent_last_slot, cada slot sigue disparando una sola vez: si el de las 9 ya
+  // corrió, a las 10 no vuelve a correr; pero si NO corrió, se recupera.
+  const vencidos = AGENT_SLOTS.filter(h => hour >= h);
+  if (vencidos.length === 0) return null;                 // todavía no llegó el primero del día
+  const slot = vencidos[vencidos.length - 1];
+  return { slot, slotLabel: `agent-${dateISO}-${String(slot).padStart(2, "0")}:00` };
 }
 
 async function maybeRunAgentSlot(token, allFlags) {
