@@ -12066,7 +12066,23 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   if (/\.(com|net|org|io|co|tv|me|info|biz|us|uk|de|es|fr|it|br|ar|mx)$/i.test(local)) return -1;
 
   // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
-  if (/^[a-z0-9]{8,}$/.test(local) && !/[aeiou]{2}/.test(local)) return -1;
+  // Maxi 2026-08-04 — ESTA LÍNEA ERA EL BUG MÁS CARO DEL RANKING.
+  // Antes: `/^[a-z0-9]{8,}$/ && !/[aeiou]{2}/` → rechazaba cualquier local de 8+ caracteres sin
+  // DOS VOCALES SEGUIDAS. La intención era cazar hashes tipo "x7k9m2p4", pero mataba justo los
+  // buzones que buscamos, porque en español/italiano/portugués/neerlandés/polaco las palabras
+  // alternan consonante-vocal:
+  //   publicidad · advertising · advertise · marketing · pubblicita · contacto · privacidad
+  //   klantenservice · reklamacje · yrityspalvelu
+  // Medido: de 46 leads donde SÍ existía un buzón comercial, el agente solo le escribió a 18.
+  // Los otros 28 tenían publicidad@ / advertising@ / marketing@ y se descartaban con score -1,
+  // mandando el pitch a info@ o support@ en su lugar.
+  // Ahora se mide la PROPORCIÓN de vocales, que es lo que de verdad separa una palabra de un
+  // hash: "publicidad" tiene 40% de vocales, "x7k9m2p4" tiene 0%.
+  const _soloLetras = local.replace(/[^a-z]/g, "");
+  const _vocales = (local.match(/[aeiou]/g) || []).length;
+  const _ratioVocal = local.length ? _vocales / local.length : 0;
+  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.22 && _soloLetras.length < local.length * 0.8) return -1;
+  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.15) return -1;   // solo letras pero sin vocales = hash
 
   // Maxi 2026-07-13 (auditoría 48h): rechazo DURO SOLO de lo que NUNCA es un contacto real:
   //  a) PLACEHOLDERS/FALSOS que se colaban como "persona" (vorname.name@/firstname.lastname@/
