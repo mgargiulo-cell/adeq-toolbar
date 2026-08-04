@@ -11400,7 +11400,9 @@ async function polishToggle() {
       // El cursor vacío es lo que hace que arranque desde el principio del pool. Sin esto,
       // retoma donde había quedado la última corrida y se saltea todo lo ya visitado —
       // justo los leads que el scraper viejo dejó sin email.
-      await polishSetear({ polish_cursor_ts: "", polish_pool: "true" });
+      // polish_only_missing: va derecho a los que NO tienen email en vez de recorrer el pool
+      // entero gastando un fetch por lead ya resuelto.
+      await polishSetear({ polish_cursor_ts: "", polish_only_missing: "true", polish_pool: "true" });
     }
   } catch (e) {
     if (btn) { btn.textContent = `⚠️ ${e.message}`; setTimeout(() => { btn.textContent = orig; }, 3000); }

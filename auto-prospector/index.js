@@ -6897,6 +6897,14 @@ let _serperContactCount = 0, _serperContactDay = "", _serperContactTried = new S
 const POLISH_COOLDOWN_MS = 8 * 1000;   // 20→8s: corre casi cada loop
 const POLISH_BATCH = 120;              // 60→120: más dominios por corrida (commit incremental por wave lo hace seguro)
 const POLISH_CONC = 12;                // 8→12: más dominios en paralelo por wave
+// ── TECHO DE TIEMPO POR CICLO (Maxi 2026-08-04) ────────────────────────────────────────────
+// polishPool corre ANTES de maybeRunAgentSlot en la misma vuelta del loop. Con el presupuesto
+// nuevo de 60s por dominio, un batch de 120 con concurrencia 12 son 10 waves × 60s = 10 minutos
+// — y el worker reinicia a los ~7 por el cap de memoria. O sea: prender el pulido dejaba al
+// agente SIN ENVIAR, que es exactamente lo contrario de lo que se busca.
+// Se corta la corrida a los 2 minutos y se sigue en la vuelta siguiente. El cursor se commitea
+// por wave, así que cortar no pierde nada ni repite trabajo.
+const POLISH_MAX_MS = 120 * 1000;
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
@@ -6911,6 +6919,7 @@ async function polishPool(token) {
     const usage = await getApolloUsageToday(token);
     if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) apolloAvailable = false;
   }
+  const soloSinEmail = String(cfg.polish_only_missing || "") === "true";
   const cursor = cfg.polish_cursor_ts || "";
   const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
   let leads = [];
@@ -6921,11 +6930,13 @@ async function polishPool(token) {
   if (!Array.isArray(leads) || leads.length === 0) {
     await setConfigValue(token, "polish_pool", "false").catch(() => {});
     await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
+    await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
     log(`✨ polish: pool COMPLETO pulido → flag OFF`);
     return;
   }
   let blocked = 0, enriched = 0;
   let _committedTs = cursor;
+  const _polishInicio = Date.now();
   for (let i = 0; i < leads.length; i += POLISH_CONC) {
     try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}  // Maxi 2026-07-15 (F3): heartbeat por ronda (job largo)
     const _wave = leads.slice(i, i + POLISH_CONC);
@@ -6935,11 +6946,8 @@ async function polishPool(token) {
         // 1) blocklist (sin red)
         const bl = await isDomainBlockedFull(domain, token);
         if (bl) { await _softRejectLead(auth, lead.id, `blocklist:${bl}`); blocked++; return; }
-        // 2) clasificar por HTML — UN fetch (detector estructural con veto publisher-ads)
-        const pc = await fetchPageContent(domain).catch(() => null);
-        if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
-        if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
-        // 3) keeper: si ya tiene email bueno, listo
+        // ¿Este lead ya está resuelto? Se calcula ANTES de salir a la red, porque en modo
+        // "solo los que no tienen email" saltearlo acá ahorra el fetch entero.
         const curEmails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
         const srcMap = lead.email_sources || {};
         const hasGood = curEmails.some(e => {
@@ -6948,6 +6956,15 @@ async function polishPool(token) {
           if (src === "apollo" || src === "informer") return true;
           return !_isGenericLocalPart(e);
         });
+        // MODO DIRIGIDO (`polish_only_missing`): el pedido es "agregá email a los que no tienen".
+        // Sin esto el pulido recorre el pool ENTERO en orden de created_at y gasta un fetch de
+        // clasificación en cada lead que ya estaba resuelto — de 1.026 pendientes, 591 ya tenían
+        // email. Con el flag, esos ni se tocan y la corrida va derecho a los que faltan.
+        if (soloSinEmail && hasGood) return;
+        // 2) clasificar por HTML — UN fetch (detector estructural con veto publisher-ads)
+        const pc = await fetchPageContent(domain).catch(() => null);
+        if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
+        if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
         // Maxi 2026-07-16: teléfono/WhatsApp del home (ya fetcheamos pc → gratis). "wa:" marca WhatsApp.
         let foundPhone = "";
         if (pc?.whatsapps?.length) foundPhone = "wa:" + pc.whatsapps[0];
@@ -7033,8 +7050,12 @@ async function polishPool(token) {
     // ordenado created_at asc → el último de cada wave es el created_at máximo procesado hasta ahora.)
     _committedTs = _wave[_wave.length - 1].created_at;
     await setConfigValue(token, "polish_cursor_ts", _committedTs).catch(() => {});
+    if (Date.now() - _polishInicio > POLISH_MAX_MS) {
+      log(`✨ polish: corté a los ${Math.round((Date.now() - _polishInicio) / 1000)}s para no comerme el turno de envío — sigo en la próxima vuelta`);
+      break;
+    }
   }
-  log(`✨ polish: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_committedTs}`);
+  log(`✨ polish${soloSinEmail ? " (solo sin email)" : ""}: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_committedTs}`);
 }
 
 // Maxi 2026-07-16: EXPANSIÓN POR SIMILARES desde los Prospects. El user pidió "que busque similares de
