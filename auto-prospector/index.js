@@ -4742,8 +4742,21 @@ function _sanitizeEmail(raw) {
 // admin de dominio/DNS y placeholders. Acepta emails del dominio del lead; los
 // webmail (gmail/hotmail) solo si parecen persona (nombre.apellido). Prioriza
 // personas sobre genéricos y capea a 15. NO se aplica a emails de Apollo.
-function _cleanScrapedEmails(list, leadDomain) {
+// opts.urlByEmail: Map email→URL de origen. Si el email lo publicó el PROPIO sitio del lead,
+// es su contacto aunque el dominio del mail sea otro (auditoría empírica 2026-08-04).
+function _cleanScrapedEmails(list, leadDomain, opts = {}) {
   const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
+  const urlByEmail = opts.urlByEmail || null;
+  // ¿El email salió de una página del propio sitio? (no de WHOIS, informer ni redes sociales)
+  const vieneDelPropioSitio = (email) => {
+    if (!urlByEmail || !core) return false;
+    const u = String(urlByEmail.get?.(email) || urlByEmail[email] || "").toLowerCase();
+    if (!u) return false;
+    try {
+      const h = new URL(u.startsWith("http") ? u : `https://${u}`).hostname.replace(/^www\./, "");
+      return h === core || h.endsWith("." + core) || core.endsWith("." + h);
+    } catch { return false; }
+  };
   const seen = new Set();
   const valid = [];
   for (const raw of Array.isArray(list) ? list : []) {
@@ -4768,13 +4781,28 @@ function _cleanScrapedEmails(list, leadDomain) {
     // de publicidad en el dominio de la editora — ej. publicidade@caras.com.br para
     // aventurasnahistoria.com.br (misma Editora Caras). Antes se descartaba → quedaba SIN email.
     // El junk (noreply/webmaster/registro) ya se filtró arriba; rankEmail después lo puntúa.
-    const isBizRole = GENERIC_LOCAL_RE.test(local);
-    // Solo: dominio del lead, webmail no-placeholder, o rol de negocio cross-domain. El resto fuera.
-    if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole) continue;
+    // Maxi 2026-08-04: faltaba AD_SALES_LOCAL. Solo se miraba GENERIC_LOCAL_RE, así que un
+    // `inzercia@` (publicidad en eslovaco) o `hirdetes@` (húngaro) cross-domain se descartaba
+    // — justo el buzón de venta de pauta que buscamos.
+    const isBizRole = GENERIC_LOCAL_RE.test(local) || AD_SALES_LOCAL.test(local);
+    // Maxi 2026-08-04: LA PROCEDENCIA MANDA SOBRE EL DOMINIO. Un email impreso en la página de
+    // contacto del propio sitio ES su contacto, aunque el buzón esté en el dominio de la casa
+    // editora. Medido: el scraper ya llegaba a la página buena y extraía el mail, y esta línea
+    // lo tiraba. Casos reales: hnonline.sk → inzercia@mafraslovakia.sk (publicidad en eslovaco,
+    // 9 emails extraídos y devolvía []), radio1.hu → hirdetes@mediamoment.hu (venta de pauta),
+    // radioagricultura.cl → vradnic@agricultura.cl (gerente general),
+    // elfinancierocr.com → 7 emails @nacion.com (mismo grupo).
+    const publicadoPorElSitio = vieneDelPropioSitio(e);
+    if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole && !publicadoPorElSitio) continue;
     seen.add(e);
     valid.push(e);
   }
-  valid.sort((a, b) => (_isGenericEmail(a) ? 1 : 0) - (_isGenericEmail(b) ? 1 : 0));
+  // El corte de 15 truncaba justo el buzón comercial cuando venía después de una lista de
+  // vendedores (hnonline.sk tenía 14 personas y después inzercia@). Ahora el de pauta va primero.
+  valid.sort((a, b) => {
+    const ad = (x) => AD_SALES_LOCAL.test(x.split("@")[0]) ? 0 : 1;
+    return (ad(a) - ad(b)) || ((_isGenericEmail(a) ? 1 : 0) - (_isGenericEmail(b) ? 1 : 0));
+  });
   return valid.slice(0, 15);
 }
 
@@ -4819,12 +4847,40 @@ function _deobfuscateEmails(text) {
   return text;
 }
 
+// ── PSEUDO-EMAILS DE ASSETS (auditoría empírica 2026-08-04) ────────────────────────────────
+// EL BUG MÁS CARO DEL SCRAPER. El regex acepta como email cualquier cosa con @ y un "TLD" de
+// 2-10 letras, así que los assets retina y las fotos con arroba de Instagram pasan el filtro:
+//   divahair.ro         → iphone-touch-icon@2x.png
+//   pocketterco.com.br  → logo@2x.png, menu@2x.png, search@2x.png
+//   radioagricultura.cl → instagram-@rosario.la, ig-@vozinha1-768x403.jpg
+//   monopoli.gr         → foto-caio-lirio_@caiolirio-...-1024x745.jpg
+// Como NO son genéricos, marcaban `_hasReal = true` y la FASE 2 —la que baja /contacto— NUNCA
+// corría. Después _cleanScrapedEmails los tiraba por cross-domain y el lead quedaba en cero.
+// Medido: 3 de 28 dominios se perdían ENTEROS por esto, teniendo el email comercial a un clic
+// (divahair.ro tiene "Vanzari: razvan.radulescu@divahair.ro" en /contact).
+const _ASSET_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|ico|bmp|avif|css|js|mjs|json|woff2?|ttf|eot|otf|mp[34]|webm|pdf|zip|xml|map)$/i;
+const _RETINA_RE    = /@\d+x\./i;
+function _esPseudoEmailDeAsset(e) {
+  const x = String(e || "").toLowerCase();
+  return _ASSET_EXT_RE.test(x) || _RETINA_RE.test(x) || /[-._]$/.test(x.split("@")[0] || "");
+}
+// Saca las URLs de media del HTML ANTES de buscar emails. Cubre los que no terminan en
+// extensión, como "instagram-@rosario.la".
+function _quitarMediaDelHtml(html) {
+  return String(html || "")
+    .replace(/\b(?:src|srcset|data-src|data-lazy-src|data-original|data-bg|poster|style)\s*=\s*(["'])[\s\S]*?\1/gi, " ")
+    .replace(/[^\s"'<>()]+\.(?:jpe?g|png|gif|webp|svg|avif|bmp|ico|mp[34]|webm|pdf|css|js|woff2?)\b/gi, " ");
+}
+
 function extractEmailsFromHtml(html) {
   if (!html) return [];
   const collected = new Set();
   // 1) Regex sobre HTML deobfuscado (texto + atributos + scripts, todo junto)
-  const clean = _deobfuscateEmails(html);
-  (clean.match(EMAIL_REGEX) || []).forEach(e => collected.add(_stripScrapePrefix(e).toLowerCase()));
+  const clean = _deobfuscateEmails(_quitarMediaDelHtml(html));
+  (clean.match(EMAIL_REGEX) || []).forEach(e => {
+    const v = _stripScrapePrefix(e).toLowerCase();
+    if (!_esPseudoEmailDeAsset(v)) collected.add(v);
+  });
   // 2) Cloudflare data-cfemail decoder — gap común en sitios con CF Pro
   for (const m of html.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi)) {
     const decoded = _decodeCfEmail(m[1]);
@@ -4930,7 +4986,7 @@ async function scrapeInformerOnly(domain) {
       });
     } catch {}
   }));
-  return { emails: _cleanScrapedEmails([...emails], domain), urlByEmail };
+  return { emails: _cleanScrapedEmails([...emails], domain, { urlByEmail }), urlByEmail };
 }
 
 // Devuelve true si el local-part es genérico (info@, contact@, etc.). Maxi
@@ -4952,7 +5008,7 @@ function _isGenericLocalPart(email) {
 // Maxi 2026-07-13 (auditoría): +cobertura del pool europeo — régie(FR), Vermarktung/Anzeigen/Verkauf(DE),
 // verkoop/adverteren(NL), vente(FR), raccolta pubblicitaria(IT), auglýsingar(IS), annons(SE). Todos = venta
 // de pauta/inventario. 'regie\b'/'regiepub' evita matchear 'regierung'(gobierno DE).
-const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor)/i;
+const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor|inzerc|inzer[aá]t|hirdet|diafimisi|diafhmish|adverten|adverteren|advertentie|oglas|marknad|myynti)/i;
 
 // Maxi 2026-07-27 (auditoría respuestas 23-27): SEGMENTOS de local-part que identifican un buzón
 // de IT / infraestructura / dominios / registrar / seguridad. Nunca son contacto de venta de pauta.
@@ -5049,8 +5105,27 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // fale-conosco), TR (iletisim/reklam/hakkimizda), HU (kapcsolat/hirdet), ID (kontak/hubungi/iklan),
   // VN (lien-he/quang-cao), FI (yhtey/maino), GR (epikoin), SE/NO (annons/om-oss), IS (auglys), PL/CZ/RU
   // (kontak/kontakty/reklam/o-nas), RO (despre). Caso testigo: sorteador.com.br → /contato.
-  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impress?um|imprint|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|advertis|anunci|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|despre|tentang|om-?oss|equipe?|\bteam\b|\bstaff\b|redac|ueber-?uns|über-?uns|impronta/i;
+  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impres+z?um|imprint|colofon|colophon|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|inzerc|inzer[aá]t|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|mediaajanlat|media-?ajanlat|advertis|adverteren|advertentie|anunci|diafimisi|diafhmish|oglas|\bmarketing\b|\bcomercial\b|\bcommercial\b|tarifas|rate-?card|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|za-?nas|poioi|despre|tentang|om-?oss|rolunk|equipe?|\bteam\b|\bstaff\b|redac|redaz|ueber-?uns|über-?uns|impronta|zakelijk|\bservice\b|servicio/i;
   const base   = `https://${domain}`;
+
+  // ── ANTI SLUG-DE-NOTA (auditoría empírica 2026-08-04) ───────────────────────────────────
+  // Palabras como "despre", "sobre", "quien", "about" o "legal" matchean TÍTULOS DE NOTAS y se
+  // comían el cupo de páginas a visitar. Casos reales capturados:
+  //   divahair.ro         → /vedete/durere-de-mama-...-despre-fiul-ei...
+  //   radioagricultura.cl → /entretencion/quien-es-dominga-lopez-la-nueva-miss-universo...
+  //   zimeye.net          → /2026/07/18/lebo-m-calls-for-calm...   (era el ÚNICO "descubierto")
+  // Una página institucional vive cerca de la raíz y tiene slug corto; una nota va con fecha,
+  // ID numérico o un slug largo. Bajó las páginas por dominio de 38 a 11 y el tiempo de 6,1s a 3,9s.
+  const _esRutaInstitucional = (u) => {
+    try {
+      const segs = new URL(u, base).pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+      if (segs.length > 3) return false;                          // /2026/08/03/slug-largo
+      if ((segs[segs.length - 1] || "").length > 42) return false; // slug largo = nota
+      if (/^\d{4}$|^\d{6,}/.test(segs[0] || "")) return false;    // /2026/... o /96295205-...
+      return true;
+    } catch { return true; }
+  };
+
   const cleanDomain = domain.replace(/^www\./, "");
   // Chrome real para evitar bloqueos por User-Agent de bot
   const uaChrome = { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36" };
@@ -5231,7 +5306,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
   // Limpieza final: sanitiza, descarta registradores/WHOIS y ajenos al dominio,
   // prioriza personas sobre genéricos y capea a 15. Corta el ruido del scraping.
-  return _cleanScrapedEmails([...emails], domain);
+  return _cleanScrapedEmails([...emails], domain, { urlByEmail });
 }
 
 // ── Page intelligence ─────────────────────────────────────────
