@@ -13123,7 +13123,6 @@ const SEC_UMBRALES = {
   proxy_llamadas_dia:      1500,   // uso total del proxy en el día (tope duro: 2000)
   proxy_no_autorizados_h:     3,   // intentos de un mail fuera de la allowlist, por hora
   pixel_floods_h:             1,   // una sola IP inundando el pixel ya es alerta
-  rebote_pct:                25,   // % de rebote sobre envíos en 24h
   envios_dia_max:           150,   // envíos totales en un día (los 3 MB no deberían pasar esto)
   heartbeat_min:             25,   // minutos sin latido del worker
   // Disparadores de ataque (patrón que el user ya validó en su otro proyecto, 2026-08-04):
@@ -13294,17 +13293,13 @@ async function securityWatchdog(token) {
     hallazgos.push(`• ${enviosHoy} mails en 24h — muy por encima de lo normal (umbral ${SEC_UMBRALES.envios_dia_max}). O se rompió el cap diario o alguien tiene acceso a un buzón.`);
   }
 
-  // ── 5. REBOTE DESCONTROLADO (quema la reputación de los dominios) ──────────────────────
-  const env24 = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hace(24)}&select=id`);
-  const reb24 = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.bounce_detected&created_at=gte.${hace(24)}&select=id`);
-  if (env24 >= 20 && (100 * reb24 / env24) > SEC_UMBRALES.rebote_pct) {
-    // El % puede pasar de 100 y NO es un error: bounce_detected cuenta rebotes DETECTADOS hoy,
-    // que en su mayoría corresponden a mails enviados días atrás. Se aclara en el propio mail
-    // para no mandar a nadie a buscar un bug que no existe.
-    hallazgos.push(`• Rebote al ${Math.round(100 * reb24 / env24)}% en 24h (${reb24} rebotes detectados / ${env24} enviados). `
-      + `Ojo: puede pasar de 100% porque los rebotes que LLEGAN hoy son de mails enviados días atrás — no es un error de cuenta. `
-      + `Lo que importa es la tendencia, no el número puntual.`);
-  }
+  // ── EL REBOTE YA NO ALERTA (decisión del user 2026-08-04) ──────────────────────────────
+  // "Los rebotes son análisis, eso no me interesa; esto es solo para alertas de seguridad."
+  // Tiene razón: un rebote alto es una métrica de negocio, no un incidente. Además el número a
+  // 24h es engañoso —los rebotes que LLEGAN hoy son de mails enviados días atrás, así que puede
+  // pasar del 100%— y una alerta que se dispara sola sin que haya nada que atacar entrena a
+  // ignorar el canal, que es justo lo que no queremos de un alertado de seguridad.
+  // El rebote se mide con el SQL de auditoría, no por mail.
 
   // ── 6. MILLIONVERIFIER CAÍDO = envíos a ciegas ─────────────────────────────────────────
   // FALSO POSITIVO corregido 2026-08-04: la key se lee PRIMERO de las variables de entorno de
