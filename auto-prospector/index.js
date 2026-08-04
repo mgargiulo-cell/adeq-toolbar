@@ -4762,6 +4762,11 @@ function _sanitizeEmail(raw) {
 function _cleanScrapedEmails(list, leadDomain, opts = {}) {
   const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
   const urlByEmail = opts.urlByEmail || null;
+  // Dominios que PROBAMOS que son la casa editora del lead (OWNERDOMAIN del ads.txt, el MX,
+  // el developer de Google Play). No es una corazonada: son tres fuentes independientes que
+  // declaran la relación. Sin esto, mobilepub@comercio.com.pe se caía por cross-domain siendo
+  // el ÚNICO contacto alcanzable de peru21.pe (Cloudflare bloquea todo lo demás).
+  const casasEditoras = new Set([...(opts.casasEditoras || [])].map(x => String(x).toLowerCase().replace(/^www\./, "")));
   // ¿El email salió de una página del propio sitio? (no de WHOIS, informer ni redes sociales)
   const vieneDelPropioSitio = (email) => {
     if (!urlByEmail || !core) return false;
@@ -4799,7 +4804,7 @@ function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     // Maxi 2026-08-04: faltaba AD_SALES_LOCAL. Solo se miraba GENERIC_LOCAL_RE, así que un
     // `inzercia@` (publicidad en eslovaco) o `hirdetes@` (húngaro) cross-domain se descartaba
     // — justo el buzón de venta de pauta que buscamos.
-    const isBizRole = GENERIC_LOCAL_RE.test(local) || AD_SALES_LOCAL.test(local);
+    const isBizRole = GENERIC_LOCAL_RE.test(local) || AD_SALES_LOCAL.test(local) || AD_SALES_CONTIENE.test(local);
     // Maxi 2026-08-04: LA PROCEDENCIA MANDA SOBRE EL DOMINIO. Un email impreso en la página de
     // contacto del propio sitio ES su contacto, aunque el buzón esté en el dominio de la casa
     // editora. Medido: el scraper ya llegaba a la página buena y extraía el mail, y esta línea
@@ -4808,14 +4813,15 @@ function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     // radioagricultura.cl → vradnic@agricultura.cl (gerente general),
     // elfinancierocr.com → 7 emails @nacion.com (mismo grupo).
     const publicadoPorElSitio = vieneDelPropioSitio(e);
-    if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole && !publicadoPorElSitio) continue;
+    const esCasaEditora = casasEditoras.has(dom) || [...casasEditoras].some(c => dom.endsWith("." + c));
+    if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole && !publicadoPorElSitio && !esCasaEditora) continue;
     seen.add(e);
     valid.push(e);
   }
   // El corte de 15 truncaba justo el buzón comercial cuando venía después de una lista de
   // vendedores (hnonline.sk tenía 14 personas y después inzercia@). Ahora el de pauta va primero.
   valid.sort((a, b) => {
-    const ad = (x) => AD_SALES_LOCAL.test(x.split("@")[0]) ? 0 : 1;
+    const ad = (x) => { const l = x.split("@")[0]; return (AD_SALES_LOCAL.test(l) || AD_SALES_CONTIENE.test(l)) ? 0 : 1; };
     return (ad(a) - ad(b)) || ((_isGenericEmail(a) ? 1 : 0) - (_isGenericEmail(b) ? 1 : 0));
   });
   return valid.slice(0, 15);
@@ -4987,6 +4993,163 @@ function detectarTrampaEmail(email, htmlContexto = "") {
     if (vocales / local.length < 0.18 && digitos >= 2) return `local_aleatorio:${local.slice(0, 24)}`;
   }
   return "";
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// EL DNS COMO ORGANIGRAMA (auditoría empírica 2026-08-04)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Ya consultábamos DoH pero SOLO como booleano ("¿tiene MX?"), tirando el contenido del
+// registro. Ahí hay tres cosas distintas, todas gratis y en 150ms:
+//   · El MX delata la CASA EDITORA: hnonline.sk → smtp2.mafra.cz → MAFRA, el grupo checo dueño.
+//     Y el ads.txt de hnonline.sk NO tenía OWNERDOMAIN, así que esto rescata el salto a la
+//     editora justo donde esa vía falla.
+//   · El `rua` del DMARC a veces es una PERSONA: radio1.hu → akovacs@radio1.hu. Eso además
+//     revela el patrón de mails de la empresa (flast) de una sola vez.
+//   · El MX clasifica el buzón para el enrutamiento del gasto en MillionVerifier.
+// Los MX de proveedor NO son casa editora. La lista se paga cara en las dos direcciones: si
+// falta un proveedor, salimos a scrapear el sitio del proveedor (medido: livenation.nl → MX
+// pphosted.com, que es Proofpoint y no estaba en la lista, y el worker se puso a buscar el
+// contacto de pauta EN PROOFPOINT). Por eso van también los hostnames reales del MX, no solo
+// la marca: pphosted (Proofpoint), iphmx (Cisco), emailsrvr (Rackspace), antispamcloud, etc.
+const _MAIL_SAAS_RE = /google|googlemail|outlook|microsoft|office365|protection\.outlook|zoho|yandex|mail\.ru|secureserver|ovh|hostinger|registrar|titan|namecheap|one\.com|ionos|1and1|mailgun|sendgrid|proofpoint|pphosted|mimecast|barracuda|messagelabs|iphmx|cisco|emailsrvr|rackspace|antispamcloud|spamexperts|mailprotect|hornetsecurity|retarus|trendmicro|sophos|forcepoint|fortinet|amazonaws|awsapps|qq\.com|163\.com|aliyun|tencent|improvmx|migadu|fastmail|messagingengine|purelymail|mailbox\.org|posteo|gandi|infomaniak|scaleway|hetzner|strato|united-domains|udag|host-?europe|combell|transip|argeweb|nazwa|home\.pl|seohost|cyberfolks|forpsi|active24|wedos|websupport|zone\.eu|elkdata|telia|bluehost|hostgator|dreamhost|siteground|godaddy|wixdns|shopify|squarespace|cloudflare|jellyfish\.systems|arsys|acens|nominalia|dinaserver|cdmon|locaweb|umbler|kinghost|uolhost|hostnet|registro\.br|icloud|apple|namesrs|dnsmadeeasy|easydns|cloudns|freedns/i;
+const _dnsOrgCache = new Map();
+
+async function _doh(name, type) {
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
+                          { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return (j.Answer || []).map(a => String(a.data || "").replace(/^"|"$/g, "").replace(/" "/g, ""));
+  } catch { return []; }
+}
+
+async function organigramaDns(domain) {
+  const d = String(domain || "").toLowerCase().replace(/^www\./, "");
+  if (!d) return { casasEditoras: [], emailsDmarc: [] };
+  if (_dnsOrgCache.has(d)) return _dnsOrgCache.get(d);
+  const [mx, dmarc] = await Promise.all([_doh(d, "MX"), _doh("_dmarc." + d, "TXT")]);
+  const hosts = mx.map(x => x.split(/\s+/).pop().replace(/\.$/, "").toLowerCase());
+  const raiz = d.split(".").slice(-2).join(".");
+  // MX en un dominio DISTINTO que no es un proveedor SaaS → es la casa editora.
+  // Segunda red, por si el proveedor no está en la lista de arriba: si la MARCA del dominio del
+  // MX se llama como un servicio de correo/hosting (mailXX, smtp-, host-, cloud-, antispam-),
+  // no es una casa editora. Sin esto, un proveedor regional nuevo nos manda a scrapear SU sitio
+  // buscando el contacto de pauta — que fue exactamente lo que pasó con pphosted.com.
+  const _pareceProveedor = (raizMx) => {
+    const marca = raizMx.split(".")[0];
+    return /^(mail|mx|smtp|imap|pop|webmail|correo|email|antispam|spam|secure|filter|gateway|relay|host|hosting|server|servidor|cloud|dns|net|web|sys|it|tech|data|zone|cluster)([0-9-]|$)/i.test(marca)
+        || /(mail|hosting|host|server|cloud|antispam|spamfilter|security|dns)$/i.test(marca);
+  };
+  const casasEditoras = [...new Set(
+    hosts.filter(h => !_MAIL_SAAS_RE.test(h))
+         .map(h => h.split(".").slice(-2).join("."))
+         .filter(h => h !== raiz)
+  )].filter(h => hostSeguroParaFetch(h) && !_pareceProveedor(h)).slice(0, 3);
+  // rua del DMARC: solo los buzones del PROPIO dominio (un rua a un tercero es un vendor).
+  const emailsDmarc = [...new Set(
+    (dmarc.join(" ").match(/mailto:([^;!,\s]+)/gi) || []).map(x => x.slice(7).toLowerCase())
+  )].filter(e => e.endsWith("@" + d));
+  const out = { casasEditoras, emailsDmarc, proveedor: hosts[0] || "" };
+  if (_dnsOrgCache.size > 3000) _dnsOrgCache.clear();
+  _dnsOrgCache.set(d, out);
+  return out;
+}
+
+// ── JSON-LD del home (costo cero: el HTML ya está en memoria) ──────────────────────────────
+// schema.org Organization declara email, telephone y legalName. Medido: 2 de 8 publishers dan
+// email (contactenos@clarin.com, acento@acento.com.do) y clarin además da "Grupo Clarín S.A.".
+// Suele ser un buzón de atención al lector, así que va por debajo de publicidad@ en el ranking.
+function emailsDeJsonLd(html) {
+  const out = new Set(); let legalName = null;
+  try {
+    for (const m of String(html || "").matchAll(/<script[^>]+application\/ld\+json[^>]*>([\s\S]{0,60000}?)<\/script>/gi)) {
+      let j; try { j = JSON.parse(m[1].trim()); } catch { continue; }
+      const nodos = [].concat(j, j["@graph"] || []).filter(Boolean);
+      for (const n of nodos) {
+        if (typeof n !== "object") continue;
+        if (n.email) out.add(String(n.email).replace(/^mailto:/i, "").toLowerCase());
+        for (const cp of [].concat(n.contactPoint || [])) if (cp && cp.email) out.add(String(cp.email).replace(/^mailto:/i, "").toLowerCase());
+        if (!legalName && n.legalName) legalName = String(n.legalName);
+      }
+    }
+  } catch {}
+  return { emails: [...out], legalName };
+}
+
+
+// ── GOOGLE PLAY: el email del developer (auditoría 2026-08-04) ─────────────────────────────
+// Google Play OBLIGA a publicar un email de contacto en la ficha de la app, y ese dato vive
+// FUERA del dominio: no lo tocan ni Cloudflare ni el WAF. Es la única vía que funcionó contra
+// peru21.pe, que devuelve 403 a todo intento de crawl.
+// Medido: peru21.pe → mobilepub@comercio.com.pe (mobile publicidad, en la casa editora),
+// clarin.com → app@agea.com.ar, ilpost.it → redazione@ilpost.it.
+// ⚠️ El gate de dominio NO es opcional: sin él, buscar "clarin" devuelve Clarins cosméticos y
+// "matichon" devuelve Marchon anteojos. La ficha TIENE que linkear el dominio target.
+async function emailsDesdeGooglePlay(domain) {
+  const raiz = String(domain || "").replace(/^www\./, "").toLowerCase();
+  const marca = raiz.split(".")[0];
+  if (!marca || marca.length < 3) return { emails: [], casaEditora: null };
+  const g = async (u) => {
+    try {
+      const r = await fetch(u, { headers: _ADS_TXT_HEADERS, redirect: "follow", signal: AbortSignal.timeout(8000) });
+      return r.ok ? await r.text() : "";
+    } catch { return ""; }
+  };
+  try {
+    const busq = await g(`https://play.google.com/store/search?q=${encodeURIComponent(marca)}&c=apps&hl=en&gl=US`);
+    if (!busq) return { emails: [], casaEditora: null };
+    const ids = [...new Set([...busq.matchAll(/\/store\/apps\/details\?id=([a-zA-Z0-9._]+)/g)].map(m => m[1]))].slice(0, 3);
+    const escapada = raiz.replace(/\./g, "\\.");
+    for (const id of ids) {
+      const ficha = await g(`https://play.google.com/store/apps/details?id=${id}&hl=en&gl=US`);
+      if (!ficha) continue;
+      if (!new RegExp(`https?://(www\\.)?${escapada}(/|"|\\\\)`, "i").test(ficha)) continue;   // gate
+      const ems = [...new Set(ficha.match(EMAIL_REGEX) || [])]
+        .map(e => e.toLowerCase())
+        .filter(e => !/google|gstatic|schema\.org|example/i.test(e))
+        .filter(e => !_esPseudoEmailDeAsset(e) && !detectarTrampaEmail(e));
+      if (ems.length) {
+        // El dominio del email suele ser el CORPORATIVO de la casa editora — vale más que el
+        // email en sí, porque ahí adentro está el contacto de pauta.
+        const dom = (ems[0].split("@")[1] || "").toLowerCase();
+        const casaEditora = dom && dom !== raiz && hostSeguroParaFetch(dom) ? dom : null;
+        return { emails: ems, casaEditora, appId: id };
+      }
+    }
+  } catch {}
+  return { emails: [], casaEditora: null };
+}
+
+// ── SUBDOMINIOS HERMANOS vía Certificate Transparency (auditoría 2026-08-04) ───────────────
+// Cada certificado TLS queda en logs públicos, y eso lista subdominios que el home no linkea:
+// comercial., publicidad., ads. Validado end-to-end contra clarin.com —que devuelve 403 en el
+// home— : certspotter expuso comercial.clarin.com, de ahí salieron atencionagencias@clarin.com
+// y trafico@clarin.com, que son exactamente el contacto de pauta.
+// Se usa certspotter y NO crt.sh: crt.sh dio 502/404/timeout en 4 de 4 intentos.
+const _SUB_COMERCIAL_RE = /^(comercial|publicidad|publicidade|reklama|reklam|inzerce|advertising|ads|adv|marketing|ventas|sales|b2b|corp|media|mediakit|kit|prensa)([.-]|$)/i;
+const _ctCache = new Map();
+async function subdominiosComerciales(domain) {
+  const d = String(domain || "").toLowerCase().replace(/^www\./, "");
+  if (_ctCache.has(d)) return _ctCache.get(d);
+  let out = [];
+  try {
+    const r = await fetch(`https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(d)}&include_subdomains=true&expand=dns_names`,
+                          { headers: _ADS_TXT_HEADERS, signal: AbortSignal.timeout(12000) });
+    if (r.status !== 429 && r.ok) {
+      const j = await r.json().catch(() => []);
+      const nombres = [...new Set((Array.isArray(j) ? j : []).flatMap(x => x.dns_names || []))].filter(n => !n.startsWith("*"));
+      out = nombres
+        .filter(n => n.endsWith("." + d))
+        .filter(n => _SUB_COMERCIAL_RE.test(n.slice(0, -(d.length + 1))))
+        .filter(hostSeguroParaFetch)
+        .slice(0, 4);
+    }
+  } catch {}
+  if (_ctCache.size > 2000) _ctCache.clear();
+  _ctCache.set(d, out);
+  return out;
 }
 
 // ── PSEUDO-EMAILS DE ASSETS (auditoría empírica 2026-08-04) ────────────────────────────────
@@ -5166,6 +5329,11 @@ function _isGenericLocalPart(email) {
 // verkoop/adverteren(NL), vente(FR), raccolta pubblicitaria(IT), auglýsingar(IS), annons(SE). Todos = venta
 // de pauta/inventario. 'regie\b'/'regiepub' evita matchear 'regierung'(gobierno DE).
 const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor|inzerc|inzer[aá]t|hirdet|diafimisi|diafhmish|adverten|adverteren|advertentie|oglas|marknad|myynti)/i;
+// Igual que AD_SALES_LOCAL pero SIN anclar al principio: el token comercial puede estar en el
+// medio o al final del buzón. Medido: mobilepub@comercio.com.pe es el único contacto alcanzable
+// de peru21.pe (Cloudflare bloquea el resto) y el ^ lo dejaba afuera. Lista más corta a propósito:
+// sin ancla, tokens de 3 letras como "adv" o "ads" pillan cualquier palabra que los contenga.
+const AD_SALES_CONTIENE = /(?:publicidad|publicidade|pubblicit[aà]?|advertis|ad[-_.]?sales|comercial|commercial|marketing|monetiz|inzerc|hirdet|reklam|patrocin|sponsor|mediakit|media[-_.]?kit|pauta|pub)$|(?:[._-])(?:pub|adv|ads|ventas|sales|comercial|marketing)(?:[._-]|$)/i;
 
 // Maxi 2026-07-27 (auditoría respuestas 23-27): SEGMENTOS de local-part que identifican un buzón
 // de IT / infraestructura / dominios / registrar / seguridad. Nunca son contacto de venta de pauta.
@@ -5257,6 +5425,9 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // rutas, seguimos los links que el sitio realmente publica (contacto/kontakt/impressum/aviso
   // legal/publicidad/media-kit/about/equipo), aunque tengan nombres no estándar.
   const discovered = new Set();
+  let _homeHtmlCache = "";
+  let _wafBloquea = false;   // Cloudflare/WAF nos cerró la puerta: no insistir con el crawl
+  const _casasEditoras = new Set();   // dominios que PROBAMOS que son la matriz (ads.txt/MX/Play)
   // Maxi 2026-07-14: cobertura MULTILINGÜE del link de contacto/publicidad/about. El email vive en la
   // página de contacto y su slug depende del idioma (no todos son /contacto). Cubre PT-BR (contato/
   // fale-conosco), TR (iletisim/reklam/hakkimizda), HU (kapcsolat/hirdet), ID (kontak/hubungi/iklan),
@@ -5273,6 +5444,21 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   //   zimeye.net          → /2026/07/18/lebo-m-calls-for-calm...   (era el ÚNICO "descubierto")
   // Una página institucional vive cerca de la raíz y tiene slug corto; una nota va con fecha,
   // ID numérico o un slug largo. Bajó las páginas por dominio de 38 a 11 y el tiempo de 6,1s a 3,9s.
+  // Facetas por query string: mafra.cz expone el contacto POR DEPARTAMENTO con
+  // /kontakt.aspx?cat=obchod (obchod = ventas). Un dedupe por PATH ve "kontakt.aspx" una sola
+  // vez y pierde justo la variante de ventas. Patrón común en CMS .aspx/PHP de Europa del Este.
+  const _DEPTO_VENTAS_RE = /(obchod|inzerce|inzercia|reklam|publicidad|publicidade|comercial|advertising|sales|ventas|marketing|pauta|hirdet|oglas|diafimisi)/i;
+  const _facetasComerciales = (html, desdeUrl) => {
+    const out = new Set();
+    try {
+      for (const m of String(html || "").matchAll(/href=["']([^"']*\?[^"']*=[^"']*)["']/gi)) {
+        let u; try { u = new URL(m[1], desdeUrl || base); } catch { continue; }
+        if ([...u.searchParams.values()].some(v => _DEPTO_VENTAS_RE.test(v))) out.add(u.href);
+      }
+    } catch {}
+    return [...out].slice(0, 4);
+  };
+
   const _esRutaInstitucional = (u) => {
     try {
       const segs = new URL(u, base).pathname.replace(/\/+$/, "").split("/").filter(Boolean);
@@ -5296,7 +5482,17 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
    while (_attempt < 2) {
     try {
       const r = await fetch(url, { headers: mobile ? uaMobile : uaChrome, redirect: "follow", signal: AbortSignal.timeout(timeout) });
-      if (!r.ok) return;
+      if (!r.ok) {
+        // Cloudflare rechazando por challenge (cf-mitigated: challenge, o 403/503 con su ray-id):
+        // no es un 403 de "esta página no existe", es el WAF diciendo que NO vamos a poder
+        // crawlear NADA de este dominio. Seguir pidiendo 40 rutas es tiempo tirado. Lo marcamos
+        // para cortar el crawl y saltar directo a las vías de afuera (DNS/CT/Play).
+        if ((r.status === 403 || r.status === 503) &&
+            (String(r.headers.get("cf-mitigated") || "").includes("challenge") || r.headers.get("cf-ray"))) {
+          _wafBloquea = true;
+        }
+        return;
+      }
       const html = await r.text();
       const found = new Set();
       // 1) regex emails en HTML general
@@ -5353,6 +5549,8 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
           discovered.add(abs);
         }
       }
+      if (url === base && !_homeHtmlCache) _homeHtmlCache = html;   // para el JSON-LD
+      for (const f of _facetasComerciales(html, url)) discovered.add(f);   // ?cat=obchod, ?dept=ventas
       return; // éxito → no reintentar
     } catch (e) {
       const isTimeout = e?.name === "TimeoutError" || e?.name === "AbortError";
@@ -5409,13 +5607,27 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // que el sitio publica (llena `discovered`), además de los emails que ya estén en el home.
   await tryFetch(base, 6000, false, false);
 
+  // JSON-LD del home: dato estructurado que el sitio declara. Costo cero, el HTML ya está.
+  try {
+    const _ld = emailsDeJsonLd(_homeHtmlCache || "");
+    for (const e of _ld.emails) {
+      if (!_esPseudoEmailDeAsset(e) && !detectarTrampaEmail(e)) {
+        emails.add(e);
+        if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, base);
+      }
+    }
+  } catch {}
+
   let _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
   // seenUrl al scope de la función: lo usan la fase 2, el 2º nivel, WordPress REST, Google y
   // el salto a la casa editora. Antes vivía dentro del if y las fases nuevas no lo veían.
   const seenUrl = new Set([base, base + "/"]);
   // FASE 2 — seguir los links DESCUBIERTOS primero (el sitio los nombró explícitamente → más
   // precisos), luego las rutas estáticas de fallback. Early-stop al primer email real / buen lote.
-  if (!_hasReal) {
+  if (_wafBloquea && !_hasReal) {
+    log(`  🛡️ ${domain}: Cloudflare nos frena con challenge — salto el crawl y voy por las vías de afuera`);
+  }
+  if (!_hasReal && !_wafBloquea) {
     const queue = [];
     for (const u of [...discovered, ...internalTargets]) {
       if (u === base) continue;
@@ -5525,6 +5737,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
       // Salto a la casa editora cuando el sitio propio no dio nada.
       const owner = String(ads?.owner || "").replace(/^www\./, "");
+      if (owner && owner !== cleanDomain) _casasEditoras.add(owner);
       if (!_hasReal && owner && owner !== cleanDomain && hostSeguroParaFetch(owner)) {
         log(`  🏢 ${domain}: sin contacto propio → salto a la casa editora (${owner})`);
         for (const ruta of ["", "/contacto", "/contact", "/kontakt", "/publicidad", "/advertising", "/impressum"]) {
@@ -5533,6 +5746,98 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         }
         _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
       }
+    } catch {}
+  }
+
+  // ── VÍAS FUERA DEL DOMINIO (auditoría 2026-08-04) ──────────────────────────────────────
+  // Todo lo anterior depende de poder crawlear el sitio. Estas tres no: viven fuera del dominio
+  // y por eso son la única salida cuando Cloudflare o un WAF nos bloquean por completo.
+  // Validado contra clarin.com y peru21.pe, que devuelven 403 a cualquier intento de crawl.
+  if (!_hasReal) {
+    // 1. DNS como organigrama: el MX delata la casa editora y el rua del DMARC a veces es una
+    //    persona real. hnonline.sk → mafra.cz · radio1.hu → akovacs@radio1.hu
+    try {
+      const org = await organigramaDns(cleanDomain).catch(() => null);
+      for (const e of (org?.emailsDmarc || [])) {
+        // dmarc@ y postmaster@ son buzones técnicos: sirven para DEDUCIR el patrón de la
+        // empresa, no para mandarles el pitch. Solo entran los que parecen persona o rol real.
+        if (/^(dmarc|postmaster|abuse|hostmaster|noc)([._-]|\d*$)/i.test(e.split("@")[0])) continue;
+        if (!detectarTrampaEmail(e)) {
+          emails.add(e);
+          if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, `dns:_dmarc.${cleanDomain}`);
+        }
+      }
+      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      // La casa editora que declara el MX: corremos el pipeline de contacto contra ELLA.
+      for (const casa of (org?.casasEditoras || [])) _casasEditoras.add(casa);
+      for (const casa of (org?.casasEditoras || [])) {
+        if (_hasReal) break;
+        log(`  🏢 ${domain}: el MX apunta a ${casa} → busco el contacto ahí`);
+        for (const ruta of ["", "/contacto", "/contact", "/kontakt", "/kontakt.aspx?cat=obchod", "/publicidad", "/impressum"]) {
+          await tryFetch(`https://${casa}${ruta}`, 6000);
+          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+        }
+        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      }
+    } catch {}
+  }
+
+  if (!_hasReal) {
+    // 2. Certificate Transparency: subdominios comerciales que el home no linkea.
+    //    clarin.com (403 en el home) → comercial.clarin.com → atencionagencias@ y trafico@
+    try {
+      const subs = await subdominiosComerciales(cleanDomain).catch(() => []);
+      if (subs.length) log(`  🔐 ${domain}: CT expuso ${subs.length} subdominio(s) comercial(es): ${subs.join(", ")}`);
+      for (const sub of subs) {
+        if (_hasReal) break;
+        for (const ruta of ["", "/contacto", "/como-publicar", "/contact", "/tarifas"]) {
+          await tryFetch(`https://${sub}${ruta}`, 6000);
+          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+        }
+        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      }
+    } catch {}
+  }
+
+  if (!_hasReal) {
+    // 3. Google Play: el email del developer es obligatorio y vive fuera del dominio.
+    //    peru21.pe (403 total) → mobilepub@comercio.com.pe · thepeninsulaqatar.com → daralsharq.net
+    //
+    //    OJO con qué se hace con ese email. Medido: clarin.com da soporteapps@agea.com.ar y
+    //    thepeninsulaqatar.com da it@daralsharq.net — soporte técnico de la app, no pauta. Mandarles
+    //    el pitch es quemar el contacto. Lo que vale de verdad es el DOMINIO: revela la casa
+    //    editora, y ahí adentro sí está el área comercial. Así que primero vamos por la casa
+    //    editora; el email de Play solo entra si su nombre es comercial (mobilepub@ sí, it@ no),
+    //    y como último recurso si no quedó absolutamente nada.
+    try {
+      const play = await emailsDesdeGooglePlay(cleanDomain).catch(() => null);
+      const _esComercial = (e) => { const l = e.split("@")[0] || ""; return AD_SALES_LOCAL.test(l) || AD_SALES_CONTIENE.test(l); };
+      const comerciales = (play?.emails || []).filter(_esComercial);
+
+      if (play?.casaEditora) _casasEditoras.add(play.casaEditora);
+      if (play?.casaEditora) {
+        log(`  🏢 ${domain}: Play revela la casa editora ${play.casaEditora} → busco el área comercial ahí`);
+        for (const ruta of ["", "/contacto", "/publicidad", "/contact", "/advertising", "/anuncie"]) {
+          await tryFetch(`https://${play.casaEditora}${ruta}`, 6000);
+          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+        }
+        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      }
+      // El comercial de Play entra siempre (es exactamente lo que buscamos).
+      for (const e of comerciales) {
+        emails.add(e);
+        if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, "google-play");
+      }
+      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      // Los técnicos, solo si el lead quedaría en cero. Mejor un buzón de soporte que nada.
+      if (!emails.size) {
+        for (const e of (play?.emails || []).slice(0, 2)) {
+          emails.add(e);
+          if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, "google-play");
+        }
+      }
+      if (play?.emails?.length) log(`  📱 ${domain}: Google Play dio ${play.emails.length} contacto(s) (${comerciales.length} comercial/es)`);
+      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
     } catch {}
   }
 
@@ -5570,7 +5875,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
   // Limpieza final: sanitiza, descarta registradores/WHOIS y ajenos al dominio,
   // prioriza personas sobre genéricos y capea a 15. Corta el ruido del scraping.
-  return _cleanScrapedEmails([...emails], domain, { urlByEmail });
+  return _cleanScrapedEmails([...emails], domain, { urlByEmail, casasEditoras: _casasEditoras });
 }
 
 // ── Page intelligence ─────────────────────────────────────────
