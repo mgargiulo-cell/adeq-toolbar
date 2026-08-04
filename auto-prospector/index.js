@@ -12790,12 +12790,20 @@ async function securityWatchdog(token) {
   const env24 = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hace(24)}&select=id`);
   const reb24 = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.bounce_detected&created_at=gte.${hace(24)}&select=id`);
   if (env24 >= 20 && (100 * reb24 / env24) > SEC_UMBRALES.rebote_pct) {
-    hallazgos.push(`• Rebote al ${Math.round(100 * reb24 / env24)}% en 24h (${reb24}/${env24}). Con esto se quema la reputación de los buzones.`);
+    // El % puede pasar de 100 y NO es un error: bounce_detected cuenta rebotes DETECTADOS hoy,
+    // que en su mayoría corresponden a mails enviados días atrás. Se aclara en el propio mail
+    // para no mandar a nadie a buscar un bug que no existe.
+    hallazgos.push(`• Rebote al ${Math.round(100 * reb24 / env24)}% en 24h (${reb24} rebotes detectados / ${env24} enviados). `
+      + `Ojo: puede pasar de 100% porque los rebotes que LLEGAN hoy son de mails enviados días atrás — no es un error de cuenta. `
+      + `Lo que importa es la tendencia, no el número puntual.`);
   }
 
   // ── 6. MILLIONVERIFIER CAÍDO = envíos a ciegas ─────────────────────────────────────────
-  if (!cfg.millionverifier_api_key) {
-    hallazgos.push(`• MillionVerifier SIN KEY: los envíos están saliendo sin verificar entregabilidad.`);
+  // FALSO POSITIVO corregido 2026-08-04: la key se lee PRIMERO de las variables de entorno de
+  // Railway y recién después de la config (ver _verifyEmailMV). El user la tiene en el env, así
+  // que mirar solo la config hacía saltar la alerta teniendo la key puesta.
+  if (!process.env.MILLIONVERIFIER_API_KEY && !cfg.millionverifier_api_key) {
+    hallazgos.push(`• MillionVerifier SIN KEY (ni en el env de Railway ni en config): los envíos salen sin verificar entregabilidad.`);
   }
 
   // ── AUTO-RECUPERACIÓN (pedido del user 2026-08-04) ─────────────────────────────────────
