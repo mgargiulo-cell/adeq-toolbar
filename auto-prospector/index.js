@@ -1383,14 +1383,49 @@ const FEEDER_SELLERS_SOURCES = [
 
 let _feederLastSlot = "";  // "YYYY-MM-DD-HH:00" del último slot disparado
 
-function _normalizeFeederDomain(d) {
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// NORMALIZADOR CANÓNICO DE DOMINIOS (Maxi 2026-08-04)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Había DOS normalizadores con criterios distintos (_normalizeFeederDomain y cleanDomain) y
+// ninguno cubría todo, así que en la base terminaron guardados dominios que no abren. Casos
+// reales encontrados por el user:
+//   "footmercato.net, www.fussballtransfers.com, www.fichajes.com"  → una LISTA entera como
+//                                                                     un solo dominio
+//   "losandes.com.ar (r)"              → el nombre del item de Monday traía la anotación
+//   "pctipp.ch."                       → punto final
+//   "fullmatchsports.cc/?tab=fullmatch"→ path y query
+//   "www.ole.com.ar"                   → prefijo www
+// Ahora los dos delegan acá. Devuelve "" si lo que queda no es un hostname válido, así el
+// llamador descarta en vez de guardar basura.
+function normalizarDominio(d) {
   if (!d || typeof d !== "string") return "";
-  return d.toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .replace(/\/.*$/, "")
+  let x = d
+    .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, "")   // invisibles del scrape/copiar-pegar
+    .toLowerCase()
     .trim();
+  // Lista pegada en un solo campo → nos quedamos con el primero y avisamos.
+  if (/[,;]/.test(x)) {
+    const partes = x.split(/[,;]+/).map(v => v.trim()).filter(Boolean);
+    if (partes.length > 1) log(`  🧹 dominio con ${partes.length} valores pegados, tomo el 1º: ${x.slice(0, 80)}`);
+    x = partes[0] || "";
+  }
+  x = x
+    .replace(/^https?:\/\//, "")        // esquema
+    .replace(/^\/+/, "")                // barras iniciales
+    .replace(/\s+[\(\[\-].*$/, "")      // anotaciones: " (r)", " [x]", " - foo"
+    .split(/[\/?#]/)[0]                 // path, query, fragmento
+    .replace(/^.*@/, "")                // credenciales usuario:pass@host
+    .replace(/:\d+$/, "")               // puerto
+    .replace(/\s+/g, "")                // espacios sobrantes
+    .replace(/^\.+/, "").replace(/\.+$/, "")   // puntos al principio o al final
+    .replace(/^www\./, "");             // www
+  // Validación final: hostname con al menos un punto y solo caracteres legales.
+  if (!x || !x.includes(".") || !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(x)) return "";
+  return x;
 }
+
+function _normalizeFeederDomain(d) { return normalizarDominio(d); }
 
 async function _findKnownDomainsWorker(token, candidates) {
   if (!Array.isArray(candidates) || candidates.length === 0) return new Set();
@@ -7426,14 +7461,7 @@ function scoreCandidate({ visits, category, topCountry, contactName, emails, pag
 
 // ── Helpers ───────────────────────────────────────────────────
 
-function cleanDomain(str) {
-  return (str || "").toLowerCase()
-    .replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "")
-    // Strip annotations comunes: " (r)", " (refresh)", " (m)", " - foo", "[bar]", etc.
-    .replace(/\s+[\(\[\-].*$/, "")
-    .replace(/\s+/g, "")
-    .trim();
-}
+function cleanDomain(str) { return normalizarDominio(str); }
 
 // Validador estricto: domain debe tener formato xxx.tld válido.
 function _isValidDomainFormat(d) {
