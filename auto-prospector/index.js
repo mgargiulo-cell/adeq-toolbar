@@ -6431,8 +6431,19 @@ async function recheckAdsTxtUnknowns(token) {
   const cfg = await getConfig(token);
   if (String(cfg.adstxt_recheck_enabled || "") !== "true") return;
   const hoy = _madridDayStartUtc().slice(0, 10);
-  if (_lastAdsRecheckDay === hoy) return;          // 1 vez por día
-  _lastAdsRecheckDay = hoy;
+  // ── POR QUÉ ESTO SE PERSISTE Y NO VIVE EN MEMORIA (Maxi 2026-08-04) ──────────────────────
+  // El marcador de "ya corrí hoy" era una variable del proceso, y el worker reinicia cada ~7min
+  // por el cap de memoria. Resultado: en CADA arranque volvía a empezar los 200 dominios desde
+  // cero, no llegaba a terminarlos antes del siguiente restart, y como corre ANTES que el
+  // barrido por URL y que el pulido, esos dos NUNCA llegaban a ejecutarse.
+  // Se vio en vivo: con el repaso prendido, `ya_procesados` se quedó clavado en 0.
+  // Ahora el marcador vive en la config (sobrevive al restart) y el job tiene techo de tiempo:
+  // si no termina, la próxima vuelta sigue con los que quedaron (la query ya ordena por
+  // last_checked_at asc, así que retoma solo).
+  if (_lastAdsRecheckDay === hoy) return;          // corte barato en memoria
+  if (String(cfg.adstxt_recheck_day || "") === hoy) { _lastAdsRecheckDay = hoy; return; }
+  const _inicioRecheck = Date.now();
+  const RECHECK_MAX_MS = 60 * 1000;
 
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const minDias = parseInt(cfg.adstxt_recheck_min_days || "7", 10) || 7;
@@ -6445,15 +6456,21 @@ async function recheckAdsTxtUnknowns(token) {
     );
     if (r.ok) filas = await r.json();
   } catch {}
-  if (!Array.isArray(filas) || filas.length === 0) return;
+  if (!Array.isArray(filas) || filas.length === 0) {
+    _lastAdsRecheckDay = hoy;
+    await setConfigValue(token, "adstxt_recheck_day", hoy).catch(() => {});
+    return;
+  }
 
   // El caché de ads.txt es por proceso: si el dominio ya se miró en esta corrida devolvería
   // el mismo veredicto viejo. Se limpia para que el re-chequeo sea real.
   _adsTxtStateCache.clear();
 
   let recuperados = 0, siguenSinLeerse = 0, confirmadosSinAds = 0;
+  let _cortado = false;
   const CONC = 6;
   for (let i = 0; i < filas.length; i += CONC) {
+    if (Date.now() - _inicioRecheck > RECHECK_MAX_MS) { _cortado = true; break; }
     await Promise.all(filas.slice(i, i + CONC).map(async (f) => {
       const r = await checkAdsTxt(f.domain).catch(() => ({ state: "unknown", why: "error" }));
       const patch = { checks: (f.checks || 1) + 1, last_checked_at: new Date().toISOString() };
@@ -6485,7 +6502,16 @@ async function recheckAdsTxtUnknowns(token) {
       } catch {}
     }));
   }
-  log(`🔁 ads.txt re-chequeo: ${filas.length} revisados · ✅ ${recuperados} recuperados (vuelven a la cola) · ❌ ${confirmadosSinAds} confirmados sin ads.txt · ❓ ${siguenSinLeerse} siguen bloqueados`);
+  const _vistos = recuperados + confirmadosSinAds + siguenSinLeerse;
+  if (_cortado) {
+    log(`🔁 ads.txt re-chequeo: corté a los ${Math.round((Date.now() - _inicioRecheck) / 1000)}s con ${_vistos}/${filas.length} — sigo en la próxima vuelta (no bloqueo el pulido)`);
+  } else {
+    // Solo se marca el día cuando la tanda terminó entera. Si se cortó, la próxima vuelta
+    // retoma: la query pide los de last_checked_at más viejo, y los ya vistos quedaron al día.
+    _lastAdsRecheckDay = hoy;
+    await setConfigValue(token, "adstxt_recheck_day", hoy).catch(() => {});
+  }
+  log(`🔁 ads.txt re-chequeo: ${_vistos} revisados · ✅ ${recuperados} recuperados (vuelven a la cola) · ❌ ${confirmadosSinAds} confirmados sin ads.txt · ❓ ${siguenSinLeerse} siguen bloqueados`);
 }
 
 async function _hasRealAdsTxt(domain) {
@@ -16702,15 +16728,22 @@ async function main() {
         // sobreviva pasa al sweep caro, que gasta scrape + Haiku solo en los dudosos.
         // Vigilante de seguridad: detecta abuso, avisa por mail y frena solo si hace falta.
         await securityWatchdog(token).catch(e => log(`⚠️ watchdog: ${e.message}`));
-        // Maxi 2026-08-01: reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout).
-        // 1×/día, gratis. Los que ahora sí tienen vuelven solos a la cola.
-        await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
+        // ── ORDEN DE LOS JOBS DE POOL (Maxi 2026-08-04) ─────────────────────────────────
+        // Corren en cadena, uno detrás del otro, y el worker reinicia cada ~7min. O sea que el
+        // orden NO es cosmético: lo que va último puede no ejecutarse nunca. Se vio en vivo —
+        // el re-chequeo de ads.txt se comía todas las vueltas y el pulido quedaba en 0.
+        // Criterio: primero lo gratis y rápido, después lo que el user pidió, al final el
+        // mantenimiento. Cada uno con su propio techo de tiempo.
+        // 1. Barrido por URL: sin red, sin créditos, segundos. Limpia basura antes de que el
+        //    pulido gaste un fetch en ella.
         await purgeByUrlOnly(token).catch(e => log(`⚠️ url-purge: ${e.message}`));
-        await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
-        // Maxi 2026-07-15: PULIDO UNIFICADO — 1 fetch/dominio: bloquea no-publishers + busca email
-        // (scrape+social+informer+Apollo) para los que quedan sin email. Reemplaza purge+reenrich.
-        // Gated por config polish_pool='true'; se auto-apaga al terminar. NO usa RapidAPI.
+        // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
+        //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
         await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
+        // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
+        //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.
+        await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
+        await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Maxi 2026-07-16: expansión por similares desde los Prospects grandes (gated similar_expansion_enabled).
         await runProspectSimilarExpansion(token).catch(e => log(`⚠️ similar-exp: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
