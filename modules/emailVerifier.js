@@ -287,13 +287,19 @@ export async function verifyEmail(email) {
     };
   }
 
+  // Maxi 2026-08-04 — ERA UN FALSO RECHAZO. Por RFC 5321 §5.1, un dominio SIN MX pero CON
+  // registro A recibe correo igual: el servidor entrega al A ("implicit MX"). Medido contra
+  // 8.8.8.8, 1.1.1.1 y 9.9.9.9: elcomercio.pe y gestion.pe no tienen MX, tienen A y SPF -all,
+  // son publishers grandes y reciben mail perfectamente. Es el ~4% de la población.
+  // Ahora esto NO invalida: baja el score y avisa, pero deja pasar. El rechazo duro queda solo
+  // para !mx && !a, que es el bloque de arriba.
   if (!mxFound && aFound) {
     return {
-      valid:   false,
-      score,
-      reason:  "Dominio existe pero sin MX — no puede recibir emails",
+      valid:   true,
+      score:   Math.max(0, score - 15),
+      reason:  "Sin MX pero con registro A — implicit MX (RFC 5321), recibe igual",
       mxFound: false,
-      tags:    [...tags, "sin-mx"],
+      tags:    [...tags, "implicit-mx"],
     };
   }
 

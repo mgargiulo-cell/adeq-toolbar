@@ -10379,6 +10379,7 @@ async function loadBouncedEmails(token) {
     if (res.ok) {
       const rows = await res.json();
       _bouncedCache.set = new Set((rows || []).map(r => (r.email || "").toLowerCase()));
+      _recontarRebotesPorDominio();   // memoria de rebote a nivel DOMINIO (auditoría 2026-08-04)
       _bouncedCache.ts = Date.now();
     }
   } catch {}
@@ -12345,6 +12346,68 @@ const MV_CACHE_MAX = 8000;
 // ENVÍA sin verificar). Medición de 14d: ~250 bounces duros sobre ~400 envíos = 63%, con
 // direcciones que MillionVerifier habría marcado invalid. Con 10.000 créditos comprados y ~40
 // envíos/día, verificar el 100% cuesta ~250 días de crédito: no hay razón para racionarlo.
+
+// ── PERFIL DEL PROVEEDOR DE CORREO (auditoría empírica 2026-08-04) ─────────────────────────
+// Censo de 48 publishers reales: 35% Microsoft 365, 35% Google Workspace, 6% gateway antispam,
+// 6% sin MX, 17% propio. El dato que cambia todo: en M365 y en los gateways la verificación SMTP
+// es ESTRUCTURALMENTE CIEGA — aceptan cualquier destinatario a nivel RCPT, así que MillionVerifier
+// devuelve "ok" o "catch_all" sin saber nada, y esos son justo los que después rebotan.
+// O sea: ~41% de las consultas pagas no aportan información. Con esto enrutamos el gasto.
+const _MX_PROVEEDORES = [
+  [/aspmx.*google|googlemail\.com|google\.com$/i,                                   "google",    "confiable"],
+  [/mail\.protection\.outlook\.com|outlook\.com$/i,                                 "m365",      "acepta_todo"],
+  [/proofpoint|pphosted|mimecast|barracuda|spamtitan|titanhq|hornetsecurity|fortimail|sophos|trendmicro/i, "gateway", "acepta_todo"],
+  [/zoho/i,                                                                          "zoho",      "confiable"],
+  [/yandex/i,                                                                        "yandex",    "confiable"],
+  [/improvmx|forwardemail|mxroute/i,                                                 "forwarder", "acepta_todo"],
+  [/secureserver\.net/i,                                                             "godaddy",   "medio"],
+  [/cpanel|websitewelcome|hostgator|hostinger|siteground|namecheap/i,                "hosting",   "acepta_todo"],
+];
+const _perfilMxCache = new Map();
+async function perfilCorreoDelDominio(dominio) {
+  const d = String(dominio || "").toLowerCase();
+  if (!d) return { proveedor: "?", verificable: "medio" };
+  if (_perfilMxCache.has(d)) return _perfilMxCache.get(d);
+  let out = { proveedor: "propio", verificable: "medio" };
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(d)}&type=MX`,
+                          { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(4000) });
+    if (r.ok) {
+      const j = await r.json();
+      const mx = (j?.Answer || []).map(a => String(a.data || "")).join(" ").toLowerCase();
+      if (!mx) out = { proveedor: "sin_mx", verificable: "medio" };   // puede ser implicit MX
+      else {
+        out = { proveedor: "propio", verificable: "medio", mx: mx.slice(0, 120) };
+        for (const [re, nombre, verif] of _MX_PROVEEDORES) {
+          if (re.test(mx)) { out = { proveedor: nombre, verificable: verif, mx: mx.slice(0, 120) }; break; }
+        }
+      }
+    }
+  } catch {}
+  if (_perfilMxCache.size > 3000) _perfilMxCache.clear();
+  _perfilMxCache.set(d, out);
+  return out;
+}
+
+// ¿Conviene gastar la consulta paga en este email? Devuelve la decisión y el motivo.
+// La lógica clave: en un proveedor que acepta cualquier destinatario, MV no puede saber nada.
+// Ahí la consulta es plata tirada Y ADEMÁS devuelve un "ok" falso que nos hace confiar de más.
+async function decidirVerificacionMV(email, fuente) {
+  const dom = String(email || "").split("@")[1] || "";
+  const local = String(email || "").split("@")[0] || "";
+  const perfil = await perfilCorreoDelDominio(dom).catch(() => ({ verificable: "medio", proveedor: "?" }));
+  const generadoPorPatron = fuente === "pattern" || fuente === "guess" || fuente === "apollo_pattern";
+  const rolComun = /^(info|contacto|contact|contato|redaccion|redazione|redacao|publicidad|publicidade|comercial|ventas|marketing|prensa)$/i.test(local);
+
+  if (perfil.verificable === "acepta_todo" && generadoPorPatron)
+    return { verificar: false, enviar: false, motivo: `${perfil.proveedor} acepta cualquier destinatario y el email es una hipótesis de patrón — MV no puede resolverlo` };
+  if (perfil.verificable === "acepta_todo")
+    return { verificar: false, enviar: true, motivo: `${perfil.proveedor} acepta todo: la consulta no aportaría información` };
+  if (rolComun && (fuente === "scrape" || fuente === "mailto") && perfil.verificable === "confiable")
+    return { verificar: false, enviar: true, motivo: "rol común publicado por el propio sitio en proveedor confiable" };
+  return { verificar: true, enviar: true, motivo: `proveedor ${perfil.proveedor}: la consulta decide` };
+}
+
 // El techo sube a 500; el valor efectivo lo sigue mandando millionverifier_daily_cap en config.
 const MV_ABS_DAILY_MAX = 500;
 let _mvDay = "", _mvCount = 0;
@@ -12478,6 +12541,10 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   const lower = email.toLowerCase();
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
   if (isBouncedSync(lower)) return -1; // hard reject: ya bounceó antes
+  // Dominio quemado: 2+ rebotes distintos ahí. El rebote casi nunca es de la casilla sino del
+  // dominio, así que insistir con otro buzón del mismo lugar es tirar reputación (2026-08-04).
+  const _rd = riesgoRebotePorDominio(lower.split("@")[1] || "");
+  if (_rd.bloquear) return -1;
   const [local, dom] = lower.split("@");
   if (!local || !dom) return -1;
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
@@ -12687,6 +12754,7 @@ function rankEmail(email, siteDomain, leadCategory = "") {
   // No descarta — baja prioridad para que ganen otros candidatos si los hay.
   if (/property|sale|offer|click|freemium|promo|bonus/.test(local)) score -= 15;
   // Free webmail = penalizar pero NO descartar (un MB humano puede mandar)
+  if (_rd.penalidad) score += _rd.penalidad;   // 1 rebote previo en el dominio → -40
   if (isFreeWebmail) score -= 20; // antes -35, ahora -20 para que webmail con persona real sobreviva
 
   // ── LANGUAGE MATCH bonus ──
@@ -12779,12 +12847,52 @@ async function _hasMxRecords(domain) {
       if (!res.ok) continue; // retry
       const data = await res.json();
       const has = Array.isArray(data?.Answer) && data.Answer.length > 0;
-      _mxCache.set(domain, has);
-      return has;
+      if (has) { _mxCache.set(domain, true); return true; }
+      // Maxi 2026-08-04 — IMPLICIT MX (RFC 5321 §5.1). Sin MX pero CON registro A, el correo se
+      // entrega igual al A. Medido contra 8.8.8.8, 1.1.1.1 y 9.9.9.9: elcomercio.pe y gestion.pe
+      // no tienen MX, tienen A y SPF -all, son publishers grandes y reciben mail perfectamente.
+      // Es ~4% de la población. Antes esto los marcaba rojo con "no_mx_records" y se descartaban.
+      try {
+        const ra = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=A`, {
+          headers: { "accept": "application/dns-json" }, signal: AbortSignal.timeout(3000),
+        });
+        if (ra.ok) {
+          const da = await ra.json();
+          if (Array.isArray(da?.Answer) && da.Answer.length > 0) {
+            _mxCache.set(domain, true);   // recibe por implicit MX
+            return true;
+          }
+        }
+      } catch {}
+      _mxCache.set(domain, false);
+      return false;
     } catch { /* retry */ }
   }
   // Ambos intentos fallaron. NO cachear, devolver null = unknown.
   return null;
+}
+
+// ── MEMORIA DE REBOTE POR DOMINIO (auditoría 2026-08-04) ───────────────────────────────────
+// La lista de rebotados bloquea el EMAIL exacto, pero el rebote casi nunca es de la casilla:
+// es del dominio (servidor decomisionado, empresa cerrada, MX roto). Si ventas@x.com rebotó,
+// info@x.com va a rebotar igual — y hoy se lo mandábamos igual.
+// Umbral 2 y no 1 a propósito: con 1 hay falsos positivos reales (una persona que se fue de una
+// empresa que sigue viva). Con 2 rebotes distintos, el dominio está quemado.
+const _rebotesPorDominio = new Map();
+function _recontarRebotesPorDominio() {
+  _rebotesPorDominio.clear();
+  for (const em of (_bouncedCache.set || new Set())) {
+    const d = String(em).split("@")[1];
+    if (!d) continue;
+    if (!_rebotesPorDominio.has(d)) _rebotesPorDominio.set(d, new Set());
+    _rebotesPorDominio.get(d).add(em);
+  }
+}
+function riesgoRebotePorDominio(dominioEmail) {
+  const n = _rebotesPorDominio.get(String(dominioEmail || "").toLowerCase())?.size || 0;
+  if (n >= 2) return { bloquear: true, motivo: `${n} rebotes previos en ese dominio` };
+  if (n === 1) return { bloquear: false, penalidad: -40 };
+  return { bloquear: false, penalidad: 0 };
 }
 
 async function scoreEmail(email) {
@@ -14375,7 +14483,18 @@ async function runAgentCycle(token, allFlags) {
               descartados++;
               continue;
             }
-            if (mvUsed < MAX_MV_PER_LEAD) {
+            // Enrutamiento del gasto (auditoría 2026-08-04): en Microsoft 365 y en los gateways
+            // antispam la verificación es estructuralmente ciega —aceptan cualquier destinatario
+            // a nivel RCPT— así que la consulta paga no aporta nada y encima devuelve un "ok"
+            // falso. Es el ~41% de los publishers. Ahí no gastamos, salvo que el email además
+            // sea una hipótesis de patrón: no verificable + hipótesis es la combinación letal.
+            const _ruta = await decidirVerificacionMV(cand.email, cand.source).catch(() => ({ verificar: true, enviar: true }));
+            if (!_ruta.enviar) {
+              log(`  ⏭️ ${domain}: ${cand.email} descartado — ${_ruta.motivo}`);
+              descartados++;
+              continue;
+            }
+            if (_ruta.verificar && mvUsed < MAX_MV_PER_LEAD) {
               mvUsed++;
               if (!(await _verifyEmailMV(token, cfg, cand.email))) {
                 // No entregable → marcar para que no se re-elija y seguir con el siguiente
