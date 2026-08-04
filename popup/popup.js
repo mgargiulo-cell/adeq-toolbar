@@ -2852,11 +2852,20 @@ const autoPushReady = { traffic: false, notDup: false, email: false };
 // que el error inverso no tiene arreglo. También se limpia esquema, barras y espacios por si el
 // dato guardado viene sucio del scrape.
 function urlDeDominio(dom) {
-  const d = String(dom || "").trim().toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^\/+/, "")
-    .split(/[\/?#]/)[0];
-  return d ? `https://${d}` : "#";
+  let d = String(dom || "")
+    // Invisibles que se cuelan del scrape y del copiar/pegar: zero-width, BOM, nbsp.
+    .replace(/[\u200B-\u200D\uFEFF\u00A0]/g, "")
+    .trim().toLowerCase()
+    .replace(/^https?:\/\//, "")     // esquema
+    .replace(/^\/+/, "")             // barras iniciales
+    .split(/[\/?#]/)[0]              // path, query, fragmento
+    .replace(/^.*@/, "")             // credenciales (usuario:pass@host)
+    .replace(/:\d+$/, "")            // puerto
+    .replace(/\.+$/, "")             // puntos finales ("clarin.com.")
+    .replace(/^\.+/, "");            // puntos iniciales
+  // Un host válido necesita al menos un punto y solo caracteres de dominio.
+  if (!d || !d.includes(".") || !/^[a-z0-9.-]+$/.test(d)) return "#";
+  return `https://${d}`;
 }
 
 function esc(s) {
@@ -5646,7 +5655,7 @@ async function bindButtons() {
     if (!allDomains.length) { alert("No hay sitios en los resultados."); return; }
     if (!confirm(`Abrir ${allDomains.length} tabs?`)) return;
     allDomains.forEach((d, i) => {
-      setTimeout(() => chrome.tabs.create({ url: `https://${d}`, active: false }), i * 50);
+      setTimeout(() => chrome.tabs.create({ url: urlDeDominio(d), active: false }), i * 50);
     });
   });
   document.getElementById("btn-cascade-apply-filters")?.addEventListener("click", applyCascadeFilters);
@@ -6720,7 +6729,7 @@ function appendCascadeItem(site, container) {
   `;
   item.querySelector(".cascade-open-one")?.addEventListener("click", (e) => {
     e.stopPropagation();
-    chrome.tabs.create({ url: `https://${site.domain}`, active: false });
+    chrome.tabs.create({ url: urlDeDominio(site.domain), active: false });
   });
 
   const cb = item.querySelector("input");
@@ -6865,7 +6874,7 @@ function openCascadeSelected() {
     result.textContent = "Select at least one site"; result.className = "push-result error"; return;
   }
 
-  toOpen.forEach(site => chrome.tabs.create({ url: `https://${site.domain}`, active: false }));
+  toOpen.forEach(site => chrome.tabs.create({ url: urlDeDominio(site.domain), active: false }));
   result.textContent = `✅ ${toOpen.length} sites opened in new tabs`;
   result.className   = "push-result ok";
 }
@@ -8004,7 +8013,7 @@ async function initSellersJsonImport(refreshAll) {
       const slice = fresh.slice().sort(() => Math.random() - 0.5).slice(0, N);
       resEl.innerHTML = `🪟 Opening ${N} tabs (400ms delay so Chrome doesn't block them)...`;
       slice.forEach((domain, i) => {
-        setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);
+        setTimeout(() => chrome.tabs.create({ url: urlDeDominio(domain), active: false }), i * 400);
       });
       const left = fresh.length - N;
       resEl.innerHTML = `<span style="color:#16a34a">✅ ${N} tabs opened${left > 0 ? `. ${left} fresh ones not opened (cap ${SELLERS_OPEN_TABS_CAP}/click).` : "."}</span>`;
@@ -11145,7 +11154,7 @@ async function initProspectsTab() {
       .map(c => c.closest(".pcard")?.dataset?.domain)
       .filter(Boolean);
     domains.forEach((domain, i) => {
-      setTimeout(() => chrome.tabs.create({ url: `https://${domain}`, active: false }), i * 400);
+      setTimeout(() => chrome.tabs.create({ url: urlDeDominio(domain), active: false }), i * 400);
     });
     showToast(`🪟 Opening ${domains.length} tabs...`, "info");
   });
