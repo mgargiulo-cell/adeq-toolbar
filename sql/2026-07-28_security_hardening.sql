@@ -85,3 +85,80 @@ select tablename,
 from pg_tables t
 where schemaname = 'public' and tablename like 'toolbar_%'
 order by rowsecurity asc, tablename;
+
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+-- PARTE 2 — LO CRÍTICO (auditoría 2026-08-04). Correr TODO junto.
+-- ═══════════════════════════════════════════════════════════════════════════════════════
+
+-- ── 6. LAS API KEYS ERAN LEGIBLES POR CUALQUIER USUARIO AUTENTICADO ────────────────────
+-- La cadena verificada: (a) el registro del proyecto está ABIERTO, (b) el allowlist de login
+-- vive en popup.js —JS público, se saltea llamando a Supabase directo—, y (c) la policy de
+-- SELECT sobre toolbar_config era `using (true)` para authenticated.
+-- Resultado: cualquiera se crea una cuenta con un Gmail, confirma el mail, hace UN
+-- `GET /rest/v1/toolbar_config?select=key,value` y se lleva Apollo + RapidAPI + Gemini +
+-- Monday + MillionVerifier. El api-proxy queda bypasseado: usa las keys crudas.
+drop policy if exists toolbar_config_select_auth on public.toolbar_config;
+drop policy if exists cfg_read_safe             on public.toolbar_config;
+create policy cfg_read_safe on public.toolbar_config
+  for select to authenticated
+  using (
+    key not like '%api_key%' and key not like '%_key' and key not like '%secret%'
+    and key not like '%token%' and key not like '%password%'
+  );
+
+-- ── 7. LA ALLOWLIST DEL PROXY ERA AUTO-SERVICIO ────────────────────────────────────────
+-- El proxy lee la allowlist de agent_enabled_users / agent_whitelist / proxy_extra_users,
+-- pero el popup ESCRIBE agent_enabled_users con el JWT del usuario, y la policy RESTRICTIVE
+-- del 15/07 solo protegía apollo_api_key, rapidapi_key, gemini_api_key y dos caps.
+-- O sea: cualquier autenticado se agregaba solo a la lista y entraba al proxy.
+drop policy if exists cfg_no_write_sensitive on public.toolbar_config;
+create policy cfg_no_write_sensitive on public.toolbar_config
+  as restrictive for all to authenticated
+  using (
+    key not in (
+      'apollo_api_key','rapidapi_key','gemini_api_key','anthropic_api_key','voyage_api_key',
+      'monday_api_key','millionverifier_api_key','serper_api_key',
+      'agent_enabled_users','agent_whitelist','proxy_extra_users',
+      'kill_switch','kill_switch_reason','security_alert_email','security_watchdog_enabled',
+      'csv_queue_daily_cap','autopilot_daily_cap_global','rapidapi_daily_limit',
+      'apollo_daily_limit','serper_contact_daily_cap','agent_max_total_sends_per_day',
+      'millionverifier_daily_cap','threshold_traffic_max'
+    )
+  )
+  with check (
+    key not in (
+      'apollo_api_key','rapidapi_key','gemini_api_key','anthropic_api_key','voyage_api_key',
+      'monday_api_key','millionverifier_api_key','serper_api_key',
+      'agent_enabled_users','agent_whitelist','proxy_extra_users',
+      'kill_switch','kill_switch_reason','security_alert_email','security_watchdog_enabled',
+      'csv_queue_daily_cap','autopilot_daily_cap_global','rapidapi_daily_limit',
+      'apollo_daily_limit','serper_contact_daily_cap','agent_max_total_sends_per_day',
+      'millionverifier_daily_cap','threshold_traffic_max'
+    )
+  );
+
+-- ── 8. HISTORIAL DE CAMBIOS EN LA CONFIG ───────────────────────────────────────────────
+-- Hoy no hay rastro: si alguien se agrega a agent_enabled_users, no queda registro de nada.
+create or replace function public.log_config_change()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.key ~ '(api_key|token|secret|enabled_users|whitelist|kill_switch|daily_cap|daily_limit)' then
+    insert into toolbar_security_events (kind, severity, actor, detail)
+    values ('config_cambiada', 'warn', coalesce(current_setting('request.jwt.claim.email', true), 'service'),
+            jsonb_build_object('key', new.key, 'antes', left(coalesce(old.value,''),80), 'ahora', left(coalesce(new.value,''),80)));
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_log_config_change on public.toolbar_config;
+create trigger trg_log_config_change after update on public.toolbar_config
+  for each row execute function public.log_config_change();
+
+-- ── 9. CHEQUEO: ¿quién usó el proxy hoy y está fuera de la allowlist? ──────────────────
+-- Detecta el abuso al PRIMER uso, no al llegar a un umbral de volumen.
+select u.user_email, u.total, u.by_provider
+from toolbar_api_usage u
+where u.day = current_date
+  and u.user_email not in (
+    select lower(jsonb_array_elements_text(value::jsonb))
+    from toolbar_config where key = 'agent_enabled_users'
+  );
