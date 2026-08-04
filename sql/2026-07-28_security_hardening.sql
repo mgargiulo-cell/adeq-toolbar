@@ -162,3 +162,56 @@ where u.day = current_date
     select lower(jsonb_array_elements_text(value::jsonb))
     from toolbar_config where key = 'agent_enabled_users'
   );
+
+-- ── 10. BOTÓN DE PÁNICO DESDE EL PANEL ─────────────────────────────────────────────────
+-- Tras el punto 7, `kill_switch` ya no es escribible por usuarios autenticados — que es lo
+-- correcto, pero deja al botón del panel sin poder tocarlo. Este RPC es la puerta controlada:
+-- corre como security definer (privilegios de la función, no del que llama) y valida que el
+-- mail de quien invoca esté en la allowlist. Así el botón funciona para los 3 MBs y para nadie más.
+create or replace function public.toggle_kill_switch(p_on boolean, p_motivo text default '')
+returns table (activo boolean, motivo text)
+language plpgsql security definer set search_path = public as $$
+declare v_email text; v_permitidos jsonb; v_motivo text;
+begin
+  v_email := lower(coalesce(current_setting('request.jwt.claim.email', true), ''));
+  if v_email = '' then raise exception 'sin identidad'; end if;
+
+  select value::jsonb into v_permitidos from toolbar_config where key = 'agent_enabled_users';
+  if v_permitidos is null
+     or not exists (select 1 from jsonb_array_elements_text(v_permitidos) e where lower(e) = v_email)
+  then
+    insert into toolbar_security_events (kind, severity, actor, detail)
+    values ('panic_intento_no_autorizado','critical', v_email, jsonb_build_object('accion', p_on));
+    raise exception 'usuario no autorizado';
+  end if;
+
+  v_motivo := case when p_on
+    then to_char(now(),'YYYY-MM-DD HH24:MI') || ' — activado a mano por ' || v_email ||
+         case when coalesce(p_motivo,'') <> '' then ': ' || left(p_motivo, 120) else '' end
+    else '' end;
+
+  update toolbar_config set value = case when p_on then 'true' else 'false' end where key = 'kill_switch';
+  update toolbar_config set value = v_motivo where key = 'kill_switch_reason';
+  -- Al soltarlo a mano se limpia la marca de automático, para que el vigilante no lo re-suelte solo.
+  update toolbar_config set value = '' where key = 'kill_switch_auto_at';
+
+  insert into toolbar_security_events (kind, severity, actor, detail)
+  values (case when p_on then 'panic_activado_panel' else 'panic_desactivado_panel' end,
+          'warn', v_email, jsonb_build_object('motivo', v_motivo));
+
+  return query select p_on, v_motivo;
+end $$;
+grant execute on function public.toggle_kill_switch(boolean, text) to authenticated;
+
+-- Estado del freno, legible desde el panel sin exponer nada más.
+create or replace function public.kill_switch_estado()
+returns table (activo boolean, motivo text, auto boolean)
+language sql security definer set search_path = public as $$
+  select
+    coalesce((select value from toolbar_config where key='kill_switch'), 'false') = 'true',
+    coalesce((select value from toolbar_config where key='kill_switch_reason'), ''),
+    coalesce((select value from toolbar_config where key='kill_switch_auto_at'), '') <> ''
+$$;
+grant execute on function public.kill_switch_estado() to authenticated;
+
+insert into toolbar_config (key, value) values ('kill_switch_auto_at','') on conflict (key) do nothing;

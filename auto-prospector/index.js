@@ -12618,6 +12618,9 @@ const SEC_UMBRALES = {
   rebote_pct:                25,   // % de rebote sobre envíos en 24h
   envios_dia_max:           150,   // envíos totales en un día (los 3 MB no deberían pasar esto)
   heartbeat_min:             25,   // minutos sin latido del worker
+  // Disparadores de ataque (patrón que el user ya validó en su otro proyecto, 2026-08-04):
+  flood_excesos_min:         40,   // ≥40 excesos de límite en 1 minuto = flood distribuido
+  ataque_ips_5min:            3,   // ≥3 IPs distintas bloqueadas en 5 min = ataque coordinado
 };
 
 async function _secLog(token, kind, severity, actor, detail) {
@@ -12661,9 +12664,15 @@ async function _secAvisar(token, cfg, { titulo, cuerpo, kind }) {
 async function _secFrenar(token, motivo) {
   await setConfigValue(token, "kill_switch", "true").catch(() => {});
   await setConfigValue(token, "kill_switch_reason", `${new Date().toISOString()} — ${motivo}`).catch(() => {});
+  // Marca de que lo activó el vigilante y no una persona. Solo lo automático se auto-suelta:
+  // si lo frenaste vos a mano, se queda frenado hasta que vos lo sueltes.
+  await setConfigValue(token, "kill_switch_auto_at", new Date().toISOString()).catch(() => {});
   await _secLog(token, "kill_switch_activado", "critical", "watchdog", { motivo });
   log(`🛑 KILL SWITCH ACTIVADO automáticamente: ${motivo}`);
 }
+
+// Minutos que tiene que aguantar la calma antes de soltar un freno automático.
+const SEC_AUTO_RECUPERACION_MIN = 30;
 
 async function securityWatchdog(token) {
   const cfg = await getConfig(token);
@@ -12708,6 +12717,26 @@ async function securityWatchdog(token) {
     hallazgos.push(`• ${floods} IP(s) inundando el pixel de apertura en la última hora. El rate limit las frenó, pero alguien está jugando con el endpoint.`);
   }
 
+  // ── 3b. FLOOD DISTRIBUIDO ──────────────────────────────────────────────────────────────
+  // Muchos excesos de límite en un minuto: no es un usuario torpe, es tráfico automatizado.
+  // El límite por IP no lo frena porque vienen de IPs distintas — por eso se mide el AGREGADO.
+  const excesosMin = await _count(`${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(pixel_flood,proxy_cuota_usuario,proxy_cuota_proveedor,proxy_cuota_global)&created_at=gte.${new Date(Date.now() - 60_000).toISOString()}&select=id`);
+  if (excesosMin >= SEC_UMBRALES.flood_excesos_min) {
+    critico = true;
+    hallazgos.push(`• FLOOD DISTRIBUIDO: ${excesosMin} excesos de límite en el último minuto. Tráfico automatizado desde varias IPs.`);
+  }
+
+  // ── 3c. ATAQUE COORDINADO ──────────────────────────────────────────────────────────────
+  // Varias IPs distintas chocando contra las defensas en pocos minutos.
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_security_events?severity=eq.critical&created_at=gte.${new Date(Date.now() - 300_000).toISOString()}&select=actor`, { headers: auth });
+    const actores = new Set((r.ok ? await r.json() : []).map(x => x.actor).filter(Boolean));
+    if (actores.size >= SEC_UMBRALES.ataque_ips_5min) {
+      critico = true;
+      hallazgos.push(`• ATAQUE COORDINADO: ${actores.size} orígenes distintos golpeando las defensas en 5 minutos.`);
+    }
+  } catch {}
+
   // ── 4. ENVÍOS DESBOCADOS (cuenta comprometida o bug de cap) ────────────────────────────
   const enviosHoy = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,secondary_sent,bounce_retry_sent,future_sent)&created_at=gte.${hace(24)}&select=id`);
   if (enviosHoy > SEC_UMBRALES.envios_dia_max) {
@@ -12725,6 +12754,42 @@ async function securityWatchdog(token) {
   // ── 6. MILLIONVERIFIER CAÍDO = envíos a ciegas ─────────────────────────────────────────
   if (!cfg.millionverifier_api_key) {
     hallazgos.push(`• MillionVerifier SIN KEY: los envíos están saliendo sin verificar entregabilidad.`);
+  }
+
+  // ── AUTO-RECUPERACIÓN (pedido del user 2026-08-04) ─────────────────────────────────────
+  // "Que si es un falso positivo se prenda nuevamente." Si el freno lo puso el vigilante (no
+  // una persona), pasaron 30 min y NO hay ningún hallazgo nuevo, lo soltamos solo y avisamos.
+  // Un freno puesto a mano NO se toca: si lo apretaste vos, lo soltás vos.
+  if (String(cfg.kill_switch || "") === "true" && (cfg.kill_switch_auto_at || "")) {
+    const desde = Date.parse(cfg.kill_switch_auto_at) || 0;
+    const minutos = (Date.now() - desde) / 60000;
+    // El reapertura automática se puede desactivar (auto_reapertura='false') si preferís
+    // confirmar vos que pasó el peligro, como hacés en el otro proyecto.
+    const autoReabrir = String(cfg.auto_reapertura || "true") !== "false";
+    if (autoReabrir && minutos >= SEC_AUTO_RECUPERACION_MIN && hallazgos.length === 0) {
+      await setConfigValue(token, "kill_switch", "false").catch(() => {});
+      await setConfigValue(token, "kill_switch_reason", "").catch(() => {});
+      await setConfigValue(token, "kill_switch_auto_at", "").catch(() => {});
+      await _secLog(token, "kill_switch_auto_liberado", "info", "watchdog", { minutos: Math.round(minutos) });
+      log(`✅ kill_switch liberado automáticamente: ${Math.round(minutos)} min sin anomalías`);
+      await _secAvisar(token, cfg, {
+        kind: "recuperado",
+        titulo: "Freno liberado — todo volvió a la normalidad",
+        cuerpo: [
+          `El freno de emergencia se había activado solo y ya pasaron ${Math.round(minutos)} minutos sin ninguna anomalía.`,
+          `Lo solté automáticamente: el agente y las APIs volvieron a operar.`,
+          ``,
+          `Si querés frenarlo de nuevo, el botón está en el panel o en tu URL de pánico.`,
+          `Para ver qué había pasado:`,
+          `  SELECT * FROM toolbar_security_events ORDER BY created_at DESC LIMIT 30;`,
+        ].join("\n"),
+      });
+      return;   // nada más que reportar en este ciclo
+    }
+    if (hallazgos.length > 0) {
+      // Sigue habiendo problema: renovamos el reloj para que no se suelte a mitad del incidente.
+      await setConfigValue(token, "kill_switch_auto_at", new Date().toISOString()).catch(() => {});
+    }
   }
 
   // Housekeeping: la tabla del rate limit del pixel crece sin freno.
@@ -12750,7 +12815,12 @@ async function securityWatchdog(token) {
   // Solo ante algo crítico e inequívoco. Un rebote alto NO frena nada (es de negocio, no un
   // ataque); un proxy disparado o envíos desbocados SÍ, porque cuestan plata cada minuto.
   let accion = "Ninguna — solo aviso. Revisalo cuando puedas.";
-  if (critico && String(cfg.kill_switch || "") !== "true") {
+  // Toggle "Defensa automática": encendido por defecto. Si lo apagás, el vigilante sigue
+  // detectando y avisando pero no frena nada solo.
+  const defensaAuto = String(cfg.defensa_automatica || "true") !== "false";
+  if (critico && !defensaAuto) {
+    accion = "⚠️ Defensa automática APAGADA — detecté el problema pero NO frené nada. Actuá vos.";
+  } else if (critico && String(cfg.kill_switch || "") !== "true") {
     await _secFrenar(token, hallazgos[0].slice(0, 150));
     accion = "🛑 KILL SWITCH ACTIVADO automáticamente. El gasto en APIs externas está CORTADO "
            + "(Anthropic, Apollo, RapidAPI, Gemini, Voyage) y el agente dejó de enviar.";

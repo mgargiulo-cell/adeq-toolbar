@@ -520,6 +520,8 @@ function initAdminPanel() {
   document.getElementById("admin-reset-cache-btn")?.addEventListener("click", resetTrafficCacheAboveThreshold);
   // Wire agent
   document.getElementById("agent-toggle")?.addEventListener("change", toggleAgent);
+  // Panel de seguridad: freno de emergencia, defensa automática y reporte de 1 clic.
+  secInit();
   document.getElementById("agent-cfg-save")?.addEventListener("click", saveAgentThresholds);
   document.getElementById("btn-feeder-runs-refresh")?.addEventListener("click", () => _refreshFeederRuns());
   document.getElementById("agent-pause-1h")?.addEventListener("click", pauseAgent1h);
@@ -11212,4 +11214,118 @@ async function updateApiFooter() {
   el.textContent = `API today: ${usage.total} (C:${c}/G:${g}/A:${a}/R:${r}/V:${v})`;
   el.title = `Anthropic (Claude): ${c}\nGemini: ${g}\nApollo: ${a}\nRapidAPI: ${r}\nVoyage (RAG): ${v}`;
   el.style.color = usage.total > 400 ? "#e53e3e" : usage.total > 250 ? "#d97706" : "#a0aec0";
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// 🛡️ PANEL DE SEGURIDAD — freno de emergencia, defensa automática y reporte (Maxi 2026-08-04)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// El freno vive como bandera en la base y lo consultan el api-proxy y el worker antes de gastar.
+// Desde acá se aprieta y se suelta en un clic. La escritura NO va directo a toolbar_config
+// (esa key está protegida por RLS a propósito): pasa por el RPC toggle_kill_switch, que corre
+// con privilegios propios y valida que el mail de quien llama esté en la allowlist.
+async function secEstado() {
+  try {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/kill_switch_estado`, {
+      method: "POST",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}`, "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (!r.ok) return null;
+    const rows = await r.json();
+    return Array.isArray(rows) ? rows[0] : rows;
+  } catch { return null; }
+}
+
+async function secPintar() {
+  const est = await secEstado();
+  const lbl = document.getElementById("sec-estado");
+  const btn = document.getElementById("sec-panic-btn");
+  const mot = document.getElementById("sec-motivo");
+  if (!lbl || !btn) return;
+  const activo = !!est?.activo;
+  lbl.textContent = activo ? "🛑 FRENO ACTIVO" : "✅ Operando normal";
+  lbl.style.color = activo ? "#fca5a5" : "#86efac";
+  btn.textContent = activo ? "✅ SOLTAR EL FRENO" : "🛑 FRENAR TODO AHORA";
+  btn.style.background = activo ? "#1e7d32" : "#b3261e";
+  btn.dataset.activo = activo ? "1" : "0";
+  if (mot) {
+    const txt = String(est?.motivo || "");
+    mot.textContent = txt ? (est?.auto ? `Automático — ${txt}` : txt) : "";
+    mot.style.display = txt ? "block" : "none";
+  }
+}
+
+async function secToggle() {
+  const btn = document.getElementById("sec-panic-btn");
+  if (!btn) return;
+  const encender = btn.dataset.activo !== "1";
+  if (encender && !confirm("Esto CORTA todo el gasto en APIs externas y frena el envío de los 3 buzones.\n\n¿Confirmás?")) return;
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/toggle_kill_switch`, {
+      method: "POST",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ p_on: encender, p_motivo: "desde el panel" }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+  } catch (e) {
+    alert("No se pudo cambiar el freno: " + String(e).slice(0, 200));
+  }
+  btn.disabled = false;
+  await secPintar();
+}
+
+// Reporte de 1 clic: junta los últimos incidentes y el estado, y lo deja en el portapapeles.
+async function secCopiarReporte() {
+  const btn = document.getElementById("sec-report-btn");
+  const orig = btn ? btn.textContent : "";
+  if (btn) btn.textContent = "…";
+  try {
+    const h = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}` };
+    const [evR, estR] = await Promise.all([
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_security_events?select=created_at,kind,severity,actor,detail&order=created_at.desc&limit=60`, { headers: h }),
+      secEstado(),
+    ]);
+    const ev = evR.ok ? await evR.json() : [];
+    const porTipo = {};
+    ev.forEach(e => { porTipo[e.kind] = (porTipo[e.kind] || 0) + 1; });
+    const txt = [
+      `REPORTE DE SEGURIDAD — ADEQ Toolbar`,
+      `Generado: ${new Date().toISOString()}`,
+      `Freno: ${estR?.activo ? "🛑 ACTIVO" : "✅ normal"}${estR?.motivo ? ` — ${estR.motivo}` : ""}`,
+      ``,
+      `INCIDENTES POR TIPO (últimos 60):`,
+      ...Object.entries(porTipo).sort((a, b) => b[1] - a[1]).map(([k, v]) => `  ${k}: ${v}`),
+      ``,
+      `DETALLE:`,
+      ...ev.slice(0, 40).map(e => `  ${String(e.created_at).slice(0, 19)} [${e.severity}] ${e.kind} · ${e.actor || "-"} · ${JSON.stringify(e.detail || {}).slice(0, 160)}`),
+    ].join("\n");
+    await navigator.clipboard.writeText(txt);
+    if (btn) btn.textContent = "✅ Copiado";
+  } catch (e) {
+    if (btn) btn.textContent = "❌ error";
+  }
+  setTimeout(() => { if (btn) btn.textContent = orig; }, 2000);
+}
+
+async function secToggleDefensa(e) {
+  const on = !!e.target.checked;
+  // defensa_automatica NO está en la lista protegida de RLS: se puede escribir directo.
+  try {
+    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.defensa_automatica`, {
+      method: "PATCH",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${auth.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ value: on ? "true" : "false" }),
+    });
+  } catch {}
+}
+
+function secInit() {
+  const b = document.getElementById("sec-panic-btn");
+  const r = document.getElementById("sec-report-btn");
+  const t = document.getElementById("sec-auto-toggle");
+  if (b && !b.dataset.wired) { b.dataset.wired = "1"; b.addEventListener("click", secToggle); }
+  if (r && !r.dataset.wired) { r.dataset.wired = "1"; r.addEventListener("click", secCopiarReporte); }
+  if (t && !t.dataset.wired) { t.dataset.wired = "1"; t.addEventListener("change", secToggleDefensa); }
+  secPintar();
 }

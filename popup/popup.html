@@ -180,6 +180,28 @@
       </div>
     </div>
 
+    <!-- 🛡️ SEGURIDAD — freno de emergencia (Maxi 2026-08-04) -->
+    <div id="sec-panel" style="background:#1e293b;border:1px solid #475569;border-radius:8px;padding:10px 12px;margin-bottom:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px">
+        <div style="font-weight:700;color:#e2e8f0;font-size:13px">🛡️ Seguridad</div>
+        <span id="sec-estado" style="font-size:11px;color:#94a3b8;flex:1;text-align:right">—</span>
+      </div>
+      <div id="sec-motivo" style="font-size:10px;color:#fca5a5;margin-bottom:8px;display:none"></div>
+      <button id="sec-panic-btn" class="btn" style="width:100%;background:#b3261e;color:#fff;font-weight:700;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:12px">
+        🛑 FRENAR TODO AHORA
+      </button>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+        <label class="toggle-switch" title="Si está apagado, el vigilante detecta y avisa pero no frena solo">
+          <input id="sec-auto-toggle" type="checkbox" checked />
+          <span class="toggle-slider"></span>
+        </label>
+        <span style="font-size:11px;color:#cbd5e1;flex:1">Defensa automática</span>
+        <button id="sec-report-btn" class="btn" style="background:#334155;color:#e2e8f0;padding:6px 10px;border:none;border-radius:6px;cursor:pointer;font-size:11px">
+          📋 Copiar reporte
+        </button>
+      </div>
+    </div>
+
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">
       <div class="stat-card"><div class="stat-num" id="agent-stat-sent">--</div><div class="stat-label">Sent today</div></div>
       <div class="stat-card"><div class="stat-num" id="agent-stat-skipped">--</div><div class="stat-label">Skipped 24h</div></div>
