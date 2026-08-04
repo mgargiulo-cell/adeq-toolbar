@@ -242,3 +242,34 @@ begin
     limit least(coalesce(p_limit, 60), 200);
 end $$;
 grant execute on function public.security_report(int) to authenticated;
+
+-- ── 12. BLOQUEO DE REGISTROS NO AUTORIZADOS ────────────────────────────────────────────
+-- El toggle "Allow new users to sign up" del dashboard no aparecía en la versión del panel del
+-- user, y además es frágil: una casilla que se mueve entre versiones y que alguien puede
+-- desmarcar sin dejar rastro. Esto es más fuerte: valida contra la propia allowlist del
+-- proyecto y deja registrado CADA intento, así el vigilante avisa si alguien está probando.
+create or replace function public.bloquear_signups_no_autorizados()
+returns trigger language plpgsql security definer set search_path = public as $$
+declare v_permitidos jsonb;
+begin
+  select value::jsonb into v_permitidos from toolbar_config where key = 'agent_enabled_users';
+  -- Falla PERMISIVO a propósito: sin lista cargada no bloquea. Prefiero eso a dejar afuera al
+  -- dueño por un error de configuración.
+  if v_permitidos is null or jsonb_array_length(v_permitidos) = 0 then return new; end if;
+  if not exists (
+    select 1 from jsonb_array_elements_text(v_permitidos) e
+    where lower(e) = lower(new.email)
+  ) then
+    insert into toolbar_security_events (kind, severity, actor, detail)
+    values ('signup_bloqueado', 'critical', lower(coalesce(new.email, '?')),
+            jsonb_build_object('cuando', now()));
+    raise exception 'registro no permitido';
+  end if;
+  return new;
+end $$;
+drop trigger if exists trg_bloquear_signups on auth.users;
+create trigger trg_bloquear_signups
+  before insert on auth.users
+  for each row execute function public.bloquear_signups_no_autorizados();
+-- OJO a futuro: si sumás un MB nuevo, agregalo PRIMERO a agent_enabled_users y después que se
+-- registre. Si no, el trigger le rechaza el alta.
