@@ -12533,6 +12533,175 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
 // - quita trailing slash
 // - si ya tiene www. → no duplica
 // - si es subdomain (ej. blog.foo.com) → NO agrega www (sería www.blog.foo.com, raro)
+
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// VIGILANTE DE SEGURIDAD — detecta, avisa y se autodefiende (Maxi 2026-07-28)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Pedido del user: "alerta en tiempo real si algo malfunciona a mgargiulo@adeqmedia.com",
+// "no quiero consumos piratas ni en Vercel ni en Supabase", "alguna función que intente
+// autosolucionar el problema identificándolo y atacándolo".
+//
+// Corre en cada ciclo del worker. Tres capas:
+//   1. DETECTA — cruza señales que YA existen en la base (uso de APIs, rebotes, incidentes
+//      del proxy y del pixel, silencio del worker) contra umbrales.
+//   2. ACTÚA SOLO — ante algo crítico y sin ambigüedad, aprieta el freno correspondiente.
+//      Nunca frena por algo dudoso: cada auto-acción tiene un disparador inequívoco.
+//   3. AVISA — un mail con lo que pasó, lo que hizo solo y cómo revertirlo en un clic.
+//
+// Anti-spam: máximo un mail por tipo de incidente cada 60 min (security_last_alert_<kind>).
+const SEC_UMBRALES = {
+  proxy_llamadas_dia:      1500,   // uso total del proxy en el día (tope duro: 2000)
+  proxy_no_autorizados_h:     3,   // intentos de un mail fuera de la allowlist, por hora
+  pixel_floods_h:             1,   // una sola IP inundando el pixel ya es alerta
+  rebote_pct:                25,   // % de rebote sobre envíos en 24h
+  envios_dia_max:           150,   // envíos totales en un día (los 3 MB no deberían pasar esto)
+  heartbeat_min:             25,   // minutos sin latido del worker
+};
+
+async function _secLog(token, kind, severity, actor, detail) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_security_events`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({ kind, severity, actor: actor || "worker", detail: detail || {} }),
+    });
+  } catch {}
+}
+
+// Mail de alerta. Va desde el buzón del propio dueño para que nunca lo filtre spam.
+async function _secAvisar(token, cfg, { titulo, cuerpo, kind }) {
+  const dest = (cfg.security_alert_email || "mgargiulo@adeqmedia.com").trim();
+  // Anti-spam: un mail por tipo cada 60 min. Si algo está roto no queremos 200 mails.
+  const ultimaKey = `security_last_alert_${kind}`;
+  const ultima = Date.parse(cfg[ultimaKey] || "") || 0;
+  if (Date.now() - ultima < 60 * 60 * 1000) return false;
+  try {
+    await sendGmailServer(token, dest, {
+      to: dest,
+      subject: `🚨 ADEQ Toolbar — ${titulo}`,
+      body: cuerpo,
+      agentActionId: null,
+    });
+    await setConfigValue(token, ultimaKey, new Date().toISOString()).catch(() => {});
+    log(`🚨 alerta de seguridad enviada a ${dest}: ${titulo}`);
+    return true;
+  } catch (e) {
+    log(`⚠️ no se pudo enviar la alerta de seguridad: ${e.message}`);
+    return false;
+  }
+}
+
+// Freno de emergencia: corta TODO el gasto externo. Lo lee el api-proxy en cada request y el
+// worker al arrancar cada ciclo. Se revierte con un UPDATE de una línea.
+async function _secFrenar(token, motivo) {
+  await setConfigValue(token, "kill_switch", "true").catch(() => {});
+  await setConfigValue(token, "kill_switch_reason", `${new Date().toISOString()} — ${motivo}`).catch(() => {});
+  await _secLog(token, "kill_switch_activado", "critical", "watchdog", { motivo });
+  log(`🛑 KILL SWITCH ACTIVADO automáticamente: ${motivo}`);
+}
+
+async function securityWatchdog(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.security_watchdog_enabled || "true") === "false") return;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const hallazgos = [];
+  let critico = false;
+
+  const _count = async (url) => {
+    try {
+      const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch { return 0; }
+  };
+  const hace = (h) => new Date(Date.now() - h * 3600_000).toISOString();
+  const hoy  = new Date().toISOString().slice(0, 10);
+
+  // ── 1. GASTO PIRATA EN EL PROXY ────────────────────────────────────────────────────────
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=eq.${hoy}&select=user_email,total`, { headers: auth });
+    const filas = r.ok ? await r.json() : [];
+    const totalDia = filas.reduce((a, f) => a + (f.total || 0), 0);
+    if (totalDia > SEC_UMBRALES.proxy_llamadas_dia) {
+      critico = true;
+      hallazgos.push(`• Uso del proxy DISPARADO: ${totalDia} llamadas hoy (umbral ${SEC_UMBRALES.proxy_llamadas_dia}).\n  Por usuario: ${filas.map(f => `${f.user_email}=${f.total}`).join(", ")}`);
+    }
+  } catch {}
+
+  // ── 2. ALGUIEN INTENTANDO ENTRAR AL PROXY ──────────────────────────────────────────────
+  const noAutorizados = await _count(`${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&created_at=gte.${hace(1)}&select=id`);
+  if (noAutorizados >= SEC_UMBRALES.proxy_no_autorizados_h) {
+    critico = true;
+    hallazgos.push(`• ${noAutorizados} intentos de acceso NO AUTORIZADO al proxy en la última hora. Alguien está probando entrar.`);
+  }
+
+  // ── 3. INUNDACIÓN DEL PIXEL ────────────────────────────────────────────────────────────
+  const floods = await _count(`${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=eq.pixel_flood&created_at=gte.${hace(1)}&select=id`);
+  if (floods >= SEC_UMBRALES.pixel_floods_h) {
+    hallazgos.push(`• ${floods} IP(s) inundando el pixel de apertura en la última hora. El rate limit las frenó, pero alguien está jugando con el endpoint.`);
+  }
+
+  // ── 4. ENVÍOS DESBOCADOS (cuenta comprometida o bug de cap) ────────────────────────────
+  const enviosHoy = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,secondary_sent,bounce_retry_sent,future_sent)&created_at=gte.${hace(24)}&select=id`);
+  if (enviosHoy > SEC_UMBRALES.envios_dia_max) {
+    critico = true;
+    hallazgos.push(`• ${enviosHoy} mails en 24h — muy por encima de lo normal (umbral ${SEC_UMBRALES.envios_dia_max}). O se rompió el cap diario o alguien tiene acceso a un buzón.`);
+  }
+
+  // ── 5. REBOTE DESCONTROLADO (quema la reputación de los dominios) ──────────────────────
+  const env24 = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hace(24)}&select=id`);
+  const reb24 = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.bounce_detected&created_at=gte.${hace(24)}&select=id`);
+  if (env24 >= 20 && (100 * reb24 / env24) > SEC_UMBRALES.rebote_pct) {
+    hallazgos.push(`• Rebote al ${Math.round(100 * reb24 / env24)}% en 24h (${reb24}/${env24}). Con esto se quema la reputación de los buzones.`);
+  }
+
+  // ── 6. MILLIONVERIFIER CAÍDO = envíos a ciegas ─────────────────────────────────────────
+  if (!cfg.millionverifier_api_key) {
+    hallazgos.push(`• MillionVerifier SIN KEY: los envíos están saliendo sin verificar entregabilidad.`);
+  }
+
+  if (hallazgos.length === 0) return;
+
+  // ── AUTO-REMEDIACIÓN ───────────────────────────────────────────────────────────────────
+  // Solo ante algo crítico e inequívoco. Un rebote alto NO frena nada (es de negocio, no un
+  // ataque); un proxy disparado o envíos desbocados SÍ, porque cuestan plata cada minuto.
+  let accion = "Ninguna — solo aviso. Revisalo cuando puedas.";
+  if (critico && String(cfg.kill_switch || "") !== "true") {
+    await _secFrenar(token, hallazgos[0].slice(0, 150));
+    accion = "🛑 KILL SWITCH ACTIVADO automáticamente. El gasto en APIs externas está CORTADO "
+           + "(Anthropic, Apollo, RapidAPI, Gemini, Voyage) y el agente dejó de enviar.";
+  }
+
+  const cuerpo = [
+    `Detecté algo raro en la toolbar y te aviso al toque.`,
+    ``,
+    `QUÉ PASÓ`,
+    ...hallazgos,
+    ``,
+    `QUÉ HICE`,
+    accion,
+    ``,
+    `CÓMO LO REVERTÍS (1 clic, en el SQL editor de Supabase)`,
+    `  UPDATE toolbar_config SET value='false' WHERE key='kill_switch';`,
+    ``,
+    `CÓMO LO FRENÁS VOS SI HACE FALTA`,
+    `  UPDATE toolbar_config SET value='true' WHERE key='kill_switch';`,
+    ``,
+    `PARA VER EL DETALLE`,
+    `  SELECT * FROM toolbar_security_events ORDER BY created_at DESC LIMIT 50;`,
+    ``,
+    `— Vigilante de la ADEQ Toolbar · ${new Date().toISOString()}`,
+  ].join("\n");
+
+  await _secAvisar(token, cfg, {
+    kind: critico ? "critico" : "aviso",
+    titulo: critico ? "ALERTA CRÍTICA — freno automático activado" : "Aviso de seguridad",
+    cuerpo,
+  });
+}
+
 function _ensureWwwPrefix(domain) {
   if (!domain) return "";
   let d = String(domain).trim().toLowerCase();
@@ -12715,6 +12884,12 @@ async function runAgentCycle(token, allFlags) {
     scanRealResponsesForUser(token, userEmail).catch(() => {});
     // Auto-reply scan (out-of-office, ticket systems, etc.) — también dispara retry
     scanAutoRepliesForUser(token, userEmail).catch(() => {});
+    // FRENO DE EMERGENCIA GLOBAL (Maxi 2026-07-28). Lo puede activar el vigilante solo, o el
+    // dueño con un UPDATE de una línea. Corta el envío de TODOS los buzones al instante.
+    if (String(cfg.kill_switch || "") === "true") {
+      log(`🛑 kill_switch ACTIVO — no se envía nada. Motivo: ${cfg.kill_switch_reason || "(sin detalle)"}`);
+      break;
+    }
     // Kill switch check
     if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
     // Daily cap — por usuario (override) o global
@@ -15299,6 +15474,8 @@ async function main() {
         // detector estructural). Gated por config purge_blocked_prospects='true'; se auto-apaga al terminar.
         // Maxi 2026-07-28: PRIMERO el barrido gratis por URL (sin red, sin créditos). Lo que
         // sobreviva pasa al sweep caro, que gasta scrape + Haiku solo en los dudosos.
+        // Vigilante de seguridad: detecta abuso, avisa por mail y frena solo si hace falta.
+        await securityWatchdog(token).catch(e => log(`⚠️ watchdog: ${e.message}`));
         // Maxi 2026-08-01: reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout).
         // 1×/día, gratis. Los que ahora sí tienen vuelven solos a la cola.
         await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));

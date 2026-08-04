@@ -65,83 +65,182 @@ const PROVIDERS = {
   },
 };
 
-const CORS = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+// Maxi 2026-07-28 (blindaje): CORS ya no es "*". Solo la extensión y el dashboard. Con "*"
+// cualquier página web podía invocar el proxy desde el navegador de un usuario logueado.
+const ORIGENES_OK = [
+  /^chrome-extension:\/\/[a-p]{32}$/,          // la extensión (cualquier ID, formato Chrome)
+  /^https:\/\/([a-z0-9-]+\.)*adeqmedia\.com$/, // dashboards propios
+  /^https:\/\/([a-z0-9-]+\.)*vercel\.app$/,    // previews de Vercel
+];
+function corsFor(origin: string) {
+  const ok = !origin || ORIGENES_OK.some(re => re.test(origin));
+  return {
+    "Access-Control-Allow-Origin":  ok ? (origin || "*") : "null",
+    "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Vary": "Origin",
+    // Cabeceras de endurecimiento — no cuestan nada y cierran vectores tontos.
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Resource-Policy": "same-site",
+  };
+}
+// Métodos permitidos por proveedor: el path estaba en allowlist pero el método no, así que se
+// podía mandar un DELETE a un endpoint que solo debería recibir GET/POST.
+const METODOS_OK: Record<string, string[]> = {
+  gemini: ["POST"], apollo: ["POST", "GET"], rapidapi: ["GET"],
+  anthropic: ["POST"], voyage: ["POST"],
 };
+// Tope GLOBAL diario, sumando todos los usuarios. Las cuotas por usuario no alcanzan: si
+// alguien consigue N cuentas, N×500 llamadas. Esto es el techo duro del gasto.
+const CUOTA_GLOBAL_DIA = 2000;
 
-function json(status: number, data: any) {
+function json(status: number, data: any, origin = "") {
   return new Response(JSON.stringify(data), {
-    status, headers: { ...CORS, "Content-Type": "application/json" },
+    status, headers: { ...corsFor(origin), "Content-Type": "application/json" },
   });
 }
 
-serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
-  if (req.method !== "POST")    return json(405, { error: "Method not allowed" });
+// Deja constancia del incidente. La alerta por mail la dispara el worker leyendo esta tabla.
+async function registrarIncidente(sb: any, kind: string, severity: string, actor: string, detail: any) {
+  try { await sb.from("toolbar_security_events").insert({ kind, severity, actor, detail }); } catch {}
+}
 
-  // ── Validate user JWT ────────────────────────────────────────
-  const authHeader = req.headers.get("authorization") || "";
-  const jwt = authHeader.replace(/^Bearer\s+/i, "");
-  if (!jwt) return json(401, { error: "Missing bearer token" });
+serve(async (req) => {
+  const origin = req.headers.get("origin") || "";
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsFor(origin) });
+  if (req.method !== "POST")    return json(405, { error: "Method not allowed" }, origin);
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabase    = createClient(supabaseUrl, serviceKey);
+  const ipHash = (req.headers.get("x-forwarded-for") || "").split(",")[0].trim().slice(0, 45);
+
+  // ── Validate user JWT ────────────────────────────────────────
+  const authHeader = req.headers.get("authorization") || "";
+  const jwt = authHeader.replace(/^Bearer\s+/i, "");
+  if (!jwt) return json(401, { error: "Missing bearer token" }, origin);
 
   const { data: userData, error: userErr } = await supabase.auth.getUser(jwt);
-  if (userErr || !userData?.user?.email) return json(401, { error: "Invalid token" });
+  if (userErr || !userData?.user?.email) {
+    await registrarIncidente(supabase, "jwt_invalido", "warn", ipHash, { origin });
+    return json(401, { error: "Invalid token" }, origin);
+  }
   const userEmail = userData.user.email.toLowerCase();
+
+  // ── BLINDAJE 2026-07-28 ──────────────────────────────────────────────────────────────
+  // Leemos config una sola vez: kill switch + allowlist de usuarios.
+  const { data: cfgRows } = await supabase.from("toolbar_config")
+    .select("key,value").in("key", ["kill_switch", "agent_whitelist", "agent_enabled_users", "proxy_extra_users"]);
+  const cfg: Record<string,string> = {};
+  for (const r of (cfgRows || [])) cfg[r.key] = r.value;
+
+  // 1. INTERRUPTOR DE EMERGENCIA: corta TODO el gasto externo de un saque.
+  if (String(cfg.kill_switch || "") === "true") {
+    return json(503, { error: "kill_switch activo — gasto externo suspendido" }, origin);
+  }
+
+  // 2. ALLOWLIST DE USUARIOS. Antes alcanzaba con estar autenticado en el proyecto Supabase:
+  // si el registro está abierto, cualquiera se crea una cuenta y gasta 500 llamadas/día
+  // (200 de Anthropic) con NUESTRAS keys. Ahora el mail tiene que estar explícitamente listado.
+  const permitidos = new Set<string>();
+  for (const k of ["agent_whitelist", "agent_enabled_users", "proxy_extra_users"]) {
+    const raw = (cfg[k] || "").trim();
+    if (!raw) continue;
+    try {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) arr.forEach((e: string) => permitidos.add(String(e).toLowerCase().trim()));
+      else raw.split(/[,;\s]+/).forEach(e => e && permitidos.add(e.toLowerCase()));
+    } catch {
+      raw.split(/[,;\s]+/).forEach(e => e && permitidos.add(e.toLowerCase()));
+    }
+  }
+  if (permitidos.size > 0 && !permitidos.has(userEmail)) {
+    await registrarIncidente(supabase, "proxy_usuario_no_autorizado", "critical", userEmail, { origin, ip: ipHash });
+    return json(403, { error: "Usuario no autorizado para el proxy" }, origin);
+  }
+
+  // 3. ORIGEN. Si vino de una web y no está en la lista, se rechaza (los clientes sin origin
+  // —el worker, curl— pasan: ahí manda el JWT).
+  if (origin && !ORIGENES_OK.some(re => re.test(origin))) {
+    await registrarIncidente(supabase, "proxy_origen_no_permitido", "critical", userEmail, { origin, ip: ipHash });
+    return json(403, { error: "Origen no permitido" }, origin);
+  }
 
   // ── Parse body ──────────────────────────────────────────────
   let payload: any;
   try { payload = await req.json(); } catch { return json(400, { error: "Invalid JSON" }); }
   const { provider, path, method = "GET", headers: extraHeaders = {}, body = null, query = "" } = payload || {};
 
-  const cfg = PROVIDERS[provider];
-  if (!cfg)               return json(400, { error: "Unknown provider" });
-  if (!cfg.allow.test(path || "")) return json(403, { error: "Path not allowed", path });
+  const pcfg = PROVIDERS[provider];
+  if (!pcfg)               return json(400, { error: "Unknown provider" }, origin);
+  if (!pcfg.allow.test(path || "")) {
+    await registrarIncidente(supabase, "proxy_path_no_permitido", "warn", userEmail, { provider, path });
+    return json(403, { error: "Path not allowed", path }, origin);
+  }
+  // Método permitido por proveedor (antes solo se validaba el path).
+  if (!(METODOS_OK[provider] || []).includes(String(method).toUpperCase()))
+    return json(405, { error: `Método ${method} no permitido para ${provider}` }, origin);
+  // El querystring lo arma el cliente: acotarlo evita que metan parámetros caros o rarezas.
+  if (String(query || "").length > 500) return json(400, { error: "query demasiado larga" }, origin);
 
-  // ── Quota check ─────────────────────────────────────────────
+  // ── CUOTA ATÓMICA (Maxi 2026-07-28) ─────────────────────────────────────────────────
+  // Antes era leer-y-después-escribir: 50 requests en paralelo leían el mismo contador y
+  // pasaban las 50 aunque quedara 1 de cuota. Ahora se incrementa y se lee en una sola
+  // operación en Postgres, así el tope es real. Y se cuenta ANTES de llamar al upstream:
+  // un intento fallido igual consume cuota, que es lo correcto contra un atacante.
   const today = new Date().toISOString().slice(0, 10);
-  const { data: quotaRow } = await supabase
-    .from("toolbar_api_usage")
-    .select("total,by_provider")
-    .eq("user_email", userEmail).eq("day", today).maybeSingle();
+  const { data: bumped, error: bumpErr } = await supabase
+    .rpc("bump_api_usage", { p_email: userEmail, p_provider: provider });
+  if (bumpErr) return json(500, { error: "No se pudo registrar el uso" }, origin);
+  const total   = bumped?.[0]?.total ?? 0;
+  const provCnt = bumped?.[0]?.prov  ?? 0;
 
-  const total   = quotaRow?.total || 0;
-  const byProv  = quotaRow?.by_provider || {};
-  const provCnt = byProv[provider] || 0;
+  if (total > DAILY_QUOTA_PER_USER) {
+    await registrarIncidente(supabase, "proxy_cuota_usuario", "warn", userEmail, { total, limite: DAILY_QUOTA_PER_USER });
+    return json(429, { error: "Daily total quota exceeded", limit: DAILY_QUOTA_PER_USER, used: total }, origin);
+  }
+  if (provCnt > PROVIDER_CAPS[provider]) {
+    await registrarIncidente(supabase, "proxy_cuota_proveedor", "warn", userEmail, { provider, provCnt });
+    return json(429, { error: `Daily ${provider} quota exceeded`, limit: PROVIDER_CAPS[provider], used: provCnt }, origin);
+  }
 
-  if (total >= DAILY_QUOTA_PER_USER)
-    return json(429, { error: "Daily total quota exceeded", limit: DAILY_QUOTA_PER_USER, used: total });
-  if (provCnt >= PROVIDER_CAPS[provider])
-    return json(429, { error: `Daily ${provider} quota exceeded`, limit: PROVIDER_CAPS[provider], used: provCnt });
+  // TOPE GLOBAL del día, sumando a todos los usuarios. Las cuotas por usuario no alcanzan:
+  // con N cuentas son N×500 llamadas. Este es el techo duro del gasto diario.
+  const { data: globalRows } = await supabase
+    .from("toolbar_api_usage").select("total").eq("day", today);
+  const globalTotal = (globalRows || []).reduce((a: number, r: any) => a + (r.total || 0), 0);
+  if (globalTotal > CUOTA_GLOBAL_DIA) {
+    await registrarIncidente(supabase, "proxy_cuota_global", "critical", userEmail, { globalTotal, limite: CUOTA_GLOBAL_DIA });
+    return json(429, { error: "Tope global diario alcanzado", used: globalTotal, limit: CUOTA_GLOBAL_DIA }, origin);
+  }
 
   // ── Build upstream request ──────────────────────────────────
-  const keyVal = Deno.env.get(cfg.keyEnv);
-  if (!keyVal) return json(500, { error: `Missing ${cfg.keyEnv} secret` });
+  const keyVal = Deno.env.get(pcfg.keyEnv);
+  if (!keyVal) return json(500, { error: `Missing ${pcfg.keyEnv} secret` }, origin);
 
-  let url = cfg.base + path;
+  let url = pcfg.base + path;
   if (query) url += (url.includes("?") ? "&" : "?") + query;
 
-  const upstreamHeaders: Record<string,string> = {
-    "Content-Type": "application/json",
-    ...extraHeaders,
-  };
+  // extraHeaders viene del cliente: filtramos cualquier cabecera de autenticación para que no
+  // pueda pisar —ni filtrar— nuestras keys. Las de auth se setean después, abajo.
+  const PROHIBIDAS = /^(authorization|x-api-key|x-rapidapi-key|x-rapidapi-host|anthropic-version|cookie|host)$/i;
+  const upstreamHeaders: Record<string,string> = { "Content-Type": "application/json" };
+  for (const [k, v] of Object.entries(extraHeaders || {})) {
+    if (!PROHIBIDAS.test(k) && typeof v === "string" && v.length < 500) upstreamHeaders[k] = v;
+  }
 
-  if (cfg.authMode === "query") {
+  if (pcfg.authMode === "query") {
     url += (url.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(keyVal);
-  } else if (cfg.authMode === "header-x-api-key") {
+  } else if (pcfg.authMode === "header-x-api-key") {
     upstreamHeaders["X-Api-Key"] = keyVal;
-  } else if (cfg.authMode === "header-rapidapi") {
+  } else if (pcfg.authMode === "header-rapidapi") {
     upstreamHeaders["x-rapidapi-key"]  = keyVal;
-    upstreamHeaders["x-rapidapi-host"] = cfg.hostHeader;
-  } else if (cfg.authMode === "header-anthropic") {
+    upstreamHeaders["x-rapidapi-host"] = pcfg.hostHeader;
+  } else if (pcfg.authMode === "header-anthropic") {
     upstreamHeaders["x-api-key"]          = keyVal;
-    upstreamHeaders["anthropic-version"]  = cfg.apiVersion || "2023-06-01";
-  } else if (cfg.authMode === "header-bearer") {
+    upstreamHeaders["anthropic-version"]  = pcfg.apiVersion || "2023-06-01";
+  } else if (pcfg.authMode === "header-bearer") {
     upstreamHeaders["Authorization"]      = `Bearer ${keyVal}`;
   }
 
@@ -154,25 +253,18 @@ serve(async (req) => {
       body: body != null && method !== "GET" && method !== "HEAD" ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
-    return json(502, { error: "Upstream fetch failed", detail: String(e) });
+    return json(502, { error: "Upstream fetch failed", detail: String(e) }, origin);
   }
 
   const upstreamBody = await upstreamRes.text();
 
-  // ── Record usage (fire-and-forget style) ────────────────────
-  const newByProv = { ...byProv, [provider]: provCnt + 1 };
-  await supabase.from("toolbar_api_usage").upsert({
-    user_email: userEmail,
-    day: today,
-    total: total + 1,
-    by_provider: newByProv,
-    updated_at: new Date().toISOString(),
-  }, { onConflict: "user_email,day" });
+  // El uso ya quedó contado arriba de forma atómica (bump_api_usage), antes de llamar al
+  // upstream. No hace falta un segundo upsert acá.
 
   return new Response(upstreamBody, {
     status: upstreamRes.status,
     headers: {
-      ...CORS,
+      ...corsFor(origin),
       "Content-Type":     upstreamRes.headers.get("content-type") || "application/json",
       "X-Quota-Remaining": String(DAILY_QUOTA_PER_USER - (total + 1)),
       "X-Provider-Remaining": String(PROVIDER_CAPS[provider] - (provCnt + 1)),
