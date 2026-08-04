@@ -1865,7 +1865,12 @@ async function _serperContactSearch(domain) {
     const res = await fetch("https://google.serper.dev/search", {
       method: "POST",
       headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ q: `${clean} contato OR contacto OR contact OR publicidade OR email OR telefone OR whatsapp`, num: 10 }),
+      // Maxi 2026-08-04: se agrega `site:` para que Google devuelva las páginas DEL SITIO, no
+      // menciones sueltas. Es la práctica que hace un media buyer a mano: googlear el dominio
+      // con "contacto" y abrir el resultado. Ahora además de minar el snippet nos quedamos con
+      // la URL, que es lo más valioso: Google ya sabe cuál es la página de contacto.
+      // Cobertura de idiomas alineada con CONTACT_HINT.
+      body: JSON.stringify({ q: `site:${clean} (contacto OR contato OR contact OR kontakt OR contatti OR iletisim OR kapcsolat OR publicidad OR publicidade OR pubblicita OR werbung OR reklam OR inzercia OR hirdetes OR advertising OR impressum OR "media kit" OR anunciate OR escribenos)`, num: 10 }),
       signal: AbortSignal.timeout(10000),
     });
     if (!res.ok) { log(`  ⚠️ Serper contact ${res.status} ${clean}`); return { emails: [], phones: [], whatsapps: [] }; }
@@ -1874,13 +1879,23 @@ async function _serperContactSearch(domain) {
     for (const r of (Array.isArray(data.organic) ? data.organic : [])) text += ` ${r.title || ""} ${r.snippet || ""} ${r.link || ""}`;
     if (data.knowledgeGraph) { const kg = data.knowledgeGraph; text += ` ${kg.title || ""} ${kg.description || ""} ${kg.phoneNumber || ""} ${kg.website || ""} ${JSON.stringify(kg.attributes || {})}`; }
     if (data.answerBox) text += ` ${data.answerBox.snippet || ""} ${data.answerBox.answer || ""}`;
+    // URLs de páginas institucionales DEL PROPIO SITIO que Google ya indexó. Vale más que el
+    // snippet: se las pasamos al scraper para que las baje en vez de adivinar rutas.
+    const urlsContacto = (Array.isArray(data.organic) ? data.organic : [])
+      .map(r => String(r.link || ""))
+      .filter(u => {
+        try {
+          const h = new URL(u).hostname.replace(/^www\./, "");
+          return (h === clean || h.endsWith("." + clean)) && CONTACT_HINT.test(new URL(u).pathname);
+        } catch { return false; }
+      }).slice(0, 6);
     // Emails: SOLO del mismo dominio registrable (evita agarrar mails de otros sitios del ranking).
     const emails = extractEmailsFromHtml(text).filter(e => {
       const host = (e.split("@")[1] || "").toLowerCase();
       return host === clean || host.endsWith("." + clean) || host === base + "." + clean.split(".").slice(1).join(".") || (base.length >= 4 && host.split(".")[0] === base);
     });
     const { phones, whatsapps } = extractPhonesFromHtml(text);
-    return { emails: [...new Set(emails)], phones, whatsapps };
+    return { urlsContacto, emails: [...new Set(emails)], phones, whatsapps };
   } catch (e) { log(`  ⚠️ Serper contact error ${clean}: ${e.message}`); return { emails: [], phones: [], whatsapps: [] }; }
 }
 
@@ -4820,6 +4835,84 @@ function _decodeCfEmail(hex) {
   } catch { return null; }
 }
 
+
+// ── DESOFUSCACIÓN AVANZADA (auditoría empírica 2026-08-04) ─────────────────────────────────
+// Prevalencia medida sobre 23 publishers accesibles: Cloudflare 26%, concatenación JS 9%,
+// palabra-por-arroba no latina 4%, espacio dentro del dominio 4%.
+
+// Entidades HTML/JS completas. El deobfuscador actual SOLO convierte &#64; y &#46;, así que en
+// los sitios con Joomla —que codifican TODAS las letras— aunque se una la concatenación no sale
+// nada: 'm&#97;rk&#101;t&#105;ng' tiene que volver a "marketing" primero.
+function _decodeEntitiesAll(t) {
+  return String(t || "")
+    .replace(/&#x([0-9a-f]{1,6});/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d{1,7});/g,         (_, d) => String.fromCharCode(+d))
+    .replace(/\\x([0-9a-f]{2})/gi,    (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\u00([0-9a-f]{2})/gi,  (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
+// Concatenación en JavaScript. Cubre los dos patrones que aparecen en la vida real:
+//   · Joomla email cloaking (crnobelo.com/impresum → marketing@crnobelo.com)
+//       var addy = 'm&#97;rk&#101;t&#105;ng' + '&#64;'; addy = addy + 'crn&#111;b&#101;l&#111;' + '&#46;' + 'c&#111;m';
+//   · document.write troceado (berekenhet.nl/zakelijk/contact.html → beheer@berekenhet.nl)
+//       a=':';b='@';c='.'; document.write('\x3ca hr'+'ef="m'+'ailto'+a+'behe'+'er@be'+'reken'+'het'+c+'nl">');
+// Joomla es enorme en Balcanes y Europa del Este, que es medio pool tier 4.
+function _deobfJsConcat(html) {
+  return String(html || "").replace(/<script\b[^>]*>([\s\S]{0,20000}?)<\/script>/gi, (full, js) => {
+    // 1) variables de 1-3 caracteres:  a=':'  ·  c='.'  ·  var b = "@"
+    const vars = {};
+    for (const m of js.matchAll(/(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*(['"])(.{1,3}?)\2\s*;/g)) vars[m[1]] = m[3];
+    let out = js;
+    // 2) 'xx' + VAR + 'yy'  →  'xxVALyy'
+    out = out.replace(/(['"])\s*\+\s*([A-Za-z_$][\w$]*)\s*\+\s*(['"])/g,
+                      (mm, q1, n) => vars[n] !== undefined ? vars[n] : mm);
+    // 3) 'xx' + 'yy'  →  'xxyy'  (repetido hasta que no quede nada por unir)
+    let prev; let guard = 0;
+    do { prev = out; out = out.replace(/(['"])\s*\+\s*(['"])/g, ""); } while (out !== prev && ++guard < 40);
+
+    // 4) ACUMULACIÓN EN VARIABLES. Joomla arma el mail en pasos separados y los pasos 2-3 no
+    //    alcanzan, porque `addy = addy + '...'` no es una concatenación de literales:
+    //      var addy = 'm&#97;rk&#101;t&#105;ng' + '&#64;';
+    //      addy = addy + 'crn&#111;b&#101;l&#111;' + '&#46;' + 'c&#111;m';
+    //    Intérprete mínimo: seguimos el valor de cada variable y al final volcamos las que
+    //    contienen una arroba, para que el regex de emails las encuentre como texto suelto.
+    const acc = {};
+    for (const m of out.matchAll(/(?:var\s+)?([A-Za-z_$][\w$]*)\s*=\s*([^;]+);/g)) {
+      const nombre = m[1];
+      let expr = m[2].trim();
+      // Solo expresiones de literales y de la propia variable: nada de llamadas a funciones.
+      if (!/^(?:['"][^'"]*['"]|[A-Za-z_$][\w$]*)(?:\s*\+\s*(?:['"][^'"]*['"]|[A-Za-z_$][\w$]*))*$/.test(expr)) continue;
+      let val = "";
+      for (const parte of expr.split("+")) {
+        const t = parte.trim();
+        if (/^['"]/.test(t)) val += t.slice(1, -1);
+        else if (acc[t] !== undefined) val += acc[t];
+        else if (vars[t] !== undefined) val += vars[t];
+      }
+      acc[nombre] = val;
+    }
+    const volcado = Object.values(acc).filter(v => v.includes("@") || v.includes("&#64;")).join(" \n ");
+    return full.replace(js, out) + (volcado ? `\n<!--${volcado}-->` : "");
+  });
+}
+
+// La palabra "arroba" en los idiomas del pool. Medido en radio1.hu, y NO es un caso menor:
+//   "Reklámértékesítés: hirdetes&#8221;kukac&#8221;mediamoment.hu"  ← venta de pauta en húngaro
+// ⚠️ El delimitador es {1,4} y NO {0,4}: con cero delimitadores, "at" matchea DENTRO de palabras
+// y "static.cloudflareinsights.com" se convierte en "st@ic.cloudflareinsights.com". El agente lo
+// probó: envenenaba los 28 dominios porque el early-stop se disparaba con esa basura.
+const _AT_WORD  = "arroba|chiocciola|arobase|arobas|kukac|apenstaartje|apenstaart|ma[lł]pk?a?|zavin[aá][cč]|papaki|παπάκι|sobaka|собака|majmun[čc]?e?|мајмунче|miuku|kissanh[aä]nt[aä]|snabel-?a|alfakr[oø]ll|shtrudel|strudel|monkey|at";
+const _DOT_WORD = "dot|punto|ponto|punkt|punt|pont|nokta|kropka|te[cč]ka|bodka|точка|τελεία|piste|prick";
+const _D1 = "[^\\p{L}\\p{N}@]{1,4}";
+const _AT_RE = new RegExp(
+  `([\\p{L}\\p{N}][\\p{L}\\p{N}._%+-]{1,63})${_D1}(?:${_AT_WORD})${_D1}` +
+  `([\\p{L}\\p{N}][\\p{L}\\p{N}-]{0,62}(?:${_D1}(?:${_DOT_WORD})${_D1}|\\s*\\.\\s*)[\\p{L}]{2,10}(?:\\s*\\.\\s*[\\p{L}]{2,10})?)`,
+  "giu");
+function _deobfAtWords(text) {
+  return String(text || "").replace(_AT_RE, (m, local, dom) =>
+    `${local}@${dom.replace(new RegExp(`${_D1}(?:${_DOT_WORD})${_D1}`, "giu"), ".").replace(/\s*\.\s*/g, ".")}`);
+}
+
 // Maxi 2026-06-30: deobfuscador PORTADO VERBATIM del extractor del dashboard
 // (modules/scraper.js → deobfuscate). Paridad total: si el MB lo encuentra a mano,
 // el worker tiene que encontrarlo. Cubre entidades con ceros, &commat;/&period;,
@@ -4827,6 +4920,9 @@ function _decodeCfEmail(hex) {
 // (regex contextual preciso, no blunt), arroba/punto, y reverso ofuscado.
 function _deobfuscateEmails(text) {
   if (!text) return "";
+  // Espacio dentro del dominio — aparece en atributos meta partidos por el CMS.
+  // Real en crnobelo.com/impresum: content="… (igor@crnobelo. com) … (emi@crnobelo. com) …"
+  text = String(text).replace(/([a-z0-9._%+\-]{2,})@([a-z0-9.\-]+)\.\s+([a-z]{2,10})\b/gi, "$1@$2.$3");
   text = text
     .replace(/&#0*64;|&#x0*40;/gi, "@").replace(/&#0*46;|&#x0*2e;/gi, ".")
     .replace(/&commat;/gi, "@").replace(/&period;/gi, ".");
@@ -4845,6 +4941,52 @@ function _deobfuscateEmails(text) {
     text = text.split("").reverse().join("");
   }
   return text;
+}
+
+
+// ── HONEYPOTS Y TRAMPAS ANTI-SCRAPER (Maxi 2026-08-04, pedido del user) ────────────────────
+// Muchos sitios siembran emails FALSOS invisibles para el visitante pero visibles para un bot:
+// si les escribís, te marcan como spammer y algunos alimentan listas negras (Project Honey Pot
+// funciona exactamente así). Escribirle a uno de esos no solo se desperdicia: quema el dominio
+// del remitente, que es lo que venimos peleando todo el día.
+// Dos defensas:
+//   1. sacar del HTML los bloques que el usuario NO ve, ANTES de extraer
+//   2. rechazar los local-part que delatan una trampa
+const _BLOQUE_OCULTO_RE = new RegExp(
+  "<([a-z]+)\\b[^>]*(?:" +
+    "style\\s*=\\s*[\"'][^\"']*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|opacity\\s*:\\s*0|" +
+      "font-size\\s*:\\s*0|text-indent\\s*:\\s*-\\d{3,}|position\\s*:\\s*absolute\\s*;?\\s*left\\s*:\\s*-\\d{3,})[^\"']*[\"']" +
+    "|\\shidden(?:\\s|>|=)" +
+    "|aria-hidden\\s*=\\s*[\"']true[\"']" +
+    "|class\\s*=\\s*[\"'][^\"']*(?:hidden|hide|sr-only|screen-reader|visually-hidden|honeypot|hp-field|nospam|antispam)[^\"']*[\"']" +
+  ")[^>]*>[\\s\\S]{0,4000}?</\\1>", "gi");
+
+function _quitarBloquesOcultos(html) {
+  let out = String(html || "");
+  let prev; let guard = 0;
+  // Repetido: los honeypots suelen estar anidados dentro de otro div oculto.
+  do { prev = out; out = out.replace(_BLOQUE_OCULTO_RE, " "); } while (out !== prev && ++guard < 4);
+  // Comentarios HTML: otro escondite clásico de emails cebo.
+  return out.replace(/<!--(?!\[if)[\s\S]{0,4000}?-->/g, " ");
+}
+
+// Local-parts que delatan una trampa o un buzón que no lee nadie.
+const _LOCAL_TRAMPA_RE = /^(?:spam-?trap|spamtrap|honey-?pot|honeypot|no-?spam|antispam|do-?not-?(?:reply|mail|send)|donotreply|nomail|noemail|null|void|blackhole|devnull|trap|bait|catchall|catch-?all|abuse-?trap|bot-?trap|robot|crawler|scraper|test-?spam|fake|dummy|invalid|unused|deprecated|obsolete)(?:[._-]|\d*$|$)/i;
+
+// ¿Este email parece una trampa? Devuelve "" si está limpio.
+function detectarTrampaEmail(email, htmlContexto = "") {
+  const lower = String(email || "").toLowerCase().trim();
+  const local = lower.split("@")[0] || "";
+  if (_LOCAL_TRAMPA_RE.test(local)) return `local_trampa:${local.slice(0, 24)}`;
+  // Local aleatorio largo en un dominio propio: firma típica del honeypot generado por script
+  // (ej. "a7f3k9x2m4q8@sitio.com"). Se exige alternancia rara Y ausencia de vocales suficientes
+  // para no llevarse puesto un "prensa2026@" o un nombre propio raro.
+  if (local.length >= 10 && /^[a-z0-9]+$/.test(local)) {
+    const vocales = (local.match(/[aeiou]/g) || []).length;
+    const digitos = (local.match(/\d/g) || []).length;
+    if (vocales / local.length < 0.18 && digitos >= 2) return `local_aleatorio:${local.slice(0, 24)}`;
+  }
+  return "";
 }
 
 // ── PSEUDO-EMAILS DE ASSETS (auditoría empírica 2026-08-04) ────────────────────────────────
@@ -4876,12 +5018,27 @@ function extractEmailsFromHtml(html) {
   if (!html) return [];
   const collected = new Set();
   // 1) Regex sobre HTML deobfuscado (texto + atributos + scripts, todo junto)
-  const clean = _deobfuscateEmails(_quitarMediaDelHtml(html));
+  // Cadena completa: sacar media → desarmar concatenación JS → entidades → palabras-arroba →
+  // el deobfuscador clásico. El orden importa: sin decodificar entidades primero, la
+  // concatenación de Joomla queda en '&#109;a&#105;l' y no sirve de nada.
+  const clean = _deobfuscateEmails(
+    _deobfAtWords(
+      _decodeEntitiesAll(
+        _deobfJsConcat(_quitarMediaDelHtml(_quitarBloquesOcultos(html)))
+      )
+    )
+  );
   (clean.match(EMAIL_REGEX) || []).forEach(e => {
     const v = _stripScrapePrefix(e).toLowerCase();
-    if (!_esPseudoEmailDeAsset(v)) collected.add(v);
+    if (!_esPseudoEmailDeAsset(v) && !detectarTrampaEmail(v)) collected.add(v);
   });
   // 2) Cloudflare data-cfemail decoder — gap común en sitios con CF Pro
+  // Cloudflare emite el hex TAMBIÉN en el fragmento del href, con otra clave XOR, y hay
+  // plantillas donde SOLO aparece esa forma (auditoría 2026-08-04).
+  for (const m of html.matchAll(/email-protection#([a-f0-9]{6,})/gi)) {
+    const d = _decodeCfEmail(m[1]);
+    if (d && d.includes("@") && !_esPseudoEmailDeAsset(d)) collected.add(d.toLowerCase());
+  }
   for (const m of html.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi)) {
     const decoded = _decodeCfEmail(m[1]);
     if (decoded && decoded.includes("@")) collected.add(decoded.toLowerCase());
@@ -5105,7 +5262,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // fale-conosco), TR (iletisim/reklam/hakkimizda), HU (kapcsolat/hirdet), ID (kontak/hubungi/iklan),
   // VN (lien-he/quang-cao), FI (yhtey/maino), GR (epikoin), SE/NO (annons/om-oss), IS (auglys), PL/CZ/RU
   // (kontak/kontakty/reklam/o-nas), RO (despre). Caso testigo: sorteador.com.br → /contato.
-  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impres+z?um|imprint|colofon|colophon|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|inzerc|inzer[aá]t|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|mediaajanlat|media-?ajanlat|advertis|adverteren|advertentie|anunci|diafimisi|diafhmish|oglas|\bmarketing\b|\bcomercial\b|\bcommercial\b|tarifas|rate-?card|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|za-?nas|poioi|despre|tentang|om-?oss|rolunk|equipe?|\bteam\b|\bstaff\b|redac|redaz|ueber-?uns|über-?uns|impronta|zakelijk|\bservice\b|servicio/i;
+  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impres+z?um|imprint|colofon|colophon|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|inzerc|inzer[aá]t|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|mediaajanlat|media-?ajanlat|advertis|adverteren|advertentie|anunci|diafimisi|diafhmish|oglas|\bmarketing\b|\bcomercial\b|\bcommercial\b|tarifas|rate-?card|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|za-?nas|poioi|despre|tentang|om-?oss|rolunk|equipe?|\bteam\b|\bstaff\b|redac|redaz|ueber-?uns|über-?uns|impronta|zakelijk|\bservice\b|servicio|escrib|escrivan|escreva|contattaci|contacte-?nos|contactez|schreib|ecrivez|écrivez|napis|napiste|napisz|yaz[ıi]n|get-?in-?touch|reach-?us|mail-?us|write-?(?:to-?)?us|drop-?us|talk-?to-?us|anunciate|anuncie|anunciar|advertise-?with|work-?with|colabora|partner|kooperation|samarbete|wspolprac|prensa|presse|stampa|imprensa|basin|sajto|tisk|dossier|brochure/i;
   const base   = `https://${domain}`;
 
   // ── ANTI SLUG-DE-NOTA (auditoría empírica 2026-08-04) ───────────────────────────────────
@@ -5253,10 +5410,12 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   await tryFetch(base, 6000, false, false);
 
   let _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+  // seenUrl al scope de la función: lo usan la fase 2, el 2º nivel, WordPress REST, Google y
+  // el salto a la casa editora. Antes vivía dentro del if y las fases nuevas no lo veían.
+  const seenUrl = new Set([base, base + "/"]);
   // FASE 2 — seguir los links DESCUBIERTOS primero (el sitio los nombró explícitamente → más
   // precisos), luego las rutas estáticas de fallback. Early-stop al primer email real / buen lote.
   if (!_hasReal) {
-    const seenUrl = new Set([base, base + "/"]);
     const queue = [];
     for (const u of [...discovered, ...internalTargets]) {
       if (u === base) continue;
@@ -5265,11 +5424,116 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       seenUrl.add(u); seenUrl.add(norm);
       queue.push(u);
     }
-    for (let i = 0; i < queue.length; i += CONCURRENT) {
-      await Promise.all(queue.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
+    // Filtrar rutas que son NOTAS y no páginas institucionales (ver _esRutaInstitucional).
+    const cola = queue.filter(u => _esRutaInstitucional(u));
+    for (let i = 0; i < cola.length; i += CONCURRENT) {
+      await Promise.all(cola.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
       _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
       if (_hasReal || emails.size >= 14) break;
     }
+
+    // ── SEGUNDO NIVEL (auditoría 2026-08-04) ──────────────────────────────────────────────
+    // `queue` se armaba UNA sola vez antes del loop, así que los links que aparecen EN las
+    // páginas de la fase 2 se agregaban a `discovered` y nunca se visitaban. Caso real:
+    // berekenhet.nl → home → /service/index.html ("Zakelijk / B2B: adverteren, sponsoring")
+    // → /zakelijk/contact.html, que es donde vive beheer@berekenhet.nl.
+    if (!_hasReal) {
+      const nivel2 = [...discovered]
+        .filter(u => !seenUrl.has(u) && !seenUrl.has(u.replace(/\/+$/, "")))
+        .filter(_esRutaInstitucional)
+        .slice(0, 8);
+      for (const u of nivel2) { seenUrl.add(u); }
+      for (let i = 0; i < nivel2.length; i += CONCURRENT) {
+        await Promise.all(nivel2.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
+        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+        if (_hasReal || emails.size >= 14) break;
+      }
+      if (nivel2.length) log(`  🔎 ${domain}: 2º nivel, ${nivel2.length} páginas más`);
+    }
+
+    // ── WORDPRESS REST (auditoría 2026-08-04) ─────────────────────────────────────────────
+    // Cuando el home no linkea su página de contacto, en vez de adivinar 90 rutas le
+    // preguntamos a WordPress cuáles existen. Una request. En zimeye.net descubrió
+    // /write-for-the-zimeye/ (título "Contact") y /advertise-with-zimeye-specials/.
+    if (!_hasReal) {
+      try {
+        const r = await fetch(`${base}/wp-json/wp/v2/pages?per_page=100&_fields=link,title`,
+                              { headers: uaChrome, redirect: "follow", signal: AbortSignal.timeout(9000) });
+        if (r.ok) {
+          const pages = await r.json();
+          const cand = (Array.isArray(pages) ? pages : [])
+            .filter(pg => CONTACT_HINT.test(pg?.link || "") || CONTACT_HINT.test(pg?.title?.rendered || ""))
+            .map(pg => pg.link).filter(u => u && !seenUrl.has(u)).slice(0, 8);
+          if (cand.length) {
+            log(`  📚 ${domain}: WordPress REST expuso ${cand.length} páginas institucionales`);
+            for (const u of cand) seenUrl.add(u);
+            for (let i = 0; i < cand.length; i += CONCURRENT) {
+              await Promise.all(cand.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
+              _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+              if (_hasReal) break;
+            }
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // ── LO QUE GOOGLE YA SABE (Maxi 2026-08-04, pedido del user) ───────────────────────────
+  // "Googlear un website con la palabra contacto a ver qué resultados salen también es una
+  // práctica que hacen." Exacto: Google ya indexó la página de contacto del sitio, así que en
+  // vez de adivinar rutas le preguntamos. Sirve sobre todo cuando el home no linkea el contacto
+  // o cuando el sitio nos bloquea el crawl pero Google sí tiene el contenido cacheado.
+  // Capeado por el mismo contador diario de Serper que ya existe.
+  if (!_hasReal && SERPER_API_KEY) {
+    try {
+      const g = await _serperContactSearch(domain).catch(() => null);
+      for (const em of (g?.emails || [])) {
+        const lo = String(em).toLowerCase();
+        if (!_esPseudoEmailDeAsset(lo) && !detectarTrampaEmail(lo)) {
+          emails.add(lo);
+          if (urlByEmail && !urlByEmail.has(lo)) urlByEmail.set(lo, `https://${cleanDomain}`);
+        }
+      }
+      const urlsG = (g?.urlsContacto || []).filter(u => !seenUrl.has(u)).slice(0, 4);
+      if (urlsG.length) {
+        log(`  🔍 ${domain}: Google indexó ${urlsG.length} página(s) de contacto → las bajo`);
+        for (const u of urlsG) seenUrl.add(u);
+        for (const u of urlsG) {
+          await tryFetch(u, 6000);
+          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+        }
+      }
+      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+    } catch {}
+  }
+
+  // ── ads.txt COMO FUENTE DE CONTACTO (auditoría 2026-08-04) ─────────────────────────────
+  // El archivo ya se bajó en la puerta 0 y el spec de IAB tiene un campo CONTACT=. Además,
+  // OWNERDOMAIN= dice quién es el dueño real del inventario: si el sitio nos bloquea (Cloudflare,
+  // muro de consentimiento), la casa editora suele ser scrapeable. Costo: cero requests nuevos.
+  if (!_hasReal) {
+    try {
+      const ads = await checkAdsTxt(domain).catch(() => null);
+      for (const c of (ads?.contactos || [])) {
+        if (!_esPseudoEmailDeAsset(c)) {
+          emails.add(c);
+          if (urlByEmail && !urlByEmail.has(c)) urlByEmail.set(c, `https://${domain}/ads.txt`);
+        }
+      }
+      if (ads?.contactos?.length) log(`  📄 ${domain}: ${ads.contactos.length} contacto(s) desde ads.txt`);
+      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+
+      // Salto a la casa editora cuando el sitio propio no dio nada.
+      const owner = String(ads?.owner || "").replace(/^www\./, "");
+      if (!_hasReal && owner && owner !== cleanDomain && hostSeguroParaFetch(owner)) {
+        log(`  🏢 ${domain}: sin contacto propio → salto a la casa editora (${owner})`);
+        for (const ruta of ["", "/contacto", "/contact", "/kontakt", "/publicidad", "/advertising", "/impressum"]) {
+          await tryFetch(`https://${owner}${ruta}`, 6000);
+          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+        }
+        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      }
+    } catch {}
   }
 
   // FASE 3 — WHOIS/informer SOLO si seguimos con CERO emails (baja calidad, último recurso).
@@ -5649,7 +5913,12 @@ function _parseAdsTxtBody(txt, contentType) {
   const matches = body.match(/^[ \t]*[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || [];
   const systems = new Set(matches.map(l => l.trim().split(",")[0].trim().toLowerCase()).filter(Boolean));
   const owner = (body.match(/^ownerdomain=(.+)$/im) || [])[1] || "";
-  return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase() };
+  // CONTACT= del spec de IAB: el publisher publica ahí su contacto, y el archivo ya lo bajamos
+  // como puerta 0, así que sale gratis (auditoría 2026-08-04: 2 emails directos en la muestra).
+  const contactos = [...body.matchAll(/^\s*(?:#\s*)?contact\s*=\s*([^\s,]+@[^\s,]+)/gim)]
+    .map(m => m[1].toLowerCase().trim()).filter(Boolean);
+  return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase(),
+           contactos: [...new Set(contactos)] };
 }
 
 async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _redirDepth = 0 } = {}) {
@@ -5757,7 +6026,7 @@ async function checkAdsTxt(domain) {
       const rHttp = await _fetchAdsTxtOnce(h, { proto: "http" });
       if (rHttp.state === "yes") r = rHttp;
     }
-    if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", checked: h }; break; }
+    if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", contactos: r.contactos || [], checked: h }; break; }
     if (r.state === "unknown") { huboUnknown = true; if (!porQue) porQue = r.why || "desconocido"; }
   }
   // app-ads.txt UNA sola vez al final (no por host): publishers app-first a veces solo publican
@@ -5765,7 +6034,7 @@ async function checkAdsTxt(domain) {
   // tardaba 48s).
   if (out.state !== "yes" && !huboUnknown) {
     const rApp = await _fetchAdsTxtOnce(d, { path: "/app-ads.txt" });
-    if (rApp.state === "yes") out = { state: "yes", lines: rApp.lines, systems: rApp.systems || 0, owner: rApp.owner || "", checked: `${d}/app-ads.txt` };
+    if (rApp.state === "yes") out = { state: "yes", lines: rApp.lines, systems: rApp.systems || 0, owner: rApp.owner || "", contactos: rApp.contactos || [], checked: `${d}/app-ads.txt` };
     else if (rApp.state === "unknown") { huboUnknown = true; if (!porQue) porQue = rApp.why || "desconocido"; }
   }
   // Si nadie dio "yes" pero algo falló por red/bloqueo, NO afirmamos que no tiene.
