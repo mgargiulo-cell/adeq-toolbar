@@ -13289,6 +13289,26 @@ async function runAgentCycle(token, allFlags) {
     // Eso lo chequeamos PER LEAD abajo (más fresco que cachear sendtrack).
     const fresh = scored;
 
+    // ── ORDEN DE INTENTO (Maxi 2026-08-04) ─────────────────────────────────────────────
+    // El pool venía SIN ordenar, así que se probaban los leads en el orden que los devolvía
+    // Postgres. Como ~2 de cada 3 intentos mueren en no_email_after_enrichment —y cada uno
+    // gasta scrape + Apollo + Serper + MillionVerifier ANTES de fallar— el ciclo se comía los
+    // ~7 min que dura el worker antes de reiniciarse y alcanzaba a mandar 2 de los 4 del cupo.
+    // Con 591 leads con email en el pool, eso deja 36 envíos por día sin hacer.
+    // Ahora se prueban primero los que YA tienen un email utilizable: el enrichment caro queda
+    // para el final del ciclo, cuando el cupo del slot ya se cumplió.
+    const _tieneEmail = (l) => Array.isArray(l.emails) ? l.emails.length > 0
+                             : (l.emails && typeof l.emails === "object" ? Object.keys(l.emails).length > 0 : false);
+    const _rankIntento = (l) => {
+      if (!_tieneEmail(l)) return 0;                                   // sin email → último
+      const e = (Array.isArray(l.emails) ? l.emails : [])[0] || "";
+      const sc = rankEmail(String(e), l.domain, l.category || "");
+      return sc >= 50 ? 3 : sc >= 0 ? 2 : 1;                           // buen email primero
+    };
+    fresh.sort((a, b) => (_rankIntento(b) - _rankIntento(a)) || ((b.score || 0) - (a.score || 0)));
+    const _conEmail = fresh.filter(_tieneEmail).length;
+    log(`🤖 Agent ${userEmail}: pool de ${fresh.length} candidatos, ${_conEmail} ya con email (se prueban primero)`);
+
     let processed = 0;
     for (const lead of fresh) {
       if (processed >= batchSize) break;
