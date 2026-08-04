@@ -4789,6 +4789,10 @@ function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     if (JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local) || PLACEHOLDER_LOCAL.test(local)) continue;
     // Basura por dominio: registradores/WHOIS
     if (JUNK_EMAIL_DOMAINS.has(dom)) continue;
+    // El local-part ES el dominio del sitio → artefacto de parseo, no un buzón. Medido:
+    // daynight.gr → "daynight.gr@wi.daynight.gr". Sale de textos tipo "daynight.gr @ wi..."
+    // o de un mailto mal armado. Se manda y rebota.
+    if (core && (local === core || local === _rootDomain(core))) continue;
     const isLeadDomain     = dom === core || dom.endsWith("." + core) || core.endsWith("." + dom);
     // Maxi 2026-07-08: gmail/hotmail/outlook/yahoo/etc. PUEDEN ser el contacto real del sitio
     // (el dueño lo aclaró explícitamente) → aceptar CUALQUIER webmail no-placeholder, sin
@@ -5321,6 +5325,27 @@ function _isGenericLocalPart(email) {
   return GENERIC_LOCAL_RE.test(local);
 }
 
+// "¿Ya tenemos el contacto BUENO y podemos parar de buscar?"
+// Antes era `algún email con local-part no genérico`, y ahí se colaba un gmail suelto que el
+// scraper había levantado de una red social o de WHOIS: contaba como contacto real y cortaba
+// TODAS las fases siguientes. Medido: peru21.pe devolvía nestorces@gmail.com y por eso nunca
+// llegaba a mobilepub@comercio.com.pe, que es el buzón de pauta de verdad.
+// Un webmail personal puede terminar siendo el contacto (el user lo pidió explícitamente), pero
+// NO es motivo para dejar de buscar el buzón corporativo. Se conserva y se sigue.
+function _tenemosContactoBueno(emails, dominioLead) {
+  const core = String(dominioLead || "").replace(/^www\./, "").toLowerCase();
+  for (const e of emails) {
+    const local = e.split("@")[0] || "";
+    const dom   = (e.split("@")[1] || "").toLowerCase();
+    if (_isGenericLocalPart(e)) continue;
+    if (WEBMAIL_RE.test(dom)) continue;                       // gmail/hotmail suelto: no corta
+    if (core && dom !== core && !dom.endsWith("." + core) && !core.endsWith("." + dom)
+        && !AD_SALES_LOCAL.test(local) && !AD_SALES_CONTIENE.test(local)) continue;  // cross-domain sin rol comercial
+    return true;
+  }
+  return false;
+}
+
 // Maxi 2026-07-09: rol de VENTA DE PAUTA/PUBLICIDAD — el buzón IDEAL para ADEQ (que vende
 // inventario). El user (Q4) lo eligió como "la mejor opción". Módulo-level para compartir entre
 // rankEmail (score +95) y _pickTier (orden de selección). Formas ACOTADAS: nada de `ads?`/`adv`
@@ -5418,6 +5443,20 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Si el sitio no tiene email pero tiene contact form, el MB puede usarlo.
   const contactFormsOut = opts.contactFormsOut || null;
   const emails = new Set();
+  // ── PRESUPUESTO DE TIEMPO POR DOMINIO (medido 2026-08-04) ────────────────────────────────
+  // Cada fase tenía su timeout, pero NADIE miraba el total. Medido sobre 45 dominios reales:
+  //   baccredomatic.com      451s   ← se come el ciclo entero del worker él solo
+  //   astroawani.com         160s
+  //   nestlefamilynes.com.mx 158s
+  //   depsycholoog.nl        147s
+  // El worker reinicia cada ~7min por el cap de memoria, así que UN dominio lento se lleva
+  // puesto todo el turno de envío — es literalmente la causa de que mandara 8 de 20 (el pool se
+  // ordenó por probabilidad de éxito, pero un lead pegajoso igual quema el ciclo).
+  // A partir del deadline no se ABREN fases nuevas; lo que ya está en vuelo termina con su
+  // propio timeout. Nunca se descarta lo que ya se encontró.
+  const _MS_MAX = Math.max(10_000, parseInt(opts.maxMs || process.env.SCRAPE_MAX_MS || "60000", 10) || 60_000);
+  const _deadline = Date.now() + _MS_MAX;
+  const _hayTiempo = () => Date.now() < _deadline;
   // socialLinks detectados durante el scraping para hacer fetch posterior
   const detectedSocialLinks = new Set();
   // Maxi 2026-07-09: links de contacto/impressum/publicidad REALES cosechados del HTML del home.
@@ -5618,7 +5657,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     }
   } catch {}
 
-  let _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+  let _hasReal = _tenemosContactoBueno(emails, cleanDomain);
   // seenUrl al scope de la función: lo usan la fase 2, el 2º nivel, WordPress REST, Google y
   // el salto a la casa editora. Antes vivía dentro del if y las fases nuevas no lo veían.
   const seenUrl = new Set([base, base + "/"]);
@@ -5627,7 +5666,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   if (_wafBloquea && !_hasReal) {
     log(`  🛡️ ${domain}: Cloudflare nos frena con challenge — salto el crawl y voy por las vías de afuera`);
   }
-  if (!_hasReal && !_wafBloquea) {
+  if (_hayTiempo() && !_hasReal && !_wafBloquea) {
     const queue = [];
     for (const u of [...discovered, ...internalTargets]) {
       if (u === base) continue;
@@ -5640,8 +5679,8 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     const cola = queue.filter(u => _esRutaInstitucional(u));
     for (let i = 0; i < cola.length; i += CONCURRENT) {
       await Promise.all(cola.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
-      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
-      if (_hasReal || emails.size >= 14) break;
+      _hasReal = _tenemosContactoBueno(emails, cleanDomain);
+      if (_hasReal || emails.size >= 14 || !_hayTiempo()) break;
     }
 
     // ── SEGUNDO NIVEL (auditoría 2026-08-04) ──────────────────────────────────────────────
@@ -5649,7 +5688,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     // páginas de la fase 2 se agregaban a `discovered` y nunca se visitaban. Caso real:
     // berekenhet.nl → home → /service/index.html ("Zakelijk / B2B: adverteren, sponsoring")
     // → /zakelijk/contact.html, que es donde vive beheer@berekenhet.nl.
-    if (!_hasReal) {
+    if (_hayTiempo() && !_hasReal) {
       const nivel2 = [...discovered]
         .filter(u => !seenUrl.has(u) && !seenUrl.has(u.replace(/\/+$/, "")))
         .filter(_esRutaInstitucional)
@@ -5657,7 +5696,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       for (const u of nivel2) { seenUrl.add(u); }
       for (let i = 0; i < nivel2.length; i += CONCURRENT) {
         await Promise.all(nivel2.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
-        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+        _hasReal = _tenemosContactoBueno(emails, cleanDomain);
         if (_hasReal || emails.size >= 14) break;
       }
       if (nivel2.length) log(`  🔎 ${domain}: 2º nivel, ${nivel2.length} páginas más`);
@@ -5667,7 +5706,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     // Cuando el home no linkea su página de contacto, en vez de adivinar 90 rutas le
     // preguntamos a WordPress cuáles existen. Una request. En zimeye.net descubrió
     // /write-for-the-zimeye/ (título "Contact") y /advertise-with-zimeye-specials/.
-    if (!_hasReal) {
+    if (_hayTiempo() && !_hasReal) {
       try {
         const r = await fetch(`${base}/wp-json/wp/v2/pages?per_page=100&_fields=link,title`,
                               { headers: uaChrome, redirect: "follow", signal: AbortSignal.timeout(9000) });
@@ -5681,7 +5720,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
             for (const u of cand) seenUrl.add(u);
             for (let i = 0; i < cand.length; i += CONCURRENT) {
               await Promise.all(cand.slice(i, i + CONCURRENT).map(url => tryFetch(url, 6000)));
-              _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+              _hasReal = _tenemosContactoBueno(emails, cleanDomain);
               if (_hasReal) break;
             }
           }
@@ -5696,7 +5735,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // vez de adivinar rutas le preguntamos. Sirve sobre todo cuando el home no linkea el contacto
   // o cuando el sitio nos bloquea el crawl pero Google sí tiene el contenido cacheado.
   // Capeado por el mismo contador diario de Serper que ya existe.
-  if (!_hasReal && SERPER_API_KEY) {
+  if (_hayTiempo() && !_hasReal && SERPER_API_KEY) {
     try {
       const g = await _serperContactSearch(domain).catch(() => null);
       for (const em of (g?.emails || [])) {
@@ -5712,10 +5751,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         for (const u of urlsG) seenUrl.add(u);
         for (const u of urlsG) {
           await tryFetch(u, 6000);
-          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+          if (_tenemosContactoBueno(emails, cleanDomain)) break;
         }
       }
-      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      _hasReal = _tenemosContactoBueno(emails, cleanDomain);
     } catch {}
   }
 
@@ -5723,7 +5762,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // El archivo ya se bajó en la puerta 0 y el spec de IAB tiene un campo CONTACT=. Además,
   // OWNERDOMAIN= dice quién es el dueño real del inventario: si el sitio nos bloquea (Cloudflare,
   // muro de consentimiento), la casa editora suele ser scrapeable. Costo: cero requests nuevos.
-  if (!_hasReal) {
+  if (_hayTiempo() && !_hasReal) {
     try {
       const ads = await checkAdsTxt(domain).catch(() => null);
       for (const c of (ads?.contactos || [])) {
@@ -5733,18 +5772,18 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         }
       }
       if (ads?.contactos?.length) log(`  📄 ${domain}: ${ads.contactos.length} contacto(s) desde ads.txt`);
-      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      _hasReal = _tenemosContactoBueno(emails, cleanDomain);
 
       // Salto a la casa editora cuando el sitio propio no dio nada.
       const owner = String(ads?.owner || "").replace(/^www\./, "");
       if (owner && owner !== cleanDomain) _casasEditoras.add(owner);
-      if (!_hasReal && owner && owner !== cleanDomain && hostSeguroParaFetch(owner)) {
+      if (_hayTiempo() && !_hasReal && owner && owner !== cleanDomain && hostSeguroParaFetch(owner)) {
         log(`  🏢 ${domain}: sin contacto propio → salto a la casa editora (${owner})`);
         for (const ruta of ["", "/contacto", "/contact", "/kontakt", "/publicidad", "/advertising", "/impressum"]) {
           await tryFetch(`https://${owner}${ruta}`, 6000);
-          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+          if (_tenemosContactoBueno(emails, cleanDomain) || !_hayTiempo()) break;
         }
-        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+        _hasReal = _tenemosContactoBueno(emails, cleanDomain);
       }
     } catch {}
   }
@@ -5753,7 +5792,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Todo lo anterior depende de poder crawlear el sitio. Estas tres no: viven fuera del dominio
   // y por eso son la única salida cuando Cloudflare o un WAF nos bloquean por completo.
   // Validado contra clarin.com y peru21.pe, que devuelven 403 a cualquier intento de crawl.
-  if (!_hasReal) {
+  if (_hayTiempo() && !_hasReal) {
     // 1. DNS como organigrama: el MX delata la casa editora y el rua del DMARC a veces es una
     //    persona real. hnonline.sk → mafra.cz · radio1.hu → akovacs@radio1.hu
     try {
@@ -5767,7 +5806,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
           if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, `dns:_dmarc.${cleanDomain}`);
         }
       }
-      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      _hasReal = _tenemosContactoBueno(emails, cleanDomain);
       // La casa editora que declara el MX: corremos el pipeline de contacto contra ELLA.
       for (const casa of (org?.casasEditoras || [])) _casasEditoras.add(casa);
       for (const casa of (org?.casasEditoras || [])) {
@@ -5775,14 +5814,14 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         log(`  🏢 ${domain}: el MX apunta a ${casa} → busco el contacto ahí`);
         for (const ruta of ["", "/contacto", "/contact", "/kontakt", "/kontakt.aspx?cat=obchod", "/publicidad", "/impressum"]) {
           await tryFetch(`https://${casa}${ruta}`, 6000);
-          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+          if (_tenemosContactoBueno(emails, cleanDomain) || !_hayTiempo()) break;
         }
-        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+        _hasReal = _tenemosContactoBueno(emails, cleanDomain);
       }
     } catch {}
   }
 
-  if (!_hasReal) {
+  if (_hayTiempo() && !_hasReal) {
     // 2. Certificate Transparency: subdominios comerciales que el home no linkea.
     //    clarin.com (403 en el home) → comercial.clarin.com → atencionagencias@ y trafico@
     try {
@@ -5792,14 +5831,14 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         if (_hasReal) break;
         for (const ruta of ["", "/contacto", "/como-publicar", "/contact", "/tarifas"]) {
           await tryFetch(`https://${sub}${ruta}`, 6000);
-          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+          if (_tenemosContactoBueno(emails, cleanDomain) || !_hayTiempo()) break;
         }
-        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+        _hasReal = _tenemosContactoBueno(emails, cleanDomain);
       }
     } catch {}
   }
 
-  if (!_hasReal) {
+  if (_hayTiempo() && !_hasReal) {
     // 3. Google Play: el email del developer es obligatorio y vive fuera del dominio.
     //    peru21.pe (403 total) → mobilepub@comercio.com.pe · thepeninsulaqatar.com → daralsharq.net
     //
@@ -5819,16 +5858,16 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         log(`  🏢 ${domain}: Play revela la casa editora ${play.casaEditora} → busco el área comercial ahí`);
         for (const ruta of ["", "/contacto", "/publicidad", "/contact", "/advertising", "/anuncie"]) {
           await tryFetch(`https://${play.casaEditora}${ruta}`, 6000);
-          if ([...emails].some(e => !_isGenericLocalPart(e))) break;
+          if (_tenemosContactoBueno(emails, cleanDomain) || !_hayTiempo()) break;
         }
-        _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+        _hasReal = _tenemosContactoBueno(emails, cleanDomain);
       }
       // El comercial de Play entra siempre (es exactamente lo que buscamos).
       for (const e of comerciales) {
         emails.add(e);
         if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, "google-play");
       }
-      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      _hasReal = _tenemosContactoBueno(emails, cleanDomain);
       // Los técnicos, solo si el lead quedaría en cero. Mejor un buzón de soporte que nada.
       if (!emails.size) {
         for (const e of (play?.emails || []).slice(0, 2)) {
@@ -5837,7 +5876,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         }
       }
       if (play?.emails?.length) log(`  📱 ${domain}: Google Play dio ${play.emails.length} contacto(s) (${comerciales.length} comercial/es)`);
-      _hasReal = [...emails].some(e => !_isGenericLocalPart(e));
+      _hasReal = _tenemosContactoBueno(emails, cleanDomain);
     } catch {}
   }
 
@@ -5854,8 +5893,8 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Maxi 2026-06-17 v4: si después de todo NO hay email NO-genérico, probar
   // extraer emails de las redes sociales detectadas en el HTML. Solo como
   // fallback para no costar bandwidth en cada lead.
-  const hasNonGeneric = [...emails].some(e => !_isGenericLocalPart(e));
-  if (!hasNonGeneric && detectedSocialLinks.size > 0) {
+  const hasNonGeneric = _tenemosContactoBueno(emails, cleanDomain);
+  if (_hayTiempo() && !hasNonGeneric && detectedSocialLinks.size > 0) {
     log(`  📱 ${domain}: scraping social media (${detectedSocialLinks.size} links) buscando email…`);
     const socialResults = await _scrapeEmailsFromSocialLinksWorker([...detectedSocialLinks]).catch(() => new Map());
     socialResults.forEach((src, em) => {
@@ -5875,6 +5914,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
   // Limpieza final: sanitiza, descarta registradores/WHOIS y ajenos al dominio,
   // prioriza personas sobre genéricos y capea a 15. Corta el ruido del scraping.
+  if (!_hayTiempo()) log(`  ⏱️ ${domain}: corté a los ${Math.round(_MS_MAX / 1000)}s (presupuesto por dominio) con ${emails.size} email(s)`);
   return _cleanScrapedEmails([...emails], domain, { urlByEmail, casasEditoras: _casasEditoras });
 }
 
