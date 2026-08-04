@@ -16326,7 +16326,14 @@ async function generateDailyDigestForMB(token, mbEmail, mbName) {
 }
 
 async function main() {
-  log("ADEQ Auto-Prospector v3 iniciado.");
+  // ── QUÉ CÓDIGO ESTÁ CORRIENDO (Maxi 2026-08-04) ──────────────────────────────────────────
+  // Pregunta que se repitió todo el día: "¿Railway ya deployó?". Desde afuera no había forma
+  // de saberlo sin abrir el dashboard, y varias veces el diagnóstico dependía de eso.
+  // Railway inyecta RAILWAY_GIT_COMMIT_SHA solo. Se escribe en config al arrancar, así que un
+  // SELECT alcanza para saber qué commit corre y desde cuándo.
+  const _commit = (process.env.RAILWAY_GIT_COMMIT_SHA || "").slice(0, 7) || "local";
+  let _selloEscrito = false;
+  log(`ADEQ Auto-Prospector v3 iniciado. commit=${_commit}`);
   // Cleanup: resetear items "processing" trabados de un crash anterior.
   // Sin esto, items con status=processing se quedan invisibles para getNextCsvItem.
   try {
@@ -16669,6 +16676,15 @@ async function main() {
 
       // Heartbeat — cliente lee esto para mostrar si Railway está vivo
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
+      // Sello del código en ejecución. Se escribe una sola vez por proceso (el worker reinicia
+      // cada ~7min, así que `worker_boot_at` además dice hace cuánto arrancó este container).
+      if (!_selloEscrito) {
+        _selloEscrito = true;
+        try {
+          await setConfigValue(token, "worker_commit", _commit);
+          await setConfigValue(token, "worker_boot_at", new Date().toISOString());
+        } catch {}
+      }
 
       // Force restart triggered desde popup (al prender csv toggle). El popup
       // setea worker_force_restart_at = ISO timestamp. Si es POSTERIOR al inicio
