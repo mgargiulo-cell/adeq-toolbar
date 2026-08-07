@@ -12422,8 +12422,18 @@ Write the prospecting email. Return JSON only.`;
       path: "/v1/messages",
       method: "POST",
       body: {
-        model: "claude-sonnet-4-5",
-        max_tokens: 1024,
+        // Maxi 2026-08-07: era claude-sonnet-4-5, que NO está en la lista blanca del api-proxy
+        // (la puse el 04/08 con el blindaje). O sea que desde esa fecha CADA pitch escrito por
+        // Claude fallaba con 400 "modelo no permitido" — el 20% de los envíos que no usan
+        // template. claude-sonnet-5 es el vigente y el que el proxy permite.
+        model: "claude-sonnet-5",
+        // Sonnet 5 PIENSA por defecto, y max_tokens topea pensamiento + respuesta juntos. Con
+        // los 1024 de antes el JSON del pitch se cortaba a la mitad. effort "low" mantiene la
+        // latencia baja (esto corre en línea con el envío) y 4000 deja aire; el proxy no acepta
+        // más de 4096.
+        max_tokens: 4000,
+        thinking: { type: "adaptive" },
+        output_config: { effort: "low" },
         system: systemMsg,
         messages: [{ role: "user", content: userMsg }],
       },

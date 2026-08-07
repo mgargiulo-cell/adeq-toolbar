@@ -7,14 +7,18 @@
 
 import { callProxy } from "./apiProxy.js";
 
-export const CLAUDE_SONNET = "claude-sonnet-4-6";
+// Maxi 2026-08-07: era claude-sonnet-4-6, que NO está en la lista blanca de modelos del
+// api-proxy (la puse el 04/08 con el blindaje). Todas las llamadas a Sonnet venían fallando
+// con 400 "modelo no permitido" desde entonces. claude-sonnet-5 es el vigente y el que el
+// proxy permite. Haiku ya estaba bien.
+export const CLAUDE_SONNET = "claude-sonnet-5";
 export const CLAUDE_HAIKU  = "claude-haiku-4-5";
 
 /**
  * Low-level helper for Anthropic's /v1/messages endpoint.
  *
  * @param {object} opts
- * @param {string} opts.model                   - "claude-sonnet-4-6" | "claude-haiku-4-5"
+ * @param {string} opts.model                   - "claude-sonnet-5" | "claude-haiku-4-5"
  * @param {number} [opts.maxTokens=1024]
  * @param {string|Array} [opts.system]          - String, or array of {type:"text", text, cache_control?}
  * @param {Array} opts.messages                 - [{role, content}]

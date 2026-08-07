@@ -343,7 +343,10 @@ Respond in Spanish. Be direct and use numbers.`;
   try {
     const result = await callClaude({
       model:     CLAUDE_SONNET,
-      maxTokens: 200,
+      // Maxi 2026-08-07: eran 200. En Sonnet 5 el max_tokens topea pensamiento + respuesta
+      // juntos, y con thinking adaptativo prendido 200 no alcanzan ni para pensar: la
+      // respuesta salía vacía o cortada. 1500 dejan aire de sobra para un análisis corto.
+      maxTokens: 1500,
       messages:  [{ role: "user", content: userMessage }],
       // Light analytical workload — adaptive thinking with low effort.
       thinking:  { type: "adaptive" },
