@@ -2780,50 +2780,65 @@ async function maybeStartAutopilotSlot(token) {
 const AGENT_SLOTS = [9, 12, 15, 18, 20];
 let _agentLastSlot = "";
 
-function _currentAgentSlot() {
+// Slots ya ejecutados HOY, persistido: "2026-08-06:9,12,15". Vive en config para sobrevivir
+// los restarts del worker (cada ~7min), igual que el marcador del re-chequeo de ads.txt.
+function _parseSlotsHechos(raw, dateISO) {
+  const [dia, lista] = String(raw || "").split(":");
+  if (dia !== dateISO) return new Set();          // es de otro día → arrancamos limpio
+  return new Set(String(lista || "").split(",").map(n => parseInt(n, 10)).filter(Number.isFinite));
+}
+
+// Maxi 2026-08-07: EL SLOT DE LAS 9 NO CORRÍA NUNCA. Medido sobre 4 días (03,04,05,06):
+// disparaban 12, 15, 18 y 20 — jamás el de las 9. Con per_cycle_limit=2 y 3 MBs eso da
+// exactamente los 8/día por MB que se venían midiendo.
+//
+// La versión anterior tomaba "el último slot vencido", que arregla un caso y rompe otro:
+// alcanza para recuperar el de las 9 a las 10, pero si se pierden DOS seguidos solo vuelve
+// el más nuevo. Y peor, el llamador marcaba el slot como usado ANTES de correr el ciclo, así
+// que cualquier salida temprana (fin de semana, fuera de horario, error) lo quemaba para todo
+// el día sin haber mandado un solo mail.
+//
+// Ahora se lleva la lista de los que YA corrieron y se toma el MÁS VIEJO pendiente. Ningún
+// slot se pierde: si el de las 9 no corrió, se ejecuta a las 10, a las 11 o cuando el worker
+// tenga aire, y después sigue con el de las 12.
+function _currentAgentSlot(slotsHechos = new Set()) {
   const { hour, weekday, dateISO } = _madridNowParts();
   if (weekday === "Sat" || weekday === "Sun") return null;
-  // Maxi 2026-08-04: RECUPERACIÓN DE SLOTS PERDIDOS.
-  // Antes exigía que la hora fuera EXACTAMENTE una de las del array. Si durante esa hora el
-  // worker estaba ocupado con otra cosa —los barridos del pool, que recorren 3.000 dominios con
-  // red— la hora pasaba y ese slot se perdía para siempre. Medido el 03/08: corrieron 12, 15,
-  // 18 y 20 pero NO el de las 9, o sea 12 envíos menos en el día entre los tres MBs.
-  // Ahora se toma el ÚLTIMO slot vencido del día. Como el label lleva la hora del slot y se
-  // persiste en agent_last_slot, cada slot sigue disparando una sola vez: si el de las 9 ya
-  // corrió, a las 10 no vuelve a correr; pero si NO corrió, se recupera.
-  const vencidos = AGENT_SLOTS.filter(h => hour >= h);
-  if (vencidos.length === 0) return null;                 // todavía no llegó el primero del día
-  const slot = vencidos[vencidos.length - 1];
-  return { slot, slotLabel: `agent-${dateISO}-${String(slot).padStart(2, "0")}:00` };
+  const pendientes = AGENT_SLOTS.filter(h => hour >= h && !slotsHechos.has(h));
+  if (pendientes.length === 0) return null;
+  const slot = pendientes[0];                             // el más viejo sin correr
+  return { slot, dateISO, atrasado: hour > slot,
+           slotLabel: `agent-${dateISO}-${String(slot).padStart(2, "0")}:00` };
 }
 
 async function maybeRunAgentSlot(token, allFlags) {
-  const slotInfo = _currentAgentSlot();
+  const cfg = await getConfig(token);
+  const { dateISO } = _madridNowParts();
+  const hechos = _parseSlotsHechos(cfg.agent_slots_done, dateISO);
+  const slotInfo = _currentAgentSlot(hechos);
   if (!slotInfo) return;
   if (_agentLastSlot === slotInfo.slotLabel) return;
 
-  // Race-condition guard: persistir slot fired en Supabase para sobrevivir
-  // restarts de Railway. Sin esto, si el worker reinicia entre 9:00 y 9:30,
-  // _agentLastSlot se reseteaba en memoria y el slot disparaba 2 veces.
-  try {
-    const cfgRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_last_slot&select=value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (cfgRes.ok) {
-      const rows = await cfgRes.json();
-      const dbVal = rows?.[0]?.value || "";
-      if (dbVal === slotInfo.slotLabel) {
-        _agentLastSlot = dbVal;  // sync memoria con DB
-        return;
-      }
-    }
-  } catch {}
+  // NO QUEMAR EL SLOT SI EL CICLO NO VA A PODER MANDAR (Maxi 2026-08-07).
+  // Antes se marcaba como usado y RECIÉN DESPUÉS se llamaba a runAgentCycle. Las dos salidas
+  // tempranas de ahí adentro (fin de semana / fuera de horario) dejaban el slot consumido sin
+  // haber mandado un solo mail, y no volvía hasta el día siguiente. Se chequea acá primero.
+  const _ag = _agentCfg(cfg);
+  if (_isWeekendSpain() || _isOutsideActiveHours(_ag.activeStart, _ag.activeEnd)) return;
 
   _agentLastSlot = slotInfo.slotLabel;
-  await setConfigValue(token, "agent_last_slot", slotInfo.slotLabel).catch(() => {});
-  log(`🤖 AGENT slot ${slotInfo.slotLabel} fired — up to 6 leads`);
-  return await runAgentCycle(token, allFlags);
+  const _porSlot = _ag.perCycleLimit;
+  log(`🤖 AGENT slot ${slotInfo.slotLabel} fired${slotInfo.atrasado ? " (RECUPERADO, iba atrasado)" : ""} — hasta ${_porSlot} leads por MB`);
+  try {
+    return await runAgentCycle(token, allFlags);
+  } finally {
+    // Se marca al TERMINAR, pase lo que pase adentro. Si el proceso muere antes, el slot sigue
+    // pendiente y se recupera en la próxima vuelta — que es justo lo que queremos.
+    hechos.add(slotInfo.slot);
+    const _ordenados = [...hechos].sort((a, b) => a - b).join(",");
+    await setConfigValue(token, "agent_slots_done", `${dateISO}:${_ordenados}`).catch(() => {});
+    await setConfigValue(token, "agent_last_slot", slotInfo.slotLabel).catch(() => {});
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
