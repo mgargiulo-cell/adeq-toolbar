@@ -5368,7 +5368,7 @@ function _tenemosContactoBueno(emails, dominioLead) {
 // Maxi 2026-07-13 (auditoría): +cobertura del pool europeo — régie(FR), Vermarktung/Anzeigen/Verkauf(DE),
 // verkoop/adverteren(NL), vente(FR), raccolta pubblicitaria(IT), auglýsingar(IS), annons(SE). Todos = venta
 // de pauta/inventario. 'regie\b'/'regiepub' evita matchear 'regierung'(gobierno DE).
-const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor|inzerc|inzer[aá]t|hirdet|diafimisi|diafhmish|adverten|adverteren|advertentie|oglas|marknad|myynti)/i;
+const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|vertrieb|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor|inzerc|inzer[aá]t|hirdet|diafimisi|diafhmish|adverten|adverteren|advertentie|oglas|marknad|myynti)/i;
 // Igual que AD_SALES_LOCAL pero SIN anclar al principio: el token comercial puede estar en el
 // medio o al final del buzón. Medido: mobilepub@comercio.com.pe es el único contacto alcanzable
 // de peru21.pe (Cloudflare bloquea el resto) y el ^ lo dejaba afuera. Lista más corta a propósito:
@@ -5930,6 +5930,9 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Limpieza final: sanitiza, descarta registradores/WHOIS y ajenos al dominio,
   // prioriza personas sobre genéricos y capea a 15. Corta el ruido del scraping.
   if (!_hayTiempo()) log(`  ⏱️ ${domain}: corté a los ${Math.round(_MS_MAX / 1000)}s (presupuesto por dominio) con ${emails.size} email(s)`);
+  // Las casas editoras probadas se devuelven por opts (un Set que el caller pasa vacío) en vez
+  // de cambiar el tipo de retorno: hay 6 callers y todos esperan un array de strings.
+  if (opts.casasEditorasOut) for (const c of _casasEditoras) opts.casasEditorasOut.add(c);
   return _cleanScrapedEmails([...emails], domain, { urlByEmail, casasEditoras: _casasEditoras });
 }
 
@@ -6320,6 +6323,10 @@ const _ANTIBOT_RE = /just a moment|checking your browser|cf-browser-verification
 // comentarios #, minúsculas, con y sin ID de certificación, comas faltantes, sufijos -OB/-EB,
 // comentarios pegados al final y los registros especiales del spec (ownerdomain=, managerdomain=,
 // inventorypartnerdomain=) que NO son líneas de seller.
+// Dominios de ad-tech: si el CONTACT= del ads.txt apunta acá, es el proveedor que le gestiona
+// la monetización al publisher, no el publisher. Son justamente nuestros competidores.
+const _ES_DOMINIO_ADTECH = /(setupad|snigel|freestar|mediavine|raptive|adthrive|ezoic|monumetric|playwire|venatus|adpushup|mediafuse|newor|sortable|adnimation|pubgalaxy|themoneytizer|optad360|yieldbird|adagio|admanager|mgid|taboola|outbrain|revcontent|criteo|pubmatic|rubicon|openx|indexexchange|appnexus|xandr|sovrn|sharethrough|triplelift|teads|smartadserver|equativ|improvedigital|seedtag|verve|adform|magnite|onetag|richaudience|smaato|inmobi|unruly|nexx?360|vidoomy|adyoulike|showheroes|aniview|anyclip|vidazoo|openweb|adtelligent|adkernel|admaven|propellerads)\./i;
+
 function _parseAdsTxtBody(txt, contentType) {
   // BOM UTF-8: en JS \s incluye U+FEFF, así que un BOM mataba la PRIMERA línea del archivo.
   // Medido en producción: elsalvador.com, atarde.com.br, hurriyet.com.tr, milliyet.com.tr,
@@ -6342,8 +6349,13 @@ function _parseAdsTxtBody(txt, contentType) {
   const owner = (body.match(/^ownerdomain=(.+)$/im) || [])[1] || "";
   // CONTACT= del spec de IAB: el publisher publica ahí su contacto, y el archivo ya lo bajamos
   // como puerta 0, así que sale gratis (auditoría 2026-08-04: 2 emails directos en la muestra).
+  // El CONTACT= del spec lo escribe quien MANTIENE el archivo, y muchas veces eso es la empresa
+  // de monetización, no el publisher. Medido: lexpress.mu (diario de Mauricio) devolvía
+  // contact@setupad.com — Setupad le gestiona el ads.txt. Mandarle el pitch a Setupad es
+  // ofrecerle inventario a un competidor. Fuera cualquier CONTACT= de un dominio ad-tech.
   const contactos = [...body.matchAll(/^\s*(?:#\s*)?contact\s*=\s*([^\s,]+@[^\s,]+)/gim)]
-    .map(m => m[1].toLowerCase().trim()).filter(Boolean);
+    .map(m => m[1].toLowerCase().trim()).filter(Boolean)
+    .filter(e => !_ES_DOMINIO_ADTECH.test(e.split("@")[1] || ""));
   return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase(),
            contactos: [...new Set(contactos)] };
 }
@@ -7108,10 +7120,10 @@ async function polishPool(token) {
         // 4) buscar email: scrape gratis (páginas internas multilingües) + REDES SOCIALES (FB/IG/Twitter)
         //    + website-informer/WHOIS — todo adentro de scrapeEmailsForDomain — y Apollo capado si vacío.
         let foundEmail = null, foundSource = null, foundName = "";
-        const _informerOut = new Set(), _socialOut = new Map();
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut }).catch(() => []);
+        const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut }).catch(() => []);
         if (Array.isArray(scraped) && scraped.length) {
-          const ranked = scraped.map(e => ({ email: e, score: rankEmail(e, domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+          const ranked = scraped.map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
           if (ranked.length) {
             foundEmail = ranked[0].email;
             const _le = foundEmail.toLowerCase();
@@ -13042,7 +13054,7 @@ function detectarEmailSospechoso(email, siteDomain = "") {
   return "";
 }
 
-function rankEmail(email, siteDomain, leadCategory = "") {
+function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   if (!email || typeof email !== "string" || !email.includes("@")) return -1;
   const lower = email.toLowerCase();
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
@@ -13150,6 +13162,18 @@ function rankEmail(email, siteDomain, leadCategory = "") {
       //   voetbalprimeur.be → info@voetbalprimeur.nl
       // Usa el mismo _brandMatches que ya valida el envío, así los dos criterios coinciden.
       score += 25;
+    } else if (casasEditoras && [...casasEditoras].some(c => {
+      const _c = String(c).toLowerCase().replace(/^www\./, "");
+      return dom === _c || dom.endsWith("." + _c);
+    })) {
+      // Maxi 2026-08-07: la CASA EDITORA probada tampoco es "otra empresa". El scraper ya la
+      // valida contra tres fuentes independientes (OWNERDOMAIN del ads.txt, el MX, el developer
+      // de Google Play) y _cleanScrapedEmails la deja pasar — pero acá se llevaba -50 igual y el
+      // lead quedaba en cero, porque polishPool descarta todo lo que puntúa <= 0.
+      // Medido: apotheken-umschau.de (la revista de salud más grande de Alemania) devuelve
+      // vertrieb@wubv.de e info@wubv.de — Wort & Bild Verlag, su editorial. Los cuatro emails
+      // se encontraban y los cuatro se tiraban acá.
+      score += 20;
     } else {
       // Cross-domain a OTRO dominio corporativo — penalidad fuerte. Marcamos
       // para revertir parcialmente si es EXEC (founder@otra-empresa puede ser
