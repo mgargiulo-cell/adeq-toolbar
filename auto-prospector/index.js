@@ -6241,6 +6241,27 @@ const PUBLISHER_CATEGORIES = new Set(["news","sports","entertainment","streaming
 // medio ni con ads.txt ni con display ads en la home.
 // OJO con el orden y la especificidad: un diario de finanzas es "news_and_media/financial_news"
 // en SimilarWeb, NO "finance/banking" → los medios de nicho no caen acá.
+// ── CATEGORÍAS QUE NO DISTINGUEN MEDIO DE EMPRESA (Maxi 2026-08-07) ──────────────────────
+// La categoría de SimilarWeb describe el TEMA, no el modelo de negocio. Para algunos temas eso
+// da lo mismo — nadie etiqueta un medio como "gambling/casino" ni como "e-commerce/checkout".
+// Para otros, el medio y la empresa reciben LA MISMA etiqueta:
+//   ccn.com          (noticias de cripto)      → finance/investing        ← igual que un bróker
+//   sofrep.com       (periodismo militar)      → heavy_industry           ← igual que una metalúrgica
+//   detail.de        (revista de arquitectura) → heavy_industry           ← ídem
+//   una revista de autos                       → vehicles/vehicles        ← igual que un concesionario
+// Medido: ccn.com fue descartado como "no es medio" y tiene 73 líneas de ads.txt. Es un
+// publisher que monetiza, y encima cripto-NOTICIAS, que el user marcó explícitamente como SÍ.
+// En estas categorías el veto por categoría no decide: pasa a la IA, que conoce los medios
+// por el dominio. En las inequívocas el veto sigue mandando.
+function _categoriaAmbiguaParaMedios(cat) {
+  const c = String(cat || "").toLowerCase().trim();
+  // OJO: la categoría llega CORTADA A 30 CARACTERES desde la base, así que los patrones se
+  // escriben contra el prefijo, no contra la palabra entera. Con "education" en vez de
+  // "educatio" las universidades (science_and_education/educatio) se colaban al camino de la
+  // IA en vez de morir en el veto — probado, fallaba con unipv.it y ulpgc.es.
+  return /finance\/(investing|finance|financial_planning)|heavy_industry|vehicles|business_and_consumer_services|computers_electronics_and_tech|news_and_media|science_and_education\/(?!educatio)/.test(c);
+}
+
 function _categoriaNoPublisher(cat) {
   const c = String(cat || "").toLowerCase().trim();
   if (!c || c === "other" || c === "?") return false;   // sin categoría no hay veto
@@ -7476,7 +7497,12 @@ async function classifyPublisher(token, domain, pageContent, swCategory, swData 
   if (adsTxt.state === "unknown" && !pageContent) {
     // 1º SimilarWeb: es data real, no una adivinanza. Para los leads del pool ya está guardada.
     const sw = _veredictoPorSimilarWeb({ category: swCategory, traffic: swData.traffic || 0, geo: swData.geo || "" });
-    if (sw === "no") {
+    // El veto por categoría cortaba ANTES de que la IA pudiera opinar — y la IA es justo lo
+    // único que distingue "noticias de cripto" de "bróker de cripto", porque las dos cosas
+    // llevan la misma etiqueta de SimilarWeb. En las categorías ambiguas se la salteamos.
+    const _ambigua = sw === "no" && _categoriaAmbiguaParaMedios(swCategory);
+    if (_ambigua) log(`  🤔 ${domain}: bloqueado y "${swCategory}" no distingue medio de empresa → decide la IA`);
+    if (sw === "no" && !_ambigua) {
       log(`  📊 ${domain}: bloqueado, pero SimilarWeb lo categoriza "${swCategory}" → no es medio, descartado`);
       return { ok: false, reason: `sw_no_publisher:${String(swCategory).slice(0, 30)} (sitio bloqueado)`, score: -999 };
     }
