@@ -7005,11 +7005,13 @@ async function polishPool(token) {
           if (src === "apollo" || src === "informer") return true;
           return !_isGenericLocalPart(e);
         });
-        // MODO DIRIGIDO (`polish_only_missing`): el pedido es "agregá email a los que no tienen".
-        // Sin esto el pulido recorre el pool ENTERO en orden de created_at y gasta un fetch de
-        // clasificación en cada lead que ya estaba resuelto — de 1.026 pendientes, 591 ya tenían
-        // email. Con el flag, esos ni se tocan y la corrida va derecho a los que faltan.
-        if (soloSinEmail && hasGood) return;
+        // OJO CON EL ATAJO (Maxi 2026-08-07): acá había un `if (soloSinEmail && hasGood) return;`
+        // para ahorrar el fetch en los leads que ya tenían email. Estaba mal: se salteaba también
+        // la CLASIFICACIÓN y la puerta del ads.txt, así que un no-publisher con email quedaba
+        // adentro para siempre — y justo esos son los que se mandan. "Solo los que no tienen
+        // email" significa no gastar la BÚSQUEDA de contacto en ellos, no dejar de revisarlos.
+        // El filtro de calidad corre para todos; el atajo real está más abajo, después de
+        // clasificar (`if (hasGood) { _savePhone(); return; }`), que es donde corresponde.
         // 2) clasificar por HTML — UN fetch (detector estructural con veto publisher-ads)
         const pc = await fetchPageContent(domain).catch(() => null);
         if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
