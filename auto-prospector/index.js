@@ -5935,7 +5935,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
 // ── Page intelligence ─────────────────────────────────────────
 
-async function fetchPageContent(domain) {
+async function fetchPageContent(domain, _yaReintentado = false) {
   try {
     const res = await fetch(`https://${domain}`, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
@@ -6190,7 +6190,30 @@ async function fetchPageContent(domain) {
     // TLS/SSL/certificado. El user pasó ejemplos: zd.blog.jp (privacy error), gamepress.gg (can't be
     // reached), eiga.com (ERR_SSL_VERSION_OR_CIPHER_MISMATCH). Esos NO se pueden servir → dead:true → se
     // descartan downstream. Timeout/reset/403 se dejan en null (puede estar VIVO bloqueando un bot → no lo matamos).
-    if (/ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo|ECONNREFUSED|CERT|SSL|TLS|EPROTO|SELF_SIGNED|UNABLE_TO_VERIFY|HANDSHAKE|WRONG_VERSION|ALTNAME|unsupported protocol/i.test(code)) return { dead: true, deadReason: code.slice(0, 60) };
+    // ── DNS MUERTO ≠ TLS QUE NO NOS GUSTA (Maxi 2026-08-07) ─────────────────────────────
+    // Acá había UNA sola lista que mezclaba las dos cosas y las mataba igual. Medido sobre
+    // los purgados reales:
+    //   sport.es (Diario Sport, Barcelona) → ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED
+    //   …pero www.sport.es responde 200. El sitio está perfecto; el que no negocia es NUESTRO
+    //   cliente, que rechaza la renegociación legacy por defecto. curl lo abre sin chistar.
+    //   toyota.co.jp → ENOTFOUND. Ese sí no existe.
+    // Otra vez el mismo patrón del día: "no pude" convertido en "no sirve".
+    //
+    // DNS que no resuelve es un hecho sobre el dominio. Un handshake TLS que falla es un hecho
+    // sobre nuestro cliente. Solo el primero mata al lead.
+    if (/ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo/i.test(code)) {
+      return { dead: true, deadReason: code.slice(0, 60) };
+    }
+    // TLS/conexión: antes de rendirse, probar con y sin www. Es un dominio distinto para el
+    // handshake y suele tener otro certificado — con sport.es alcanza para recuperarlo entero.
+    if (/CERT|SSL|TLS|EPROTO|SELF_SIGNED|UNABLE_TO_VERIFY|HANDSHAKE|WRONG_VERSION|RENEGOTIATION|ALTNAME|ECONNREFUSED|unsupported protocol/i.test(code) && !_yaReintentado) {
+      const _alterno = /^www\./i.test(domain) ? domain.replace(/^www\./i, "") : `www.${domain}`;
+      const _r = await fetchPageContent(_alterno, true).catch(() => null);
+      if (_r && !_r.dead) return _r;
+      // Ni con www ni sin él. NO lo declaramos muerto: no pudimos leerlo, que es distinto.
+      // Vuelve null y lo juzgan las otras señales (ads.txt, tráfico guardado, categoría).
+      return null;
+    }
     return null;
   }
 }
