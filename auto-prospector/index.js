@@ -9189,8 +9189,14 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   while (processed < maxItems) {
     // Hard timeout 20min — apagar y salir aunque queden items pendientes.
     if (Date.now() - _csvSessionStart >= CSV_SESSION_LIMIT_MS) {
-      log(`⏱ CSV queue: 20min hard cap alcanzado — auto-apagando (procesados: ${processed}). Re-prender manual si querés seguir.`);
-      await setConfigValue(token, "csv_queue_enabled", "false");
+      // Maxi 2026-08-07: acá se APAGABA el flag y se pedía reinicio MANUAL. El techo de 20min
+      // está bien —le da turno al resto de los jobs— pero apagar la cola no: quedaban 1.716
+      // dominios esperando, y con el backlog alto el feeder deja de descubrir (a propósito,
+      // >250). Resultado: nadie procesa, nadie descubre, el pool se drena. Trabado en círculo
+      // hasta que un humano se acordara de prender un toggle.
+      // Ahora se corta la TANDA, no la cola: la próxima vuelta arranca una sesión nueva y sigue
+      // donde quedó. El techo de tiempo se respeta igual.
+      log(`⏱ CSV queue: 20min de tanda — corto acá y sigo en la próxima vuelta (procesados: ${processed})`);
       break;
     }
     // Re-check del flag cada 5 items — si el user apagó el toggle, paramos YA.
@@ -9208,6 +9214,13 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     // (popup pre-check + promoteWaitlist en main loop). Si llegamos acá,
     // hay items para procesar normalmente.
     const item = await getNextCsvItem(token, blockedUsers);
+    // OJO: getNextCsvItem devuelve null por DOS motivos distintos — que no quede nada, o que
+    // todo lo que queda sea de un usuario que llegó a su cupo diario. Solo el primero es "cola
+    // vacía"; tratar el segundo igual apagaría la cola teniendo trabajo pendiente.
+    if (!item && blockedUsers.size > 0) {
+      log(`  ⏸ CSV queue: lo que queda es de usuarios en su cupo diario — sigo mañana (no apago la cola)`);
+      break;
+    }
     if (!item) {
       // Cola vacía. Verificar si TAMBIÉN waitlist está vacía (entonces no hay
       // nada en absoluto). Si es así, apagar el toggle para ahorrar Railway
