@@ -6082,6 +6082,27 @@ async function fetchPageContent(domain) {
     const appKw      = [/\b(download (the |our |your )?app|descarg[aá] (la |nuestra )?app|baixe (o |nosso )?app|get the app|t[ée]l[ée]charge[rz] (l'?|notre )app)\b/i, /\b(on the app ?store|on google play|download on the app store|get it on google play|disponible en (el )?app ?store|disponible en google play|available for (ios|android)|para (ios|android))\b/i];
     const shopKw     = [/\b(add to (cart|basket|bag)|a[ñn]adir al carrito|agregar al carrito|adicionar ao carrinho|aggiungi al carrello|comprar ahora|buy now|comprar agora|finalizar compra|mi carrito|shopping cart|free shipping|env[íi]o gratis|frete gr[áa]tis)\b/i, /\b(online shop|tienda online|loja online|negozio online|boutique en ligne|our (store|shop)|nuestra tienda|nossa loja|(in|out of) stock|sold out|agotado)\b/i];
 
+    // ── LO QUE EL SITIO DICE QUE ES, EN SU PROPIO TÍTULO (Maxi 2026-08-07) ──────────────────
+    // Los keywords de abajo exigen DOS coincidencias en todo el HTML (`_hits(arr) >= 2`, y los
+    // arrays tienen exactamente 2 patrones → es un AND). Eso deja pasar al que se auto-describe
+    // UNA vez pero clarísimo. Casos que reportó el user:
+    //   ripio.com      → "Liderando cripto en LATAM desde 2013 | Crypto exchange"  → pasaba
+    //   malpagames.com → "Malpa Games - Mobile Publisher"                          → pasaba
+    // El <title> es una auto-declaración, igual de confiable que el schema.org: nadie pone
+    // "Crypto exchange" en su título si no lo es. Va con el MISMO candado que las reglas de
+    // schema (`!hasPublisherAds`), así que un medio que vende inventario nunca se toca.
+    // Ojo con los medios DE cripto/gaming: las reglas piden exchange/wallet/broker o
+    // publisher/studio, no la palabra suelta. "Crypto news" y "Gaming news" no matchean.
+    const _tituloYSitio = `${title} ${desc}`.slice(0, 400);
+    const TITULO_DELATOR = [
+      [/\b(crypto|cripto)[\s·|-]{0,3}(exchange|wallet|broker)\b|\bexchange de (cripto|bitcoin)|casa de cambio (de )?cripto|\b(compra|comprar|buy) y (vende|vender|sell) (bitcoin|cripto)/i, "crypto"],
+      [/\b(mobile|game|gaming|app|hyper[- ]?casual)[\s·|-]{0,3}(publisher|studio|developer|dev)\b|\bgame studio\b|\bestudio de (juegos|videojuegos)\b/i, "app"],
+      [/\b(software|it|tech|digital|web|cloud)[\s·|-]{0,3}(company|agency|agencia|consult\w+|services|solutions)\b|\bsoluciones (digitales|tecnol[oó]gicas|de software)\b|\bdesarrollo de software\b|\bstaff augmentation\b/i, "service"],
+      [/\b(tienda (online|oficial|virtual)|loja (oficial|online)|online (shop|store)|comprar online|e-?commerce oficial)\b/i, "ecommerce"],
+    ];
+    let _tipoPorTitulo = null;
+    for (const [re, tipo] of TITULO_DELATOR) { if (re.test(_tituloYSitio)) { _tipoPorTitulo = tipo; break; } }
+
     let nonPublisherType = null;
     // Maxi 2026-07-15: isStore ya NO es "aunque tenga ads" — si el sitio corre ad-tech de PUBLISHER
     // (AdSense/GPT/SSP/Taboola) es un medio con tienda de merch (allhiphop.com), NO una tienda. Veto.
@@ -6106,6 +6127,8 @@ async function fetchPageContent(domain) {
     else if (!hasPublisherAds && saasSchema.test(html)) nonPublisherType = "saas";
     else if (!hasPublisherAds && corpSchema.test(html)) nonPublisherType = "corporate";
     else if (!hasPublisherAds && personalSchema.test(html)) nonPublisherType = "personal";
+    // El título se lee DESPUÉS del schema (más específico) y ANTES de los keywords (más laxos).
+    else if (!hasPublisherAds && _tipoPorTitulo) nonPublisherType = _tipoPorTitulo;
     // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
     // O red partner de ADEQ: Taboola/MGID/Ezoic/Seedtag/Teads...). Un publisher que monetiza con ads
     // —aunque embeba schema de un hotel/producto que RESEÑA, o mencione vocabulario financiero— NUNCA
@@ -6991,6 +7014,21 @@ async function polishPool(token) {
         const pc = await fetchPageContent(domain).catch(() => null);
         if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
         if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
+        // ── PUERTA 0 (ads.txt) TAMBIÉN EN EL PULIDO — Maxi 2026-08-07 ─────────────────────
+        // El pulido clasificaba por HTML pero NO miraba el ads.txt, así que un sitio sin
+        // archivo pasaba de largo. Se vio con natura.com.co (ads.txt 404, e-commerce) y
+        // globant.com (403 en ads.txt + home ilegible = CERO evidencia) apareciendo en el pool.
+        // La regla del user es que sin ads.txt no entra, y este es el job que hoy recorre el
+        // pool entero, así que la puerta tiene que estar acá. checkAdsTxt cachea por proceso.
+        const _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown" }));
+        if (_ads.state === "no") { await _softRejectLead(auth, lead.id, "sin_ads_txt"); blocked++; return; }
+        // "unknown" no es "no": puede ser Cloudflare tapándonos. Pero si ADEMÁS no pudimos leer
+        // la home, no tenemos UNA sola señal de que monetice — y gastar scrape ahí es tirar
+        // tiempo. Vuelve como no-verificable, que es reversible cuando el re-chequeo lo resuelva.
+        if (_ads.state !== "yes" && !pc) {
+          await _softRejectLead(auth, lead.id, "sin_evidencia_monetizacion (ads.txt no verificable)");
+          blocked++; return;
+        }
         // Maxi 2026-07-16: teléfono/WhatsApp del home (ya fetcheamos pc → gratis). "wa:" marca WhatsApp.
         let foundPhone = "";
         if (pc?.whatsapps?.length) foundPhone = "wa:" + pc.whatsapps[0];
