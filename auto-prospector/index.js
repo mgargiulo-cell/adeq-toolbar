@@ -1476,11 +1476,20 @@ function _madridNowParts() {
   };
 }
 
-function _currentFeederSlot() {
+// Maxi 2026-08-07: exigía la hora EXACTA. Si a las 9 el worker estaba ocupado con otra cosa
+// —los barridos del pool recorren miles de dominios con red— la hora pasaba y ese slot se
+// perdía para el resto del día. Es el mismo defecto que tenía el slot del agente (arreglado
+// hoy en e71322d): ahí se medía que el de las 9 no corría NUNCA.
+// Mismo remedio: se lleva la lista de los que ya corrieron hoy —que acá ya existe, persistida
+// en toolbar_feeder_runs por slot_label— y se toma el MÁS VIEJO pendiente. El chequeo contra
+// esa tabla lo hace el llamador, así que un slot recuperado tampoco dispara dos veces.
+function _currentFeederSlot(hechos = new Set()) {
   const { hour, weekday, dateISO } = _madridNowParts();
   if (weekday === "Sat" || weekday === "Sun") return null;
-  if (!FEEDER_SLOTS.includes(hour)) return null;
-  return { slot: hour, slotLabel: `${dateISO}-${String(hour).padStart(2, "0")}:00` };
+  const pendientes = FEEDER_SLOTS.filter(h => hour >= h && !hechos.has(h));
+  if (pendientes.length === 0) return null;
+  const slot = pendientes[0];
+  return { slot, atrasado: hour > slot, slotLabel: `${dateISO}-${String(slot).padStart(2, "0")}:00` };
 }
 
 async function _getFeederTodayRuns(token, dateISO) {
@@ -2527,9 +2536,25 @@ async function _getFeederSourceWeights(token) {
 
 // ORQUESTADOR: chequea si estamos en slot y si no disparó, dispara
 async function maybeRunFeederSlot(token) {
-  const slotInfo = _currentFeederSlot();
+  // Los slots que YA corrieron hoy salen de toolbar_feeder_runs, que es la fuente de verdad y
+  // sobrevive a los restarts del worker (cada ~7min). Con eso _currentFeederSlot devuelve el
+  // más viejo que falta en vez de exigir la hora en punto.
+  const _hoy = _madridNowParts().dateISO;
+  const _hechos = new Set();
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?slot_label=like.${encodeURIComponent(_hoy)}*&select=slot_label`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (r.ok) for (const f of await r.json()) {
+      const m = /-(\d{2}):00$/.exec(f.slot_label || "");
+      if (m) _hechos.add(parseInt(m[1], 10));
+    }
+  } catch {}
+  const slotInfo = _currentFeederSlot(_hechos);
   if (!slotInfo) return;
   const { slotLabel } = slotInfo;
+  if (slotInfo.atrasado) log(`🌱 FEEDER: recupero el slot de las ${slotInfo.slot} que se había perdido`);
   if (_feederLastSlot === slotLabel) return;
   // DB recuerda (survives worker restart)
   try {
