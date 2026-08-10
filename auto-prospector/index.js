@@ -13003,19 +13003,32 @@ async function _verifyEmailMV(token, cfg, email) {
     // pasaba en silencio y los rebotes aparecían después sin explicación.
     if (_mvCount === cap) log(`⚠️ MillionVerifier: llegué al tope de ${cap}/día — de acá en más los emails van SIN verificar (esperar rebotes)`);
     _mvCount++;
-    return true;
+    return "riesgo";   // sin verificar no es "limpio": que compita como reserva, no como bueno
   }
   _mvCount++;
   // Persistir SIEMPRE (no cada 20) → un restart no pierde la cuenta del día. ~60 writes/día = nada.
   setConfigValue(token, "millionverifier_used", `${day}:${_mvCount}`).catch(() => {});
   try {
     const r = await fetch(`https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(key)}&email=${encodeURIComponent(lower)}&timeout=10`, { signal: AbortSignal.timeout(12000) });
-    if (!r.ok) return true;                                // error API → fail-open
+    if (!r.ok) return "riesgo";                            // error API → fail-open, pero como reserva
     const j = await r.json().catch(() => null);
     const res = String(j?.result || "").toLowerCase();
-    const deliverable = !(res === "invalid" || res === "disposable");  // bloquea SOLO lo claramente malo
+    // ── TRES ESTADOS, NO DOS (Maxi 2026-08-10) ──────────────────────────────────────────
+    // Antes: `!(invalid || disposable)`. Todo lo demás pasaba, incluido **catch_all** — un
+    // dominio que acepta CUALQUIER dirección en el SMTP aunque la casilla no exista. Son
+    // justamente los que rebotan días después. Medido del 07 al 10/08: 26 rebotes DUROS sobre 21
+    // dominios, con MillionVerifier verificando de verdad (32 consultas hoy, tope 200 — no era
+    // falta de cupo, como creí primero).
+    // Bloquearlos de una tampoco sirve: muchísimos publishers corporativos son catch-all y
+    // perderíamos el lead entero. La respuesta correcta no es sí/no, son tres estados, y el
+    // caller ya prueba candidatos en orden — así que puede preferir el limpio y dejar el dudoso
+    // de reserva.
+    const estado = (res === "invalid" || res === "disposable") ? "no"
+                 : (res === "catch_all" || res === "unknown" || res === "risky") ? "riesgo"
+                 : "ok";
+    const deliverable = estado !== "no";
     if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
-    _mvCache.set(lower, deliverable);
+    _mvCache.set(lower, estado);
     // Maxi 2026-07-24: registrar el resultado de CADA verificación → medir el ROI (¿cuánta basura
     // real agarra vs plata tirada?). Fire-and-forget, no frena el envío.
     fetch(`${SUPABASE_URL}/rest/v1/toolbar_mv_results`, {
@@ -13023,9 +13036,10 @@ async function _verifyEmailMV(token, cfg, email) {
       headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
       body: JSON.stringify({ domain: lower.split("@")[1] || "", email: lower, result: res, quality: String(j?.quality || "").toLowerCase(), blocked: !deliverable }),
     }).catch(() => {});
-    if (!deliverable) log(`  🚫 MV: ${lower} = ${res} (no entregable) → skip envío`);
-    return deliverable;
-  } catch { return true; }                                 // timeout/red → fail-open
+    if (estado === "no")     log(`  🚫 MV: ${lower} = ${res} (no entregable) → skip envío`);
+    if (estado === "riesgo")  log(`  ⚠️ MV: ${lower} = ${res} (dominio catch-all: acepta todo, puede rebotar) → queda de reserva`);
+    return estado;
+  } catch { return "riesgo"; }                             // timeout/red → fail-open, pero como reserva
 }
 
 
@@ -15104,6 +15118,11 @@ async function runAgentCycle(token, allFlags) {
         if (email && ranked.length > 0) {
           const MAX_MV_PER_LEAD = 3;
           let mvUsed = 0, chosen = null, descartados = 0;
+          // Reserva: el mejor candidato "riesgo" (catch-all, o que no se pudo verificar). No se
+          // descarta —perderíamos publishers corporativos enteros, que suelen ser catch-all— pero
+          // se usa solo si ningún candidato verifica limpio. Como _orden ya viene por ranking, el
+          // primero que caiga acá es el mejor de los dudosos.
+          let reserva = null;
           // Arrancar por el email YA elegido (puede no ser ranked[0]: el 2do pass de Claude lo
           // pudo haber cambiado). Sin esto el loop volvía a empezar por ranked[0] y pisaba
           // silenciosamente la elección de Claude.
@@ -15136,7 +15155,8 @@ async function runAgentCycle(token, allFlags) {
             }
             if (_ruta.verificar && mvUsed < MAX_MV_PER_LEAD) {
               mvUsed++;
-              if (!(await _verifyEmailMV(token, cfg, cand.email))) {
+              const _mv = await _verifyEmailMV(token, cfg, cand.email);
+              if (_mv === "no") {
                 // No entregable → marcar para que no se re-elija y seguir con el siguiente
                 markEmailBounced(token, {
                   email: cand.email, reason: "mv_undeliverable",
@@ -15145,9 +15165,18 @@ async function runAgentCycle(token, allFlags) {
                 descartados++;
                 continue;
               }
+              if (_mv === "riesgo") {
+                if (!reserva) reserva = cand;   // guardo el mejor dudoso y sigo buscando uno limpio
+                continue;
+              }
             }
             chosen = cand;
             break;
+          }
+          // Ningún candidato verificó limpio: antes de dejar el lead sin enviar, va la reserva.
+          if (!chosen && reserva) {
+            chosen = reserva;
+            log(`  ⚠️ ${domain}: ninguno verificó limpio → mando a ${reserva.email} (catch-all o sin verificar; puede rebotar)`);
           }
           if (chosen && chosen.email !== email) {
             log(`  ↪️ ${domain}: ${email} no entregable → salto instantáneo a ${chosen.email} (descartados: ${descartados})`);
@@ -15268,7 +15297,7 @@ async function runAgentCycle(token, allFlags) {
         // el user cargue millionverifier_api_key → sin key devuelve true y NO cambia nada. Con
         // key: si el buzón es invalid/disposable, NO enviamos (evita el rebote) y marcamos el
         // email como bounced local para que NO se re-elija y el re-enrich busque otro contacto.
-        if (!(await _verifyEmailMV(token, cfg, email))) {
+        if ((await _verifyEmailMV(token, cfg, email)) === "no") {
           if (reservedId) {
             fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
               method: "PATCH",
