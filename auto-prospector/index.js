@@ -10178,8 +10178,13 @@ const AGENT_DEFAULTS = {
 };
 
 function _agentCfg(cfg) {
+  // Maxi 2026-08-10: leía SOLO `agent_<key>`. Si alguien guarda la clave sin el prefijo —cosa
+  // fácil de hacer, porque en AGENT_DEFAULTS se llama `per_cycle_limit` a secas— el valor se
+  // ignora en silencio y el agente sigue con el default. Pasó exactamente eso: se puso
+  // per_cycle_limit=4, la config decía 4, y el agente siguió mandando de a 2 durante 3 días.
+  // Ahora se acepta cualquiera de las dos formas, con prioridad a la prefijada.
   const get = (key, dflt) => {
-    const v = cfg[`agent_${key}`];
+    const v = cfg[`agent_${key}`] ?? cfg[key];
     if (v == null || v === "") return dflt;
     if (typeof dflt === "number") {
       const n = parseInt(v, 10);
@@ -12985,8 +12990,21 @@ async function _verifyEmailMV(token, cfg, email) {
     _mvCount = persisted.startsWith(day + ":") ? (parseInt(persisted.split(":")[1], 10) || 0) : 0;
   }
   // Cap efectivo = min(config, techo absoluto). El techo hardcoded manda aunque la config quede alta.
-  const cap = Math.min(parseInt(cfg.millionverifier_daily_cap || "100", 10) || 100, MV_ABS_DAILY_MAX);
-  if (_mvCount >= cap) return true;                        // cap diario → fail-open (NO gasta)
+  // Maxi 2026-08-10: el default era 100/día. Cuando se llega al tope esta función devuelve true
+  // —FALLA ABIERTO, o sea el email pasa SIN verificar— y con 60 envíos/día más los reintentos y
+  // los re-chequeos se pasan los 100 sin esfuerzo. A partir de ahí se manda a ciegas.
+  // Medido del 07 al 10/08: 26 rebotes DUROS sobre 21 dominios, teniendo MillionVerifier activo.
+  // La clave `millionverifier_daily_cap` nunca se llegó a poner en la base (quedó pendiente
+  // desde el 27/07), así que el default es lo único que manda. Se sube al techo absoluto: el
+  // gasto real lo acota MV_ABS_DAILY_MAX, no este número.
+  const cap = Math.min(parseInt(cfg.millionverifier_daily_cap || String(MV_ABS_DAILY_MAX), 10) || MV_ABS_DAILY_MAX, MV_ABS_DAILY_MAX);
+  if (_mvCount >= cap) {
+    // Fail-open a propósito (no frenar los envíos), pero que quede registro: hasta hoy esto
+    // pasaba en silencio y los rebotes aparecían después sin explicación.
+    if (_mvCount === cap) log(`⚠️ MillionVerifier: llegué al tope de ${cap}/día — de acá en más los emails van SIN verificar (esperar rebotes)`);
+    _mvCount++;
+    return true;
+  }
   _mvCount++;
   // Persistir SIEMPRE (no cada 20) → un restart no pierde la cuenta del día. ~60 writes/día = nada.
   setConfigValue(token, "millionverifier_used", `${day}:${_mvCount}`).catch(() => {});
