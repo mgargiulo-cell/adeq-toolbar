@@ -13927,13 +13927,32 @@ async function securityWatchdog(token) {
   } catch {}
 
   // ── 2. ALGUIEN INTENTANDO ENTRAR AL PROXY ──────────────────────────────────────────────
-  const noAutorizados = await _count(`${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&created_at=gte.${hace(1)}&select=id`);
+  const _urlNoAut = `${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&created_at=gte.${hace(1)}`;
+  const noAutorizados = await _count(`${_urlNoAut}&select=id`);
+  // Maxi 2026-08-10: el aviso decía "3 intentos" y nada más, así que para saber si era un ataque
+  // o un MB con la sesión vencida había que ir al SQL igual. Con el actor y el tipo en el propio
+  // mail se decide de un vistazo: si el mail es de un MB conocido, es una sesión caída.
+  let _quienes = "";
+  try {
+    const r = await fetch(`${_urlNoAut}&select=kind,actor&order=created_at.desc&limit=10`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (r.ok) {
+      const filas = await r.json();
+      const porActor = {};
+      for (const f of (Array.isArray(filas) ? filas : [])) {
+        const k = `${f.actor || "(sin identificar)"} · ${f.kind}`;
+        porActor[k] = (porActor[k] || 0) + 1;
+      }
+      const lista = Object.entries(porActor).map(([k, n]) => `${k} ×${n}`).join(" | ");
+      if (lista) _quienes = `\n  Quién: ${lista}`;
+    }
+  } catch {}
   if (noAutorizados >= SEC_UMBRALES.proxy_no_autorizados_h) {
     // AVISA pero NO frena (auditoría 2026-08-04). Si el kill switch se disparara con intentos
     // de auth fallidos, cualquier tercero podría APAGARNOS EL AGENTE a propósito martillando el
     // proxy con tokens inválidos — un DoS gratis contra nosotros mismos. El freno automático se
     // reserva para señales de GASTO REAL, que es lo único que cuesta plata cada minuto.
-    hallazgos.push(`• ${noAutorizados} intentos de acceso NO AUTORIZADO al proxy en la última hora. Alguien está probando entrar (no freno el agente por esto: sería el DoS que busca).`);
+    hallazgos.push(`• ${noAutorizados} intentos de acceso NO AUTORIZADO al proxy en la última hora. Alguien está probando entrar (no freno el agente por esto: sería el DoS que busca).${_quienes}`);
   }
 
   // ── 3. INUNDACIÓN DEL PIXEL ────────────────────────────────────────────────────────────
@@ -14044,6 +14063,7 @@ async function securityWatchdog(token) {
   // Solo ante algo crítico e inequívoco. Un rebote alto NO frena nada (es de negocio, no un
   // ataque); un proxy disparado o envíos desbocados SÍ, porque cuestan plata cada minuto.
   let accion = "Ninguna — solo aviso. Revisalo cuando puedas.";
+  let freno = false;   // ¿este aviso APAGÓ algo? decide qué instrucciones lleva el mail
   // Toggle "Defensa automática": encendido por defecto. Si lo apagás, el vigilante sigue
   // detectando y avisando pero no frena nada solo.
   const defensaAuto = String(cfg.defensa_automatica || "true") !== "false";
@@ -14051,6 +14071,7 @@ async function securityWatchdog(token) {
     accion = "⚠️ Defensa automática APAGADA — detecté el problema pero NO frené nada. Actuá vos.";
   } else if (critico && String(cfg.kill_switch || "") !== "true") {
     await _secFrenar(token, hallazgos[0].slice(0, 150));
+    freno = true;
     accion = "🛑 KILL SWITCH ACTIVADO automáticamente. El gasto en APIs externas está CORTADO "
            + "(Anthropic, Apollo, RapidAPI, Gemini, Voyage) y el agente dejó de enviar.";
   }
@@ -14064,10 +14085,17 @@ async function securityWatchdog(token) {
     `QUÉ HICE`,
     accion,
     ``,
-    `CÓMO LO REVERTÍS (1 clic, en el SQL editor de Supabase)`,
-    `  UPDATE toolbar_config SET value='false' WHERE key='kill_switch';`,
-    ``,
-    `CÓMO LO FRENÁS VOS SI HACE FALTA`,
+    // Maxi 2026-08-10: el mail mostraba SIEMPRE el "CÓMO LO REVERTÍS", incluso diciendo arriba
+    // "QUÉ HICE: ninguna, solo aviso". Se lee como que algo se congeló y hay que ir corriendo a
+    // destrabarlo. Un aviso que asusta de más se termina ignorando, que es lo peor que le puede
+    // pasar a una alerta de seguridad. Ahora las instrucciones dependen de si frenó o no.
+    ...(freno
+      ? [`CÓMO LO REVERTÍS (1 clic, en el SQL editor de Supabase)`,
+         `  UPDATE toolbar_config SET value='false' WHERE key='kill_switch';`,
+         ``]
+      : [`NO HAY NADA QUE DESTRABAR — el agente sigue funcionando normal.`,
+         ``]),
+    `SI QUERÉS FRENAR TODO VOS`,
     `  UPDATE toolbar_config SET value='true' WHERE key='kill_switch';`,
     ``,
     `PARA VER EL DETALLE`,
