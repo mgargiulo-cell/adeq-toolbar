@@ -14509,7 +14509,20 @@ async function runAgentCycle(token, allFlags) {
       const sc = rankEmail(String(e), l.domain, l.category || "");
       return sc >= 50 ? 3 : sc >= 0 ? 2 : 1;                           // buen email primero
     };
-    fresh.sort((a, b) => (_rankIntento(b) - _rankIntento(a)) || ((b.score || 0) - (a.score || 0)));
+    // ⚠️ Maxi 2026-08-10: este sort BORRABA la cascada GEO. Arriba se arma `mixed` con un
+    // round-robin por nivel —LATAM → Centroamérica → España → Europa/Asia/África → Anglo— y acá
+    // se reordenaba TODO por calidad de email, tirando ese trabajo a la basura. Lo agregué yo el
+    // 04/08 para no gastar el ciclo en leads que iban a fallar, sin ver que pisaba la prioridad
+    // geográfica que el user había pedido el 21/07.
+    // Medido del 07 al 10/08: 56% de los envíos a Anglo (el tope es 10%) y CERO a LATAM.
+    // Ahora el nivel GEO manda y la calidad del email desempata ADENTRO de cada nivel. El sort
+    // de JS es estable, así que la rotación por país del round-robin sobrevive como tercer
+    // criterio. Se cumplen las dos cosas: LATAM primero, y dentro de LATAM los que van a andar.
+    fresh.sort((a, b) => {
+      const ta = _geoTier(_leadIso(a.geo, a.geos_all)), tb = _geoTier(_leadIso(b.geo, b.geos_all));
+      if (ta !== tb) return ta - tb;                                        // 1º el nivel GEO
+      return (_rankIntento(b) - _rankIntento(a)) || ((b.score || 0) - (a.score || 0));
+    });
     const _conEmail = fresh.filter(_tieneEmail).length;
     log(`🤖 Agent ${userEmail}: pool de ${fresh.length} candidatos, ${_conEmail} ya con email (se prueban primero)`);
 
