@@ -14207,6 +14207,14 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     // modules/monday.js pushToMonday— deja Comentarios en blanco). NO es el pitch: es solo la
     // etiqueta de origen. El MB puede editar el comentario después sin que se re-sobrescriba
     // (esto solo corre al CREAR el item).
+    // ── ORIGEN DEL LEAD (Maxi 2026-08-10) ────────────────────────────────────────────────
+    // Hasta hoy esto iba SOLO a Comentarios (`texto`), que es una columna de texto libre. El
+    // agente la escribe bien siempre —no hay ninguna condición— pero el primer MB que anota algo
+    // ahí borra la marca. De ahí el "a veces figura y a veces no": no falla el push, la pisa el
+    // uso normal del board.
+    // Si existe una columna dedicada (id en `monday_col_origen`), la marca va AHÍ, donde nadie
+    // escribe a mano. Comentarios se sigue completando por compatibilidad mientras no exista.
+    ...(_mondayColOrigen ? { [_mondayColOrigen]: "Agente" } : {}),
     [MONDAY_COL_PITCH]: "Agente",
   };
   if (payload.phone && !_mondayPhoneIso(payload.geo)) {
@@ -14241,6 +14249,10 @@ const MONDAY_COL_ESTADO  = "deal_stage";      // Estado (status/dropdown)
 const MONDAY_COL_OWNER   = "deal_owner";      // Ejecutivo (person)
 const MONDAY_COL_PITCH   = "texto";           // Comentarios (text)
 const MONDAY_COL_PHONE   = "tel_fono_1";      // Telefono (phone column)
+// Columna DEDICADA para el origen (Agente/Manual). Vacía = no existe todavía y se sigue usando
+// Comentarios. Para activarla: crear en el board una columna de tipo Estado con las opciones
+// "Agente" y "Manual", y guardar su id en toolbar_config.monday_col_origen.
+let _mondayColOrigen = "";
 // Reengagement / Email Futuro — el agente al disparar el email B actualiza
 // estas dos fechas con hoy+5 y hoy+10. Verificar IDs en Monday si el push falla.
 const MONDAY_COL_FU1     = "fecha2";          // Fecha FU1 (today + 5) — Maxi 2026-07-15: era "fecha2_8" (id inexistente en board 1420268379 → "This column ID doesn't exist" en cada dispatch); id real verificado = "fecha2"
@@ -14273,6 +14285,7 @@ async function runAgentCycle(token, allFlags) {
 
   const cfg = await getConfig(token);
   const aCfg = _agentCfg(cfg);
+  _mondayColOrigen = String(cfg.monday_col_origen || "").trim();   // columna dedicada de origen, si existe
   const monday_api_key_default = cfg.monday_api_key || "";
 
   // Active hours check — fuera de 9-20 España no manda nada (ni Monday, ni mail)

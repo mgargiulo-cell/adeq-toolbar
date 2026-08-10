@@ -118,6 +118,10 @@ export async function pushToMonday(data) {
   // El push del AGENTE (auto-prospector: pushToMondayServer) escribe "Agente". Desde hoy TODO item
   // lleva identificación en Comentarios. NO es el pitch (eso el user no lo quiere ahí).
   const columnValues = {
+    // Maxi 2026-08-10: la marca de origen vivía SOLO en Comentarios, que es texto libre — el
+    // primer MB que anota algo ahí la borra. De ahí el "a veces figura y a veces no". Si hay una
+    // columna dedicada configurada, va ahí; Comentarios se sigue completando por compatibilidad.
+    ...(CONFIG.MONDAY_COLUMNS.origen ? { [CONFIG.MONDAY_COLUMNS.origen]: "Manual" } : {}),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   "Manual",
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),

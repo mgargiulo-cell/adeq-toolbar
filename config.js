@@ -36,6 +36,11 @@ export const CONFIG = {
     trafico:         "texto7",
     idioma:          "estado_12",
     comentarios:     "texto",
+    // Columna DEDICADA para el origen (Agente/Manual). Vacía = todavía no existe y la marca
+    // sigue yendo a Comentarios. Para activarla: crear en el board una columna tipo Estado con
+    // las opciones "Agente" y "Manual", y poner su id acá (y en toolbar_config.monday_col_origen
+    // para que el worker la use también).
+    origen:          "",
     email:           "email_mm2edcd3",   // email column (was text_mkrwahsz)
     telefono:        "tel_fono_1",
     // Reengagement / Email Futuro — el agente actualiza estas dos al disparar
