@@ -150,7 +150,17 @@ export async function updateMonday({ itemId, traffic, email, geo, estado, fecha,
   const personId = resolveMondayPerson(ejecutivo, loginEmail);
 
   // Comentarios: NO se incluye pitch — decisión user 2026-05-12.
+  // Maxi 2026-08-10: la marca de origen se escribía SOLO al CREAR el item. Los dominios que ya
+  // estaban en el board —miles, desde 2024— pasan por acá y se quedaban sin marca. Ese era el
+  // "a veces sí y a veces no": no es aleatorio, es si el item es nuevo o ya existía.
+  // Verificado en el board con tres items de la misma marca:
+  //   fr.besoccer.com      creado hoy   → "Agente"
+  //   www.es.besoccer.com  creado 2024  → ""
+  //   company.besoccer.com creado 06/26 → null
+  // Un push manual siempre lo hace un MB, así que la marca es correcta también al actualizar.
   const columnValues = {
+    ...(CONFIG.MONDAY_COLUMNS.origen ? { [CONFIG.MONDAY_COLUMNS.origen]: "Manual" } : {}),
+    [CONFIG.MONDAY_COLUMNS.comentarios]:   "Manual",
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
     ...(email                                                             ? { [CONFIG.MONDAY_COLUMNS.email]:         { email: email, text: email } } : {}),
