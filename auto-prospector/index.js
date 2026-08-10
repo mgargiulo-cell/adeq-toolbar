@@ -8395,19 +8395,33 @@ async function getNextCsvItem(token, blockedUsers = new Set()) {
       const list = [...blockedUsers].map(u => `"${u}"`).join(",");
       filter = `&uploaded_by=not.in.(${list})`;
     }
-    const pedir = async (extra) => {
+    const pedir = async (extra, lim = 1) => {
       const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}${extra}&order=uploaded_at.asc&limit=1&select=id,domain,uploaded_by,error_message`,
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}${extra}&order=uploaded_at.asc&limit=${lim}&select=id,domain,uploaded_by,error_message`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       );
       const j = await r.json().catch(() => []);
       return Array.isArray(j) ? j : [];
     };
     // 1ª pasada: cargas de MBs (todo lo que no subió el worker). 2ª: el resto.
-    let rows = await pedir(`&uploaded_by=neq.${encodeURIComponent(AGENT_UPLOADER)}`);
-    if (rows.length === 0) rows = await pedir("");
-    if (rows.length === 0) return null;
-    const item = rows[0];
+    // Maxi 2026-08-10: se pedía UN item y si el reclamo fallaba se devolvía null — que el
+    // llamador lee como "cola vacía" y FRENA TODO. Un solo item problemático a la cabeza
+    // bloqueaba los 1.616 de atrás. Ahora se piden varios y se prueba con el siguiente.
+    let rows = await pedir(`&uploaded_by=neq.${encodeURIComponent(AGENT_UPLOADER)}`, 8);
+    if (rows.length === 0) rows = await pedir("", 8);
+    if (rows.length === 0) return null;   // esto SÍ es cola vacía
+    for (const item of rows) {
+      const _ok = await _reclamarCsvItem(token, item);
+      if (_ok) return _ok;
+    }
+    log(`  ⚠️ CSV queue: no pude reclamar ninguno de los ${rows.length} primeros — reintento en la próxima vuelta`);
+    return null;
+  } catch { return null; }
+}
+
+// Reclamo atómico de UN item. Devuelve el item si quedó nuestro, null si no.
+async function _reclamarCsvItem(token, item) {
+  try {
     if (item.uploaded_by && item.uploaded_by !== AGENT_UPLOADER) {
       log(`⚡ prioridad MB: ${item.domain} (${item.uploaded_by}) — se procesa antes que la cola del agente`);
     }
@@ -8425,7 +8439,24 @@ async function getNextCsvItem(token, blockedUsers = new Set()) {
       }
     );
     const claimed = await claim.json().catch(() => []);
-    return claimed?.[0] ? item : null; // si otro proceso lo tomó, claimed será []
+    if (claimed?.[0]) return item;
+    // Cuerpo vacío NO prueba que el reclamo falló: si el PATCH funcionó pero PostgREST no
+    // devolvió la representación, el item YA quedó en `processing` y nosotros lo dábamos por
+    // perdido → devolvíamos null → el llamador frenaba la cola entera. Y el item quedaba
+    // colgado en processing hasta el próximo restart. Con 1.616 pendientes eso es rendimiento
+    // cero: cada vuelta convertía un pending en processing y se iba sin procesar nada.
+    // Antes de rendirse, preguntamos cómo quedó de verdad.
+    try {
+      const _v = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${item.id}&select=status`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      const _row = _v.ok ? (await _v.json().catch(() => []))[0] : null;
+      if (_row?.status === "processing") return item;          // era nuestro
+      if (_row?.status === "pending") {
+        // Sigue pendiente: el PATCH no entró. Lo dejamos para otro y probamos el siguiente.
+        log(`  ⚠️ CSV queue: ${item.domain} no se pudo reclamar (sigue pending) — paso al siguiente`);
+      }
+    } catch {}
+    return null;
   } catch { return null; }
 }
 
