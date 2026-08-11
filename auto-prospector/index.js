@@ -1861,12 +1861,13 @@ const AUTOGOOGLE_SLOTS = [10, 11, 14, 17, 21];  // Maxi 2026-07-15 (F4): 8→10 
 const AUTOGOOGLE_MONTHLY_CAP = 2500;           // techo Serper/mes (plan FREE de Serper); el pacing lo reparte por días
 let _autoGoogleLastSlot = "";
 const _AUTOGOOGLE_KEYWORDS = [
-  "breaking news today","football transfer news","stock market today","crypto news today","best gaming laptops","healthy dinner recipes","weight loss tips","travel destinations 2025","movie reviews","celebrity gossip","nba highlights","premier league news","personal finance tips","ai news today","smartphone reviews","home workout routine","car reviews 2025","real estate market news","budget travel tips","best tv series to watch",
-  "noticias de hoy","fichajes futbol","precio del bitcoin","recetas faciles","consejos de salud","resultados liga","analisis politico","mejores celulares","horoscopo de hoy","peliculas estreno","tips de viaje","mercado inmobiliario","finanzas personales","noticias deportivas","tutoriales tecnologia",
-  "noticias de hoje","futebol ao vivo","preco bitcoin","receitas faceis","dicas de saude","resultados brasileirao","analise politica","melhores celulares","filmes lancamento","dicas de viagem",
+  // Fallback inline por si keywordsData.js no carga. SIN INGLÉS (pedido del user
+  // 2026-08-11): el bloque en inglés que había acá traía la CNN y la BBC, que ya
+  // conocemos y son anglo, y encima se buscaba con `gl` de países no-anglo.
+  "noticias de hoy","fichajes futbol","precio del bitcoin","recetas faciles","consejos de salud","resultados liga","analisis politico","mejores celulares","horoscopo de hoy","peliculas estreno","tips de viaje","mercado inmobiliario","finanzas personales","noticias deportivas","tutoriales tecnologia","ultimas noticias","noticias locales","farandula","clima hoy","tabla de posiciones",
+  "noticias de hoje","futebol ao vivo","preco bitcoin","receitas faceis","dicas de saude","resultados brasileirao","analise politica","melhores celulares","filmes lancamento","dicas de viagem","noticias locais","ultimas noticias",
   "notizie di oggi","calciomercato","prezzo bitcoin","ricette facili","consigli salute","risultati serie a","recensioni film","migliori smartphone","viaggi economici","oroscopo oggi",
   "actualites du jour","mercato football","prix bitcoin","recettes faciles","conseils sante","resultats ligue 1","critiques films","meilleurs smartphones","idees voyage","horoscope du jour",
-  "nachrichten heute","fussball transfers","bitcoin preis","einfache rezepte","gesundheitstipps","bundesliga ergebnisse","filmkritiken","beste smartphones","reisetipps","horoskop heute",
 ];
 
 // Países de búsqueda (Serper `gl`) para targeting GEO — NO-Anglo (LATAM + EU + TR/GR).
@@ -1900,19 +1901,47 @@ const _HUELLAS_ES = [
   `"tarifas publicitarias" OR "pauta publicitaria" diario digital {tld}`,
   `"nuestra redacción" OR "quiénes somos" noticias locales {tld}`,
 ];
-const _HUELLAS_INTL = [
+// Sin inglés (pedido del user 2026-08-11). Cada idioma con SUS TLDs: buscar en
+// portugués sobre site:.it no tiene sentido y quema una consulta de Serper.
+const _HUELLAS_PT = [
   `inurl:ads.txt "google.com, pub-" {tld}`,
-  `"media kit" OR "advertise with us" news portal {tld}`,
-  `"advertising rates" OR "our audience" online magazine {tld}`,
-  `"editorial team" OR "about our newsroom" news {tld}`,
+  `"mídia kit" OR "midia kit" OR "anuncie conosco" portal de notícias {tld}`,
+  `"tabela de preços" publicidade site de notícias {tld}`,
+  `"nossa redação" OR "quem somos" notícias {tld}`,
+];
+const _HUELLAS_IT = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"media kit" OR "pubblicità sul sito" quotidiano online {tld}`,
+  `"tariffe pubblicitarie" OR "listino pubblicitario" testata online {tld}`,
+  `"la nostra redazione" OR "chi siamo" notizie {tld}`,
+];
+const _HUELLAS_FR = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"kit média" OR "annoncer sur" site d'actualités {tld}`,
+  `"tarifs publicitaires" OR "régie publicitaire" journal en ligne {tld}`,
+  `"notre rédaction" OR "qui sommes-nous" actualités {tld}`,
 ];
 
+const _TLDS_POR_IDIOMA = {
+  es: HISPANIC_TLDS,
+  pt: [".br", ".pt", ".com.br"],
+  it: [".it"],
+  fr: [".fr", ".be", ".ca", ".ch", ".ma", ".sn"],
+};
+
 function _construirBusquedasDeHuella(esHispano, cuantas) {
-  const plantillas = esHispano ? _HUELLAS_ES : _HUELLAS_INTL;
-  const tlds = esHispano ? HISPANIC_TLDS : [".mx", ".ar", ".es", ".it", ".pt", ".pl", ".tr", ".gr", ".br", ".cl", ".co"];
+  // En el turno hispano, todo en español. En el otro, español mayoritario y el
+  // resto repartido entre portugués, italiano y francés. Inglés nunca.
+  const mezcla = esHispano
+    ? ["es", "es", "es", "es"]
+    : ["es", "es", "pt", "it", "fr"];
+  const porIdioma = { es: _HUELLAS_ES, pt: _HUELLAS_PT, it: _HUELLAS_IT, fr: _HUELLAS_FR };
   const out = [];
   for (let i = 0; i < cuantas; i++) {
-    const p = plantillas[i % plantillas.length];
+    const lang = mezcla[i % mezcla.length];
+    const plantillas = porIdioma[lang];
+    const tlds = _TLDS_POR_IDIOMA[lang];
+    const p = plantillas[Math.floor(i / mezcla.length) % plantillas.length];
     const tld = tlds[Math.floor(Math.random() * tlds.length)];
     out.push(p.replace("{tld}", `site:${tld}`));
   }
@@ -2142,11 +2171,36 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Pool = TODAS las frases de cascade (7549, 12 idiomas) desde keywordsData.js; fallback inline.
   // Maxi 2026-07-17 TURNO HISPANO: en los slots hispanos el pool se restringe al español
   // (672 frases) → descubrimiento LATAM/Centroamérica/España garantizado todos los días.
+  // ── SIN INGLÉS, Y MAYORMENTE ESPAÑOL (Maxi 2026-08-11, pedido del user) ─────
+  // Antes el turno no-hispano usaba `Object.values(_AG_KEYWORDS).flat()`, o sea las
+  // 12 lenguas juntas — incluidas 716 frases en INGLÉS. Y peor: las buscaba con el
+  // `gl` rotado sobre países no-anglo, así que le pedía a Google "breaking news
+  // today" desde México. Lo peor de los dos mundos: keyword que trae publishers
+  // anglo enormes que ya conocemos, con un targeting que no le corresponde.
+  //
+  // Mezcla nueva: español dominante, después portugués/italiano/francés, y una
+  // rebanada chica para el resto de las lenguas NO inglesas (para no romper la
+  // cascada GEO, donde Europa/Asia siguen siendo nivel 4 y no cero). Inglés: nunca.
   let pool;
   try {
-    pool = _hispanicSlot
-      ? (_AG_KEYWORDS.es || []).filter(s => typeof s === "string" && s)
-      : Object.values(_AG_KEYWORDS).flat().filter(s => typeof s === "string" && s);
+    if (_hispanicSlot) {
+      pool = (_AG_KEYWORDS.es || []).filter(s => typeof s === "string" && s);
+    } else {
+      const _tomar = (lang, frac) => {
+        const arr = (_AG_KEYWORDS[lang] || []).filter(s => typeof s === "string" && s);
+        return arr.sort(() => Math.random() - 0.5).slice(0, Math.ceil(arr.length * frac));
+      };
+      pool = [
+        ..._tomar("es", 1.00),                                        // español: todo
+        ..._tomar("pt", 0.60), ..._tomar("it", 0.60), ..._tomar("fr", 0.60),
+        // Resto NO inglés, en dosis chica: alemán, neerlandés, polaco, turco, árabe.
+        ..._tomar("de", 0.15), ..._tomar("nl", 0.15), ..._tomar("pl", 0.15),
+        ..._tomar("tr", 0.15), ..._tomar("ar", 0.15),
+      ];
+      // Cinturón: si alguna vez vuelve a colarse inglés por otra vía, se filtra acá.
+      const _enSet = new Set((_AG_KEYWORDS.en || []).map(s => String(s).toLowerCase()));
+      pool = pool.filter(s => !_enSet.has(String(s).toLowerCase()));
+    }
   } catch { pool = []; }
   if (!pool || pool.length < 50) pool = _AUTOGOOGLE_KEYWORDS;
   // Maxi 2026-07-16: sumar las keywords FRESCAS generadas por Claude (si el flag está prendido).
