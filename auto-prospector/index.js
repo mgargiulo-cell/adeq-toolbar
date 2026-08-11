@@ -1987,6 +1987,55 @@ function _construirBusquedasPorCiudad(esHispano, cuantas) {
   return [...new Set(out)];
 }
 
+// ── MEDIA KITS Y TARIFARIOS EN PDF ───────────────────────────────────────────
+// `filetype:` estaba sin usar. Un sitio que publica su kit de medios o su tarifario
+// tiene equipo comercial y precios: es literalmente el perfil de cliente. Y el PDF
+// suele traer adentro el email comercial y el nombre del contacto, que es el North
+// Star del proyecto — se baja gratis, sin gastar otro crédito.
+const _HUELLAS_PDF = {
+  es: [`"kit de medios" OR "tarifas publicitarias" filetype:pdf {tld}`,
+       `"tarifario publicitario" OR "tarifas de pauta" filetype:pdf {tld}`],
+  pt: [`"mídia kit" OR "tabela de preços" publicidade filetype:pdf {tld}`],
+  it: [`"media kit" OR "listino pubblicitario" filetype:pdf {tld}`],
+  fr: [`"kit média" OR "tarifs publicitaires" filetype:pdf {tld}`],
+};
+
+// ── PARES POR SSP REGIONAL ───────────────────────────────────────────────────
+// La jugada más "media buyer" de todas: si un publisher validado monetiza con un SSP
+// REGIONAL, quién más use ese mismo SSP es su par — mismo país, mismo tamaño, y con
+// ads.txt garantizado (la puerta 0 ya viene aprobada). Se excluyen los universales
+// (Google, Amazon, AppNexus) porque están en el ads.txt de todo el mundo y no dicen nada.
+const _SSP_UNIVERSALES = new Set([
+  "google.com", "doubleclick.net", "aps.amazon.com", "amazon-adsystem.com",
+  "appnexus.com", "openx.com", "rubiconproject.com", "magnite.com", "pubmatic.com",
+  "indexexchange.com", "criteo.com", "smartadserver.com", "taboola.com", "outbrain.com",
+]);
+
+async function _construirBusquedasPorSspRegional(token, cuantas) {
+  if (cuantas <= 0) return [];
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  let semillas = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&select=domain,geo&order=validated_at.desc&limit=12`, { headers: auth });
+    if (r.ok) semillas = (await r.json()).filter(x => x.domain);
+  } catch {}
+  if (!semillas.length) return [];
+  const out = [];
+  for (const s of semillas.slice(0, 4)) {
+    if (out.length >= cuantas) break;
+    const sistemas = await _adsTxtSystems(s.domain).catch(() => []);
+    const regionales = (sistemas || []).filter(x => !_SSP_UNIVERSALES.has(String(x).toLowerCase())).slice(0, 2);
+    if (!regionales.length) continue;
+    // El TLD del propio publisher acota la búsqueda a su mercado.
+    const tld = (String(s.domain).match(/\.([a-z]{2,3}(?:\.[a-z]{2})?)$/i) || [])[1];
+    const site = tld ? ` site:.${tld}` : "";
+    const q = `inurl:ads.txt ${regionales.map(r => `"${r}"`).join(" OR ")}${site}`;
+    out.push(q);
+    _IDIOMA_DE_FRASE.set(q, "es");
+  }
+  return [...new Set(out)].slice(0, cuantas);
+}
+
 const _TLDS_POR_IDIOMA = {
   es: HISPANIC_TLDS,
   pt: [".br", ".pt", ".com.br", ".ao", ".mz"],
@@ -2057,7 +2106,14 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
   const mezcla = esHispano
     ? ["es", "es", "es", "es"]
     : ["es", "es", "pt", "it", "fr"];
-  const porIdioma = { es: _HUELLAS_ES, pt: _HUELLAS_PT, it: _HUELLAS_IT, fr: _HUELLAS_FR };
+  // Los PDF entran en el mismo pool de huellas: un tarifario publicado es la prueba
+  // más fuerte de que hay equipo comercial, y el archivo suele traer el contacto.
+  const porIdioma = {
+    es: [..._HUELLAS_ES, ..._HUELLAS_PDF.es],
+    pt: [..._HUELLAS_PT, ..._HUELLAS_PDF.pt],
+    it: [..._HUELLAS_IT, ..._HUELLAS_PDF.it],
+    fr: [..._HUELLAS_FR, ..._HUELLAS_PDF.fr],
+  };
   const out = [];
   for (let i = 0; i < cuantas; i++) {
     const lang = mezcla[i % mezcla.length];
@@ -2065,7 +2121,9 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
     const tlds = _TLDS_POR_IDIOMA[lang];
     const p = plantillas[Math.floor(i / mezcla.length) % plantillas.length];
     const tld = tlds[Math.floor(Math.random() * tlds.length)];
-    out.push(p.replace("{tld}", `site:${tld}`));
+    const q = p.replace("{tld}", `site:${tld}`);
+    out.push(q);
+    _IDIOMA_DE_FRASE.set(q, lang);   // targeting exacto, sin heurística
   }
   return [...new Set(out)];
 }
@@ -2443,9 +2501,12 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Reparto del slot: 35% huella comercial (prueba directa de que monetiza), 20%
   // ciudades secundarias (el long tail regional), y el resto temas del pool, que
   // pasan de ser la vía principal a ser exploración.
-  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.35)));
+  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.30)));
   const _porCiudad       = _construirBusquedasPorCiudad(_hispanicSlot, Math.max(1, Math.round(N * 0.20)));
-  const _dirigidas = [..._huellaPublisher, ..._porCiudad];
+  // Explotar el propio éxito: los pares de un publisher que YA validamos.
+  const _porSsp          = await _construirBusquedasPorSspRegional(token, Math.max(1, Math.round(N * 0.10))).catch(() => []);
+  const _dirigidas = [..._huellaPublisher, ..._porCiudad, ..._porSsp];
+  if (_porSsp.length) log(`  🤝 AutoGoogle: ${_porSsp.length} búsqueda(s) de pares por SSP regional de publishers validados`);
   const _restoTemas = Math.max(0, N - _dirigidas.length);
   const kws = [
     ..._pickTop.slice(0, Math.round(_restoTemas * 0.65)),
@@ -2512,8 +2573,13 @@ async function _runAutoGoogleSlot(token, slotLabel) {
       if (DEPRIO_TLD_RE.test(d)) { _tirados++; return false; }
       if (_MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || BRAND_BLOCKLIST.has(d)) { _tirados++; return false; }
       try { if (!isDomainAllowed(d)) { _tirados++; return false; } } catch {}
+      // Solo se descarta por IMPOSIBILIDAD estructural (gobierno, universidad,
+      // acortador, CDN, placeholder). Los rechazos por RUBRO —tienda, apuestas,
+      // comparador, clasificados— ya NO se aplican acá: regla del user del 11/08,
+      // "toda url con ads.txt y +400k sirve, no importa el rubro". Que decida la
+      // puerta grande río abajo, con datos, en vez de adivinar por el nombre.
       const v = classifyByUrlOnly(d, "", 0);
-      if (v && v.ok === false) { _tirados++; return false; }
+      if (v && v.ok === false && _VETO_ESTRUCTURAL.test(String(v.reason || ""))) { _tirados++; return false; }
       // El título y el snippet vienen GRATIS en la misma respuesta de Serper y
       // delatan una tienda o un portal de trámites antes de gastar un solo crédito.
       const ctx = _contexto.get(d);
@@ -3035,6 +3101,77 @@ async function _publishersFromSellersJson(networkDomain) {
     } catch {}
   }
   return [];
+}
+
+// ── DESCUBRIR REDES NUEVAS BUSCANDO sellers.json EN GOOGLE ───────────────────
+// El mejor ratio créditos→dominios de todo el sistema. Hasta ahora las redes nuevas
+// solo se descubrían leyendo el ads.txt de nuestras propias semillas: un circuito
+// cerrado que solo encuentra lo que ya está cerca de lo que tenemos.
+//
+// Buscar `inurl:sellers.json` abre una segunda boca: cada red que aparece se pasa a
+// `_publishersFromSellersJson` —que ya existe— y devuelve CIENTOS o miles de
+// publishers de una, sin gastar un crédito más. 5 búsquedas por semana alcanzan.
+const SELLERS_DISCOVERY_BUSQUEDAS = 5;
+
+async function descubrirRedesPorSellersJson(token) {
+  try {
+    if (!SERPER_API_KEY) return 0;
+    if (!(await _tocaCorrer(token, "sellers_discovery", 7 * 24 * 60))) return 0;   // 1×/semana
+
+    const consultas = [
+      `inurl:sellers.json "seller_type" "PUBLISHER"`,
+      `inurl:sellers.json publicidad programática LATAM`,
+      `inurl:sellers.json "PUBLISHER" site:.com.ar OR site:.com.mx OR site:.com.br`,
+      `inurl:sellers.json ssp "INTERMEDIARY" español`,
+      `inurl:sellers.json ad exchange "sellers"`,
+    ].slice(0, SELLERS_DISCOVERY_BUSQUEDAS);
+
+    const hosts = new Set();
+    for (const q of consultas) {
+      const { domains, ok } = await _serperSearch(q, 20, "", { hl: "es" });
+      if (!ok) continue;
+      domains.forEach(d => hosts.add(d));
+    }
+    if (!hosts.size) {
+      await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 7 * 24 * 60, detalle: "0 hosts en la búsqueda", real: 0 });
+      return 0;
+    }
+
+    // Redes que ya conocemos: no vale la pena volver a bajarles el sellers.json.
+    let descubiertas = [];
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.discovered_sellers_networks&select=value`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      if (r.ok) { const rows = await r.json(); descubiertas = JSON.parse(rows?.[0]?.value || "[]"); }
+    } catch {}
+    const conocidas = new Set([..._KNOWN_SELLER_HOSTS, ...descubiertas.map(d => String(d).toLowerCase())]);
+    const nuevas = [...hosts].filter(h => !conocidas.has(h) && !EXCLUDE_DOMAINS.has(h)).slice(0, 15);
+    if (!nuevas.length) {
+      await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 7 * 24 * 60, detalle: `${hosts.size} hosts, ninguno nuevo`, real: 0 });
+      return 0;
+    }
+
+    // Validar que de verdad publican un sellers.json con publishers adentro.
+    const validas = [];
+    for (const net of nuevas) {
+      const pubs = await _publishersFromSellersJson(net).catch(() => []);
+      if (Array.isArray(pubs) && pubs.length >= 20) { validas.push(net); log(`  🌐 sellers.json nuevo: ${net} → ${pubs.length} publishers`); }
+    }
+    if (validas.length) {
+      const _todas = [...new Set([...descubiertas, ...validas])].slice(0, 200);
+      await setConfigValue(token, "discovered_sellers_networks", JSON.stringify(_todas)).catch(() => {});
+      log(`🌐 sellers-discovery: ${validas.length} red(es) nueva(s) → las va a explotar el feeder de ads.txt-graph`);
+    }
+    await saludPing(token, "sellers_discovery", {
+      status: "ok", cadenciaMin: 7 * 24 * 60,
+      detalle: `${hosts.size} hosts, ${nuevas.length} candidatas, ${validas.length} con sellers.json real`,
+      real: validas.length, esperado: 1,
+    });
+    return validas.length;
+  } catch (e) {
+    log(`⚠️ descubrirRedesPorSellersJson: ${e.message}`);
+    return 0;
+  }
 }
 
 async function _feederPullAdsTxtGraph(token, maxInject, sessionKnown) {
@@ -8140,14 +8277,50 @@ async function runProspectSimilarExpansion(token) {
 // que "no pude chequear" (Cloudflare/timeout) NO es "no tiene": eso se reintenta, no se descarta.
 const PROSPECT_SCORE_MIN = 30;
 
-function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType }) {
+// ── REGLA NUEVA DEL USER (2026-08-11) ────────────────────────────────────────
+// Textual: "toda url que tenga txt y que tenga más de 400k vistas según SimilarWeb
+// sirve, no importa si es un medio de noticias, una web de loterías, etc."
+//
+// Es una simplificación correcta y hace redundante media capa de filtros. Todo el
+// aparato de "¿es un medio?" (categoría de SimilarWeb, keywords del home, título
+// delator, veredicto de la IA) era un PROXY para adivinar si el sitio monetiza
+// display. Pero el ads.txt no es un proxy: es la prueba. Un sitio de loterías con
+// ads.txt de 20 exchanges y 2M de visitas vende inventario igual que un diario, y
+// nos sirve igual.
+//
+// Lo que SÍ sigue vetando, porque no es cuestión de rubro sino de imposibilidad:
+// gobierno, universidades, dominios muertos, acortadores, CDN, placeholders,
+// registrars y el techo de 40M (esos tienen equipo comercial propio).
+const _VETO_ESTRUCTURAL = /gobierno|educacion|universidad|academico|elearning|acortador|cdn|placeholder|registrar|hosting_gratuito|plataforma$|wiki/;
+
+// ¿El sitio pasa por la puerta grande? ads.txt confirmado + tráfico suficiente.
+// Si pasa, los vetos por RUBRO no aplican: ya demostró que monetiza.
+function _apruebaPorAdsTxtYTrafico(adsTxt, traffic) {
+  const pv = Number(traffic || 0);
+  return adsTxt?.state === "yes" && pv >= REVIEW_QUEUE_MIN_TRAFFIC;
+}
+
+function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType, traffic = 0 }) {
   const señales = [];
   let score = 0;
   const add = (pts, txt) => { score += pts; señales.push(`${pts >= 0 ? "+" : ""}${pts} ${txt}`); };
 
+  // ── LA PUERTA GRANDE (Maxi 2026-08-11) ────────────────────────────────────
+  // "Toda url que tenga txt y más de 400k vistas sirve, no importa si es un medio
+  // de noticias, una web de loterías, etc." Si el sitio ya demostró que monetiza,
+  // los vetos por RUBRO no aplican: eran un proxy para adivinar lo que el ads.txt
+  // prueba directamente. Siguen vetando las imposibilidades estructurales
+  // (gobierno, universidad, muerto, acortador, CDN) y el techo de 40M.
+  const _pasaPuertaGrande = _apruebaPorAdsTxtYTrafico(adsTxt, traffic);
+
   // ── VETOS DUROS: ninguna suma los compensa ──
   if (urlVerdict && !urlVerdict.ok) {
-    return { ok: false, score: -999, reason: urlVerdict.reason, señales: [urlVerdict.reason] };
+    // Con ads.txt + tráfico, solo los rechazos ESTRUCTURALES siguen matando.
+    const _esEstructural = _VETO_ESTRUCTURAL.test(String(urlVerdict.reason || ""));
+    if (_esEstructural || !_pasaPuertaGrande) {
+      return { ok: false, score: -999, reason: urlVerdict.reason, señales: [urlVerdict.reason] };
+    }
+    señales.push(`rubro "${urlVerdict.reason}" perdonado: tiene ads.txt y tráfico`);
   }
   if (adsTxt?.state === "no") {
     return { ok: false, score: -999, reason: "sin_ads_txt", señales: ["sin ads.txt = no puede monetizar"] };
@@ -8155,27 +8328,24 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   if (pageContent?.dead) {
     return { ok: false, score: -999, reason: `unreachable:${pageContent.deadReason || "dead"}`, señales: ["sitio caído"] };
   }
-  if (pageContent?.nonPublisherType) {
+  if (pageContent?.nonPublisherType && !_pasaPuertaGrande) {
     return { ok: false, score: -999, reason: `nonpub_${pageContent.nonPublisherType}`, señales: [`estructural: ${pageContent.nonPublisherType}`] };
   }
-  if (haikuType && haikuType !== "publisher" && haikuType !== "other") {
+  if (haikuType && haikuType !== "publisher" && haikuType !== "other" && !_pasaPuertaGrande) {
     return { ok: false, score: -999, reason: `haiku_${haikuType}`, señales: [`IA: ${haikuType}`] };
   }
-  // Maxi 2026-08-01: la categoría REAL de SimilarWeb manda. Si el sitio es banca, seguros,
-  // e-commerce, educación, gobierno, religión o beneficencia → se va acá, SIN puntuar.
-  // Antes esto solo se miraba para sitios que nos bloqueaban el scraper; el resto llegaba al
-  // score y podía compensar con "display ads" + "categoría de medios" mal detectada.
-  if (_categoriaNoPublisher(swCategory)) {
+  // La categoría de SimilarWeb ya no veta por sí sola si hay ads.txt y tráfico: un
+  // sitio de loterías o de finanzas que vende display es un cliente igual.
+  if (_categoriaNoPublisher(swCategory) && !_pasaPuertaGrande) {
     return { ok: false, score: -999, reason: `categoria_no_publisher:${String(swCategory).slice(0, 40)}`, señales: [`SimilarWeb: ${swCategory}`] };
   }
-  // Y el equivalente barato: la IA dice "other" (no es un medio) y encima NO hay ads.txt.
-  // Sin ads.txt no puede monetizar display; sin veredicto de medio no hay a qué agarrarse.
-  // No se puntúa: se va.
+  // Este se queda tal cual: la IA no lo reconoce como medio Y NO hay ads.txt. Sin
+  // ads.txt no hay puerta grande posible, así que la condición ya lo cubre.
   if (haikuType === "other" && adsTxt?.state !== "yes") {
     return { ok: false, score: -999, reason: "ia_other_sin_ads_txt", señales: ["la IA no lo reconoce como medio y no tiene ads.txt"] };
   }
   const title = pageContent?.title || "";
-  if (title && NON_PUBLISHER_TITLE_RE.test(title)) {
+  if (title && NON_PUBLISHER_TITLE_RE.test(title) && !_pasaPuertaGrande) {
     return { ok: false, score: -999, reason: `title_nonpub:"${title.slice(0, 40)}"`, señales: ["título de empresa/SaaS"] };
   }
 
@@ -8409,7 +8579,7 @@ async function classifyPublisher(token, domain, pageContent, swCategory, swData 
     // "duda" o la IA no respondió → recién ahí lo dejamos para reintentar.
   }
 
-  const v = scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType });
+  const v = scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType, traffic: Number(swData?.traffic || 0) });
   if (!v.ok && !v.retry) log(`  ⚖️ ${domain} NO prospectable (${v.reason}) — ${v.señales.join(" · ")}`);
   if (v.retry) log(`  ⏳ ${domain} sin datos para juzgar (ads.txt y home bloqueados) → se reintenta, NO se descarta`);
   return { ok: v.ok, retry: !!v.retry, reason: v.reason, score: v.score, señales: v.señales };
@@ -10372,13 +10542,29 @@ async function runSession(token, cfg, sessionStart) {
       const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&select=domain&order=validated_at.desc&limit=10`, _seedAuth);
       if (r.ok) _addSeeds(await r.json());
     } catch {}
-    try { // 3) Pending de alto tráfico (>=350K) como relleno
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&select=domain&order=created_at.desc&limit=10`, _seedAuth);
-      if (r.ok) _addSeeds(await r.json());
+    // 3) LOS PROSPECTS QUE YA TENEMOS EN LISTA (Maxi 2026-08-11, pedido del user:
+    //    "el autopilot puede buscar similares de los prospects que hay en lista, como
+    //    otra forma de llenar el buzón, que eso no se hace hoy día").
+    //    Antes eran 10 y SIEMPRE los mismos: los más nuevos por fecha. Con 700+
+    //    pendientes, el 98% de la lista no se usaba nunca como semilla. Ahora son 30
+    //    y el offset ROTA, así que a lo largo de los días se recorre el pool entero.
+    let _offsetSemillas = 0;
+    try { _offsetSemillas = parseInt((await getConfig(token))?.autopilot_seed_offset || "0", 10) || 0; } catch {}
+    const _NSEM = 30;
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&select=domain&order=created_at.desc&limit=${_NSEM}&offset=${_offsetSemillas}`, _seedAuth);
+      if (r.ok) {
+        const filas = await r.json();
+        _addSeeds(filas);
+        // Si el offset se pasó del final, volver al principio.
+        const _prox = (Array.isArray(filas) && filas.length === _NSEM) ? _offsetSemillas + _NSEM : 0;
+        await setConfigValue(token, "autopilot_seed_offset", String(_prox)).catch(() => {});
+        log(`  🌱 semillas desde Prospects: ${Array.isArray(filas) ? filas.length : 0} (offset ${_offsetSemillas} → ${_prox})`);
+      }
     } catch {}
     // 4) Monday activo
     mondayDomains.slice(0, 10).forEach(d => seedDomains.add(d));
-    log(`Similar discovery seeds: ${seedDomains.size} dominios (sendtrack + validated + pending>=350K + Monday)`);
+    log(`Similar discovery seeds: ${seedDomains.size} dominios (sendtrack + validated + ${_NSEM} de Prospects rotando + Monday)`);
     if (seedDomains.size === 0) {
       log("Sin seeds disponibles — fallback a Majestic global");
       pool = majesticFullPool;
@@ -18501,6 +18687,9 @@ async function main() {
       // Barrido diario del 100% de los ciclos finalizados de Monday: vuelven a
       // Prospects con email nuevo, y el pipeline decide si siguen cumpliendo.
       await sincronizarFinalizadosDeMonday(token).catch(e => log(`⚠️ mondaySync: ${e.message}`));
+      // 1×/semana: buscar sellers.json en Google para descubrir redes nuevas. Cada red
+      // devuelve cientos de publishers sin gastar un crédito más.
+      await descubrirRedesPorSellersJson(token).catch(e => log(`⚠️ sellersDiscovery: ${e.message}`));
 
       // Promueve items waiting_pool → pending si hay espacio en review_queue.
       // Cada loop iteration lo intenta — items "preparados" por MBs entran
