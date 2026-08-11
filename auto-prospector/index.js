@@ -1643,7 +1643,11 @@ const PER_SOURCE_ACTIVE_CAP = {
   auto_feeder_sellers:  250,
   auto_feeder_majestic: 150,   // autopilot (majestic/similar)
   auto_feeder_adstxt:   120,   // autopilot (ads.txt-graph)
-  auto_feeder_monday:   120,
+  // Maxi 2026-08-11: 120 → 400. Los finalizados de Monday dejaron de ser una porción
+  // del reparto del feeder y pasaron a ser un barrido DIARIO del 100% del board
+  // (sincronizarFinalizadosDeMonday). Es la mejor fuente que tenemos —gente que ya
+  // trabajó con nosotros— y con el carril viejo se estrangulaba sola.
+  auto_feeder_monday:   400,
   autogoogle:           180,   // carril RESERVADO — nunca lo tapa un JSON
   auto_feeder_similar:  150,   // Maxi 2026-07-16: expansión por similares desde Prospects
 };
@@ -1823,15 +1827,19 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
     if (_p < slotsPending) { status = "pending"; _p++; }
     else if (_w < slotsWaiting) { status = "waiting_pool"; _w++; }
     else { status = "next_day"; }
-    return { domain, status, source: sourceTag, uploaded_by: "worker@autofeeder", uploaded_at: new Date().toISOString() };
+    const fila = { domain, status, source: sourceTag, uploaded_by: "worker@autofeeder", uploaded_at: new Date().toISOString() };
+    // Re-prospección deliberada (finalizados de Monday): la fila vieja se REACTIVA.
+    // Sin esto el insert la ignora en silencio y el dominio nunca vuelve a procesarse.
+    if (opts.reactivar) { fila.processed_at = null; fila.error_message = null; }
+    return fila;
   });
   try {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue${opts.reactivar ? "?on_conflict=domain" : ""}`, {
       method: "POST",
       headers: {
         "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
         "Content-Type": "application/json",
-        "Prefer": "resolution=ignore-duplicates,return=representation",
+        "Prefer": `resolution=${opts.reactivar ? "merge-duplicates" : "ignore-duplicates"},return=representation`,
       },
       body: JSON.stringify(payload),
     });
@@ -2315,6 +2323,164 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
 }
 
 // FUENTE 2: Monday Ciclo Finalizado (pool 1000 + shuffle)
+// ════════════════════════════════════════════════════════════════
+// SINCRONIZACIÓN DIARIA DE FINALIZADOS DE MONDAY (Maxi 2026-08-11)
+// ════════════════════════════════════════════════════════════════
+// Pedido textual: "que siempre tenga el 100% de los ciclos finalizados,
+// actualizándose cada día, importados de Monday. Llegan finalizados y los importa,
+// buscando nuevo email y validando si la url es viable".
+//
+// Por qué hacía falta: `_feederPullMonday` existía pero era una porción del reparto
+// del feeder (cupo chico, carril de 120) Y además filtraba los dominios "ya
+// conocidos" — que es TODO lo finalizado, por definición. O sea: la fuente más
+// valiosa que tenemos (gente que ya trabajó con nosotros) aportaba cero.
+//
+// Este job es distinto: barre el 100% del board una vez por día, sin depender del
+// reparto entre fuentes. Los que entran pasan por el pipeline normal de
+// `processCsvItem`, así que la URL se re-valida sola (ads.txt, tráfico, clasificador
+// de publisher) y se les busca contacto de nuevo.
+const MONDAY_FINALIZADO_STAGE = 5;          // deal_stage index del board 1420268379
+const MONDAY_SYNC_MAX_POR_DIA = 400;        // techo para no inundar la cola de una
+
+async function sincronizarFinalizadosDeMonday(token) {
+  try {
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return 0;
+    if (String(cfg.monday_sync_finalizados ?? "true") !== "true") return 0;   // ON por default
+    if (!(await _tocaCorrer(token, "monday_sync_finalizados", 24 * 60))) return 0;
+
+    const mondayApiKey = await _getMondayApiKeyForFeeder(token);
+    if (!mondayApiKey) {
+      await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "sin api key de Monday" });
+      return 0;
+    }
+
+    // Traer TODOS los finalizados, paginando hasta el final (no un sample).
+    let cursor = null, items = [], vueltas = 0;
+    do {
+      const pageArgs = cursor
+        ? `cursor: "${cursor}", limit: 500`
+        : `limit: 500, query_params: { rules: [{ column_id: "deal_stage", compare_value: [${MONDAY_FINALIZADO_STAGE}], operator: any_of }] }`;
+      const query = `{ boards(ids: [1420268379]) { items_page(${pageArgs}) { cursor items { name } } } }`;
+      const res = await fetch("https://api.monday.com/v2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": mondayApiKey, "API-Version": "2024-01" },
+        body: JSON.stringify({ query }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) {
+        await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: `Monday HTTP ${res.status}` });
+        return 0;   // no pude leer ≠ no hay finalizados
+      }
+      const data = await res.json().catch(() => null);
+      const page = data?.data?.boards?.[0]?.items_page;
+      if (!page) {
+        await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "respuesta inesperada de Monday" });
+        return 0;
+      }
+      items = items.concat(page.items || []);
+      cursor = page.cursor || null;
+    } while (cursor && ++vueltas < 20);
+
+    const todos = [...new Set(items.map(it => _normalizeFeederDomain(it.name || "")).filter(Boolean))];
+    if (!todos.length) {
+      await saludPing(token, "monday_sync", { status: "ok", cadenciaMin: 24 * 60, detalle: "0 finalizados en el board" });
+      return 0;
+    }
+
+    const dias = parseInt(cfg.monday_reprospect_days || "90", 10) || 90;
+    const recientes = await _dominiosContactadosDesde(token, dias);
+    if (recientes === null) {
+      await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "no pude leer los contactados recientes" });
+      return 0;   // nunca re-prospectar a ciegas: alguien podría haber recibido el mail ayer
+    }
+    const enCola = await _dominiosActivosEnCola(token, todos);
+    const candidatos = todos.filter(d => !recientes.has(d) && !enCola.has(d)).slice(0, MONDAY_SYNC_MAX_POR_DIA);
+
+    let encolados = 0;
+    if (candidatos.length) {
+      encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true });
+      await _limpiarMarcaDeEmail(token, candidatos).catch(() => {});
+    }
+    log(`🔁 Monday finalizados: ${todos.length} en el board · ${recientes.size ? `${todos.filter(d => recientes.has(d)).length} contactados hace <${dias}d` : "0 recientes"} · ${enCola.size} ya en cola · ${candidatos.length} re-prospectables → ${encolados} encolados`);
+    await saludPing(token, "monday_sync", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: `${todos.length} finalizados, ${candidatos.length} re-prospectables, ${encolados} encolados`,
+      real: encolados, esperado: candidatos.length,
+    });
+    if (candidatos.length && encolados === 0) {
+      await saludAlerta(token, {
+        clave: "monday-sync-sin-encolar", severidad: "warning",
+        titulo: "🔁 Los finalizados de Monday no entraron",
+        cuerpo: `Había ${candidatos.length} re-prospectables y no se encoló ninguno. Suele ser el carril de la fuente lleno (auto_feeder_monday).`,
+        metadata: { candidatos: candidatos.length, total: todos.length },
+      });
+    }
+    return encolados;
+  } catch (e) {
+    log(`⚠️ sincronizarFinalizadosDeMonday: ${e.message}`);
+    await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: e.message }).catch(() => {});
+    return 0;
+  }
+}
+
+// ── Dominios a los que YA les escribimos en los últimos N días ───────────────
+// Devuelve null si no se pudo leer: re-prospectar a ciegas podría mandarle un mail
+// a alguien que lo recibió ayer.
+async function _dominiosContactadosDesde(token, dias) {
+  const desde = new Date(Date.now() - dias * 86400000).toISOString();
+  const out = new Set();
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${desde.slice(0, 10)}&select=domain&limit=20000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+    );
+    if (!r.ok) return null;
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return null;
+    rows.forEach(x => { const d = _normalizeFeederDomain(x.domain || ""); if (d) out.add(d); });
+    return out;
+  } catch { return null; }
+}
+
+// Dominios que ya están esperando turno en la cola: no tiene sentido re-encolarlos.
+async function _dominiosActivosEnCola(token, candidatos) {
+  const out = new Set();
+  if (!Array.isArray(candidatos) || !candidatos.length) return out;
+  const BATCH = 200;
+  for (let i = 0; i < candidatos.length; i += BATCH) {
+    const inList = candidatos.slice(i, i + BATCH).map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?domain=in.(${encodeURIComponent(inList)})&status=in.(pending,processing,waiting_pool,next_day)&select=domain`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      if (!r.ok) continue;
+      const rows = await r.json();
+      if (Array.isArray(rows)) rows.forEach(x => x.domain && out.add(String(x.domain).toLowerCase()));
+    } catch {}
+  }
+  return out;
+}
+
+// Borra la marca de "ya le busqué email y no encontré" para que la caza vuelva sobre
+// estos dominios. Al re-prospectar un cliente que cerró ciclo queremos un contacto
+// NUEVO, no el mismo de hace seis meses que quizás ya no trabaja ahí.
+async function _limpiarMarcaDeEmail(token, dominios) {
+  if (!Array.isArray(dominios) || !dominios.length) return;
+  const BATCH = 100;
+  for (let i = 0; i < dominios.length; i += BATCH) {
+    const inList = dominios.slice(i, i + BATCH).map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=in.(${encodeURIComponent(inList)})`, {
+        method: "PATCH",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ email_intentos: 0, email_ultimo_intento: null, email_ultimo_motivo: null }),
+      });
+    } catch {}
+  }
+}
+
 async function _feederPullMonday(token, targetCount, sessionKnown) {
   try {
     const mondayApiKey = await _getMondayApiKeyForFeeder(token);
@@ -2344,13 +2510,38 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
       const j = Math.floor(Math.random() * (i + 1));
       [pool[i], pool[j]] = [pool[j], pool[i]];
     }
-    const known = await _findKnownDomainsWorker(token, pool);
-    const fresh = pool.filter(d => !known.has(d) && !sessionKnown.has(d));
-    if (fresh.length === 0) return 0;
+    // ⚠️ ACÁ ESTABA EL BUG DE FONDO (Maxi 2026-08-11) ─────────────────────────
+    // Este feeder filtraba por `_findKnownDomainsWorker`, o sea descartaba todo lo
+    // que ya hubiera pasado por el sistema. Pero un ciclo FINALIZADO de Monday es,
+    // por definición, un dominio que ya prospectamos: SIEMPRE estaba "conocido", así
+    // que `fresh` daba 0 y el feeder no traía nunca nada. Y encima el insert usa
+    // ignore-duplicates, con lo cual aunque pasara el filtro tampoco habría entrado.
+    // La fuente más valiosa que tenemos —clientes que ya cerraron un ciclo con
+    // nosotros— estaba estructuralmente muerta.
+    //
+    // Re-prospectar finalizados es RE-TRABAJO deliberado, no primer contacto, y la
+    // regla del negocio es que el re-trabajo no tiene tope. Lo único que hay que
+    // respetar es no volver a escribirle demasiado pronto al mismo dominio.
+    const _diasReprospect = parseInt((await getConfig(token).catch(() => ({})))?.monday_reprospect_days || "90", 10) || 90;
+    const _recientes = await _dominiosContactadosDesde(token, _diasReprospect).catch(() => null);
+    if (_recientes === null) { log(`  ⚠️ monday: no pude leer los contactados recientes — no re-prospecto a ciegas`); return 0; }
+    const _enCola = await _dominiosActivosEnCola(token, pool).catch(() => new Set());
+    const fresh = pool.filter(d => !_recientes.has(d) && !_enCola.has(d) && !sessionKnown.has(d));
+    if (fresh.length === 0) { log(`  🌱 monday: ${pool.length} finalizados, ninguno re-prospectable (todos contactados en los últimos ${_diasReprospect}d o ya en cola)`); return 0; }
     const slice = fresh.slice(0, targetCount);
     slice.forEach(d => sessionKnown.add(d));
-    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday");
-    log(`  🌱 monday: pool=${pool.length}, frescos=${fresh.length} → insertados=${inserted}`);
+    // merge-duplicates: si el dominio ya tiene fila vieja en la cola, se REACTIVA a
+    // pending en vez de que el insert se ignore en silencio.
+    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday", { reactivar: true });
+    // Y se borra la marca de "ya le busqué email": queremos buscarle uno NUEVO, que es
+    // justo el sentido de volver sobre un cliente que ya cerró ciclo.
+    await _limpiarMarcaDeEmail(token, slice).catch(() => {});
+    log(`  🌱 monday: ${pool.length} finalizados, ${fresh.length} re-prospectables (>${_diasReprospect}d sin contacto) → insertados=${inserted}`);
+    await saludPing(token, "feeder_monday", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: `${pool.length} finalizados, ${fresh.length} re-prospectables, ${inserted} encolados`,
+      real: inserted, esperado: Math.min(targetCount, fresh.length),
+    });
     return inserted;
   } catch (e) {
     log(`  ⚠️ monday feeder error: ${e.message}`);
@@ -17921,6 +18112,9 @@ async function main() {
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
       // Caza de emails: cada 3 días vuelve sobre los leads sin contacto.
       await maybeCazaEmails(token).catch(e => log(`⚠️ cazaEmails: ${e.message}`));
+      // Barrido diario del 100% de los ciclos finalizados de Monday: vuelven a
+      // Prospects con email nuevo, y el pipeline decide si siguen cumpliendo.
+      await sincronizarFinalizadosDeMonday(token).catch(e => log(`⚠️ mondaySync: ${e.message}`));
 
       // Promueve items waiting_pool → pending si hay espacio en review_queue.
       // Cada loop iteration lo intenta — items "preparados" por MBs entran
