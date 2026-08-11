@@ -5196,6 +5196,10 @@ async function subdominiosComerciales(domain) {
   return out;
 }
 
+// Títulos y textos que son el MURO del WAF, no el sitio. Si la única página que conseguimos es
+// esta, no leímos nada — aunque el fetch haya devuelto 200 y un título.
+const _ES_PAGINA_BLOQUEADA = /request rejected|access denied|acceso denegado|just a moment|attention required|checking your (browser|connection)|verify you are human|ddos protection|security check|error 10\d\d|cf-browser-verification|are you a robot|unusual traffic|forbidden|not acceptable|blocked by|bot detection/i;
+
 // ── PSEUDO-EMAILS DE ASSETS (auditoría empírica 2026-08-04) ────────────────────────────────
 // EL BUG MÁS CARO DEL SCRAPER. El regex acepta como email cualquier cosa con @ y un "TLD" de
 // 2-10 letras, así que los assets retina y las fotos con arroba de Instagram pasan el filtro:
@@ -7112,6 +7116,15 @@ async function polishPool(token) {
         const pc = await fetchPageContent(domain).catch(() => null);
         if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
         if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
+        // ── LA PÁGINA DE BLOQUEO NO ES LA PÁGINA (Maxi 2026-08-10) ───────────────────────
+        // fetchPageContent devuelve "algo" aunque ese algo sea el muro del WAF. El título
+        // "Request Rejected" (Akamai) o "Just a moment..." (Cloudflare) NO es el sitio, pero
+        // como pc no viene null, la regla de "sin evidencia" de abajo no dispara y el lead pasa.
+        // Reportado por el user con la X: portaldaindustria.com.br entró teniendo ads.txt
+        // ilegible y devolviendo "Request Rejected".
+        const _esMuroDeBloqueo = pc && _ES_PAGINA_BLOQUEADA.test(`${pc.title || ""} ${(pc.description || "").slice(0, 120)}`);
+        const _pcUtil = _esMuroDeBloqueo ? null : pc;   // un muro cuenta como "no pude leerlo"
+
         // ── PUERTA 0 (ads.txt) TAMBIÉN EN EL PULIDO — Maxi 2026-08-07 ─────────────────────
         // El pulido clasificaba por HTML pero NO miraba el ads.txt, así que un sitio sin
         // archivo pasaba de largo. Se vio con natura.com.co (ads.txt 404, e-commerce) y
@@ -7123,8 +7136,17 @@ async function polishPool(token) {
         // "unknown" no es "no": puede ser Cloudflare tapándonos. Pero si ADEMÁS no pudimos leer
         // la home, no tenemos UNA sola señal de que monetice — y gastar scrape ahí es tirar
         // tiempo. Vuelve como no-verificable, que es reversible cuando el re-chequeo lo resuelva.
-        if (_ads.state !== "yes" && !pc) {
-          await _softRejectLead(auth, lead.id, "sin_evidencia_monetizacion (ads.txt no verificable)");
+        // Sin ads.txt verificable Y sin una sola señal de que muestre publicidad, no hay
+        // evidencia de que el sitio monetice. Antes esto solo cortaba si la home era ilegible;
+        // ahora también si es legible pero no tiene NADA (ni ads display, ni ad-tech, ni ads.txt).
+        // Es el caso de santanderx.com, enciclopedia.banrepcultural.org y compañía: páginas
+        // perfectamente vivas que simplemente no venden inventario.
+        // El motivo es reversible a propósito: recheckAdsTxtUnknowns lo reintenta a diario y, si
+        // el ads.txt aparece, el dominio vuelve solo a la cola.
+        const _sinSenalDeAds = !_pcUtil || (!_pcUtil.hasDisplayAds && !_pcUtil.hasProgrammatic
+                                            && !(_pcUtil.adNetworks || []).length);
+        if (_ads.state !== "yes" && _sinSenalDeAds) {
+          await _softRejectLead(auth, lead.id, `sin_evidencia_monetizacion (ads.txt ${_ads.state}${_esMuroDeBloqueo ? ", muro de bloqueo" : ""})`);
           blocked++; return;
         }
         // Maxi 2026-07-16: teléfono/WhatsApp del home (ya fetcheamos pc → gratis). "wa:" marca WhatsApp.
