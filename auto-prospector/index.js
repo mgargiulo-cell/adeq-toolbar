@@ -1938,6 +1938,55 @@ const _HUELLAS_FR = [
   `"notre rédaction" OR "qui sommes-nous" actualités {tld}`,
 ];
 
+// ── CIUDADES SECUNDARIAS: el antídoto contra los cuatro gigantes ─────────────
+// Buscar "noticias Argentina" devuelve Clarín, La Nación, Infobae y Página 12 — que
+// ya conocemos y que además rozan el techo de 40M. El long tail regional, que es el
+// cliente real de ADEQ, aparece cuando buscás por CIUDAD. Es exactamente lo que hace
+// un media buyer que conoce el mercado.
+const _CIUDADES = {
+  ar: ["Córdoba", "Rosario", "Mendoza", "Tucumán", "Salta", "Neuquén", "Mar del Plata", "Bahía Blanca", "Santa Fe", "Corrientes"],
+  mx: ["Guadalajara", "Monterrey", "Puebla", "Tijuana", "León", "Mérida", "Querétaro", "Culiacán", "Hermosillo", "Toluca"],
+  co: ["Medellín", "Cali", "Barranquilla", "Bucaramanga", "Cartagena", "Pereira", "Manizales", "Cúcuta", "Ibagué"],
+  cl: ["Valparaíso", "Concepción", "Antofagasta", "Temuco", "La Serena", "Iquique", "Puerto Montt", "Rancagua"],
+  pe: ["Arequipa", "Trujillo", "Chiclayo", "Piura", "Cusco", "Huancayo", "Iquitos", "Tacna"],
+  es: ["Sevilla", "Valencia", "Zaragoza", "Málaga", "Murcia", "Valladolid", "Vigo", "Granada", "Alicante", "Bilbao"],
+  br: ["Belo Horizonte", "Curitiba", "Porto Alegre", "Recife", "Salvador", "Fortaleza", "Goiânia", "Manaus", "Belém"],
+  ec: ["Guayaquil", "Cuenca", "Manta", "Ambato", "Loja"],
+  bo: ["Santa Cruz", "Cochabamba", "El Alto", "Sucre"],
+  uy: ["Salto", "Maldonado", "Paysandú"],
+  py: ["Ciudad del Este", "Encarnación"],
+  ve: ["Maracaibo", "Valencia", "Barquisimeto", "Maracay"],
+  cr: ["Alajuela", "Cartago", "Liberia"],
+  gt: ["Quetzaltenango", "Escuintla"],
+  do: ["Santiago de los Caballeros", "La Romana"],
+  it: ["Napoli", "Torino", "Palermo", "Bologna", "Firenze", "Bari", "Catania", "Verona"],
+  fr: ["Lyon", "Marseille", "Toulouse", "Bordeaux", "Lille", "Nantes", "Strasbourg", "Rennes"],
+};
+const _PLANTILLAS_CIUDAD = {
+  es: [`diario digital {ciudad}`, `noticias {ciudad} hoy portal`, `periódico local {ciudad}`, `medio digital {ciudad} publicidad`],
+  pt: [`jornal digital {ciudad}`, `notícias {ciudad} hoje portal`, `portal de notícias {ciudad}`],
+  it: [`giornale online {ciudad}`, `notizie {ciudad} oggi`, `quotidiano locale {ciudad}`],
+  fr: [`journal en ligne {ciudad}`, `actualités {ciudad} aujourd'hui`, `média local {ciudad}`],
+};
+const _IDIOMA_DE_PAIS = { br: "pt", it: "it", fr: "fr" };
+
+function _construirBusquedasPorCiudad(esHispano, cuantas) {
+  const paises = esHispano
+    ? Object.keys(_CIUDADES).filter(p => !["br", "it", "fr"].includes(p))
+    : Object.keys(_CIUDADES);
+  const out = [];
+  for (let i = 0; i < cuantas; i++) {
+    const pais = paises[Math.floor(Math.random() * paises.length)];
+    const lang = _IDIOMA_DE_PAIS[pais] || "es";
+    const ciudad = _CIUDADES[pais][Math.floor(Math.random() * _CIUDADES[pais].length)];
+    const plt = _PLANTILLAS_CIUDAD[lang];
+    const q = plt[Math.floor(Math.random() * plt.length)].replace("{ciudad}", ciudad);
+    out.push(q);
+    _IDIOMA_DE_FRASE.set(q, lang);   // targeting exacto, sin heurística
+  }
+  return [...new Set(out)];
+}
+
 const _TLDS_POR_IDIOMA = {
   es: HISPANIC_TLDS,
   pt: [".br", ".pt", ".com.br", ".ao", ".mz"],
@@ -1946,6 +1995,61 @@ const _TLDS_POR_IDIOMA = {
   // occidental francófona, que sí entran en el foco.
   fr: [".fr", ".be", ".ch", ".ma", ".sn", ".dz", ".tn", ".ci"],
 };
+
+// ── APAREAR IDIOMA, PAÍS E INTERFAZ (Maxi 2026-08-11) ────────────────────────
+// El `gl` se sorteaba de los 41 países SIN mirar el idioma de la frase, así que una
+// frase en portugués se buscaba con gl=pl casi siempre. Es el mismo error que el del
+// inglés, un escalón más abajo: la keyword correcta con el targeting equivocado.
+// Además nunca se mandaba `hl` (idioma de interfaz), que le dice a Google en qué
+// lengua espera uno los resultados.
+const _PAISES_POR_IDIOMA = {
+  es: ["mx", "ar", "cl", "co", "pe", "uy", "es", "ve", "ec", "bo", "py", "cr", "gt", "do", "pa"],
+  pt: ["br", "pt", "ao", "mz"],
+  it: ["it", "ch"],
+  fr: ["fr", "be", "ch", "ma", "sn", "ci", "dz", "tn"],
+  de: ["de", "ch", "be"],
+  nl: ["nl", "be"],
+  pl: ["pl"],
+  tr: ["tr"],
+  ar: ["ma", "eg", "dz", "tn"],
+};
+// Detección barata del idioma de una frase por palabras funcionales. No hace falta
+// nada sofisticado: alcanza para no buscar en portugués sobre Polonia.
+const _PISTAS_IDIOMA = [
+  // OJO: `noticias` sin tilde es ESPAÑOL. El patrón portugués tiene que pedir marcas
+  // inequívocas (tilde en notícias, "de hoje", "você"), o se traga medio castellano.
+  ["pt", /\b(de hoje|notícias|futebol|receitas|dicas|pre[çc]o|m[ií]dia kit|an[uú]ncie|quem somos|jornal|brasileirao|brasileir[ãa]o)\b/i],
+  ["it", /\b(di oggi|notizie|calcio|ricette|consigli|prezzo|pubblicit[àa]|quotidiano|chi siamo|testata)\b/i],
+  ["fr", /\b(du jour|actualit[ée]s|recettes|conseils|prix|publicitaires|journal|qui sommes|r[ée]daction|annoncer)\b/i],
+  ["de", /\b(heute|nachrichten|rezepte|preis|werbung|zeitung)\b/i],
+  ["nl", /\b(vandaag|nieuws|recepten|prijs|advertentie)\b/i],
+  ["pl", /\b(dzisiaj|wiadomo[śs]ci|przepisy|cena|reklama)\b/i],
+  ["tr", /\b(bug[üu]n|haberler|tarifleri|fiyat|reklam)\b/i],
+  ["ar", /[؀-ۿ]/],
+  ["es", /\b(de hoy|noticias|recetas|consejos|precio|publicidad|diario|qui[ée]nes somos|redacci[óo]n|anunciar|peri[óo]dico)\b/i],
+];
+
+// Idioma REAL de cada frase, anotado al armar el pool (no adivinado). Vive a nivel
+// de módulo porque el pool se arma en un lado y el targeting se resuelve en otro.
+const _IDIOMA_DE_FRASE = new Map();
+
+function _paisParaFrase(frase, esHispano) {
+  // El TLD explícito de la query manda sobre cualquier heurística: si dice site:.br,
+  // hay que buscar desde Brasil.
+  const _tld = String(frase).match(/site:\.(?:com\.)?([a-z]{2})\b/i);
+  if (_tld) {
+    const cc = _tld[1].toLowerCase();
+    const idioma = Object.keys(_PAISES_POR_IDIOMA).find(l => _PAISES_POR_IDIOMA[l].includes(cc)) || "es";
+    return { gl: cc, hl: idioma };
+  }
+  if (esHispano) return { gl: HISPANIC_GL[Math.floor(Math.random() * HISPANIC_GL.length)], hl: "es" };
+  // 1º el dato exacto (anotado al armar el pool). 2º la heurística, para las frases
+  // que vienen de otro lado: las huellas, las frescas de Claude y las sugeridas por Google.
+  let idioma = _IDIOMA_DE_FRASE.get(frase) || "";
+  if (!idioma) { idioma = "es"; for (const [lang, re] of _PISTAS_IDIOMA) { if (re.test(frase)) { idioma = lang; break; } } }
+  const paises = _PAISES_POR_IDIOMA[idioma] || _PAISES_POR_IDIOMA.es;
+  return { gl: paises[Math.floor(Math.random() * paises.length)], hl: idioma };
+}
 
 function _construirBusquedasDeHuella(esHispano, cuantas) {
   // En el turno hispano, todo en español. En el otro, español mayoritario y el
@@ -1987,28 +2091,78 @@ function _isHispanicSlot(hour, slots, dateISO) {
 // Maxi 2026-07-15 (auditoría AutoGoogle): devuelve {domains, ok, status} para que el caller distinga
 // éxito de error (antes tragaba todo a [] → "cero silencioso"). + timeout 10s (era el ÚNICO fetch del
 // hot-path sin timeout → un cuelgue de Serper bloqueaba el loop y starvaba el heartbeat).
-async function _serperSearch(query, num = 20, gl = "") {
-  if (!SERPER_API_KEY) return { domains: [], ok: false, status: 0 };
+// ── RUIDO QUE GOOGLE DEVUELVE EN CASI TODA BÚSQUEDA (Maxi 2026-08-11) ────────
+// Excluirlos en la propia query no cuesta un crédito extra y libera ~25-35% de los
+// 20 resultados para candidatos de verdad. Es subir el `num` sin pagarlo.
+const _SERPER_EXCLUIR = [
+  "facebook.com", "instagram.com", "youtube.com", "x.com", "twitter.com",
+  "wikipedia.org", "tiktok.com", "linkedin.com", "pinterest.com", "reddit.com",
+  "amazon.com", "mercadolibre.com", "booking.com", "tripadvisor.com",
+].map(d => `-site:${d}`).join(" ");
+
+// Señales en el título/snippet que delatan que NO es un medio. Descartar acá sale
+// GRATIS: antes se gastaba un fetch de ads.txt, un slot del carril de 180 y después
+// un hit PAGO de RapidAPI para enterarse de lo mismo.
+const _SNIPPET_NO_ES_MEDIO = /\b(agregar al carrito|añadir al carrito|adicionar ao carrinho|aggiungi al carrello|ajouter au panier|comprar ahora|comprá online|iniciar sesi[oó]n|crear cuenta|mi cuenta|reg[ií]strate|matr[ií]cula|inscripciones abiertas|plan de estudios|nuestras sucursales|solicitar turno|env[ií]o gratis|frete gr[aá]tis|apuesta|casino|tragamonedas|cat[aá]logo de productos|lista de precios de productos)\b/i;
+
+// Señal de que el sitio está VIVO: Google muestra fecha reciente en el snippet.
+const _SNIPPET_FECHA = /\b(hace \d+ (minutos?|horas?|d[ií]as?)|h[aá] \d+ (minutos?|horas?|dias?)|\d{1,2} (ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)|\d{1,2} de (enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre))/i;
+
+/**
+ * Busca en Serper y devuelve resultados CON contexto, no solo el hostname.
+ * Antes se tiraban title, snippet, date y position — que vienen gratis en la misma
+ * respuesta y permiten descartar basura antes de gastar un solo crédito más.
+ *
+ * @param opts.endpoint  "search" (web) | "news" (medios vivos, con fecha y fuente)
+ * @param opts.page      paginación: sin esto cada frase devolvía SIEMPRE los mismos 20
+ * @param opts.hl        idioma de interfaz, apareado con el país
+ */
+async function _serperSearch(query, num = 20, gl = "", opts = {}) {
+  if (!SERPER_API_KEY) return { domains: [], resultados: [], ok: false, status: 0 };
+  const endpoint = opts.endpoint === "news" ? "news" : "search";
   try {
-    const body = { q: query, num };
-    if (gl) body.gl = gl;  // país de búsqueda → prioriza publishers de ese país (targeting GEO)
-    const res = await fetch("https://google.serper.dev/search", {
+    const body = { q: `${query} ${_SERPER_EXCLUIR}`.trim(), num };
+    if (gl) body.gl = gl;             // país de búsqueda → targeting GEO
+    if (opts.hl) body.hl = opts.hl;   // idioma de interfaz, apareado con el país
+    if (opts.page && opts.page > 1) body.page = opts.page;
+    if (opts.tbs) body.tbs = opts.tbs;
+    const res = await fetch(`https://google.serper.dev/${endpoint}`, {
       method: "POST",
       headers: { "X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(10000),
     });
-    if (!res.ok) { log(`  ⚠️ Serper ${res.status} para "${query}"`); return { domains: [], ok: false, status: res.status }; }
+    if (!res.ok) { log(`  ⚠️ Serper ${res.status} para "${query}"`); return { domains: [], resultados: [], ok: false, status: res.status }; }
     const data = await res.json();
-    const out = [];
-    for (const r of (Array.isArray(data.organic) ? data.organic : [])) {
+    // /search devuelve `organic`; /news devuelve `news`. Leer solo `organic` con el
+    // endpoint de noticias devolvía 0 en silencio.
+    const crudos = Array.isArray(data.organic) ? data.organic
+                 : Array.isArray(data.news)    ? data.news : [];
+    const resultados = [];
+    const vistos = new Set();
+    for (const r of crudos) {
       try {
         const h = new URL(r.link).hostname.toLowerCase().replace(/^www\./, "");
-        if (h && h.includes(".")) out.push(h);
+        if (!h || !h.includes(".") || vistos.has(h)) continue;
+        vistos.add(h);
+        resultados.push({
+          host: h,
+          title: String(r.title || "").slice(0, 200),
+          snippet: String(r.snippet || "").slice(0, 300),
+          date: r.date || "",
+          position: r.position || resultados.length + 1,
+          sitelinks: Array.isArray(r.sitelinks) ? r.sitelinks.map(x => x.title).filter(Boolean).slice(0, 8) : [],
+        });
       } catch {}
     }
-    return { domains: [...new Set(out)], ok: true, status: 200 };
-  } catch (e) { log(`  ⚠️ Serper error "${query}": ${e.message}`); return { domains: [], ok: false, status: -1 }; }
+    // Vienen gratis en la misma respuesta y son expansión de keywords VALIDADA por
+    // Google — mejor que pagarle a Haiku para que invente frases que Google no vio.
+    const sugeridas = [
+      ...(Array.isArray(data.relatedSearches) ? data.relatedSearches.map(x => x.query) : []),
+      ...(Array.isArray(data.peopleAlsoAsk) ? data.peopleAlsoAsk.map(x => x.question) : []),
+    ].filter(q => typeof q === "string" && q.length > 8 && q.length < 80);
+    return { domains: resultados.map(r => r.host), resultados, sugeridas, ok: true, status: 200, credits: data.credits };
+  } catch (e) { log(`  ⚠️ Serper error "${query}": ${e.message}`); return { domains: [], resultados: [], ok: false, status: -1 }; }
 }
 
 // Maxi 2026-07-16: FALLBACK de contacto por Google. El user mostró que muchos sitios (BR/GR/…) tienen
@@ -2062,9 +2216,23 @@ async function maybeRunAutoGoogleSlot(token) {
   if (!SERPER_API_KEY) return;  // sin key → AutoGoogle apagado
   const { hour, weekday, dateISO } = _madridNowParts();
   if (weekday === "Sat" || weekday === "Sun") return;  // solo lunes a viernes
-  if (!AUTOGOOGLE_SLOTS.includes(hour)) return;
-  const slotLabel = `${dateISO}-${hour}:00`;
+  // ── EL GUARDIÁN VIVÍA SOLO EN MEMORIA (Maxi 2026-08-11) ────────────────────
+  // `_autoGoogleLastSlot` es una variable del proceso y el worker reinicia cada ~7
+  // min: el MISMO slot podía re-dispararse hasta 8 veces por hora, gastando créditos
+  // de más (lo frenaba el carril lleno, de casualidad). Y al revés, un slot perdido
+  // porque el worker estaba ocupado se perdía ENTERO, sin recuperación. Todos los
+  // demás schedulers ya se habían migrado a la base; este quedó afuera.
+  // Ahora: marca persistida + se toma el slot pendiente MÁS VIEJO del día, igual que
+  // el agente y el feeder.
+  const _cfgAG = await getConfig(token).catch(() => null);
+  if (!_cfgAG) return;                                   // no pude leer ≠ toca correr
+  const _hechosAG = _parseSlotsHechos(_cfgAG.autogoogle_slots_done, dateISO);
+  const _pendientesAG = AUTOGOOGLE_SLOTS.filter(h => hour >= h && !_hechosAG.has(h));
+  if (_pendientesAG.length === 0) return;
+  const _slotAG = _pendientesAG[0];                      // el más viejo sin correr
+  const slotLabel = `${dateISO}-${_slotAG}:00`;
   if (_autoGoogleLastSlot === slotLabel) return;
+  if (_slotAG !== hour) log(`🔎 AutoGoogle: recuperando el slot de las ${_slotAG}:00 (son las ${hour})`);
   // Maxi 2026-07-01: AutoGoogle tiene VÍA PROPIA más laxa. Trae publishers frescos de
   // Google (no las listas ad-tech del backlog del feeder) y se autolimita con su cap
   // mensual (2500 búsquedas). Antes lo frenaba el mismo gate que el feeder (150) → con
@@ -2075,8 +2243,17 @@ async function maybeRunAutoGoogleSlot(token) {
   const _bl = await _getCsvQueueBacklog(token);
   if (_bl >= AUTOGOOGLE_HALT) { log(`🔎 AutoGoogle SKIP: trabajo activo ${_bl} (>${AUTOGOOGLE_HALT})`); return; }
   _autoGoogleLastSlot = slotLabel;
-  try { await _runAutoGoogleSlot(token, slotLabel); }
-  catch (e) { log(`⚠️ AutoGoogle slot: ${e.message}`); }
+  try {
+    await _runAutoGoogleSlot(token, slotLabel);
+    // Se marca al TERMINAR BIEN. Si el proceso muere antes, el slot queda pendiente
+    // y se recupera — que es justo lo que queremos.
+    _hechosAG.add(_slotAG);
+    await setConfigValue(token, "autogoogle_slots_done", `${dateISO}:${[..._hechosAG].sort((a, b) => a - b).join(",")}`).catch(() => {});
+  } catch (e) {
+    _autoGoogleLastSlot = "";                            // que lo pueda reintentar
+    await saludPing(token, "autogoogle", { status: "fail", detalle: e.message }).catch(() => {});
+    log(`⚠️ AutoGoogle slot: ${e.message}`);
+  }
 }
 
 // Maxi 2026-07-16: reconcilia la atribución de AutoGoogle. Para los dominios inyectados en slots previos,
@@ -2203,10 +2380,17 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   try {
     if (_hispanicSlot) {
       pool = (_AG_KEYWORDS.es || []).filter(s => typeof s === "string" && s);
+      pool.forEach(q => _IDIOMA_DE_FRASE.set(q, "es"));
     } else {
       const _tomar = (lang, frac) => {
         const arr = (_AG_KEYWORDS[lang] || []).filter(s => typeof s === "string" && s);
-        return arr.sort(() => Math.random() - 0.5).slice(0, Math.ceil(arr.length * frac));
+        const sel = arr.sort(() => Math.random() - 0.5).slice(0, Math.ceil(arr.length * frac));
+        // El idioma NO hace falta adivinarlo: acá lo sabemos con certeza, porque
+        // estamos sacando la frase del bloque de ese idioma. Se anota para que el
+        // targeting de país use el dato exacto en vez de una heurística que falla
+        // con palabras sin marcas gramaticales ("calciomercato").
+        sel.forEach(q => _IDIOMA_DE_FRASE.set(q, lang));
+        return sel;
       };
       pool = [
         ..._tomar("es", 1.00),                                        // español: todo
@@ -2230,12 +2414,17 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // traen más dominios FRESCOS (toolbar_keyword_yield) + ~35% exploración random (para seguir descubriendo
   // frases buenas y no encasillarse). Sube la calidad de URLs sin gastar más búsquedas.
   let _topPhrases = [];
+  const _yieldPorFrase = new Map();   // frase → cuántas veces se buscó (para paginar)
   try {
     const _yr = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&order=qualified.desc,fresh.desc&select=phrase&limit=600`,
+      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&order=qualified.desc,fresh.desc&select=phrase,searches&limit=600`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
-    if (_yr.ok) _topPhrases = (await _yr.json()).map(r => r.phrase).filter(p => typeof p === "string");
+    if (_yr.ok) {
+      const _filas = await _yr.json();
+      _topPhrases = _filas.map(r => r.phrase).filter(p => typeof p === "string");
+      _filas.forEach(r => { if (r.phrase) _yieldPorFrase.set(r.phrase, r.searches || 0); });
+    }
   } catch {}
   const _poolSet = new Set(pool);
   const _topInPool = _topPhrases.filter(p => _poolSet.has(p));
@@ -2251,23 +2440,49 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // La más potente es `inurl:ads.txt`: devuelve sitios cuyo archivo ads.txt está
   // indexado, o sea que YA venden display. Es la puerta 0 del negocio ("sin ads.txt
   // no entra") convertida en buscador, y sale gratis.
-  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.25)));
-  const kws = [..._pickTop, ..._explore.slice(0, Math.max(0, _explore.length - _huellaPublisher.length)), ..._huellaPublisher]
-    .sort(() => Math.random() - 0.5);
+  // Reparto del slot: 35% huella comercial (prueba directa de que monetiza), 20%
+  // ciudades secundarias (el long tail regional), y el resto temas del pool, que
+  // pasan de ser la vía principal a ser exploración.
+  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.35)));
+  const _porCiudad       = _construirBusquedasPorCiudad(_hispanicSlot, Math.max(1, Math.round(N * 0.20)));
+  const _dirigidas = [..._huellaPublisher, ..._porCiudad];
+  const _restoTemas = Math.max(0, N - _dirigidas.length);
+  const kws = [
+    ..._pickTop.slice(0, Math.round(_restoTemas * 0.65)),
+    ..._explore.slice(0, _restoTemas - Math.round(_restoTemas * 0.65)),
+    ..._dirigidas,
+  ].sort(() => Math.random() - 0.5);
   log(`🔎 AutoGoogle slot ${slotLabel}${_hispanicSlot ? " 🌎 HISPANO (es-only)" : ""} — ${kws.length} búsquedas (${_pickTop.length} top-yield + ${_explore.length} explore · mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
   const found = new Set();
   const kwDomains = new Map();  // Maxi 2026-07-16: keyword → dominios que trajo (para calcular el yield)
-  let queriesDone = 0, errCount = 0, lastStatus = 0;
-  for (const kw of kws) {
-    // País de búsqueda rotado (targeting GEO no-Anglo) → trae publishers del país objetivo.
-    // Turno hispano → rotación SOLO entre países de habla hispana (Maxi 2026-07-17).
-    const _glPool = _hispanicSlot ? HISPANIC_GL : _AUTOGOOGLE_GL;
-    const gl = _glPool[Math.floor(Math.random() * _glPool.length)];
-    const { domains, ok, status } = await _serperSearch(kw, 20, gl);
-    // Maxi 2026-07-15: contar SOLO las búsquedas EXITOSAS. Antes queriesDone++ corría siempre → las
-    // fallidas (Serper 403/429 por créditos agotados) igual gastaban el "cap mensual" → se auto-bloqueaba.
-    if (ok) { queriesDone++; domains.forEach(d => found.add(d)); kwDomains.set(kw, domains); }
-    else { errCount++; lastStatus = status; }
+  const _contexto = new Map();  // dominio → señales del resultado (título, snippet, posición…)
+  const _sugeridasGoogle = new Set();
+  let queriesDone = 0, errCount = 0, lastStatus = 0, _errSeguidos = 0;
+  for (const [_i, kw] of kws.entries()) {
+    // Corte temprano: si Serper viene fallando en serie (429/403 por créditos), seguir
+    // gastando las N búsquedas restantes no arregla nada. Antes el loop terminaba igual.
+    if (_errSeguidos >= 3) { log(`  🛑 AutoGoogle: 3 errores seguidos de Serper (${lastStatus}) — corto el slot`); break; }
+    // País apareado con el IDIOMA de la frase: buscar una frase en portugués con gl=pl
+    // (17 de cada 19 veces, con la rotación vieja) es tirar el crédito.
+    const { gl, hl } = _paisParaFrase(kw, _hispanicSlot);
+    // Una porción del slot va al endpoint de NOTICIAS: cada resultado es por definición
+    // un medio que publica, con fecha. Es el instrumento de precisión que faltaba.
+    const _esNews = !/inurl:|filetype:|site:/i.test(kw) && (_i % 5 === 0);
+    const { domains, resultados, sugeridas, ok, status } = await _serperSearch(kw, 20, gl, {
+      hl, endpoint: _esNews ? "news" : "search",
+      // Paginación derivada del uso histórico: sin esto una frase devolvía SIEMPRE los
+      // mismos 20, y como el ranking prefiere repetir las que más rindieron, el sistema
+      // interpretaba su propia ceguera como "ya no hay mercado".
+      page: 1 + (( _yieldPorFrase.get(kw) || 0 ) % 4),
+    });
+    if (ok) {
+      queriesDone++; _errSeguidos = 0;
+      domains.forEach(d => found.add(d));
+      kwDomains.set(kw, domains);
+      (resultados || []).forEach(r => { if (!_contexto.has(r.host)) _contexto.set(r.host, r); });
+      (sugeridas || []).forEach(q => _sugeridasGoogle.add(q));
+    }
+    else { errCount++; lastStatus = status; _errSeguidos++; }
     if (queriesDone > 0 && queriesDone % 20 === 0) {
       try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}  // Maxi 2026-07-15 (F3): heartbeat dentro del loop largo
@@ -2285,9 +2500,51 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Dedup canónico (cola activa + Prospects) + inject, si hubo resultados.
   let freshCount = 0, inserted = 0, _freshSet = new Set();
   if (found.size > 0) {
-    const cands = [...found].filter(d => !DEPRIO_TLD_RE.test(d));   // pre-filtro TLD Anglo deprio
+    // ── LOS FILTROS GRATIS QUE ESTE FEEDER NO APLICABA (Maxi 2026-08-11) ──────
+    // AutoGoogle era el ÚNICO feeder que solo miraba el TLD. Los demás pasan además
+    // por isDomainAllowed, isCorporatePattern, BRAND_BLOCKLIST y classifyByUrlOnly
+    // —todo gratis, sin red—. Consecuencia: facebook.com, wikipedia.org, amazon.com y
+    // dominios .gob que Google devuelve en casi toda búsqueda de tema se comían un
+    // fetch de ads.txt, un lugar del carril de 180 y después un hit PAGO de RapidAPI,
+    // porque classifyByUrlOnly recién corría DESPUÉS de pedir el tráfico.
+    let _tirados = 0;
+    const cands = [...found].filter(d => {
+      if (DEPRIO_TLD_RE.test(d)) { _tirados++; return false; }
+      if (_MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || BRAND_BLOCKLIST.has(d)) { _tirados++; return false; }
+      try { if (!isDomainAllowed(d)) { _tirados++; return false; } } catch {}
+      const v = classifyByUrlOnly(d, "", 0);
+      if (v && v.ok === false) { _tirados++; return false; }
+      // El título y el snippet vienen GRATIS en la misma respuesta de Serper y
+      // delatan una tienda o un portal de trámites antes de gastar un solo crédito.
+      const ctx = _contexto.get(d);
+      if (ctx && _SNIPPET_NO_ES_MEDIO.test(`${ctx.title} ${ctx.snippet}`)) { _tirados++; return false; }
+      return true;
+    });
+    if (_tirados) log(`  🧹 AutoGoogle: ${_tirados} dominios descartados GRATIS antes de gastar cuota (redes, wikis, gobiernos, tiendas)`);
     const known = await _findKnownDomainsWorker(token, cands);
-    const fresh = cands.filter(d => !known.has(d));
+    let fresh = cands.filter(d => !known.has(d));
+
+    // ── QUÉ 180 ENTRAN, NO CUÁNTOS (Maxi 2026-08-11) ──────────────────────────
+    // El cuello de botella no es la cuota de Serper: es el carril de 180. Antes el
+    // orden de inyección era el orden arbitrario de un Set, o sea que cuáles entraban
+    // hoy era azar. Ahora se ordenan por probabilidad de ser un publisher.
+    if (fresh.length > 1) {
+      const _puntaje = (d) => {
+        const ctx = _contexto.get(d) || {};
+        let p = 0;
+        // Lo trajeron varias consultas distintas → señal fuerte.
+        let apariciones = 0;
+        for (const doms of kwDomains.values()) if (doms.includes(d)) apariciones++;
+        p += Math.min(apariciones, 4) * 12;
+        p += Math.max(0, 12 - (ctx.position || 12));            // salir arriba pesa
+        if (URL_PUBLISHER_HINT.test(d)) p += 25;                 // el nombre suena a medio
+        if (ctx.date || _SNIPPET_FECHA.test(ctx.snippet || "")) p += 20;   // publica: está vivo
+        // Sitelinks con secciones de diario = portal de noticias.
+        if ((ctx.sitelinks || []).some(t => /deportes|pol[ií]tica|econom[ií]a|espect[aá]culos|sociedad|opini[óo]n|internacional|esportes|cronaca|actualit/i.test(t))) p += 20;
+        return p;
+      };
+      fresh = fresh.map(d => ({ d, p: _puntaje(d) })).sort((a, b) => b.p - a.p).map(x => x.d);
+    }
     _freshSet = new Set(fresh);
     freshCount = fresh.length;
     if (fresh.length > 0) {
@@ -2340,6 +2597,13 @@ async function _runAutoGoogleSlot(token, slotLabel) {
       await setConfigValue(token, "autogoogle_stats", JSON.stringify({ slot: slotLabel, searches: queriesDone, found: found.size, fresh: freshCount, inserted, freshRate: _newRate, at: new Date().toISOString().slice(0, 16) }));
     } catch {}
     log(`🔎 AutoGoogle: ${found.size} dominios de ${queriesDone} búsquedas → ${freshCount} nuevos → ${inserted} encolados · freshRate ${_newRate} (spend inteligente)`);
+    // Latido: si el motor deja de rendir, se ve el mismo día. Lo esperado es al menos
+    // un dominio fresco cada dos búsquedas; por debajo de la mitad de eso, el vigilante avisa.
+    await saludPing(token, "autogoogle", {
+      status: "ok", cadenciaMin: 240,
+      detalle: `${queriesDone} búsquedas → ${found.size} dominios → ${freshCount} nuevos → ${inserted} encolados`,
+      real: freshCount, esperado: Math.max(1, Math.round(queriesDone * 0.5)),
+    });
   } else {
     log(`🔎 AutoGoogle: 0 búsquedas exitosas (revisar autogoogle_last_error) — freshRate sin cambios`);
   }
