@@ -6693,7 +6693,12 @@ async function startCascade() {
     await runCascade(seed, onProgress);
 
     if (cascadeResults.length === 0) {
-      resultsEl.innerHTML = '<div class="cascade-empty">No prospects found with those filters.</div>';
+      // Maxi 2026-08-10: este mensaje decía SIEMPRE "con esos filtros", incluso cuando la fuente
+      // no había devuelto un solo sitio. Son dos problemas distintos y se veían igual: el user
+      // ajustaba filtros que no tenían nada que ver mientras el scraper estaba roto.
+      resultsEl.innerHTML = cascadeRawResults.length === 0
+        ? '<div class="cascade-empty">La fuente no devolvió sitios similares para este dominio. No son los filtros — puede ser un dominio sin datos, o la fuente caída.</div>'
+        : `<div class="cascade-empty">Se encontraron ${cascadeRawResults.length} sitios similares, pero <b>ninguno pasa los filtros</b> actuales (tráfico, ranking, idioma). Aflojalos y probá de nuevo.</div>`;
       actionsEl.style.display = "none";
     } else {
       const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (limit ${CASCADE_LIMIT})` : "";

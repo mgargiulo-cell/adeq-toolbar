@@ -74,18 +74,35 @@ export async function getSimilarSitesFromSimilarSites(domain) {
 
     const json  = JSON.parse(match[1]);
 
-    // Recursive search for arrays containing domain-like objects
     const domains = [];
+    const _agregar = (d) => {
+      if (!d || typeof d !== "string" || !d.includes(".") || d.includes("/")) return;
+      const c = d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
+      if (c && c !== clean) domains.push(c);
+    };
+
+    // ── RUTA DIRECTA (Maxi 2026-08-10) ────────────────────────────────────────────────────
+    // similarsites.com publica los similares en props.pageProps.siteData.SimilarSites[].Site.
+    // La clave es "Site" con S MAYÚSCULA. La búsqueda recursiva de abajo probaba
+    // domain/Domain/url/site/hostname — "site" en minúscula, que en JS no es lo mismo — así que
+    // devolvía CERO y el usuario veía "No prospects found with those filters" como si el sitio
+    // no tuviera similares. Verificado contra clarin.com: 20 dominios en esa ruta exacta.
+    // Se lee la ruta conocida primero (precisa y barata) y la recursiva queda de red.
+    try {
+      for (const it of (json?.props?.pageProps?.siteData?.SimilarSites || [])) {
+        _agregar(typeof it === "string" ? it : (it?.Site || it?.site || it?.Domain || it?.domain));
+      }
+    } catch {}
+
+    // Recursive search for arrays containing domain-like objects
     function search(obj) {
       if (!obj || typeof obj !== "object") return;
       if (Array.isArray(obj)) {
         for (const item of obj) {
           if (item && typeof item === "object") {
-            const d = item.domain || item.Domain || item.url || item.site || item.hostname;
-            if (d && typeof d === "string" && d.includes(".") && !d.includes("/")) {
-              const cleaned = d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
-              if (cleaned && cleaned !== clean) domains.push(cleaned);
-            }
+            // Se agregan Site/Host/Name: las variantes con mayúscula que usa el JSON real.
+            _agregar(item.domain || item.Domain || item.url || item.URL || item.site
+                     || item.Site || item.hostname || item.Hostname || item.host || item.Host);
             search(item);
           }
         }
@@ -95,9 +112,13 @@ export async function getSimilarSitesFromSimilarSites(domain) {
     }
     search(json);
 
-    return [...new Set(domains)].slice(0, 60); // Maxi 2026-06-19: 20→60 (más similares, sigue gratis sin RapidAPI)
-  } catch {
-    // Silent fail — el runCascade aplica fallback automático a RapidAPI
+    const out = [...new Set(domains)].slice(0, 60); // Maxi 2026-06-19: 20→60 (más similares, gratis)
+    // Que un scraper roto NO se vea igual que "este sitio no tiene similares". Es la misma
+    // trampa de siempre: un "no pude leerlo" que se muestra como un "no hay".
+    if (out.length === 0) console.warn(`[cascade] similarsites.com no devolvió similares para ${clean} — ¿cambió la estructura de la página?`);
+    return out;
+  } catch (e) {
+    console.warn(`[cascade] similarsites.com falló para ${clean}: ${e.message} — cae a RapidAPI`);
     return [];
   }
 }
