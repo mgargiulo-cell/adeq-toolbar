@@ -6659,8 +6659,14 @@ async function startCascade() {
 
   const passesFilters = (site) => {
     if (CASCADE_BLOCKLIST.has(site.domain.replace(/^www\./, ""))) return false;
-    if (tMin > 0 && site.visits < tMin) return false;
-    if (tMax !== Infinity && site.visits > tMax) return false;
+    // Maxi 2026-08-10: los similares NACEN con visits:0 — es un placeholder, el tráfico real se
+    // consulta recién cuando el MB abre uno (así la cascada no gasta créditos). Este filtro leía
+    // ese 0 como "tiene cero visitas" y descartaba TODO. Y como los filtros se guardan entre
+    // sesiones, alcanzaba con haber puesto un mínimo una vez para que la cascada quedara vacía
+    // para siempre. El filtro de RANKING de la línea de abajo ya se protegía (`site.globalRank &&`);
+    // este no. Mismo criterio: si no sabemos el tráfico, no descartamos por tráfico.
+    if (tMin > 0 && site.visits > 0 && site.visits < tMin) return false;
+    if (tMax !== Infinity && site.visits > 0 && site.visits > tMax) return false;
     if (rMin > 0 && site.globalRank && site.globalRank < rMin) return false;
     if (rMax !== Infinity && site.globalRank && site.globalRank > rMax) return false;
     if (langFilter && site.countryCode !== langFilter) return false;
