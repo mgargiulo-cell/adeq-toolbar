@@ -736,12 +736,32 @@ function _isWeekendSpain() {
   return day === "Sat" || day === "Sun";
 }
 
+// ¿Toca el rollover diario de next_day? La marca vive en config, no en memoria, así
+// que un restart no la borra. Devuelve true UNA sola vez por día calendario español.
+async function _tocaRolloverNextDay(token, todaySpain) {
+  try {
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return false;                                   // no pude leer ≠ cambió el día
+    if ((cfg.next_day_rollover_day || "") === todaySpain) return false;
+    await setConfigValue(token, "next_day_rollover_day", todaySpain).catch(() => {});
+    return true;
+  } catch { return false; }
+}
+
 async function getDailyGlobalCounters(token) {
   // Día actual España (calendario, no UTC)
   const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" });
   const todaySpain = fmt.format(new Date());
   // Reset si cambió el día calendario
-  const _dayChanged = _csvDailyCounterDate !== null && _csvDailyCounterDate !== todaySpain;
+  // ⚠️ ANTES el rollover exigía que EL MISMO PROCESO viera dos días calendario
+  // distintos (`_csvDailyCounterDate !== null && ... !== todaySpain`). El worker
+  // reinicia cada ~7 min y duerme fuera de 9-23, así que eso NO PASABA NUNCA: las
+  // filas en `next_day` se quedaban ahí para siempre y, como `_countActiveCsvBySource`
+  // las cuenta, consumían cupo del carril de su fuente de forma permanente. Ese es el
+  // mecanismo exacto por el que AutoGoogle y similar-expansion salían sin gastar un
+  // crédito: veían el carril lleno de filas fantasma. Ahora la marca va en config y
+  // sobrevive a los reinicios.
+  const _dayChanged = await _tocaRolloverNextDay(token, todaySpain);
   if (_csvDailyCounterDate !== todaySpain) { _csvDailyCounterDate = todaySpain; _csvDailyCounter = 0; }
   if (_autopilotDailyCounterDate !== todaySpain) { _autopilotDailyCounterDate = todaySpain; _autopilotDailyCounter = 0; }
   // Rollover next_day → waiting_pool al cambiar el día (excedente diario espera al día
@@ -772,6 +792,22 @@ async function getDailyGlobalCounters(token) {
       } else {
         log(`🌅 day rollover ${todaySpain}: waiting_pool lleno (${_wNow}/${WAITING_POOL_CAP}) — next_day espera`);
       }
+      // Si next_day se acumula, los carriles de los feeders quedan tapados por filas
+      // que nunca van a entrar y el descubrimiento se apaga solo, en silencio.
+      try {
+        const nr = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&select=id`,
+          { headers: { ..._auth, "Prefer": "count=exact", "Range": "0-0" } });
+        const _atascados = parseInt((nr.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+        await saludPing(token, "next_day_rollover", { status: "ok", cadenciaMin: 24 * 60, detalle: `${_atascados} en next_day`, real: _atascados });
+        if (_atascados > 500) {
+          await saludAlerta(token, {
+            clave: "next-day-atascado", severidad: "warning",
+            titulo: `🚧 ${_atascados} dominios atascados en next_day`,
+            cuerpo: `Esas filas consumen cupo del carril de su fuente, así que los feeders se saltean solos sin gastar créditos. El waiting_pool está en ${_wNow}/${WAITING_POOL_CAP}.`,
+            metadata: { next_day: _atascados, waiting_pool: _wNow },
+          });
+        }
+      } catch {}
     } catch (e) { log(`⚠️ next_day rollover: ${e.message}`); }
   }
   // Cargar persisted counters de Supabase si vienen del mismo día
@@ -1005,10 +1041,14 @@ async function refreshOneEmptyLead(token, cfg) {
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(traffic.eq.0,traffic.is.null)&select=id,domain&order=created_at.asc&limit=${REFRESH_EMPTY_BATCH}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
+    // PostgREST devuelve un OBJETO de error, no un array. Antes eso apagaba el flag.
+    if (!res.ok) { await saludPing(token, "refresh_empty_leads", { status: "fail", detalle: `HTTP ${res.status}` }); return; }
     const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) {
+    if (!Array.isArray(rows)) { await saludPing(token, "refresh_empty_leads", { status: "fail", detalle: "respuesta inesperada" }); return; }
+    if (rows.length === 0) {
       log("✅ Refresh empty leads: completado, no quedan leads sin traffic. Apagando flag.");
       await setConfigValue(token, "agent_refresh_empty_leads", "false");
+      await saludPing(token, "refresh_empty_leads", { status: "ok", detalle: "sin leads pendientes de tráfico" });
       return;
     }
     log(`🔄 Refresh empty batch: ${rows.length} leads`);
@@ -1437,8 +1477,17 @@ async function _findKnownDomainsWorker(token, candidates) {
   // (cualquier status) o en Prospects. Así no re-analiza lo ya visto y avanza a lo
   // nuevo. Re-prospect de finalizados = flujo Monday aparte. Tras reset total, todo
   // vuelve a ser nuevo. (Sincronizado con el import manual en modules/sellersJson.js.)
+  // ⚠️ MATIZ IMPORTANTE (Maxi 2026-08-11): "conocido" NO puede incluir a los que
+  // fallaron por una causa transitoria. Antes el filtro era "" — cualquier fila en
+  // cualquier status contaba como visto, incluidos `error` y `skipped`, que es donde
+  // terminan los dominios que se cayeron por un 500 de Supabase, un timeout o un muro
+  // de Cloudflare. Resultado: el universo de dominios descubribles solo podía
+  // ACHICARSE, y un publisher real descartado por un blip quedaba excluido de las 7
+  // vías de descubrimiento para siempre. Los estados terminales de verdad (done,
+  // pending, processing, frozen, next_day, waiting_pool) sí siguen bloqueando.
+  const _ESTADOS_REINTENTABLES = ["error", "skipped"];
   const tables = [
-    { table: "toolbar_csv_queue",     col: "domain", filter: "" },
+    { table: "toolbar_csv_queue",     col: "domain", filter: `&status=not.in.(${_ESTADOS_REINTENTABLES.join(",")})` },
     { table: "toolbar_review_queue",  col: "domain", filter: "" },
   ];
   for (let i = 0; i < candidates.length; i += BATCH) {
@@ -1816,6 +1865,41 @@ const _AUTOGOOGLE_GL = ["mx", "ar", "br", "cl", "co", "pe", "uy", "es", "it", "f
 const HISPANIC_GL = ["mx", "ar", "cl", "co", "pe", "uy", "es", "ve", "ec", "bo", "py", "cr", "gt", "do", "pa", "hn", "sv", "ni"];
 const HISPANIC_TLDS = [".mx", ".ar", ".cl", ".co", ".pe", ".uy", ".es", ".ve", ".ec", ".bo", ".py", ".cr", ".gt", ".do", ".pa", ".hn", ".sv", ".ni", ".pr", ".cu"];
 
+// ── BÚSQUEDAS POR HUELLA DE PUBLISHER (Maxi 2026-08-11) ──────────────────────
+// Un media buyer humano no busca "recetas fáciles" para encontrar a quién venderle:
+// busca señales de que el sitio VENDE PUBLICIDAD. Estas consultas replican eso.
+//
+//  · `inurl:ads.txt "pub-"` → el ads.txt indexado por Google. Es la prueba directa de
+//    que el sitio monetiza display, y es justo la puerta 0 del negocio.
+//  · `"media kit"` / `"tarifas publicitarias"` → el sitio tiene equipo comercial.
+//  · `"anunciar con nosotros"` → busca activamente anunciantes.
+// Todo esto sale gratis: son búsquedas normales de Serper, del mismo cupo.
+const _HUELLAS_ES = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"media kit" OR "kit de medios" noticias {tld}`,
+  `"anunciar con nosotros" OR "publicite aqui" portal noticias {tld}`,
+  `"tarifas publicitarias" OR "pauta publicitaria" diario digital {tld}`,
+  `"nuestra redacción" OR "quiénes somos" noticias locales {tld}`,
+];
+const _HUELLAS_INTL = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"media kit" OR "advertise with us" news portal {tld}`,
+  `"advertising rates" OR "our audience" online magazine {tld}`,
+  `"editorial team" OR "about our newsroom" news {tld}`,
+];
+
+function _construirBusquedasDeHuella(esHispano, cuantas) {
+  const plantillas = esHispano ? _HUELLAS_ES : _HUELLAS_INTL;
+  const tlds = esHispano ? HISPANIC_TLDS : [".mx", ".ar", ".es", ".it", ".pt", ".pl", ".tr", ".gr", ".br", ".cl", ".co"];
+  const out = [];
+  for (let i = 0; i < cuantas; i++) {
+    const p = plantillas[i % plantillas.length];
+    const tld = tlds[Math.floor(Math.random() * tlds.length)];
+    out.push(p.replace("{tld}", `site:${tld}`));
+  }
+  return [...new Set(out)];
+}
+
 // Índice de día absoluto (UTC) — para alternar el turno hispano día a día.
 function _dayIndex(dateISO) {
   const [y, m, d] = String(dateISO).split("-").map(Number);
@@ -2067,7 +2151,18 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const _pickTop = [..._topInPool].sort(() => Math.random() - 0.5).slice(0, Math.round(N * 0.65));
   const _pickTopSet = new Set(_pickTop);
   const _explore = pool.filter(p => !_pickTopSet.has(p)).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
-  const kws = [..._pickTop, ..._explore].sort(() => Math.random() - 0.5);
+  // ── HUELLA DE PUBLISHER, no tema (Maxi 2026-08-11) ────────────────────────
+  // Las keywords del pool buscan TEMAS ("breaking news today", "recetas faciles").
+  // Google responde a eso con la CNN y la BBC: sitios enormes, anglo y que ya
+  // conocemos. Lo que necesitamos son portales regionales que MONETIZAN, y para eso
+  // hay que buscar la huella del negocio, no el contenido.
+  //
+  // La más potente es `inurl:ads.txt`: devuelve sitios cuyo archivo ads.txt está
+  // indexado, o sea que YA venden display. Es la puerta 0 del negocio ("sin ads.txt
+  // no entra") convertida en buscador, y sale gratis.
+  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.25)));
+  const kws = [..._pickTop, ..._explore.slice(0, Math.max(0, _explore.length - _huellaPublisher.length)), ..._huellaPublisher]
+    .sort(() => Math.random() - 0.5);
   log(`🔎 AutoGoogle slot ${slotLabel}${_hispanicSlot ? " 🌎 HISPANO (es-only)" : ""} — ${kws.length} búsquedas (${_pickTop.length} top-yield + ${_explore.length} explore · mes ${used}/${monthlyCap}, freshRate ${freshRate.toFixed(2)}, ${daysLeft}d)...`);
   const found = new Set();
   const kwDomains = new Map();  // Maxi 2026-07-16: keyword → dominios que trajo (para calcular el yield)
@@ -2854,16 +2949,29 @@ async function maybeRunAgentSlot(token, allFlags) {
   _agentLastSlot = slotInfo.slotLabel;
   const _porSlot = _ag.perCycleLimit;
   log(`🤖 AGENT slot ${slotInfo.slotLabel} fired${slotInfo.atrasado ? " (RECUPERADO, iba atrasado)" : ""} — hasta ${_porSlot} leads por MB`);
+  // ⚠️ Antes esto era un `finally`, que corre TAMBIÉN cuando runAgentCycle lanza una
+  // excepción: un throw en getConfig o en un fetch sin catch quemaba el slot con cero
+  // envíos y sin recuperación posible. Caso nº11 del patrón "no pude" = "ya está".
+  // Ahora el slot se marca solo si el ciclo terminó de verdad.
+  let _resultado;
   try {
-    return await runAgentCycle(token, allFlags);
-  } finally {
-    // Se marca al TERMINAR, pase lo que pase adentro. Si el proceso muere antes, el slot sigue
-    // pendiente y se recupera en la próxima vuelta — que es justo lo que queremos.
-    hechos.add(slotInfo.slot);
-    const _ordenados = [...hechos].sort((a, b) => a - b).join(",");
-    await setConfigValue(token, "agent_slots_done", `${dateISO}:${_ordenados}`).catch(() => {});
-    await setConfigValue(token, "agent_last_slot", slotInfo.slotLabel).catch(() => {});
+    _resultado = await runAgentCycle(token, allFlags);
+  } catch (e) {
+    _agentLastSlot = "";                       // que lo pueda reintentar esta misma vuelta
+    await saludPing(token, "agente_envios", { status: "fail", detalle: `el ciclo tiró error: ${e.message}` });
+    await saludAlerta(token, {
+      clave: "agente-ciclo-roto", severidad: "error",
+      titulo: `💥 El ciclo de envío falló`,
+      cuerpo: `Slot ${slotInfo.slotLabel} abortado por: ${e.message}\nEl slot queda PENDIENTE y se reintenta.`,
+      metadata: { slot: slotInfo.slotLabel, error: e.message },
+    });
+    return;
   }
+  hechos.add(slotInfo.slot);
+  const _ordenados = [...hechos].sort((a, b) => a - b).join(",");
+  await setConfigValue(token, "agent_slots_done", `${dateISO}:${_ordenados}`).catch(() => {});
+  await setConfigValue(token, "agent_last_slot", slotInfo.slotLabel).catch(() => {});
+  return _resultado;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -3182,10 +3290,14 @@ async function backfillMissingFields(token, cfg) {
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(language.is.null,language.eq.,contact_name.is.null,contact_name.eq.,category.is.null,category.eq.,page_title.is.null,page_title.eq.,score.eq.0,score.is.null)&select=id,domain,traffic,geo,language,category,page_title,ad_networks,emails,contact_name,score,status&order=created_at.asc&limit=${BACKFILL_BATCH}`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
+    // PostgREST devuelve un OBJETO de error, no un array. Antes eso apagaba el flag.
+    if (!res.ok) { await saludPing(token, "backfill_missing", { status: "fail", detalle: `HTTP ${res.status}` }); return; }
     const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) {
+    if (!Array.isArray(rows)) { await saludPing(token, "backfill_missing", { status: "fail", detalle: "respuesta inesperada" }); return; }
+    if (rows.length === 0) {
       log("✅ Backfill missing: completado, no quedan leads incompletos. Apagando flag.");
       await setConfigValue(token, "agent_backfill_missing", "false");
+      await saludPing(token, "backfill_missing", { status: "ok", detalle: "sin leads incompletos" });
       return;
     }
     log(`🔧 Backfill missing batch: ${rows.length} leads`);
@@ -4298,7 +4410,11 @@ async function findSimilarSites(domain, rapidApiKey) {
           if (Array.isArray(obj)) {
             for (const item of obj) {
               if (item && typeof item === "object") {
-                const d = item.domain || item.Domain || item.url || item.site || item.hostname;
+                // ⚠️ La clave real de similarsites.com es `Site`, con S MAYÚSCULA.
+                // Verificado contra clarin.com: 20 dominios en props.pageProps.siteData
+                // .SimilarSites[].Site. Sin `Site` acá la búsqueda devolvía 0 SIEMPRE.
+                // El fix se aplicó a modules/cascade.js el 08/08 y no se portó al worker.
+                const d = item.Site || item.site || item.domain || item.Domain || item.url || item.hostname;
                 if (d && typeof d === "string" && d.includes(".") && !d.includes("/")) {
                   const cd = d.replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, "").toLowerCase();
                   if (cd && cd !== clean) domains.push(cd);
@@ -6202,6 +6318,25 @@ async function fetchPageContent(domain, _yaReintentado = false) {
       else if (_hits(personalKw) >= 1) nonPublisherType = "personal";
     }
 
+    // ── EL MURO DE WAF NO ES EL SITIO (Maxi 2026-08-11) ──────────────────────
+    // "Just a moment...", "Access Denied", "Attention Required" son páginas de
+    // Cloudflare/Akamai, no del publisher. Antes esto se detectaba SOLO en polishPool
+    // y en el embudo de entrada pasaba como página real: `pageContent` venía truthy con
+    // hasDisplayAds:false, así que `scoreProspectable` calculaba que sí pudo juzgar y
+    // NUNCA activaba el retry. Un diario detrás de Cloudflare se descartaba para siempre
+    // por "no monetiza", cuando lo único que pasó es que no pudimos leerlo.
+    const _muro = _ES_PAGINA_BLOQUEADA.test(`${title} ${desc.slice(0, 120)}`);
+    if (_muro) {
+      return {
+        bloqueado: true, bloqueadoPor: title.slice(0, 60),
+        title: title.slice(0, 100), description: desc.slice(0, 280),
+        adNetworks: [], category: "",
+        hasDisplayAds: false, hasProgrammatic: false,
+        nonPublisherType: "",              // NO juzgamos el tipo por un muro
+        htmlLang, ogLocale, hreflang, jsonLdLang, pathLang, textSample: "",
+      };
+    }
+
     return {
       title: title.slice(0, 100),
       description: desc.slice(0, 280),
@@ -6386,7 +6521,34 @@ function _parseAdsTxtBody(txt, contentType) {
     .map(m => m[1].toLowerCase().trim()).filter(Boolean)
     .filter(e => !_ES_DOMINIO_ADTECH.test(e.split("@")[1] || ""));
   return { lines: matches.length, systems: systems.size, owner: owner.trim().toLowerCase(),
+           // La LISTA de exchanges, no solo cuántos: quién está adentro dice más que el número.
+           // La usa el puntaje de calidad para separar un publisher premium de un content farm.
+           sistemas: [...systems].slice(0, 120),
            contactos: [...new Set(contactos)] };
+}
+
+// ── EXCHANGES PREMIUM ────────────────────────────────────────────────────────
+// Estar en estos ads.txt significa que alguien con estándares de admisión ya aprobó al
+// sitio. Google Ad Manager/AdX y Amazon TAM son los más exigentes; el resto son SSPs de
+// primer nivel que igual auditan. Un ads.txt de 40 líneas sin ninguno de estos suele ser
+// un content farm viviendo de popunders.
+const _EXCHANGES_PREMIUM = [
+  "google.com", "doubleclick.net", "aps.amazon.com", "amazon-adsystem.com",
+  "rubiconproject.com", "magnite.com", "pubmatic.com", "indexexchange.com",
+  "appnexus.com", "openx.com", "criteo.com", "smartadserver.com",
+  "triplelift.com", "sharethrough.com", "spotx.tv", "freewheel.tv", "teads.tv",
+];
+function _exchangesPremiumEnAdsTxt(adsTxt) {
+  const sis = Array.isArray(adsTxt?.sistemas) ? adsTxt.sistemas : [];
+  if (!sis.length) return [];
+  const encontrados = new Set();
+  for (const s of sis) {
+    const host = String(s || "").toLowerCase().replace(/^www\./, "");
+    for (const p of _EXCHANGES_PREMIUM) {
+      if (host === p || host.endsWith(`.${p}`)) { encontrados.add(p); break; }
+    }
+  }
+  return [...encontrados];
 }
 
 async function _fetchAdsTxtOnce(host, { proto = "https", path = "/ads.txt", _redirDepth = 0 } = {}) {
@@ -6494,7 +6656,7 @@ async function checkAdsTxt(domain) {
       const rHttp = await _fetchAdsTxtOnce(h, { proto: "http" });
       if (rHttp.state === "yes") r = rHttp;
     }
-    if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, owner: r.owner || "", contactos: r.contactos || [], checked: h }; break; }
+    if (r.state === "yes") { out = { state: "yes", lines: r.lines, systems: r.systems || 0, sistemas: r.sistemas || [], owner: r.owner || "", contactos: r.contactos || [], checked: h }; break; }
     if (r.state === "unknown") { huboUnknown = true; if (!porQue) porQue = r.why || "desconocido"; }
   }
   // app-ads.txt UNA sola vez al final (no por host): publishers app-first a veces solo publican
@@ -6502,7 +6664,7 @@ async function checkAdsTxt(domain) {
   // tardaba 48s).
   if (out.state !== "yes" && !huboUnknown) {
     const rApp = await _fetchAdsTxtOnce(d, { path: "/app-ads.txt" });
-    if (rApp.state === "yes") out = { state: "yes", lines: rApp.lines, systems: rApp.systems || 0, owner: rApp.owner || "", contactos: rApp.contactos || [], checked: `${d}/app-ads.txt` };
+    if (rApp.state === "yes") out = { state: "yes", lines: rApp.lines, systems: rApp.systems || 0, sistemas: rApp.sistemas || [], owner: rApp.owner || "", contactos: rApp.contactos || [], checked: `${d}/app-ads.txt` };
     else if (rApp.state === "unknown") { huboUnknown = true; if (!porQue) porQue = rApp.why || "desconocido"; }
   }
   // Si nadie dio "yes" pero algo falló por red/bloqueo, NO afirmamos que no tiene.
@@ -6832,17 +6994,25 @@ async function purgeByUrlOnly(token) {
   const BATCH = 1000;
   const cursor = cfg.url_purge_cursor || "";
   const cursorClause = cursor ? `&created_at=lt.${encodeURIComponent(cursor)}` : "";
-  let rows = [];
+  let rows = null;
   try {
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at,traffic,category&order=created_at.desc&limit=${BATCH}`,
       { headers: auth }
     );
-    if (r.ok) rows = await r.json();
+    if (r.ok) { const j = await r.json(); if (Array.isArray(j)) rows = j; }
   } catch {}
-  if (!Array.isArray(rows) || rows.length === 0) {
+  // "No pude leer" ≠ "no queda nada". Ver el comentario de polishPool.
+  if (rows === null) {
+    await saludPing(token, "url_purge", { status: "fail", detalle: "no se pudo leer el pool — se conserva el cursor" });
+    log(`⚠️ url-purge: la consulta falló — NO apago el barrido`);
+    return;
+  }
+  if (rows.length === 0) {
     await setConfigValue(token, "url_purge_enabled", "false").catch(() => {});
     await setConfigValue(token, "url_purge_cursor", "").catch(() => {});
+    await setConfigValue(token, "url_purge_last_done", new Date().toISOString()).catch(() => {});
+    await saludPing(token, "url_purge", { status: "ok", detalle: "pool barrido completo" });
     log(`🧹 url-purge: pool barrido COMPLETO → flag OFF`);
     return;
   }
@@ -6889,14 +7059,22 @@ async function sweepBlockedFromProspects(token) {
   const BATCH = 60;
   const cursor = cfg.purge_cursor_ts || "";
   const cursorClause = cursor ? `&created_at=lt.${encodeURIComponent(cursor)}` : "";
-  let rows = [];
+  let rows = null;
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,created_at,traffic,category,geo,language&order=created_at.desc&limit=${BATCH}`, { headers: auth });
-    if (r.ok) rows = await r.json();
+    if (r.ok) { const j = await r.json(); if (Array.isArray(j)) rows = j; }
   } catch {}
-  if (!Array.isArray(rows) || rows.length === 0) {
+  // "No pude leer" ≠ "no queda nada". Ver el comentario de polishPool.
+  if (rows === null) {
+    await saludPing(token, "purge_blocked", { status: "fail", detalle: "no se pudo leer el pool — se conserva el cursor" });
+    log(`⚠️ purge-prospects: la consulta falló — NO apago el barrido`);
+    return;
+  }
+  if (rows.length === 0) {
     await setConfigValue(token, "purge_blocked_prospects", "false").catch(() => {});
     await setConfigValue(token, "purge_cursor_ts", "").catch(() => {});
+    await setConfigValue(token, "purge_blocked_last_done", new Date().toISOString()).catch(() => {});
+    await saludPing(token, "purge_blocked", { status: "ok", detalle: "pool barrido completo" });
     log(`🧹 purge-prospects: pool barrido COMPLETO → flag OFF`);
     return;
   }
@@ -7071,19 +7249,39 @@ async function polishPool(token) {
   const soloSinEmail = String(cfg.polish_only_missing || "") === "true";
   const cursor = cfg.polish_cursor_ts || "";
   const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
-  let leads = [];
+  // ⚠️ "La query falló" ≠ "terminé de recorrer el pool". Antes los dos casos
+  // caían en el mismo `length === 0` y un 500 de Supabase apagaba el barrido Y
+  // le borraba el cursor, sin avisar. Caso nº10 del patrón "no pude" = "ya está".
+  // ⚠️ `polish_only_missing` NO filtraba nada: se leía y solo se usaba en el log,
+  // mientras el botón del popup prometía "va derecho a los que NO tienen email".
+  // Recorría el pool entero gastando un fetch por lead. Ahora sí filtra.
+  const sinEmailClause = soloSinEmail ? `&or=(emails.is.null,emails.eq.%5B%5D)` : "";
+  let leads = null;
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,emails,email_sources,contact_name,contact_phone,category,traffic,created_at&order=created_at.asc&limit=${POLISH_BATCH}`, { headers: auth });
-    if (r.ok) leads = await r.json();
+    const _sel = (cols) => `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}${sinEmailClause}&select=${cols}&order=created_at.asc&limit=${POLISH_BATCH}`;
+    const _base = "id,domain,emails,email_sources,contact_name,contact_phone,category,traffic,created_at";
+    let r = await fetch(_sel(`${_base},email_intentos`), { headers: auth });
+    // Igual que en el pool del agente: `email_intentos` la crea la migración del 11/08.
+    // Si el código va antes que el SQL, se sigue trabajando sin esa columna en vez de
+    // interpretar el 400 como "no queda nada que pulir".
+    if (!r.ok) r = await fetch(_sel(_base), { headers: auth });
+    if (r.ok) { const j = await r.json(); if (Array.isArray(j)) leads = j; }
   } catch {}
-  if (!Array.isArray(leads) || leads.length === 0) {
+  if (leads === null) {
+    await saludPing(token, "polish_pool", { status: "fail", detalle: "no se pudo leer el pool — se conserva el cursor" });
+    log(`⚠️ polish: la consulta al pool falló — NO apago el barrido, reintento la próxima vuelta`);
+    return;
+  }
+  if (leads.length === 0) {
     await setConfigValue(token, "polish_pool", "false").catch(() => {});
     await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
     await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
+    await setConfigValue(token, "polish_last_done", new Date().toISOString()).catch(() => {});
+    await saludPing(token, "polish_pool", { status: "ok", detalle: "pool completo pulido" });
     log(`✨ polish: pool COMPLETO pulido → flag OFF`);
     return;
   }
-  let blocked = 0, enriched = 0;
+  let blocked = 0, enriched = 0, sinEmail = 0;
   let _committedTs = cursor;
   const _polishInicio = Date.now();
   for (let i = 0; i < leads.length; i += POLISH_CONC) {
@@ -7220,11 +7418,26 @@ async function polishPool(token) {
             _patch.contact_name = foundName || lead.contact_name || "";
           }
           if (foundPhone && !_curPhone) _patch.contact_phone = foundPhone;
+          if (foundEmail) { _patch.email_intentos = 0; _patch.email_ultimo_motivo = null; }
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
             body: JSON.stringify(_patch),
           });
           if (foundEmail) enriched++;
+        } else if (!curEmails.length) {
+          // Buscamos y no encontramos. ANTES esto no dejaba rastro: el cursor pasaba y
+          // el lead quedaba indistinguible de uno ya resuelto, para siempre. Es la causa
+          // directa de los ~310 leads sin email estancados. Ahora se registra el intento
+          // para poder reintentar con backoff en vez de darlo por perdido.
+          sinEmail++;
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({
+              email_intentos: (lead.email_intentos || 0) + 1,
+              email_ultimo_intento: new Date().toISOString(),
+              email_ultimo_motivo: "no_encontrado",
+            }),
+          }).catch(() => {});
         }
       } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
     }));
@@ -7239,7 +7452,14 @@ async function polishPool(token) {
       break;
     }
   }
-  log(`✨ polish${soloSinEmail ? " (solo sin email)" : ""}: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} cursor→${_committedTs}`);
+  log(`✨ polish${soloSinEmail ? " (solo sin email)" : ""}: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} sin_email=${sinEmail} cursor→${_committedTs}`);
+  // El rendimiento esperado: al menos 1 de cada 4 leads sin email debería resolverse.
+  // Si cae por debajo, el vigilante avisa en vez de que lo descubramos dentro de un mes.
+  await saludPing(token, "polish_pool", {
+    status: "ok", cadenciaMin: 30,
+    detalle: `batch ${leads.length}: ${enriched} con email nuevo, ${blocked} descartados, ${sinEmail} sin suerte`,
+    real: enriched, esperado: Math.max(1, Math.round((enriched + sinEmail) / 4)),
+  });
 }
 
 // Maxi 2026-07-16: EXPANSIÓN POR SIMILARES desde los Prospects. El user pidió "que busque similares de
@@ -7278,12 +7498,17 @@ async function runProspectSimilarExpansion(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const cursor = cfg.similar_expansion_cursor || "";
   const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
-  let seeds = [];
+  let seeds = null;
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.500000${cursorClause}&select=domain,created_at&order=created_at.asc&limit=${SIMILAR_EXP_BATCH}`, { headers: auth });
-    if (r.ok) seeds = await r.json();
+    if (r.ok) { const j = await r.json(); if (Array.isArray(j)) seeds = j; }
   } catch {}
-  if (!Array.isArray(seeds) || seeds.length === 0) {
+  // "No pude leer" ≠ "no quedan semillas": antes un 500 reseteaba el cursor.
+  if (seeds === null) {
+    await saludPing(token, "similar_expansion", { status: "fail", detalle: "no se pudieron leer las semillas — se conserva el cursor" });
+    return;
+  }
+  if (seeds.length === 0) {
     await setConfigValue(token, "similar_expansion_cursor", "").catch(() => {});  // fin → reset (los Prospects cambian)
     return;
   }
@@ -7374,6 +7599,16 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
     // Puntúa por EXCHANGES DISTINTOS, no por líneas: 400 líneas de un solo sistema monetiza
     // mucho menos que 30 exchanges reales.
     add(sys >= 15 ? 45 : sys >= 5 ? 35 : 25, `ads.txt (${adsTxt.lines} líneas, ${sys} exchanges)`);
+    // ── CALIDAD DEL ads.txt, no solo cantidad (Maxi 2026-08-11) ──────────────
+    // Hasta acá todo el aparato respondía "¿monetiza sí o no?", binario. Pero un content
+    // farm con 40 redes de popunder puntuaba MÁS que un diario regional serio con 6
+    // exchanges premium. Quién está en el ads.txt dice más que cuántos: si adentro está
+    // Google AdX/Ad Manager o Amazon TAM, alguien con estándares ya lo aprobó. Es dato
+    // que YA descargamos y estábamos tirando.
+    const _premium = _exchangesPremiumEnAdsTxt(adsTxt);
+    if (_premium.length >= 3)      add(25, `ads.txt premium (${_premium.slice(0, 3).join(", ")})`);
+    else if (_premium.length >= 1) add(15, `ads.txt con ${_premium.join(", ")}`);
+    else if (sys >= 5)             add(-10, "ads.txt sin ningún exchange premium");
   }
   if (pageContent?.hasDisplayAds)     { monetiza = true; add(30, "display ads en la home"); }
   if (pageContent?.hasProgrammatic)   { monetiza = true; add(15, "programmatic"); }
@@ -7404,7 +7639,8 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
     || PUBLISHER_CATEGORIES.has(cat)   // ya es la lista estricta (news/sports/entertainment/streaming/food)
     || /news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|\btv\b|streaming|gaming|blog|recipe|arts_and_entertainment/.test(swc);
   if (adsTxt?.state !== "yes" && !evidenciaDeMedio) {
-    const pudimosJuzgar = !!haikuType || !!swc;
+    // Si lo que leímos fue un muro de WAF, no juzgamos nada aunque haya título.
+    const pudimosJuzgar = (!!haikuType || !!swc) && pageContent?.bloqueado !== true;
     return {
       ok: false, retry: !pudimosJuzgar, score,
       reason: pudimosJuzgar ? `sin_ads_txt_ni_evidencia_de_medio${haikuType ? `:ia_${haikuType}` : ""}` : "sin_datos_reintentar",
@@ -7422,7 +7658,10 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
     // en unknown (Cloudflare/timeout) Y encima no pudimos leer la home, no tenemos UNA sola
     // señal: rechazar ahí es descartar por una falla NUESTRA, el mismo error que costó 2.011
     // leads congelados por cuota de API. Devolvemos retry:true y el barrido lo deja pending.
-    const sinDatos = adsTxt?.state === "unknown" && !pageContent;
+    // Un muro de WAF cuenta como NO haber leído la home: `pageContent` viene truthy pero
+    // no dice nada del sitio. Sin este `|| pageContent?.bloqueado`, un diario detrás de
+    // Cloudflare se descartaba por "no monetiza" sin que nadie lo hubiera mirado nunca.
+    const sinDatos = adsTxt?.state === "unknown" && (!pageContent || pageContent.bloqueado === true);
     return {
       ok: false, retry: sinDatos, score,
       reason: sinDatos ? "sin_datos_reintentar"
@@ -8971,6 +9210,17 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Regla del user: "lo que un MB importa a mano, todo debe pasar el filtro siempre".
   {
     const pub = await classifyPublisher(token, domain, pageContent, swCategory);
+    // ⚠️ EL VEREDICTO TIENE TRES ESTADOS, NO DOS (Maxi 2026-08-11).
+    // Acá se miraba solo `!pub.ok` y se descartaba PERMANENTEMENTE, ignorando por
+    // completo el `pub.retry` que la propia función devuelve para decir "no pude
+    // juzgarlo, no lo mates". Un publisher detrás de Cloudflare, o uno cuyo ads.txt
+    // no se pudo leer por un timeout, terminaba en `skipped` — un estado que NADIE
+    // vuelve a mirar nunca. Ahora el "no sé" va a next_day y se reintenta mañana.
+    if (!pub.ok && pub.retry) {
+      await markCsvItem(token, item.id, "next_day", { error_message: `reintentar: ${pub.reason}` });
+      log(`  🔁 ${domain} — no pudimos juzgarlo (${pub.reason}) → se reintenta mañana, NO se descarta`);
+      return;
+    }
     if (!pub.ok) {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${pub.reason}` });
       log(`  🗑 ${domain} — no parece publisher (${pub.reason}) → skip`);
@@ -9564,12 +9814,23 @@ async function runSession(token, cfg, sessionStart) {
               if (!m) return [];
               const j = JSON.parse(m[1]);
               const found = [];
+              // Ruta conocida primero: precisa y barata. La clave es `Site` con S MAYÚSCULA
+              // (verificado contra clarin.com). La recursiva de abajo queda de red por si
+              // similarsites cambia la estructura.
+              try {
+                for (const it of (j?.props?.pageProps?.siteData?.SimilarSites || [])) {
+                  const dd = typeof it === "string" ? it : (it?.Site || it?.site || it?.Domain || it?.domain);
+                  if (dd && typeof dd === "string" && dd.includes(".")) {
+                    found.push(dd.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, ""));
+                  }
+                }
+              } catch {}
               const search = (obj) => {
                 if (!obj || typeof obj !== "object") return;
                 if (Array.isArray(obj)) {
                   for (const it of obj) {
                     if (it && typeof it === "object") {
-                      const dd = it.domain || it.Domain || it.hostname;
+                      const dd = it.Site || it.site || it.domain || it.Domain || it.hostname;
                       if (dd && typeof dd === "string" && dd.includes(".") && !dd.includes("/")) {
                         found.push(dd.toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/$/, ""));
                       }
@@ -9587,11 +9848,51 @@ async function runSession(token, cfg, sessionStart) {
         ));
         results.flat().forEach(d => d && d !== "" && discoveredSet.add(d));
       }
+      // ── CLOUDFLARE RADAR: estaba implementado y era CÓDIGO MUERTO ──────────
+      // `loadRadarPoolForCountries` se ejecutaba y gastaba HTTP, pero su único
+      // consumidor era la rama `else if (hasTargetGeo)`, inalcanzable porque
+      // `_autopilotMode` es una constante literal. Radar es el top de sitios más
+      // visitados POR PAÍS: es lo más parecido a lo que hace un media buyer a mano
+      // buscando medios de México, Argentina o España. Ahora se suma al pool.
+      // Se mide ANTES de mezclar Radar: si no, Radar rellenaría el pool y volvería a
+      // tapar una caída del parser de similares. Cada fuente se vigila por separado.
+      const _soloSimilares = discoveredSet.size;
+      let _deRadar = 0;
+      if (radarPool && radarPool.size) {
+        for (const d of radarPool.keys()) {
+          if (d && !discoveredSet.has(d)) { discoveredSet.add(d); _deRadar++; }
+        }
+        log(`🌐 Radar: +${_deRadar} dominios top por país sumados al pool del autopilot`);
+      }
       pool = [...discoveredSet];
-      poolSource = `similar-sites-${seedDomains.size}seeds`;
+      poolSource = `similar-sites-${seedDomains.size}seeds${_deRadar ? `+radar${_deRadar}` : ""}`;
       log(`Similar discovery: ${pool.length.toLocaleString()} dominios descubiertos desde ${seedDomains.size} seeds (gratis)`);
+      // PROHIBIDO EL FALLBACK SILENCIOSO (regla de oro, Maxi 2026-08-11).
+      // Este `log` inocente tapó durante semanas que el parser de similares devolvía 0
+      // por la clave `Site` en minúscula: el autopilot venía tirando Majestic al azar
+      // disfrazado de similar-discovery, y eso es exactamente la "baja calidad" del pool.
+      // Degradar está bien; degradar sin avisar, no.
+      await saludPing(token, "autopilot_similares", {
+        status: _soloSimilares === 0 ? "fail" : "ok", cadenciaMin: 120,
+        detalle: `${_soloSimilares} similares desde ${seedDomains.size} semillas (+${_deRadar} de Radar)`,
+        real: _soloSimilares, esperado: Math.max(10, seedDomains.size * 3),
+      });
+      if (_soloSimilares === 0 && seedDomains.size > 0) {
+        await saludAlerta(token, {
+          clave: "similares-cero", severidad: "error",
+          titulo: "🔍 El parser de similares devolvió 0",
+          cuerpo: `Con ${seedDomains.size} semillas no salió ni un similar. Suele ser que similarsites.com cambió la estructura del JSON (ya pasó con la clave 'Site'). El pool quedó con ${_deRadar} de Radar.`,
+          metadata: { seeds: seedDomains.size, radar: _deRadar },
+        });
+      }
       if (pool.length === 0) {
-        log("Similar discovery vacío — fallback a Majestic global");
+        log("🚨 Similar discovery vacío — fallback a Majestic global (esto NO es normal)");
+        await saludAlerta(token, {
+          clave: "autopilot-similares-cero", severidad: "error",
+          titulo: "🔍 El descubrimiento de similares devolvió 0",
+          cuerpo: `Con ${seedDomains.size} semillas no salió ni un dominio similar, así que el autopilot cae a Majestic global (calidad muy inferior). Suele ser que similarsites.com cambió la estructura del JSON.`,
+          metadata: { seeds: seedDomains.size },
+        });
         pool = majesticFullPool;
         poolSource = "majestic-global-fallback";
       }
@@ -10259,11 +10560,24 @@ function _agentCfg(cfg) {
       };
     }
   } catch {}
+  // ⚠️ LAS HORAS NO USAN EL FALLBACK SIN PREFIJO (Maxi 2026-08-11).
+  // `active_hours_start` / `active_hours_end` son claves REALES y compartidas: las lee el
+  // gate global del worker. El fallback agregado el 10/08 hizo que, si no existe
+  // `agent_active_hours_end`, el agente heredara la ventana del worker. Con esa clave en 20,
+  // `_isOutsideActiveHours(9,20)` devuelve true a las 20:00 → el 5º slot NO PODÍA disparar
+  // nunca y el techo real del día era 16, no 20. Acá se leen SOLO las prefijadas.
+  const getHora = (key, dflt) => {
+    const n = parseInt(cfg[`agent_${key}`], 10);
+    return Number.isFinite(n) ? n : dflt;
+  };
+  // El último slot es a las 20:00, así que la ventana tiene que cerrar DESPUÉS.
+  const _fin = getHora("active_hours_end", AGENT_DEFAULTS.active_hours_end);
+  const _ultimoSlot = AGENT_SLOTS[AGENT_SLOTS.length - 1];
   return {
     thresholdTraffic: get("threshold_traffic",    AGENT_DEFAULTS.threshold_traffic),
     maxPerDay:        focus.dailyOverride || get("max_per_day", AGENT_DEFAULTS.max_per_day),
-    activeStart:      get("active_hours_start",   AGENT_DEFAULTS.active_hours_start),
-    activeEnd:        get("active_hours_end",     AGENT_DEFAULTS.active_hours_end),
+    activeStart:      getHora("active_hours_start", AGENT_DEFAULTS.active_hours_start),
+    activeEnd:        Math.max(_fin, _ultimoSlot + 1),
     perCycleLimit:    get("per_cycle_limit",      AGENT_DEFAULTS.per_cycle_limit),
     focus,
   };
@@ -10401,12 +10715,45 @@ async function _getTemplateScores(token) {
           }
         }
       }
+
+      // ── 3. RESPUESTAS REALES — la moneda que importa (Maxi 2026-08-11) ─────
+      // Todo este ranking se calculaba con APERTURAS, que es la ÚNICA métrica que un
+      // cold email malo puede ganar: un asunto llamativo sube el open rate aunque el
+      // cuerpo no le dé a nadie una razón para contestar. Optimizar por apertura es
+      // optimizar la métrica equivocada, y es parte de por qué llevábamos meses de
+      // cambios manuales sin resultado.
+      // `toolbar_response_tracking` existe desde junio con el campo que distingue una
+      // respuesta REAL de un fuera-de-oficina, y no la miraba nadie. Ahora manda ella:
+      // si hay muestra suficiente, el template se elige por respuestas; si todavía no,
+      // se sigue usando la apertura como aproximación provisoria.
+      try {
+        const rtRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?response_type=eq.real&sent_at=gte.${cutoff}&select=agent_action_id`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        if (rtRes.ok) {
+          const respuestas = await rtRes.json();
+          if (Array.isArray(respuestas)) {
+            for (const r of respuestas) {
+              const tid = actionToTpl.get(r.agent_action_id);
+              if (tid && map.has(tid)) {
+                const m = map.get(tid);
+                m.respuestas = (m.respuestas || 0) + 1;
+              }
+            }
+          }
+        }
+      } catch (e) { log(`⚠️ respuestas por template: ${e.message}`); }
     }
   } catch (e) { log(`⚠️ _getTemplateScores: ${e.message}`); }
   _templateScoresCache.map = map;
   _templateScoresCache.ts = Date.now();
   return map;
 }
+
+// Muestra mínima de respuestas reales para que el ranking deje de usar aperturas.
+// Por debajo de esto el ruido manda y una sola respuesta suertuda decidiría todo.
+const RESPUESTAS_MIN_PARA_DECIDIR = 5;
 
 async function pickAnyTemplate(token, userEmail, language) {
   const lang = (language || "en").toLowerCase().slice(0, 2);
@@ -10446,7 +10793,41 @@ async function pickAnyTemplate(token, userEmail, language) {
   // reparto parejo, NO ponderado por open-rate). Con 3 defaults → ~33% cada uno.
   const pool = dbDrafts.length > 0 ? dbDrafts : baked;
   if (pool.length === 0) return { template: null, templateId: null };
-  const picked = pool[Math.floor(Math.random() * pool.length)];
+
+  // ── APRENDIZAJE POR RESPUESTAS REALES (Maxi 2026-08-11) ────────────────────
+  // La regla del user es reparto parejo ("100% templates rotando"), y se respeta
+  // mientras no haya evidencia: sin datos, uniforme. Pero una vez que se juntan
+  // RESPUESTAS REALES suficientes (no aperturas), sería tirar información no usarlas.
+  //
+  // El equilibrio: se inclina hacia el que consigue respuestas, pero cada template
+  // conserva un piso de participación. Así ninguno se muere por una mala racha
+  // temprana y el sistema sigue aprendiendo en vez de encerrarse en el primer
+  // ganador — que es como se aprende de verdad, no eligiendo siempre al que va
+  // ganando con 3 datos.
+  let picked = null;
+  try {
+    const scores = await _getTemplateScores(token);
+    const totalRespuestas = pool.reduce((a, t) => a + ((scores.get(t.id)?.respuestas) || 0), 0);
+    if (totalRespuestas >= RESPUESTAS_MIN_PARA_DECIDIR) {
+      const PISO = 0.15;                               // 15% garantizado por template
+      const pesos = pool.map(t => {
+        const s = scores.get(t.id) || {};
+        const envios = s.sends || 0, resp = s.respuestas || 0;
+        // Laplace: un template nuevo arranca en la media, no en cero.
+        return (resp + 1) / (envios + 2);
+      });
+      const suma = pesos.reduce((a, b) => a + b, 0) || 1;
+      const norm = pesos.map(p => (1 - PISO * pool.length) * (p / suma) + PISO);
+      let r = Math.random(), acc = 0;
+      for (let i = 0; i < pool.length; i++) { acc += norm[i]; if (r <= acc) { picked = pool[i]; break; } }
+      if (!picked) picked = pool[pool.length - 1];
+      const _det = pool.map((t, i) => `${t.id}:${Math.round(norm[i] * 100)}%`).join(" ");
+      log(`  🧠 template por respuestas reales (${totalRespuestas} en 30d) → ${_det}`);
+    }
+  } catch (e) { log(`  ⚠️ ponderación por respuestas: ${e.message}`); }
+
+  // Sin datos suficientes → reparto parejo, como pidió el user.
+  if (!picked) picked = pool[Math.floor(Math.random() * pool.length)];
 
   return {
     template: { body: picked.body, subjects: picked.subjects },
@@ -11331,7 +11712,16 @@ async function scanRealResponsesForUser(token, userEmail) {
         // Query Gmail: respuestas DEL contact al userEmail después del envío
         const sentDate = new Date(row.sent_at);
         const afterDate = `${sentDate.getUTCFullYear()}/${sentDate.getUTCMonth()+1}/${sentDate.getUTCDate()}`;
-        const q = encodeURIComponent(`from:${to} to:${userEmail} after:${afterDate} in:anywhere`);
+        // ── SESGO DE MEDICIÓN CORREGIDO (Maxi 2026-08-11) ─────────────────────
+        // Antes se buscaba SOLO `from:<la dirección exacta>`. Pero el copy viejo pedía
+        // literalmente que te reenviaran a otra persona ("pasame el contacto del
+        // encargado"), así que cuando el mecanismo funcionaba, la respuesta llegaba
+        // desde OTRA dirección de la misma empresa y no se contaba nunca. Estábamos
+        // midiendo cero en parte porque no sabíamos mirar donde iba a caer la respuesta.
+        // Ahora se busca en todo el dominio del destinatario.
+        const _domRespuesta = (row.domain || to.split("@")[1] || "").replace(/^www\./, "");
+        const _desde = _domRespuesta ? `from:(${to} OR *@${_domRespuesta})` : `from:${to}`;
+        const q = encodeURIComponent(`${_desde} to:${userEmail} after:${afterDate} in:anywhere`);
         const listRes = await fetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=5`,
           { headers: { "Authorization": `Bearer ${accessToken}` } }
@@ -13748,11 +14138,16 @@ function _textToHtmlServer(text) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/\r\n/g, "\n")
-    // Anti-linkify: rompe la auto-detección de URLs en el cliente del
-    // destinatario. Reemplaza `.` con `&#46;` dentro de patrones de dominio
-    // (alfanuméricos-dot-alfanuméricos). Visual idéntico, sin <a> link.
-    // Pedido del user 2026-05-18: URLs como texto plano.
-    .replace(/\b([a-z0-9-]{2,}(?:\.[a-z0-9-]{2,})+)\b/gi, (m) => m.replace(/\./g, "&#46;"))
+    // ── SE SACÓ EL ANTI-LINKIFY (Maxi 2026-08-11) ────────────────────────────
+    // Acá había un `.replace(/\./g, "&#46;")` sobre cualquier patrón de dominio, para
+    // que el cliente no autodetectara URLs. Costaba dos penalizaciones de spam reales:
+    //   1. Reemplazar puntos por entidades HTML es *entity obfuscation*, exactamente la
+    //      técnica que SpamAssassin y Proofpoint puntúan como evasión.
+    //   2. Dejaba la parte text/plain y la text/html diciendo cosas DISTINTAS
+    //      ("eltribuno.com" vs "eltribuno&#46;com"), y la divergencia entre partes de un
+    //      multipart/alternative es otra heurística clásica de spam.
+    // El objetivo original (que no salgan links clickeables) se cumple igual: nunca
+    // insertamos <a>, y un dominio pelado sin http:// ni www. no se autolinkea solo.
     .split("\n\n")
     .map(p => `<p>${p.replace(/\n/g, "<br/>")}</p>`)
     .join("\n");
@@ -14258,6 +14653,15 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     [MONDAY_COL_GEO]:     geoNormalized,
     [MONDAY_COL_EMAIL]:   { email: payload.email, text: payload.email },
     [MONDAY_COL_DATE]:    { date: new Date().toISOString().split("T")[0] },
+    // ── FECHAS DE SEGUIMIENTO (Maxi 2026-08-11) ────────────────────────────
+    // Los follow-ups los hace Monday, no la toolbar — esa es la división de tareas.
+    // Pero el agente solo escribía FU1/FU2 desde el camino de re-engagement, que está
+    // APAGADO, así que en el envío normal las columnas quedaban vacías y Monday no
+    // tenía de dónde disparar nada. Resultado: cada prospecto recibía un solo toque en
+    // la vida. En cold outreach el 70-80% de las respuestas llegan del toque 2 al 5.
+    // Ahora todo envío deja programado el seguimiento del lado del CRM.
+    [MONDAY_COL_FU1]:     { date: new Date(Date.now() + 5  * 86_400_000).toISOString().split("T")[0] },
+    [MONDAY_COL_FU2]:     { date: new Date(Date.now() + 10 * 86_400_000).toISOString().split("T")[0] },
     [MONDAY_COL_IDIOMA]:  { index: payload.idioma_idx || 0 },
     [MONDAY_COL_ESTADO]:  { label: "Propuesta Vigente (T)" },
     ...(payload.monday_user_id ? { [MONDAY_COL_OWNER]: { personsAndTeams: [{ id: payload.monday_user_id, kind: "person" }] } } : {}),
@@ -14379,7 +14783,26 @@ async function runAgentCycle(token, allFlags) {
   let perUserCap = {};
   try { perUserCap = JSON.parse(cfg.agent_max_per_day_by_user || "{}"); } catch {}
 
-  for (const userEmail of allFlags.agentUsers) {
+  // ── EL ÚLTIMO MB YA NO SE MUERE DE HAMBRE (Maxi 2026-08-11) ─────────────────
+  // runAgentCycle no tiene techo de tiempo y corre después de 3-4 min de tareas de
+  // mantenimiento, contra un proceso que reinicia a los ~7 min. Cuando se cortaba a
+  // mitad, el reintento volvía a empezar por agentUsers[0] y le daba otro batch, así
+  // que el último del array podía no ser alcanzado NUNCA: el orden del array decidía
+  // quién cobraba. Ahora se atiende primero al que está más atrasado contra su cupo.
+  const _ordenMbs = [];
+  for (const u of allFlags.agentUsers) {
+    const _cap = perUserCap[u.toLowerCase()] ?? _agentCfg(cfg).maxPerDay;
+    const _hechos = await getAgentDailyCount(token, u).catch(() => null);
+    // Si no pudimos medir, va al frente: "no sé" no puede degradarse a "ya mandó".
+    _ordenMbs.push({ u, falta: _hechos == null ? Number.MAX_SAFE_INTEGER : _cap - _hechos });
+  }
+  _ordenMbs.sort((a, b) => b.falta - a.falta);
+  const _usuariosOrdenados = _ordenMbs.map(x => x.u);
+  if (_usuariosOrdenados.length > 1) {
+    log(`🤖 orden de atención (más atrasado primero): ${_ordenMbs.map(x => `${x.u.split("@")[0]}(faltan ${x.falta === Number.MAX_SAFE_INTEGER ? "?" : x.falta})`).join(" → ")}`);
+  }
+
+  for (const userEmail of _usuariosOrdenados) {
     if (!AGENT_WHITELIST.has((userEmail || "").toLowerCase())) {
       log(`🚫 Agent: user ${userEmail} no está en whitelist hardcoded — skip`);
       continue;
@@ -14440,11 +14863,28 @@ async function runAgentCycle(token, allFlags) {
       }
     }
     const remaining = userMaxPerDay - sentToday;
-    // El batch lo acota el cupo de PRIMER CONTACTO. Solo si hay un techo total configurado
-    // (opt-in, normalmente apagado) se acota además por lo que quede de ese presupuesto.
-    const batchSize = maxTotalPerDay > 0
-      ? Math.min(aCfg.perCycleLimit, remaining, maxTotalPerDay - totalToday)
-      : Math.min(aCfg.perCycleLimit, remaining);
+
+    // ── PERSEGUIR EL NÚMERO, no mandar de a N fijos (Maxi 2026-08-11) ──────────
+    // Requisito textual: "que el agente cumpla por media buyer el envío de 20 correos,
+    // sí o sí, si en prospects hay url+emails a disposición".
+    //
+    // Antes el batch era un `perCycleLimit` fijo: 5 slots × 4 = exactamente 20, cero
+    // margen. Cualquier slot que rindiera 3 en vez de 4 terminaba el día en 19 y no
+    // había ningún mecanismo de recuperación — el cupo perdido se perdía para siempre.
+    //
+    // Ahora el batch se calcula por RITMO: lo que falta repartido entre los slots que
+    // quedan. Si un slot mandó de menos, el siguiente levanta la diferencia solo; y en
+    // el último slot del día se intenta todo lo que reste. El tope por slot sigue
+    // existiendo (el doble del configurado) para no hacer un burst que Gmail castigue.
+    const _hSpain = _spainHour();
+    const _slotsQueQuedan = Math.max(1, AGENT_SLOTS.filter(h => h >= _hSpain).length);
+    const _porRitmo = Math.ceil(remaining / _slotsQueQuedan);
+    const _techoSlot = Math.max(aCfg.perCycleLimit, aCfg.perCycleLimit * 2);
+    let batchSize = Math.min(Math.max(aCfg.perCycleLimit, _porRitmo), _techoSlot, remaining);
+    if (maxTotalPerDay > 0) batchSize = Math.min(batchSize, maxTotalPerDay - totalToday);
+    if (_porRitmo > aCfg.perCycleLimit) {
+      log(`  📈 ${userEmail}: van ${sentToday}/${userMaxPerDay} y quedan ${_slotsQueQuedan} slots → este slot intenta ${batchSize} (en vez de ${aCfg.perCycleLimit})`);
+    }
 
     // Aplicar focus filtros al query.
     // geos_priority son ISO 2-letter codes (AR, UY, ES...). Matchea contra
@@ -14477,10 +14917,24 @@ async function runAgentCycle(token, allFlags) {
     // created_at DESC → caía siempre en los más nuevos = poca variedad.
     // Ahora pool grande (300) + el bucket-shuffle por GEO se encarga del orden.
     const POOL_SIZE = 300;
-    const queueRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone&limit=${POOL_SIZE}`, // Maxi 2026-07-03 perf: select=* → solo columnas usadas (scoreWebsite + pool loop + per-lead loop). Egress ALTO: POOL_SIZE filas de tabla ancha
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
+    // ⚠️ Sin `order=` PostgREST devuelve el orden físico de Postgres, que es estable.
+    // Los leads que fallan pero siguen `pending` (sin email, ya contactado, todos los
+    // candidatos indeliverables) volvían a caer en la MISMA ventana de 300 en todos los
+    // slots de todos los días: con 1.600+ pendientes, la ventana podía estar dominada por
+    // fracasos crónicos y el resto del pool no se veía nunca. Ordenar por
+    // `email_ultimo_intento` manda al frente a los que todavía no se intentaron.
+    const _urlPool = (orden) =>
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
+    const _hdrsPool = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    let queueRes = await fetch(_urlPool("&order=email_ultimo_intento.asc.nullsfirst,score.desc"), { headers: _hdrsPool });
+    // RED DE SEGURIDAD: `email_ultimo_intento` la crea sql/2026-08-11_salud_y_alertas.sql.
+    // Si el código se deploya ANTES de correr ese SQL, PostgREST responde 400 y sin este
+    // fallback el agente vería "0 candidatos" y DEJARÍA DE ENVIAR hasta que alguien
+    // corriera la migración. Un orden mejor no puede costar el envío del día.
+    if (!queueRes.ok) {
+      log(`  ↩️ pool: el orden por email_ultimo_intento falló (HTTP ${queueRes.status}) — sigo sin ese orden (¿falta correr la migración?)`);
+      queueRes = await fetch(_urlPool("&order=score.desc"), { headers: _hdrsPool });
+    }
     const candidatesRaw = await queueRes.json();
     if (!Array.isArray(candidatesRaw) || candidatesRaw.length === 0) {
       log(`🤖 Agent ${userEmail}: 0 candidatos (threshold=${aCfg.thresholdTraffic}, geos=${focus.geosPriority.join(",")||"all"}, cat=${focus.categoriesPriority.join(",")||"all"})`);
@@ -15091,6 +15545,10 @@ async function runAgentCycle(token, allFlags) {
               templateId = picked.templateId;
               pitch = fillTemplate(picked.template, {
                 domain, geo: leadGeo, traffic: leadTraffic, senderName,
+                // Estos dos existían en el lead y NUNCA llegaban al template: nadie
+                // recibía su nombre en el saludo ni una sola señal de su propio sitio.
+                contactName: lead.contact_name || "",
+                adNetworks:  Array.isArray(lead.ad_networks) ? lead.ad_networks : [],
               });
             }
           } catch (e) { log(`  ⚠️ pickAnyTemplate ${domain}: ${e.message}`); }
@@ -15100,6 +15558,8 @@ async function runAgentCycle(token, allFlags) {
             templateId = `baked_${(lead.language || "en").toLowerCase().slice(0,2)}_fallback`;
             pitch = fillTemplate(tpl, {
               domain, geo: leadGeo, traffic: leadTraffic, senderName,
+              contactName: lead.contact_name || "",
+              adNetworks:  Array.isArray(lead.ad_networks) ? lead.ad_networks : [],
             });
           }
           // Persistir templateId para que el send loggee qué se usó
@@ -15118,7 +15578,14 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // 4. Send Gmail PRIMERO — si falla, no toca Monday
-        const subject = pitch.subjects[0];
+        // Rotar el asunto en vez de usar siempre el primero. Cada template trae 3
+        // variantes y las otras 2 eran código muerto: cientos de mails salían con el
+        // asunto idéntico, que es una huella trivial de agrupar para Gmail. Se elige
+        // de forma determinista por dominio para que un reintento del MISMO lead no
+        // cambie de asunto a mitad de una conversación.
+        const _subjs = (pitch.subjects || []).filter(Boolean);
+        const _hashDom = [...domain].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+        const subject = _subjs.length ? _subjs[_hashDom % _subjs.length] : `Sobre ${domain}`;
 
         // BLOCKLIST GUARD (defense-in-depth) — admin pudo agregar el dominio
         // entre intake y send. Recheck antes de mandar.
@@ -15422,8 +15889,14 @@ async function runAgentCycle(token, allFlags) {
             r.score >= 40 && !isBouncedSync(r.email)
           );
           if (secondCandidate) {
+            // ⚠️ NO MANDAR EL MISMO MAIL DOS VECES AL MISMO DOMINIO EN EL MISMO MINUTO.
+            // Antes iban el mismo asunto y el mismo cuerpo, byte por byte, a dos personas
+            // de la misma empresa a la vez. Si se cruzan, se termina la poca credibilidad
+            // que quedaba, y encima duplica la huella de spam para Gmail. Ahora el 2do
+            // recibe una variante corta que reconoce explícitamente el doble contacto.
+            const _cuerpo2do = `${pitch.body}\n\n---\nPD: escribí también a ${email.split("@")[0]}@${domain} por las dudas — si no sos vos quien lleva esto, ignoralo sin problema.`;
             log(`  ➕ ${domain}: agente envía AL 2DO email ${secondCandidate.email} (score=${secondCandidate.score}, source=${secondCandidate.source})`);
-            await sendGmailServer(token, userEmail, { to: secondCandidate.email, subject, body: pitch.body, agentActionId: null });
+            await sendGmailServer(token, userEmail, { to: secondCandidate.email, subject, body: _cuerpo2do, agentActionId: null });
             // Registrar en response_tracking con source del 2do
             fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
               method: "POST",
@@ -15554,6 +16027,14 @@ async function runAgentCycle(token, allFlags) {
         if (/no_refresh_token|no_monday_api_key|oauth_refresh_failed/.test(err.message || "")) break;
       }
     }
+    // Latido del envío: cuánto mandó este slot contra lo que se propuso. Si el slot
+    // rinde menos de la mitad, el vigilante lo levanta el mismo día en vez de que lo
+    // descubramos en una auditoría dos semanas después.
+    await saludPing(token, "agente_envios", {
+      status: "ok", cadenciaMin: 240,
+      detalle: `${userEmail}: ${processed} de ${batchSize} en este slot (${sentToday + processed}/${userMaxPerDay} hoy)`,
+      real: processed, esperado: batchSize,
+    });
   }
 }
 
@@ -16158,6 +16639,353 @@ async function createNotificationWorker(token, payload) {
     });
     return res.ok;
   } catch { return false; }
+}
+
+// ════════════════════════════════════════════════════════════════
+// SALUD — REGLA DE ORO (Maxi 2026-08-11)
+// ════════════════════════════════════════════════════════════════
+// "Todo lo que armemos tiene que traer su alerta automática."
+//
+// El motivo: los 5 problemas grandes de la auditoría del 2026-08-11 eran TODOS
+// silenciosos. Ninguno tiró una excepción. El autopilot logueaba "fallback a
+// Majestic" como operación normal mientras llevaba semanas sin descubrir nada;
+// cuatro barridos se apagaban diciendo "pool completo" cuando en realidad la
+// query había fallado; el slot de las 20 no existía por la ventana horaria.
+//
+// Por eso acá se vigila LO QUE NO PASÓ, no solo lo que falló:
+//   · saludPing     — cada job estampa su latido y su rendimiento
+//   · saludAlerta   — aviso deduplicado (campanita + mail si es grave)
+//   · saludWatchdog — compara lo real contra lo esperado y grita
+// ════════════════════════════════════════════════════════════════
+
+// Día calendario en España (no UTC). Estaba repetido inline en 8 lugares.
+function _madridDateStr(d = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
+
+// ── Cadencia por RELOJ, no por iteraciones ───────────────────────────────────
+// `iterCount % 60` son 30 min de proceso ininterrumpido, pero el worker reinicia
+// cada ~7 min por el cap de memoria y CADA DEPLOY lo resetea a cero. Resultado: el
+// descongelador y otros 5 jobs casi nunca corrían. El bug ya estaba diagnosticado
+// en el código para `rescueFailedMondayPushes` (2026-07-17) y se arregló solo ahí.
+// Acá se arregla para todos, con la marca persistida en config.
+const _CADENCIA_MEM = new Map();
+async function _tocaCorrer(token, clave, minutos) {
+  const ahora = Date.now();
+  const ventana = minutos * 60 * 1000;
+  if (ahora - (_CADENCIA_MEM.get(clave) || 0) < ventana) return false;
+  const cfg = await getConfig(token).catch(() => null);
+  if (!cfg) return false;                              // no pude leer ≠ toca correr
+  const ultima = Date.parse(cfg[`cadencia_${clave}`] || "") || 0;
+  if (ahora - ultima < ventana) { _CADENCIA_MEM.set(clave, ultima); return false; }
+  _CADENCIA_MEM.set(clave, ahora);
+  await setConfigValue(token, `cadencia_${clave}`, new Date(ahora).toISOString()).catch(() => {});
+  return true;
+}
+
+// Throttle en memoria: evita escribir el latido en cada vuelta del loop (30s).
+// Se pierde en cada restart y no importa — el peor caso es una escritura de más.
+const _SALUD_ULTIMO_PING = new Map();   // job -> { ts, status }
+const SALUD_PING_THROTTLE_MS = 60 * 1000;
+
+/**
+ * Estampa el latido de un job.
+ * @param job            nombre estable (se usa como PK)
+ * @param status         "ok" | "fail" | "skipped"
+ * @param detalle        texto corto para el humano
+ * @param cadenciaMin    cada cuántos minutos DEBERÍA correr (null = no se vigila el latido)
+ * @param real/esperado  rendimiento medido vs. deseado (opcionales)
+ */
+async function saludPing(token, job, { status = "ok", detalle = "", cadenciaMin = null, real = null, esperado = null } = {}) {
+  try {
+    // Un "ok" repetido se puede saltear; un fallo o un cambio de estado SIEMPRE se escribe.
+    const prev = _SALUD_ULTIMO_PING.get(job);
+    const mismoEstado = prev && prev.status === status;
+    if (status === "ok" && mismoEstado && Date.now() - prev.ts < SALUD_PING_THROTTLE_MS) return;
+    _SALUD_ULTIMO_PING.set(job, { ts: Date.now(), status });
+
+    const ahora = new Date().toISOString();
+    const fila = {
+      job,
+      last_run_at: ahora,
+      last_status: status,
+      last_detail: (detalle || "").slice(0, 300),
+      updated_at: ahora,
+    };
+    if (cadenciaMin != null) fila.esperado_cada_min = cadenciaMin;
+    if (real     != null)    fila.real_ultimo     = real;
+    if (esperado != null)    fila.esperado_ultimo = esperado;
+
+    if (status === "ok") {
+      fila.last_ok_at = ahora;
+      fila.fails_consecutivos = 0;
+    } else if (status === "fail") {
+      // Solo acá pagamos una lectura extra: los fallos son raros.
+      let previos = 0;
+      try {
+        const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_health?job=eq.${encodeURIComponent(job)}&select=fails_consecutivos`, {
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+        });
+        if (r.ok) { const j = await r.json(); previos = (Array.isArray(j) && j[0]?.fails_consecutivos) || 0; }
+      } catch {}
+      fila.fails_consecutivos = previos + 1;
+    }
+
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_health`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(fila),
+    });
+  } catch { /* la salud nunca puede romper al job que vigila */ }
+}
+
+/**
+ * Aviso deduplicado. Va a la campanita del popup; si es grave, además por mail.
+ * Regla anti-ruido: un aviso por clave por día. Una alerta que suena todos los
+ * días se ignora a la semana (por eso Maxi borró los scanners viejos en 06-18).
+ */
+async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning", metadata = {} }) {
+  const hoy = _madridDateStr();
+  try {
+    await createNotificationWorker(token, {
+      mb_email: "_admin",
+      type: "system_failure",
+      severity: severidad,
+      title: titulo,
+      body: cuerpo,
+      metadata,
+      dedup_key: `salud-${clave}-${hoy}`,
+    });
+    log(`🚨 SALUD [${severidad}] ${titulo} — ${cuerpo}`);
+    if (severidad === "error") {
+      const cfg = await getConfig(token).catch(() => ({}));
+      await _secAvisar(token, cfg, {
+        titulo,
+        cuerpo: `${cuerpo}\n\nRevisá el detalle con:\n  SELECT * FROM toolbar_health_check ORDER BY estado, job;`,
+        kind: `salud_${clave}`,
+      }).catch(() => {});
+    }
+  } catch (e) { log(`⚠️ saludAlerta: ${e.message}`); }
+}
+
+// Cada cuánto corre el vigilante (minutos de reloj, NO iteraciones del loop:
+// iterCount se resetea en cada restart y por eso los jobs con `% 60` no corrían).
+const SALUD_WATCHDOG_CADA_MIN = 15;
+
+/**
+ * El vigilante. Compara lo real contra lo esperado y avisa.
+ * Corre temprano en el loop, ANTES de la cadena de mantenimiento, para que no
+ * se lo coma el reinicio de los 7 minutos: un detector que vive dentro de lo
+ * que vigila se muere con lo que vigila.
+ */
+async function saludWatchdog(token) {
+  try {
+    const cfg = await getConfig(token).catch(() => ({}));
+    const ultima = Date.parse(cfg.salud_watchdog_at || "") || 0;
+    if (Date.now() - ultima < SALUD_WATCHDOG_CADA_MIN * 60 * 1000) return;
+    await setConfigValue(token, "salud_watchdog_at", new Date().toISOString()).catch(() => {});
+
+    // ── 1. Latido: ¿hay algo que hace demasiado que no corre? ──────────────
+    let filas = [];
+    let leyoOk = false;
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_health?select=*`, {
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      });
+      if (r.ok) { filas = await r.json(); leyoOk = Array.isArray(filas); }
+    } catch {}
+    if (!leyoOk) return;   // no pudimos leer ≠ todo sano. Nunca alertamos a ciegas.
+
+    const atrasados = [], rindenPoco = [], fallando = [];
+    for (const f of filas) {
+      const cad = f.esperado_cada_min;
+      const okTs = Date.parse(f.last_ok_at || "") || 0;
+      if (cad && (!okTs || Date.now() - okTs > cad * 3 * 60 * 1000)) {
+        const hace = okTs ? Math.round((Date.now() - okTs) / 60000) : null;
+        atrasados.push(`${f.job} (${hace == null ? "nunca corrió" : `hace ${hace} min, esperado cada ${cad}`})`);
+      }
+      if ((f.fails_consecutivos || 0) >= 3) fallando.push(`${f.job} (${f.fails_consecutivos} fallos seguidos: ${f.last_detail || "sin detalle"})`);
+      if (f.esperado_ultimo != null && f.real_ultimo != null && Number(f.real_ultimo) < Number(f.esperado_ultimo) * 0.5) {
+        rindenPoco.push(`${f.job} (${f.real_ultimo} de ${f.esperado_ultimo} esperados)`);
+      }
+    }
+    if (atrasados.length) {
+      await saludAlerta(token, {
+        clave: "jobs-atrasados", severidad: "error",
+        titulo: `⏰ ${atrasados.length} trabajo(s) sin correr`,
+        cuerpo: atrasados.join("\n"), metadata: { jobs: atrasados },
+      });
+    }
+    if (fallando.length) {
+      await saludAlerta(token, {
+        clave: "jobs-fallando", severidad: "error",
+        titulo: `💥 ${fallando.length} trabajo(s) fallando`,
+        cuerpo: fallando.join("\n"), metadata: { jobs: fallando },
+      });
+    }
+    if (rindenPoco.length) {
+      await saludAlerta(token, {
+        clave: "jobs-rinden-poco", severidad: "warning",
+        titulo: `📉 ${rindenPoco.length} trabajo(s) rindiendo por debajo`,
+        cuerpo: rindenPoco.join("\n"), metadata: { jobs: rindenPoco },
+      });
+    }
+
+    // ── 2. El KPI del negocio: ¿salieron los 20 por MB? ────────────────────
+    // Se evalúa recién a las 19h Madrid: antes de eso "van 8" es normal.
+    if (_spainHour() >= 19 && !_isWeekendSpain()) {
+      const objetivo = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
+      let users = [];
+      try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+      const flojos = [];
+      for (const u of users) {
+        const n = await getAgentDailyCount(token, u).catch(() => null);
+        if (n == null) continue;                       // no pudimos medir ≠ no mandó
+        if (n < objetivo) flojos.push(`${u}: ${n} de ${objetivo}`);
+      }
+      if (flojos.length) {
+        await saludAlerta(token, {
+          clave: "envios-incompletos", severidad: "error",
+          titulo: `📮 El agente no llegó a los ${objetivo} envíos`,
+          cuerpo: `${flojos.join("\n")}\n\nMirá qué lo frenó:\n  SELECT reason, count(*) FROM toolbar_agent_actions\n   WHERE action='skipped' AND created_at::date = CURRENT_DATE GROUP BY 1 ORDER BY 2 DESC;`,
+          metadata: { objetivo, detalle: flojos },
+        });
+      }
+    }
+
+    // ── 3. ¿Queda pool para mañana? ────────────────────────────────────────
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=not.eq.%5B%5D&select=id&limit=1`, {
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
+      });
+      if (!r.ok) await saludPing(token, "pool_listos", { status: "fail", detalle: `la consulta falló: HTTP ${r.status}` });
+      if (r.ok) {
+        const listos = parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
+        const piso = parseInt(cfg.salud_pool_minimo || "120", 10) || 120;
+        await saludPing(token, "pool_listos", { status: "ok", detalle: `${listos} leads con email`, real: listos, esperado: piso });
+        if (listos < piso) {
+          await saludAlerta(token, {
+            clave: "pool-bajo", severidad: "error",
+            titulo: `🪫 Quedan ${listos} prospects con email`,
+            cuerpo: `Piso deseado: ${piso}. A ${objetivoDiarioTotal(cfg)} envíos por día eso alcanza para ~${Math.floor(listos / Math.max(1, objetivoDiarioTotal(cfg)))} días. El descubrimiento no está reponiendo.`,
+            metadata: { listos, piso },
+          });
+        }
+      }
+    } catch {}
+
+    await saludPing(token, "salud_watchdog", { status: "ok", detalle: `${filas.length} jobs vigilados`, cadenciaMin: SALUD_WATCHDOG_CADA_MIN });
+  } catch (e) { log(`⚠️ saludWatchdog: ${e.message}`); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// AUTO-PULIDO — los barridos se re-prenden solos (Maxi 2026-08-11)
+// ════════════════════════════════════════════════════════════════
+// Pedido textual: "que automáticamente cada 10 días se haga un auto-análisis para
+// borrar lo que no va, y otro para conseguir mails en los sin mails, que sea
+// automático y no yo que lo tenga que estar pidiendo".
+//
+// Los tres barridos ya tenían cursor y auto-apagado; lo único que faltaba era que
+// alguien los volviera a encender. Se escalonan para no correr los tres juntos y
+// comerse el presupuesto de 7 minutos del proceso.
+const BARRIDOS_AUTO = [
+  // clave de flag              marca de fin                cursor              días  desfase
+  { flag: "url_purge_enabled",        fin: "url_purge_last_done",      cursor: "url_purge_cursor",        dias: 10, offset: 0 },
+  { flag: "polish_pool",              fin: "polish_last_done",         cursor: "polish_cursor_ts",        dias: 10, offset: 3 },
+  { flag: "purge_blocked_prospects",  fin: "purge_blocked_last_done",  cursor: "purge_cursor_ts",         dias: 10, offset: 6 },
+];
+
+async function maybeReprenderBarridos(token) {
+  try {
+    if (!(await _tocaCorrer(token, "reprender_barridos", 60))) return;
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    const ahora = Date.now();
+    for (const b of BARRIDOS_AUTO) {
+      if (String(cfg[b.flag] || "") === "true") continue;          // ya está corriendo
+      const fin = Date.parse(cfg[b.fin] || "") || 0;
+      // Si nunca terminó uno, se siembra la marca para que el desfase valga desde hoy
+      // y no arranquen los tres a la vez en el primer boot con el código nuevo.
+      if (!fin) {
+        await setConfigValue(token, b.fin, new Date(ahora - (b.dias - b.offset) * 86400000).toISOString()).catch(() => {});
+        continue;
+      }
+      if (ahora - fin < b.dias * 86400000) continue;
+      await setConfigValue(token, b.cursor, "").catch(() => {});   // desde el principio
+      await setConfigValue(token, b.flag, "true").catch(() => {});
+      const dias = Math.round((ahora - fin) / 86400000);
+      log(`🔁 auto-pulido: re-encendido ${b.flag} (último barrido hace ${dias} días)`);
+      await saludAlerta(token, {
+        clave: `barrido-${b.flag}`, severidad: "info",
+        titulo: `🔁 Repaso automático del pool`,
+        cuerpo: `Se volvió a encender ${b.flag} — el último barrido completo fue hace ${dias} días.`,
+        metadata: { flag: b.flag, dias },
+      });
+    }
+    await saludPing(token, "auto_pulido", { status: "ok", cadenciaMin: 60, detalle: "barridos revisados" });
+  } catch (e) { log(`⚠️ maybeReprenderBarridos: ${e.message}`); }
+}
+
+// ── Caza continua de emails ──────────────────────────────────────────────────
+// El otro auto-análisis que pidió Maxi: "conseguir mails en los sin mails, que
+// sea automático". Cada 3 días revisa si quedan leads pending sin email que no se
+// intentaron nunca o hace más de una semana, y en ese caso enciende el repaso en
+// modo "solo sin email". Reusa todo el motor de polishPool.
+const CAZA_EMAILS_CADA_DIAS   = 3;
+const CAZA_EMAILS_REINTENTO_D = 7;   // no re-machacar el mismo dominio antes de una semana
+
+async function maybeCazaEmails(token) {
+  try {
+    if (!(await _tocaCorrer(token, "caza_emails", CAZA_EMAILS_CADA_DIAS * 24 * 60))) return;
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    if (String(cfg.polish_pool || "") === "true") return;   // ya hay un barrido en curso
+
+    const corte = new Date(Date.now() - CAZA_EMAILS_REINTENTO_D * 86400000).toISOString();
+    let cuantos = 0;
+    try {
+      const r = await fetch(
+        // OJO: dos parámetros `or=` sueltos se pisan entre sí en PostgREST.
+        // Hay que anidarlos dentro de un `and=(...)`.
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&and=(or(emails.is.null,emails.eq.%5B%5D),or(email_ultimo_intento.is.null,email_ultimo_intento.lt.${encodeURIComponent(corte)}))&select=id&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+      );
+      if (!r.ok) {                                           // no pude medir ≠ no hay nada
+        await saludPing(token, "caza_emails", { status: "fail", detalle: `la consulta falló: HTTP ${r.status}` });
+        return;
+      }
+      cuantos = parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
+    } catch { return; }
+
+    await saludPing(token, "caza_emails", {
+      status: "ok", cadenciaMin: CAZA_EMAILS_CADA_DIAS * 24 * 60,
+      detalle: `${cuantos} leads sin email para reintentar`, real: cuantos,
+    });
+    if (cuantos === 0) return;
+
+    await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
+    await setConfigValue(token, "polish_only_missing", "true").catch(() => {});
+    await setConfigValue(token, "polish_pool", "true").catch(() => {});
+    log(`🕵️ caza de emails: ${cuantos} leads sin contacto → repaso encendido en modo solo-sin-email`);
+    await saludAlerta(token, {
+      clave: "caza-emails", severidad: "info",
+      titulo: `🕵️ Caza de emails automática`,
+      cuerpo: `Arrancó el repaso sobre ${cuantos} leads sin contacto (no se intentaban desde hace ${CAZA_EMAILS_REINTENTO_D}+ días).`,
+      metadata: { cuantos },
+    });
+  } catch (e) { log(`⚠️ maybeCazaEmails: ${e.message}`); }
+}
+
+// Envíos/día sumando todos los MB activos — para calcular cuántos días aguanta el pool.
+function objetivoDiarioTotal(cfg) {
+  let users = [];
+  try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+  const porMb = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
+  return Math.max(1, users.length * porMb);
 }
 
 // Devuelve los últimos N días hábiles (excluye sáb/dom) como array de YYYY-MM-DD.
@@ -16843,7 +17671,11 @@ async function main() {
     try {
       const ghCfg = await getConfig(token);
       const ghStart = parseInt(ghCfg.active_hours_start || "9", 10);
-      const ghEnd   = parseInt(ghCfg.active_hours_end   || "23", 10);
+      // El gate global hace `continue` de TODA la iteración, así que si cierra a las 20
+      // el 5º slot del agente muere antes de que nadie lo mire. La ventana global nunca
+      // puede cerrar antes que el último slot de envío. (Maxi 2026-08-11)
+      const _ghEndCfg = parseInt(ghCfg.active_hours_end || "23", 10);
+      const ghEnd = Math.max(Number.isFinite(_ghEndCfg) ? _ghEndCfg : 23, AGENT_SLOTS[AGENT_SLOTS.length - 1] + 1);
       // Manual override del admin: si flag manual_override_until > now, bypass horario.
       // Permite encender autopilot/queue fuera de 9-23 L-V cuando admin lo necesita.
       // Expira solo (2h default) para que no quede prendido olvidado todo el finde.
@@ -16872,10 +17704,10 @@ async function main() {
     } catch {}
 
 
-    // ── Re-engagement cada 60 iters (~25min) — INACTIVE por default ──
+    // ── Re-engagement cada 25 min de RELOJ — INACTIVE por default ──
     // Solo corre si toolbar_config.agent_reengagement_enabled='true'.
     // Sin esto la función early-returns sin tocar nada.
-    if (iterCount % 60 === 0) {
+    if (await _tocaCorrer(token, "reengagement", 25)) {
       runReengagementCycle(token).catch(e => log(`⚠️ reengagement: ${e.message}`));
       // Cola MANUAL de Email Futuro (toolbar_reengagement_queue) — se procesa
       // siempre que esté el flag general activo (mismo gate que el otro).
@@ -16897,9 +17729,12 @@ async function main() {
     // depender de que el worker sobreviva N iteraciones sin deploys.
     rescueFailedMondayPushes(token).catch(e => log(`⚠️ rescate monday: ${e.message}`));
 
-    // ── Unfreezer cada 60 iters (~25min) ──
-    // Mueve toolbar_frozen_leads.frozen_until ≤ now() de vuelta a csv_queue.pending
-    if (iterCount % 60 === 0) {
+    // ── Unfreezer cada 15 min de RELOJ ──
+    // Mueve toolbar_frozen_leads.frozen_until ≤ now() de vuelta a csv_queue.pending.
+    // Es lo ÚNICO que devuelve al pool los leads congelados: cuando dependía de
+    // `iterCount % 60` no corría casi nunca, y por eso `no_email_3_attempts` era una
+    // condena perpetua. Ahí estaban estancados los ~310 leads sin email.
+    if (await _tocaCorrer(token, "unfreezer", 15)) {
       try {
         const now = new Date().toISOString();
         const res = await fetch(
@@ -16935,14 +17770,21 @@ async function main() {
           }
           log(`🧊 Unfreezer: ${rows.length} leads liberados de frozen → re-encolados en csv_queue`);
         }
-      } catch (e) { log(`⚠️ unfreezer: ${e.message}`); }
+        await saludPing(token, "unfreezer", {
+          status: "ok", cadenciaMin: 15,
+          detalle: Array.isArray(rows) ? `${rows.length} liberados` : "sin filas vencidas",
+        });
+      } catch (e) {
+        await saludPing(token, "unfreezer", { status: "fail", cadenciaMin: 15, detalle: e.message });
+        log(`⚠️ unfreezer: ${e.message}`);
+      }
     }
 
     // ── Cleanup periódico cada 30 iters ──
     // Maxi 2026-06-18: ampliado para incluir leads con traffic=0 / NULL después
     // de 48hs (les damos chance de que el refresh los enriquezca). Excluye
     // monday_refresh (re-prospect explícito del MB, se procesan igual).
-    if (iterCount % 30 === 0) {
+    if (await _tocaCorrer(token, "cleanup_pool", 15)) {
       try {
         // Reset -1 → 0 (re-eligible for refresh)
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=eq.-1`, {
@@ -17029,6 +17871,18 @@ async function main() {
           process.exit(1); // exit code 1 = Railway interpreta como crash y reinicia automático
         }
       } catch {}
+
+      // ── VIGILANTE DE SALUD — va PRIMERO, a propósito ──────────────────────
+      // La cadena de mantenimiento de abajo puede comerse 3-4 de los 7 minutos
+      // que vive el proceso. Un detector que corre al final se muere junto con lo
+      // que vigila y nunca avisa de nada. Tiene su propio guard de 15 min, así que
+      // llamarlo en cada vuelta sale en microsegundos.
+      await saludWatchdog(token).catch(e => log(`⚠️ saludWatchdog: ${e.message}`));
+
+      // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
+      await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
+      // Caza de emails: cada 3 días vuelve sobre los leads sin contacto.
+      await maybeCazaEmails(token).catch(e => log(`⚠️ cazaEmails: ${e.message}`));
 
       // Promueve items waiting_pool → pending si hay espacio en review_queue.
       // Cada loop iteration lo intenta — items "preparados" por MBs entran

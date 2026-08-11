@@ -1,186 +1,254 @@
 // ============================================================
 // ADEQ Toolbar Agent — Templates de outreach por idioma
-// Los 3 borradores fijos (validados con el user 2026-07-08).
-// El agente los manda 33/33/33 (reparto parejo, pickAnyTemplate uniforme).
+// REESCRITOS 2026-08-11 tras la auditoría de "por qué nadie contesta".
 //
-// Cada template:
-//  - Placeholders {{domain}} {{traffic}} {{geo}} {{sender_name}}.
-//  - SIN signature/closing formal (Gmail aplica firma default).
-//  - MISMO contenido que los defaults de toolbar_pitch_drafts (Analysis) —
-//    ver sql/seed_default_drafts.sql. Mantener ambos sincronizados.
+// Qué estaba mal en los anteriores (3 textos por idioma, ~200 envíos/semana,
+// CERO respuestas reales más allá de algún fuera-de-oficina):
 //
-//   B1: identificar al encargado de los anuncios ("¿este es el correo de...?")
-//   B2: campañas de video (in-stream/out-stream) + pedir contacto/whatsapp
-//   B3: campañas de display y video + pedir contacto del encargado
+//  1. Los tres PEDÍAN UN FAVOR y no ofrecían nada. Dos de los tres pedían
+//     "pasame el contacto del encargado" — y el ranking de emails (rankEmail +
+//     _pickTier, ~250 líneas) está construido justamente para llegar AL encargado.
+//     Al target ideal se le pedía el contacto de sí mismo. Cuanto mejor funcionaba
+//     el ranking, más absurdo llegaba el mensaje.
+//  2. Personalización real = el dominio, y solo en 1 de 3 textos. {{geo}},
+//     {{traffic}} y {{sender_name}} estaban implementados y NO SE USABAN en ninguno.
+//  3. No decían qué es ADEQ Media, así que desde el otro lado era indistinguible
+//     de un arbitrajista. Un publisher no deja entrar a nadie a su ads.txt a ciegas.
+//  4. Sin nombre humano y sin despedida: se delegaba todo a la firma de Gmail.
+//
+// Reglas del copy nuevo:
+//  - Saludar por nombre cuando lo tenemos ({{saludo}} resuelve solo).
+//  - Nombrar UNA señal concreta del sitio (su ad stack o su tráfico) para que se
+//    note que alguien lo miró. Si no la tenemos, la frase desaparece sola.
+//  - Decir qué somos en una línea y ofrecer verificación (sellers.json), que es
+//    como se genera confianza en programática.
+//  - Pedir UNA cosa concreta y chica, no un favor administrativo.
+//  - Firmar con nombre. La firma de Gmail se sigue agregando abajo.
+//  - Sin CPMs ni casos inventados: eso lo carga Maxi cuando lo defina.
+//
+// Placeholders disponibles: {{domain}} {{traffic}} {{geo}} {{sender_name}}
+//                           {{saludo}} {{senal}}
+// Los que quedan vacíos se limpian solos en fillTemplate (incluida la línea entera
+// si queda huérfana), así que ningún mail sale con un hueco raro.
 // ============================================================
 const TEMPLATES = {
   // ── ESPAÑOL ────────────────────────────────────────────────
   es: [
     {
-      subjects: ["Publicidad en {{domain}} - ADEQ", "¿Quién maneja los anuncios? - ADEQ", "Contacto de publicidad - ADEQ"],
-      body: `Hola!
+      subjects: ["Inventario de {{domain}}", "Consulta sobre {{domain}}", "{{domain}} — display y video"],
+      body: `{{saludo}}
 
-Este es el correo de quien maneja los anuncios de la web de {{domain}}?
+Soy {{sender_name}}, de ADEQ Media. Compramos inventario de display y video para anunciantes, y trabajamos directo con publishers.
 
-Soy del área de ventas de ADEQ Media, y me quería poner en contacto con la persona encargada para ofrecerles unas campañas que nos gustaría monetizar con ustedes.
+{{senal}}Nos interesa sumar a {{domain}} como partner.
 
-Cualquier cosa avisame.`,
+Podés verificarnos en nuestro sellers.json antes de cualquier cosa. Si te sirve, te paso los formatos que estamos comprando y los volúmenes para tu mercado, y vemos si tiene sentido.
+
+¿Te va bien que te escriba con eso?
+
+{{sender_name}}`,
     },
     {
-      subjects: ["Campañas de video activas - ADEQ", "Video para {{domain}} - ADEQ", "Campañas de video - ADEQ"],
-      body: `Hola, te escribo de ADEQ Media. Tenemos campañas de video activas (in-stream y out-stream) que están funcionando muy bien en websites como el tuyo.
+      subjects: ["Video para {{domain}}", "Presupuesto de video — {{domain}}", "{{domain}}: in-stream y out-stream"],
+      body: `{{saludo}}
 
-¿Me podrían pasar el whatsapp o contacto de la persona que se encarga de manejar las implementaciones o monetización?
+Te escribo de ADEQ Media. Tenemos presupuesto de video (in-stream y out-stream) sin colocar para {{geo}} este trimestre.
 
-Muchas gracias, espero el dato para escribirles.
+{{senal}}Por el perfil de {{domain}}, entra en lo que estamos buscando.
 
-Saludos.`,
+No te pido que hagas nada todavía: si me decís que sí, te mando los formatos y el volumen estimado y lo mirás con calma.
+
+{{sender_name}}
+ADEQ Media`,
     },
     {
-      subjects: ["Campañas de display y video - ADEQ", "Contacto del encargado - ADEQ", "Display y video para {{domain}} - ADEQ"],
-      body: `Buen día.
+      subjects: ["{{domain}} — 15 minutos", "Propuesta para {{domain}}", "Monetización de {{domain}}"],
+      body: `{{saludo}}
 
-¿Me podrían pasar el contacto del encargado del website?
+{{sender_name}} de ADEQ Media. Trabajamos con publishers de {{geo}} conectando su inventario con anunciantes, en display y video.
 
-Es para poder conversar sobre unas campañas de display y video, que nos interesaría poder incluirlas en su sitio web.
+{{senal}}Me gustaría proponerte una prueba chica en {{domain}}: un formato, un mes, y medimos.
 
-Gracias`,
+Si te interesa, contestame y coordinamos 15 minutos esta semana o la que viene.
+
+Gracias,
+{{sender_name}}`,
     },
   ],
 
   // ── INGLÉS ─────────────────────────────────────────────────
   en: [
     {
-      subjects: ["Advertising on {{domain}} - ADEQ", "Who handles the ads? - ADEQ", "Advertising contact - ADEQ"],
-      body: `Hi!
+      subjects: ["{{domain}} inventory", "Question about {{domain}}", "{{domain}} — display and video"],
+      body: `{{saludo}}
 
-Is this the email of the person who handles advertising on {{domain}}?
+I'm {{sender_name}}, from ADEQ Media. We buy display and video inventory for advertisers and work directly with publishers.
 
-I'm from the sales team at ADEQ Media, and I wanted to get in touch with the person in charge to offer you some campaigns we'd love to monetize with you.
+{{senal}}We'd like to add {{domain}} as a partner.
 
-Let me know.`,
+You can verify us in our sellers.json before anything else. If it's useful, I'll send over the formats we're buying and the volumes for your market, and we can see if it makes sense.
+
+Would that be alright?
+
+{{sender_name}}`,
     },
     {
-      subjects: ["Active video campaigns - ADEQ", "Video for {{domain}} - ADEQ", "Video campaigns - ADEQ"],
-      body: `Hi, I'm reaching out from ADEQ Media. We have active video campaigns (in-stream and out-stream) that are performing really well on sites like yours.
+      subjects: ["Video budget for {{domain}}", "{{domain}}: in-stream and out-stream", "Video campaigns — {{domain}}"],
+      body: `{{saludo}}
 
-Could you pass me the WhatsApp or contact of the person who handles implementations or monetization?
+I'm writing from ADEQ Media. We have unplaced video budget (in-stream and out-stream) for {{geo}} this quarter.
 
-Thanks a lot, I'll wait for the details to get in touch.
+{{senal}}Given the profile of {{domain}}, it fits what we're looking for.
 
-Best.`,
+I'm not asking you to do anything yet: if you say yes, I'll send the formats and estimated volume and you can look at it whenever.
+
+{{sender_name}}
+ADEQ Media`,
     },
     {
-      subjects: ["Display and video campaigns - ADEQ", "Site manager contact - ADEQ", "Display & video for {{domain}} - ADEQ"],
-      body: `Good morning.
+      subjects: ["{{domain}} — 15 minutes", "A proposal for {{domain}}", "Monetizing {{domain}}"],
+      body: `{{saludo}}
 
-Could you pass me the contact of the person in charge of the website?
+{{sender_name}} here, from ADEQ Media. We work with publishers in {{geo}}, connecting their inventory to advertisers across display and video.
 
-It's to discuss some display and video campaigns that we'd be interested in including on your site.
+{{senal}}I'd like to propose a small test on {{domain}}: one format, one month, and we measure.
 
-Thanks`,
+If that's interesting, reply and we'll find 15 minutes this week or next.
+
+Thanks,
+{{sender_name}}`,
     },
   ],
 
   // ── PORTUGUÉS ──────────────────────────────────────────────
   pt: [
     {
-      subjects: ["Publicidade em {{domain}} - ADEQ", "Quem cuida dos anúncios? - ADEQ", "Contato de publicidade - ADEQ"],
-      body: `Olá!
+      subjects: ["Inventário de {{domain}}", "Sobre {{domain}}", "{{domain}} — display e vídeo"],
+      body: `{{saludo}}
 
-Este é o email de quem cuida da publicidade do site {{domain}}?
+Sou {{sender_name}}, da ADEQ Media. Compramos inventário de display e vídeo para anunciantes e trabalhamos direto com publishers.
 
-Sou da área de vendas da ADEQ Media, e queria entrar em contato com a pessoa responsável para oferecer algumas campanhas que gostaríamos de monetizar com vocês.
+{{senal}}Temos interesse em somar {{domain}} como parceiro.
 
-Qualquer coisa, me avisa.`,
+Você pode nos verificar no nosso sellers.json antes de qualquer coisa. Se for útil, mando os formatos que estamos comprando e os volumes para o seu mercado, e vemos se faz sentido.
+
+Posso te escrever com isso?
+
+{{sender_name}}`,
     },
     {
-      subjects: ["Campanhas de vídeo ativas - ADEQ", "Vídeo para {{domain}} - ADEQ", "Campanhas de vídeo - ADEQ"],
-      body: `Olá, escrevo da ADEQ Media. Temos campanhas de vídeo ativas (in-stream e out-stream) que estão funcionando muito bem em sites como o seu.
+      subjects: ["Vídeo para {{domain}}", "Verba de vídeo — {{domain}}", "{{domain}}: in-stream e out-stream"],
+      body: `{{saludo}}
 
-Poderiam me passar o WhatsApp ou contato da pessoa que cuida das implementações ou monetização?
+Escrevo da ADEQ Media. Temos verba de vídeo (in-stream e out-stream) sem alocar para {{geo}} neste trimestre.
 
-Muito obrigado, aguardo o dado para entrar em contato.
+{{senal}}Pelo perfil de {{domain}}, entra no que estamos buscando.
 
-Abraços.`,
+Não peço nada ainda: se você disser que sim, mando os formatos e o volume estimado e você olha com calma.
+
+{{sender_name}}
+ADEQ Media`,
     },
     {
-      subjects: ["Campanhas de display e vídeo - ADEQ", "Contato do responsável - ADEQ", "Display e vídeo para {{domain}} - ADEQ"],
-      body: `Bom dia.
+      subjects: ["{{domain}} — 15 minutos", "Proposta para {{domain}}", "Monetização de {{domain}}"],
+      body: `{{saludo}}
 
-Poderiam me passar o contato do responsável pelo site?
+{{sender_name}}, da ADEQ Media. Trabalhamos com publishers de {{geo}} conectando o inventário deles a anunciantes, em display e vídeo.
 
-É para conversar sobre algumas campanhas de display e vídeo que teríamos interesse em incluir no seu site.
+{{senal}}Gostaria de propor um teste pequeno em {{domain}}: um formato, um mês, e medimos.
 
-Obrigado`,
+Se tiver interesse, responda e marcamos 15 minutos esta semana ou na próxima.
+
+Obrigado,
+{{sender_name}}`,
     },
   ],
 
   // ── ITALIANO ───────────────────────────────────────────────
   it: [
     {
-      subjects: ["Pubblicità su {{domain}} - ADEQ", "Chi gestisce gli annunci? - ADEQ", "Contatto pubblicità - ADEQ"],
-      body: `Ciao!
+      subjects: ["Inventory di {{domain}}", "Una domanda su {{domain}}", "{{domain}} — display e video"],
+      body: `{{saludo}}
 
-È questa l'email di chi gestisce la pubblicità del sito {{domain}}?
+Sono {{sender_name}}, di ADEQ Media. Compriamo inventory display e video per gli inserzionisti e lavoriamo direttamente con i publisher.
 
-Sono dell'area vendite di ADEQ Media, e volevo mettermi in contatto con la persona responsabile per proporvi alcune campagne che ci piacerebbe monetizzare con voi.
+{{senal}}Ci interesserebbe aggiungere {{domain}} tra i nostri partner.
 
-Fammi sapere.`,
+Puoi verificarci nel nostro sellers.json prima di qualsiasi cosa. Se ti è utile, ti mando i formati che stiamo comprando e i volumi per il tuo mercato, e vediamo se ha senso.
+
+Ti va se ti scrivo con quei dati?
+
+{{sender_name}}`,
     },
     {
-      subjects: ["Campagne video attive - ADEQ", "Video per {{domain}} - ADEQ", "Campagne video - ADEQ"],
-      body: `Ciao, ti scrivo da ADEQ Media. Abbiamo campagne video attive (in-stream e out-stream) che stanno funzionando molto bene su siti come il tuo.
+      subjects: ["Budget video per {{domain}}", "{{domain}}: in-stream e out-stream", "Campagne video — {{domain}}"],
+      body: `{{saludo}}
 
-Potresti passarmi il WhatsApp o il contatto della persona che si occupa delle implementazioni o della monetizzazione?
+Ti scrivo da ADEQ Media. Abbiamo budget video (in-stream e out-stream) non ancora allocato per {{geo}} in questo trimestre.
 
-Grazie mille, aspetto il contatto per scrivervi.
+{{senal}}Per il profilo di {{domain}}, rientra in quello che stiamo cercando.
 
-Saluti.`,
+Non ti chiedo niente per ora: se mi dici di sì, ti mando i formati e il volume stimato e lo guardi con calma.
+
+{{sender_name}}
+ADEQ Media`,
     },
     {
-      subjects: ["Campagne display e video - ADEQ", "Contatto del responsabile - ADEQ", "Display e video per {{domain}} - ADEQ"],
-      body: `Buongiorno.
+      subjects: ["{{domain}} — 15 minuti", "Una proposta per {{domain}}", "Monetizzazione di {{domain}}"],
+      body: `{{saludo}}
 
-Potreste passarmi il contatto del responsabile del sito?
+{{sender_name}} di ADEQ Media. Lavoriamo con publisher in {{geo}}, collegando il loro inventory agli inserzionisti, su display e video.
 
-È per parlare di alcune campagne display e video che ci interesserebbe includere sul vostro sito.
+{{senal}}Vorrei proporti un test piccolo su {{domain}}: un formato, un mese, e misuriamo.
 
-Grazie`,
+Se ti interessa, rispondimi e troviamo 15 minuti questa settimana o la prossima.
+
+Grazie,
+{{sender_name}}`,
     },
   ],
 
   // ── ÁRABE ──────────────────────────────────────────────────
   ar: [
     {
-      subjects: ["الإعلانات على {{domain}} - ADEQ", "من يدير الإعلانات؟ - ADEQ", "جهة اتصال الإعلانات - ADEQ"],
-      body: `مرحباً!
+      subjects: ["مساحات {{domain}} الإعلانية", "استفسار بخصوص {{domain}}", "{{domain}} — العرض والفيديو"],
+      body: `{{saludo}}
 
-هل هذا هو بريد الشخص المسؤول عن الإعلانات في موقع {{domain}}؟
+أنا {{sender_name}} من ADEQ Media. نشتري مساحات إعلانية للعرض والفيديو لصالح المعلنين، ونعمل مباشرة مع الناشرين.
 
-أنا من قسم المبيعات في ADEQ Media، وأردت التواصل مع الشخص المسؤول لأعرض عليكم بعض الحملات التي يسعدنا تحقيق الدخل منها معكم.
+{{senal}}يهمنا إضافة {{domain}} كشريك.
 
-في انتظار ردك.`,
+يمكنك التحقق منا عبر ملف sellers.json الخاص بنا قبل أي شيء. وإذا كان مفيداً، أرسل لك الصيغ التي نشتريها والأحجام المتاحة لسوقك، ونرى إن كان الأمر مناسباً.
+
+هل يناسبك أن أرسل لك هذه التفاصيل؟
+
+{{sender_name}}`,
     },
     {
-      subjects: ["حملات فيديو نشطة - ADEQ", "فيديو لـ {{domain}} - ADEQ", "حملات فيديو - ADEQ"],
-      body: `مرحباً، أكتب إليك من ADEQ Media. لدينا حملات فيديو نشطة (in-stream و out-stream) تحقق نتائج ممتازة على مواقع مثل موقعك.
+      subjects: ["ميزانية فيديو لموقع {{domain}}", "{{domain}}: in-stream و out-stream", "حملات فيديو — {{domain}}"],
+      body: `{{saludo}}
 
-هل يمكنكم تزويدي برقم واتساب أو بيانات التواصل مع الشخص المسؤول عن التنفيذ أو تحقيق الدخل؟
+أكتب إليك من ADEQ Media. لدينا ميزانية فيديو (in-stream و out-stream) غير مخصصة بعد لمنطقة {{geo}} هذا الربع.
 
-شكراً جزيلاً، بانتظار المعلومات للتواصل معكم.
+{{senal}}بالنظر إلى طبيعة {{domain}}، فهو ضمن ما نبحث عنه.
 
-مع التحية.`,
+لا أطلب منك شيئاً الآن: إن وافقت، أرسل لك الصيغ والحجم التقديري وتطّلع عليها براحتك.
+
+{{sender_name}}
+ADEQ Media`,
     },
     {
-      subjects: ["حملات عرض وفيديو - ADEQ", "التواصل مع المسؤول - ADEQ", "عرض وفيديو لـ {{domain}} - ADEQ"],
-      body: `صباح الخير.
+      subjects: ["{{domain}} — 15 دقيقة", "مقترح لموقع {{domain}}", "تحقيق الدخل من {{domain}}"],
+      body: `{{saludo}}
 
-هل يمكنكم تزويدي ببيانات التواصل مع المسؤول عن الموقع؟
+{{sender_name}} من ADEQ Media. نعمل مع ناشرين في {{geo}} ونربط مساحاتهم الإعلانية بالمعلنين، في العرض والفيديو.
 
-الأمر يتعلق بالتحدث حول بعض حملات العرض (display) والفيديو التي نود تضمينها في موقعكم.
+{{senal}}أود أن أقترح تجربة صغيرة على {{domain}}: صيغة واحدة، لمدة شهر، ونقيس النتائج.
 
-شكراً`,
+إن كان الأمر يهمك، ردّ عليّ ونحدد 15 دقيقة هذا الأسبوع أو الذي يليه.
+
+شكراً،
+{{sender_name}}`,
     },
   ],
 };
@@ -232,16 +300,54 @@ export function fillTemplate(tpl, vars) {
   const trafficStr = traffic > 0
     ? (traffic >= 1_000_000 ? `${Math.round(traffic / 1_000_000)}M` : `${Math.round(traffic / 1_000)}K`)
     : "";
+
+  // ── {{saludo}} — saludar por nombre cuando lo tenemos ────────────────────
+  // `contact_name` ya existía en toolbar_review_queue, se le pasaba a Claude y al
+  // payload de Monday, pero NUNCA llegaba hasta acá: nadie recibía su nombre en el
+  // saludo. Un cold email B2B sin un nombre humano no se contesta.
+  // Se toma solo el primer nombre y se descartan valores basura (todo mayúsculas,
+  // con arroba, con dígitos o demasiado largos: suelen ser el nombre de la empresa).
+  const nombreCrudo = clean(vars.contactName);
+  const primerNombre = (() => {
+    if (!nombreCrudo || nombreCrudo.length > 40) return "";
+    if (/[@\d]/.test(nombreCrudo)) return "";
+    const p = nombreCrudo.split(/\s+/)[0].replace(/[^\p{L}'-]/gu, "");
+    if (p.length < 2 || p.length > 20) return "";
+    if (p === p.toUpperCase() && p.length > 3) return "";        // "REDACCION", "VENTAS"
+    return p.charAt(0).toUpperCase() + p.slice(1).toLowerCase();
+  })();
+  const saludo = primerNombre ? `Hola ${primerNombre},` : "Hola,";
+
+  // ── {{senal}} — la prueba de que alguien miró el sitio ───────────────────
+  // Una frase corta con un dato REAL y verificable del sitio. Si no tenemos ningún
+  // dato, queda vacía y la frase siguiente se lee igual de bien. Nunca se inventa.
+  const redes = Array.isArray(vars.adNetworks) ? vars.adNetworks.filter(Boolean) : [];
+  const senal = (() => {
+    if (redes.length) {
+      const lista = redes.slice(0, 2).join(" y ");
+      return `Vi que ya trabajan con ${lista}. `;
+    }
+    if (trafficStr) return `Vi que están en el orden de ${trafficStr} visitas al mes. `;
+    return "";
+  })();
+
   const apply = (s) => String(s || "")
     .replace(/\{\{domain\}\}/g, domain)
     .replace(/\{\{geo\}\}/g, geo)
     .replace(/\{\{traffic\}\}/g, trafficStr)
     .replace(/\{\{sender_name\}\}/g, senderName)
+    .replace(/\{\{saludo\}\}/g, saludo)
+    .replace(/\{\{senal\}\}/g, senal)
     // Cualquier placeholder restante {{xxx}} → vacío (no leak al user).
     .replace(/\{\{[a-z_]+\}\}/gi, "")
     // Limpieza de artefactos comunes de placeholders vacíos.
     .replace(/[ \t]+([,.;:!?])/g, "$1")           // espacio antes de puntuación
     .replace(/\(\s*\)/g, "")                       // paréntesis vacíos
+    // Si un placeholder vacío dejó una preposición colgada ("para  este trimestre",
+    // "publishers de , conectando"), se limpia. Sin esto, un lead sin GEO mandaba un
+    // mail con un agujero visible y eso solo se nota cuando ya salió.
+    .replace(/\s+(para|de|en|for|in|of|per|em|da)\s+([,.])/gi, "$2")
+    .replace(/\s+,/g, ",")
     .replace(/[ \t]{2,}/g, " ")                    // espacios dobles
     .replace(/\n{3,}/g, "\n\n")                    // saltos de línea triples
     .trim();
