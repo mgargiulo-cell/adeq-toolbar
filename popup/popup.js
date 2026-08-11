@@ -10529,6 +10529,24 @@ function initProspectCard(card, data) {
     // Maxi 2026-06-30: INVESTIGAR el sitio para aprender — fetch del HTML en vivo y
     // extraer título + meta description + headings, para que Claude clasifique por
     // CONTENIDO REAL (no solo por los campos guardados). Best-effort, con timeout corto.
+    // Maxi 2026-08-10: junto con el HTML, chequear el ads.txt y GUARDARLO en el feedback.
+    // Revisando 42 rechazos manuales tuve que re-descargar los 42 dominios para saber qué tenían
+    // —lento, y para entonces varios ya habían cambiado—. El estado del ads.txt en el MOMENTO
+    // del rechazo es el dato que decide si el filtro falló o si el sitio simplemente no
+    // monetiza, y cuesta un fetch que ya estábamos haciendo igual.
+    let adsTxtEstado = "?";
+    const _adsTxtPromesa = (async () => {
+      try {
+        const r = await fetch(`https://${data.domain}/ads.txt`, { signal: AbortSignal.timeout(6000) });
+        if (r.status === 404 || r.status === 410) return "no";
+        if (!r.ok) return `ilegible_${r.status}`;
+        const t = await r.text();
+        if (/<html|<!doctype/i.test(t.slice(0, 500))) return "no";            // soft-404
+        const lineas = (t.match(/^[ \t]*[^\s,#][^,\n]*,[^,\n]+,\s*(DIRECT|RESELLER)/gim) || []).length;
+        return lineas > 0 ? `si_${lineas}` : "no";
+      } catch { return "ilegible_red"; }
+    })();
+
     let siteSnippet = "";
     try {
       const resp = await fetch(`https://${data.domain}`, { signal: AbortSignal.timeout(5000) });
@@ -10554,12 +10572,18 @@ function initProspectCard(card, data) {
       });
       webType = (r?.text || "").trim().replace(/^["']|["']$/g, "").slice(0, 60);
     } catch (e) { console.warn("[reject] Claude type err", e?.message); }
+    adsTxtEstado = await _adsTxtPromesa.catch(() => "?");
+    // El motivo queda con el estado del ads.txt pegado: "no tiene ads.txt [ads.txt: no]" se puede
+    // auditar después sin volver a salir a la red, y distingue "el filtro falló" de "el sitio
+    // cambió desde entonces".
+    const _motivoCompleto = [reason, webType ? `[tipo: ${webType}]` : "", `[ads.txt: ${adsTxtEstado}]`]
+      .filter(Boolean).join(" ");
     await Promise.all([
-      rejectReviewItem(state.accessToken, id, data.domain),
+      rejectReviewItem(state.accessToken, id, data.domain, _motivoCompleto),
       saveAutopilotFeedback(state.accessToken, {
         user_email: state.loginEmail, domain: data.domain, action: "disliked",
         category: data.category, geo: data.geo, ad_networks: data.ad_networks, traffic: data.traffic,
-        reason: [reason, webType ? `[tipo: ${webType}]` : ""].filter(Boolean).join(" ") || undefined,
+        reason: _motivoCompleto || undefined,
       }),
     ]);
     if (typeof showToast === "function") showToast(webType ? `🧠 Aprendido — evitar tipo: ${webType}` : "❌ Rechazado", "info", 3500);
@@ -11174,7 +11198,7 @@ async function initProspectsTab() {
       const card = document.querySelector(`.pcard[data-id="${id}"]`);
       const domain = card?.dataset?.domain || "";
       try {
-        await rejectReviewItem(state.accessToken, id, domain);
+        await rejectReviewItem(state.accessToken, id, domain, "rechazo masivo desde el panel");
         card?.remove();
         ok++;
       } catch { fail++; }

@@ -851,7 +851,11 @@ export async function markReviewQueueAsContacted(accessToken, domain, validatedB
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-export async function rejectReviewItem(accessToken, id, domain) {
+// Maxi 2026-08-10: acepta `motivo` y lo deja escrito en suspect_reason con el prefijo "mb:".
+// Antes el rechazo manual solo cambiaba el status, así que en el pool era indistinguible de
+// cualquier otro rejected y la revisión posterior no sabía POR QUÉ ni QUIÉN. Con el prefijo, la
+// misma consulta que audita los descartes automáticos muestra también los humanos.
+export async function rejectReviewItem(accessToken, id, domain, motivo = "") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   const expiresAt = new Date(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000).toISOString();
@@ -859,7 +863,11 @@ export async function rejectReviewItem(accessToken, id, domain) {
     await fetch(`${url}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
       method: "PATCH",
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "rejected" }),
+      body: JSON.stringify({
+        status: "rejected",
+        suspect_reject: true,
+        ...(motivo ? { suspect_reason: `mb: ${String(motivo).substring(0, 190)}` } : {}),
+      }),
     });
     await fetch(`${url}/rest/v1/toolbar_import_queue`, {
       method: "POST",
