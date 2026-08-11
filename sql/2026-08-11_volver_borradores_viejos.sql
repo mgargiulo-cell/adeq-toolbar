@@ -1,35 +1,48 @@
 -- ══════════════════════════════════════════════════════════════════════════════
--- VOLVER A LOS BORRADORES DE ANTES — 2026-08-11
+-- VOLVER A LOS BORRADORES DEL USER Y BORRAR LOS MÍOS — 2026-08-11
 --
--- El user no aprobó el copy nuevo y pidió volver a los suyos para trabajarlos él.
--- Esto es exactamente el inverso del archivado de hoy: no se pierde nada, y el copy
--- nuevo queda guardado por si alguna parte llega a servir más adelante.
+-- El copy que escribí no estaba aprobado y encima le llegó a un prospecto real con
+-- los placeholders CRUDOS ({{saludo}}, {{sender_name}}), porque la extensión solo
+-- sabe resolver {{domain}}. Se eliminan.
 --
--- Corré los 3 bloques de una.
+-- Cómo se distinguen sin riesgo: los míos son los ÚNICOS que contienen {{saludo}}
+-- o {{senal}} en el cuerpo. Ningún borrador del user los tiene. No hace falta
+-- confiar en el nombre ni en el asunto.
+--
+-- Corré los 4 bloques de una. Es idempotente y funciona sin importar si ya
+-- corriste el archivo anterior o no.
 -- ══════════════════════════════════════════════════════════════════════════════
 
 
--- ── 1. GUARDAR EL COPY NUEVO (sale del pool, no se borra) ─────────────────────
-UPDATE toolbar_pitch_drafts
-   SET user_email = '_nuevo_sin_aprobar_2026_08_11_'
- WHERE user_email = '_default_';
+-- ── 1. VER QUÉ SE VA A BORRAR (mirá esto antes de seguir) ─────────────────────
+SELECT user_email, language, subject
+  FROM toolbar_pitch_drafts
+ WHERE body LIKE '%{{saludo}}%' OR body LIKE '%{{senal}}%'
+ ORDER BY language, priority;
 
 
--- ── 2. DEVOLVER LOS DE ANTES AL POOL ──────────────────────────────────────────
+-- ── 2. DEVOLVER LOS DEL USER AL POOL ──────────────────────────────────────────
+-- (si ya los devolviste, esto no hace nada)
 UPDATE toolbar_pitch_drafts
    SET user_email = '_default_'
- WHERE user_email = '_viejo_2026_08_11_';
+ WHERE user_email IN ('_viejo_2026_08_11_');
 
 
--- ── 3. CHEQUEO — tienen que salir 15 y con los asuntos de siempre ─────────────
-SELECT language, priority, subject, left(body, 50) AS arranque
+-- ── 3. BORRAR LOS MÍOS, DEFINITIVO ────────────────────────────────────────────
+DELETE FROM toolbar_pitch_drafts
+ WHERE body LIKE '%{{saludo}}%' OR body LIKE '%{{senal}}%';
+
+
+-- ── 4. CHEQUEO ────────────────────────────────────────────────────────────────
+-- Tienen que quedar 15 (3 × es/en/pt/it/ar), todos cortos y con asunto "- ADEQ".
+SELECT language, priority, subject, left(body, 45) AS arranque
   FROM toolbar_pitch_drafts
  WHERE user_email = '_default_'
  ORDER BY language, priority;
 
--- Y que no haya quedado ningún placeholder que la extensión no sepa reemplazar.
--- La toolbar solo resuelve {{domain}}; cualquier otro llegaría CRUDO al destinatario.
+-- Y que NINGUNO tenga un placeholder que la extensión no sepa resolver.
+-- La toolbar solo reemplaza {{domain}}: cualquier otro llega crudo al destinatario.
+-- Esta consulta tiene que devolver CERO filas.
 SELECT language, subject, body
   FROM toolbar_pitch_drafts
- WHERE user_email = '_default_'
-   AND (body ~ '\{\{(?!domain\}\})' OR subject ~ '\{\{(?!domain\}\})');
+ WHERE body ~ '\{\{(?!domain\}\})' OR subject ~ '\{\{(?!domain\}\})';

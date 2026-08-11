@@ -2,12 +2,9 @@
 // ADEQ Toolbar Agent — Templates de outreach por idioma
 // Los 3 borradores fijos, VALIDADOS POR EL USER.
 //
-// Maxi 2026-08-11: se probó reemplazarlos por un copy más largo (partner
-// directo / presupuesto de video / prueba de 15 min) y el user lo rechazó:
-// "los borradores tienen que ser cortos". Vuelven los originales. El copy que
-// no se aprobó quedó guardado en la base bajo user_email
-// '_nuevo_sin_aprobar_2026_08_11_' por si alguna parte llega a servir.
-//
+// Maxi 2026-08-11: se probó reemplazarlos por un copy más largo y el user lo
+// rechazó — "los mails tienen que ser simples". Ese copy se ELIMINÓ (no está
+// archivado en ningún lado). Regla: los borradores los escribe el user.
 // ⚠️ NO AGREGAR PLACEHOLDERS NUEVOS ACÁ SIN TOCAR TAMBIÉN LA EXTENSIÓN.
 // Estos mismos textos los usa el MB para los envíos MANUALES desde el popup, y
 // esa ruta solo sabe reemplazar {{domain}}. Cualquier otro placeholder le llega
