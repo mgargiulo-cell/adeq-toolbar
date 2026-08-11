@@ -98,6 +98,17 @@ const URL_REJECT_RULES = [
   // OJO: nada de un genérico tipo /^bet[a-z]+/ — se llevaba puesto betevecom.cat (betevé, la TV
   // de Barcelona) y bethemedia.com. Solo stems inequívocos + la lista explícita de arriba.
   [/(^|\.)[a-z-]*(casino|apuest|betting|bookmaker|poker|bingo)[a-z-]*\./i, "casa_apuestas"],
+  // Maxi 2026-08-11 (auditoría de las 39 "respuestas"): inkabet.pe recibió pitch. La regla
+  // de arriba pide "betting" entero, así que las marcas que terminan en -bet se escapaban
+  // todas (inkabet, doradobet, sunbet). Se agrega el sufijo, con excepciones para los que
+  // llevan "bet" por casualidad: beteve.cat es un MEDIO catalán, y están tibet/bethlehem/
+  // betterhomes/sabetha. Probado: 0 falsos positivos sobre 18 publishers reales.
+  [/(^|\.)(?!beteve|tibet|bethlehem|betterhomes|abetter|sabetha)[a-z][a-z-]{2,14}bet(s|365)?\.[a-z]{2,}(\.[a-z]{2})?$/i, "casa_apuestas"],
+  [/\.bet$/i, "casa_apuestas"],                       // TLD dedicado al juego
+  // Comparadores de precios y clasificados: agregan oferta de terceros, no producen
+  // contenido editorial. Vistos en el pool con pitch enviado: comparabien.com.pe.
+  [/(^|\.)(compara|comparador|comparateur|vergleich)[a-z-]*\./i, "comparador"],
+  [/(^|\.)[a-z-]*(clasificados|classificados|kleinanzeigen|annonces|marktplaats)[a-z-]*\./i, "clasificados"],
   // ── Plataformas de streaming (tienen su propio inventario) ──
   [/^(disneyplus|netflix|primevideo|hbomax|paramountplus|pluto|roku|sling|fubo|plex|tubitv|viki|mxplayer|crunchyroll|spotify|deezer|tidal|apple|itunes)\./i, "plataforma_streaming"],
   // ── Viajes / aerolíneas / hoteles ──
@@ -11735,7 +11746,7 @@ async function scanRealResponsesForUser(token, userEmail) {
         let isAutoReply = false;
         for (const id of ids) {
           const msgRes = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=Auto-Submitted&metadataHeaders=Subject&metadataHeaders=X-Autoreply&metadataHeaders=X-Auto-Response-Suppress`,
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=Auto-Submitted&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=X-Autoreply&metadataHeaders=X-Auto-Response-Suppress`,
             { headers: { "Authorization": `Bearer ${accessToken}` } }
           );
           if (!msgRes.ok) continue;
@@ -11745,7 +11756,21 @@ async function scanRealResponsesForUser(token, userEmail) {
           const subj = headers.find(h => h.name?.toLowerCase() === "subject")?.value || "";
           const hasAutoReplyHeader = !!headers.find(h => ["x-autoreply","x-auto-response-suppress"].includes(h.name?.toLowerCase()));
           const subjOOO = /\b(out of office|out-of-office|away|ausencia|vacation|vacaciones|férias|ferie|abwesen|auto[-\s]?reply|automatic reply|automatisch|absence|absencia)\b/i.test(subj);
-          if (/auto-replied|auto-generated/i.test(autoSub) || hasAutoReplyHeader || subjOOO) {
+          // ── ACUSE DE TICKET ≠ RESPUESTA (Maxi 2026-08-11) ────────────────────
+          // De las 39 "respuestas reales" acumuladas entre junio y agosto, casi todas
+          // venían de mesas de ayuda (ajuda@, apoyo@, soporte@, support@, service@,
+          // abonnements@, bok@, csmtix@) y eran acuses automáticos de ticket. No traen
+          // Auto-Submitted ni asunto de fuera-de-oficina, así que pasaban como REALES:
+          // el sistema se auto-reportaba éxito mientras el dueño no veía una sola
+          // negociación. Medir mal es peor que no medir, porque decide a dónde va el
+          // presupuesto: el cerebro nuevo elige templates con este número.
+          const subjTicket = /\b(ticket|case|caso|folio|solicitud|solicita[cç][aã]o|richiesta|request|referencia|reference|protocolo|\[#?\d{3,}\]|#\d{4,})\b/i.test(subj)
+            || /\b(hemos recibido|recibimos su|we (have )?received|received your|obrigado pelo contato|gracias por (contactar|comunicarse)|thank you for contacting|abbiamo ricevuto|votre demande|ihre anfrage)\b/i.test(subj);
+          // Y el remitente: si contesta el buzón de reclamos, es la mesa de ayuda
+          // haciendo su trabajo, no un interlocutor comercial.
+          const _remitente = (headers.find(h => h.name?.toLowerCase() === "from")?.value || "").toLowerCase();
+          const desdeMesaDeAyuda = /\b(no[-.]?reply|noreply|soporte|suporte|support|ajuda|apoyo|atencion|atendimento|helpdesk|servicedesk|ticket|abonnements?|customercare|customerservice)\b/i.test(_remitente);
+          if (/auto-replied|auto-generated/i.test(autoSub) || hasAutoReplyHeader || subjOOO || subjTicket || desdeMesaDeAyuda) {
             isAutoReply = true;
             break;
           }
@@ -13727,7 +13752,20 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // PERSON (+70, por el punto en "soporte.epaper") o PERSON_LIKELY (+55, "denuncias") y le
   // GANABAN a un contacto real. Ahora +8: sendables como ÚLTIMO recurso (North Star: ≥1 email),
   // pero pierden contra cualquier persona/rol comercial. Chequeado ANTES del patrón nombre.apellido.
-  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|denuncias?|reclamos?|reclama[cç][õo]es|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|legal|privacy|privacidad|privacidade|\bdpo\b|abuse|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|servicios?|servico|service|helpdesk|help)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
+  // ── MESA DE AYUDA: NO SE LE ESCRIBE (Maxi 2026-08-11) ─────────────────────
+  // Medido sobre las 39 "respuestas reales" de junio-agosto: casi TODAS venían de
+  // ajuda@, apoyo@, soporte@, support@, service@, abonnements@, bok@, csmtix@,
+  // suport@. No eran respuestas comerciales: eran ACUSES DE TICKET automáticos, que
+  // el clasificador no cazaba porque no traen cabecera de auto-reply ni asunto de
+  // fuera-de-oficina. Es decir, el sistema se estaba auto-reportando éxito mientras
+  // el dueño veía cero negociaciones — y tenía razón él.
+  // Escribirle al buzón de reclamos no solo no vende: mete un pitch en la cola de
+  // atención al cliente del publisher, que es la peor primera impresión posible.
+  // Score NEGATIVO = rankEmail lo descarta. Preferimos no mandar antes que mandar acá.
+  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|ajuda|apoyo|denuncias?|reclamos?|reclama[cç][õo]es|abonnements?|suscripciones|assinaturas|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|helpdesk|help|servicios?|servico|service|tickets?|customer[a-z]*|cliente[a-z]*|servicedesk)([._-]|$)/i.test(local)) { score -= 20; matchedRole = "MESA_DE_AYUDA"; }
+  // Otros departamentos que no son mesa de ayuda: no venden pauta, pero tampoco
+  // ensucian una cola de soporte. Siguen sendables como último recurso (North Star: ≥1 email).
+  else if (/^(rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|legal|privacy|privacidad|privacidade|\bdpo\b|abuse)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
   // Maxi 2026-07-27 (auditoría respuestas 23-27): buzones de IT / infraestructura / dominios /
   // registrar. NO son contacto de venta de pauta y jamás responden un pitch de inventario; peor,
   // varios son direcciones técnicas donde el mail se archiva o abre un ticket. Casos reales de
