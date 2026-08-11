@@ -1872,7 +1872,23 @@ const _AUTOGOOGLE_KEYWORDS = [
 
 // Países de búsqueda (Serper `gl`) para targeting GEO — NO-Anglo (LATAM + EU + TR/GR).
 // Simula buscar DESDE ese país → Google prioriza publishers de/para ese país.
-const _AUTOGOOGLE_GL = ["mx", "ar", "br", "cl", "co", "pe", "uy", "es", "it", "fr", "de", "nl", "pt", "pl", "tr", "gr", "se", "be", "ch"];
+// ── ALCANCE GEOGRÁFICO (Maxi 2026-08-11, regla del user) ─────────────────────
+// "Me enfoco más en Centro y Sudamérica, y Europa, Asia, África. Oceanía y
+// Norteamérica no." México queda ADENTRO: geográficamente es Norteamérica, pero es
+// el mercado hispano principal y encabeza la cascada GEO desde siempre. Lo que sale
+// es EE.UU./Canadá (anglo, ya deprio por TLD) y toda Oceanía.
+// Antes la lista era solo LATAM + Europa occidental: Asia y África, que el user
+// quiere cubrir, no estaban representadas por ningún país.
+const _AUTOGOOGLE_GL = [
+  // Centro y Sudamérica (el foco principal)
+  "mx", "ar", "br", "cl", "co", "pe", "uy", "ve", "ec", "bo", "py", "cr", "gt", "do", "pa",
+  // Europa
+  "es", "it", "fr", "pt", "de", "nl", "pl", "gr", "be", "ch", "ro", "cz", "se",
+  // Asia (con idiomas que sí tenemos: turco, árabe, indonesio, japonés)
+  "tr", "id", "jp", "th", "vn",
+  // África (árabe en el norte, francés en el oeste, portugués en Angola/Mozambique)
+  "ma", "eg", "dz", "tn", "sn", "ci", "ao", "mz",
+];
 
 // ── TURNO HISPANO (Maxi 2026-07-17, pedido del user) ────────────────────────────────
 // Garantiza que TODOS los días haya crons dedicados a webs de HABLA HISPANA: LATAM +
@@ -1924,9 +1940,11 @@ const _HUELLAS_FR = [
 
 const _TLDS_POR_IDIOMA = {
   es: HISPANIC_TLDS,
-  pt: [".br", ".pt", ".com.br"],
+  pt: [".br", ".pt", ".com.br", ".ao", ".mz"],
   it: [".it"],
-  fr: [".fr", ".be", ".ca", ".ch", ".ma", ".sn"],
+  // Sin .ca: Norteamérica queda fuera por regla del user. Con Magreb y África
+  // occidental francófona, que sí entran en el foco.
+  fr: [".fr", ".be", ".ch", ".ma", ".sn", ".dz", ".tn", ".ci"],
 };
 
 function _construirBusquedasDeHuella(esHispano, cuantas) {
@@ -2608,7 +2626,9 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
 // para no gastar RapidAPI traffic-lookup en sitios obvios de USA/UK/CA/AU/NZ/IE.
 // Cubre los casos donde el TLD ya nos dice el país. Sitios .com globales
 // siguen pasando (SimilarWeb decide después si son USA-heavy).
-const DEPRIO_TLD_RE = /\.(us|uk|co\.uk|ca|au|com\.au|nz|co\.nz|ie)$/i;
+// Maxi 2026-08-11: se suman los TLD que faltaban de Oceanía y Norteamérica, que el
+// user excluyó explícitamente del foco (antes faltaban .fj .pg .nc y .qc.ca).
+const DEPRIO_TLD_RE = /\.(us|uk|co\.uk|ca|qc\.ca|au|com\.au|net\.au|org\.au|nz|co\.nz|ie|fj|pg|nc|ws|to)$/i;
 
 // Maxi 2026-07-16: código de país → sufijos de TLD, para SESGAR Majestic hacia los GEOs objetivo
 // (worker_discovery_config.geos_priority) en vez de random global (que trae mucho USA/marca).
@@ -7754,10 +7774,40 @@ async function runProspectSimilarExpansion(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const cursor = cfg.similar_expansion_cursor || "";
   const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
+  // ── PRIMERO LOS HALLAZGOS FRESCOS Y BUENOS (Maxi 2026-08-11) ────────────────
+  // Regla del user: "debe descubrir similares cuando encuentra uno bueno, eso hace
+  // el MB luego de googlear". Antes esto recorría el pool VIEJO con un cursor
+  // ascendente por fecha, así que un publisher excelente descubierto hoy por
+  // AutoGoogle esperaba a que el cursor recorriera 1.600 leads antes de expandirse
+  // — o sea nunca, porque el cursor se reseteaba al llegar al final.
+  //
+  // Ahora la prioridad es: lo más NUEVO y con mejor puntaje primero. Encontró uno
+  // bueno, busca sus pares en el acto. El barrido viejo por cursor queda de relleno
+  // cuando no hay hallazgos frescos sin expandir.
+  let _yaExpandidos = new Set();
+  try { _yaExpandidos = new Set(JSON.parse(cfg.similar_expansion_hechos || "[]")); } catch {}
+
+  let _porCursor = false;      // true = barrido viejo; false = hallazgos frescos
   let seeds = null;
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.500000${cursorClause}&select=domain,created_at&order=created_at.asc&limit=${SIMILAR_EXP_BATCH}`, { headers: auth });
-    if (r.ok) { const j = await r.json(); if (Array.isArray(j)) seeds = j; }
+    // 1) Hallazgos recientes que ya pasaron todos los filtros y puntúan bien.
+    const rFresco = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&score=gte.${PROSPECT_SCORE_MIN}&select=domain,created_at,score&order=created_at.desc&limit=40`, { headers: auth });
+    if (rFresco.ok) {
+      const j = await rFresco.json();
+      if (Array.isArray(j)) {
+        const frescos = j.filter(x => x.domain && !_yaExpandidos.has(String(x.domain).toLowerCase()));
+        if (frescos.length) {
+          seeds = frescos.slice(0, SIMILAR_EXP_BATCH);
+          log(`🔗 similar-exp: ${seeds.length} semilla(s) FRESCA(s) y bien puntuada(s) — se expanden primero`);
+        }
+      }
+    }
+    // 2) Si no hay nada fresco sin expandir, se sigue con el barrido por cursor.
+    if (seeds === null) {
+      _porCursor = true;
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.500000${cursorClause}&select=domain,created_at&order=created_at.asc&limit=${SIMILAR_EXP_BATCH}`, { headers: auth });
+      if (r.ok) { const j = await r.json(); if (Array.isArray(j)) seeds = j; }
+    }
   } catch {}
   // "No pude leer" ≠ "no quedan semillas": antes un 500 reseteaba el cursor.
   if (seeds === null) {
@@ -7765,13 +7815,15 @@ async function runProspectSimilarExpansion(token) {
     return;
   }
   if (seeds.length === 0) {
-    await setConfigValue(token, "similar_expansion_cursor", "").catch(() => {});  // fin → reset (los Prospects cambian)
+    if (_porCursor) await setConfigValue(token, "similar_expansion_cursor", "").catch(() => {});  // fin → reset (los Prospects cambian)
     return;
   }
   const _lastTs = seeds[seeds.length - 1].created_at;
   const sessionKnown = new Set();
+  const _expandidasAhora = [];
   let injected = 0;
   for (const s of seeds) {
+    _expandidasAhora.push(String(s.domain || "").toLowerCase());
     try {
       const sims = await findSimilarSites(s.domain, rapidapi_key).catch(() => []);
       if (!Array.isArray(sims) || sims.length === 0) continue;
@@ -7785,8 +7837,24 @@ async function runProspectSimilarExpansion(token) {
     } catch (e) { log(`  ⚠️ similar-exp ${s.domain}: ${e.message}`); }
     try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
   }
-  await setConfigValue(token, "similar_expansion_cursor", _lastTs).catch(() => {});
-  log(`🔗 similar-exp: semillas=${seeds.length} → ${injected} similares frescos inyectados (cursor→${_lastTs})`);
+  // El cursor SOLO avanza en el barrido viejo. Por el camino de hallazgos frescos las
+  // semillas vienen ordenadas al revés (más nuevas primero): guardar ese timestamp
+  // como cursor haría saltear medio pool.
+  if (_porCursor) {
+    await setConfigValue(token, "similar_expansion_cursor", _lastTs).catch(() => {});
+  }
+  // Memoria rodante de semillas ya expandidas, para no volver sobre las mismas cada
+  // 5 minutos. Se guardan las últimas 300: con el pool rotando, más no hace falta.
+  try {
+    const _mem = [...new Set([..._expandidasAhora, ..._yaExpandidos])].slice(0, 300);
+    await setConfigValue(token, "similar_expansion_hechos", JSON.stringify(_mem));
+  } catch {}
+  log(`🔗 similar-exp: semillas=${seeds.length} (${_porCursor ? "barrido por cursor" : "hallazgos frescos"}) → ${injected} similares frescos inyectados`);
+  await saludPing(token, "similar_expansion", {
+    status: "ok", cadenciaMin: 60,
+    detalle: `${seeds.length} semillas → ${injected} similares`,
+    real: injected, esperado: seeds.length,   // se espera al menos 1 similar nuevo por semilla
+  });
 }
 
 // Gate principal. Devuelve { ok, reason }. ok=false → no va a Prospects.
