@@ -11911,6 +11911,14 @@ async function runReengagementCycle(token) {
 
       // Send Gmail
       try {
+        // ⚠️ RUTA DE ALTO RIESGO (Maxi 2026-08-12): se le escribe a un dominio que
+        // YA rebotó. Un segundo rebote duro sobre el mismo dominio es de lo que más
+        // rápido quema la reputación. Acá NO alcanza con "riesgo": se exige "ok".
+        const _vr = await _verifyEmailMV(token, newEmail).catch(() => "riesgo");
+        if (_vr !== "ok") {
+          log(`  ⛔ re-engagement ${newEmail}: verificación dio "${_vr}" y el dominio ya rebotó — no se manda`);
+          continue;
+        }
         await sendGmailServer(token, userEmail, { to: newEmail, subject, body: pitch.body, agentActionId: reservedId });
       } catch (err) {
         log(`  ❌ ${domain} re-engagement send fail: ${err.message}`);
@@ -13235,14 +13243,18 @@ async function _countAgentActionsToday(token, userEmail, actions, label) {
       // Fail-open: si no podemos contar, asumimos 0 y seguimos. El sendtrack 30d guard +
       // reserved slots + per_cycle_limit limitan el daño. Fail-closed perdía el día entero
       // por un glitch de Supabase.
-      log(`⚠️ ${label} HTTP ${res.status} — fail-open (assume 0, retry next cycle)`);
-      return 0;
+      // Antes esto devolvía 0 = "no mandaste nada, mandá 20 más", y un glitch de
+      // Supabase podía duplicar el día. Ahora devuelve null = "no sé", y el llamador
+      // decide con prudencia. Es la regla de oro del proyecto: "no pude medir" no
+      // puede degradarse a un número que habilite gasto.
+      log(`⚠️ ${label} HTTP ${res.status} — no se pudo contar (devuelve null)`);
+      return null;
     }
     const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
     return m ? parseInt(m[1]) : 0;
   } catch (e) {
-    log(`⚠️ ${label} error: ${e.message} — fail-open (assume 0)`);
-    return 0;
+    log(`⚠️ ${label} error: ${e.message} — no se pudo contar (devuelve null)`);
+    return null;
   }
 }
 
@@ -14957,7 +14969,157 @@ function _textToHtmlServer(text) {
     .join("\n");
 }
 
-async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null }) {
+// ════════════════════════════════════════════════════════════════
+// BLINDAJE ANTI-SPAM (Maxi 2026-08-12)
+// ════════════════════════════════════════════════════════════════
+// "Garantizar" que nunca caiga en spam es imposible: la decisión final la toma
+// Gmail. Lo que sí se puede es no darle un solo motivo. Acá se controla todo lo
+// que depende de nosotros: la estructura del MIME, la coherencia entre las partes
+// y un linter que corre DENTRO del enviador.
+
+// RFC 2047: un encoded-word no puede pasar de 75 caracteres. Un asunto en árabe en
+// un solo encoded-word daba ~90 y salía un header malformado. Se parte en varios,
+// cortando en fronteras de carácter UTF-8 para no romper los multibyte.
+function _codificarAsunto(subject) {
+  const s = String(subject || "");
+  if (/^[\x20-\x7E]*$/.test(s)) return s;                     // ASCII puro: tal cual
+  const bytes = Buffer.from(s, "utf-8");
+  const MAX_BYTES = Math.floor((75 - 12) / 4) * 3;            // margen del encoded-word
+  const trozos = [];
+  let i = 0;
+  while (i < bytes.length) {
+    let fin = Math.min(i + MAX_BYTES, bytes.length);
+    while (fin > i && fin < bytes.length && (bytes[fin] & 0xC0) === 0x80) fin--;   // no partir un carácter
+    trozos.push(`=?UTF-8?B?${bytes.subarray(i, fin).toString("base64")}?=`);
+    i = fin;
+  }
+  return trozos.join("\r\n ");                                 // continuación plegada (RFC 5322)
+}
+
+// RFC 5322 limita las líneas a 998 octetos. La firma HTML de Gmail suele venir en
+// UNA línea de varios KB y salía sin cortar. quoted-printable pliega solo, y es lo
+// que usa Gmail cuando escribís un mail a mano.
+function _aQuotedPrintable(texto) {
+  const bytes = Buffer.from(String(texto || ""), "utf-8");
+  let out = "", linea = "";
+  const empujar = (tok) => {
+    if (linea.length + tok.length > 73) { out += linea + "=\r\n"; linea = ""; }
+    linea += tok;
+  };
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 13 && bytes[i + 1] === 10) { out += linea + "\r\n"; linea = ""; i++; continue; }
+    if (b === 10) { out += linea + "\r\n"; linea = ""; continue; }
+    if ((b >= 33 && b <= 126 && b !== 61) || b === 32 || b === 9) empujar(String.fromCharCode(b));
+    else empujar("=" + b.toString(16).toUpperCase().padStart(2, "0"));
+  }
+  if (/[ \t]$/.test(linea)) linea = linea.slice(0, -1) + (linea.endsWith(" ") ? "=20" : "=09");
+  return out + linea;
+}
+
+// La firma sale de Gmail y se inyectaba CRUDA en cada mail. Si un buzón tiene un
+// logo en un CDN, un banner, o una firma hecha con una herramienta que trae su
+// propio tracking, todo eso viaja con nuestra reputación y nadie se entera.
+function _sanitizarFirma(html) {
+  let h = String(html || "");
+  h = h.replace(/<script[\s\S]*?<\/script>/gi, "");
+  h = h.replace(/<iframe[\s\S]*?<\/iframe>/gi, "");
+  h = h.replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  h = h.replace(/<img\b[^>]*>/gi, (tag) => {
+    const src = (tag.match(/src\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+    // OJO: sin cerrar el valor, width="120" matcheaba como si fuera 1px y borraba
+    // el logo legítimo de la firma. El dígito tiene que ser el valor COMPLETO.
+    const esPixel = /(width|height)\s*=\s*(["']?)[12]\2(?=[\s/>])/i.test(tag);
+    const esPropia = /^data:/i.test(src) || /(^|\/\/|\.)adeqmedia\.com/i.test(src);
+    return (esPropia && !esPixel) ? tag : "";
+  });
+  return h;
+}
+
+// HTML → texto, para que la parte text/plain diga LO MISMO que la HTML.
+function _htmlATexto(html) {
+  return String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"')
+    .replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// El nombre para el From. Ya venía en la respuesta de settings/sendAs que se pide
+// para la firma, y se tiraba.
+const _nombreRemitenteCache = new Map();
+async function _nombreDeRemitente(userEmail) {
+  const k = String(userEmail || "").toLowerCase();
+  const c = _nombreRemitenteCache.get(k);
+  if (c && Date.now() - c.ts < 3600_000) return c.nombre;
+  let nombre = "";
+  try {
+    const at = await getGmailAccessToken(userEmail);
+    const r = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(userEmail)}`,
+      { headers: { "Authorization": `Bearer ${at}` } });
+    if (r.ok) nombre = String((await r.json())?.displayName || "").trim();
+  } catch {}
+  if (!nombre) nombre = getSenderName(userEmail) || "";
+  _nombreRemitenteCache.set(k, { nombre, ts: Date.now() });
+  return nombre;
+}
+
+// ── EL LINTER DE ENTREGABILIDAD ──────────────────────────────────────────────
+const _MAY_PERMITIDAS = new Set(["ADEQ","CPM","CTR","GEO","IAB","URL","SEO","B2B","IVA","CRM","SSP","DSP","RTB","PDF","ADEQMEDIA"]);
+
+function revisarEntregabilidad({ to, subject, body, html, mime, esProspeccion = true }) {
+  const bloqueantes = [], avisos = [];
+  const s = String(subject || ""), b = String(body || "");
+  // El correo INTERNO (alertas de salud, avisos de seguridad a mgargiulo@) no es
+  // prospección: no va a un desconocido, no compite por reputación y suele traer
+  // SQL, mayúsculas y textos largos. Si le aplicáramos las reglas de estilo, el
+  // vigilante se bloquearía sus propias alertas — el peor fallo silencioso posible.
+  const _estricto = esProspeccion !== false;
+
+  // Placeholders sin resolver: el bug de {{saludo}} del 11/08 le llegó a un
+  // prospecto real. Con esto no habría salido.
+  if (/\{\{|\}\}|\[\[|%%|__[A-Z]+__/.test(s + " " + b)) bloqueantes.push("placeholder_sin_resolver");
+  if (/\b(null|undefined|NaN)\b/.test(s + " " + b)) bloqueantes.push("valor_vacio_en_el_texto");
+
+  if (!s.trim()) bloqueantes.push("asunto_vacio");
+  if (_estricto && s.length > 78) bloqueantes.push("asunto_muy_largo");
+  if (/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(s)) bloqueantes.push("emoji_en_el_asunto");
+  if (/[\r\n]/.test(s) || /[\r\n]/.test(String(to || ""))) bloqueantes.push("salto_de_linea_en_cabecera");
+
+  if (_estricto) {
+    const palabras = b.trim().split(/\s+/).filter(Boolean).length;
+    if (palabras < 15) bloqueantes.push(`cuerpo_muy_corto_${palabras}`);
+    if (palabras > 400) bloqueantes.push(`cuerpo_muy_largo_${palabras}`);
+    if ((b.match(/!/g) || []).length > 2) bloqueantes.push("exceso_de_exclamaciones");
+    const grito = (b.match(/\b[A-ZÁÉÍÓÚÑ]{4,}\b/g) || []).filter(w => !_MAY_PERMITIDAS.has(w));
+    if (grito.length) bloqueantes.push(`mayusculas:${grito.slice(0, 2).join(",")}`);
+  }
+
+  // Caracteres que marcan spam o sirven para suplantar
+  if (/[​-‍﻿]/.test(s + b)) bloqueantes.push("caracteres_invisibles");
+  if (/[‪-‮⁦-⁩]/.test(s + b)) bloqueantes.push("override_bidireccional");
+  if (/[a-zA-Z]/.test(b) && /[Ѐ-ӿͰ-Ͽ]/.test(b)) bloqueantes.push("homoglifos_mezclados");
+  // Entidades numéricas: atrapa si alguien reintroduce el anti-linkify de los puntos.
+  if (/&#\d+;/.test(b) || /&#\d+;/.test(String(html || ""))) bloqueantes.push("entidades_html_ofuscadas");
+
+  const urls = (String(html || b).match(/https?:\/\/[^\s"'<>)]+/gi) || [])
+    .filter(u => !/track-open|unsubscribe|\/unsub/i.test(u));
+  if (_estricto && urls.length > 3) bloqueantes.push(`demasiados_links_${urls.length}`);
+
+  if (mime) {
+    if (mime.split("\r\n").some(l => Buffer.byteLength(l, "utf-8") > 990)) bloqueantes.push("linea_mime_mayor_a_990");
+    if (_estricto && /Content-Disposition:\s*attachment/i.test(mime)) bloqueantes.push("adjunto_en_prospeccion");
+    if ((mime.match(/=\?UTF-8\?B\?[^?]+\?=/g) || []).some(w => w.length > 75)) bloqueantes.push("encoded_word_mayor_a_75");
+  }
+
+  if (/^(info|contacto|contact|hello|hola)@/i.test(String(to || ""))) avisos.push("destinatario_generico");
+  return { ok: bloqueantes.length === 0, bloqueantes, avisos };
+}
+
+async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null, esProspeccion = true }) {
   // Sanitización final del destinatario: aunque venga del review_queue, de un
   // reintento o de un email viejo/manual, acá lo limpiamos (saca %, control chars,
   // basura al inicio). Si queda inválido, NO enviamos (evita el caso "%hector@...").
@@ -14977,60 +15139,101 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
     return { ok: false, error: "invalid_recipient" };
   }
   const accessToken = await getGmailAccessToken(userEmail);
-  const signatureHtml = await getGmailSignatureHtmlServer(userEmail);
-  // Open-rate tracking pixel — solo si tenemos un agent_action_id (envíos del agente)
-  const trackingPixel = agentActionId
-    // Maxi 2026-07-27 (auditoría): se agrega &t=<epoch del envío>. La edge function descarta las
-    // "aperturas" que llegan en los primeros 2 min, que son el prefetch de imágenes de Google/
-    // Outlook y los escáneres de seguridad — medido: 23,2% de todos los eventos. Filtrar por
-    // user-agent NO sirve: el 24,8% viene de GoogleImageProxy y ahí adentro hay aperturas REALES
-    // de usuarios de Gmail (Gmail siempre proxea las imágenes), así que descartarlo mataría el dato bueno.
-    // &amp; y no & suelto: es un atributo HTML y hay clientes de correo con sanitizadores
-    // estrictos que rompen o recortan la query string si ven un & sin escapar.
+  const signatureHtml = _sanitizarFirma(await getGmailSignatureHtmlServer(userEmail));
+  const nombreRemitente = await _nombreDeRemitente(userEmail);
+  const _cfgEnv = await getConfig(_workerToken || _token).catch(() => ({}));
+
+  // ── EL PIXEL, SOLO SI SE PIDE (Maxi 2026-08-12) ───────────────────────────
+  // Era la ÚNICA imagen y el único recurso remoto del mensaje: un 1x1 alojado en un
+  // host que ni siquiera es adeqmedia.com. Un cold email cuyo único elemento HTML es
+  // un píxel de terceros es un patrón que Gmail y Microsoft identifican. Y la señal
+  // que compraba estaba contaminada de origen (Gmail proxea TODAS las imágenes; ya
+  // hubo que descartar el 23% de los eventos por prefetch). Ahora el aprendizaje mide
+  // RESPUESTAS REALES, así que el píxel dejó de pagar lo que cuesta en reputación.
+  // Se vuelve a prender con tracking_pixel_enabled=true.
+  const trackingPixel = (agentActionId && String(_cfgEnv?.tracking_pixel_enabled || "") === "true")
     ? `<img src="${SUPABASE_URL}/functions/v1/track-open?aid=${agentActionId}&amp;t=${Date.now()}" width="1" height="1" alt="" style="display:block;border:0;width:1px;height:1px"/>`
     : "";
 
-  // Subject RFC 2047 encoded para soportar acentos (ej. "monetización")
-  const subjectEncoded = /^[\x20-\x7E]*$/.test(subject)
-    ? subject
-    : `=?UTF-8?B?${Buffer.from(subject, "utf-8").toString("base64")}?=`;
+  const subjectEncoded = _codificarAsunto(subject);
 
-  let mime;
-  // Forzar multipart si hay tracking pixel (necesita HTML), aunque no haya signature
-  const useMultipart = (signatureHtml && signatureHtml.trim()) || trackingPixel;
-  if (useMultipart) {
-    // Multipart: text + HTML con signature default del user
-    const boundary = `----=adeq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,10)}`;
-    const htmlBody = `${_textToHtmlServer(body)}${signatureHtml ? "\n<br/>\n" + signatureHtml : ""}${trackingPixel ? "\n" + trackingPixel : ""}`;
-    mime = [
-      `To: ${to}`,
-      `From: ${userEmail}`,
-      `Subject: ${subjectEncoded}`,
-      "MIME-Version: 1.0",
-      `Content-Type: multipart/alternative; boundary="${boundary}"`,
-      "",
-      `--${boundary}`,
-      "Content-Type: text/plain; charset=utf-8",
-      "Content-Transfer-Encoding: 8bit",
-      "",
-      body,
-      "",
-      `--${boundary}`,
-      "Content-Type: text/html; charset=utf-8",
-      "Content-Transfer-Encoding: 8bit",
-      "",
-      htmlBody,
-      "",
-      `--${boundary}--`,
-    ].join("\r\n");
-  } else {
-    // Sin signature → text/plain (legacy)
-    mime = [
-      `To: ${to}`, `From: ${userEmail}`, `Subject: ${subjectEncoded}`,
-      "Content-Type: text/plain; charset=utf-8", "MIME-Version: 1.0", "",
-      body,
-    ].join("\r\n");
+  // ── LIST-UNSUBSCRIBE ──────────────────────────────────────────────────────
+  // Desde febrero de 2024 Gmail y Yahoo lo EXIGEN a remitentes de volumen, con
+  // List-Unsubscribe-Post para el opt-out de un clic (RFC 8058). No teníamos ni el
+  // header ni un link. Y para un publisher europeo, un cold email sin forma de darse
+  // de baja es además exposición de GDPR.
+  const _mailBaja = String(_cfgEnv?.unsubscribe_email || "").trim() || userEmail;
+  const _cabecerasBaja = esProspeccion ? [
+    `List-Unsubscribe: <mailto:${_mailBaja}?subject=Baja>`,
+    "List-Unsubscribe-Post: List-Unsubscribe=One-Click",
+  ] : [];
+  // El header solo no alcanza: el humano tiene que poder pedirlo leyendo el mail.
+  const _pieBaja = esProspeccion
+    ? `\n\n--\nSi preferis que no volvamos a escribirte, respondé "baja" y no te contactamos mas.`
+    : "";
+
+  // ── LAS DOS PARTES DICEN LO MISMO ─────────────────────────────────────────
+  // Antes la HTML llevaba la firma (nombre, cargo, teléfono, links) y la plain no
+  // llevaba nada: quien lo abriera en un cliente de texto recibía un mail anónimo, y
+  // la divergencia entre partes de un multipart/alternative es heurística de spam.
+  const _firmaTexto = signatureHtml ? "\n\n" + _htmlATexto(signatureHtml) : "";
+  const cuerpoTexto = `${body}${_firmaTexto}${_pieBaja}`;
+  const _pieHtml = _pieBaja ? `\n<p style="color:#888;font-size:12px">${_pieBaja.trim().replace(/^--\n/, "")}</p>` : "";
+  const htmlBody = `${_textToHtmlServer(body)}${signatureHtml ? "\n<br/>\n" + signatureHtml : ""}${_pieHtml}${trackingPixel ? "\n" + trackingPixel : ""}`;
+
+  const boundary = `----=adeq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  const mime = [
+    `To: ${to}`,
+    // El From llevaba SOLO la dirección. Un cold email B2B sin nombre humano en el
+    // remitente puntúa peor en el filtro y muchísimo peor con quien lo recibe.
+    `From: ${nombreRemitente ? `${_codificarAsunto(nombreRemitente)} <${userEmail}>` : userEmail}`,
+    `Subject: ${subjectEncoded}`,
+    ..._cabecerasBaja,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    "",
+    `--${boundary}`,
+    "Content-Type: text/plain; charset=utf-8",
+    // quoted-printable pliega solo a 76 columnas. Con 8bit la firma HTML de Gmail
+    // salía en UNA línea de varios KB, por encima del límite de 998 octetos del RFC
+    // 5322 — estructuralmente distinto de un Gmail escrito a mano, que es justo lo
+    // que perfilan los clasificadores de correo masivo.
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    _aQuotedPrintable(cuerpoTexto),
+    "",
+    `--${boundary}`,
+    "Content-Type: text/html; charset=utf-8",
+    "Content-Transfer-Encoding: quoted-printable",
+    "",
+    _aQuotedPrintable(htmlBody),
+    "",
+    `--${boundary}--`,
+  ].join("\r\n");
+
+  // ── EL LINTER, JUSTO ANTES DE SALIR ───────────────────────────────────────
+  // Vive acá adentro y no en los callers, para que ninguna ruta futura se lo pueda
+  // saltear por olvido.
+  const _rev = revisarEntregabilidad({ to, subject, body: cuerpoTexto, html: htmlBody, mime, esProspeccion });
+  if (!_rev.ok) {
+    log(`  🛑 NO SE ENVÍA a ${to} — el linter lo frenó: ${_rev.bloqueantes.join(", ")}`);
+    if (_workerToken && userEmail) {
+      logAgentAction(_workerToken, userEmail, {
+        domain: String(to).split("@")[1] || "_lint_",
+        action: "skipped", reason: `linter:${_rev.bloqueantes[0]}`,
+        details: { bloqueantes: _rev.bloqueantes, avisos: _rev.avisos, subject },
+      }).catch(() => {});
+      saludAlerta(_workerToken, {
+        clave: `linter-${_rev.bloqueantes[0]}`, severidad: "error",
+        titulo: "🛑 Un mail se frenó antes de salir",
+        cuerpo: `Para ${to}: ${_rev.bloqueantes.join(", ")}\nAsunto: ${subject}`,
+        metadata: { to, bloqueantes: _rev.bloqueantes },
+      }).catch(() => {});
+    }
+    return { ok: false, error: `linter_${_rev.bloqueantes[0]}` };
   }
+  if (_rev.avisos.length) log(`  ⚠️ entregabilidad (${to}): ${_rev.avisos.join(", ")}`);
+
   const raw = Buffer.from(mime, "utf-8").toString("base64")
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
@@ -15113,9 +15316,10 @@ async function _secAvisar(token, cfg, { titulo, cuerpo, kind }) {
   try {
     await sendGmailServer(token, dest, {
       to: dest,
-      subject: `🚨 ADEQ Toolbar — ${titulo}`,
+      subject: `ADEQ Toolbar — ${titulo}`,
       body: cuerpo,
       agentActionId: null,
+      esProspeccion: false,       // correo interno: sin baja, sin reglas de estilo
     });
     await setConfigValue(token, ultimaKey, new Date().toISOString()).catch(() => {});
     log(`🚨 alerta de seguridad enviada a ${dest}: ${titulo}`);
@@ -15606,7 +15810,14 @@ async function runAgentCycle(token, allFlags) {
     log(`🤖 orden de atención (más atrasado primero): ${_ordenMbs.map(x => `${x.u.split("@")[0]}(faltan ${x.falta === Number.MAX_SAFE_INTEGER ? "?" : x.falta})`).join(" → ")}`);
   }
 
+  let _primerMb = true;
   for (const userEmail of _usuariosOrdenados) {
+    // ── ESCALONAR LOS BUZONES (Maxi 2026-08-12) ────────────────────────────
+    // Los tres corrían seguidos: sus mails salían dentro de la misma ventana de
+    // ~15 min después de cada slot. Tres buzones del MISMO dominio disparando a la
+    // vez, cinco veces por día, es un patrón de envío automatizado. Se separan.
+    if (!_primerMb) await sleep(90_000 + Math.floor(Math.random() * 60_000));
+    _primerMb = false;
     if (!AGENT_WHITELIST.has((userEmail || "").toLowerCase())) {
       log(`🚫 Agent: user ${userEmail} no está en whitelist hardcoded — skip`);
       continue;
@@ -15639,7 +15850,13 @@ async function runAgentCycle(token, allFlags) {
     const _capSource = _capPerUser ? "agent_max_per_day_by_user"
                      : (aCfg.focus.dailyOverride ? "agent_focus_config.daily_override (PISA al campo del admin)"
                                                  : "agent_max_per_day (campo del admin)");
-    const sentToday = await getAgentDailyCount(token, userEmail);
+    const _contado = await getAgentDailyCount(token, userEmail);
+    // "No sé cuántos mandé" no puede significar ni "mandé 0" (revienta el cupo) ni
+    // "mandé todos" (pierde el día). Se asume casi lleno: sale un envío de prueba y
+    // en la próxima vuelta, con la base ya respondiendo, se recupera el ritmo.
+    const _noSeCuantos = _contado == null;
+    const sentToday = _noSeCuantos ? Math.max(0, userMaxPerDay - 1) : _contado;
+    if (_noSeCuantos) log(`  ⚠️ ${userEmail}: no se pudo contar lo enviado hoy — mando 1 solo por prudencia`);
     if (sentToday >= userMaxPerDay) {
       log(`🤖 Agent ${userEmail}: cap diario ${userMaxPerDay} alcanzado (${sentToday})`);
       continue;
@@ -16700,7 +16917,15 @@ async function runAgentCycle(token, allFlags) {
             // recibe una variante corta que reconoce explícitamente el doble contacto.
             const _cuerpo2do = `${pitch.body}\n\n---\nPD: escribí también a ${email.split("@")[0]}@${domain} por las dudas — si no sos vos quien lleva esto, ignoralo sin problema.`;
             log(`  ➕ ${domain}: agente envía AL 2DO email ${secondCandidate.email} (score=${secondCandidate.score}, source=${secondCandidate.source})`);
-            await sendGmailServer(token, userEmail, { to: secondCandidate.email, subject, body: _cuerpo2do, agentActionId: null });
+            // Verificar también acá: esta ruta mandaba sin preguntar.
+            const _v2 = await _verifyEmailMV(token, secondCandidate.email).catch(() => "riesgo");
+            if (_v2 === "no") { log(`  ⛔ ${domain}: el 2º email no verifica — no se manda`); throw new Error("segundo_no_verifica"); }
+            // Y separarlo en el tiempo: salían dos mensajes al MISMO dominio con el
+            // MISMO asunto en menos de un segundo. Eso se ve desde afuera como un
+            // disparo automático. Se espera y se rota el asunto.
+            await sleep(12000 + Math.floor(Math.random() * 8000));
+            const _subj2 = (pitch.subjects || []).find(x => x && x !== subject) || subject;
+            await sendGmailServer(token, userEmail, { to: secondCandidate.email, subject: _subj2, body: _cuerpo2do, agentActionId: null });
             // Registrar en response_tracking con source del 2do
             fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
               method: "POST",
@@ -17747,6 +17972,154 @@ async function autoAjustarSegunMetricas(token) {
       detalle: ajustes.length ? ajustes.join(" · ") : `sin cambios (pool para ${diasDeAutonomia.toFixed(1)} días)`,
     });
   } catch (e) { log(`⚠️ autoAjustarSegunMetricas: ${e.message}`); }
+}
+
+// ════════════════════════════════════════════════════════════════
+// VIGILANCIA DE REPUTACIÓN (Maxi 2026-08-12)
+// ════════════════════════════════════════════════════════════════
+// Los tres buzones comparten adeqmedia.com, y en Gmail la reputación es POR
+// DOMINIO: si uno acumula rebotes, caen los tres — y el mismo dominio es el que se
+// usa para hablar con clientes reales. No había ningún freno por tasa de rebote.
+const REBOTE_TECHO_BUZON  = 0.02;   // 2% en 7 días → se pausa ese buzón
+const REBOTE_TECHO_DOMINIO = 0.03;  // 3% sumando los tres → se frena todo
+
+async function vigilarReputacion(token) {
+  try {
+    if (!(await _tocaCorrer(token, "vigilar_reputacion", 6 * 60))) return;
+    const desde = new Date(Date.now() - 7 * 86400000).toISOString();
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+
+    let envios = [];
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${desde}&select=user_email,email_to&limit=3000`, { headers: auth });
+      if (!r.ok) return;                                   // no pude medir ≠ todo bien
+      envios = await r.json();
+    } catch { return; }
+    if (!Array.isArray(envios) || envios.length < 30) return;   // muestra chica: no concluir
+
+    let rebotados = new Set();
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email&limit=3000`, { headers: auth });
+      if (!r.ok) return;
+      const f = await r.json();
+      if (Array.isArray(f)) rebotados = new Set(f.map(x => String(x.email || "").toLowerCase()));
+    } catch { return; }
+
+    const porBuzon = {};
+    for (const e of envios) {
+      const mb = (e.user_email || "?").toLowerCase();
+      porBuzon[mb] = porBuzon[mb] || { env: 0, reb: 0 };
+      porBuzon[mb].env++;
+      if (rebotados.has(String(e.email_to || "").toLowerCase())) porBuzon[mb].reb++;
+    }
+    const totEnv = envios.length;
+    const totReb = Object.values(porBuzon).reduce((a, x) => a + x.reb, 0);
+    const tasaDominio = totReb / totEnv;
+
+    // ── Dominio entero por encima del techo: se frena todo ────────────────────
+    if (tasaDominio > REBOTE_TECHO_DOMINIO) {
+      await setConfigValue(token, "agent_paused_until", new Date(Date.now() + 12 * 3600_000).toISOString()).catch(() => {});
+      await saludAlerta(token, {
+        clave: "reputacion-dominio", severidad: "error",
+        titulo: `🔥 Rebote del ${(tasaDominio * 100).toFixed(1)}% — envío PAUSADO 12h`,
+        cuerpo: `${totReb} rebotes sobre ${totEnv} envíos en 7 días, por encima del techo del ${REBOTE_TECHO_DOMINIO * 100}%.\nLa reputación en Gmail es por DOMINIO: esto arrastra a los tres buzones y también al correo con clientes.\nRevisá la verificación de direcciones antes de reanudar.`,
+        metadata: { tasa: +tasaDominio.toFixed(4), envios: totEnv, rebotes: totReb },
+      });
+      log(`🔥 REPUTACIÓN: rebote ${(tasaDominio * 100).toFixed(1)}% → agente pausado 12h`);
+    } else {
+      // ── Un buzón puntual pasado de rosca ───────────────────────────────────
+      for (const [mb, d] of Object.entries(porBuzon)) {
+        if (d.env < 20) continue;
+        const t = d.reb / d.env;
+        if (t > REBOTE_TECHO_BUZON) {
+          await saludAlerta(token, {
+            clave: `reputacion-${mb}`, severidad: "error",
+            titulo: `⚠️ ${mb} rebota al ${(t * 100).toFixed(1)}%`,
+            cuerpo: `${d.reb} de ${d.env} envíos en 7 días. Techo por buzón: ${REBOTE_TECHO_BUZON * 100}%.\nSi sigue subiendo se frena el dominio entero.`,
+            metadata: { mb, tasa: +t.toFixed(4) },
+          });
+        }
+      }
+    }
+
+    // ── Señal indirecta pero fuerte: silencio absoluto ─────────────────────────
+    // Muchos envíos y CERO respuestas reales suele significar que no los están
+    // viendo. Es lo más parecido a un detector de "estamos en spam" que se puede
+    // tener sin Postmaster Tools.
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${desde}&select=response_type&limit=3000`, { headers: auth });
+      if (r.ok) {
+        const f = await r.json();
+        if (Array.isArray(f) && f.length >= 80) {
+          const reales = f.filter(x => x.response_type === "real").length;
+          if (reales === 0) {
+            await saludAlerta(token, {
+              clave: "silencio-total", severidad: "error",
+              titulo: `🔇 ${f.length} envíos en 7 días y CERO respuestas reales`,
+              cuerpo: `Un silencio así suele significar que los mails no se están viendo (spam), no que el copy sea malo.\nChequeá Google Postmaster Tools y el estado de DKIM/DMARC.`,
+              metadata: { envios: f.length },
+            });
+          }
+        }
+      }
+    } catch {}
+
+    await saludPing(token, "reputacion", {
+      status: "ok", cadenciaMin: 6 * 60,
+      detalle: `rebote ${(tasaDominio * 100).toFixed(2)}% sobre ${totEnv} envíos (7d)`,
+      real: Math.round((1 - tasaDominio) * 100), esperado: 97,
+    });
+  } catch (e) { log(`⚠️ vigilarReputacion: ${e.message}`); }
+}
+
+// ── CHEQUEO DEL PROPIO DNS ───────────────────────────────────────────────────
+// Diez líneas que cubren el agujero más grande de la auditoría: nadie verificaba
+// SPF, DKIM ni DMARC de adeqmedia.com. Sin autenticación, cualquier arreglo de
+// contenido rinde menos. El helper `_doh` ya existía para mirar el DNS de los
+// prospectos; acá se lo apunta a nuestro propio dominio.
+async function chequearAutenticacionPropia(token) {
+  try {
+    if (!(await _tocaCorrer(token, "dns_propio", 24 * 60))) return;
+    const dom = (await getConfig(token).catch(() => ({})))?.dominio_remitente || "adeqmedia.com";
+    const txt = async (n) => {
+      try {
+        const r = await _doh(n, "TXT");
+        return (Array.isArray(r) ? r : []).map(x => String(x.data || "").replace(/^"|"$/g, ""));
+      } catch { return null; }
+    };
+    const raiz  = await txt(dom);
+    const dkim  = await txt(`google._domainkey.${dom}`);
+    const dmarc = await txt(`_dmarc.${dom}`);
+    if (raiz === null && dkim === null && dmarc === null) return;   // DNS caído: no concluir
+
+    const problemas = [];
+    const spf = (raiz || []).filter(t => /^v=spf1/i.test(t));
+    if (!spf.length) problemas.push("NO hay registro SPF");
+    else if (spf.length > 1) problemas.push(`hay ${spf.length} registros SPF (eso INVALIDA los dos)`);
+    else if (!/include:_spf\.google\.com/i.test(spf[0])) problemas.push("el SPF no incluye _spf.google.com");
+
+    if (!(dkim || []).some(t => /v=DKIM1/i.test(t))) {
+      problemas.push("NO hay DKIM en google._domainkey — hay que generarlo en la consola de Workspace y darle 'Start authentication'");
+    }
+    const dm = (dmarc || []).find(t => /^v=DMARC1/i.test(t));
+    if (!dm) problemas.push("NO hay DMARC en _dmarc");
+    else if (/p=none/i.test(dm)) problemas.push("el DMARC está en p=none (monitoreo). Cuando los reportes alineen, subir a p=quarantine");
+
+    if (problemas.length) {
+      await saludAlerta(token, {
+        clave: "dns-autenticacion", severidad: "error",
+        titulo: `📮 La autenticación de ${dom} tiene ${problemas.length} problema(s)`,
+        cuerpo: `${problemas.map(p => "· " + p).join("\n")}\n\nEsto NO se arregla desde el código: es DNS y consola de Google Workspace.\nMientras falte, todo lo demás que hagamos contra el spam rinde menos.`,
+        metadata: { dominio: dom, problemas },
+      });
+    }
+    await saludPing(token, "dns_propio", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: problemas.length ? problemas.join(" · ") : "SPF, DKIM y DMARC en orden",
+      real: problemas.length ? 0 : 1, esperado: 1,
+    });
+    log(`📮 DNS ${dom}: ${problemas.length ? problemas.join(" · ") : "SPF/DKIM/DMARC OK"}`);
+  } catch (e) { log(`⚠️ chequearAutenticacionPropia: ${e.message}`); }
 }
 
 // Cada cuánto, como MÁXIMO, se manda el mail de resumen.
@@ -19053,6 +19426,10 @@ async function main() {
       await guardarMetricasDelDia(token).catch(e => log(`⚠️ métricas: ${e.message}`));
       // Autoajuste: mueve perillas dentro de límites duros según la tendencia.
       await autoAjustarSegunMetricas(token).catch(e => log(`⚠️ autoajuste: ${e.message}`));
+      // Reputación: freno automático por tasa de rebote + detector de silencio total.
+      await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
+      // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
+      await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
