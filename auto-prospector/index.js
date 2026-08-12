@@ -17648,6 +17648,107 @@ async function guardarMetricasDelDia(token) {
   } catch (e) { log(`⚠️ guardarMetricasDelDia: ${e.message}`); }
 }
 
+// ════════════════════════════════════════════════════════════════
+// AUTOAJUSTE POR MÉTRICAS (Maxi 2026-08-12)
+// ════════════════════════════════════════════════════════════════
+// Pedido: "que seas autónomo y puedas solucionar todo problema que se vaya
+// presentando en pos de optimizar". El que corre 24/7 es el worker, así que la
+// autonomía tiene que vivir acá y no en una sesión de chat.
+//
+// Lee la historia de métricas y mueve perillas concretas DENTRO DE LÍMITES DUROS.
+// Tres reglas que se respetan siempre:
+//   1. Todo ajuste tiene tope y piso. Nada puede dispararse solo.
+//   2. Se necesita evidencia de varios días, no un mal día suelto.
+//   3. Todo cambio queda registrado y se cuenta en el resumen de 72h.
+const _LIMITES_AJUSTE = {
+  feeder_daily_target: { min: 80,  max: 400, paso: 40 },
+  agent_threshold_traffic: { min: 350000, max: 800000, paso: 50000 },
+};
+
+async function autoAjustarSegunMetricas(token) {
+  try {
+    if (!(await _tocaCorrer(token, "autoajuste", 24 * 60))) return;
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    if (String(cfg.autoajuste_enabled ?? "true") !== "true") return;   // apagable
+
+    // Se necesitan al menos 3 días de historia: un día malo no es una tendencia.
+    let dias = [];
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_metricas_diarias?select=*&order=dia.desc&limit=7`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      if (r.ok) dias = await r.json();
+    } catch {}
+    if (!Array.isArray(dias) || dias.length < 3) return;
+
+    const prom = (campo) => dias.reduce((a, d) => a + (Number(d[campo]) || 0), 0) / dias.length;
+    const ajustes = [];
+    const _mover = async (clave, actual, dir) => {
+      const lim = _LIMITES_AJUSTE[clave];
+      const nuevo = Math.max(lim.min, Math.min(lim.max, actual + dir * lim.paso));
+      if (nuevo === actual) return null;
+      await setConfigValue(token, clave, String(nuevo));
+      return `${clave}: ${actual} → ${nuevo}`;
+    };
+
+    // ── 1. ¿Alcanza el pool para los envíos de los próximos días? ────────────
+    // Es la métrica que decide todo: sin pool, los 20 diarios no salen por más que
+    // el enviador funcione perfecto.
+    const listos = Number(dias[0].pool_con_email || 0);
+    let users = []; try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+    const consumoDiario = Math.max(1, users.length * (parseInt(cfg.agent_max_per_day || "20", 10) || 20));
+    const diasDeAutonomia = listos / consumoDiario;
+    const objetivoActual = parseInt(cfg.feeder_daily_target || "150", 10) || 150;
+
+    if (diasDeAutonomia < 5) {
+      // Menos de 5 días de combustible: hay que descubrir más.
+      const m = await _mover("feeder_daily_target", objetivoActual, +1);
+      if (m) ajustes.push(`pool para ${diasDeAutonomia.toFixed(1)} días → subo el descubrimiento (${m})`);
+    } else if (diasDeAutonomia > 20) {
+      // Más de 20 días: sobra pool y cada lead nuevo cuesta créditos. Bajar el ritmo.
+      const m = await _mover("feeder_daily_target", objetivoActual, -1);
+      if (m) ajustes.push(`pool para ${diasDeAutonomia.toFixed(1)} días → bajo el descubrimiento y ahorro créditos (${m})`);
+    }
+
+    // ── 2. ¿Se está encontrando email, o el pool se llena de leads mudos? ────
+    // Si la mayoría de lo que entra no consigue contacto, subir el volumen solo
+    // agranda el problema: conviene exigir más tráfico en la entrada, porque los
+    // sitios más grandes tienen más superficie donde encontrar un email.
+    const altasProm = prom("altas");
+    const halladosProm = prom("emails_hallados");
+    const sinEmail = Number(dias[0].pool_sin_email || 0);
+    if (altasProm >= 10 && sinEmail > listos * 1.5 && halladosProm < altasProm * 0.2) {
+      const th = parseInt(cfg.agent_threshold_traffic || "400000", 10) || 400000;
+      const m = await _mover("agent_threshold_traffic", th, +1);
+      if (m) ajustes.push(`${Math.round(sinEmail)} leads mudos contra ${listos} con email → subo el piso de tráfico (${m})`);
+    }
+
+    // ── 3. ¿Los envíos llegan al objetivo? ───────────────────────────────────
+    // Si no llegan y ADEMÁS hay pool de sobra, el problema no es el combustible:
+    // es el enviador. Eso NO se autoajusta — se reporta, porque tocarlo a ciegas
+    // puede empeorarlo. La autonomía tiene que saber dónde termina.
+    const enviadosProm = prom("enviados");
+    if (enviadosProm < consumoDiario * 0.7 && diasDeAutonomia > 5) {
+      await saludAlerta(token, {
+        clave: "envios-bajos-con-pool", severidad: "error",
+        titulo: `📮 Se envía por debajo del objetivo y NO es por falta de pool`,
+        cuerpo: `Promedio ${Math.round(enviadosProm)} de ${consumoDiario} esperados, con ${listos} leads listos (${diasDeAutonomia.toFixed(1)} días).\nEsto no lo autoajusto: hay que mirar por qué se saltean.\n  SELECT reason, count(*) FROM toolbar_agent_actions WHERE action='skipped' AND created_at > now() - interval '3 days' GROUP BY 1 ORDER BY 2 DESC;`,
+        metadata: { enviados: Math.round(enviadosProm), objetivo: consumoDiario, pool: listos },
+      });
+    }
+
+    if (ajustes.length) {
+      await setConfigValue(token, "autoajuste_ultimo", `${_madridDateStr()} — ${ajustes.join(" · ")}`).catch(() => {});
+      for (const a of ajustes) await _acumularCuracion(token, `autoajuste — ${a}`).catch(() => {});
+      log(`🎛️ autoajuste: ${ajustes.join(" · ")}`);
+    }
+    await saludPing(token, "autoajuste", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: ajustes.length ? ajustes.join(" · ") : `sin cambios (pool para ${diasDeAutonomia.toFixed(1)} días)`,
+    });
+  } catch (e) { log(`⚠️ autoAjustarSegunMetricas: ${e.message}`); }
+}
+
 // Cada cuánto, como MÁXIMO, se manda el mail de resumen.
 const RESUMEN_SALUD_CADA_HORAS = 72;
 
@@ -18950,6 +19051,8 @@ async function main() {
       await enviarResumenSalud(token).catch(e => log(`⚠️ resumenSalud: ${e.message}`));
       // Snapshot diario de las 4 métricas, al cierre de la jornada.
       await guardarMetricasDelDia(token).catch(e => log(`⚠️ métricas: ${e.message}`));
+      // Autoajuste: mueve perillas dentro de límites duros según la tendencia.
+      await autoAjustarSegunMetricas(token).catch(e => log(`⚠️ autoajuste: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
