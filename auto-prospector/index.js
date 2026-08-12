@@ -8151,7 +8151,10 @@ const SIMILAR_EXP_COOLDOWN_MS = 5 * 60 * 1000;
 const SIMILAR_EXP_BATCH = 6;
 async function runProspectSimilarExpansion(token) {
   const cfg = await getConfig(token);
-  if (String(cfg.similar_expansion_enabled || "") !== "true") return;
+  if (String(cfg.similar_expansion_enabled || "") !== "true") {
+    await saludApagado(token, "similar_expansion", "similar_expansion_enabled=false");
+    return;
+  }
   if (Date.now() - _lastSimilarExpAt < SIMILAR_EXP_COOLDOWN_MS) return;
   _lastSimilarExpAt = Date.now();
   const rapidapi_key = cfg.rapidapi_key;
@@ -17562,16 +17565,164 @@ async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning"
       dedup_key: `salud-${clave}-${hoy}`,
     });
     log(`🚨 SALUD [${severidad}] ${titulo} — ${cuerpo}`);
-    if (severidad === "error") {
-      const cfg = await getConfig(token).catch(() => ({}));
-      await _secAvisar(token, cfg, {
-        titulo,
-        cuerpo: `${cuerpo}\n\nRevisá el detalle con:\n  SELECT * FROM toolbar_health_check ORDER BY estado, job;`,
-        kind: `salud_${clave}`,
-      }).catch(() => {});
+    // ── NO SE MANDA MAIL ACÁ (Maxi 2026-08-12) ─────────────────────────────
+    // Antes cada alerta grave disparaba su propio mail y el user recibió varios por
+    // día, casi todos falsos. Pedido textual: "que sea 1 unificado cada 72 hs como
+    // máximo, para no tener que hacer correcciones día a día".
+    // Ahora se acumula y lo manda `enviarResumenSalud` en un solo mail.
+    if (severidad === "error" || severidad === "warning") {
+      await _acumularEnResumen(token, { clave, titulo, cuerpo, severidad });
     }
   } catch (e) { log(`⚠️ saludAlerta: ${e.message}`); }
 }
+
+// Cada cuánto, como MÁXIMO, se manda el mail de resumen.
+const RESUMEN_SALUD_CADA_HORAS = 72;
+
+// Acumula un hallazgo en el resumen pendiente. Deduplica por clave: si el mismo
+// problema aparece 40 veces en 3 días, en el mail va UNA línea con el conteo.
+async function _acumularEnResumen(token, item) {
+  try {
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    let pend = [];
+    try { pend = JSON.parse(cfg.salud_resumen_pendiente || "[]"); } catch {}
+    const ya = pend.find(x => x.clave === item.clave);
+    if (ya) {
+      ya.veces = (ya.veces || 1) + 1;
+      ya.cuerpo = item.cuerpo;                       // el detalle más reciente
+      ya.ultima = new Date().toISOString();
+    } else {
+      pend.push({ ...item, veces: 1, primera: new Date().toISOString(), ultima: new Date().toISOString() });
+    }
+    await setConfigValue(token, "salud_resumen_pendiente", JSON.stringify(pend.slice(0, 40)));
+  } catch {}
+}
+
+// Registra algo que el sistema se arregló solo, para contarlo en el resumen.
+async function _acumularCuracion(token, texto) {
+  try {
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    let cur = [];
+    try { cur = JSON.parse(cfg.salud_resumen_curado || "[]"); } catch {}
+    cur.push({ texto, cuando: new Date().toISOString() });
+    await setConfigValue(token, "salud_resumen_curado", JSON.stringify(cur.slice(-40)));
+  } catch {}
+}
+
+/**
+ * UN solo mail cada 72 horas con todo junto: lo que se arregló solo y lo que
+ * necesita una mano. Si no hay nada pendiente, no manda nada.
+ */
+async function enviarResumenSalud(token) {
+  try {
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    const ultima = Date.parse(cfg.salud_resumen_at || "") || 0;
+    if (Date.now() - ultima < RESUMEN_SALUD_CADA_HORAS * 3600 * 1000) return;
+
+    let pend = [], curado = [];
+    try { pend   = JSON.parse(cfg.salud_resumen_pendiente || "[]"); } catch {}
+    try { curado = JSON.parse(cfg.salud_resumen_curado || "[]"); } catch {}
+    // Nada que contar → no se molesta a nadie, pero se corre la ventana igual para
+    // que el próximo resumen no salga apenas aparezca el primer hallazgo.
+    if (!pend.length && !curado.length) {
+      await setConfigValue(token, "salud_resumen_at", new Date().toISOString()).catch(() => {});
+      return;
+    }
+
+    const dias = RESUMEN_SALUD_CADA_HORAS / 24;
+    const partes = [`Resumen de los últimos ${dias} días.\n`];
+
+    if (curado.length) {
+      partes.push(`✅ SE ARREGLÓ SOLO (${curado.length}) — no tenés que hacer nada:`);
+      const _agr = {};
+      curado.forEach(c => { _agr[c.texto] = (_agr[c.texto] || 0) + 1; });
+      Object.entries(_agr).forEach(([t, n]) => partes.push(`   · ${t}${n > 1 ? ` (${n} veces)` : ""}`));
+      partes.push("");
+    }
+
+    const graves = pend.filter(p => p.severidad === "error");
+    const leves  = pend.filter(p => p.severidad !== "error");
+    if (graves.length) {
+      partes.push(`🔴 NECESITA UNA MANO (${graves.length}):`);
+      graves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — se repitió ${p.veces} veces` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`));
+      partes.push("");
+    }
+    if (leves.length) {
+      partes.push(`🟡 PARA MIRAR CUANDO PUEDAS (${leves.length}):`);
+      leves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` (${p.veces}×)` : ""}`));
+      partes.push("");
+    }
+    partes.push("El detalle completo:\n  SELECT * FROM toolbar_health_check ORDER BY estado, job;");
+
+    const _titulo = graves.length
+      ? `Resumen ${dias}d — ${graves.length} cosa(s) para revisar`
+      : `Resumen ${dias}d — todo bajo control`;
+
+    // Se manda por el canal de siempre. `kind` fijo para que el anti-spam del
+    // remitente cuente este mail como uno solo.
+    const _ok = await _secAvisar(token, cfg, { titulo: _titulo, cuerpo: partes.join("\n"), kind: "salud_resumen" });
+    if (_ok !== false) {
+      await setConfigValue(token, "salud_resumen_at", new Date().toISOString()).catch(() => {});
+      await setConfigValue(token, "salud_resumen_pendiente", "[]").catch(() => {});
+      await setConfigValue(token, "salud_resumen_curado", "[]").catch(() => {});
+      log(`📬 resumen de salud enviado (${graves.length} graves, ${leves.length} leves, ${curado.length} curados)`);
+    }
+  } catch (e) { log(`⚠️ enviarResumenSalud: ${e.message}`); }
+}
+
+/**
+ * Marca un job como APAGADO A PROPÓSITO. No es lo mismo que roto.
+ * Sin esto, cualquier job detrás de un flag en false figuraba "atrasado" para
+ * siempre y generaba una alerta diaria que no había que atender.
+ */
+async function saludApagado(token, job, motivo = "flag apagado") {
+  return saludPing(token, job, { status: "off", detalle: motivo });
+}
+
+// ── CURAS CONOCIDAS (Maxi 2026-08-12) ────────────────────────────────────────
+// "La idea es que vos puedas autogestionarte con los errores que enviás y
+// autocorregirlos." Cada entrada arregla una causa concreta y devuelve qué hizo,
+// o null si no correspondía. Lo que se cura no llega al mail.
+const _CURAS_CONOCIDAS = {
+  // Los tres barridos se auto-apagan al terminar; si quedaron apagados y ya pasó el
+  // plazo, el auto-pulido debería re-encenderlos. Si no lo hizo, se fuerza acá.
+  polish_pool: async (token, cfg) => {
+    if (String(cfg.polish_pool || "") === "true") return null;
+    await setConfigValue(token, "polish_cursor_ts", "");
+    await setConfigValue(token, "polish_pool", "true");
+    return "re-encendido el repaso del pool";
+  },
+  url_purge: async (token, cfg) => {
+    if (String(cfg.url_purge_enabled || "") === "true") return null;
+    await setConfigValue(token, "url_purge_cursor", "");
+    await setConfigValue(token, "url_purge_enabled", "true");
+    return "re-encendida la purga por URL";
+  },
+  purge_blocked: async (token, cfg) => {
+    if (String(cfg.purge_blocked_prospects || "") === "true") return null;
+    await setConfigValue(token, "purge_cursor_ts", "");
+    await setConfigValue(token, "purge_blocked_prospects", "true");
+    return "re-encendido el barrido de bloqueados";
+  },
+  // Este arranca apagado por default y lo queremos prendido: es una de las vías de
+  // descubrimiento. Si figura atrasado por el flag, se prende en vez de avisar.
+  similar_expansion: async (token, cfg) => {
+    if (String(cfg.similar_expansion_enabled || "") === "true") return null;
+    await setConfigValue(token, "similar_expansion_enabled", "true");
+    return "prendida la expansión por similares (estaba apagada por default)";
+  },
+  // Un marcador de slots corrupto o de otro día deja al agente sin poder disparar.
+  agente_envios: async (token, cfg) => {
+    const hoy = _madridDateStr();
+    const marca = String(cfg.agent_slots_done || "");
+    if (!marca || marca.startsWith(`${hoy}:`)) return null;
+    await setConfigValue(token, "agent_slots_done", "");
+    return `limpiado el marcador de slots, que era de otro día (${marca.split(":")[0]})`;
+  },
+};
 
 // Cada cuánto corre el vigilante (minutos de reloj, NO iteraciones del loop:
 // iterCount se resetea en cada restart y por eso los jobs con `% 60` no corrían).
@@ -17601,17 +17752,61 @@ async function saludWatchdog(token) {
     } catch {}
     if (!leyoOk) return;   // no pudimos leer ≠ todo sano. Nunca alertamos a ciegas.
 
+    // ── MINUTOS ACTIVOS, NO DE RELOJ (Maxi 2026-08-12) ────────────────────
+    // La primera tanda de alertas fue casi toda FALSA: decían "similar_expansion hace
+    // 914 min" a las 4 de la mañana. El worker duerme fuera de 9-23 y los fines de
+    // semana, así que esas 15 horas de gap son NORMALES, no una falla. Comparar contra
+    // el reloj de pared hacía que todos los jobs parecieran caídos cada mañana.
+    // Se acota el atraso a los minutos que la ventana activa lleva abierta hoy.
+    const _minsVentanaAbierta = Math.max(0, (_spainHour() - (parseInt(cfg.active_hours_start || "9", 10) || 9)) * 60);
+    const _atrasoReal = (okTs) => {
+      const pared = Math.round((Date.now() - okTs) / 60000);
+      return Math.min(pared, Math.max(_minsVentanaAbierta, 1));
+    };
+
     const atrasados = [], rindenPoco = [], fallando = [];
     for (const f of filas) {
       const cad = f.esperado_cada_min;
       const okTs = Date.parse(f.last_ok_at || "") || 0;
-      if (cad && (!okTs || Date.now() - okTs > cad * 3 * 60 * 1000)) {
-        const hace = okTs ? Math.round((Date.now() - okTs) / 60000) : null;
-        atrasados.push(`${f.job} (${hace == null ? "nunca corrió" : `hace ${hace} min, esperado cada ${cad}`})`);
+      // Un job APAGADO a propósito no está roto. `last_status='off'` lo pone el propio
+      // job cuando su flag está en false: sin esto, similar_expansion (que arranca
+      // apagado por default) figuraba "atrasado" para siempre.
+      if (f.last_status === "off") continue;
+      if (cad && okTs && _atrasoReal(okTs) > cad * 3) {
+        atrasados.push(`${f.job} (hace ${_atrasoReal(okTs)} min de actividad, esperado cada ${cad})`);
+      }
+      // "Nunca corrió" solo se reporta si la ventana ya lleva un rato abierta: al
+      // arrancar el worker, TODOS los jobs están sin correr por definición.
+      if (cad && !okTs && _minsVentanaAbierta > 120) {
+        atrasados.push(`${f.job} (nunca corrió)`);
       }
       if ((f.fails_consecutivos || 0) >= 3) fallando.push(`${f.job} (${f.fails_consecutivos} fallos seguidos: ${f.last_detail || "sin detalle"})`);
       if (f.esperado_ultimo != null && f.real_ultimo != null && Number(f.real_ultimo) < Number(f.esperado_ultimo) * 0.5) {
         rindenPoco.push(`${f.job} (${f.real_ultimo} de ${f.esperado_ultimo} esperados)`);
+      }
+    }
+
+    // ── AUTOCURACIÓN: arreglar antes de molestar (Maxi 2026-08-12) ─────────
+    // Pedido del user: "la idea es que vos puedas autogestionarte con los errores
+    // que enviás y autocorregirlos". Lo que tiene arreglo conocido se arregla solo y
+    // se cuenta en el resumen; solo se reporta como problema lo que NO se pudo curar.
+    const curados = [];
+    if (atrasados.length) {
+      for (const _txt of [...atrasados]) {
+        const job = _txt.split(" ")[0];
+        const _arreglo = _CURAS_CONOCIDAS[job];
+        if (!_arreglo) continue;
+        try {
+          const hecho = await _arreglo(token, cfg);
+          if (hecho) {
+            curados.push(`${job}: ${hecho}`);
+            atrasados.splice(atrasados.indexOf(_txt), 1);
+          }
+        } catch (e) { log(`⚠️ autocuración ${job}: ${e.message}`); }
+      }
+      if (curados.length) {
+        log(`🔧 autocuración: ${curados.join(" · ")}`);
+        for (const c of curados) await _acumularCuracion(token, c).catch(() => {});
       }
     }
     if (atrasados.length) {
@@ -18679,6 +18874,8 @@ async function main() {
       // que vigila y nunca avisa de nada. Tiene su propio guard de 15 min, así que
       // llamarlo en cada vuelta sale en microsegundos.
       await saludWatchdog(token).catch(e => log(`⚠️ saludWatchdog: ${e.message}`));
+      // UN solo mail cada 72h con todo junto (lo curado + lo que necesita una mano).
+      await enviarResumenSalud(token).catch(e => log(`⚠️ resumenSalud: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
