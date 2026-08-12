@@ -17576,6 +17576,78 @@ async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning"
   } catch (e) { log(`⚠️ saludAlerta: ${e.message}`); }
 }
 
+// ════════════════════════════════════════════════════════════════
+// SNAPSHOT DIARIO DE LAS 4 MÉTRICAS (Maxi 2026-08-12)
+// ════════════════════════════════════════════════════════════════
+// Las consultas del reporte son una FOTO del día. Sin historia no se puede
+// responder "¿esto mejora o empeora?", que es el sentido de medir cada 48 horas.
+// Una fila por día, escrita al cierre de la jornada.
+async function guardarMetricasDelDia(token) {
+  try {
+    if (!(await _tocaCorrer(token, "metricas_diarias", 12 * 60))) return;
+    // Se corre cerca del cierre para que el día esté completo.
+    if (_spainHour() < 21) return;
+    const hoy = _madridDateStr();
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const _contar = async (url) => {
+      try {
+        const r = await fetch(`${SUPABASE_URL}/rest/v1/${url}`, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+        if (!r.ok) return null;                       // no pude medir ≠ cero
+        return parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
+      } catch { return null; }
+    };
+
+    // 1 · envíos, cortados por MB
+    const porMb = {};
+    let enviados = 0;
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hoy}T00:00:00&select=user_email&limit=2000`, { headers: auth });
+      if (r.ok) {
+        const filas = await r.json();
+        if (Array.isArray(filas)) {
+          enviados = filas.length;
+          filas.forEach(f => { const u = f.user_email || "?"; porMb[u] = (porMb[u] || 0) + 1; });
+        }
+      }
+    } catch {}
+
+    // 2 · altas, cortadas por fuente
+    const porFuente = {};
+    let altas = 0;
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${hoy}T00:00:00&select=source&limit=5000`, { headers: auth });
+      if (r.ok) {
+        const filas = await r.json();
+        if (Array.isArray(filas)) {
+          altas = filas.length;
+          filas.forEach(f => { const s = f.source || "(sin fuente)"; porFuente[s] = (porFuente[s] || 0) + 1; });
+        }
+      }
+    } catch {}
+
+    // 3 y 4 · limpiados y emails hallados
+    const limpiados = await _contar(`toolbar_review_queue?status=eq.rejected&updated_at=gte.${hoy}T00:00:00&select=id`);
+    const hallados  = await _contar(`toolbar_review_queue?emails=not.eq.%5B%5D&updated_at=gte.${hoy}T00:00:00&created_at=lt.${hoy}T00:00:00&select=id`);
+    // Estado del pool al cierre
+    const conEmail  = await _contar(`toolbar_review_queue?status=eq.pending&emails=not.eq.%5B%5D&select=id`);
+    const sinEmail  = await _contar(`toolbar_review_queue?status=eq.pending&or=(emails.is.null,emails.eq.%5B%5D)&select=id`);
+    const congelados = await _contar(`toolbar_frozen_leads?select=domain`);
+
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_metricas_diarias`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({
+        dia: hoy, enviados, enviados_por_mb: porMb,
+        altas, altas_por_fuente: porFuente,
+        limpiados, emails_hallados: hallados,
+        pool_con_email: conEmail, pool_sin_email: sinEmail, congelados,
+      }),
+    });
+    log(`📊 métricas de ${hoy}: ${enviados} enviados · ${altas} altas · ${limpiados} limpiados · ${hallados} emails hallados · pool ${conEmail} con / ${sinEmail} sin`);
+    await saludPing(token, "metricas_diarias", { status: "ok", cadenciaMin: 24 * 60, detalle: `${enviados} env · ${altas} altas · ${hallados} emails` });
+  } catch (e) { log(`⚠️ guardarMetricasDelDia: ${e.message}`); }
+}
+
 // Cada cuánto, como MÁXIMO, se manda el mail de resumen.
 const RESUMEN_SALUD_CADA_HORAS = 72;
 
@@ -18876,6 +18948,8 @@ async function main() {
       await saludWatchdog(token).catch(e => log(`⚠️ saludWatchdog: ${e.message}`));
       // UN solo mail cada 72h con todo junto (lo curado + lo que necesita una mano).
       await enviarResumenSalud(token).catch(e => log(`⚠️ resumenSalud: ${e.message}`));
+      // Snapshot diario de las 4 métricas, al cierre de la jornada.
+      await guardarMetricasDelDia(token).catch(e => log(`⚠️ métricas: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
