@@ -1020,6 +1020,16 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
 // auto-apaga el flag.
 const REFRESH_EMPTY_BATCH = 3;
 async function refreshOneEmptyLead(token, cfg) {
+  // ⛔ REGLA DEL USER (2026-08-18), textual: "No hay que volver a consultar el tráfico si ya
+  // entró a Prospects porque pasó el filtro. Nunca."
+  // Este job hacía exactamente eso: agarraba leads YA en Prospects con traffic 0/null y les
+  // volvía a comprar el dato a SimilarWeb. Cada uno cuesta un hit del plan de 40.000/mes.
+  // Queda bloqueado en firme, no alcanzaba con el flag: estaba apagado de hecho pero cualquiera
+  // podía prenderlo sin saber lo que costaba.
+  // Si algún día hace falta revivirlo, hablarlo primero — la alternativa correcta para un lead
+  // con traffic 0 NO es volver a pagarlo, es que el agente de revisión lo saque de Prospects:
+  // si nunca tuvo una lectura válida de tráfico, en realidad nunca pasó el filtro.
+  if (String(cfg.permitir_recompra_de_trafico || "") !== "true") return;
   const flag = cfg.agent_refresh_empty_leads === "true";
   if (!flag) return;
   const rapidapi_key = cfg.rapidapi_key;
@@ -4875,8 +4885,9 @@ async function _scrapeTrafficFallback(domain) {
 async function getTrafficData(domain, rapidApiKey) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" };
 
-  // REGLA DE ORO: cache compartida 90 días en Supabase. Antes de gastar 1 hit
-  // a RapidAPI, chequeamos si ya tenemos data fresca de este dominio.
+  // REGLA DE ORO: cache compartida en Supabase (90 días por defecto, ajustable con
+  // `traffic_cache_dias`). Antes de gastar 1 hit a RapidAPI, chequeamos si ya tenemos
+  // data fresca de este dominio. Un dato ya comprado no se vuelve a comprar.
   const cleanD = cleanDomain(domain);
   const cached = await getTrafficCacheServer(cleanD);
   if (cached) {
@@ -5066,10 +5077,22 @@ async function getTrafficData(domain, rapidApiKey) {
 }
 
 // Cache helpers de tráfico para el worker (acceso directo a Supabase).
+// ── CUÁNTO VALE UN DATO YA COMPRADO (Maxi 2026-08-18) ───────────────────────────────
+// Regla del user: "no tiene que gastar crédito en Prospects si ya están los datos que
+// tomamos antes; el crédito se gasta solo en la primera consulta, por única vez".
+// Cada llamada a SimilarWeb cuesta plata del plan de RapidAPI (40.000/mes), así que
+// preguntar dos veces por el mismo dominio es tirar plata.
+// El valor estaba fijo en 90 días dentro del código. Ahora se puede estirar desde la
+// config sin tocar código ni deployar: `traffic_cache_dias`.
+// Por qué no es infinito: el tráfico es el filtro de calidad (mínimo 400K visitas). Un
+// sitio que hace dos años tenía medio millón puede estar muerto hoy, y decidir sobre un
+// dato viejo es peor que gastar la consulta. 90 días es el equilibrio; subilo si preferís
+// ahorrar, bajalo si empezás a ver leads con tráfico que no se corresponde.
+let _trafficCacheDias = 90;
 async function getTrafficCacheServer(domain) {
   if (!domain) return null;
   try {
-    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 90);
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - _trafficCacheDias);
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER}` } }
@@ -19890,6 +19913,14 @@ async function main() {
 
       // Heartbeat — cliente lee esto para mostrar si Railway está vivo
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
+
+      // Maxi 2026-08-18: refrescar cuántos días vale un dato de tráfico ya comprado.
+      // Vive en una variable de módulo porque getTrafficCacheServer se llama desde lugares
+      // que no tienen la config a mano.
+      try {
+        const _d = parseInt((await getConfig(token)).traffic_cache_dias || "90", 10);
+        if (_d > 0) _trafficCacheDias = _d;
+      } catch {}
 
       // Maxi 2026-08-18: libera las reservas de envío que quedaron colgadas. Va acá, en el loop,
       // y no solo al arrancar: el apagón del 12-18/08 fue exactamente eso — la salvaguarda existía
