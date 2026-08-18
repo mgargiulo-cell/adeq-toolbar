@@ -7505,15 +7505,19 @@ async function parteDelDia(token) {
     `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=source`,
     { headers: auth }
   ).then(r => r.ok ? r.json() : []).catch(() => []);
-  let altaImport = 0, altaAutopilot = 0, altaAutogoogle = 0, altaOtros = 0;
+  // Monday va aparte de los demás imports: es el reciclado de ciclos finalizados, o sea gente
+  // que YA trabajó con nosotros. Es la fuente de mejor calidad que hay y merece su propio
+  // renglón — mezclada con sellers.json y los CSV no se nota si deja de entrar.
+  let altaImport = 0, altaMonday = 0, altaAutopilot = 0, altaAutogoogle = 0, altaOtros = 0;
   for (const a of (Array.isArray(_altas) ? _altas : [])) {
     const s = String(a.source || "").toLowerCase();
     if (/autogoogle/.test(s)) altaAutogoogle++;
+    else if (/monday/.test(s)) altaMonday++;
     else if (/autopilot|similar|majestic|radar/.test(s)) altaAutopilot++;
-    else if (/monday|sellers|csv|manual|adstxt|import|feeder/.test(s)) altaImport++;
+    else if (/sellers|csv|manual|adstxt|import|feeder/.test(s)) altaImport++;
     else altaOtros++;
   }
-  const altasHoy = altaImport + altaAutopilot + altaAutogoogle + altaOtros;
+  const altasHoy = altaImport + altaMonday + altaAutopilot + altaAutogoogle + altaOtros;
   const backlog  = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`);
 
   // 4. LIMPIEZA: URLs que YA ESTABAN en Prospects y se sacaron hoy por no cumplir.
@@ -7545,7 +7549,7 @@ async function parteDelDia(token) {
   // Un motor en cero mientras otros traen es la señal que se perdió tres semanas: el total
   // disimulaba que Autopilot y AutoGoogle estaban muertos porque Monday seguía dando algo.
   else {
-    const _mudos = [["Autopilot", altaAutopilot], ["AutoGoogle", altaAutogoogle], ["los imports", altaImport]]
+    const _mudos = [["Autopilot", altaAutopilot], ["AutoGoogle", altaAutogoogle], ["los imports", altaImport], ["el reciclado de Monday", altaMonday]]
       .filter(([, n]) => n === 0).map(([m]) => m);
     if (_mudos.length) problemas.push(`Hoy no trajo nada: ${_mudos.join(", ")}. Los demás sí, así que no es una caída general.`);
   }
@@ -7560,14 +7564,15 @@ async function parteDelDia(token) {
     `1 · ENVÍOS  ${totalEnviado}/${objetivoTotal}`,
     ...lineasEnvio,
     "",
-    `2 · ALTAS POR IMPORT (Monday, sellers.json, CSV)   ${altaImport}`,
+    `2 · ALTAS POR IMPORT (sellers.json, CSV)           ${altaImport}`,
     `3 · ALTAS POR AUTOPILOT (similares, Majestic)      ${altaAutopilot}`,
     `4 · ALTAS POR AUTOGOOGLE                           ${altaAutogoogle}`,
+    `5 · MONDAY FINALIZADOS reciclados a Prospects      ${altaMonday}`,
     ...(altaOtros > 0 ? [`    (otras fuentes: ${altaOtros})`] : []),
     `    Total de altas del día: ${altasHoy}`,
     "",
-    `5 · SACADAS DE PROSPECTS por no cumplir            ${purgadas}`,
-    `6 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
+    `6 · SACADAS DE PROSPECTS por no cumplir            ${purgadas}`,
+    `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
     "",
     `PROSPECTS HOY  ${conEmail} contactables (~${diasDeStock} días de envíos) · ${sinEmail} sin email · ${backlog} en cola`,
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
