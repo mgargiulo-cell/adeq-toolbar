@@ -67,8 +67,13 @@ const PROVIDERS = {
 
 // Maxi 2026-07-28 (blindaje): CORS ya no es "*". Solo la extensión y el dashboard. Con "*"
 // cualquier página web podía invocar el proxy desde el navegador de un usuario logueado.
+// Maxi 2026-08-18: se fijó el ID REAL. Antes el patrón aceptaba CUALQUIER extensión de Chrome
+// ([a-p]{32}), así que una extensión cualquiera instalada en el navegador de un MB podía llamar
+// al proxy con la sesión de ese MB. El ID sale de la `key` fija del manifest, así que es estable
+// en todas las instalaciones (Web Store y carga manual del zip).
+const EXTENSION_ID = "jgbacjjjohjaiojjecgnejcalepkjclm";
 const ORIGENES_OK = [
-  /^chrome-extension:\/\/[a-p]{32}$/,          // extensión Chrome (ver nota: conviene fijar el ID real)
+  new RegExp(`^chrome-extension://${EXTENSION_ID}$`),
   /^https:\/\/([a-z0-9-]+\.)*adeqmedia\.com$/, // dashboards propios
   /^https:\/\/([a-z0-9-]+\.)*vercel\.app$/,    // previews de Vercel
 ];
@@ -123,7 +128,18 @@ serve(async (req) => {
 
   const { data: userData, error: userErr } = await supabase.auth.getUser(jwt);
   if (userErr || !userData?.user?.email) {
-    await registrarIncidente(supabase, "jwt_invalido", "warn", ipHash, { origin });
+    // Maxi 2026-08-18: se clasifica el incidente por ORIGEN. Un panel con la sesión vencida
+    // generaba decenas de 401 por hora y el Vigilante mandaba "64 intentos de acceso NO
+    // AUTORIZADO" — alarma real por una causa benigna. Ahora, si el origen es NUESTRO, queda como
+    // `info` (se registra igual, para poder auditar, pero el Vigilante no lo cuenta como ataque);
+    // si viene de afuera, sigue siendo `warn` y sí alerta. El `origin` en el detalle hace que el
+    // mail se conteste solo, sin tener que ir al SQL.
+    const propio = ORIGENES_OK.some((re) => re.test(origin));
+    await registrarIncidente(supabase, "jwt_invalido", propio ? "info" : "warn", ipHash, {
+      origin: origin || "(sin origen)",
+      propio,
+      motivo: userErr?.message?.slice(0, 120) || "token no válido",
+    });
     return json(401, { error: "Invalid token" }, origin);
   }
   const userEmail = userData.user.email.toLowerCase();

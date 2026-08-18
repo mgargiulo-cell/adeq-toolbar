@@ -1571,8 +1571,14 @@ let _rqValidCountCache = { at: 0, n: 0 };
 async function _getReviewQueueValidCount(token) {
   if (Date.now() - _rqValidCountCache.at < 30_000) return _rqValidCountCache.n;
   try {
+    // Maxi 2026-08-18: ahora cuenta SOLO los leads que se pueden usar, o sea los que tienen
+    // email. Antes contaba todo lo pendiente y el propio comentario del código lo admitía:
+    // "el conteo está inflado por leads SIN email (71%)". El efecto era un bloqueo circular —
+    // el pool se llenaba de leads sin contactar, el feeder los contaba y decía "está lleno, no
+    // traigo más", el agente no podía enviarlos, y el pool no drenaba nunca. Contar lo que
+    // sirve hace que el freno se active cuando de verdad hay trabajo, no cuando hay basura.
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${REVIEW_QUEUE_MIN_TRAFFIC}&emails=neq.%5B%5D&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     const range = res.headers.get("content-range") || "";
@@ -1753,7 +1759,54 @@ async function _drainBacklog(token, sourceTag, room) {
   } catch (e) { log(`  ⚠️ drain pre-listado: ${e.message}`); return 0; }
 }
 
+// ── ¿ES UN DOMINIO DE VERDAD? (Maxi 2026-08-18) ──────────────────────────────────────
+// Lo que costó no tener esto: `cachalot.k` entró a la cola el 6 de julio. El ".k" no existe
+// como terminación, así que SimilarWeb devolvía HTTP 400 en cada intento. Como el 400 estaba
+// mal clasificado como error transitorio, se reintentaba sin fin y la cola nunca avanzaba:
+// 1.711 dominios detrás sin procesar y los tres motores de descubrimiento frenados por
+// saturación. Seis semanas de parálisis por un dominio mal escrito.
+// El 400 ya está arreglado, pero la lección de fondo es otra: basura que no debió entrar
+// nunca. Éste es el filtro más barato del sistema — sin red, sin API, sin costo.
+// Primero LIMPIA (protocolo, www, ruta, puerto) y después juzga. El orden importa: tirar un
+// lead bueno por venir escrito como "https://ejemplo.com/noticias" sería cambiar un problema
+// por otro. Devuelve el dominio limpio, o "" si no hay dominio posible ahí adentro.
+function _dominioLimpio(d) {
+  let s = String(d || "").trim().toLowerCase();
+  if (!s) return "";
+  s = s.replace(/^[a-z]+:\/\//, "");     // https://
+  s = s.split(/[/?#]/)[0];               // ruta, query, ancla
+  s = s.split("@").pop();                // user@host
+  s = s.split(":")[0];                   // :8080
+  s = s.replace(/^www\./, "").replace(/\.$/, "");
+  // Dominios con acentos o ñ (olé.com.ar, españa.es): existen y en un mercado hispano son
+  // leads reales. Se pasan a punycode, que es como los resuelve internet de verdad, en vez
+  // de descartarlos por "caracteres raros".
+  if (/[^\x00-\x7F]/.test(s)) {
+    try { s = new URL(`http://${s}`).hostname.replace(/^www\./, ""); } catch { return ""; }
+  }
+  return s;
+}
+function _dominioValido(d) {
+  const s = _dominioLimpio(d);
+  if (!s || s.length > 253 || s.length < 4) return false;
+  if (/[\s_\\]/.test(s)) return false;
+  if (s.startsWith(".") || s.includes("..")) return false;
+  const partes = s.split(".");
+  if (partes.length < 2) return false;                // sin punto no es un dominio
+  const tld = partes[partes.length - 1];
+  if (!/^[a-z]{2,24}$/.test(tld)) return false;       // ← acá muere "cachalot.k"
+  return partes.every(p => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(p) && p.length <= 63);
+}
+
 async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
+  // Maxi 2026-08-18: se descarta la basura ANTES de que ocupe un lugar en la cola.
+  {
+    const _antesVal = domains.length;
+    // Se limpia Y se valida: lo recuperable entra normalizado, lo imposible no entra.
+    domains = [...new Set(domains.filter(_dominioValido).map(_dominioLimpio))];
+    const _tirados = _antesVal - domains.length;
+    if (_tirados > 0) log(`  🧹 ${sourceTag}: ${_tirados} dominio(s) descartado(s) o unificado(s) antes de encolar`);
+  }
   if (!domains || domains.length === 0) return 0;
   // CARRIL de la fuente: si ya llenó su cupo activo, no inyectar más.
   const laneCap  = PER_SOURCE_ACTIVE_CAP[sourceTag] ?? DEFAULT_SOURCE_CAP;
@@ -3574,7 +3627,11 @@ async function maybeStartAutopilotSlot(token) {
 // alineado con el feeder (cuando el cron mete leads, 30min después el
 // worker los procesa, y al próximo slot el Agent ya tiene material).
 // ════════════════════════════════════════════════════════════════
-const AGENT_SLOTS = [9, 12, 15, 18, 20];
+// Maxi 2026-08-18: se suma el slot de las 21 como CIERRE DEL DÍA. El objetivo es 20 por MB
+// "sí o sí", y el reparto por slot ya se auto-ajusta (si un slot manda 2 de 4, el siguiente
+// intenta 6). Lo que faltaba era una última pasada: si a las 20 un MB va en 14, sin este slot
+// esos 6 envíos se pierden hasta mañana. Con las horas activas hasta las 23, entra cómodo.
+const AGENT_SLOTS = [9, 12, 15, 18, 20, 21];
 let _agentLastSlot = "";
 
 // Slots ya ejecutados HOY, persistido: "2026-08-06:9,12,15". Vive en config para sobrevivir
@@ -7388,6 +7445,267 @@ async function _auditAdsTxt(token, domain, verdict, reason, source, gate) {
 //   · ahora tiene ads.txt  → se marca resuelto y el dominio VUELVE a la cola para analizarse
 //   · sigue sin poder leerse → suma un intento y espera al próximo ciclo
 //   · resulta que no tiene  → pasa a 'no' (ya no se reintenta más)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// EL PARTE DEL DÍA (Maxi 2026-08-18) — un mail que contesta "¿se cumplió el objetivo?"
+// ══════════════════════════════════════════════════════════════════════════════════════
+// Por qué existe, y es la lección más cara de todo el 18/08:
+// El sistema SÍ detectó las dos caídas. En los logs del día estaba escrito:
+//     "⏰ similar_expansion sin correr (hace 300 min, esperado cada 60)"
+//     "📉 monday_sync (4 de 400 esperados) · polish_pool (0 de 1 esperados)"
+// Detección correcta y a tiempo. Pero saludAlerta escribe una NOTIFICACIÓN EN EL PANEL, y
+// nadie abre el panel. Mientras tanto el Vigilante de seguridad —que estaba dando falsos
+// positivos— sí mandaba mail cada hora.
+// O sea: el alertado estaba invertido. Lo ruidoso e inofensivo llegaba a la bandeja; lo que
+// paró la producción seis semanas quedó en silencio. El envío estuvo muerto del 12 al 18 de
+// agosto y el descubrimiento desde el 27 de julio: 0 envíos y 0 altas, sin que nadie se
+// enterara.
+// Este mail invierte eso: UNA pregunta por día, con el número que importa y, si falla, el
+// motivo. No compite con nada: si todo va bien son cuatro renglones.
+const OBJETIVO_POR_MB = 20;
+async function parteDelDia(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.parte_diario_enabled ?? "true") === "false") return;
+  const hoy = _madridDateStr();
+  if ((cfg.parte_diario_ultimo || "") === hoy) return;          // uno por día
+  if (_spainHour() < 21) return;                                        // al cierre de la jornada
+  await setConfigValue(token, "parte_diario_ultimo", hoy).catch(() => {});
+
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const _contar = async (url) => {
+    try {
+      const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch { return 0; }
+  };
+  const desdeHoy = _madridMidnightUtcISO();
+
+  // 1. Envíos por MB — el número que define si el día se cumplió.
+  let mbs = [];
+  try { mbs = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+  const lineasEnvio = [];
+  let totalEnviado = 0;
+  for (const mb of mbs) {
+    const n = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mb)}&action=eq.sent&created_at=gte.${desdeHoy}&select=id`);
+    totalEnviado += n;
+    lineasEnvio.push(`   ${n >= OBJETIVO_POR_MB ? "✅" : "🔴"} ${mb.split("@")[0]}: ${n}/${OBJETIVO_POR_MB}`);
+  }
+  const objetivoTotal = mbs.length * OBJETIVO_POR_MB;
+
+  // 2. Prospects: lo que importa no es el total, es cuántos se pueden contactar.
+  const conEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`);
+  const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
+  const diasDeStock = totalEnviado > 0 ? (conEmail / Math.max(1, objetivoTotal)).toFixed(1) : "?";
+
+  // 3. Descubrimiento: ¿entró algo nuevo hoy?
+  const altasHoy = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=id`);
+  const backlog  = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`);
+
+  // 4. Lo que se rompió hoy, si algo se rompió.
+  const problemas = [];
+  if (totalEnviado < objetivoTotal) {
+    const motivos = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&created_at=gte.${desdeHoy}&select=reason`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    const top = {};
+    for (const m of (Array.isArray(motivos) ? motivos : [])) {
+      const k = String(m.reason || "?").split(":")[0];
+      top[k] = (top[k] || 0) + 1;
+    }
+    const orden = Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    if (orden.length) problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos. Los descartes de hoy: ${orden.map(([k, v]) => `${k} (${v})`).join(", ")}.`);
+    else problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos y NO hay descartes registrados — el agente no llegó a intentarlo. Revisar si el worker corrió.`);
+  }
+  if (altasHoy === 0) problemas.push("No entró ni una URL nueva a Prospects. El descubrimiento está parado.");
+  if (backlog >= CSV_QUEUE_HALT_HIGH) problemas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): el feeder está frenado hasta que drene.`);
+  if (conEmail < objetivoTotal * 2) problemas.push(`Quedan ${conEmail} contactables: menos de 2 días de envíos. Hay ${sinEmail} sin email esperando que se los busque.`);
+
+  const ok = problemas.length === 0;
+  const cuerpo = [
+    ok ? "Todo en orden." : "⚠️ Hay cosas que revisar.",
+    "",
+    `ENVÍOS  ${totalEnviado}/${objetivoTotal}`,
+    ...lineasEnvio,
+    "",
+    `PROSPECTS  ${conEmail} contactables (~${diasDeStock} días de envíos) · ${sinEmail} sin email`,
+    `DESCUBRIMIENTO  ${altasHoy} URLs nuevas hoy · ${backlog} en cola`,
+    ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
+    "",
+    `— Parte diario de la ADEQ Toolbar · ${hoy}`,
+  ].join("\n");
+
+  const dest = (cfg.security_alert_email || "mgargiulo@adeqmedia.com").trim();
+  try {
+    await sendGmailServer(token, dest, {
+      to: dest,
+      subject: `Toolbar ${hoy} — ${ok ? `✅ ${totalEnviado}/${objetivoTotal} envíos` : `⚠️ ${totalEnviado}/${objetivoTotal} envíos`}`,
+      body: cuerpo,
+      agentActionId: null,
+      esProspeccion: false,
+    });
+    log(`📬 parte del día enviado a ${dest} — ${totalEnviado}/${objetivoTotal} envíos`);
+  } catch (e) {
+    log(`🔴 no se pudo enviar el parte del día: ${e.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+// CADUCIDAD DE LA COLA (Maxi 2026-08-18) — la cola es una cola, no un depósito
+// ══════════════════════════════════════════════════════════════════════════════════════
+// El problema que resuelve, con los números reales del 18/08:
+//   pending 1.711 · waiting_pool 679 · processing 1  =  2.391, los más viejos del 6 de julio.
+//   El feeder se frena cuando pending+processing supera 250. Había 1.712. Resultado: tres
+//   semanas sin descubrir NADA, esperando que drenara una cola que no drenaba.
+//
+// El error de diseño: entrada sin límite, salida con freno, y el freno es un ALTO TOTAL en vez
+// de una regulación. Alcanza con que el drenado se trabe una vez para que quede trabado para
+// siempre — el sistema no tiene forma de recuperarse solo.
+//
+// La corrección: un dominio que esperó semanas ya no sirve. Su tráfico está viejo, puede haber
+// entrado a Monday en el medio, y sobre todo está bloqueando a todos los que vienen atrás.
+// Guardarlo no tiene valor; sacarlo desbloquea el sistema entero.
+//
+// Se marca 'expired', no se borra: el dominio sigue registrado (no se vuelve a descubrir
+// gastando créditos) y se puede revivir con un UPDATE si algún día hiciera falta.
+const COLA_CADUCIDAD_DIAS = 30;
+async function caducarColaVieja(token) {
+  const cfg = await getConfig(token);
+  const dias = parseInt(cfg.cola_caducidad_dias || String(COLA_CADUCIDAD_DIAS), 10) || COLA_CADUCIDAD_DIAS;
+  const corte = new Date(Date.now() - dias * 86400_000).toISOString();
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,waiting_pool,next_day)&uploaded_at=lt.${encodeURIComponent(corte)}`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json", "Prefer": "return=representation",
+        },
+        body: JSON.stringify({ status: "expired", error_message: `caducado tras ${dias} días sin procesar` }),
+      }
+    );
+    if (!r.ok) return;
+    const filas = await r.json().catch(() => []);
+    const n = Array.isArray(filas) ? filas.length : 0;
+    if (n === 0) return;
+    log(`🗓️ Cola: ${n} dominio(s) caducado(s) tras ${dias} días sin procesarse — el feeder se destraba`);
+    // Caducar mucho NO es normal: significa que la cola no está drenando. Se avisa, porque el
+    // modo de falla anterior fue exactamente éste y pasó tres semanas sin que nadie se enterara.
+    if (n >= 200) {
+      await saludAlerta(token, {
+        clave: "cola-no-drena", severidad: "error",
+        titulo: "🗓️ La cola de dominios no está drenando",
+        cuerpo: `Caducaron ${n} dominios sin procesar (más de ${dias} días esperando).\n`
+              + `El feeder estaba frenado por backlog. Se destrabó solo, pero la causa de fondo `
+              + `es que la cola no se procesa al ritmo al que entra: revisar los logs de "CSV queue start".`,
+      }).catch(() => {});
+    }
+  } catch (e) { log(`⚠️ caducidad de cola: ${e.message}`); }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
+// AGENTE DE REVISIÓN (Maxi 2026-08-18) — la tercera pata del modelo
+// ══════════════════════════════════════════════════════════════════════════════════════
+// El user definió tres agentes: Ventas (envía), Nuevos Clientes (descubre) y REVISIÓN.
+// Los dos primeros existían; el tercero no. Lo que había eran tres trabajos sueltos
+// (sweepBlockedFromProspects, purgeByUrlOnly, polishPool) que:
+//   · arrancan solo si alguien prende un flag a mano,
+//   · recorren el pool UNA vez,
+//   · y se apagan solos al terminar.
+// O sea: mantenimiento a pedido. Nadie los volvió a prender, y por eso el 35% del pool
+// quedó sin email para siempre y la basura se acumuló hasta que alguien se acordaba.
+// Un sistema que tiene que estar SIEMPRE cargado no puede depender de la memoria de nadie.
+//
+// Este agente los vuelve a armar solo:
+//   · BUSCAR EMAILS: si quedan leads sin email, prende polishPool. Es la tarea que más
+//     mueve la aguja — cada lead sin email es un envío que no se puede hacer.
+//   · REVISAR CALIDAD: cada N días re-arma los barridos para sacar lo que no cumple.
+//     Debería encontrar poco, porque el filtro ya corre al entrar; si encuentra mucho,
+//     es señal de que el filtro de entrada se está escapando algo.
+// Maxi 2026-08-18: la revisión es CONTINUA, no periódica. Razón del user, y es la correcta:
+// desde hoy el agente de ventas NO juzga lo que manda — agarra lo que está en Prospects con
+// email y escribe. O sea que Prospects es la única garantía de calidad que queda. Si ahí entra
+// una URL mala, se le escribe a una URL mala.
+// Por eso el repaso se re-arma apenas termina una pasada, en vez de esperar una semana.
+// El intervalo mínimo evita re-chequear el mismo dominio varias veces por día: con 750 leads
+// una pasada cuesta ~USD 0,75 (1 scrape gratis + Haiku solo en los dudosos), así que una vuelta
+// diaria es ~USD 23/mes. Bajarlo a 0 lo vuelve permanente pero multiplica ese número.
+// Se ajusta con la clave `revision_calidad_cada_dias`.
+const REVISION_CALIDAD_CADA_DIAS = 1;
+async function agenteRevision(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.agente_revision_enabled ?? "true") === "false") return;
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+
+  // ── Tarea 1: que ningún lead se quede sin email ──────────────────────────────────
+  // polishPool se apaga solo al terminar la pasada. Si todavía quedan leads sin email,
+  // se vuelve a armar: es trabajo pendiente, no una tarea terminada.
+  if (String(cfg.polish_pool || "") !== "true") {
+    let sinEmail = 0;
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`,
+        { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } }
+      );
+      sinEmail = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch {}
+    if (sinEmail > 0) {
+      await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
+      await setConfigValue(token, "polish_pool", "true").catch(() => {});
+      log(`🔁 Revisión: ${sinEmail} leads sin email → se re-arma la búsqueda de contactos`);
+    }
+  }
+
+  // ── Tarea 2: revisar la calidad del pool cada N días ─────────────────────────────
+  const cadaDias = parseInt(cfg.revision_calidad_cada_dias || String(REVISION_CALIDAD_CADA_DIAS), 10) || REVISION_CALIDAD_CADA_DIAS;
+  const ultima = cfg.revision_calidad_ultima ? new Date(cfg.revision_calidad_ultima).getTime() : 0;
+  const vencida = Date.now() - ultima > cadaDias * 86400_000;
+  const yaCorriendo = String(cfg.purge_blocked_prospects || "") === "true"
+                   || String(cfg.url_purge_enabled || "") === "true";
+  if (vencida && !yaCorriendo) {
+    await setConfigValue(token, "url_purge_cursor", "").catch(() => {});
+    await setConfigValue(token, "purge_cursor_ts", "").catch(() => {});
+    await setConfigValue(token, "url_purge_enabled", "true").catch(() => {});
+    await setConfigValue(token, "purge_blocked_prospects", "true").catch(() => {});
+    await setConfigValue(token, "revision_calidad_ultima", new Date().toISOString()).catch(() => {});
+    log(`🔁 Revisión: pasaron ${cadaDias} días → se re-arma el repaso de calidad de todo el pool`);
+  }
+}
+
+// ── LIMPIEZA DE RESERVAS HUÉRFANAS ───────────────────────────────────────────────────
+// Antes del envío se crea una fila 'reserved' para no sobre-enviar si el worker muere en el
+// medio. El cupo diario cuenta 'sent' + 'reserved', así que una reserva que nunca se confirma
+// consume cupo para siempre.
+// Maxi 2026-08-18: esto ya existía pero corría SOLO en main(), o sea una vez al arrancar. Como
+// el worker venía corriendo sin reiniciarse, no se ejecutó nunca más y se acumularon 482
+// reservas huérfanas entre el 12 y el 18 de agosto → los tres MBs con el cupo lleno y CERO
+// envíos durante seis días. Una salvaguarda que solo corre al arrancar no protege de nada
+// mientras el sistema está andando, que es justo cuando hace falta.
+// Ahora corre en cada ciclo: es un PATCH que casi siempre matchea 0 filas.
+async function limpiarReservasHuerfanas(token) {
+  try {
+    const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.reserved&created_at=lt.${cutoff}`,
+      {
+        method: "PATCH",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY,
+          "Authorization": `Bearer ${BACKEND_BEARER || token || ""}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=representation",
+        },
+        body: JSON.stringify({ action: "failed", reason: "orphaned_reserve_crash_recovery" }),
+      }
+    );
+    if (r.ok) {
+      const filas = await r.json().catch(() => []);
+      const n = Array.isArray(filas) ? filas.length : 0;
+      if (n > 0) log(`🧹 ${n} reserva(s) huérfana(s) liberada(s) — el cupo diario vuelve a estar disponible`);
+    }
+  } catch (e) { log(`⚠️ limpieza de reservas huérfanas: ${e.message}`); }
+}
+
 let _lastAdsRecheckDay = "";
 async function recheckAdsTxtUnknowns(token) {
   const cfg = await getConfig(token);
@@ -8151,7 +8469,12 @@ const SIMILAR_EXP_COOLDOWN_MS = 5 * 60 * 1000;
 const SIMILAR_EXP_BATCH = 6;
 async function runProspectSimilarExpansion(token) {
   const cfg = await getConfig(token);
-  if (String(cfg.similar_expansion_enabled || "") !== "true") {
+  // Maxi 2026-08-18: por defecto PRENDIDA. Es una de las tres patas que pidió el user
+  // ("de las URLs que sirven, buscar sus similares") y estaba apagada de hecho: la clave
+  // `similar_expansion_enabled` ni siquiera existía en la config, así que el `|| ""` la dejaba
+  // en falso para siempre. Un motor que nadie apagó a propósito pero que nunca corrió.
+  // Para apagarla ahora hay que ponerla explícitamente en "false".
+  if (String(cfg.similar_expansion_enabled ?? "true") !== "true") {
     await saludApagado(token, "similar_expansion", "similar_expansion_enabled=false");
     return;
   }
@@ -9744,13 +10067,35 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // freeze → BLOCKLIST PERMANENTE como "inoperativo".
     // O sea: quedarnos sin cuota de API borraba inventario bueno para siempre.
     // Estas condiciones son estado NUESTRO, no un defecto del dominio → reintento sin penalizar.
+    // ⚠️ Maxi 2026-08-18 — EL BUG QUE FRENÓ EL DESCUBRIMIENTO SEIS SEMANAS.
+    // El 400 estaba en esta lista junto con 401/402/403. Pero no es lo mismo:
+    //   401/402/403 = NUESTRO plan de RapidAPI (vencido, sin cupo) → reintentar tiene sentido.
+    //   400         = Bad Request → el DOMINIO es inválido. Reintentar nunca lo va a arreglar.
+    // Como el transitorio NO cuenta intentos, un dominio malformado se reintentaba para siempre.
+    // Pasó de verdad: `cachalot.k` (el ".k" no existe como terminación) quedó girando desde el
+    // 6 de julio. La cola procesaba SIEMPRE el mismo item —202 veces en una tanda de 20 min— y
+    // nunca llegaba a los 1.711 que tenía detrás. Con la cola tapada, el gate de backlog frenó
+    // al feeder, a Autopilot y a AutoGoogle: cero URLs nuevas en Prospects durante tres semanas.
+    // Un dominio mal escrito paralizó todo el sistema, y sin un solo error en los logs.
     const _transient = /429|timeout|timed out|\b5\d\d\b|network|fetch failed|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket|aborted/i.test(_errStr)
-      || /daily_cap_reached|per_minute_fuse_tripped|HTTP 40[0123]|quota|exceeded|not subscribed|rate limit/i.test(_errStr);
-    if (_transient) {
+      || /daily_cap_reached|per_minute_fuse_tripped|HTTP 40[123]|quota|exceeded|not subscribed|rate limit/i.test(_errStr);
+
+    // TECHO ABSOLUTO DE REINTENTOS. Aunque el error sea genuinamente transitorio, ningún item
+    // puede girar sin fin: si no salió en 20 vueltas, deja de trabar a los que vienen atrás.
+    // Es la red que faltaba — el bug de arriba fue posible sólo porque no había ningún límite.
+    const _reintentos = parseInt((item.error_message || "").match(/retry_(\d+)/)?.[1] || "0", 10);
+    if (_transient && _reintentos < 20) {
       await markCsvItem(token, item.id, "pending", {
-        error_message: `traffic_api_transient (reintento sin penalizar): ${_errStr.slice(0, 50)}`,
+        error_message: `traffic_api_transient retry_${_reintentos + 1} (reintento sin penalizar): ${_errStr.slice(0, 40)}`,
       });
-      log(`  🔁 ${domain} — API tráfico transitorio (${_errStr.slice(0, 40)}) → reintento, NO congela`);
+      log(`  🔁 ${domain} — API tráfico transitorio (${_errStr.slice(0, 40)}) → reintento ${_reintentos + 1}/20`);
+      return;
+    }
+    if (_transient) {
+      await markCsvItem(token, item.id, "skipped", {
+        error_message: `traffic_api_transient: 20 reintentos sin éxito — se libera la cola (${_errStr.slice(0, 40)})`,
+      });
+      log(`  🛑 ${domain} — 20 reintentos sin éxito, lo saco de la cola para no trabar al resto`);
       return;
     }
     // Tracking de intentos via error_message (no requiere schema change)
@@ -14935,9 +15280,11 @@ async function getGmailSignatureHtmlServer(userEmail) {
   if (cached && Date.now() - cached.ts < SIG_TTL_MS) return cached.html;
   try {
     const accessToken = await getGmailAccessToken(userEmail);
+    // Maxi 2026-08-18: mismo timeout que _nombreDeRemitente. Corre en el mismo camino del envío
+    // y contra el mismo endpoint de Google: si uno puede colgarse, este también.
     const res = await fetch(
       "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs",
-      { headers: { "Authorization": `Bearer ${accessToken}` } }
+      { headers: { "Authorization": `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) }
     );
     if (!res.ok) return "";
     const data = await res.json();
@@ -15058,8 +15405,13 @@ async function _nombreDeRemitente(userEmail) {
   let nombre = "";
   try {
     const at = await getGmailAccessToken(userEmail);
+    // Maxi 2026-08-18: TIMEOUT. Este fetch se agregó el 12/08 sin AbortSignal y es el que paró
+    // el agente 6 días: si Google no contesta, la promesa queda colgada para siempre — no falla,
+    // no lanza excepción, el try/catch no la ve. sendGmailServer nunca volvía, la fila quedaba en
+    // 'reserved' y como el cupo diario cuenta las reservas, cada MB se auto-bloqueaba.
+    // 482 reservas huérfanas y CERO envíos entre el 12 y el 18 de agosto.
     const r = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs/${encodeURIComponent(userEmail)}`,
-      { headers: { "Authorization": `Bearer ${at}` } });
+      { headers: { "Authorization": `Bearer ${at}` }, signal: AbortSignal.timeout(10_000) });
     if (r.ok) nombre = String((await r.json())?.displayName || "").trim();
   } catch {}
   if (!nombre) nombre = getSenderName(userEmail) || "";
@@ -15415,20 +15767,27 @@ async function securityWatchdog(token) {
   } catch {}
 
   // ── 2. ALGUIEN INTENTANDO ENTRAR AL PROXY ──────────────────────────────────────────────
-  const _urlNoAut = `${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&created_at=gte.${hace(1)}`;
+  // Maxi 2026-08-18: se excluyen los `severity=info`. Desde hoy la Edge Function marca así los
+  // 401 que vienen de NUESTRO propio origen (extensión/dashboard), que son paneles con la sesión
+  // vencida, no un atacante. Antes se contaban todos juntos y el mail avisaba "64 intentos de
+  // acceso NO AUTORIZADO" por algo benigno — la alarma perdía valor justo por ser ruidosa.
+  const _urlNoAut = `${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&severity=neq.info&created_at=gte.${hace(1)}`;
   const noAutorizados = await _count(`${_urlNoAut}&select=id`);
   // Maxi 2026-08-10: el aviso decía "3 intentos" y nada más, así que para saber si era un ataque
   // o un MB con la sesión vencida había que ir al SQL igual. Con el actor y el tipo en el propio
   // mail se decide de un vistazo: si el mail es de un MB conocido, es una sesión caída.
   let _quienes = "";
   try {
-    const r = await fetch(`${_urlNoAut}&select=kind,actor&order=created_at.desc&limit=10`,
+    const r = await fetch(`${_urlNoAut}&select=kind,actor,detail&order=created_at.desc&limit=10`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
     if (r.ok) {
       const filas = await r.json();
       const porActor = {};
       for (const f of (Array.isArray(filas) ? filas : [])) {
-        const k = `${f.actor || "(sin identificar)"} · ${f.kind}`;
+        // El ORIGEN es lo que decide si hay que preocuparse: si dice chrome-extension nuestro,
+        // es un MB con la sesión caída; si viene vacío, es una llamada directa (curl/script).
+        const _org = f.detail?.origin || "(sin origen)";
+        const k = `${f.actor || "(sin identificar)"} · ${f.kind} · desde ${_org}`;
         porActor[k] = (porActor[k] || 0) + 1;
       }
       const lista = Object.entries(porActor).map(([k, n]) => `${k} ×${n}`).join(" | ");
@@ -15822,6 +16181,37 @@ async function runAgentCycle(token, allFlags) {
       log(`🚫 Agent: user ${userEmail} no está en whitelist hardcoded — skip`);
       continue;
     }
+
+    // ── FRENO POR REBOTE (Maxi 2026-08-18) ─────────────────────────────────────────────
+    // Si un buzón empieza a rebotar fuerte, seguir enviando ese día no consigue clientes:
+    // quema la reputación de la cuenta de Gmail. Y la reputación es lo único de todo este
+    // sistema que no se arregla con un deploy — se recupera en semanas, o no se recupera.
+    // Por eso, y sólo por eso, este freno puede costar envíos del día: 20 mails desde una
+    // cuenta ya marcada valen menos que la cuenta.
+    // Umbral configurable con `rebote_max_pct_dia`. Se mide sobre los envíos de HOY.
+    {
+      const _pctMax = parseInt(cfg.rebote_max_pct_dia || "8", 10) || 8;
+      const _enviados = await _countAgentActionsToday(token, userEmail, ["sent"], "reboteGuard/sent");
+      if (_enviados >= 10) {   // con menos de 10 envíos el porcentaje no dice nada
+        const _rebotes = await _countAgentActionsToday(token, userEmail, ["bounce_detected"], "reboteGuard/bounce");
+        const _pct = Math.round((_rebotes / _enviados) * 100);
+        if (_pct >= _pctMax) {
+          log(`🩺 ${userEmail}: ${_pct}% de rebote hoy (${_rebotes}/${_enviados}, tope ${_pctMax}%) — FRENO el envío para no quemar el buzón`);
+          await logAgentAction(token, userEmail, {
+            domain: "_cycle_", action: "skipped", reason: `rebote_alto_${_pct}pct`,
+            details: { rebotes: _rebotes, enviados: _enviados, tope: _pctMax },
+          });
+          await saludAlerta(token, {
+            clave: `rebote-alto-${userEmail}`, severidad: "error",
+            titulo: "🩺 Freno un buzón por rebotes",
+            cuerpo: `${userEmail} lleva ${_pct}% de rebote hoy (${_rebotes} de ${_enviados}).\n`
+                  + `Paro sus envíos por hoy para proteger la reputación de la cuenta.\n`
+                  + `Si los rebotes vienen de una fuente concreta, conviene revisarla antes de mañana.`,
+          }).catch(() => {});
+          continue;   // próximo MB
+        }
+      }
+    }
     // Bounce scan (Gmail INBOX) — fire-and-forget para que no atrase el ciclo
     scanBouncesForUser(token, userEmail).catch(() => {});
     // Maxi 2026-06-18: scan respuestas REALES (no OOO) para nutrir
@@ -15944,19 +16334,64 @@ async function runAgentCycle(token, allFlags) {
     // slots de todos los días: con 1.600+ pendientes, la ventana podía estar dominada por
     // fracasos crónicos y el resto del pool no se veía nunca. Ordenar por
     // `email_ultimo_intento` manda al frente a los que todavía no se intentaron.
-    const _urlPool = (orden) =>
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${geoClause}${categoryClause}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
+    // Maxi 2026-08-18: `filtros` pasó a ser un parámetro. Antes geoClause/categoryClause
+    // estaban incrustados acá, así que no había forma de pedir el pool SIN el foco de GEO
+    // cuando ese foco no llenaba el lote.
+    const _urlPool = (orden, filtros = "") =>
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${filtros}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
     const _hdrsPool = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
-    let queueRes = await fetch(_urlPool("&order=email_ultimo_intento.asc.nullsfirst,score.desc"), { headers: _hdrsPool });
-    // RED DE SEGURIDAD: `email_ultimo_intento` la crea sql/2026-08-11_salud_y_alertas.sql.
-    // Si el código se deploya ANTES de correr ese SQL, PostgREST responde 400 y sin este
-    // fallback el agente vería "0 candidatos" y DEJARÍA DE ENVIAR hasta que alguien
-    // corriera la migración. Un orden mejor no puede costar el envío del día.
-    if (!queueRes.ok) {
-      log(`  ↩️ pool: el orden por email_ultimo_intento falló (HTTP ${queueRes.status}) — sigo sin ese orden (¿falta correr la migración?)`);
-      queueRes = await fetch(_urlPool("&order=score.desc"), { headers: _hdrsPool });
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // CÓMO SE ELIGE A QUIÉN ESCRIBIRLE (Maxi 2026-08-18) — dos reglas del user
+    // ══════════════════════════════════════════════════════════════════════════════════
+    // 1. "Si está en Prospects y tiene mail, que se envíe."
+    //    Antes se traían 300 leads SIN mirar si tenían email. Como el 82% del pool no
+    //    tiene, esa ventana se llenaba de inservibles y el agente los descartaba de a uno:
+    //    5.654 'no_email_after_enrichment' en 60 días, 15 descartes por cada envío. Ese era
+    //    el techo real de ~10 envíos/día en vez de 20. Ahora el filtro va EN LA CONSULTA.
+    //
+    // 2. "Priorizar las geos predefinidas" — PRIORIZAR, no restringir.
+    //    geosPriority era un filtro DURO: si esos países no tenían leads con email, el
+    //    agente se quedaba en 0 candidatos y no mandaba nada. Ahora se pide primero el
+    //    foco y, si no llena el lote, se completa con el resto del pool. Los del foco
+    //    quedan adelante, así que se mandan primero igual.
+    //
+    // Cada pedido tiene su red: si un filtro u orden hace fallar a PostgREST se reintenta
+    // sin él. Ninguna mejora puede costar el envío del día.
+    const _soloConEmail = "&emails=neq.%5B%5D";   // jsonb no vacío; NULL también queda afuera
+    const _pedir = async (orden, filtros) => {
+      const r = await fetch(_urlPool(orden, filtros), { headers: _hdrsPool }).catch(() => null);
+      if (!r || !r.ok) return null;
+      const j = await r.json().catch(() => null);
+      return Array.isArray(j) ? j : null;
+    };
+    const _ordenBueno = "&order=email_ultimo_intento.asc.nullsfirst,score.desc";
+    const _ordenSimple = "&order=score.desc";
+
+    // Paso 1: las GEOs del foco, solo con email.
+    let candidatesRaw = await _pedir(_ordenBueno, _soloConEmail + geoClause + categoryClause)
+                     ?? await _pedir(_ordenSimple, _soloConEmail + geoClause + categoryClause)
+                     ?? [];
+    const _delFoco = candidatesRaw.length;
+
+    // Paso 2: si el foco no llenó el lote, se completa con el resto del pool (con email).
+    if (candidatesRaw.length < POOL_SIZE && geoClause) {
+      const resto = await _pedir(_ordenBueno, _soloConEmail + categoryClause)
+                 ?? await _pedir(_ordenSimple, _soloConEmail + categoryClause)
+                 ?? [];
+      const vistos = new Set(candidatesRaw.map(c => c.id));
+      for (const c of resto) if (!vistos.has(c.id)) candidatesRaw.push(c);
     }
-    const candidatesRaw = await queueRes.json();
+
+    // Última red: si el filtro por email hizo fallar todo (columna distinta a la esperada),
+    // se vuelve al comportamiento viejo antes que quedarse sin enviar.
+    if (candidatesRaw.length === 0) {
+      candidatesRaw = await _pedir(_ordenBueno, geoClause + categoryClause)
+                   ?? await _pedir(_ordenSimple, geoClause + categoryClause)
+                   ?? [];
+      if (candidatesRaw.length) log(`  ⚠️ pool: el filtro por email no funcionó — voy sin él (revisar la columna 'emails')`);
+    }
+    log(`  🎯 pool ${userEmail}: ${candidatesRaw.length} con email (${_delFoco} de las GEOs del foco, ${candidatesRaw.length - _delFoco} del resto)`);
     if (!Array.isArray(candidatesRaw) || candidatesRaw.length === 0) {
       log(`🤖 Agent ${userEmail}: 0 candidatos (threshold=${aCfg.thresholdTraffic}, geos=${focus.geosPriority.join(",")||"all"}, cat=${focus.categoriesPriority.join(",")||"all"})`);
       // Loggear al feed UI para que el admin vea actividad aunque no haya envíos
@@ -16740,6 +17175,25 @@ async function runAgentCycle(token, allFlags) {
           }
         }
 
+        // ── RED DE SEGURIDAD GRATIS (Maxi 2026-08-18) ────────────────────────────────────
+        // El agente ya no juzga la calidad del lead: manda lo que está en Prospects con email.
+        // Eso está bien —el filtro corre al entrar y el agente de revisión repasa el pool a
+        // diario— pero deja una ventana: una URL mala que entra hoy se manda antes de que la
+        // revisión pase. Este chequeo la cierra y no cuesta NADA: mira solo el nombre del
+        // dominio, sin red, sin API, sin IA. Caza bancos, gobiernos, universidades y acortadores
+        // por el patrón de la URL. No reemplaza al filtro de entrada: es el último cinturón.
+        const _urlChk = classifyByUrlOnly(domain, lead.category || "", lead.traffic || 0);
+        if (!_urlChk.ok) {
+          log(`  🛑 ${domain}: NO se envía — la URL no debería estar en Prospects (${_urlChk.reason})`);
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `envio: ${_urlChk.reason}`.slice(0, 200) }),
+          }).catch(() => {});
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `url_no_prospectable:${_urlChk.reason}` });
+          continue; // próximo lead
+        }
+
         // RESERVA en counter ANTES del send. Si Railway crashea entre send y log,
         // el counter ya tiene el slot reservado → próximo arranque no over-sends.
         // Usamos action='reserved' (no 'sent') para que getAgentDailyCount sume
@@ -16849,7 +17303,17 @@ async function runAgentCycle(token, allFlags) {
           markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
           continue; // próximo lead — el re-enrich le buscará otro email
         }
-        await sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId });
+        // Maxi 2026-08-18: TECHO DE TIEMPO al envío completo. La lección del apagón del 12 al 18
+        // de agosto: un solo fetch sin timeout adentro de sendGmailServer congeló el agente seis
+        // días sin dejar UN error. Lo peligroso no fue el fetch, fue que un cuelgue no se
+        // distingue de un trabajo lento: no hay excepción, no hay log, no hay alerta.
+        // Con esto, cualquier cuelgue —éste o el que venga— se convierte en una excepción que cae
+        // en el catch que ya existe: marca 'failed', libera el cupo reservado y sigue con el
+        // próximo lead. El sistema se degrada en vez de detenerse.
+        await Promise.race([
+          sendGmailServer(token, userEmail, { to: email, subject, body: pitch.body, agentActionId: reservedId }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("send_timeout_90s")), 90_000)),
+        ]);
 
         // PATCH reserved → sent ahora que confirmamos el envío
         // Loggeamos también template_id (baked_<lang>_<idx> o db_<id>) para
@@ -19052,31 +19516,7 @@ async function main() {
     log(`⚠️ Cleanup processing items failed: ${e.message}`);
   }
 
-  // ── Cleanup: reserved slots huérfanos (> 5min sin patch a sent/failed) ──
-  // Audit P1 fix: si Railway crashea entre el INSERT reserved y el PATCH→sent,
-  // el slot queda como 'reserved' permanente y cuenta para el cap diario.
-  // Acumula con cada crash → over-count → menos envíos de los permitidos.
-  // Acá los marcamos como 'failed' con reason='orphaned_reserve' para que el
-  // contador del cap no los cuente (filtra solo action='sent').
-  try {
-    const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // 5min atrás
-    const orphanRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.reserved&created_at=lt.${cutoff}`,
-      {
-        method: "PATCH",
-        headers: {
-          "apikey": SUPABASE_ANON_KEY,
-          "Authorization": `Bearer ${BACKEND_BEARER || ""}`,
-          "Content-Type": "application/json",
-          "Prefer": "return=minimal",
-        },
-        body: JSON.stringify({ action: "failed", reason: "orphaned_reserve_crash_recovery" }),
-      }
-    );
-    if (orphanRes.ok) log("🧹 Cleanup: reserved slots huérfanos → failed (cap diario corregido)");
-  } catch (e) {
-    log(`⚠️ Cleanup orphaned reserves failed: ${e.message}`);
-  }
+  await limpiarReservasHuerfanas(_workerToken);
 
 
   let token = null;
@@ -19390,6 +19830,11 @@ async function main() {
 
       // Heartbeat — cliente lee esto para mostrar si Railway está vivo
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}
+
+      // Maxi 2026-08-18: libera las reservas de envío que quedaron colgadas. Va acá, en el loop,
+      // y no solo al arrancar: el apagón del 12-18/08 fue exactamente eso — la salvaguarda existía
+      // pero vivía en main(), y el worker llevaba días sin reiniciar.
+      await limpiarReservasHuerfanas(token);
       // Sello del código en ejecución. Se escribe una sola vez por proceso (el worker reinicia
       // cada ~7min, así que `worker_boot_at` además dice hace cuánto arrancó este container).
       if (!_selloEscrito) {
@@ -19465,6 +19910,10 @@ async function main() {
         await setConfigValue(token, "review_queue_band_status",
           JSON.stringify({ valid: rqValid, saturation: FEEDER_RQ_SATURATION, at: new Date().toISOString() })
         );
+        // Maxi 2026-08-18: la caducidad va ANTES del feeder a propósito. Si destraba la cola,
+        // el feeder lo ve en ESTA misma vuelta y vuelve a traer dominios de inmediato, en vez
+        // de perder un ciclo.
+        await caducarColaVieja(token).catch(e => log(`⚠️ caducidad cola: ${e.message}`));
         await maybeRunFeederSlot(token).catch(e => log(`⚠️ feeder slot: ${e.message}`));
         await maybeStartAutopilotSlot(token).catch(e => log(`⚠️ autopilot slot: ${e.message}`));
         await maybeRunAutoGoogleSlot(token).catch(e => log(`⚠️ autogoogle slot: ${e.message}`));
@@ -19500,6 +19949,13 @@ async function main() {
         await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
         // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
         //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.
+        // Maxi 2026-08-18: el agente de REVISIÓN. Re-arma solo la búsqueda de emails y el
+        // repaso de calidad. Va antes de los barridos para que, si los arma, corran en esta
+        // misma vuelta.
+        await agenteRevision(token).catch(e => log(`⚠️ agente revisión: ${e.message}`));
+        // Maxi 2026-08-18: el parte del día. Se auto-limita a uno por jornada y sólo dispara
+        // después de las 21 Madrid, así que llamarlo en cada vuelta no cuesta nada.
+        await parteDelDia(token).catch(e => log(`⚠️ parte del día: ${e.message}`));
         await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
         await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Maxi 2026-07-16: expansión por similares desde los Prospects grandes (gated similar_expansion_enabled).

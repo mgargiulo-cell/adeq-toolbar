@@ -8,9 +8,20 @@ import { CONFIG } from "../config.js";
 
 let _sbAuthToken = null;
 let _sbUserEmail = null;
-export function setProxyAuth(accessToken, email) {
+// Maxi 2026-08-18: el token se guardaba UNA sola vez al login y no se renovaba nunca. Como el
+// JWT de Supabase dura 1 hora, cualquier panel abierto más que eso empezaba a mandar un token
+// vencido en CADA llamada → la Edge Function respondía 401 y registraba un incidente
+// `jwt_invalido`. Eso es lo que disparaba los mails del Vigilante avisando "29/37/64 intentos de
+// acceso NO AUTORIZADO": no era un atacante, éramos nosotros mismos.
+// Ahora, ante un 401, el proxy pide un token nuevo y reintenta UNA vez.
+// El renovador lo inyecta el popup (que ya tiene ensureFreshToken con single-flight): tiene que
+// haber UN SOLO dueño del refresh, porque el refresh_token de Supabase es de un solo uso y dos
+// renovaciones en paralelo se invalidan entre sí.
+let _refresher = null;
+export function setProxyAuth(accessToken, email, refresher) {
   _sbAuthToken = accessToken || null;
   if (email) _sbUserEmail = email.toLowerCase();
+  if (typeof refresher === "function") _refresher = refresher;
 }
 
 function proxyUrl() {
@@ -249,9 +260,10 @@ export async function callProxy(provider, path, opts = {}) {
 
   let attempt = 0;
   let lastRes = null;
+  let yaRenove = false;   // el refresh por 401 se intenta UNA sola vez por llamada
 
   while (attempt <= MAX_RETRIES) {
-    const res = await fetch(proxyUrl(), {
+    let res = await fetch(proxyUrl(), {
       method: "POST",
       headers: {
         "Content-Type":  "application/json",
@@ -260,6 +272,30 @@ export async function callProxy(provider, path, opts = {}) {
       },
       body: payload,
     });
+
+    // ── AUTO-CURACIÓN DEL TOKEN VENCIDO (Maxi 2026-08-18) ────────────────────────────
+    // Un 401 acá es, casi siempre, el JWT que venció mientras el panel estaba abierto.
+    // Antes se devolvía el error al caller y la llamada se perdía — y encima cada intento
+    // dejaba un incidente de seguridad. Ahora se renueva y se reintenta en el momento.
+    if (res.status === 401 && !yaRenove && _refresher) {
+      yaRenove = true;
+      try {
+        const nuevo = await _refresher();
+        if (nuevo && nuevo !== _sbAuthToken) {
+          _sbAuthToken = nuevo;
+          console.log("[apiProxy] token vencido → renovado, reintentando");
+          res = await fetch(proxyUrl(), {
+            method: "POST",
+            headers: {
+              "Content-Type":  "application/json",
+              "Authorization": `Bearer ${_sbAuthToken}`,
+              "apikey":        CONFIG.SUPABASE_ANON_KEY,
+            },
+            body: payload,
+          });
+        }
+      } catch (e) { console.warn("[apiProxy] no se pudo renovar el token:", e?.message); }
+    }
 
     if (!RETRYABLE_STATUSES.has(res.status) || attempt === MAX_RETRIES) {
       const text = await res.text();

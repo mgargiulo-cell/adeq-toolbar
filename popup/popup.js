@@ -2978,8 +2978,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   // antes de expirar) → los contadores Apollo/AutoGoogle del footer (que lo usan) hacían early-return y
   // quedaban en "--" para siempre. Lo seteamos acá, antes de los refresh de contadores de abajo.
   state.accessToken = auth.accessToken;
-  // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase
-  setProxyAuth(auth.accessToken, auth.user);
+  // Seed the Edge Function proxy auth — Gemini/Apollo/RapidAPI calls go through Supabase.
+  // Maxi 2026-08-18: se le pasa TAMBIÉN el renovador. Antes el proxy se quedaba con el token del
+  // login para siempre; al vencer (1h) cada llamada daba 401 y dejaba un incidente `jwt_invalido`
+  // en toolbar_security_events → los mails del Vigilante sobre "intentos de acceso no autorizado"
+  // eran nuestros propios paneles con la sesión vencida. Con esto se renueva y reintenta solo.
+  // ensureFreshToken tiene single-flight, así que sigue habiendo un único dueño del refresh.
+  setProxyAuth(auth.accessToken, auth.user, () => ensureFreshToken(Infinity));
 
   // Uso mensual de RapidAPI: footer counter (siempre visible) + banner (≥50%).
   // Re-chequea cada 60s para reflejar hits de otros MBs en paralelo.
