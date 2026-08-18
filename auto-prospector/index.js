@@ -7496,9 +7496,34 @@ async function parteDelDia(token) {
   const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
   const diasDeStock = totalEnviado > 0 ? (conEmail / Math.max(1, objetivoTotal)).toFixed(1) : "?";
 
-  // 3. Descubrimiento: ¿entró algo nuevo hoy?
-  const altasHoy = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=id`);
+  // 3. ALTAS DE HOY, SEPARADAS POR MÉTODO.
+  // El user quiere ver los tres caminos por separado y no sumados: import (Monday/sellers/CSV),
+  // Autopilot y AutoGoogle son motores distintos, con costos distintos, y si uno se cae el total
+  // lo disimula. Justamente eso pasó: Monday seguía trayendo unos pocos mientras Autopilot y
+  // AutoGoogle estaban muertos hacía tres semanas, y el número global no lo mostraba.
+  const _altas = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=source`,
+    { headers: auth }
+  ).then(r => r.ok ? r.json() : []).catch(() => []);
+  let altaImport = 0, altaAutopilot = 0, altaAutogoogle = 0, altaOtros = 0;
+  for (const a of (Array.isArray(_altas) ? _altas : [])) {
+    const s = String(a.source || "").toLowerCase();
+    if (/autogoogle/.test(s)) altaAutogoogle++;
+    else if (/autopilot|similar|majestic|radar/.test(s)) altaAutopilot++;
+    else if (/monday|sellers|csv|manual|adstxt|import|feeder/.test(s)) altaImport++;
+    else altaOtros++;
+  }
+  const altasHoy = altaImport + altaAutopilot + altaAutogoogle + altaOtros;
   const backlog  = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`);
+
+  // 4. LIMPIEZA: URLs que YA ESTABAN en Prospects y se sacaron hoy por no cumplir.
+  // Ojo con la fecha: se filtra por `updated_at` (cuándo se rechazó), no por `created_at`
+  // (cuándo entró el lead). Es un error fácil y da números que no significan nada.
+  const purgadas = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.rejected&updated_at=gte.${desdeHoy}&select=id`);
+
+  // 5. EMAILS RECUPERADOS: leads que no tenían email y hoy sí. Contador que lleva polishPool.
+  const _pe = String(cfg.polish_enriquecidos_hoy || "").split(":");
+  const emailsHallados = _pe[0] === hoy ? (parseInt(_pe[1], 10) || 0) : 0;
 
   // 4. Lo que se rompió hoy, si algo se rompió.
   const problemas = [];
@@ -7517,6 +7542,14 @@ async function parteDelDia(token) {
     else problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos y NO hay descartes registrados — el agente no llegó a intentarlo. Revisar si el worker corrió.`);
   }
   if (altasHoy === 0) problemas.push("No entró ni una URL nueva a Prospects. El descubrimiento está parado.");
+  // Un motor en cero mientras otros traen es la señal que se perdió tres semanas: el total
+  // disimulaba que Autopilot y AutoGoogle estaban muertos porque Monday seguía dando algo.
+  else {
+    const _mudos = [["Autopilot", altaAutopilot], ["AutoGoogle", altaAutogoogle], ["los imports", altaImport]]
+      .filter(([, n]) => n === 0).map(([m]) => m);
+    if (_mudos.length) problemas.push(`Hoy no trajo nada: ${_mudos.join(", ")}. Los demás sí, así que no es una caída general.`);
+  }
+  if (sinEmail > 0 && emailsHallados === 0) problemas.push(`Hay ${sinEmail} leads sin email y hoy no se recuperó ninguno — revisar si la búsqueda de contactos está corriendo.`);
   if (backlog >= CSV_QUEUE_HALT_HIGH) problemas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): el feeder está frenado hasta que drene.`);
   if (conEmail < objetivoTotal * 2) problemas.push(`Quedan ${conEmail} contactables: menos de 2 días de envíos. Hay ${sinEmail} sin email esperando que se los busque.`);
 
@@ -7524,11 +7557,19 @@ async function parteDelDia(token) {
   const cuerpo = [
     ok ? "Todo en orden." : "⚠️ Hay cosas que revisar.",
     "",
-    `ENVÍOS  ${totalEnviado}/${objetivoTotal}`,
+    `1 · ENVÍOS  ${totalEnviado}/${objetivoTotal}`,
     ...lineasEnvio,
     "",
-    `PROSPECTS  ${conEmail} contactables (~${diasDeStock} días de envíos) · ${sinEmail} sin email`,
-    `DESCUBRIMIENTO  ${altasHoy} URLs nuevas hoy · ${backlog} en cola`,
+    `2 · ALTAS POR IMPORT (Monday, sellers.json, CSV)   ${altaImport}`,
+    `3 · ALTAS POR AUTOPILOT (similares, Majestic)      ${altaAutopilot}`,
+    `4 · ALTAS POR AUTOGOOGLE                           ${altaAutogoogle}`,
+    ...(altaOtros > 0 ? [`    (otras fuentes: ${altaOtros})`] : []),
+    `    Total de altas del día: ${altasHoy}`,
+    "",
+    `5 · SACADAS DE PROSPECTS por no cumplir            ${purgadas}`,
+    `6 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
+    "",
+    `PROSPECTS HOY  ${conEmail} contactables (~${diasDeStock} días de envíos) · ${sinEmail} sin email · ${backlog} en cola`,
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
     "",
     `— Parte diario de la ADEQ Toolbar · ${hoy}`,
@@ -8448,6 +8489,20 @@ async function polishPool(token) {
     }
   }
   log(`✨ polish${soloSinEmail ? " (solo sin email)" : ""}: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} sin_email=${sinEmail} cursor→${_committedTs}`);
+
+  // Maxi 2026-08-18: acumulador diario de "URLs que NO tenían email y ahora sí".
+  // Es una de las 6 métricas base que el user quiere ver todos los días, y la única que no
+  // se puede reconstruir con una consulta: el lead pasa de "sin email" a "con email" y no
+  // queda rastro de que antes no lo tenía. Por eso se cuenta acá, en el momento en que pasa.
+  if (enriched > 0) {
+    try {
+      const _hoyP = _madridDateStr();
+      const _prev = String((await getConfig(token)).polish_enriquecidos_hoy || "");
+      const [_d, _n] = _prev.split(":");
+      const _acum = (_d === _hoyP ? parseInt(_n, 10) || 0 : 0) + enriched;
+      await setConfigValue(token, "polish_enriquecidos_hoy", `${_hoyP}:${_acum}`);
+    } catch {}
+  }
   // El rendimiento esperado: al menos 1 de cada 4 leads sin email debería resolverse.
   // Si cae por debajo, el vigilante avisa en vez de que lo descubramos dentro de un mes.
   await saludPing(token, "polish_pool", {
