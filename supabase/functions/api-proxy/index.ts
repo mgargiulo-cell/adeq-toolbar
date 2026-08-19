@@ -265,6 +265,24 @@ serve(async (req) => {
   const total   = bumped?.[0]?.total ?? 0;
   const provCnt = bumped?.[0]?.prov  ?? 0;
 
+  // ── EL WORKER TIENE SU PROPIA ESCALA (Maxi 2026-08-19) ──────────────────────────────
+  // Las cuotas de arriba están pensadas para una PERSONA: si a un MB le roban la sesión, que
+  // no pueda gastar más de 500 llamadas. El worker es otra cosa — clasifica con Haiku UNA VEZ
+  // POR DOMINIO, y hoy tiene 1.711 en cola más ~750 en Prospects que la revisión repasa a
+  // diario. Con el tope de 200 tardaría más de una semana en drenar la cola.
+  // El costo real es bajo: cada clasificación son ~200 tokens de entrada y 20 de salida en
+  // Haiku, o sea unos USD 0,0003. 5.000 por día son ~USD 1,50.
+  // Configurable con `proxy_cuota_worker_<proveedor>` por si hay que ajustarlo sin deployar.
+  if (_esWorker) {
+    const _capW = parseInt(cfg[`proxy_cuota_worker_${provider}`] || "", 10)
+      || ({ anthropic: 5000, voyage: 5000, apollo: 500, rapidapi: 2000, gemini: 500 }[provider] ?? 2000);
+    if (provCnt > _capW) {
+      await registrarIncidente(supabase, "proxy_cuota_worker", "warn", userEmail, { provider, provCnt, limite: _capW });
+      return json(429, { error: `Cuota diaria del worker para ${provider} alcanzada`, limit: _capW, used: provCnt }, origin);
+    }
+    // El tope global de 2000 es la suma de los usuarios humanos; al worker no le aplica porque
+    // ya tiene el suyo, más alto y a propósito. Si le aplicara, se frenaría solo a media cola.
+  } else {
   if (total > DAILY_QUOTA_PER_USER) {
     await registrarIncidente(supabase, "proxy_cuota_usuario", "warn", userEmail, { total, limite: DAILY_QUOTA_PER_USER });
     return json(429, { error: "Daily total quota exceeded", limit: DAILY_QUOTA_PER_USER, used: total }, origin);
@@ -282,6 +300,7 @@ serve(async (req) => {
   if (globalTotal > CUOTA_GLOBAL_DIA) {
     await registrarIncidente(supabase, "proxy_cuota_global", "critical", userEmail, { globalTotal, limite: CUOTA_GLOBAL_DIA });
     return json(429, { error: "Tope global diario alcanzado", used: globalTotal, limit: CUOTA_GLOBAL_DIA }, origin);
+  }
   }
 
   // ── Build upstream request ──────────────────────────────────

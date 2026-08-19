@@ -15875,6 +15875,16 @@ async function securityWatchdog(token) {
       for (const f of (Array.isArray(filas) ? filas : [])) {
         // El ORIGEN es lo que decide si hay que preocuparse: si dice chrome-extension nuestro,
         // es un MB con la sesión caída; si viene vacío, es una llamada directa (curl/script).
+        // ── NO ALERTAR POR NOSOTROS MISMOS (Maxi 2026-08-19) ──────────────────────────
+        // Las IPs de Railway son NUESTRO worker. El 18 y 19 de agosto generaron cuatro
+        // mails de "intentos de acceso NO AUTORIZADO" y estuvimos por bloquear el rango,
+        // lo que habría cortado el sistema entero. Un whois lo resolvía en diez segundos.
+        // Una alerta que señala a la víctima es peor que no tener alerta: manda a apagar
+        // el incendio con nafta.
+        // 152.55.x y 162.220.x son de Railway (RC-1550). Si algún día cambian de rango,
+        // se agregan en `ips_propias` sin tocar código.
+        const _ipsPropias = String(cfg.ips_propias || "152.55.,162.220.").split(",").map(s => s.trim()).filter(Boolean);
+        if (_ipsPropias.some(p => String(f.actor || "").startsWith(p))) continue;
         const _org = f.detail?.origin || "(sin origen)";
         const k = `${f.actor || "(sin identificar)"} · ${f.kind} · desde ${_org}`;
         porActor[k] = (porActor[k] || 0) + 1;
@@ -16012,11 +16022,38 @@ async function securityWatchdog(token) {
            + "(Anthropic, Apollo, RapidAPI, Gemini, Voyage) y el agente dejó de enviar.";
   }
 
+  // ── QUÉ TENÉS QUE HACER (Maxi 2026-08-19) ────────────────────────────────────────────
+  // Pedido textual del user: "que yo sepa o lea si tengo que hacer algo o decirte algo, sino
+  // no tiene sentido una alerta llena de un mensaje que no sé qué tiene que hacer".
+  // Tenía razón. El mail decía "Ninguna — solo aviso. Revisalo cuando puedas", que no es una
+  // instrucción: es una preocupación delegada. Y encima las cuatro alertas de "acceso NO
+  // AUTORIZADO" del 18 y 19 de agosto describían a nuestro propio worker.
+  // Regla nueva: cada hallazgo trae su paso concreto. Si no hay nada que hacer, el mail lo
+  // dice con esas palabras en vez de dejarlo abierto.
+  const _quehacer = [];
+  for (const h of hallazgos) {
+    if (/no autorizado|jwt_invalido/i.test(h)) {
+      _quehacer.push(`• Verificá de quién es la IP antes de bloquear nada: whois <IP>. El 19/08 estas`,
+                     `  alertas eran de Railway, o sea el worker nuestro. Si el whois dice Railway, ignorala.`);
+    } else if (/cap|techo|limite|límite/i.test(h)) {
+      _quehacer.push(`• Revisá el valor en toolbar_config y decidí si el techo del código quedó viejo.`,
+                     `  Si el plan contratado subió, hay que subir el techo también.`);
+    } else if (/kill switch|freno/i.test(h)) {
+      _quehacer.push(`• El gasto está CORTADO. Mirá el detalle abajo y, si es un falso positivo,`,
+                     `  revertilo con el comando de acá arriba.`);
+    } else {
+      _quehacer.push(`• Mandale esta alerta a Claude y decile "revisá esto" — no requiere que hagas nada ya.`);
+    }
+  }
+
   const cuerpo = [
     `Detecté algo raro en la toolbar y te aviso al toque.`,
     ``,
     `QUÉ PASÓ`,
     ...hallazgos,
+    ``,
+    `QUÉ TENÉS QUE HACER`,
+    ...(_quehacer.length ? [...new Set(_quehacer)] : [`• Nada. Es informativo.`]),
     ``,
     `QUÉ HICE`,
     accion,
