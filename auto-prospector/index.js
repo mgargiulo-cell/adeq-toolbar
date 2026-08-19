@@ -2873,6 +2873,20 @@ async function sincronizarFinalizadosDeMonday(token) {
       detalle: `${todos.length} finalizados, ${candidatos.length} re-prospectables, ${encolados} encolados`,
       real: encolados, esperado: candidatos.length,
     });
+    // Maxi 2026-08-19: estos números vivían SOLO en el log de Railway. El user preguntó
+    // "cuántos finalizados de Monday quedan sin analizar" y no había forma de contestarlo
+    // desde la base — el SQL daba 0 porque miraba la cola, que estaba vacía.
+    // Ahora quedan guardados para que el parte diario los muestre: sin esto no se puede saber
+    // si el techo de 400/día alcanza o si el board acumula más rápido de lo que se recicla.
+    await setConfigValue(token, "monday_sync_ultimo", JSON.stringify({
+      fecha: _madridDateStr(),
+      en_board: todos.length,
+      contactados_recientes: todos.filter(d => recientes.has(d)).length,
+      ya_en_cola: enCola.size,
+      reprospectables: candidatos.length,
+      encolados,
+      techo: MONDAY_SYNC_MAX_POR_DIA,
+    })).catch(() => {});
     if (candidatos.length && encolados === 0) {
       await saludAlerta(token, {
         clave: "monday-sync-sin-encolar", severidad: "warning",
@@ -7659,6 +7673,32 @@ async function parteDelDia(token) {
   // (cuándo entró el lead). Es un error fácil y da números que no significan nada.
   const purgadas = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.rejected&updated_at=gte.${desdeHoy}&select=id`);
 
+  // Reciclado de Monday: lo escribe sincronizarFinalizadosDeMonday en su pasada diaria.
+  let _monday = null;
+  try { _monday = JSON.parse(cfg.monday_sync_ultimo || "null"); } catch {}
+
+  // AutoGoogle: qué keywords están rindiendo. El sistema YA aprende solo (65% las mejores +
+  // 35% exploración, con el yield por frase en toolbar_keyword_yield), pero ese aprendizaje
+  // era invisible: no había forma de ver qué está funcionando sin entrar a la base.
+  // Se muestran las 3 mejores y las peores, que es lo que permite decidir si el motor
+  // está aprendiendo bien o girando sobre frases que no traen nada.
+  let _kwTop = [], _kwMal = [];
+  try {
+    const kws = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.3&select=phrase,searches,fresh,qualified&order=qualified.desc&limit=200`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (Array.isArray(kws) && kws.length) {
+      const conRatio = kws.map(k => ({
+        ...k, ratio: k.searches ? (k.qualified || 0) / k.searches : 0,
+      })).sort((a, b) => b.ratio - a.ratio);
+      _kwTop = conRatio.slice(0, 3);
+      _kwMal = conRatio.filter(k => (k.qualified || 0) === 0 && k.searches >= 5).slice(0, 3);
+    }
+  } catch {}
+  let _agStats = null;
+  try { _agStats = JSON.parse(cfg.autogoogle_stats || "null"); } catch {}
+
   // 5. EMAILS RECUPERADOS: leads que no tenían email y hoy sí. Contador que lleva polishPool.
   const _pe = String(cfg.polish_enriquecidos_hoy || "").split(":");
   const emailsHallados = _pe[0] === hoy ? (parseInt(_pe[1], 10) || 0) : 0;
@@ -7714,6 +7754,24 @@ async function parteDelDia(token) {
       `RENDIMIENTO POR FUENTE (últimos 7 días — cuántos trajo y cuántos pasaron el filtro)`,
       ...lineasFuente,
       `   Menos de 10% que pasan = esa fuente está gastando créditos para nada.`,
+    ] : []),
+    ...(_kwTop.length ? [
+      ``,
+      `AUTOGOOGLE — qué búsquedas están funcionando`,
+      ...(_agStats ? [`   Último slot ${_agStats.slot}: ${_agStats.searches} búsquedas → ${_agStats.found} encontrados → ${_agStats.inserted} nuevos`] : []),
+      ...(_kwTop.map(k => `   ✅ "${String(k.phrase).slice(0, 44)}" — ${k.qualified} útiles en ${k.searches} búsquedas`)),
+      ...(_kwMal.length ? _kwMal.map(k => `   🔴 "${String(k.phrase).slice(0, 44)}" — 0 útiles en ${k.searches} búsquedas`) : []),
+      `   El motor ya se sesga solo hacia las verdes (65% mejores + 35% exploración).`,
+    ] : []),
+    ...(_monday ? [
+      ``,
+      `RECICLADO DE MONDAY (última pasada: ${_monday.fecha})`,
+      `   ${_monday.en_board} ciclos finalizados en el board`,
+      `   ${_monday.contactados_recientes} se saltean (contactados hace menos de 90 días)`,
+      `   ${_monday.reprospectables} eran re-prospectables → ${_monday.encolados} entraron`,
+      ...(_monday.reprospectables > _monday.techo
+        ? [`   ⚠️ El techo de ${_monday.techo}/día se está quedando corto: quedan ${_monday.reprospectables - _monday.encolados} esperando.`]
+        : [`   ✅ Entró todo lo que se podía: el board queda al día.`]),
     ] : []),
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
     "",
