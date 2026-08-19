@@ -132,46 +132,47 @@ serve(async (req) => {
   const jwt = authHeader.replace(/^Bearer\s+/i, "");
   if (!jwt) return json(401, { error: "Missing bearer token" }, origin);
 
-  // ── CORTE POR MARTILLEO (Maxi 2026-08-19) ──────────────────────────────────────────────
-  // Desde el 12/08 hay IPs probando entrar sin parar: primero 162.220.232.202 (450 intentos
-  // en 6 días), después 152.55.176.97 (~20-70 por hora, sostenido más de un día). Todas con
-  // el Origin VACÍO, o sea que no son un navegador: son scripts.
-  // No entran —el token siempre es inválido— pero cada intento cuesta una llamada de auth a
-  // Supabase y llena la tabla de incidentes.
-  // Se corta ANTES de validar el token: si no viene de un origen nuestro y ya falló muchas
-  // veces seguidas, se devuelve 429 y listo. Deliberadamente NO toca el kill switch: frenar
-  // el agente por intentos fallidos sería regalarle a cualquiera un DoS gratis contra
-  // nosotros mismos. Esto solo frena a quien martilla, y el agente sigue trabajando.
-  const _esOrigenPropio = ORIGENES_OK.some((re) => re.test(origin));
-  if (!_esOrigenPropio && ipHash) {
-    const desde = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    const { count } = await supabase
-      .from("toolbar_security_events")
-      .select("id", { count: "exact", head: true })
-      .eq("kind", "jwt_invalido")
-      .eq("actor", ipHash)
-      .gte("created_at", desde);
-    if ((count ?? 0) >= 20) {
-      return json(429, { error: "Too many failed attempts" }, origin);
-    }
-  }
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // EL WORKER ES UN LLAMADOR LEGÍTIMO (Maxi 2026-08-19)
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // Durante semanas esto generó mails de "intentos de acceso NO AUTORIZADO" y estuvimos a
+  // punto de bloquear la IP. Eran de Railway: NUESTRO PROPIO WORKER.
+  //
+  // El worker manda `Authorization: Bearer <SERVICE_ROLE_KEY>` (su supabaseLogin() devuelve
+  // la service key cuando está configurada — no tiene ningún token de usuario). Acá abajo se
+  // validaba con `auth.getUser(jwt)`, que espera un token de USUARIO: una service key no lo
+  // es, así que devolvía 401 y registraba `jwt_invalido`. Cada llamada del worker al proxy
+  // fallaba. Eso es el "4xx Rate: 100%" del dashboard.
+  //
+  // Consecuencia real: todo lo que el worker pide por el proxy —clasificación con Haiku,
+  // Apollo, embeddings— venía fallando entero, en silencio, y encima se disfrazaba de ataque.
+  //
+  // La comparación es contra la key exacta que esta misma función tiene en su entorno. No
+  // agrega riesgo: quien tenga esa key ya tiene acceso total a la base, el proxy es lo de
+  // menos.
+  const _esWorker = !!serviceKey && jwt === serviceKey;
 
-  const { data: userData, error: userErr } = await supabase.auth.getUser(jwt);
-  if (userErr || !userData?.user?.email) {
-    // Maxi 2026-08-18: se clasifica el incidente por ORIGEN. Un panel con la sesión vencida
-    // generaba decenas de 401 por hora y el Vigilante mandaba "64 intentos de acceso NO
-    // AUTORIZADO" — alarma real por una causa benigna. Ahora, si el origen es NUESTRO, queda como
-    // `info` (se registra igual, para poder auditar, pero el Vigilante no lo cuenta como ataque);
-    // si viene de afuera, sigue siendo `warn` y sí alerta. El `origin` en el detalle hace que el
-    // mail se conteste solo, sin tener que ir al SQL.
-    await registrarIncidente(supabase, "jwt_invalido", _esOrigenPropio ? "info" : "warn", ipHash, {
-      origin: origin || "(sin origen)",
-      propio: _esOrigenPropio,
-      motivo: userErr?.message?.slice(0, 120) || "token no válido",
-    });
-    return json(401, { error: "Invalid token" }, origin);
+  let userEmail: string;
+  if (_esWorker) {
+    userEmail = "worker@backend";        // identidad propia para las cuotas
+  } else {
+    const { data: userData, error: userErr } = await supabase.auth.getUser(jwt);
+    if (userErr || !userData?.user?.email) {
+      // Maxi 2026-08-18: se clasifica el incidente por ORIGEN. Un panel con la sesión vencida
+      // generaba decenas de 401 por hora y el Vigilante mandaba "64 intentos de acceso NO
+      // AUTORIZADO" — alarma real por una causa benigna. Si el origen es NUESTRO queda como
+      // `info` (se registra para auditar, pero el Vigilante no lo cuenta como ataque); si viene
+      // de afuera sigue siendo `warn` y sí alerta.
+      const _esOrigenPropio = ORIGENES_OK.some((re) => re.test(origin));
+      await registrarIncidente(supabase, "jwt_invalido", _esOrigenPropio ? "info" : "warn", ipHash, {
+        origin: origin || "(sin origen)",
+        propio: _esOrigenPropio,
+        motivo: userErr?.message?.slice(0, 120) || "token no válido",
+      });
+      return json(401, { error: "Invalid token" }, origin);
+    }
+    userEmail = userData.user.email.toLowerCase();
   }
-  const userEmail = userData.user.email.toLowerCase();
 
   // ── BLINDAJE 2026-07-28 ──────────────────────────────────────────────────────────────
   // Leemos config una sola vez: kill switch + allowlist de usuarios.
@@ -206,7 +207,10 @@ serve(async (req) => {
   }
   // Sin el `size > 0`: si las tres keys están vacías, la lista vacía tiene que RECHAZAR a todos,
   // no dejar pasar a todos. Fallar abierto acá equivale a no tener allowlist.
-  if (!permitidos.has(userEmail)) {
+  // El worker no está en la allowlist de mails ni tiene por qué estarlo: se identifica con la
+  // service key, que es una credencial más fuerte que cualquier lista. El kill switch de arriba
+  // SÍ lo frena, que es lo que se quiere de un interruptor de emergencia.
+  if (!_esWorker && !permitidos.has(userEmail)) {
     await registrarIncidente(supabase, "proxy_usuario_no_autorizado", "critical", userEmail, { origin, ip: ipHash });
     return json(403, { error: "Usuario no autorizado para el proxy" }, origin);
   }
