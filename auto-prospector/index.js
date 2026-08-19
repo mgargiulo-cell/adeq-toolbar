@@ -1942,16 +1942,13 @@ const _AUTOGOOGLE_KEYWORDS = [
 // es EE.UU./Canadá (anglo, ya deprio por TLD) y toda Oceanía.
 // Antes la lista era solo LATAM + Europa occidental: Asia y África, que el user
 // quiere cubrir, no estaban representadas por ningún país.
-const _AUTOGOOGLE_GL = [
-  // Centro y Sudamérica (el foco principal)
-  "mx", "ar", "br", "cl", "co", "pe", "uy", "ve", "ec", "bo", "py", "cr", "gt", "do", "pa",
-  // Europa
-  "es", "it", "fr", "pt", "de", "nl", "pl", "gr", "be", "ch", "ro", "cz", "se",
-  // Asia (con idiomas que sí tenemos: turco, árabe, indonesio, japonés)
-  "tr", "id", "jp", "th", "vn",
-  // África (árabe en el norte, francés en el oeste, portugués en Angola/Mozambique)
-  "ma", "eg", "dz", "tn", "sn", "ci", "ao", "mz",
-];
+// ⚠️ La lista de países de búsqueda NO vive acá: vive en `_PAISES_POR_IDIOMA` (~2117),
+// que es la que consulta `_paisParaFrase`. Acá había una segunda lista, `_AUTOGOOGLE_GL`,
+// que NADIE referenciaba: código muerto desde que se escribió. Era peligrosa porque incluía
+// id/jp/th/vn/gr/ro/cz/se y daba la impresión de que Asia y media Europa estaban cubiertas,
+// cuando en realidad no se buscaba en ninguno de esos países. Se eliminó el 19/08/2026 al
+// descubrir que "Asia" era, en los hechos, solo Turquía.
+// Si hay que agregar un país, va en _PAISES_POR_IDIOMA junto a su idioma.
 
 // ── TURNO HISPANO (Maxi 2026-07-17, pedido del user) ────────────────────────────────
 // Garantiza que TODOS los días haya crons dedicados a webs de HABLA HISPANA: LATAM +
@@ -1974,6 +1971,16 @@ const HISPANIC_TLDS = [".mx", ".ar", ".cl", ".co", ".pe", ".uy", ".es", ".ve", "
 //  · `"anunciar con nosotros"` → busca activamente anunciantes.
 // Todo esto sale gratis: son búsquedas normales de Serper, del mismo cupo.
 const _HUELLAS_ES = [
+  // Maxi 2026-08-19 — huellas nuevas. Todas comparten la misma lógica que las que ya
+  // funcionaban: buscar rastros que SOLO deja un sitio que vende publicidad de verdad.
+  // Un blog personal no publica un tarifario con formatos IAB ni tiene app-ads.txt.
+  `inurl:sellers.json "seller_type" {tld}`,          // el propio sellers.json indexado
+  `inurl:app-ads.txt "pub-" {tld}`,                  // publisher con app → casi siempre tiene web
+  `"300x250" OR "728x90" tarifas publicidad {tld}`,  // formatos IAB = tarifario real, no promesa
+  `"solicitar cotización" publicidad banner {tld}`,
+  `"asociación de medios digitales" socios {tld}`,   // directorios de editores por país
+  `"premio periodismo digital" finalistas {tld}`,    // listas curadas de medios chicos activos
+  `"representante comercial exclusivo" medios digitales {tld}`,
   `inurl:ads.txt "google.com, pub-" {tld}`,
   `"media kit" OR "kit de medios" noticias {tld}`,
   `"anunciar con nosotros" OR "publicite aqui" portal noticias {tld}`,
@@ -2123,7 +2130,13 @@ const _PAISES_POR_IDIOMA = {
   nl: ["nl", "be"],
   pl: ["pl"],
   tr: ["tr"],
-  ar: ["ma", "eg", "dz", "tn"],
+  // Maxi 2026-08-19: se suman los países árabes de Medio Oriente. La lista solo tenía el
+  // Magreb, así que Arabia Saudita, Emiratos, Jordania e Irak —mercados publicitarios
+  // grandes y dentro del foco de Asia— no se buscaban nunca.
+  ar: ["ma", "eg", "dz", "tn", "sa", "ae", "jo", "iq"],
+  // Idiomas nuevos: sin esta entrada, sus frases no tendrían país y no se buscarían.
+  id: ["id"],
+  ja: ["jp"],
 };
 // Detección barata del idioma de una frase por palabras funcionales. No hace falta
 // nada sofisticado: alcanza para no buscar en portugués sobre Polonia.
@@ -2519,6 +2532,13 @@ async function _runAutoGoogleSlot(token, slotLabel) {
         // Resto NO inglés, en dosis chica: alemán, neerlandés, polaco, turco, árabe.
         ..._tomar("de", 0.15), ..._tomar("nl", 0.15), ..._tomar("pl", 0.15),
         ..._tomar("tr", 0.15), ..._tomar("ar", 0.15),
+        // Maxi 2026-08-19: indonesio y japonés estaban CARGADOS pero nunca se usaban.
+        // 567 frases en indonesio y 571 en japonés, escritas y guardadas, que jamás se
+        // buscaron: el pool las salteaba y la lista de países asiáticos era código muerto
+        // (_AUTOGOOGLE_GL no se referencia en ningún lado). O sea que "Asia" era Turquía.
+        // Indonesia es el 4º país del mundo en población y Japón un mercado publicitario
+        // enorme; los dos entran en el foco geográfico que pidió el user.
+        ..._tomar("id", 0.15), ..._tomar("ja", 0.15),
       ];
       // Cinturón: si alguna vez vuelve a colarse inglés por otra vía, se filtra acá.
       const _enSet = new Set((_AG_KEYWORDS.en || []).map(s => String(s).toLowerCase()));
@@ -2564,7 +2584,13 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Reparto del slot: 35% huella comercial (prueba directa de que monetiza), 20%
   // ciudades secundarias (el long tail regional), y el resto temas del pool, que
   // pasan de ser la vía principal a ser exploración.
-  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.30)));
+  // Maxi 2026-08-19: 30% → 45% de huella comercial, a costa de los temas de contenido.
+  // Los temas ("noticias de hoy", "precio del bitcoin") devuelven a los gigantes que ya
+  // conocemos y que no contestan un mail frío: es gastar un crédito de Serper para que
+  // Google nos repita Clarín e Infobae. La huella comercial, en cambio, solo aparece en
+  // sitios que MONETIZAN, así que filtra sola y casi todo lo que trae es prospectable.
+  // Los temas bajan a exploración pura, que es el rol que les corresponde.
+  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.45)));
   const _porCiudad       = _construirBusquedasPorCiudad(_hispanicSlot, Math.max(1, Math.round(N * 0.20)));
   // Explotar el propio éxito: los pares de un publisher que YA validamos.
   const _porSsp          = await _construirBusquedasPorSspRegional(token, Math.max(1, Math.round(N * 0.10))).catch(() => []);
@@ -6628,6 +6654,65 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     }
   } catch {}
 
+  // ── EL RSS: el mail que el medio publica sin darse cuenta (Maxi 2026-08-19) ──────────
+  // El estándar RSS 2.0 define dos campos que llevan email OBLIGATORIAMENTE en formato mail:
+  // <managingEditor> (el responsable editorial) y <webMaster> (el técnico). Miles de medios
+  // los publican sin pensarlo, y suele ser el mail REAL de redacción, no un info@ genérico.
+  // Es el mejor retorno de toda la cascada: un fetch, sin API, sin key, sin crédito.
+  // Se prueba primero el link declarado en el home (<link rel="alternate" type=".../rss+xml">)
+  // y después las rutas habituales.
+  try {
+    const _feeds = [];
+    const _mLink = (_homeHtmlCache || "").match(/<link[^>]+type=["']application\/(?:rss|atom)\+xml["'][^>]*>/gi) || [];
+    for (const tag of _mLink.slice(0, 3)) {
+      const h = tag.match(/href=["']([^"']+)["']/i)?.[1];
+      if (h) _feeds.push(h.startsWith("http") ? h : new URL(h, base).href);
+    }
+    for (const r of ["/feed", "/rss", "/feed/rss", "/rss.xml", "/?feed=rss2"]) _feeds.push(base.replace(/\/$/, "") + r);
+    for (const url of [...new Set(_feeds)].slice(0, 4)) {
+      if (emails.size >= 3) break;
+      try {
+        const res = await fetchExternoSeguro(url, { redirect: "follow", signal: AbortSignal.timeout(6000) });
+        if (!res.ok) continue;
+        const xml = (await res.text()).slice(0, 300000);
+        for (const m of xml.matchAll(/<(managingEditor|webMaster)>([^<]+)<\//gi)) {
+          // El campo puede venir como "mail@dom.com (Nombre)" — el estándar lo permite.
+          const e = (m[2].match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i) || [])[0];
+          if (e && !_esPseudoEmailDeAsset(e) && !detectarTrampaEmail(e)) {
+            emails.add(e.toLowerCase());
+            if (urlByEmail && !urlByEmail.has(e.toLowerCase())) urlByEmail.set(e.toLowerCase(), url);
+          }
+        }
+        if (emails.size) break;   // el feed contestó y dio algo: no hace falta probar los demás
+      } catch {}
+    }
+  } catch {}
+
+  // ── EL SITEMAP: dejar de adivinar rutas (Maxi 2026-08-19) ────────────────────────────
+  // Hoy se prueban ~90 rutas institucionales a ciegas (/contacto, /kontakt, /impressum...).
+  // El sitemap dice las que EXISTEN de verdad, y funciona donde la API de WordPress no llega
+  // (Drupal, Joomla, hechos a mano). Dos fetches: robots.txt para ubicarlo, y el sitemap.
+  try {
+    const _rob = await fetchExternoSeguro(`${base.replace(/\/$/, "")}/robots.txt`, { signal: AbortSignal.timeout(5000) }).catch(() => null);
+    const _sm = [];
+    if (_rob?.ok) {
+      const t = (await _rob.text()).slice(0, 50000);
+      for (const m of t.matchAll(/^\s*sitemap:\s*(\S+)/gim)) _sm.push(m[1]);
+    }
+    if (!_sm.length) _sm.push(`${base.replace(/\/$/, "")}/sitemap.xml`);
+    for (const smUrl of _sm.slice(0, 2)) {
+      try {
+        const res = await fetchExternoSeguro(smUrl, { signal: AbortSignal.timeout(7000) });
+        if (!res.ok) continue;
+        const xml = (await res.text()).slice(0, 500000);
+        for (const m of xml.matchAll(/<loc>([^<]+)<\/loc>/gi)) {
+          const u = m[1].trim();
+          if (CONTACT_HINT.test(u) && discovered.size < 40) discovered.add(u);
+        }
+      } catch {}
+    }
+  } catch {}
+
   let _hasReal = _tenemosContactoBueno(emails, cleanDomain);
   // seenUrl al scope de la función: lo usan la fase 2, el 2º nivel, WordPress REST, Google y
   // el salto a la casa editora. Antes vivía dentro del if y las fases nuevas no lo veían.
@@ -6636,6 +6721,38 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // precisos), luego las rutas estáticas de fallback. Early-stop al primer email real / buen lote.
   if (_wafBloquea && !_hasReal) {
     log(`  🛡️ ${domain}: Cloudflare nos frena con challenge — salto el crawl y voy por las vías de afuera`);
+    // ── WAYBACK MACHINE: la puerta de atrás cuando el sitio nos cierra la de adelante ──
+    // (Maxi 2026-08-19) Cuando Cloudflare bloquea, hoy solo quedaban DNS, Certificate
+    // Transparency y Google Play — todas indirectas. El archivo de internet tiene el HTML
+    // que el sitio SÍ servía antes, sin challenge, y encima recupera páginas de contacto
+    // que después se borraron. Gratis, sin key, y es la única vía para estos casos.
+    // Se pide el índice CDX filtrando por rutas de contacto y se baja el snapshot.
+    try {
+      const cdx = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(cleanDomain)}/*&output=json`
+                + `&collapse=urlkey&filter=original:.*(contact|contacto|kontakt|impressum|publicidad|advertise|about).*`
+                + `&filter=statuscode:200&limit=8&fl=timestamp,original`;
+      const r = await fetchExternoSeguro(cdx, { signal: AbortSignal.timeout(12000) }).catch(() => null);
+      if (r?.ok) {
+        const filas = await r.json().catch(() => []);
+        const snaps = (Array.isArray(filas) ? filas.slice(1) : []).slice(0, 3);   // fila 0 = cabecera
+        for (const [ts, orig] of snaps) {
+          if (_tenemosContactoBueno(emails, cleanDomain)) break;
+          try {
+            const snapUrl = `https://web.archive.org/web/${ts}id_/${orig}`;
+            const sr = await fetchExternoSeguro(snapUrl, { signal: AbortSignal.timeout(10000) });
+            if (!sr.ok) continue;
+            const html = (await sr.text()).slice(0, 400000);
+            for (const e of extractEmailsFromHtml(html)) {
+              if (!_esPseudoEmailDeAsset(e) && !detectarTrampaEmail(e)) {
+                emails.add(e);
+                if (urlByEmail && !urlByEmail.has(e)) urlByEmail.set(e, orig);
+              }
+            }
+          } catch {}
+        }
+        if (emails.size) log(`  🕰️ ${domain}: rescatado del archivo de internet (${emails.size} email(s))`);
+      }
+    } catch {}
   }
   if (_hayTiempo() && !_hasReal && !_wafBloquea) {
     const queue = [];
