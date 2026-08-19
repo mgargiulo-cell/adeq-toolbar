@@ -7469,6 +7469,90 @@ async function _auditAdsTxt(token, domain, verdict, reason, source, gate) {
 //   · sigue sin poder leerse → suma un intento y espera al próximo ciclo
 //   · resulta que no tiene  → pasa a 'no' (ya no se reintenta más)
 // ══════════════════════════════════════════════════════════════════════════════════════
+// VIGILANTE DEL DESCUBRIMIENTO (Maxi 2026-08-19)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// Pedido del user: "si se satura necesitamos saber qué ocurrió o que se autosolucione; la
+// idea es que todos los días se descubran nuevos dominios".
+//
+// Lo que pasó y no puede repetirse: un dominio inválido trabó la cola el 6 de julio. La cola
+// pasó de 250 y los CUATRO motores se apagaron en cascada — correctamente, porque está bien
+// no llenar un depósito que nadie vacía. Pero el problema estaba en otro lado, nadie lo supo,
+// y Prospects estuvo tres semanas sin recibir una sola URL.
+//
+// El parte de las 21 lo habría mostrado, pero una vez por día y a la noche. Esto corre cada
+// hora: si en las últimas 6 horas hábiles no entró NADA, diagnostica la causa concreta,
+// intenta destrabarla solo, y recién si no puede avisa — diciendo qué pasa, no "revisalo".
+const DESCUBRIMIENTO_HORAS_SIN_ALTAS = 6;
+async function vigilarDescubrimiento(token) {
+  const cfg = await getConfig(token);
+  if (String(cfg.vigilante_descubrimiento_enabled ?? "true") === "false") return;
+  if (_isWeekendSpain() || _spainHour() < 11 || _spainHour() > 22) return;  // con la jornada empezada
+  if (!(await _tocaCorrer(token, "vigilante_descubrimiento", 60))) return;
+
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const _contar = async (url) => {
+    try {
+      const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch { return -1; }
+  };
+
+  const desde = new Date(Date.now() - DESCUBRIMIENTO_HORAS_SIN_ALTAS * 3600_000).toISOString();
+  const altas = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde}&select=id`);
+  if (altas !== 0) return;                     // entró algo: todo bien, no molestamos
+  if (altas === -1) return;                    // no pude leer ≠ no hay altas
+
+  // No entró nada en 6 horas. ¿Por qué? Se busca la causa concreta, no un "algo pasa".
+  const backlog   = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`);
+  const enEspera  = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.waiting_pool&select=id`);
+  const rapid     = await getRapidApiUsageThisMonth(token).catch(() => ({ usedThisMonth: 0, limit: 40000 }));
+  const rapidHoy  = await getRapidApiUsageToday(token).catch(() => ({ usedToday: 0, limit: 1800 }));
+
+  const causas = [];
+  let curado = null;
+
+  if (backlog >= CSV_QUEUE_HALT_HIGH) {
+    causas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): los motores se frenan solos hasta que drene.`);
+    // AUTOCURACIÓN: lo más probable es que haya items viejos trabando. Se caducan y se mira
+    // si con eso alcanza. Es la misma maniobra que destrabó los 1.711 del 6 de julio.
+    await caducarColaVieja(token).catch(() => {});
+    const despues = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`);
+    if (despues >= 0 && despues < backlog) curado = `Caduqué los vencidos: la cola bajó de ${backlog} a ${despues}.`;
+  }
+  if (rapidHoy.usedToday >= rapidHoy.limit) {
+    causas.push(`Se agotó el cupo diario de SimilarWeb (${rapidHoy.usedToday}/${rapidHoy.limit}). Se retoma mañana — es pacing, no una falla.`);
+  }
+  if (rapid.usedThisMonth >= rapid.limit * 0.95) {
+    causas.push(`El plan mensual de SimilarWeb va por ${rapid.usedThisMonth}/${rapid.limit}: a partir del 95% los motores frenan.`);
+  }
+  if (!SERPER_API_KEY) causas.push(`AutoGoogle está apagado: falta la variable SERPER_API_KEY en Railway.`);
+  if (backlog === 0 && enEspera === 0) {
+    causas.push(`La cola está VACÍA y aun así no entró nada: los motores no están encontrando dominios nuevos, o no están corriendo.`);
+  }
+  if (!causas.length) causas.push(`No encontré una causa evidente. La cola está en ${backlog} y el cupo alcanza.`);
+
+  await saludAlerta(token, {
+    clave: "descubrimiento-parado", severidad: "error",
+    titulo: "🔭 Hace 6 horas que no entra ninguna URL nueva a Prospects",
+    cuerpo: [
+      `En las últimas ${DESCUBRIMIENTO_HORAS_SIN_ALTAS} horas no entró ni una URL nueva.`,
+      ``,
+      `POR QUÉ`,
+      ...causas.map(c => `  • ${c}`),
+      ``,
+      ...(curado ? [`YA LO DESTRABÉ`, `  ${curado}`, `  Si en la próxima hora sigue en cero, avisá.`, ``] : []),
+      `QUÉ TENÉS QUE HACER`,
+      curado
+        ? `  Nada por ahora — lo destrabé solo. Este mail es para que sepas que pasó.`
+        : `  Mandame este mail y decime "revisá el descubrimiento". La causa de arriba es el punto de partida.`,
+      ``,
+      `Estado: cola ${backlog} · en espera ${enEspera} · SimilarWeb ${rapid.usedThisMonth}/${rapid.limit} del mes`,
+    ].join("\n"),
+  }).catch(() => {});
+  log(`🔭 Vigilante descubrimiento: 0 altas en ${DESCUBRIMIENTO_HORAS_SIN_ALTAS}h — ${causas[0]}`);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════
 // EL PARTE DEL DÍA (Maxi 2026-08-18) — un mail que contesta "¿se cumplió el objetivo?"
 // ══════════════════════════════════════════════════════════════════════════════════════
 // Por qué existe, y es la lección más cara de todo el 18/08:
@@ -19986,6 +20070,10 @@ async function main() {
       // No cuesta nada: si no son las 21 o ya se mandó hoy, vuelve en el acto.
       // La lección: el aviso de que algo falló no puede depender de que el sistema esté sano.
       await parteDelDia(token).catch(e => log(`⚠️ parte del día: ${e.message}`));
+      // Maxi 2026-08-19: vigila que TODOS LOS DÍAS entren dominios nuevos. Va acá arriba por la
+      // misma razón que el parte: un aviso de que algo se frenó no puede depender de que el
+      // sistema esté funcionando. Se auto-limita a una vez por hora.
+      await vigilarDescubrimiento(token).catch(e => log(`⚠️ vigilante descubrimiento: ${e.message}`));
       // Sello del código en ejecución. Se escribe una sola vez por proceso (el worker reinicia
       // cada ~7min, así que `worker_boot_at` además dice hace cuánto arrancó este container).
       if (!_selloEscrito) {
