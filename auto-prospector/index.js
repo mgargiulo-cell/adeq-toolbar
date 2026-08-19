@@ -7627,6 +7627,33 @@ async function parteDelDia(token) {
   const altasHoy = altaImport + altaMonday + altaAutopilot + altaAutogoogle + altaOtros;
   const backlog  = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=id`);
 
+  // 3b. RENDIMIENTO POR FUENTE — pedido del user (2026-08-19): "vemos bien el rendimiento con
+  // el email que me llega, en donde tengo que tener info de esto".
+  // No alcanza con cuántos trajo cada motor: importa cuántos SOBREVIVIERON al filtro. Una
+  // fuente que trae 300 y deja 4 está gastando créditos y llenando la cola para nada, y en el
+  // total no se nota. Se mira la última semana para que un día flojo no confunda.
+  const _sem = new Date(Date.now() - 7 * 86400_000).toISOString();
+  const _porFuente = {};
+  try {
+    const filas = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?uploaded_at=gte.${_sem}&select=source,status`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    for (const f of (Array.isArray(filas) ? filas : [])) {
+      const s = String(f.source || "?").replace(/^auto_feeder_/, "");
+      _porFuente[s] = _porFuente[s] || { trajo: 0, paso: 0 };
+      _porFuente[s].trajo++;
+      if (f.status === "done") _porFuente[s].paso++;
+    }
+  } catch {}
+  const lineasFuente = Object.entries(_porFuente)
+    .sort((a, b) => b[1].trajo - a[1].trajo)
+    .map(([s, v]) => {
+      const pct = v.trajo ? Math.round((v.paso / v.trajo) * 100) : 0;
+      const señal = pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
+      return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)`;
+    });
+
   // 4. LIMPIEZA: URLs que YA ESTABAN en Prospects y se sacaron hoy por no cumplir.
   // Ojo con la fecha: se filtra por `updated_at` (cuándo se rechazó), no por `created_at`
   // (cuándo entró el lead). Es un error fácil y da números que no significan nada.
@@ -7682,6 +7709,12 @@ async function parteDelDia(token) {
     `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
     "",
     `PROSPECTS HOY  ${conEmail} contactables (~${diasDeStock} días de envíos) · ${sinEmail} sin email · ${backlog} en cola`,
+    ...(lineasFuente.length ? [
+      ``,
+      `RENDIMIENTO POR FUENTE (últimos 7 días — cuántos trajo y cuántos pasaron el filtro)`,
+      ...lineasFuente,
+      `   Menos de 10% que pasan = esa fuente está gastando créditos para nada.`,
+    ] : []),
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
     "",
     `— Parte diario de la ADEQ Toolbar · ${hoy}`,
