@@ -15716,7 +15716,13 @@ const SEC_TECHOS_DUROS = {
   // descubrimiento se frenaba por un límite nuestro, no del proveedor. 2000 deja pasar el
   // 1.800 real con un poco de aire, y sigue siendo un freno de verdad contra un runaway.
   // Si algún día cambia el plan, este número tiene que cambiar con él.
-  rapidapi_daily_limit:          2000,
+  // Maxi 2026-08-19: 2000 → 5000. El techo diario es PACING, no presupuesto: lo que cuida la
+  // plata es el tope mensual de 40.000, que no se toca. Poner el diario tan bajo que no se
+  // pueda drenar un atraso convierte una protección en un obstáculo — que es lo que pasó con
+  // los 1.711 dominios encolados desde julio: a 1.800 por día tardaban tres días en salir.
+  // 5.000 permite ponerse al día cuando hace falta y sigue siendo un freno real contra un
+  // runaway (5.000 son ~USD 0 de RapidAPI, pero 8 días seguidos se comerían el mes).
+  rapidapi_daily_limit:          5000,
   serper_contact_daily_cap:      300,
   autogoogle_serper_daily_cap:   300,
   agent_max_total_sends_per_day: 200,
