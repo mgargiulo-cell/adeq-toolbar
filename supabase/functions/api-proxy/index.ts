@@ -44,10 +44,16 @@ const PROVIDERS = {
     allow: /^\/v1\/(mixed_people\/api_search|people\/match|organizations\/enrich)$/,
   },
   rapidapi: {
-    base: "https://similarweb-insights.p.rapidapi.com",
+    // Maxi 2026-08-19: era `similarweb-insights`, que quedó viejo. El worker consulta
+    // `website-insights` y es el que está contratado (plan de 40.000/mes); la lista de paths
+    // de acá abajo también es la de website-insights (website-details, country-metadata,
+    // ai-traffic). O sea que el proxy mandaba a los MBs a una API distinta de la del worker
+    // —y probablemente sin suscripción—, mientras traffic.js esperaba el shape de
+    // website-insights. Los dos caminos tienen que pegarle a la misma API.
+    base: "https://website-insights.p.rapidapi.com",
     authMode: "header-rapidapi",
     keyEnv: "RAPIDAPI_KEY",
-    hostHeader: "similarweb-insights.p.rapidapi.com",
+    hostHeader: "website-insights.p.rapidapi.com",
     allow: /^\/(all-insights|traffic|ai-traffic|rank|seo|website-details|similar-sites|country-metadata|engagement|countries|similar|category|description|keywords|general|website-analysis)$/,
   },
   anthropic: {
