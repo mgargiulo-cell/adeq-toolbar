@@ -2774,6 +2774,26 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
     .map(d => `https://${String(d).replace(/^https?:\/\//, "").replace(/\/.*$/, "")}/sellers.json`);
   const _todas = [...new Set([...FEEDER_SELLERS_SOURCES, ..._urlsDesc])];
   if (_urlsDesc.length) log(`  📗 sellers: ${FEEDER_SELLERS_SOURCES.length} fijas + ${_urlsDesc.length} descubiertas = ${_todas.length} redes a consultar`);
+
+  // Maxi 2026-08-19: la lista COMPLETA queda publicada en la base para poder verla.
+  // Las 280 originales viven en el código y el user no tenía forma de consultarlas junto a las
+  // que encontró el sistema — por eso no notó que las automáticas ni siquiera se estaban
+  // usando. Cada red lleva su marca de origen: si no se puede distinguir lo que trajo el
+  // sistema de lo que cargó una persona, no hay manera de saber si el descubrimiento sirve.
+  try {
+    const _fijasH = FEEDER_SELLERS_SOURCES.map(_hostFromSellersUrl).filter(Boolean);
+    const _autoH  = _urlsDesc.map(_hostFromSellersUrl).filter(Boolean).filter(h => !_fijasH.includes(h));
+    await setConfigValue(token, "sellers_lista_completa", JSON.stringify({
+      actualizado: new Date().toISOString().slice(0, 16),
+      fijas: _fijasH.length,
+      automaticas: _autoH.length,
+      total: _fijasH.length + _autoH.length,
+      redes: [
+        ..._fijasH.sort().map(red => ({ red, origen: "fija" })),
+        ..._autoH.sort().map(red => ({ red, origen: "🤖 auto" })),
+      ],
+    }));
+  } catch {}
   const sourcesToTry = _todas.sort(() => Math.random() - 0.5);
   for (const url of sourcesToTry) {
     if (inserted >= targetCount) break;
