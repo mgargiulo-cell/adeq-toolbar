@@ -2754,7 +2754,27 @@ async function _getMondayApiKeyForFeeder(token) {
 // FUENTE 1: sellers.json (rotación, insiste hasta llegar al target)
 async function _feederPullSellers(token, targetCount, sessionKnown) {
   let inserted = 0;
-  const sourcesToTry = [...FEEDER_SELLERS_SOURCES].sort(() => Math.random() - 0.5);
+  // ⚠️ EL CIRCUITO ESTABA CORTADO EN EL ÚLTIMO PASO (Maxi 2026-08-19)
+  // Observación del user: "el listado de json lo agregué yo y quedó fijo, nunca el sistema
+  // auto-agregó". Tenía razón, y la causa estaba acá.
+  // El sistema SÍ descubre redes nuevas: `_feederPullAdsTxtGraph` lee el ads.txt de nuestros
+  // publishers, saca las redes que aparecen, y las guarda en `discovered_sellers_networks`.
+  // Pero esta función —la que consulta sellers.json todos los días— leía SOLO la lista fija
+  // del código. O sea que una red descubierta se explotaba UNA vez, en el momento del hallazgo,
+  // y después quedaba muerta en la config sin que nadie la volviera a consultar.
+  // Descubrir sin incorporar no es descubrir. Ahora la lista de consulta es fija + descubiertas,
+  // que es lo que hace que la base crezca sola mes a mes.
+  let _desc = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.discovered_sellers_networks&select=value`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (r.ok) _desc = JSON.parse((await r.json())?.[0]?.value || "[]");
+  } catch {}
+  const _urlsDesc = (Array.isArray(_desc) ? _desc : [])
+    .map(d => `https://${String(d).replace(/^https?:\/\//, "").replace(/\/.*$/, "")}/sellers.json`);
+  const _todas = [...new Set([...FEEDER_SELLERS_SOURCES, ..._urlsDesc])];
+  if (_urlsDesc.length) log(`  📗 sellers: ${FEEDER_SELLERS_SOURCES.length} fijas + ${_urlsDesc.length} descubiertas = ${_todas.length} redes a consultar`);
+  const sourcesToTry = _todas.sort(() => Math.random() - 0.5);
   for (const url of sourcesToTry) {
     if (inserted >= targetCount) break;
     try {
