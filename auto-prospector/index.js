@@ -15710,7 +15710,13 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
 // autenticados, así que un cap "de configuración" no es una defensa: es una sugerencia. Estos
 // valores están en el código y el vigilante corrige la DB si alguien los sube.
 const SEC_TECHOS_DUROS = {
-  rapidapi_daily_limit:          600,
+  // Maxi 2026-08-19: 600 → 2000. El 600 quedó de cuando no sabíamos la cuota real; el plan
+  // es de 40.000/mes, o sea ~1.800/día repartidos en los ~22 días hábiles. Con el techo en
+  // 600 el vigilante bajaba solo el cap a menos de un tercio de lo contratado y el
+  // descubrimiento se frenaba por un límite nuestro, no del proveedor. 2000 deja pasar el
+  // 1.800 real con un poco de aire, y sigue siendo un freno de verdad contra un runaway.
+  // Si algún día cambia el plan, este número tiene que cambiar con él.
+  rapidapi_daily_limit:          2000,
   serper_contact_daily_cap:      300,
   autogoogle_serper_daily_cap:   300,
   agent_max_total_sends_per_day: 200,
@@ -19926,6 +19932,17 @@ async function main() {
       // y no solo al arrancar: el apagón del 12-18/08 fue exactamente eso — la salvaguarda existía
       // pero vivía en main(), y el worker llevaba días sin reiniciar.
       await limpiarReservasHuerfanas(token);
+
+      // ── EL PARTE DEL DÍA VA ACÁ ARRIBA, A PROPÓSITO (Maxi 2026-08-19) ──────────────────
+      // La primera versión lo puso en la cadena de mantenimiento, detrás de polishPool. No
+      // salió nunca: ese bloque corre en cadena y lo de adelante se come la vuelta —el propio
+      // comentario del bloque lo advierte ("lo que va último puede no ejecutarse nunca") y aun
+      // así caí en lo mismo. Encima polishPool ahora corre SIEMPRE porque el agente de revisión
+      // lo re-arma, así que el parte quedó tapado justo por lo que agregamos el mismo día.
+      // Acá arriba se ejecuta sí o sí, en cada vuelta, antes de cualquier trabajo pesado.
+      // No cuesta nada: si no son las 21 o ya se mandó hoy, vuelve en el acto.
+      // La lección: el aviso de que algo falló no puede depender de que el sistema esté sano.
+      await parteDelDia(token).catch(e => log(`⚠️ parte del día: ${e.message}`));
       // Sello del código en ejecución. Se escribe una sola vez por proceso (el worker reinicia
       // cada ~7min, así que `worker_boot_at` además dice hace cuánto arrancó este container).
       if (!_selloEscrito) {
@@ -20044,9 +20061,6 @@ async function main() {
         // repaso de calidad. Va antes de los barridos para que, si los arma, corran en esta
         // misma vuelta.
         await agenteRevision(token).catch(e => log(`⚠️ agente revisión: ${e.message}`));
-        // Maxi 2026-08-18: el parte del día. Se auto-limita a uno por jornada y sólo dispara
-        // después de las 21 Madrid, así que llamarlo en cada vuelta no cuesta nada.
-        await parteDelDia(token).catch(e => log(`⚠️ parte del día: ${e.message}`));
         await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
         await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Maxi 2026-07-16: expansión por similares desde los Prospects grandes (gated similar_expansion_enabled).

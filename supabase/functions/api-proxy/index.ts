@@ -126,6 +126,30 @@ serve(async (req) => {
   const jwt = authHeader.replace(/^Bearer\s+/i, "");
   if (!jwt) return json(401, { error: "Missing bearer token" }, origin);
 
+  // ── CORTE POR MARTILLEO (Maxi 2026-08-19) ──────────────────────────────────────────────
+  // Desde el 12/08 hay IPs probando entrar sin parar: primero 162.220.232.202 (450 intentos
+  // en 6 días), después 152.55.176.97 (~20-70 por hora, sostenido más de un día). Todas con
+  // el Origin VACÍO, o sea que no son un navegador: son scripts.
+  // No entran —el token siempre es inválido— pero cada intento cuesta una llamada de auth a
+  // Supabase y llena la tabla de incidentes.
+  // Se corta ANTES de validar el token: si no viene de un origen nuestro y ya falló muchas
+  // veces seguidas, se devuelve 429 y listo. Deliberadamente NO toca el kill switch: frenar
+  // el agente por intentos fallidos sería regalarle a cualquiera un DoS gratis contra
+  // nosotros mismos. Esto solo frena a quien martilla, y el agente sigue trabajando.
+  const _esOrigenPropio = ORIGENES_OK.some((re) => re.test(origin));
+  if (!_esOrigenPropio && ipHash) {
+    const desde = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { count } = await supabase
+      .from("toolbar_security_events")
+      .select("id", { count: "exact", head: true })
+      .eq("kind", "jwt_invalido")
+      .eq("actor", ipHash)
+      .gte("created_at", desde);
+    if ((count ?? 0) >= 20) {
+      return json(429, { error: "Too many failed attempts" }, origin);
+    }
+  }
+
   const { data: userData, error: userErr } = await supabase.auth.getUser(jwt);
   if (userErr || !userData?.user?.email) {
     // Maxi 2026-08-18: se clasifica el incidente por ORIGEN. Un panel con la sesión vencida
@@ -134,10 +158,9 @@ serve(async (req) => {
     // `info` (se registra igual, para poder auditar, pero el Vigilante no lo cuenta como ataque);
     // si viene de afuera, sigue siendo `warn` y sí alerta. El `origin` en el detalle hace que el
     // mail se conteste solo, sin tener que ir al SQL.
-    const propio = ORIGENES_OK.some((re) => re.test(origin));
-    await registrarIncidente(supabase, "jwt_invalido", propio ? "info" : "warn", ipHash, {
+    await registrarIncidente(supabase, "jwt_invalido", _esOrigenPropio ? "info" : "warn", ipHash, {
       origin: origin || "(sin origen)",
-      propio,
+      propio: _esOrigenPropio,
       motivo: userErr?.message?.slice(0, 120) || "token no válido",
     });
     return json(401, { error: "Invalid token" }, origin);
