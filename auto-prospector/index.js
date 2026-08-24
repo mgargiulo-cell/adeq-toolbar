@@ -1506,7 +1506,9 @@ async function _findKnownDomainsWorker(token, candidates) {
   // ACHICARSE, y un publisher real descartado por un blip quedaba excluido de las 7
   // vías de descubrimiento para siempre. Los estados terminales de verdad (done,
   // pending, processing, frozen, next_day, waiting_pool) sí siguen bloqueando.
-  const _ESTADOS_REINTENTABLES = ["error", "skipped"];
+  // `expired` entra acá: son dominios que caducaron esperando en la cola SIN haber sido
+// evaluados nunca. Dejarlos fuera los bloqueaba para las siete vías, para siempre.
+const _ESTADOS_REINTENTABLES = ["error", "skipped", "expired"];
   const tables = [
     { table: "toolbar_csv_queue",     col: "domain", filter: `&status=not.in.(${_ESTADOS_REINTENTABLES.join(",")})` },
     { table: "toolbar_review_queue",  col: "domain", filter: "" },
@@ -1672,7 +1674,11 @@ const DEFAULT_SOURCE_CAP = 150;
 async function _countActiveCsvBySource(token, sourceTag) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool,next_day)&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
+      // `next_day` NO ocupa carril: son filas que ESPERAN, no trabajo en curso. Con 117 en
+      // next_day y cap 150, similar-expansion —la fuente que mejor convierte— se quedaba con
+      // 33 lugares y cortaba antes de gastar nada. El mismo bug se arregló el 01/07 para el
+      // gate global y nunca se portó a este contador.
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool)&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     return parseInt((res.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
@@ -1971,21 +1977,25 @@ const HISPANIC_TLDS = [".mx", ".ar", ".cl", ".co", ".pe", ".uy", ".es", ".ve", "
 //  · `"anunciar con nosotros"` → busca activamente anunciantes.
 // Todo esto sale gratis: son búsquedas normales de Serper, del mismo cupo.
 const _HUELLAS_ES = [
-  // Maxi 2026-08-19 — huellas nuevas. Todas comparten la misma lógica que las que ya
-  // funcionaban: buscar rastros que SOLO deja un sitio que vende publicidad de verdad.
-  // Un blog personal no publica un tarifario con formatos IAB ni tiene app-ads.txt.
-  `inurl:sellers.json "seller_type" {tld}`,          // el propio sellers.json indexado
-  `inurl:app-ads.txt "pub-" {tld}`,                  // publisher con app → casi siempre tiene web
-  `"300x250" OR "728x90" tarifas publicidad {tld}`,  // formatos IAB = tarifario real, no promesa
-  `"solicitar cotización" publicidad banner {tld}`,
-  `"asociación de medios digitales" socios {tld}`,   // directorios de editores por país
-  `"premio periodismo digital" finalistas {tld}`,    // listas curadas de medios chicos activos
-  `"representante comercial exclusivo" medios digitales {tld}`,
+  // ORDEN A PROPÓSITO (Maxi 2026-08-24): primero las PROBADAS, que son las que traían
+  // publishers. Las agregadas el 19/08 quedan detrás hasta poder medirlas — cuando
+  // estaban al frente, y con el bug del índice, `inurl:sellers.json` se comió el 100%
+  // de la huella comercial y devolvía ad-networks en vez de medios.
   `inurl:ads.txt "google.com, pub-" {tld}`,
   `"media kit" OR "kit de medios" noticias {tld}`,
   `"anunciar con nosotros" OR "publicite aqui" portal noticias {tld}`,
   `"tarifas publicitarias" OR "pauta publicitaria" diario digital {tld}`,
   `"nuestra redacción" OR "quiénes somos" noticias locales {tld}`,
+  // ── Agregadas el 19/08, todavía sin medir. Van al final a propósito. ──
+  `inurl:app-ads.txt "pub-" {tld}`,                  // publisher con app → casi siempre tiene web
+  `"300x250" OR "728x90" tarifas publicidad {tld}`,  // formatos IAB = tarifario real
+  `"solicitar cotización" publicidad banner {tld}`,
+  `"asociación de medios digitales" socios {tld}`,   // directorios de editores por país
+  `"premio periodismo digital" finalistas {tld}`,    // listas curadas de medios activos
+  `"representante comercial exclusivo" medios digitales {tld}`,
+  // `inurl:sellers.json` se SACÓ de acá: devuelve SSPs y ad-networks, no medios, y
+  // esos mueren gratis en la blocklist. Para descubrir redes nuevas ya existe
+  // `descubrirRedesPorSellersJson`, que es donde ese tipo de búsqueda sí sirve.
 ];
 // Sin inglés (pedido del user 2026-08-11). Cada idioma con SUS TLDs: buscar en
 // portugués sobre site:.it no tiene sentido y quema una consulta de Serper.
@@ -2177,6 +2187,9 @@ function _paisParaFrase(frase, esHispano) {
 }
 
 function _construirBusquedasDeHuella(esHispano, cuantas) {
+  // Rotar el punto de arranque por día: así en una semana se recorren todas las
+  // plantillas en vez de repetir siempre las primeras.
+  const _rotacionDelDia = _dayIndex(_madridDateStr()) % 7;
   // En el turno hispano, todo en español. En el otro, español mayoritario y el
   // resto repartido entre portugués, italiano y francés. Inglés nunca.
   const mezcla = esHispano
@@ -2195,7 +2208,14 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
     const lang = mezcla[i % mezcla.length];
     const plantillas = porIdioma[lang];
     const tlds = _TLDS_POR_IDIOMA[lang];
-    const p = plantillas[Math.floor(i / mezcla.length) % plantillas.length];
+    // ⚠️ ESTO DIVIDÍA POR EL LARGO DE LA MEZCLA DE IDIOMAS (Maxi 2026-08-24).
+    // Con los N reales de un slot (8-32 búsquedas) solo se alcanzaban las plantillas 0,
+    // 1 y 2 — ni con N=60 se llegaba a la 7. El 19/08 se agregaron 7 plantillas nuevas
+    // AL PRINCIPIO, y las 5 probadas quedaron en los índices 7-13: inalcanzables. Desde
+    // ese día la huella comercial pasó a ser `inurl:sellers.json`, que devuelve SSPs y
+    // ad-networks en vez de medios, y todo moría gratis en la blocklist. Ese es el motivo
+    // de las 1.225 búsquedas con 29 dominios y del silencio desde el 18/08.
+    const p = plantillas[(i + _rotacionDelDia) % plantillas.length];
     const tld = tlds[Math.floor(Math.random() * tlds.length)];
     const q = p.replace("{tld}", `site:${tld}`);
     out.push(q);
@@ -2493,10 +2513,17 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // búsqueda (rolling). Pool saturado (freshRate bajo) → MENOS búsquedas (no quemar créditos); piso 8 para
   // seguir sondeando cuando el pool se renueve; freshRate alto → hasta el budget completo.
   const _throttle = Math.max(0.15, Math.min(1, freshRate));
-  N = Math.min(remaining, 200, Math.max(8, Math.round(N * _throttle)));
+  // ⚠️ EL PISO DE 8 QUEMA CUPO A CIEGAS (Maxi 2026-08-24). Aunque `freshRate` sea 0,
+  // el "gasto inteligente" nunca bajaba de 8 búsquedas por slot: 5 slots × 21 días
+  // hábiles = ~840 búsquedas mensuales garantizadas aunque el motor no traiga NADA.
+  // Buena parte de las 1.225 gastadas este mes con 29 dominios encolados salió de acá.
+  // Ahora, si el rendimiento está por el piso, se busca poco y se espera a que el
+  // arreglo de las plantillas se note, en vez de seguir tirando créditos.
+  const _pisoBusquedas = freshRate < 0.1 ? 3 : 8;
+  N = Math.min(remaining, 200, Math.max(_pisoBusquedas, Math.round(N * _throttle)));
   // Cap por lugar en el carril: no buscar más de lo que entra. freshRate = dominios nuevos por
   // búsqueda → para llenar _laneRoom slots alcanzan ~_laneRoom/freshRate búsquedas (piso 8).
-  N = Math.min(N, Math.max(8, Math.ceil(_laneRoom / Math.max(0.2, freshRate))));
+  N = Math.min(N, Math.max(_pisoBusquedas, Math.ceil(_laneRoom / Math.max(0.2, freshRate))));
   // Pool = TODAS las frases de cascade (7549, 12 idiomas) desde keywordsData.js; fallback inline.
   // Maxi 2026-07-17 TURNO HISPANO: en los slots hispanos el pool se restringe al español
   // (672 frases) → descubrimiento LATAM/Centroamérica/España garantizado todos los días.
@@ -3601,7 +3628,7 @@ async function _measureFeederRuns(token) {
     const today = _madridNowParts().dateISO;
     const cutoffAgo = new Date(Date.now() - FEEDER_MEASURE_DELAY_MIN * 60_000).toISOString();
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&effective_added=is.null&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,rq_valid_before&limit=5`,
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&conversion_pct=is.null&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,rq_valid_before&limit=5`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return;
@@ -4556,7 +4583,16 @@ async function _isGeoOverrepresentedInPool(token, topCountryName, geosAll) {
   if (!iso) return false;
   const count = _geoPoolCache.byGeo.get(iso) || 0;
   const pct = count / _geoPoolCache.totalPending;
-  return pct > _GEO_SATURATION_PCT;
+  // ⚠️ EL 25% PAREJO PELEA CONTRA LA CASCADA GEO (Maxi 2026-08-24).
+  // La regla del negocio es LATAM primero, después Centroamérica y España. Pero un
+  // tope del 25% por país trata igual a Brasil que a Nueva Zelanda: la expansión por
+  // similares encuentra los pares brasileños de un publisher brasileño, BR pasa del
+  // 25%, y todos rebotan a `next_day`. Son los 117 que tenía atascados similar-expansion,
+  // que además es la fuente que MEJOR convierte.
+  // Los niveles prioritarios tienen más margen; los de nivel 4 y los anglo, el de antes.
+  const _tier = _geoTier(iso);
+  const _techo = _tier <= 3 ? 0.45 : _GEO_SATURATION_PCT;
+  return pct > _techo;
 }
 
 // Período mensual = ciclo 6 → 6 (Maxi 2026-06-17). El RapidAPI cycle real
@@ -8110,7 +8146,9 @@ async function limpiarReservasHuerfanas(token) {
 let _lastAdsRecheckDay = "";
 async function recheckAdsTxtUnknowns(token) {
   const cfg = await getConfig(token);
-  if (String(cfg.adstxt_recheck_enabled || "") !== "true") return;
+  // Prendido por default, como los demás flags recurrentes. Arrancaba apagado y el job
+  // que recupera los ads.txt que no se pudieron leer no corría nunca.
+  if (String(cfg.adstxt_recheck_enabled ?? "true") !== "true") return;
   const hoy = _madridDayStartUtc().slice(0, 10);
   // ── POR QUÉ ESTO SE PERSISTE Y NO VIVE EN MEMORIA (Maxi 2026-08-04) ──────────────────────
   // El marcador de "ya corrí hoy" era una variable del proceso, y el worker reinicia cada ~7min
@@ -8160,7 +8198,11 @@ async function recheckAdsTxtUnknowns(token) {
         recuperados++;
         // Vuelve a la cola: el dominio SÍ monetiza, merece analizarse.
         try {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue`, {
+          // ⚠️ SIN `?on_conflict=domain` (Maxi 2026-08-24). El dominio YA tiene fila en
+          // la cola, así que el POST chocaba con el unique, el catch se lo tragaba, y el
+          // audit quedaba marcado `resolved_at` → el ads.txt recuperado NUNCA se
+          // reintentaba. Es el mismo bug que el unfreezer describe en su comentario.
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?on_conflict=domain`, {
             method: "POST",
             headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
             body: JSON.stringify([{ domain: f.domain, status: "pending", uploaded_by: AGENT_UPLOADER, source: f.source || "adstxt_recheck", uploaded_at: new Date().toISOString() }]),
@@ -10489,7 +10531,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // - traffic < 400K → skip (no entra)
   // - traffic = 0 / null / error → after 3 failed attempts, FREEZE 15d/30d/60d
   // - traffic ≥ 400K → entra al pool
-  if ((!visits || visits <= 0) && !bypassGeoPrefs) {
+  // ⚠️ `bypassGeoPrefs` significa "saltear preferencias de GEO", NADA MÁS. Acá también
+  // apagaba el reintento y el freeze ante fallas de la API de tráfico, así que para un
+  // cliente de Monday que ya trabajó con nosotros, un timeout de RapidAPI terminaba en
+  // "pageviews 0 below min 350000" — descarte permanente, sin rastro de que algo falló.
+  // La prueba: Monday tiene 0 frozen y 0 next_day, que es imposible si el bloque corriera.
+  // Caso 15 del patrón "no pude" tratado como "no sirve".
+  if (!visits || visits <= 0) {
     // Maxi 2026-06-22 FIX: NO penalizar/congelar por fallas TRANSITORIAS de la API
     // (429/5xx/timeout/red). Antes 3 timeouts seguidos congelaban un lead bueno 15-60d
     // y hasta lo mandaban a blocklist. Solo se cuenta como intento fallido cuando la API
@@ -10753,7 +10801,12 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Antes los imports manuales lo salteaban y un banco cargado a mano entraba a Prospects.
   // Regla del user: "lo que un MB importa a mano, todo debe pasar el filtro siempre".
   {
-    const pub = await classifyPublisher(token, domain, pageContent, swCategory);
+    // ⚠️ SIN EL 5º ARGUMENTO, LA REGLA DE LA PUERTA GRANDE NO EXISTE (Maxi 2026-08-24).
+    // `scoreProspectable` lee el tráfico de `swData?.traffic`; sin pasarlo daba 0 y
+    // `_apruebaPorAdsTxtYTrafico` devolvía false SIEMPRE. O sea que la regla del user
+    // —"toda url con ads.txt y +400k sirve, no importa el rubro"— estaba escrita y no
+    // se aplicaba a UN SOLO lead nuevo: todos los vetos por rubro seguían matando.
+    const pub = await classifyPublisher(token, domain, pageContent, swCategory, { traffic: effectivePageViews || visits || 0, geo: topCountry || "" });
     // ⚠️ EL VEREDICTO TIENE TRES ESTADOS, NO DOS (Maxi 2026-08-11).
     // Acá se miraba solo `!pub.ok` y se descartaba PERMANENTEMENTE, ignorando por
     // completo el `pub.retry` que la propia función devuelve para decir "no pude
@@ -10955,7 +11008,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       pitch:          "",
       pitchSubject:   "",
       pitchSubjects:  [],
-      score:          0,
+      // ⚠️ ERA 0 FIJO (Maxi 2026-08-24). Las 6 fuentes que entran por la cola quedaban
+      // con score 0, y la expansión por similares pide `score >= 30` para tomar una
+      // semilla fresca. O sea que la ruta "encontré uno bueno, busco sus pares" era
+      // estructuralmente inalcanzable y siempre caía al barrido viejo por cursor —
+      // justo lo que el comentario del 11/08 dice haber arreglado. El puntaje ya venía
+      // calculado en `pub.score`, una línea más arriba.
+      score:          Number(pub?.score) || 0,
       adNetworks,
       pageTitle,
       // Monday refresh tagea con el MB dueño del item original (deal_owner)
@@ -11786,7 +11845,7 @@ async function runSession(token, cfg, sessionStart) {
       continue;
     }
     // Cap superior — sitios mega-grandes no son target ADEQ
-    if (visits > MAX_TRAFFIC_FOR_PROSPECT) {
+    if (pageViews > MAX_TRAFFIC_FOR_PROSPECT) {
       log(`  ✗ Tráfico (${Math.round(visits/1_000_000)}M) > ${MAX_TRAFFIC_FOR_PROSPECT/1_000_000}M cap — too big for ADEQ`);
       await markProcessed(token, [domain], "traffic_too_high");
       count++; skipped++;
@@ -11837,7 +11896,15 @@ async function runSession(token, cfg, sessionStart) {
 
     // ── FILTRO DE BASURA (Maxi 2026-06-19) — antes el autopilot NO filtraba
     // gov/uni/empresa/SaaS (solo el path CSV lo hacía). Ahora también acá.
-    const _pub = await classifyPublisher(token, domain, pageContent, trafficData?.swCategory);
+    const _pub = await classifyPublisher(token, domain, pageContent, trafficData?.swCategory, { traffic: pageViews || visits || 0, geo: topCountry || "" });
+    // El veredicto tiene TRES estados. `retry` significa "no pude juzgarlo" (Cloudflare,
+    // timeout), no "no sirve". El arreglo del 11/08 se hizo en processCsvItem y nunca se
+    // portó acá: el autopilot mataba permanentemente a cualquier publisher bloqueado.
+    if (!_pub.ok && _pub.retry) {
+      log(`  ⏳ ${domain} — no pudimos juzgarlo (${_pub.reason}) → se reintenta, NO se descarta`);
+      count++; skipped++;
+      continue;
+    }
     if (!_pub.ok) {
       log(`  🗑 ${domain} — no parece publisher (${_pub.reason}) → skip`);
       await markProcessed(token, [domain], "not_publisher");
@@ -12020,7 +12087,7 @@ async function runSession(token, cfg, sessionStart) {
       // AutoGoogle marcaba 0 calificados. Ahora se etiqueta por el ORIGEN real del dominio:
       // similar (de la API de similares), radar (Cloudflare Radar por país) o majestic.
       source:        likedSimilarDomains.has(domain) ? "similar"
-                       : (poolSource.startsWith("radar") ? "radar" : "majestic"),
+                       : (poolSource.includes("radar") ? "radar" : "majestic"),
     });
     if (saveOk === "ok") {
       await markProcessed(token, [domain], "added_to_review");
@@ -19432,7 +19499,10 @@ async function saludWatchdog(token) {
     }
     if (rindenPoco.length) {
       await saludAlerta(token, {
-        clave: "jobs-rinden-poco", severidad: "warning",
+        // ERA "warning" = solo campanita. AutoGoogle estuvo 4 días hábiles sin encolar
+        // nada, con la señal correcta escrita en toolbar_health, y nadie se enteró
+        // porque el aviso no salía del panel. Un motor que deja de producir es grave.
+        clave: "jobs-rinden-poco", severidad: "error",
         titulo: `📉 ${rindenPoco.length} trabajo(s) rindiendo por debajo`,
         cuerpo: rindenPoco.join("\n"), metadata: { jobs: rindenPoco },
       });
