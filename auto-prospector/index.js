@@ -17716,6 +17716,7 @@ async function runAgentCycle(token, allFlags) {
         if (email && ranked.length > 0) {
           const MAX_MV_PER_LEAD = 3;
           let mvUsed = 0, chosen = null, descartados = 0;
+          const _motivosDescarte = [];   // POR QUÉ se cayó cada candidato, no solo cuántos
           // Reserva: el mejor candidato "riesgo" (catch-all, o que no se pudo verificar). No se
           // descarta —perderíamos publishers corporativos enteros, que suelen ser catch-all— pero
           // se usa solo si ningún candidato verifica limpio. Como _orden ya viene por ranking, el
@@ -17729,7 +17730,7 @@ async function runAgentCycle(token, allFlags) {
             ...ranked.filter(c => c.email !== email),
           ];
           for (const cand of _orden) {
-            if (isBouncedSync(cand.email)) { descartados++; continue; }   // ya rebotó antes
+            if (isBouncedSync(cand.email)) { descartados++; _motivosDescarte.push("ya_reboto"); continue; }
             // Maxi 2026-07-28: marca distinta → descartar ESTE candidato, no el lead.
             // Antes el chequeo vivía después de la reserva y hacía `continue` del lead entero,
             // marcándolo 'rejected' PARA SIEMPRE aunque tuviera otras direcciones buenas. Casos
@@ -17737,7 +17738,7 @@ async function runAgentCycle(token, allFlags) {
             // subdominios de globo.com (es el WHOIS proxy, no el publisher).
             if (!_brandMatches(cand.email, domain)) {
               log(`  🚫 ${domain}: ${cand.email} es de otra marca — se descarta el email, NO el lead`);
-              descartados++;
+              descartados++; _motivosDescarte.push("otra_marca");
               continue;
             }
             // Enrutamiento del gasto (auditoría 2026-08-04): en Microsoft 365 y en los gateways
@@ -17748,7 +17749,7 @@ async function runAgentCycle(token, allFlags) {
             const _ruta = await decidirVerificacionMV(cand.email, cand.source).catch(() => ({ verificar: true, enviar: true }));
             if (!_ruta.enviar) {
               log(`  ⏭️ ${domain}: ${cand.email} descartado — ${_ruta.motivo}`);
-              descartados++;
+              descartados++; _motivosDescarte.push("catch_all_y_patron");
               continue;
             }
             if (_ruta.verificar && mvUsed < MAX_MV_PER_LEAD) {
@@ -17791,8 +17792,28 @@ async function runAgentCycle(token, allFlags) {
             log(`  ⏭ ${domain}: SKIP — todos los candidatos no entregables (${descartados} descartados)`);
             await logAgentAction(token, userEmail, {
               domain, action: "skipped", reason: "all_candidates_undeliverable",
-              details: { traffic: leadTraffic, geo: leadGeo, emails_count: emails.length, descartados },
+              // ⚠️ ANTES SOLO SE GUARDABA EL NÚMERO (Maxi 2026-08-24). Con 327 descartes en
+              // 7 días —el mayor freno de envíos que queda— no había forma de saber la causa
+              // sin leer el código. Ahora el motivo de cada candidato queda en la fila.
+              details: {
+                traffic: leadTraffic, geo: leadGeo, emails_count: emails.length, descartados,
+                motivos: _motivosDescarte.reduce((a, m) => { a[m] = (a[m] || 0) + 1; return a; }, {}),
+              },
             });
+            // ── NO ES UN CALLEJÓN SIN SALIDA (Maxi 2026-08-24) ──────────────────
+            // Estos leads quedaban atascados: el agente los elegía y los descartaba en
+            // CADA ciclo, para siempre. El motivo dominante es "el proveedor acepta
+            // cualquier destinatario y el email es una hipótesis de patrón" — o sea que
+            // el problema no es el lead, es que solo tenemos direcciones inventadas.
+            // La salida correcta no es descartarlo: es ir a buscarle un email REAL.
+            // Se limpia la marca de intento para que la caza de emails lo tome primero.
+            if (_motivosDescarte.includes("catch_all_y_patron")) {
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+                method: "PATCH",
+                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+                body: JSON.stringify({ email_ultimo_intento: null, email_ultimo_motivo: "solo_hipotesis_de_patron" }),
+              }).catch(() => {});
+            }
             continue; // próximo lead
           }
         }
