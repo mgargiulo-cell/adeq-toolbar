@@ -8438,7 +8438,7 @@ async function purgeByUrlOnly(token) {
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${ids.slice(i, i + 100).join(",")})`, {
           method: "PATCH",
           headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `urlpurge: ${reason}`.slice(0, 200) }),
+          body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `urlpurge: ${reason}`.slice(0, 200), rejected_at: new Date().toISOString() }),
         });
       } catch (e) { log(`⚠️ url-purge patch: ${e.message}`); }
     }
@@ -8582,7 +8582,7 @@ async function sweepBlockedFromProspects(token) {
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${d.id}`, {
         method: "PATCH",
         headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `purge: ${d.reason}`.slice(0, 200) }),
+        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `purge: ${d.reason}`.slice(0, 200), rejected_at: new Date().toISOString() }),
       });
       log(`  🗑️ purge ${d.domain} — ${d.reason}`);
     } catch {}
@@ -8602,7 +8602,7 @@ async function _softRejectLead(auth, id, reason) {
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${id}`, {
       method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-      body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `purge: ${reason}`.slice(0, 200) }),
+      body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `purge: ${reason}`.slice(0, 200), rejected_at: new Date().toISOString() }),
     });
   } catch {}
 }
@@ -8814,7 +8814,15 @@ async function polishPool(token) {
             _patch.contact_name = foundName || lead.contact_name || "";
           }
           if (foundPhone && !_curPhone) _patch.contact_phone = foundPhone;
-          if (foundEmail) { _patch.email_intentos = 0; _patch.email_ultimo_motivo = null; }
+          if (foundEmail) {
+            _patch.email_intentos = 0;
+            _patch.email_ultimo_motivo = null;
+            // RESCATE: la fecha se marca SOLO si el lead no tenía ningún email. Es la
+            // métrica que pidió el user —"a cuántas URLs que entraron sin contacto se
+            // les encontró uno"— y mide el trabajo del BARRIDO, no el del descubrimiento.
+            // Si el lead ya venía con email, sumar uno más no es un rescate.
+            if (!curEmails.length) _patch.email_found_at = new Date().toISOString();
+          }
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
             body: JSON.stringify(_patch),
@@ -17715,7 +17723,7 @@ async function runAgentCycle(token, allFlags) {
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `envio: ${_urlChk.reason}`.slice(0, 200) }),
+            body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `envio: ${_urlChk.reason}`.slice(0, 200), rejected_at: new Date().toISOString() }),
           }).catch(() => {});
           await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `url_no_prospectable:${_urlChk.reason}` });
           continue; // próximo lead
