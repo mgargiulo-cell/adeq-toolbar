@@ -10165,7 +10165,7 @@ async function getNextCsvItem(token, blockedUsers = new Set()) {
     }
     const pedir = async (extra, lim = 1) => {
       const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}${extra}&order=uploaded_at.asc&limit=${lim}&select=id,domain,uploaded_by,error_message`,
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.pending${filter}${extra}&order=uploaded_at.asc&limit=${lim}&select=id,domain,uploaded_by,error_message,source`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       );
       const j = await r.json().catch(() => []);
@@ -10207,7 +10207,11 @@ async function _reclamarCsvItem(token, item) {
       }
     );
     const claimed = await claim.json().catch(() => []);
-    if (claimed?.[0]) return item;
+    // Se devuelve la fila COMPLETA que trajo el PATCH, no la parcial del SELECT.
+    // El SELECT pedía solo id/domain/uploaded_by/error_message, así que `item.source`
+    // llegaba undefined y todo terminaba etiquetado "autopilot" (ver el switch de
+    // processCsvItem). La representación ya venía en la respuesta y se descartaba.
+    if (claimed?.[0]) return { ...item, ...claimed[0] };
     // Cuerpo vacío NO prueba que el reclamo falló: si el PATCH funcionó pero PostgREST no
     // devolvió la representación, el item YA quedó en `processing` y nosotros lo dábamos por
     // perdido → devolvíamos null → el llamador frenaba la cola entera. Y el item quedaba
@@ -10391,9 +10395,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // discovery automático. "csv"/"manual" solo son válidos si uploaded_by es un MB humano
     // (isManualImport). Un source desconocido de un item del worker/autofeeder NUNCA debe quedar
     // "csv" (mentía: leads del worker aparecían como imports manuales); cae a "autopilot".
+    // ⚠️ EL DEFAULT MENTÍA (Maxi 2026-08-24) ────────────────────────────────
+    // `getNextCsvItem` pedía `select=id,domain,uploaded_by,error_message` — SIN
+    // `source`. Así que `item.source` llegaba undefined SIEMPRE, el switch caía acá
+    // y TODO quedaba etiquetado "autopilot". Medido: en 7 días, 127 leads de
+    // similar-expansion, 58 del grafo de ads.txt, 42 de sellers.json y 24 de
+    // Majestic entraron a Prospects disfrazados de autopilot. Por eso "autopilot"
+    // parecía la fuente dominante con 3.369 leads y las otras cuatro no existían.
+    //
+    // Ya se agregó `source` al select. Y el default deja de adivinar: si de verdad
+    // no sabemos de dónde vino, se dice. Una etiqueta inventada es peor que una
+    // desconocida, porque las métricas por fuente deciden dónde invertir.
     default:
       source = (item.source && String(item.source).trim())
-        || (isManualImport ? "csv" : "autopilot");
+        || (isManualImport ? "csv" : "origen_desconocido");
   }
   let mondayItemId = null;
 
