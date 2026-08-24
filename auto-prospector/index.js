@@ -8824,9 +8824,25 @@ async function polishPool(token) {
             foundSource = _socialOut.has(_le) ? "social" : (_informerOut.has(_le) ? "informer" : "scrape");
           }
         }
-        if (!foundEmail && apolloAvailable) {
+        // ── APOLLO TAMBIÉN PARA MEJORAR UN GENÉRICO (Maxi 2026-08-24) ──────────
+        // Antes solo se llamaba cuando el rastreo gratis no encontraba NADA. Como el
+        // descubrimiento gratis quedó muy bueno (13 vías), casi siempre encuentra algo
+        // —normalmente un info@— y Apollo no entraba nunca: 137 llamadas de un plan de
+        // 2.500 en 12 días, o sea el 5,5% de algo que se paga igual.
+        //
+        // Pero un info@ NO es un contacto comercial. Medido en el pool: 127 leads
+        // pendientes tienen SOLO direcciones genéricas. Apollo es la única vía que
+        // devuelve una persona con nombre y cargo, que es justamente lo que hace que un
+        // mail se conteste. Ahí es donde el crédito rinde.
+        const _soloGenericos = curEmails.length > 0
+          && curEmails.every(e => _isGenericLocalPart(e))
+          && (!foundEmail || _isGenericLocalPart(foundEmail));
+        if ((!foundEmail || _soloGenericos) && apolloAvailable) {
           const ap = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true }).catch(() => null);
-          if (ap?.email) { foundEmail = ap.email; foundSource = "apollo"; foundName = ap.contact_name || ""; }
+          if (ap?.email) {
+            foundEmail = ap.email; foundSource = "apollo"; foundName = ap.contact_name || "";
+            if (_soloGenericos) log(`  ⬆️ ${domain}: Apollo mejoró un genérico → ${ap.email}${ap.contact_name ? ` (${ap.contact_name})` : ""}`);
+          }
         }
         // 5) Maxi 2026-07-16 FALLBACK Google (Serper) OPTIMIZADO: gasta 1 crédito SOLO si el dominio quedó
         //    con CERO email (NO en los que ya tienen uno genérico → esos ya son contactables). Con CAP
@@ -19286,6 +19302,45 @@ async function vigilarFuentesDeDescubrimiento(token) {
   } catch (e) { log(`⚠️ vigilarFuentesDeDescubrimiento: ${e.message}`); }
 }
 
+// ── ¿ESTAMOS USANDO LO QUE PAGAMOS? (Maxi 2026-08-24) ────────────────────────
+// Todos los detectores de este sistema vigilan que no nos PASEMOS de los topes.
+// Ninguno vigilaba lo contrario: un plan pago que se desaprovecha. Apollo llevaba 137
+// llamadas de 2.500 en 12 días —el 5,5%— y nadie se enteró, porque desde el punto de
+// vista de los guards eso es "todo en orden". Los créditos no se acumulan: lo que no
+// se usa antes del 12 de cada mes se pierde.
+async function vigilarAprovechamientoDeApollo(token) {
+  try {
+    if (!(await _tocaCorrer(token, "aprovechamiento_apollo", 24 * 60))) return;
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg || !cfg.apollo_api_key) return;
+
+    const usadas = parseInt(cfg.apollo_calls_month || "0", 10) || 0;
+    const inicio = Date.parse(`${cfg.apollo_calls_month_period || ""}T00:00:00Z`);
+    if (!inicio) return;
+    const diasCorridos = Math.max(1, Math.floor((Date.now() - inicio) / 86400000));
+    if (diasCorridos < 5) return;                       // muy temprano para juzgar el ritmo
+
+    const proyectado = Math.round((usadas / diasCorridos) * 30);
+    const pct = proyectado / APOLLO_MONTHLY_HARD_CAP;
+    await saludPing(token, "aprovechamiento_apollo", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: `${usadas} usadas en ${diasCorridos}d → proyección ${proyectado} de ${APOLLO_MONTHLY_HARD_CAP}`,
+      real: proyectado, esperado: APOLLO_MONTHLY_HARD_CAP,
+    });
+
+    // Por debajo de la mitad del plan hay plata tirada, y es accionable: significa que
+    // hay leads que se podrían estar mejorando con un contacto real y no se están tocando.
+    if (pct < 0.5) {
+      await saludAlerta(token, {
+        clave: "apollo-desaprovechado", severidad: "warning",
+        titulo: `💸 Apollo va a usar ${proyectado} de ${APOLLO_MONTHLY_HARD_CAP} créditos`,
+        cuerpo: `Llevás ${usadas} en ${diasCorridos} días. Los créditos NO se acumulan: lo que no se use antes del cierre del ciclo se pierde.\nApollo es la única vía que devuelve una PERSONA con nombre y cargo — el resto entrega buzones genéricos.\nMirá cuántos leads podrían mejorarse:\n  SELECT count(*) FROM toolbar_review_queue WHERE status='pending'\n   AND jsonb_array_length(coalesce(emails,'[]'::jsonb)) = 0;`,
+        metadata: { usadas, dias: diasCorridos, proyectado, plan: APOLLO_MONTHLY_HARD_CAP },
+      });
+    }
+  } catch (e) { log(`⚠️ vigilarAprovechamientoDeApollo: ${e.message}`); }
+}
+
 // ── CHEQUEO DEL PROPIO DNS ───────────────────────────────────────────────────
 // Diez líneas que cubren el agujero más grande de la auditoría: nadie verificaba
 // SPF, DKIM ni DMARC de adeqmedia.com. Sin autenticación, cualquier arreglo de
@@ -20671,6 +20726,8 @@ async function main() {
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
       // Y que ninguna fuente pueda morirse en silencio otra vez.
       await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
+      // Y que no se desperdicie un plan pago: los créditos de Apollo no se acumulan.
+      await vigilarAprovechamientoDeApollo(token).catch(e => log(`⚠️ apollo uso: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
