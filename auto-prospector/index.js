@@ -10575,6 +10575,23 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // puede girar sin fin: si no salió en 20 vueltas, deja de trabar a los que vienen atrás.
     // Es la red que faltaba — el bug de arriba fue posible sólo porque no había ningún límite.
     const _reintentos = parseInt((item.error_message || "").match(/retry_(\d+)/)?.[1] || "0", 10);
+
+    // ⚠️ QUEDARSE SIN CUOTA NO ES CULPA DEL DOMINIO (Maxi 2026-08-24).
+    // Si el que se quedó sin cupo somos NOSOTROS —plan de RapidAPI agotado, cap diario
+    // alcanzado— reintentar ahora es inútil: la respuesta va a ser la misma hasta que
+    // resetee. Pero el contador de reintentos subía igual, así que en un día sin cuota
+    // cada item quemaba sus 20 intentos y terminaba en `skipped`. Un problema de
+    // facturación nuestro borraba inventario bueno de la cola.
+    // Estos van a `next_day`: vuelven mañana, sin gastar un intento.
+    const _sinCuotaNuestra = /daily_cap_reached|per_minute_fuse_tripped|HTTP 40[123]|quota|exceeded|not subscribed/i.test(_errStr);
+    if (_sinCuotaNuestra) {
+      await markCsvItem(token, item.id, "next_day", {
+        error_message: `sin_cuota_de_api (no cuenta como intento): ${_errStr.slice(0, 40)}`,
+      });
+      log(`  ⏸️ ${domain} — nos quedamos sin cuota de API, vuelve mañana SIN gastar un intento`);
+      return;
+    }
+
     if (_transient && _reintentos < 20) {
       await markCsvItem(token, item.id, "pending", {
         error_message: `traffic_api_transient retry_${_reintentos + 1} (reintento sin penalizar): ${_errStr.slice(0, 40)}`,
