@@ -3689,7 +3689,12 @@ async function maybeStartAutopilotSlot(token) {
   if (_autopilotLastSlot === slotLabel) return;
   // Maxi 2026-06-22: gate de backlog — no descubrir más si la cola csv está llena.
   const _apBl = await _getCsvQueueBacklog(token);
-  if (_apBl >= CSV_QUEUE_HALT_HIGH) { log(`🤖 Autopilot SKIP: cola csv backlog ${_apBl} (>${CSV_QUEUE_HALT_HIGH})`); return; }
+  // El segundo freno: si la cola pasa de 250, el slot no se prende. Sumado al gate del
+  // loop, el autopilot quedaba apagado de forma permanente. El backlog es un motivo
+  // válido para no INUNDAR la cola, pero el autopilot no escribe en la cola: escribe
+  // directo a Prospects. Se sube el umbral a un valor que solo salta si la cosa está
+  // realmente desbordada.
+  if (_apBl >= CSV_QUEUE_HALT_HIGH * 4) { log(`🤖 Autopilot SKIP: cola csv desbordada (${_apBl})`); return; }
 
   // Race-condition guard: persistir en Supabase para sobrevivir restarts.
   try {
@@ -19182,6 +19187,61 @@ async function vigilarReputacion(token) {
   } catch (e) { log(`⚠️ vigilarReputacion: ${e.message}`); }
 }
 
+// ── UNA FUENTE MUERTA NO PUEDE SER INVISIBLE (Maxi 2026-08-24) ───────────────
+// El vigilante de descubrimiento contaba las altas GLOBALES, así que mientras Monday
+// y sellers alimentaran, una fuente en cero pasaba desapercibida. Costó caro dos veces
+// en un mes: AutoGoogle estuvo 4 días hábiles sin encolar nada, y el autopilot estuvo
+// UN MES entero sin producir un lead — y en los dos casos el dato estaba en la base.
+// Esto mira fuente por fuente.
+const _FUENTES_VIGILADAS = {
+  // fuente en Prospects : cada cuántos días debería producir al menos un lead
+  autopilot:      3,
+  autogoogle:     3,
+  similar:        5,
+  adstxt:         5,
+  sellers_json:   5,
+  majestic:       7,
+  monday_refresh: 3,
+};
+
+async function vigilarFuentesDeDescubrimiento(token) {
+  try {
+    if (!(await _tocaCorrer(token, "vigilar_fuentes", 12 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const mudas = [];
+    for (const [fuente, diasMax] of Object.entries(_FUENTES_VIGILADAS)) {
+      let ultimo = null;
+      try {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?source=eq.${encodeURIComponent(fuente)}&select=created_at&order=created_at.desc&limit=1`,
+          { headers: auth });
+        if (!r.ok) continue;                       // no pude medir ≠ está muerta
+        const f = await r.json();
+        if (!Array.isArray(f)) continue;
+        if (!f.length) { mudas.push(`${fuente}: nunca produjo un lead`); continue; }
+        ultimo = Date.parse(f[0].created_at) || null;
+      } catch { continue; }
+      if (!ultimo) continue;
+      const dias = Math.floor((Date.now() - ultimo) / 86400000);
+      if (dias >= diasMax) mudas.push(`${fuente}: ${dias} días sin producir (esperado cada ${diasMax})`);
+    }
+    await saludPing(token, "fuentes_descubrimiento", {
+      status: "ok", cadenciaMin: 12 * 60,
+      detalle: mudas.length ? `${mudas.length} fuente(s) muda(s)` : "las 7 producen",
+      real: Object.keys(_FUENTES_VIGILADAS).length - mudas.length,
+      esperado: Object.keys(_FUENTES_VIGILADAS).length,
+    });
+    if (mudas.length) {
+      await saludAlerta(token, {
+        clave: "fuentes-mudas", severidad: "error",
+        titulo: `🔌 ${mudas.length} fuente(s) de descubrimiento sin producir`,
+        cuerpo: `${mudas.map(m => "· " + m).join("\n")}\n\nMientras las otras alimenten, esto no se nota en el total.\n  SELECT source, count(*), max(created_at)::date FROM toolbar_review_queue GROUP BY 1 ORDER BY 2 DESC;`,
+        metadata: { mudas },
+      });
+    }
+  } catch (e) { log(`⚠️ vigilarFuentesDeDescubrimiento: ${e.message}`); }
+}
+
 // ── CHEQUEO DEL PROPIO DNS ───────────────────────────────────────────────────
 // Diez líneas que cubren el agujero más grande de la auditoría: nadie verificaba
 // SPF, DKIM ni DMARC de adeqmedia.com. Sin autenticación, cualquier arreglo de
@@ -20565,6 +20625,8 @@ async function main() {
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
+      // Y que ninguna fuente pueda morirse en silencio otra vez.
+      await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
       await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
@@ -20735,8 +20797,19 @@ async function main() {
       if (parallelTasks.length > 0) {
         await Promise.all(parallelTasks);
       }
-      // Si csv hubo trabajo, no caemos a autopilot — próximo loop sigue csv
-      if (csvProcessed > 0) {
+      // ⚠️ ESTO MATÓ AL AUTOPILOT DURANTE UN MES (Maxi 2026-08-24).
+      // "Si la cola tuvo trabajo, no caemos a autopilot." Suena razonable, pero la cola
+      // SIEMPRE tiene trabajo: con 1.000+ pendientes, `csvProcessed > 0` se cumple en
+      // casi todas las vueltas y el autopilot no llegaba a ejecutarse nunca. Medido con
+      // la atribución ya corregida: 180 leads en total y el último del 27 de julio.
+      //
+      // Y no compiten por nada: el autopilot escribe DIRECTO a Prospects, no pasa por la
+      // cola, y tiene su propio techo de sesión de 20 minutos. Que la cola esté ocupada
+      // no es motivo para no descubrir.
+      //
+      // Se le garantiza un turno cada 30 min de reloj. El resto de las vueltas sigue
+      // priorizando la cola, como estaba pensado.
+      if (csvProcessed > 0 && !(await _tocaCorrer(token, "turno_autopilot", 30))) {
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
