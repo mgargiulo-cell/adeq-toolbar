@@ -229,15 +229,35 @@ serve(async (req) => {
 
   const pcfg = PROVIDERS[provider];
   if (!pcfg)               return json(400, { error: "Unknown provider" }, origin);
-  if (!pcfg.allow.test(path || "")) {
-    await registrarIncidente(supabase, "proxy_path_no_permitido", "warn", userEmail, { provider, path });
-    return json(403, { error: "Path not allowed", path }, origin);
+
+  // ⚠️ EL PROXY BLOQUEABA TODAS LAS LLAMADAS DE LOS MEDIA BUYERS (Maxi 2026-08-24).
+  // El contrato es `path` y `query` por separado, pero la extensión manda la query
+  // pegada: "/all-insights?domain=silsila.net". Como los regex de `allow` terminan en
+  // `$`, eso NUNCA matcheaba y devolvía 403 "Path not allowed". Medido en
+  // toolbar_security_events: cientos de rechazos de mgargiulo@ y sales@ en un día,
+  // todos de rapidapi. Desde afuera se veía como "SimilarWeb no anda" cuando en
+  // realidad el plan estaba al 7% de uso.
+  //
+  // El proxy tiene que ser tolerante con su cliente: se separa acá y se valida solo
+  // la parte del path. La query sigue pasando por su propio tope de longitud.
+  let _path = String(path || "");
+  let _query = String(query || "");
+  const _corte = _path.indexOf("?");
+  if (_corte >= 0) {
+    const _pegada = _path.slice(_corte + 1);
+    _path = _path.slice(0, _corte);
+    _query = _query ? `${_query}&${_pegada}` : _pegada;
+  }
+
+  if (!pcfg.allow.test(_path)) {
+    await registrarIncidente(supabase, "proxy_path_no_permitido", "warn", userEmail, { provider, path: _path, original: path });
+    return json(403, { error: "Path not allowed", path: _path }, origin);
   }
   // Método permitido por proveedor (antes solo se validaba el path).
   if (!(METODOS_OK[provider] || []).includes(String(method).toUpperCase()))
     return json(405, { error: `Método ${method} no permitido para ${provider}` }, origin);
   // El querystring lo arma el cliente: acotarlo evita que metan parámetros caros o rarezas.
-  if (String(query || "").length > 500) return json(400, { error: "query demasiado larga" }, origin);
+  if (_query.length > 500) return json(400, { error: "query demasiado larga" }, origin);
 
   // El BODY también lo elegía el cliente: podía pedir el modelo más caro con max_tokens enorme.
   // Con el techo global de 2000 llamadas/día, 8k tokens de salida en el modelo grande son ~US$400
@@ -307,8 +327,10 @@ serve(async (req) => {
   const keyVal = Deno.env.get(pcfg.keyEnv);
   if (!keyVal) return json(500, { error: `Missing ${pcfg.keyEnv} secret` }, origin);
 
-  let url = pcfg.base + path;
-  if (query) url += (url.includes("?") ? "&" : "?") + query;
+  // `_path` (sin query): si se usara `path`, la query saldría duplicada al concatenar
+  // `_query` unas líneas más abajo.
+  let url = pcfg.base + _path;
+  if (_query) url += (url.includes("?") ? "&" : "?") + _query;
 
   // extraHeaders viene del cliente: filtramos cualquier cabecera de autenticación para que no
   // pueda pisar —ni filtrar— nuestras keys. Las de auth se setean después, abajo.
