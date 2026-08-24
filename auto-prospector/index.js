@@ -15837,9 +15837,23 @@ async function _nombreDeRemitente(userEmail) {
 // ── EL LINTER DE ENTREGABILIDAD ──────────────────────────────────────────────
 const _MAY_PERMITIDAS = new Set(["ADEQ","CPM","CTR","GEO","IAB","URL","SEO","B2B","IVA","CRM","SSP","DSP","RTB","PDF","ADEQMEDIA"]);
 
-function revisarEntregabilidad({ to, subject, body, html, mime, esProspeccion = true }) {
+/**
+ * @param body    el texto COMPLETO que sale (plantilla + firma + pie) → reglas estructurales
+ * @param cuerpo  SOLO la plantilla, lo que escribimos nosotros → reglas de estilo
+ *
+ * ⚠️ La distinción no es cosmética (Maxi 2026-08-24). Cuando esto linteaba el texto
+ * completo, la FIRMA del media buyer entraba a las reglas de estilo — y una firma de
+ * empresa dice "ADEQ MEDIA" y "ARGENTINA" en mayúsculas, legítimamente. La regla de
+ * "no grites" las leyó como gritos y bloqueó 83 envíos reales en dos días. El estilo
+ * se juzga sobre lo que redactamos nosotros; la firma es del dueño del buzón.
+ */
+function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, esProspeccion = true }) {
   const bloqueantes = [], avisos = [];
   const s = String(subject || ""), b = String(body || "");
+  // Si no llega la plantilla por separado, NO se juzga el estilo. Bloquear un envío
+  // legítimo es peor que dejar pasar un "!" de más: el costo de un falso positivo acá
+  // ya se pagó (83 envíos perdidos en dos días por la firma del MB).
+  const plantilla = cuerpo != null ? String(cuerpo) : null;
   // El correo INTERNO (alertas de salud, avisos de seguridad a mgargiulo@) no es
   // prospección: no va a un desconocido, no compite por reputación y suele traer
   // SQL, mayúsculas y textos largos. Si le aplicáramos las reglas de estilo, el
@@ -15861,13 +15875,16 @@ function revisarEntregabilidad({ to, subject, body, html, mime, esProspeccion = 
   if (_estricto && /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(s)) bloqueantes.push("emoji_en_el_asunto");
   if (/[\r\n]/.test(s) || /[\r\n]/.test(String(to || ""))) bloqueantes.push("salto_de_linea_en_cabecera");
 
-  if (_estricto) {
-    const palabras = b.trim().split(/\s+/).filter(Boolean).length;
+  if (_estricto && plantilla != null) {
+    // Sobre la PLANTILLA, no sobre el mail entero: la firma no se juzga.
+    const palabras = plantilla.trim().split(/\s+/).filter(Boolean).length;
     if (palabras < 15) bloqueantes.push(`cuerpo_muy_corto_${palabras}`);
     if (palabras > 400) bloqueantes.push(`cuerpo_muy_largo_${palabras}`);
-    if ((b.match(/!/g) || []).length > 2) bloqueantes.push("exceso_de_exclamaciones");
-    const grito = (b.match(/\b[A-ZÁÉÍÓÚÑ]{4,}\b/g) || []).filter(w => !_MAY_PERMITIDAS.has(w));
-    if (grito.length) bloqueantes.push(`mayusculas:${grito.slice(0, 2).join(",")}`);
+    if ((plantilla.match(/!/g) || []).length > 2) bloqueantes.push("exceso_de_exclamaciones");
+    // Y dentro de la plantilla, se exigen DOS gritos para bloquear. Una sola palabra en
+    // mayúsculas suele ser un nombre propio o una sigla; dos o más ya es tono de spam.
+    const grito = (plantilla.match(/\b[A-ZÁÉÍÓÚÑ]{4,}\b/g) || []).filter(w => !_MAY_PERMITIDAS.has(w));
+    if (grito.length >= 2) bloqueantes.push(`mayusculas:${grito.slice(0, 2).join(",")}`);
   }
 
   // Caracteres que marcan spam o sirven para suplantar
@@ -15986,7 +16003,7 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
   // ── EL LINTER, JUSTO ANTES DE SALIR ───────────────────────────────────────
   // Vive acá adentro y no en los callers, para que ninguna ruta futura se lo pueda
   // saltear por olvido.
-  const _rev = revisarEntregabilidad({ to, subject, body: cuerpoTexto, html: htmlBody, mime, esProspeccion });
+  const _rev = revisarEntregabilidad({ to, subject, body: cuerpoTexto, cuerpo: body, html: htmlBody, mime, esProspeccion });
   if (!_rev.ok) {
     log(`  🛑 NO SE ENVÍA a ${to} — el linter lo frenó: ${_rev.bloqueantes.join(", ")}`);
     if (_workerToken && userEmail) {
@@ -16680,13 +16697,33 @@ async function runAgentCycle(token, allFlags) {
     // cuenta ya marcada valen menos que la cuenta.
     // Umbral configurable con `rebote_max_pct_dia`. Se mide sobre los envíos de HOY.
     {
+      // ⚠️ COHORTES CRUZADAS (Maxi 2026-08-24) ───────────────────────────────
+      // Esto comparaba los rebotes DETECTADOS hoy contra los envíos de HOY. Son
+      // cohortes distintas: un rebote que llega hoy corresponde a un mail de días
+      // atrás. Con pocos envíos el cociente se dispara — quedó registrado un
+      // "rebote_alto_227pct", que es aritméticamente imposible como tasa real.
+      // Ahora se mide sobre la MISMA ventana de 7 días para las dos cosas, y se
+      // exige evidencia estadística (Wilson) en vez de comparar un cociente crudo.
       const _pctMax = parseInt(cfg.rebote_max_pct_dia || "8", 10) || 8;
-      const _enviados = await _countAgentActionsToday(token, userEmail, ["sent"], "reboteGuard/sent");
-      if (_enviados >= 10) {   // con menos de 10 envíos el porcentaje no dice nada
-        const _rebotes = await _countAgentActionsToday(token, userEmail, ["bounce_detected"], "reboteGuard/bounce");
-        const _pct = Math.round((_rebotes / _enviados) * 100);
-        if (_pct >= _pctMax) {
-          log(`🩺 ${userEmail}: ${_pct}% de rebote hoy (${_rebotes}/${_enviados}, tope ${_pctMax}%) — FRENO el envío para no quemar el buzón`);
+      const _desde7 = new Date(Date.now() - 7 * 86400000).toISOString();
+      const _cuenta = async (accion) => {
+        try {
+          const r = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.${accion}&created_at=gte.${_desde7}&select=id`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
+          if (!r.ok) return null;
+          return parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
+        } catch { return null; }
+      };
+      const _enviados = await _cuenta("sent");
+      // Muestra mínima real: con 10 envíos, un rebote ya da 10% y frena el buzón sin
+      // que eso signifique nada.
+      if (_enviados != null && _enviados >= 60) {
+        const _rebotes = (await _cuenta("bounce_detected")) ?? 0;
+        const _pct = Math.round((Math.min(_rebotes, _enviados) / _enviados) * 100);
+        const _piso = _wilsonLimiteInferior(Math.min(_rebotes, _enviados), _enviados) * 100;
+        if (_piso >= _pctMax) {
+          log(`🩺 ${userEmail}: rebote ${_pct}% en 7d, piso estadístico ${_piso.toFixed(1)}% (${_rebotes}/${_enviados}, tope ${_pctMax}%) — FRENO el envío`);
           await logAgentAction(token, userEmail, {
             domain: "_cycle_", action: "skipped", reason: `rebote_alto_${_pct}pct`,
             details: { rebotes: _rebotes, enviados: _enviados, tope: _pctMax },
@@ -16694,7 +16731,7 @@ async function runAgentCycle(token, allFlags) {
           await saludAlerta(token, {
             clave: `rebote-alto-${userEmail}`, severidad: "error",
             titulo: "🩺 Freno un buzón por rebotes",
-            cuerpo: `${userEmail} lleva ${_pct}% de rebote hoy (${_rebotes} de ${_enviados}).\n`
+            cuerpo: `${userEmail} lleva ${_pct}% de rebote en los últimos 7 días (${_rebotes} de ${_enviados}, piso estadístico ${_piso.toFixed(1)}%).\n`
                   + `Paro sus envíos por hoy para proteger la reputación de la cuenta.\n`
                   + `Si los rebotes vienen de una fuente concreta, conviene revisarla antes de mañana.`,
           }).catch(() => {});
