@@ -4619,8 +4619,14 @@ function _cycleStartForAnchor(anchorDay) {
 // cuota → ese día podía gastar sobre el cupo viejo creyendo que tenía 40k frescos.
 // El chequeo de reset compara por YYYY-MM (ver getRapidApiUsageThisMonth), así que mover el
 // ancla al 7 corre el límite del ciclo al día correcto sin romper los contadores guardados.
+// ⚠️ ANCLA ACTUALIZADA AL 18 (Maxi 2026-08-24). El plan cambió: es un
+// `custom-40k-hard` de USD 25/mes que arrancó el **18 de agosto de 2026** y renueva
+// cada 30 días, o sea el 17 de septiembre. El ancla en 7 hacía que el worker diera
+// por empezado un ciclo nuevo once días antes de tiempo y reseteara el contador
+// sobre una cuota que todavía no se había repuesto.
+const RAPIDAPI_CYCLE_ANCHOR_DAY = 18;
 function _billingCyclePeriod() {
-  return _cycleStartForAnchor(7).toISOString().slice(0, 10); // "2026-06-07"
+  return _cycleStartForAnchor(RAPIDAPI_CYCLE_ANCHOR_DAY).toISOString().slice(0, 10);
 }
 
 // Apollo: ciclo 12→12 (verificado en el panel — renew Aug 12, 2026). Maxi 2026-07-17.

@@ -6995,7 +6995,10 @@ async function runDiagnostic() {
   const swPromise = (async () => {
     try {
       const r = await callProxy("rapidapi", `/similar-sites?domain=${encodeURIComponent(domain)}`, { method: "GET" });
-      const quota = r.quota?.providerRemaining != null ? ` · ${r.quota.providerRemaining} quota left` : "";
+      // ⚠️ ESTE NÚMERO NO ES LA CUOTA DEL PROVEEDOR (Maxi 2026-08-24). El proxy lo
+      // calcula como `su propio cap diario − usadas hoy`. Decía "0 quota left" con
+      // 37.000 llamadas disponibles en RapidAPI, y se leía como "se acabó el plan".
+      const quota = r.quota?.providerRemaining != null ? ` · quedan ${r.quota.providerRemaining} de tu cupo diario en la toolbar` : "";
       if (!r.ok) return { ok: false, msg: `HTTP ${esc(String(r.status ?? ''))}${quota}` };
       const d = r.data || {};
       if (d.error || !d.Visits) return { ok: false, msg: `No data for ${domain}${quota}` };
