@@ -15848,12 +15848,17 @@ function revisarEntregabilidad({ to, subject, body, html, mime, esProspeccion = 
 
   // Placeholders sin resolver: el bug de {{saludo}} del 11/08 le llegó a un
   // prospecto real. Con esto no habría salido.
-  if (/\{\{|\}\}|\[\[|%%|__[A-Z]+__/.test(s + " " + b)) bloqueantes.push("placeholder_sin_resolver");
-  if (/\b(null|undefined|NaN)\b/.test(s + " " + b)) bloqueantes.push("valor_vacio_en_el_texto");
+  // Estas dos solo en prospección: el correo interno cita SQL, que legítimamente
+  // contiene NULL, y puede mostrar un placeholder como ejemplo de lo que se detectó.
+  if (_estricto && /\{\{|\}\}|\[\[|%%|__[A-Z]+__/.test(s + " " + b)) bloqueantes.push("placeholder_sin_resolver");
+  if (_estricto && /\b(null|undefined|NaN)\b/.test(s + " " + b)) bloqueantes.push("valor_vacio_en_el_texto");
 
   if (!s.trim()) bloqueantes.push("asunto_vacio");
   if (_estricto && s.length > 78) bloqueantes.push("asunto_muy_largo");
-  if (/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(s)) bloqueantes.push("emoji_en_el_asunto");
+  // El emoji solo importa en un cold email a un desconocido. En el correo INTERNO es
+  // al revés: el parte usa 🔴/⚠️/✅ para que se lea de un vistazo. El 21/08 esta regla
+  // bloqueó el propio parte diario del sistema — el detector censurándose a sí mismo.
+  if (_estricto && /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(s)) bloqueantes.push("emoji_en_el_asunto");
   if (/[\r\n]/.test(s) || /[\r\n]/.test(String(to || ""))) bloqueantes.push("salto_de_linea_en_cabecera");
 
   if (_estricto) {
@@ -16138,6 +16143,7 @@ async function securityWatchdog(token) {
     try {
       await sendGmailServer(token, dest, {
         to: dest,
+        esProspeccion: false,          // correo interno
         subject: "✅ ADEQ Toolbar — prueba del alertado de seguridad",
         body: [
           `Si estás leyendo esto, el canal de alertas FUNCIONA.`,
@@ -16304,8 +16310,9 @@ async function securityWatchdog(token) {
       await setConfigValue(token, "kill_switch_auto_at", "").catch(() => {});
       await _secLog(token, "kill_switch_auto_liberado", "info", "watchdog", { minutos: Math.round(minutos) });
       log(`✅ kill_switch liberado automáticamente: ${Math.round(minutos)} min sin anomalías`);
-      await _secAvisar(token, cfg, {
-        kind: "recuperado",
+      // Buena noticia: no merece un mail propio, va al resumen.
+      await saludAlerta(token, {
+        clave: "freno-liberado", severidad: "info",
         titulo: "Freno liberado — todo volvió a la normalidad",
         cuerpo: [
           `El freno de emergencia se había activado solo y ya pasaron ${Math.round(minutos)} minutos sin ninguna anomalía.`,
@@ -16315,6 +16322,7 @@ async function securityWatchdog(token) {
           `Para ver qué había pasado:`,
           `  SELECT * FROM toolbar_security_events ORDER BY created_at DESC LIMIT 30;`,
         ].join("\n"),
+        metadata: { minutos: Math.round(minutos) },
       });
       return;   // nada más que reportar en este ciclo
     }
@@ -16415,11 +16423,29 @@ async function securityWatchdog(token) {
     `— Vigilante de la ADEQ Toolbar · ${new Date().toISOString()}`,
   ].join("\n");
 
-  await _secAvisar(token, cfg, {
-    kind: critico ? "critico" : "aviso",
-    titulo: critico ? "ALERTA CRÍTICA — freno automático activado" : "Aviso de seguridad",
-    cuerpo,
-  });
+  // ── UN SOLO CANAL, UNA SOLA CADENCIA (Maxi 2026-08-24) ────────────────────
+  // Regla del user: "1 unificado cada 72 hs como máximo". Las alertas de seguridad
+  // esquivaban el resumen porque usaban su propio canal, y terminaron siendo el mail
+  // que MÁS llegaba — encima con falsos positivos (los "450 intentos de acceso" eran
+  // nuestro propio worker). El alertado quedó invertido: lo ruidoso e inofensivo en
+  // la bandeja, y las dos caídas de producción en un panel que nadie abre.
+  //
+  // Ahora solo lo CRÍTICO (freno automático activado) manda mail al instante, porque
+  // ahí el sistema se detuvo y hay que saberlo ya. Lo demás entra al resumen de 72h.
+  if (critico) {
+    await _secAvisar(token, cfg, {
+      kind: "critico",
+      titulo: "ALERTA CRÍTICA — freno automático activado",
+      cuerpo,
+    });
+  } else {
+    await saludAlerta(token, {
+      clave: "seguridad-aviso", severidad: "warning",
+      titulo: "Aviso de seguridad",
+      cuerpo,
+      metadata: { hallazgos: hallazgos.length },
+    });
+  }
 }
 
 function _ensureWwwPrefix(domain) {
@@ -18908,13 +18934,38 @@ async function autoAjustarSegunMetricas(token) {
 // Los tres buzones comparten adeqmedia.com, y en Gmail la reputación es POR
 // DOMINIO: si uno acumula rebotes, caen los tres — y el mismo dominio es el que se
 // usa para hablar con clientes reales. No había ningún freno por tasa de rebote.
-const REBOTE_TECHO_BUZON  = 0.02;   // 2% en 7 días → se pausa ese buzón
-const REBOTE_TECHO_DOMINIO = 0.03;  // 3% sumando los tres → se frena todo
+const REBOTE_TECHO_BUZON  = 0.02;   // 2% en 7 días → alerta sobre ese buzón
+const REBOTE_TECHO_DOMINIO = 0.03;  // 3% sumando los tres → freno
+
+// ⚠️ MUESTRA MÍNIMA (Maxi 2026-08-24) ────────────────────────────────────────
+// Este freno lo escribí el 12/08 comparando la tasa cruda contra el techo, con una
+// muestra mínima de 30. El 21/08 pausó el envío con 3 rebotes sobre 80 = 3,75%, y
+// como la condición seguía dándose, RE-pausó seis veces seguidas: los tres buzones
+// terminaron el día en 0 de 20. O sea que la protección contra quemar el dominio
+// causó exactamente el daño que venía a evitar.
+//
+// El problema no era el umbral sino la aritmética: con 80 envíos, 3 rebotes o 1
+// rebote son estadísticamente lo mismo. Ahora se compara el LÍMITE INFERIOR del
+// intervalo de confianza de Wilson al 95%, que es la forma correcta de preguntar
+// "¿tengo evidencia de que la tasa REAL supera el techo?" en vez de "¿el número de
+// esta semana quedó arriba?". Con 3/80 el límite inferior da 1,3%: no frena. Con
+// 30/400 da 5,3%: frena, y ahí sí hay un problema de verdad.
+const REBOTE_MUESTRA_MINIMA = 150;   // por debajo de esto no se concluye nada
+
+function _wilsonLimiteInferior(exitos, total, z = 1.96) {
+  if (!total) return 0;
+  const p = exitos / total;
+  const z2 = z * z;
+  const centro = (p + z2 / (2 * total)) / (1 + z2 / total);
+  const margen = (z / (1 + z2 / total)) * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total));
+  return Math.max(0, centro - margen);
+}
 
 async function vigilarReputacion(token) {
   try {
     if (!(await _tocaCorrer(token, "vigilar_reputacion", 6 * 60))) return;
     const desde = new Date(Date.now() - 7 * 86400000).toISOString();
+    const cfg = await getConfig(token).catch(() => ({}));
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
     let envios = [];
@@ -18923,7 +18974,7 @@ async function vigilarReputacion(token) {
       if (!r.ok) return;                                   // no pude medir ≠ todo bien
       envios = await r.json();
     } catch { return; }
-    if (!Array.isArray(envios) || envios.length < 30) return;   // muestra chica: no concluir
+    if (!Array.isArray(envios) || envios.length < REBOTE_MUESTRA_MINIMA) return;   // sin evidencia, no se concluye
 
     let rebotados = new Set();
     try {
@@ -18945,21 +18996,25 @@ async function vigilarReputacion(token) {
     const tasaDominio = totReb / totEnv;
 
     // ── Dominio entero por encima del techo: se frena todo ────────────────────
-    if (tasaDominio > REBOTE_TECHO_DOMINIO) {
+    const _pisoDominio = _wilsonLimiteInferior(totReb, totEnv);
+    // Ya pausado: no volver a pausar. El 21/08 esto se re-disparó 6 veces seguidas y
+    // extendió la pausa indefinidamente, dejando a los tres buzones en 0 de 20.
+    const _yaPausado = Date.parse(cfg?.agent_paused_until || "") > Date.now();
+    if (_pisoDominio > REBOTE_TECHO_DOMINIO && !_yaPausado) {
       await setConfigValue(token, "agent_paused_until", new Date(Date.now() + 12 * 3600_000).toISOString()).catch(() => {});
       await saludAlerta(token, {
         clave: "reputacion-dominio", severidad: "error",
         titulo: `🔥 Rebote del ${(tasaDominio * 100).toFixed(1)}% — envío PAUSADO 12h`,
-        cuerpo: `${totReb} rebotes sobre ${totEnv} envíos en 7 días, por encima del techo del ${REBOTE_TECHO_DOMINIO * 100}%.\nLa reputación en Gmail es por DOMINIO: esto arrastra a los tres buzones y también al correo con clientes.\nRevisá la verificación de direcciones antes de reanudar.`,
+        cuerpo: `${totReb} rebotes sobre ${totEnv} envíos en 7 días (piso estadístico ${(_pisoDominio * 100).toFixed(1)}%, techo ${REBOTE_TECHO_DOMINIO * 100}%).\nLa reputación en Gmail es por DOMINIO: esto arrastra a los tres buzones y también al correo con clientes.\nRevisá la verificación de direcciones antes de reanudar.`,
         metadata: { tasa: +tasaDominio.toFixed(4), envios: totEnv, rebotes: totReb },
       });
       log(`🔥 REPUTACIÓN: rebote ${(tasaDominio * 100).toFixed(1)}% → agente pausado 12h`);
     } else {
       // ── Un buzón puntual pasado de rosca ───────────────────────────────────
       for (const [mb, d] of Object.entries(porBuzon)) {
-        if (d.env < 20) continue;
+        if (d.env < 60) continue;                       // muestra chica por buzón: no concluir
         const t = d.reb / d.env;
-        if (t > REBOTE_TECHO_BUZON) {
+        if (_wilsonLimiteInferior(d.reb, d.env) > REBOTE_TECHO_BUZON) {
           await saludAlerta(token, {
             clave: `reputacion-${mb}`, severidad: "error",
             titulo: `⚠️ ${mb} rebota al ${(t * 100).toFixed(1)}%`,
@@ -19009,10 +19064,28 @@ async function chequearAutenticacionPropia(token) {
   try {
     if (!(await _tocaCorrer(token, "dns_propio", 24 * 60))) return;
     const dom = (await getConfig(token).catch(() => ({})))?.dominio_remitente || "adeqmedia.com";
+    // ⚠️ DOS BUGS ENCADENADOS, ARREGLADOS EL 2026-08-24 ──────────────────────
+    // 1) `_doh` YA devuelve strings (mapea a.data internamente). Acá se le volvía a
+    //    pedir `.data` a un string → undefined → todos los registros quedaban en "".
+    //    Resultado: el 21/08 el sistema reportó "NO hay SPF, NO hay DKIM, NO hay
+    //    DMARC" sobre un dominio que tiene los tres bien puestos, y mandó al user a
+    //    arreglar lo que ya estaba.
+    // 2) `_doh` devuelve [] tanto si la consulta FALLA como si no hay registros. Con
+    //    eso, un DNS caído se leía como "no tenés autenticación" — el mismo patrón de
+    //    siempre. Acá se consulta directo para poder distinguir los dos casos.
     const txt = async (n) => {
       try {
-        const r = await _doh(n, "TXT");
-        return (Array.isArray(r) ? r : []).map(x => String(x.data || "").replace(/^"|"$/g, ""));
+        const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(n)}&type=TXT`,
+          { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(8000) });
+        if (!r.ok) return null;                       // no pude consultar ≠ no hay registro
+        const j = await r.json();
+        if (typeof j.Status !== "number") return null;
+        if (j.Status !== 0 && j.Status !== 3) return null;   // 0=ok, 3=NXDOMAIN (sí es "no hay")
+        // Un TXT largo (DKIM) viene partido en varios trozos entrecomillados que hay
+        // que CONCATENAR: "aaa" "bbb" es un solo registro, no dos.
+        return (j.Answer || [])
+          .filter(a => a.type === 16)
+          .map(a => String(a.data || "").replace(/"\s+"/g, "").replace(/^"|"$/g, ""));
       } catch { return null; }
     };
     const raiz  = await txt(dom);
