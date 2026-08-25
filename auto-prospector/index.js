@@ -8518,7 +8518,9 @@ async function limpiarReservasHuerfanas(token) {
   try {
     const cutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.reserved&created_at=lt.${cutoff}`,
+      // Incluye `reserved_rework`: si no, las reservas del re-engagement quedarían
+      // colgadas para siempre en vez de liberarse a los 5 minutos.
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(reserved,reserved_rework)&created_at=lt.${cutoff}`,
       {
         method: "PATCH",
         headers: {
@@ -8949,7 +8951,11 @@ async function sweepBlockedFromProspects(token) {
       // 1 query solo para subdominios, no para todo el pool.
       try {
         const _sibRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=like.*${encodeURIComponent(_r)}&select=domain,created_at&order=created_at.asc&limit=1`,
+          // ⚠️ EL PUNTO VA ANCLADO (Maxi 2026-08-25). Con `like.*raiz` a secas,
+          // `quehoteles.com` matchea contra `hoteles.com` y se descarta como si fuera un
+          // subdominio de la misma empresa. Son empresas distintas. Confirmado en el pool.
+          // La primera rama cubre la raíz exacta, la segunda los subdominios de verdad.
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(domain.eq.${encodeURIComponent(_r)},domain.like.*.${encodeURIComponent(_r)})&select=domain,created_at&order=created_at.asc&limit=1`,
           { headers: auth }
         );
         const _sib = _sibRes.ok ? await _sibRes.json() : [];
@@ -11170,7 +11176,8 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   if (_root && _root !== String(domain).toLowerCase().replace(/^www\./, "")) {
     try {
       const _dupRes = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=like.*${encodeURIComponent(_root)}&select=domain&limit=1`,
+        // Mismo anclaje que arriba: sin el punto, empresas distintas se pisaban.
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(domain.eq.${encodeURIComponent(_root)},domain.like.*.${encodeURIComponent(_root)})&select=domain&limit=1`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       );
       const _dup = _dupRes.ok ? await _dupRes.json() : [];
@@ -13213,7 +13220,12 @@ async function runReengagementCycle(token) {
           method: "POST",
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=representation" },
           body: JSON.stringify({
-            user_email: userEmail, domain, action: "reserved",
+            // ⚠️ `reserved_rework`, NO `reserved` (Maxi 2026-08-25). El cupo diario cuenta
+            // ['sent','reserved'], y la regla del negocio dice que los 20/día son de PRIMER
+            // CONTACTO: el re-trabajo va aparte y no tiene tope. Con la etiqueta genérica,
+            // cada re-engagement en vuelo le robaba un slot de prospecto nuevo al buzón.
+            // El PATCH final sigue poniendo 're_sent', que tampoco cuenta en el cupo.
+            user_email: userEmail, domain, action: "reserved_rework",
             // email_to faltaba (auditoría 2026-08-04): los re_sent aparecían con destinatario
             // NULL en el listado y no se podían cruzar contra los rebotes.
             email_to: newEmail,
@@ -17392,7 +17404,33 @@ async function runAgentCycle(token, allFlags) {
       // Muestra mínima real: con 10 envíos, un rebote ya da 10% y frena el buzón sin
       // que eso signifique nada.
       if (_enviados != null && _enviados >= 60) {
-        const _rebotes = (await _cuenta("bounce_detected")) ?? 0;
+        // ⚠️ ACÁ SE DIVIDÍAN PERAS POR MANZANAS (Maxi 2026-08-25).
+        // El numerador era `bounce_detected` de los últimos 7 días: rebotes DETECTADOS
+        // ahora, de mails mandados en cualquier momento del pasado. El denominador eran los
+        // mails MANDADOS en esos 7 días. Cohortes distintas. Para sales@ daba 319%.
+        // El `Math.min` tapaba el absurdo dejándolo en 100%, que no salva nada: con 118
+        // rebotes viejos y 37 envíos nuevos igual frenaba el buzón sin motivo.
+        // Ahora se mide la MISMA cohorte: de los mails que mandé en la ventana, cuántos
+        // rebotaron. Es exactamente lo que ya hacía bien vigilarReputacion.
+        let _rebotes = 0;
+        try {
+          const _rs = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${_desde7}&select=email_to&limit=3000`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
+          const _rb = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=5000`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
+          if (!_rs.ok || !_rb.ok) throw new Error("no pude medir");
+          const _dest = (await _rs.json()).map(x => String(x.email_to || "").toLowerCase()).filter(Boolean);
+          const _malos = new Set((await _rb.json()).map(x => String(x.email || "").toLowerCase()));
+          _rebotes = _dest.filter(e => _malos.has(e)).length;
+        } catch (e) {
+          // "No pude medir" NO puede frenar a nadie: sería el patrón de siempre otra vez.
+          log(`  ℹ️ ${userEmail}: no pude calcular el rebote de la cohorte (${e.message}) — no freno`);
+          _rebotes = -1;
+        }
+        if (_rebotes < 0) { /* sin medición fiable, se sigue enviando */ }
+        else {
         const _pct = Math.round((Math.min(_rebotes, _enviados) / _enviados) * 100);
         const _piso = _wilsonLimiteInferior(Math.min(_rebotes, _enviados), _enviados) * 100;
         if (_piso >= _pctMax) {
@@ -17409,6 +17447,7 @@ async function runAgentCycle(token, allFlags) {
                   + `Si los rebotes vienen de una fuente concreta, conviene revisarla antes de mañana.`,
           }).catch(() => {});
           continue;   // próximo MB
+        }
         }
       }
     }
