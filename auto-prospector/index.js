@@ -13730,6 +13730,16 @@ async function processManualReengagementQueue(token) {
             to:      future_email,
             subject: original_subject,
             body:    original_body,
+            // ⚠️ NO SE PASA `cuerpo` A PROPÓSITO (Maxi 2026-08-25). `original_body` es el mail
+            // ORIGINAL tal como salió, con la firma adentro (124 de 125 filas de esta cola la
+            // tienen). Si se lo entrego al linter como si fuera una plantilla, las reglas de
+            // ESTILO se aplican sobre la firma: "ADEQ MEDIA" y "BUENOS AIRES, ARGENTINA" se
+            // leen como gritos y el mail se frena. Es la MISMA trampa que ya frenó 79 envíos
+            // el 18-19/08, reaparecida en cuanto este camino volvió a enviar.
+            // Sin `cuerpo`, el linter saltea las reglas de estilo —que es su fail-safe
+            // documentado— y mantiene las estructurales, que son las que importan acá:
+            // placeholders sin resolver, adjuntos, líneas de más de 990 octetos.
+            cuerpo:  undefined,
             agentActionId: null, // worker no inyecta pixel acá; el seguimiento del futuro es out of scope v1
           });
           if (!sent?.id) {   // Maxi 2026-07-08 BUG FIX: Gmail éxito = {id,...}, no {ok:true}
@@ -19958,7 +19968,10 @@ async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning"
     // cola rechazando lotes enteros— no es un renglón para leer pasado mañana: son días de
     // negocio perdidos. Ya pasó dos veces esta semana. Estas claves salen en el momento.
     // El anti-spam de 60 minutos por tipo que ya tiene `_secAvisar` evita la avalancha.
-    const _ES_PARO = /^(agente-sin-enviar|salud-descubrimiento-parado|embudo-cortado|cola_rechaza_lote|autogoogle-no-encola|fuentes-mudas)/;
+    // `linter-` entra acá (Maxi 2026-08-25): un bloqueo del linter frena un envío REAL. El
+    // 18-19/08 fueron 79 y hoy 68 más, todos por leer la firma como si fuera la plantilla.
+    // Enterarse 72 horas después es enterarse cuando ya se perdieron dos días de prospección.
+    const _ES_PARO = /^(agente-sin-enviar|salud-descubrimiento-parado|embudo-cortado|cola_rechaza_lote|autogoogle-no-encola|fuentes-mudas|linter-)/;
     if (severidad === "error" && _ES_PARO.test(String(clave || ""))) {
       try {
         const _cfgAviso = await getConfig(token).catch(() => null);
