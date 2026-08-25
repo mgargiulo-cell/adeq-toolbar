@@ -5665,6 +5665,13 @@ function _brandStripTld(d) {
     "org.uk","ac.uk","gov.uk","com.pt","org.br","gov.br","edu.br",
   ]);
   if (TWO_LEVEL.has(last2)) return parts[parts.length - 3] || "";
+  // ⚠️ LA LISTA SIEMPRE QUEDA CORTA (Maxi 2026-08-25). `addustour.com.jo` recortaba a
+  // "com" porque com.jo no estaba, y por eso el enviador lo trataba como otra marca
+  // siendo literalmente el MISMO nombre con otro TLD. Regla genérica de respaldo: si el
+  // penúltimo trozo es un genérico de segundo nivel, la marca está un lugar más atrás.
+  if (parts.length >= 3 && /^(com|net|org|gov|edu|ac|co|or|ne|gob|mil)$/.test(parts[parts.length - 2])) {
+    return parts[parts.length - 3] || "";
+  }
   return parts[parts.length - 2] || "";
 }
 // Raíz registrable (eTLD+1) de un dominio: casavogue.globo.com → globo.com
@@ -5685,10 +5692,39 @@ function _rootDomain(d) {
   return last2;
 }
 
-function _brandMatches(email, leadDomain) {
+/**
+ * ⚠️ REESCRITO EL 2026-08-25 — ESTA REGLA FRENABA ~320 ENVÍOS POR DÍA.
+ *
+ * El registro de motivos que agregué el 24/08 lo dejó a la vista: de 1.215 candidatos
+ * descartados en 517 leads, el 100% cayó acá. Y mirando QUÉ rechazaba:
+ *   3djuegos.com     → publicidad@webedia-group.com   (Webedia es su casa editora)
+ *   4troxoi.gr       → emporiko@kathimerini.gr        (emporiko = comercial)
+ *   ad-italia.it     → adstxt@condenast.com           (Condé Nast)
+ *   beurs.nl         → sales@iexgroup.nl              (IEX Group)
+ *   addustour.com    → advertis@addustour.com.jo      (la MISMA marca, otro TLD)
+ *
+ * O sea que el sistema buscaba a propósito el contacto de la casa editora —lo agregamos
+ * por DNS y por OWNERDOMAIN del ads.txt— y después el enviador lo tiraba. Una parte
+ * trabajaba contra la otra.
+ *
+ * La regla nació para un caso real y distinto: `info@domain-contact.org` como email #1 de
+ * pixiv.net, que es el proxy de WHOIS, no el publisher. La diferencia entre ese caso y los
+ * de arriba no es el dominio: **es de dónde salió el email**. Si lo scrapeamos DEL PROPIO
+ * SITIO, es el contacto que ellos publican, valga el dominio que valga. Si vino de WHOIS o
+ * de una hipótesis de patrón, ahí sí hay que exigir que la marca coincida.
+ *
+ * @param fuente  de dónde salió el email (`cand.source`). Sin fuente se mantiene el
+ *                comportamiento estricto de antes.
+ */
+const _FUENTES_DEL_PROPIO_SITIO = /^(scrape|mailto|jsonld|json_ld|sitemap|rss|wordpress|wp|contact_form|social|ads_txt|adstxt|google_contact|play|wayback|apollo)/i;
+
+function _brandMatches(email, leadDomain, fuente = "") {
   const recipientDom = (String(email || "").split("@")[1] || "").toLowerCase();
   const leadDom      = String(leadDomain || "").toLowerCase().replace(/^www\./, "");
   if (!recipientDom || !leadDom) return false;
+  // Publicado por ellos en su propio sitio (o devuelto por Apollo para ESE dominio):
+  // es su contacto, aunque el buzón viva en el dominio del grupo editor.
+  if (_FUENTES_DEL_PROPIO_SITIO.test(String(fuente || ""))) return true;
   const isWebmail = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/.test(recipientDom);
   const rb = _brandStripTld(recipientDom), lb = _brandStripTld(leadDom);
   return recipientDom === leadDom
@@ -17775,7 +17811,7 @@ async function runAgentCycle(token, allFlags) {
             // marcándolo 'rejected' PARA SIEMPRE aunque tuviera otras direcciones buenas. Casos
             // reales del pool: info@domain-contact.org como email #1 de pixiv.net y de los 4
             // subdominios de globo.com (es el WHOIS proxy, no el publisher).
-            if (!_brandMatches(cand.email, domain)) {
+            if (!_brandMatches(cand.email, domain, cand.source)) {
               log(`  🚫 ${domain}: ${cand.email} es de otra marca — se descarta el email, NO el lead`);
               descartados++; _motivosDescarte.push("otra_marca");
               continue;
