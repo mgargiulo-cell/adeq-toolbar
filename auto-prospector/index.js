@@ -8342,6 +8342,9 @@ async function parteDelDia(token) {
     `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
     "",
     `PROSPECTS HOY  ${_num(conEmail)} contactables (~${diasDeStock} días de envíos) · ${_num(sinEmail)} sin email · ${_num(backlog)} en cola`,
+    ...(conEmail != null && objetivoTotal > 0 && (conEmail / objetivoTotal) < 10
+      ? [`   🪫 Menos de 10 días de stock: el agente BAJÓ el ritmo de envío solo para no vaciar Prospects. Vuelve a 20/MB cuando el pool se recupere.`]
+      : []),
     ...(lineasFuente.length ? [
       ``,
       `RENDIMIENTO POR FUENTE (últimos 7 días — cuántos trajo y cuántos pasaron el filtro)`,
@@ -8460,7 +8463,9 @@ async function parteDelDia(token) {
   ]))}
 
   ${_card("El pool hoy", _kv([
-    ["Contactables (con email)", `${_num(conEmail)}  ·  ~${diasDeStock} días de envíos`, (conEmail != null && conEmail < objetivoTotal * 2) ? _ROJO : _VERDE],
+    ["Contactables (con email)", `${_num(conEmail)}  ·  ~${diasDeStock} días de envíos`, (conEmail != null && conEmail < objetivoTotal * 10) ? _ROJO : _VERDE],
+    ...(conEmail != null && objetivoTotal > 0 && (conEmail / objetivoTotal) < 10
+      ? [["Ritmo de envío", "BAJADO por stock — vuelve solo al recuperarse", _ROJO]] : []),
     ["Sin email todavía", _num(sinEmail)],
     ["En cola esperando", _num(backlog)],
     ["Sacadas de Prospects por no cumplir", _num(purgadas)],
@@ -17764,6 +17769,60 @@ async function runAgentCycle(token, allFlags) {
   let perUserCap = {};
   try { perUserCap = JSON.parse(cfg.agent_max_per_day_by_user || "{}"); } catch {}
 
+  // ── EL AGENTE NO SE COME SU PROPIO INVENTARIO (Maxi 2026-08-25, regla del user) ──────
+  // "Idealmente debería tener 10 días (dos semanas de 5 días laborables) por delante de
+  //  stock de envíos. Si ve que está bajando, debe regular a menos el envío hasta que
+  //  Prospects vuelva a subir."
+  //
+  // Hasta hoy el agente mandaba sus 20/día sin mirar cuánto le quedaba: vaciaba el pool y
+  // recién ahí se frenaba solo, en seco. Esto es el freno progresivo.
+  //
+  // Se mide la autonomía contra el objetivo COMPLETO (20 × MBs), no contra el cupo ya
+  // recortado: si no, bajar el cupo subiría la autonomía y el freno se soltaría solo en un
+  // bucle. El piso de 5 existe porque parar del todo es peor que ir despacio — sin envíos
+  // no hay respuestas, y el pool tarda días en recuperarse igual.
+  //
+  // Es complementario a `autoAjustarSegunMetricas`, que regula la ENTRADA (cuánto descubrir).
+  // Uno abre la canilla y el otro cierra el desagüe; no se pisan.
+  const _DIAS_STOCK_OBJETIVO = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
+  let _recorteStock = null;
+  if (String(cfg.agent_regular_por_stock ?? "true") === "true") {
+    let _contactables = null;
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } });
+      if (r.ok) _contactables = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch {}
+    // "No pude medir" NO recorta nada: sería frenar el envío por un glitch de la base.
+    if (_contactables != null) {
+      const _objetivoPleno = Math.max(1, allFlags.agentUsers.length) * (_agentCfg(cfg).maxPerDay || 20);
+      const _dias = _contactables / _objetivoPleno;
+      const _tope = (d) => d >= _DIAS_STOCK_OBJETIVO ? null      // stock sano: se manda todo
+                        : d >= _DIAS_STOCK_OBJETIVO * 0.7 ? 15
+                        : d >= _DIAS_STOCK_OBJETIVO * 0.4 ? 10
+                        : 5;                                     // piso: nunca cero
+      const _nuevoTope = _tope(_dias);
+      if (_nuevoTope != null) {
+        _recorteStock = { dias: _dias, contactables: _contactables, tope: _nuevoTope };
+        log(`🪫 Stock para ${_dias.toFixed(1)} días (objetivo ${_DIAS_STOCK_OBJETIVO}) — bajo el envío a ${_nuevoTope}/MB para no vaciar Prospects`);
+        await saludAlerta(token, {
+          clave: "stock-bajo-freno-envio", severidad: "warning",
+          titulo: `🪫 Bajo el ritmo de envío: quedan ${_dias.toFixed(1)} días de stock`,
+          cuerpo: `${_contactables} contactables en Prospects para un objetivo de ${_objetivoPleno}/día.\n`
+                + `Bajo a ${_nuevoTope} por buzón hasta que el pool se recupere. El descubrimiento sube solo por su lado.\n`
+                + `Si esto se repite varios días, el problema son las FUENTES: revisar cuántas altas entran por día.`,
+          metadata: { dias: Number(_dias.toFixed(1)), contactables: _contactables, tope: _nuevoTope },
+        }).catch(() => {});
+      }
+      await saludPing(token, "stock_envios", {
+        status: _nuevoTope != null ? "warn" : "ok", cadenciaMin: 60,
+        detalle: `${_contactables} contactables · ${_dias.toFixed(1)} días · tope ${_nuevoTope ?? _agentCfg(cfg).maxPerDay}/MB`,
+        real: Math.round(_dias), esperado: _DIAS_STOCK_OBJETIVO,
+      }).catch(() => {});
+    }
+  }
+
   // ── EL ÚLTIMO MB YA NO SE MUERE DE HAMBRE (Maxi 2026-08-11) ─────────────────
   // runAgentCycle no tiene techo de tiempo y corre después de 3-4 min de tareas de
   // mantenimiento, contra un proceso que reinicia a los ~7 min. Cuando se cortaba a
@@ -17778,7 +17837,8 @@ async function runAgentCycle(token, allFlags) {
   await limpiarReservasHuerfanas(token).catch(() => {});
   const _ordenMbs = [];
   for (const u of allFlags.agentUsers) {
-    const _cap = perUserCap[u.toLowerCase()] ?? _agentCfg(cfg).maxPerDay;
+    const _capBase = perUserCap[u.toLowerCase()] ?? _agentCfg(cfg).maxPerDay;
+    const _cap = _recorteStock ? Math.min(_capBase, _recorteStock.tope) : _capBase;
     const _hechos = await getAgentDailyCount(token, u).catch(() => null);
     // Si no pudimos medir, va al frente: "no sé" no puede degradarse a "ya mandó".
     _ordenMbs.push({ u, falta: _hechos == null ? Number.MAX_SAFE_INTEGER : _cap - _hechos });
@@ -17906,7 +17966,10 @@ async function runAgentCycle(token, allFlags) {
     //   3. agent_max_per_day          → el campo "max" del panel de admin
     // Si tocás el campo del admin y el cap no cambia, es porque daily_override quedó en algo != 0.
     const _capPerUser = Number(perUserCap[(userEmail || "").toLowerCase()]) || 0;
-    const userMaxPerDay = _capPerUser || aCfg.maxPerDay;
+    // El recorte por stock manda sobre el cupo configurado: es el freno que evita que el
+    // agente se coma su propio inventario (regla del user, 2026-08-25).
+    const _capConfigurado = _capPerUser || aCfg.maxPerDay;
+    const userMaxPerDay = _recorteStock ? Math.min(_capConfigurado, _recorteStock.tope) : _capConfigurado;
     const _capSource = _capPerUser ? "agent_max_per_day_by_user"
                      : (aCfg.focus.dailyOverride ? "agent_focus_config.daily_override (PISA al campo del admin)"
                                                  : "agent_max_per_day (campo del admin)");
