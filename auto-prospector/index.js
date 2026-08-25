@@ -17145,8 +17145,19 @@ function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, esProspe
     if ((plantilla.match(/!/g) || []).length > 2) bloqueantes.push("exceso_de_exclamaciones");
     // Y dentro de la plantilla, se exigen DOS gritos para bloquear. Una sola palabra en
     // mayúsculas suele ser un nombre propio o una sigla; dos o más ya es tono de spam.
+    // ⚠️ ESTA REGLA DEJA DE BLOQUEAR (Maxi 2026-08-25). Lleva DOS incidentes y 147 envíos
+    // reales frenados —79 el 18-19/08 y 68+ hoy— y no atajó jamás un mail spammy. Las dos
+    // veces fue lo mismo: leyó "ADEQ MEDIA" y "BUENOS AIRES, ARGENTINA" de la firma. La
+    // segunda vez ni siquiera pude reproducir CÓMO le llega la firma al cuerpo, y mientras
+    // tanto se perdían envíos: un guard que solo produjo falsos positivos no puede seguir
+    // frenando el negocio mientras se investiga.
+    // Pasa a AVISO, con el contexto alrededor para poder rastrear el origen la próxima vez.
     const grito = (plantilla.match(/\b[A-ZÁÉÍÓÚÑ]{4,}\b/g) || []).filter(w => !_MAY_PERMITIDAS.has(w));
-    if (grito.length >= 2) bloqueantes.push(`mayusculas:${grito.slice(0, 2).join(",")}`);
+    if (grito.length >= 2) {
+      const _i = plantilla.indexOf(grito[0]);
+      const _ctx = plantilla.slice(Math.max(0, _i - 45), _i + 60).replace(/\s+/g, " ");
+      avisos.push(`mayusculas:${grito.slice(0, 3).join(",")} · contexto: "…${_ctx}…"`);
+    }
   }
 
   // Caracteres que marcan spam o sirven para suplantar
