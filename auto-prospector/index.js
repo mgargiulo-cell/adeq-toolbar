@@ -11681,27 +11681,39 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   const userCounts    = new Map(); // email → cuántos procesamos en esta tanda
   let processed       = 0;
 
+  // ⚠️ SIN RASTRO NO SE PUEDE DIAGNOSTICAR (Maxi 2026-08-25). La cola se frenó media hora
+  // con 200 pendientes y cero errores: todas sus salidas tempranas eran un `return 0` mudo
+  // que solo dejaba una línea en los logs de Railway, a los que no siempre hay acceso.
+  // Ahora cada motivo de no-arranque queda en toolbar_health, consultable desde SQL.
+  await saludPing(token, "csv_queue", {
+    status: "ok", cadenciaMin: 30,
+    detalle: `arranca · rapidapi ${rapidUsage.usedToday}/${rapidUsage.limit} día, ${rapidMonth.usedThisMonth}/${rapidMonth.limit} mes · csv ${dailyGlobal.csvCount}/${dailyGlobal.csvCap}`,
+  }).catch(() => {});
   log(`▶ CSV queue start (apollo: ${apolloUsage.usedToday}/${apolloUsage.limit} · rapidapi día: ${rapidUsage.usedToday}/${rapidUsage.limit} · mes: ${rapidMonth.usedThisMonth}/${rapidMonth.limit} · csv global hoy: ${dailyGlobal.csvCount}/${dailyGlobal.csvCap})`);
 
   // Hard cap MENSUAL — no procesar si pasamos el límite del mes
   if (rapidMonth.usedThisMonth >= rapidMonth.limit) {
     log(`⛔ Cap MENSUAL de RapidAPI alcanzado — CSV queue no arranca hasta próximo mes.`);
+    await saludPing(token, "csv_queue", { status: "off", detalle: `cap mensual RapidAPI ${rapidMonth.usedThisMonth}/${rapidMonth.limit}` }).catch(() => {});
     return 0;
   }
   // Hard cap DIARIO
   if (rapidUsage.usedToday >= rapidUsage.limit) {
     log(`⛔ Cap diario de RapidAPI alcanzado — CSV queue no arranca. Reset mañana.`);
+    await saludPing(token, "csv_queue", { status: "off", detalle: `cap diario RapidAPI ${rapidUsage.usedToday}/${rapidUsage.limit}` }).catch(() => {});
     return 0;
   }
   // Hard cap GLOBAL diario CSV (safety net — cap por encima del per-user para
   // proteger RapidAPI/Railway si bug en agente o MBs sobre-prospectan)
   if (dailyGlobal.csvCount >= dailyGlobal.csvCap) {
     log(`⛔ Cap diario GLOBAL CSV alcanzado (${dailyGlobal.csvCount}/${dailyGlobal.csvCap}) — pausa hasta próximo día operativo.`);
+    await saludPing(token, "csv_queue", { status: "off", detalle: `cap global CSV ${dailyGlobal.csvCount}/${dailyGlobal.csvCap}` }).catch(() => {});
     return 0;
   }
   // Pausa fin de semana — operativo solo Lun-Vie España
   if (_isWeekendSpain()) {
     log(`⏸ Fin de semana España — CSV queue pausada hasta lunes.`);
+    await saludPing(token, "csv_queue", { status: "off", detalle: "fin de semana" }).catch(() => {});
     return 0;
   }
   _rapidGlobalCounter = 0;
