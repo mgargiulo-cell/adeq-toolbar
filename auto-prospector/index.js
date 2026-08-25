@@ -8286,9 +8286,13 @@ async function parteDelDia(token) {
   };
   const _porPersona = new Map();
   const _fila = (n) => {
-    if (!_porPersona.has(n)) _porPersona.set(n, { enviados: [], mirados: 0, conEmail: 0, geos: new Map(), imports: 0, importados: 0 });
+    if (!_porPersona.has(n)) _porPersona.set(n, { enviados: [], mirados: 0, conEmail: 0, geos: new Map(), imports: 0, importados: 0, nuevas: 0, conocidas: 0, arriba: 0, abajo: 0, sinDato: 0 });
     return _porPersona.get(n);
   };
+  // El piso con el que se separa "sirve" de "no sirve" en el parte. El user lo pidió en 500k;
+  // el gate del sistema es `agent_threshold_traffic` (hoy 400k), que es otra cosa y más
+  // estricta río abajo. Este número es solo para leer el trabajo del día.
+  const _PISO_PARTE = parseInt(cfg.parte_piso_trafico || "500000", 10) || 500000;
 
   // Los mails que de verdad salieron a mano.
   const _manuales = await fetch(
@@ -8301,12 +8305,20 @@ async function parteDelDia(token) {
 
   // Los sitios que miraron (con geo). No todos terminan en un envío.
   const _hist = await fetch(
-    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo&limit=2000`,
+    // `is_new` y `page_views` además de lo anterior: el user quiere saber, por MB, cuántas
+    // URLs abrió y cómo se reparten — nuevas vs ya conocidas, y por encima o por debajo del
+    // piso de tráfico. "Para saber si trabajó y de qué manera". (Maxi 2026-08-25.)
+    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo,is_new,page_views&limit=2000`,
     { headers: auth }
   ).then(r => r.ok ? r.json() : []).catch(() => []);
   for (const h of (Array.isArray(_hist) ? _hist : [])) {
     const f = _fila(_quien(h.media_buyer));
     f.mirados++;
+    if (h.is_new) f.nuevas++; else f.conocidas++;
+    const _pv = Number(h.page_views) || 0;
+    if (_pv >= _PISO_PARTE) f.arriba++;
+    else if (_pv > 0) f.abajo++;
+    else f.sinDato++;
     if (String(h.email || "").includes("@")) f.conEmail++;
     const g = String(h.geo || "").trim();
     if (g) f.geos.set(g, (f.geos.get(g) || 0) + 1);
@@ -8347,7 +8359,11 @@ async function parteDelDia(token) {
       }
       // El contexto va al final y con el nombre correcto: es lo que la toolbar analizó, no
       // una decisión del MB.
-      if (d.mirados) _lineasManual.push(`      (la toolbar analizó ${d.mirados} sitios en sus sesiones${d.conEmail ? `, ${d.conEmail} con email` : ""}${_geoTop ? ` · ${_geoTop}` : ""})`);
+      if (d.mirados) {
+        const _k = Math.round(_PISO_PARTE / 1000);
+        _lineasManual.push(`      URLs abiertas: ${d.mirados} · ${d.nuevas} nuevas / ${d.conocidas} ya conocidas · ${d.arriba} de +${_k}k / ${d.abajo} de -${_k}k / ${d.sinDato} sin dato de tráfico`);
+        if (_geoTop) _lineasManual.push(`      GEO: ${_geoTop}`);
+      }
       _lineasManual.push("");
     }
   }
@@ -8471,7 +8487,17 @@ async function parteDelDia(token) {
         // el nombre correcto — antes decía "sitios" y se leía como decisión del MB.
         return _card(
           `${_e(nombre)} · ${d.enviados.length} mail(s) enviado(s) a mano${d.imports ? ` · ${d.imports} import(s)` : ""}`,
-          `${_tabla}${d.mirados ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:10px;border-top:1px solid ${_BORDE};margin-top:10px">La toolbar analizó ${d.mirados} sitios en sus sesiones${d.conEmail ? ` · ${d.conEmail} con email` : ""}${_geoTop ? `<div style="padding-top:5px">${_geoTop}</div>` : ""}</div>` : ""}`
+          `${_tabla}${d.mirados ? `<div style="padding-top:10px;border-top:1px solid ${_BORDE};margin-top:10px">
+             <div style="font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px;padding-bottom:6px">URLs abiertas con la toolbar</div>
+             ${_kv([
+               ["Total abiertas", d.mirados],
+               ["Nuevas / ya conocidas", `${d.nuevas} / ${d.conocidas}`],
+               [`Superan ${Math.round(_PISO_PARTE / 1000)}k vistas`, d.arriba, d.arriba ? _VERDE : _GRIS],
+               [`Por debajo de ${Math.round(_PISO_PARTE / 1000)}k`, d.abajo],
+               ["Sin dato de tráfico", d.sinDato, d.sinDato ? _ROJO : _GRIS],
+             ])}
+             ${_geoTop ? `<div style="padding-top:8px">${_geoTop}</div>` : ""}
+           </div>` : ""}`
         );
       }).join("")
     : _card("Sin actividad manual", `<div style="color:${_GRIS}">Hoy nadie usó la toolbar a mano, o el registro no llegó.</div>`);
