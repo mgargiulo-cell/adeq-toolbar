@@ -7964,12 +7964,19 @@ async function parteDelDia(token) {
   await setConfigValue(token, "parte_diario_ultimo", hoy).catch(() => {});
 
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  // ⚠️ UN GLITCH NO ES UN CERO (Maxi 2026-08-25). Devolvía 0 tanto si la consulta fallaba
+  // como si de verdad no había nada, así que un 500 de Supabase se leía como "hoy no pasó
+  // nada" y el parte lo informaba como un hecho. Ahora un fallo se marca con `null` y el
+  // renglón dice "no se pudo medir" en vez de mentir con un cero.
   const _contar = async (url) => {
     try {
       const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      if (!r.ok) return null;
       return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
-    } catch { return 0; }
+    } catch { return null; }
   };
+  const _num = (v) => (v == null ? "?" : v);        // para mostrar sin mentir
+  const _n0  = (v) => (v == null ? 0 : v);          // para cuentas donde null no sirve
   const desdeHoy = _madridMidnightUtcISO();
 
   // 1. Envíos por MB — el número que define si el día se cumplió.
@@ -7993,7 +8000,7 @@ async function parteDelDia(token) {
   // 2. Prospects: lo que importa no es el total, es cuántos se pueden contactar.
   const conEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`);
   const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
-  const diasDeStock = totalEnviado > 0 ? (conEmail / Math.max(1, objetivoTotal)).toFixed(1) : "?";
+  const diasDeStock = (totalEnviado > 0 && conEmail != null) ? (conEmail / Math.max(1, objetivoTotal)).toFixed(1) : "?";
 
   // 3. ALTAS DE HOY, SEPARADAS POR MÉTODO.
   // El user quiere ver los tres caminos por separado y no sumados: import (Monday/sellers/CSV),
@@ -8122,9 +8129,9 @@ async function parteDelDia(token) {
     if (_mudos.length) problemas.push(`Hoy no trajo nada: ${_mudos.join(", ")}. Los demás sí, así que no es una caída general.`);
   }
   if (_kwSinNinguna) problemas.push(`Ninguna de las ${_kwSinNinguna} búsquedas de AutoGoogle califica un solo lead. No es que las frases sean malas: la cadena está cortada entre la búsqueda y Prospects.`);
-  if (sinEmail > 0 && emailsHallados === 0) problemas.push(`Hay ${sinEmail} leads sin email y hoy no se recuperó ninguno — revisar si la búsqueda de contactos está corriendo.`);
-  if (backlog >= CSV_QUEUE_HALT_HIGH) problemas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): el feeder está frenado hasta que drene.`);
-  if (conEmail < objetivoTotal * 2) problemas.push(`Quedan ${conEmail} contactables: menos de 2 días de envíos. Hay ${sinEmail} sin email esperando que se los busque.`);
+  if (sinEmail != null && sinEmail > 0 && emailsHallados === 0) problemas.push(`Hay ${sinEmail} leads sin email y hoy no se recuperó ninguno — revisar si la búsqueda de contactos está corriendo.`);
+  if (backlog != null && backlog >= CSV_QUEUE_HALT_HIGH) problemas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): el feeder está frenado hasta que drene.`);
+  if (conEmail != null && conEmail < objetivoTotal * 2) problemas.push(`Quedan ${conEmail} contactables: menos de 2 días de envíos. Hay ${sinEmail} sin email esperando que se los busque.`);
 
   // ── PARTE 2: EL TRABAJO A MANO DE CADA MB (Maxi 2026-08-25, pedido del user) ─────────
   // Todo lo de arriba es del AGENTE. Esto es lo otro: qué hizo cada persona a mano hoy.
@@ -8196,6 +8203,11 @@ async function parteDelDia(token) {
     }
   }
 
+  // Si algún número no se pudo medir, se dice. Un parte que muestra "?" es honesto; uno
+  // que muestra 0 porque falló una consulta hace tomar decisiones sobre datos inventados.
+  const _noMedidos = [["contactables", conEmail], ["sin email", sinEmail], ["en cola", backlog], ["purgadas", purgadas]]
+    .filter(([, v]) => v == null).map(([k]) => k);
+  if (_noMedidos.length) problemas.push(`No se pudieron medir: ${_noMedidos.join(", ")}. Los renglones con "?" no son ceros, son consultas que fallaron.`);
   const ok = problemas.length === 0;
   const cuerpo = [
     ok ? "Todo en orden." : "⚠️ Hay cosas que revisar.",
@@ -8210,10 +8222,10 @@ async function parteDelDia(token) {
     ...(altaOtros > 0 ? [`    (otras fuentes: ${altaOtros})`] : []),
     `    Total de altas del día: ${altasHoy}`,
     "",
-    `6 · SACADAS DE PROSPECTS por no cumplir            ${purgadas}`,
+    `6 · SACADAS DE PROSPECTS por no cumplir            ${_num(purgadas)}`,
     `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
     "",
-    `PROSPECTS HOY  ${conEmail} contactables (~${diasDeStock} días de envíos) · ${sinEmail} sin email · ${backlog} en cola`,
+    `PROSPECTS HOY  ${_num(conEmail)} contactables (~${diasDeStock} días de envíos) · ${_num(sinEmail)} sin email · ${_num(backlog)} en cola`,
     ...(lineasFuente.length ? [
       ``,
       `RENDIMIENTO POR FUENTE (últimos 7 días — cuántos trajo y cuántos pasaron el filtro)`,
@@ -8330,10 +8342,10 @@ async function parteDelDia(token) {
   ]))}
 
   ${_card("El pool hoy", _kv([
-    ["Contactables (con email)", `${conEmail}  ·  ~${diasDeStock} días de envíos`, conEmail < objetivoTotal * 2 ? _ROJO : _VERDE],
-    ["Sin email todavía", sinEmail],
-    ["En cola esperando", backlog],
-    ["Sacadas de Prospects por no cumplir", purgadas],
+    ["Contactables (con email)", `${_num(conEmail)}  ·  ~${diasDeStock} días de envíos`, (conEmail != null && conEmail < objetivoTotal * 2) ? _ROJO : _VERDE],
+    ["Sin email todavía", _num(sinEmail)],
+    ["En cola esperando", _num(backlog)],
+    ["Sacadas de Prospects por no cumplir", _num(purgadas)],
     ["Emails encontrados hoy (no tenían)", emailsHallados],
   ]))}
 
@@ -19640,7 +19652,12 @@ async function saludPing(token, job, { status = "ok", detalle = "", cadenciaMin 
     if (real     != null)    fila.real_ultimo     = real;
     if (esperado != null)    fila.esperado_ultimo = esperado;
 
-    if (status === "ok") {
+    // ⚠️ "warn" NO ESCRIBÍA `last_ok_at` (Maxi 2026-08-25). Los vigilantes que usan ese
+    // estado —el del embudo, el del agente frenado— quedaban con la fecha del último ok
+    // congelada para siempre, y el watchdog los reportaba como "sin correr nunca" aunque
+    // estuvieran latiendo cada 12 horas. Un aviso NO es una caída: el job corrió y avisó,
+    // que es exactamente lo que tiene que hacer. Cuenta como latido.
+    if (status === "ok" || status === "warn") {
       fila.last_ok_at = ahora;
       fila.fails_consecutivos = 0;
     } else if (status === "fail") {
