@@ -5531,7 +5531,14 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
       headers: { "X-Api-Key": apolloApiKey, "Content-Type": "application/json" },
       body: JSON.stringify({
         q_organization_domains_list: [domain],
-        person_titles: ["CEO","founder","co-founder","owner","publisher","editor in chief","managing editor","director","head of digital","VP"],
+        // ⚠️ SE PEDÍA UNA COSA Y SE DESCARTABA OTRA (Maxi 2026-08-25).
+        // La búsqueda pedía "editor in chief" y "managing editor"... que `_score` rechaza
+        // con -1 por matchear /editor|journalist|redactor/. O sea que Apollo devolvía
+        // gente que nosotros nunca íbamos a desbloquear, y el crédito no se gastaba: 235
+        // de 2.250 con el 42% del ciclo corrido, en un plan que se paga entero.
+        // Ahora se le piden los cargos que de verdad valen: comercial y publicidad
+        // primero, dirección después. Es la misma lista que premia `_score`.
+        person_titles: ["head of advertising","advertising director","ad sales","ad operations","programmatic","monetization","revenue director","commercial director","director comercial","gerente comercial","publicidad","publicidade","sales director","marketing director","business development","CEO","founder","co-founder","owner","publisher"],
         per_page: 5,
         page: 1,
       }),
@@ -5600,7 +5607,14 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
       headers: { "X-Api-Key": apolloKey, "Content-Type": "application/json" },
       body: JSON.stringify({
         q_organization_domains_list: [domain],
-        person_titles: ["CEO","founder","co-founder","owner","publisher","editor in chief","managing editor","director","head of digital","VP","marketing","commercial"],
+        // ⚠️ SE PEDÍA UNA COSA Y SE DESCARTABA OTRA (Maxi 2026-08-25).
+        // La búsqueda pedía "editor in chief" y "managing editor"... que `_score` rechaza
+        // con -1 por matchear /editor|journalist|redactor/. O sea que Apollo devolvía
+        // gente que nosotros nunca íbamos a desbloquear, y el crédito no se gastaba: 235
+        // de 2.250 con el 42% del ciclo corrido, en un plan que se paga entero.
+        // Ahora se le piden los cargos que de verdad valen: comercial y publicidad
+        // primero, dirección después. Es la misma lista que premia `_score`.
+        person_titles: ["head of advertising","advertising director","ad sales","ad operations","programmatic","monetization","revenue director","commercial director","director comercial","gerente comercial","publicidad","publicidade","sales director","marketing director","business development","CEO","founder","co-founder","owner","publisher"],
         per_page: 5, page: 1,
       }),
       signal: AbortSignal.timeout(12000),
@@ -5820,7 +5834,15 @@ function _rootDomain(d) {
  * @param fuente  de dónde salió el email (`cand.source`). Sin fuente se mantiene el
  *                comportamiento estricto de antes.
  */
-const _FUENTES_DEL_PROPIO_SITIO = /^(scrape|mailto|jsonld|json_ld|sitemap|rss|wordpress|wp|contact_form|social|ads_txt|adstxt|google_contact|play|wayback|apollo)/i;
+// Fuentes en las que el email salió del PROPIO sitio (o de un proveedor que consultamos
+// nosotros), y por lo tanto se le perdona que el dominio del correo sea el de la casa
+// editora. La única que NO entra es `informer` (WHOIS/registrador), que es justo la que
+// devuelve al dueño del dominio y no al contacto comercial.
+// Maxi 2026-08-25: faltaba `generic` —1.634 emails del pool, los info@/contacto@ que el
+// scraper saca de la página de contacto— y las vías nuevas de descubrimiento (MX, DMARC,
+// Certificate Transparency, YouTube). Al no estar, se las trataba como origen desconocido
+// y hostil, que es exactamente lo contrario de lo que son.
+const _FUENTES_DEL_PROPIO_SITIO = /^(scrape|mailto|jsonld|json_ld|sitemap|rss|wordpress|wp|contact_form|social|ads_txt|adstxt|google_contact|play|wayback|apollo|generic|mx|dmarc|ct|cert_transparency|youtube|instagram|facebook|twitter|linkedin)/i;
 
 function _brandMatches(email, leadDomain, fuente = "") {
   const recipientDom = (String(email || "").split("@")[1] || "").toLowerCase();
@@ -9163,7 +9185,15 @@ async function polishPool(token) {
   // ⚠️ `polish_only_missing` NO filtraba nada: se leía y solo se usaba en el log,
   // mientras el botón del popup prometía "va derecho a los que NO tienen email".
   // Recorría el pool entero gastando un fetch por lead. Ahora sí filtra.
-  const sinEmailClause = soloSinEmail ? `&or=(emails.is.null,emails.eq.%5B%5D)` : "";
+  // ⚠️ SIN BACKOFF, EL PULIDO MACHACA A LOS MISMOS (Maxi 2026-08-25).
+  // Escribe `email_ultimo_intento` en cada pasada pero no lo miraba al elegir, así que
+  // volvía sobre los mismos 348 leads mudos hasta 13 veces, gastando su presupuesto en
+  // sitios que ya demostraron no tener email visible mientras el resto del pool esperaba.
+  // Una semana es tiempo de sobra para que un sitio publique un contacto nuevo.
+  const _corteIntento = new Date(Date.now() - 3 * 86_400_000).toISOString();   // 3 días: medido, con 7 quedaban 19 elegibles de 344
+  const sinEmailClause = soloSinEmail
+    ? `&and=(or(emails.is.null,emails.eq.%5B%5D),or(email_ultimo_intento.is.null,email_ultimo_intento.lt.${encodeURIComponent(_corteIntento)}))`
+    : "";
   let leads = null;
   try {
     const _sel = (cols) => `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}${sinEmailClause}&select=${cols}&order=created_at.asc&limit=${POLISH_BATCH}`;
@@ -9199,10 +9229,13 @@ async function polishPool(token) {
       log(`✨ polish: pool completo pulido → segunda pasada SOLO sobre los mudos`);
       return;
     }
-    await setConfigValue(token, "polish_pool", "false").catch(() => {});
+    // Con el backoff de 3 días, "no hay elegibles" NO significa "no quedan mudos": significa
+    // que a todos se los intentó hace poco. Apagar el barrido acá lo dejaría muerto con 344
+    // leads sin email esperando. Se vuelve a la pasada general, que sí tiene trabajo, y los
+    // mudos reaparecen solos cuando vence su backoff. (Maxi 2026-08-25.)
     await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
-    await saludPing(token, "polish_pool", { status: "ok", detalle: "no queda ningún lead sin email" });
-    log(`✨ polish: NO queda un solo lead sin email → flag OFF`);
+    await saludPing(token, "polish_pool", { status: "ok", detalle: "los mudos están todos en backoff → vuelvo a la pasada general" });
+    log(`✨ polish: ningún mudo elegible ahora (backoff 3d) → vuelvo a la pasada general`);
     return;
   }
   let blocked = 0, enriched = 0, sinEmail = 0;
