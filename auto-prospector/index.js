@@ -8319,7 +8319,9 @@ async function parteDelDia(token) {
     // Una URL que supera el piso Y ya tiene email es un lead listo para escribir. Si el MB
     // la abrió y no le escribió, quedó ahí. Es el número más accionable del parte: hoy
     // Agustina abrió 50 y dejó 25 en esa condición.
-    if (Number(h.page_views) >= _PISO_PARTE && String(h.email || "").includes("@")) f.listos = (f.listos || 0) + 1;
+    if (Number(h.page_views) >= _PISO_PARTE && String(h.email || "").includes("@")) {
+      (f.candidatosListos = f.candidatosListos || []).push(String(h.domain || "").toLowerCase());
+    }
     // Foco geográfico. La regla es LATAM → Centroamérica → España → Europa/Asia/África, con
     // anglosajón al 10%. Si el MB pasa el día en sitios de Estados Unidos, el problema no es
     // cuánto trabajó sino DÓNDE, y eso no se ve en ningún otro renglón.
@@ -8408,6 +8410,35 @@ async function parteDelDia(token) {
     d.coberturaPct = _JORNADA_MIN > 0 ? Math.round(100 * d.activoMin / _JORNADA_MIN) : null;
   }
 
+  // ── ¿YA LO HABÍAMOS CONTACTADO? (Maxi 2026-08-25, corrección del user) ─────────────
+  // "Ojo que si superó el umbral y no le escribió, podría ser porque ya está contactado en
+  // el sistema." Tenía razón y el número estaba inflado: de los 25 que el parte le contaba a
+  // Agustina como "listos y sin escribir", 11 ya estaban en sendtrack. Contarlos como
+  // trabajo pendiente es acusarla de no hacer algo que hizo bien en no hacer.
+  // Se traen los contactados de los últimos 30 días —la misma ventana que usa el guard del
+  // agente para no re-contactar— y se descuentan. Los de hace MÁS de 30 días sí se pueden
+  // retomar, así que van aparte en vez de perderse.
+  const _contactados30 = new Set();
+  const _contactadosAlguna = new Set();
+  try {
+    const _c30 = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
+    const _st = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain,send_date&limit=50000`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    for (const f of (Array.isArray(_st) ? _st : [])) {
+      const d = String(f.domain || "").toLowerCase();
+      if (!d) continue;
+      _contactadosAlguna.add(d);
+      if (String(f.send_date || "") >= _c30) _contactados30.add(d);
+    }
+  } catch {}
+  for (const [, d] of _porPersona) {
+    const cand = d.candidatosListos || [];
+    d.listos     = cand.filter(x => !_contactadosAlguna.has(x)).length;                       // nunca contactados
+    d.retomables = cand.filter(x => _contactadosAlguna.has(x) && !_contactados30.has(x)).length; // +30 días
+    d.yaContactados = cand.filter(x => _contactados30.has(x)).length;                          // no tocar
+  }
+
   // ── EL NÚMERO DEL DÍA CONTRA SU PROPIO PROMEDIO (Maxi 2026-08-25) ──────────────────
   // "50 URLs" no dice nada solo. Contra el promedio de esa persona sí: 50 es normal para
   // Agustina (56/día) y sería un récord para Diego (11/día). Sin esto, comparar a dos MB
@@ -8465,7 +8496,9 @@ async function parteDelDia(token) {
         _lineasManual.push(`      URLs abiertas: ${d.mirados}  (${d.nuevas} nuevas · ${d.conocidas} ya conocidas)${_vs}`);
         _lineasManual.push(`      De esas: ${d.arriba} superan ${_k}k · ${d.abajo} por debajo · ${d.sinDato} sin dato de tráfico`);
         if (_conv != null) _lineasManual.push(`      Aprovechamiento: le escribió a ${d.enviados.length} de las ${d.arriba} que servían (${_conv}%)`);
-        if (d.listos) _lineasManual.push(`      ⏳ Quedaron ${d.listos - d.enviados.length > 0 ? d.listos - d.enviados.length : 0} listos para escribir: superan ${_k}k Y ya tienen email, pero no salió mail`);
+        if (d.listos) _lineasManual.push(`      ⏳ Quedaron ${d.listos} SIN CONTACTAR: superan ${_k}k, ya tienen email y nunca se les escribió`);
+        if (d.retomables) _lineasManual.push(`         (+ ${d.retomables} contactados hace más de 30 días — se pueden retomar)`);
+        if (d.yaContactados) _lineasManual.push(`         (${d.yaContactados} ya contactados en los últimos 30 días — bien no escribirles)`);
         if (d.anglo) _lineasManual.push(`      🌎 Fuera del foco geográfico: ${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%) son anglo/Norteamérica`);
         if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
         if (d.desde) {
@@ -8618,7 +8651,9 @@ async function parteDelDia(token) {
                ["Sin dato de tráfico", d.sinDato, d.sinDato ? _ROJO : _GRIS],
                ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
-               ...(d.listos > d.enviados.length ? [["Listos y sin escribir", `${d.listos - d.enviados.length}`, _ROJO]] : []),
+               ...(d.listos ? [["Sin contactar y listos", `${d.listos}`, d.listos > 5 ? _ROJO : "#b26a00"]] : []),
+               ...(d.retomables ? [["Retomables (+30 días)", `${d.retomables}`]] : []),
+               ...(d.yaContactados ? [["Ya contactados (30 días)", `${d.yaContactados}`, _GRIS]] : []),
                ...(d.anglo ? [["Fuera del foco (anglo)", `${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%)`,
                    (d.anglo / d.mirados) > 0.3 ? _ROJO : _GRIS]] : []),
                ...(_promedios.get(nombre) ? [["Su promedio (14 días)", `${_promedios.get(nombre)} URLs/día`]] : []),
