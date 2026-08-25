@@ -21617,8 +21617,17 @@ async function main() {
           `${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?frozen_until=lte.${encodeURIComponent(now)}&select=domain,source,uploaded_by,attempt_count&limit=20`,
           { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
         );
+        // ⚠️ "No pude leer" no puede reportarse como "no había nada" (Maxi 2026-08-25).
+        // Si la consulta fallaba, `rows` no era un array y el ping de más abajo igual decía
+        // status ok / "sin filas vencidas". El vigilante veía verde mientras 1.699 leads
+        // congelados esperaban a que alguien los liberara.
+        // Se LANZA en vez de hacer `return`: este bloque vive dentro del bucle principal del
+        // worker, y un `return` acá cortaría el worker entero. El catch de abajo ya deja el
+        // ping en fail y sigue con el resto de la vuelta.
+        if (!res.ok) throw new Error(`no se pudo leer la lista de congelados (HTTP ${res.status})`);
         const rows = await res.json();
-        if (Array.isArray(rows) && rows.length) {
+        if (!Array.isArray(rows)) throw new Error("respuesta inesperada al leer congelados");
+        if (rows.length) {
           for (const row of rows) {
             // Maxi 2026-06-22 FIX: UPSERT (on_conflict=domain) en vez de INSERT plano.
             // Antes el INSERT chocaba con la fila vieja status=frozen (dominio único) →
@@ -21648,7 +21657,7 @@ async function main() {
         }
         await saludPing(token, "unfreezer", {
           status: "ok", cadenciaMin: 15,
-          detalle: Array.isArray(rows) ? `${rows.length} liberados` : "sin filas vencidas",
+          detalle: rows.length ? `${rows.length} liberados` : "sin filas vencidas",
         });
       } catch (e) {
         await saludPing(token, "unfreezer", { status: "fail", cadenciaMin: 15, detalle: e.message });
