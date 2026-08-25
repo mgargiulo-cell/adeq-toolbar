@@ -3070,6 +3070,58 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
 const MONDAY_FINALIZADO_STAGE = 5;          // deal_stage index del board 1420268379
 const MONDAY_SYNC_MAX_POR_DIA = 400;        // techo para no inundar la cola de una
 
+// ── EL ESTADO DE MONDAY, GUARDADO PARA PODER CONSULTARLO (Maxi 2026-08-25) ──────────
+// Regla del user, verificada contra las 11 etiquetas del board: solo se re-contacta si el
+// dominio NO está en Monday, o si está en "Ciclo Finalizado", "Mail No Enviado" o
+// "Descartado". Todo lo demás bloquea. `MONDAY_BLOCKED_STATES` ya lo encodea bien.
+// El problema era otro: ese estado no quedaba guardado en ningún lado, así que el parte
+// diario no podía decir si un dominio contactado hace 40 días se puede retomar o tiene un
+// deal vivo — mandaba a "revisar en Monday" a mano.
+// Esto recorre el board una vez al día y persiste SOLO los bloqueados (los activos), que son
+// muchos menos que el total. Con eso, "no está en la lista" = se puede retomar.
+async function guardarBloqueadosDeMonday(token) {
+  try {
+    if (!(await _tocaCorrer(token, "monday_bloqueados", 24 * 60))) return;
+    const apiKey = await _getMondayApiKeyForFeeder(token);
+    if (!apiKey) return;
+    let cursor = null, bloqueados = [], vueltas = 0;
+    do {
+      const args = cursor ? `limit: 500, cursor: "${cursor}"` : `limit: 500`;
+      const query = `{ boards(ids: [1420268379]) { items_page(${args}) { cursor items { name column_values(ids: ["deal_stage"]) { text } } } } }`;
+      const res = await fetch("https://api.monday.com/v2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": apiKey, "API-Version": "2024-01" },
+        body: JSON.stringify({ query }), signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const page = data?.data?.boards?.[0]?.items_page;
+      if (!page) throw new Error("respuesta inesperada");
+      for (const it of (page.items || [])) {
+        const estado = it.column_values?.[0]?.text || "";
+        if (_isMondayBlocked(estado)) {
+          const d = cleanDomain(it.name);
+          if (d) bloqueados.push(d);
+        }
+      }
+      cursor = page.cursor;
+    } while (cursor && ++vueltas < 40);
+    bloqueados = [...new Set(bloqueados)];
+    await setConfigValue(token, "monday_bloqueados", JSON.stringify(bloqueados)).catch(() => {});
+    await setConfigValue(token, "monday_bloqueados_at", new Date().toISOString()).catch(() => {});
+    await saludPing(token, "monday_bloqueados", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: `${bloqueados.length} dominios con deal activo (no se re-contactan)`,
+      real: bloqueados.length, esperado: bloqueados.length,
+    });
+    log(`📋 Monday: ${bloqueados.length} dominios con deal activo guardados — el parte ya puede decir qué se puede retomar`);
+  } catch (e) {
+    // No pude leer ≠ nadie está bloqueado. Se conserva la lista anterior.
+    await saludPing(token, "monday_bloqueados", { status: "fail", cadenciaMin: 24 * 60, detalle: e.message }).catch(() => {});
+    log(`⚠️ guardarBloqueadosDeMonday: ${e.message} — se conserva la lista del día anterior`);
+  }
+}
+
 async function sincronizarFinalizadosDeMonday(token) {
   try {
     const cfg = await getConfig(token).catch(() => null);
@@ -8432,11 +8484,30 @@ async function parteDelDia(token) {
       if (String(f.send_date || "") >= _c30) _contactados30.add(d);
     }
   } catch {}
+  // Los que Monday bloquea: deal vivo o con dueño trabajándolo. Regla del user verificada
+  // contra las 11 etiquetas del board: solo se retoma si NO está en Monday, o si está en
+  // Ciclo Finalizado / Mail No Enviado / Descartado.
+  let _mondayBloq = null;
+  try {
+    const _b = JSON.parse(cfg.monday_bloqueados || "null");
+    if (Array.isArray(_b)) _mondayBloq = new Set(_b.map(d => String(d).toLowerCase()));
+  } catch {}
   for (const [, d] of _porPersona) {
     const cand = d.candidatosListos || [];
     d.listos     = cand.filter(x => !_contactadosAlguna.has(x)).length;                       // nunca contactados
-    d.retomables = cand.filter(x => _contactadosAlguna.has(x) && !_contactados30.has(x)).length; // +30 días
-    d.yaContactados = cand.filter(x => _contactados30.has(x)).length;                          // no tocar
+    d.yaContactados = cand.filter(x => _contactados30.has(x)).length;                          // contactados hace poco
+    const _viejos = cand.filter(x => _contactadosAlguna.has(x) && !_contactados30.has(x));
+    if (_mondayBloq) {
+      // Con la lista de Monday se puede afirmar: retomable = pasó el mes Y no tiene deal vivo.
+      d.retomables   = _viejos.filter(x => !_mondayBloq.has(x)).length;
+      d.conDealVivo  = _viejos.filter(x =>  _mondayBloq.has(x)).length;
+      d.mondaySabido = true;
+    } else {
+      // Sin la lista (primer día, o Monday no contestó) NO se afirma nada.
+      d.retomables = _viejos.length;
+      d.conDealVivo = 0;
+      d.mondaySabido = false;
+    }
   }
 
   // ── EL NÚMERO DEL DÍA CONTRA SU PROPIO PROMEDIO (Maxi 2026-08-25) ──────────────────
@@ -8503,7 +8574,10 @@ async function parteDelDia(token) {
         // Confirmarlo pide el estado de Monday por dominio, que hoy no está guardado —el
         // sync recorre el board pero solo persiste un resumen—. Así que el parte informa el
         // hecho y NO afirma lo que no puede verificar.
-        if (d.retomables) _lineasManual.push(`         (+ ${d.retomables} contactados hace más de 30 días — revisar en Monday: solo se retoman si no están o si el ciclo terminó)`);
+        if (d.retomables) _lineasManual.push(d.mondaySabido
+          ? `         (+ ${d.retomables} se pueden RETOMAR: pasó el mes y no tienen deal vivo en Monday)`
+          : `         (+ ${d.retomables} contactados hace más de 30 días — revisar en Monday, todavía no tengo el estado del board)`);
+        if (d.conDealVivo) _lineasManual.push(`         (${d.conDealVivo} tienen deal VIVO en Monday — no se tocan)`);
         if (d.yaContactados) _lineasManual.push(`         (${d.yaContactados} ya contactados en los últimos 30 días — bien no escribirles)`);
         if (d.anglo) _lineasManual.push(`      🌎 Fuera del foco geográfico: ${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%) son anglo/Norteamérica`);
         if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
@@ -8658,7 +8732,10 @@ async function parteDelDia(token) {
                ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
                ...(d.listos ? [["Sin contactar y listos", `${d.listos}`, d.listos > 5 ? _ROJO : "#b26a00"]] : []),
-               ...(d.retomables ? [["Contactados hace +30 días", `${d.retomables} — revisar en Monday antes de retomar`]] : []),
+               ...(d.retomables ? [[d.mondaySabido ? "Se pueden retomar" : "Contactados hace +30 días",
+                   d.mondaySabido ? `${d.retomables}` : `${d.retomables} — falta el estado del board`,
+                   d.mondaySabido ? "#b26a00" : _GRIS]] : []),
+               ...(d.conDealVivo ? [["Con deal vivo en Monday", `${d.conDealVivo} — no se tocan`, _GRIS]] : []),
                ...(d.yaContactados ? [["Ya contactados (30 días)", `${d.yaContactados}`, _GRIS]] : []),
                ...(d.anglo ? [["Fuera del foco (anglo)", `${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%)`,
                    (d.anglo / d.mirados) > 0.3 ? _ROJO : _GRIS]] : []),
@@ -22731,6 +22808,7 @@ async function main() {
       if (_hayTiempo()) await maybeCazaEmails(token).catch(e => log(`⚠️ cazaEmails: ${e.message}`));
       // Barrido diario del 100% de los ciclos finalizados de Monday: vuelven a
       // Prospects con email nuevo, y el pipeline decide si siguen cumpliendo.
+      if (_hayTiempo()) await guardarBloqueadosDeMonday(token).catch(e => log(`⚠️ monday bloqueados: ${e.message}`));
       if (_hayTiempo()) await sincronizarFinalizadosDeMonday(token).catch(e => log(`⚠️ mondaySync: ${e.message}`));
       // 1×/semana: buscar sellers.json en Google para descubrir redes nuevas. Cada red
       // devuelve cientos de publishers sin gastar un crédito más.
