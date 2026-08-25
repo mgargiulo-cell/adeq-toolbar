@@ -14146,12 +14146,75 @@ async function loadBouncedEmails(token) {
   return _bouncedCache.set;
 }
 
+// ── LO QUE SE APRENDIÓ DE LOS REBOTES, APLICADO ANTES DE MANDAR (Maxi 2026-08-25) ──────
+// Pedido del user: "cuando lleguen rechazados, debe leer esa dirección, ver de qué tipo es
+// y tomar nota para que no vuelva a pasar". El reintento a otra dirección ya existía; lo que
+// faltaba era la inteligencia sobre la CAUSA.
+// Medido: 32 dominios rebotaron 2 o más direcciones = 95 rebotes evitables. Después del
+// primer "usuario inexistente" seguíamos probando otras direcciones en el mismo lugar, y
+// también rebotaban — quemando reputación por nada.
+// Regla aprendida: si un dominio ya rechazó DOS direcciones distintas por usuario
+// inexistente, no acepta direcciones nuevas. Se deja de probar ahí.
+// `dominio_inexistente` es peor todavía: no es que el buzón no exista, es que el sitio no
+// resuelve. Con UNO alcanza.
+const _DOMINIOS_QUE_RECHAZAN = new Map();   // dominio → { usuarios: N, dominioMuerto: bool }
+let _dominiosRechazoAt = 0;
+async function _cargarDominiosQueRechazan(token) {
+  if (Date.now() - _dominiosRechazoAt < 30 * 60 * 1000) return;   // refresco cada 30 min
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo&limit=5000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (!r.ok) return;                      // no pude leer ≠ nadie rechaza
+    const filas = await r.json();
+    if (!Array.isArray(filas)) return;
+    _DOMINIOS_QUE_RECHAZAN.clear();
+    for (const f of filas) {
+      const dom = String(f.email || "").split("@")[1]?.toLowerCase();
+      if (!dom) continue;
+      const acc = _DOMINIOS_QUE_RECHAZAN.get(dom) || { usuarios: 0, dominioMuerto: false };
+      if (f.tipo === "dominio_inexistente") acc.dominioMuerto = true;
+      else if (f.tipo === "usuario_inexistente" || !f.tipo) acc.usuarios++;
+      _DOMINIOS_QUE_RECHAZAN.set(dom, acc);
+    }
+    _dominiosRechazoAt = Date.now();
+  } catch {}
+}
+// Devuelve el motivo por el que NO conviene escribir a este dominio, o "" si se puede.
+function _porQueNoEscribirA(email) {
+  const dom = String(email || "").split("@")[1]?.toLowerCase();
+  if (!dom) return "";
+  const acc = _DOMINIOS_QUE_RECHAZAN.get(dom);
+  if (!acc) return "";
+  if (acc.dominioMuerto) return "el dominio no existe (rebotó por DNS)";
+  if (acc.usuarios >= 2) return `ya rechazó ${acc.usuarios} direcciones distintas por usuario inexistente`;
+  return "";
+}
+
 function isBouncedSync(email) {
   return _bouncedCache.set.has((email || "").toLowerCase());
 }
 
-async function markEmailBounced(token, { email, reason, originalActionId, originalDomain }) {
+// Busca de dónde salió una dirección, mientras el lead todavía esté en el pool. Después de
+// que sale —contactado o rechazado— esa información ya no existe en ningún lado, y por eso
+// el rebote la congela en el momento. (Maxi 2026-08-25.)
+async function _fuenteDelEmail(token, email) {
+  const _m = String(email || "").toLowerCase();
+  if (!_m) return null;
   try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?emails=cs.${encodeURIComponent(JSON.stringify([_m]))}&select=email_sources&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (!r.ok) return null;
+    const f = await r.json();
+    const src = Array.isArray(f) && f[0]?.email_sources ? f[0].email_sources[_m] : null;
+    return _normSrc(src) || null;
+  } catch { return null; }
+}
+
+async function markEmailBounced(token, { email, reason, originalActionId, originalDomain, tipo, detalle, fuente }) {
+  try {
+    const _fuenteCongelada = fuente || (await _fuenteDelEmail(token, email).catch(() => null));
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails`, {
       method: "POST",
       headers: {
@@ -14163,6 +14226,13 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
         reason: (reason || "").substring(0, 300),
         original_action_id: originalActionId || null,
         original_domain: originalDomain || null,
+          // ⚠️ LA FUENTE SE GUARDA ACÁ, NO SE DEDUCE DESPUÉS. Intenté atribuir los rebotes
+          // cruzando contra `email_sources` y 388 de 443 no tenían fuente: cuando el lead
+          // sale del pool esa información desaparece. Sin saber QUIÉN produjo la dirección
+          // que rebotó, no se puede aprender nada.
+          tipo:    tipo || null,
+          detalle: (detalle || "").substring(0, 200) || null,
+          fuente:  _fuenteCongelada,
       }),
     });
     _bouncedCache.set.add((email || "").toLowerCase());
@@ -14352,6 +14422,21 @@ async function scanBouncesForUser(token, userEmail) {
           /4\d\d[\s-]?\d\.\d\.\d|mailbox full|over quota|temporarily|temporary failure|try again later|rate limit/i.test(bodyText) &&
           !isHardBounce;
         const bounceType = isHardBounce ? "hard" : (isSoftBounce ? "soft" : "unknown");
+        // ── APRENDER EL PORQUÉ, NO SOLO ANOTAR EL QUÉ (Maxi 2026-08-25, pedido del user) ──
+        // Ya existía el reintento a otra dirección cuando algo rebota, pero no había
+        // inteligencia sobre la CAUSA. Medido: 32 dominios rebotaron 2 o más direcciones —
+        // 95 rebotes evitables, porque después del primer rechazo seguimos probando otras
+        // direcciones en el mismo lugar y también rebotaron.
+        // "hard/soft" no alcanza para decidir: un buzón lleno y un dominio muerto son los
+        // dos "no entregado" y piden cosas opuestas. Estas cinco categorías sí deciden.
+        const _tipoRebote =
+          /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|does not exist.{0,20}domain/i.test(bodyText) ? "dominio_inexistente"
+          : /mailbox full|over quota|quota exceeded|insufficient storage|buz[oó]n lleno|caixa.{0,10}cheia/i.test(bodyText) ? "buzon_lleno"
+          : /blocked|blacklist|spam|reputation|policy|rejected due to|not authorized|denied|550[\s-]?5\.7\./i.test(bodyText) ? "bloqueado"
+          : isHardBounce ? "usuario_inexistente"
+          : isSoftBounce ? "temporal"
+          : "desconocido";
+        const _detalleRebote = (bodyText.match(/\b[45]\d\d[\s-]?\d\.\d\.\d\b[^\n]{0,90}/) || [""])[0].trim().slice(0, 200);
 
         for (const failed of failedEmails) {
           if (!isBouncedSync(failed)) {
@@ -14360,7 +14445,7 @@ async function scanBouncesForUser(token, userEmail) {
             // puede entrar). Solo hard/unknown matan el contacto. El retry a un alternativo
             // igual se dispara abajo, así tenemos cobertura sin quemar el email soft.
             if (bounceType !== "soft") {
-              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1] });
+              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
             } else {
               log(`  ↩️ soft bounce ${failed} — transitorio, NO se blacklistea (se podrá reintentar)`);
             }
@@ -18053,6 +18138,9 @@ async function runAgentCycle(token, allFlags) {
 
   // Refresh bounced cache + scan INBOX al inicio del ciclo
   await loadBouncedEmails(token);
+  // Lo aprendido de los rebotes: qué dominios ya demostraron que no aceptan direcciones
+  // nuevas. Se usa más abajo, antes de elegir a quién escribirle. (Maxi 2026-08-25.)
+  await _cargarDominiosQueRechazan(token);
 
   // Whitelist de users autorizados a usar el agent (defense-in-depth).
   // Lee toolbar_config.agent_whitelist (CSV) y fallback hardcoded a admin.
@@ -19164,6 +19252,16 @@ async function runAgentCycle(token, allFlags) {
             // marcándolo 'rejected' PARA SIEMPRE aunque tuviera otras direcciones buenas. Casos
             // reales del pool: info@domain-contact.org como email #1 de pixiv.net y de los 4
             // subdominios de globo.com (es el WHOIS proxy, no el publisher).
+            // Lo aprendido de rebotes anteriores en ESE dominio. No es que esta dirección
+            // haya rebotado —eso lo cubre isBouncedSync—: es que el dominio ya demostró que
+            // rechaza direcciones nuevas, así que probar otra es quemar reputación para
+            // nada. Medido: 73 leads del pool apuntan a un dominio así. (Maxi 2026-08-25.)
+            const _noEscribir = _porQueNoEscribirA(cand.email);
+            if (_noEscribir) {
+              log(`  🧠 ${domain}: no escribo a ${cand.email} — ${_noEscribir}`);
+              descartados++; _motivosDescarte.push("dominio_ya_rechazo");
+              continue;
+            }
             if (!_brandMatches(cand.email, domain, cand.source)) {
               log(`  🚫 ${domain}: ${cand.email} es de otra marca — se descarta el email, NO el lead`);
               descartados++; _motivosDescarte.push("otra_marca");
