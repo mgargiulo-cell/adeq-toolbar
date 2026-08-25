@@ -8315,6 +8315,15 @@ async function parteDelDia(token) {
     const f = _fila(_quien(h.media_buyer));
     f.mirados++;
     if (h.is_new) f.nuevas++; else f.conocidas++;
+    // ── LO QUE QUEDÓ SOBRE LA MESA (Maxi 2026-08-25) ─────────────────────────────────
+    // Una URL que supera el piso Y ya tiene email es un lead listo para escribir. Si el MB
+    // la abrió y no le escribió, quedó ahí. Es el número más accionable del parte: hoy
+    // Agustina abrió 50 y dejó 25 en esa condición.
+    if (Number(h.page_views) >= _PISO_PARTE && String(h.email || "").includes("@")) f.listos = (f.listos || 0) + 1;
+    // Foco geográfico. La regla es LATAM → Centroamérica → España → Europa/Asia/África, con
+    // anglosajón al 10%. Si el MB pasa el día en sitios de Estados Unidos, el problema no es
+    // cuánto trabajó sino DÓNDE, y eso no se ve en ningún otro renglón.
+    if (_ANGLO_PARTE.test(String(h.geo || ""))) f.anglo = (f.anglo || 0) + 1;
     const _pv = Number(h.page_views) || 0;
     if (_pv >= _PISO_PARTE) f.arriba++;
     else if (_pv > 0) f.abajo++;
@@ -8374,6 +8383,9 @@ async function parteDelDia(token) {
   // sueltos estaban pegados entre sí.
   const _JORNADA_H = parseFloat(cfg.parte_jornada_horas || "9") || 9;   // 09:00 a 18:00 AR
   const _JORNADA_MIN = Math.round(_JORNADA_H * 60);
+  // Geos fuera del foco: anglosajón y Norteamérica. Acepta el código y el nombre, porque el
+  // historial guarda a veces uno y a veces otro.
+  const _ANGLO_PARTE = /^(US|CA|GB|UK|AU|NZ|IE|United States|Canada|United Kingdom|Australia|New Zealand|Ireland)$/i;
   const _horaAr = (t) => new Date(t).toLocaleTimeString("es-AR", {
     timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit", hour12: false });
   for (const [, d] of _porPersona) {
@@ -8395,6 +8407,27 @@ async function parteDelDia(token) {
     d.activoMin  = Math.max(0, d.ventanaMin - d.huecoTotal);
     d.coberturaPct = _JORNADA_MIN > 0 ? Math.round(100 * d.activoMin / _JORNADA_MIN) : null;
   }
+
+  // ── EL NÚMERO DEL DÍA CONTRA SU PROPIO PROMEDIO (Maxi 2026-08-25) ──────────────────
+  // "50 URLs" no dice nada solo. Contra el promedio de esa persona sí: 50 es normal para
+  // Agustina (56/día) y sería un récord para Diego (11/día). Sin esto, comparar a dos MB
+  // con ritmos distintos lleva a conclusiones falsas.
+  const _promedios = new Map();
+  try {
+    const _d14 = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+    const _hist = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=gte.${_d14}&select=media_buyer,date&limit=5000`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    const _acc = {};
+    for (const h of (Array.isArray(_hist) ? _hist : [])) {
+      const q = _quien(h.media_buyer);
+      _acc[q] = _acc[q] || { total: 0, dias: new Set() };
+      _acc[q].total++; _acc[q].dias.add(h.date);
+    }
+    for (const [q, v] of Object.entries(_acc)) {
+      if (v.dias.size >= 3) _promedios.set(q, Math.round(v.total / v.dias.size));
+    }
+  } catch {}
 
   const _personas = [..._porPersona.entries()].sort((a, b) => (b[1].enviados.length + b[1].mirados) - (a[1].enviados.length + a[1].mirados));
   const _lineasManual = [];
@@ -8427,9 +8460,13 @@ async function parteDelDia(token) {
         // La conversión es la señal de trabajo real: de las URLs que SÍ servían, ¿a cuántas
         // les escribió? Abrir 50 y mandar 2 no se lee igual si 37 servían que si servían 2.
         const _conv = d.arriba > 0 ? Math.round(100 * d.enviados.length / d.arriba) : null;
-        _lineasManual.push(`      URLs abiertas: ${d.mirados}  (${d.nuevas} nuevas · ${d.conocidas} ya conocidas)`);
+        const _prom = _promedios.get(nombre);
+        const _vs = _prom ? `  ·  su promedio: ${_prom}/día${d.mirados < _prom * 0.6 ? " ⚠️" : ""}` : "";
+        _lineasManual.push(`      URLs abiertas: ${d.mirados}  (${d.nuevas} nuevas · ${d.conocidas} ya conocidas)${_vs}`);
         _lineasManual.push(`      De esas: ${d.arriba} superan ${_k}k · ${d.abajo} por debajo · ${d.sinDato} sin dato de tráfico`);
         if (_conv != null) _lineasManual.push(`      Aprovechamiento: le escribió a ${d.enviados.length} de las ${d.arriba} que servían (${_conv}%)`);
+        if (d.listos) _lineasManual.push(`      ⏳ Quedaron ${d.listos - d.enviados.length > 0 ? d.listos - d.enviados.length : 0} listos para escribir: superan ${_k}k Y ya tienen email, pero no salió mail`);
+        if (d.anglo) _lineasManual.push(`      🌎 Fuera del foco geográfico: ${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%) son anglo/Norteamérica`);
         if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
         if (d.desde) {
           const _hm = (m) => `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}min`;
@@ -8581,6 +8618,10 @@ async function parteDelDia(token) {
                ["Sin dato de tráfico", d.sinDato, d.sinDato ? _ROJO : _GRIS],
                ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
+               ...(d.listos > d.enviados.length ? [["Listos y sin escribir", `${d.listos - d.enviados.length}`, _ROJO]] : []),
+               ...(d.anglo ? [["Fuera del foco (anglo)", `${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%)`,
+                   (d.anglo / d.mirados) > 0.3 ? _ROJO : _GRIS]] : []),
+               ...(_promedios.get(nombre) ? [["Su promedio (14 días)", `${_promedios.get(nombre)} URLs/día`]] : []),
                ...(d.sesiones ? [["Toolbar abierta", `~${Math.round((d.segundos || 0) / 60)} min · ${d.sesiones} sesiones`]] : []),
                ...(d.desde ? [["Actividad (hora AR)", `${_horaAr(d.desde)} — ${_horaAr(d.hasta)}`]] : []),
                ...(d.desde ? [["Cobertura de la jornada",
