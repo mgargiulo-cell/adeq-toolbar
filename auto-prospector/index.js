@@ -8322,7 +8322,11 @@ async function parteDelDia(token) {
     if (String(h.email || "").includes("@")) f.conEmail++;
     // Franja horaria del día: dice si trabajó de corrido o en dos ratos sueltos.
     const _t = Date.parse(h.created_at || "");
-    if (_t) { f.desde = Math.min(f.desde || _t, _t); f.hasta = Math.max(f.hasta || _t, _t); }
+    if (_t) {
+      f.desde = Math.min(f.desde || _t, _t);
+      f.hasta = Math.max(f.hasta || _t, _t);
+      (f.momentos = f.momentos || []).push(_t);   // para calcular los huecos de inactividad
+    }
     const g = String(h.geo || "").trim();
     if (g) f.geos.set(g, (f.geos.get(g) || 0) + 1);
   }
@@ -8355,6 +8359,27 @@ async function parteDelDia(token) {
     const f = _fila(_quien(i.user_email));
     f.imports++;
     f.importados += parseInt(i.inserted_count || 0, 10) || 0;
+  }
+
+  // ── HUECOS DE INACTIVIDAD (Maxi 2026-08-25, pedido del user) ───────────────────────
+  // "Saber si hubo mucha inactividad, entre cuál y cuál horario, hora Argentina."
+  // Los minutos totales no dicen la forma del día: 11 minutos repartidos en toda la tarde
+  // no se leen igual que 11 minutos seguidos. Esto muestra los silencios largos.
+  // ⚠️ EN HORA DE BUENOS AIRES a propósito, no Madrid. El resto del parte usa Madrid porque
+  // es la ventana horaria del AGENTE; esto es sobre personas que están en Argentina, y
+  // mostrarles su propio día en otro huso sería inútil.
+  const _HUECO_MIN = parseInt(cfg.parte_hueco_minutos || "30", 10) || 30;
+  const _horaAr = (t) => new Date(t).toLocaleTimeString("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit", hour12: false });
+  for (const [, d] of _porPersona) {
+    const ms = (d.momentos || []).sort((a, b) => a - b);
+    d.huecos = [];
+    for (let i = 1; i < ms.length; i++) {
+      const _gap = Math.round((ms[i] - ms[i - 1]) / 60000);
+      if (_gap >= _HUECO_MIN) d.huecos.push({ desde: ms[i - 1], hasta: ms[i], min: _gap });
+    }
+    d.huecos.sort((a, b) => b.min - a.min);
+    d.huecoTotal = d.huecos.reduce((a, h) => a + h.min, 0);
   }
 
   const _personas = [..._porPersona.entries()].sort((a, b) => (b[1].enviados.length + b[1].mirados) - (a[1].enviados.length + a[1].mirados));
@@ -8392,7 +8417,18 @@ async function parteDelDia(token) {
         _lineasManual.push(`      De esas: ${d.arriba} superan ${_k}k · ${d.abajo} por debajo · ${d.sinDato} sin dato de tráfico`);
         if (_conv != null) _lineasManual.push(`      Aprovechamiento: le escribió a ${d.enviados.length} de las ${d.arriba} que servían (${_conv}%)`);
         if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
-        if (d.desde) _lineasManual.push(`      Actividad: de ${_hhmm(d.desde)} a ${_hhmm(d.hasta)}`);
+        if (d.desde) {
+          const _span = Math.round((d.hasta - d.desde) / 60000);
+          _lineasManual.push(`      Actividad (hora Argentina): de ${_horaAr(d.desde)} a ${_horaAr(d.hasta)} — ${Math.floor(_span / 60)}h ${_span % 60}min de punta a punta`);
+          if (d.huecos.length) {
+            _lineasManual.push(`      Inactividad: ${d.huecoTotal} min en ${d.huecos.length} hueco(s) de más de ${_HUECO_MIN} min`);
+            for (const h of d.huecos.slice(0, 3)) {
+              _lineasManual.push(`         · ${_horaAr(h.desde)} → ${_horaAr(h.hasta)}   (${h.min} min sin actividad)`);
+            }
+          } else {
+            _lineasManual.push(`      Sin huecos de más de ${_HUECO_MIN} min: trabajó de corrido.`);
+          }
+        }
         if (_geoTop) _lineasManual.push(`      GEO: ${_geoTop}`);
       }
       _lineasManual.push("");
@@ -8529,8 +8565,13 @@ async function parteDelDia(token) {
                ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
                ...(d.sesiones ? [["Toolbar abierta", `~${Math.round((d.segundos || 0) / 60)} min · ${d.sesiones} sesiones`]] : []),
-               ...(d.desde ? [["Actividad", `${new Date(d.desde).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" })} — ${new Date(d.hasta).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" })}`]] : []),
+               ...(d.desde ? [["Actividad (hora AR)", `${_horaAr(d.desde)} — ${_horaAr(d.hasta)}`]] : []),
+               ...(d.desde ? [["Inactividad", d.huecos.length
+                   ? `${d.huecoTotal} min en ${d.huecos.length} hueco(s)`
+                   : `sin huecos de +${_HUECO_MIN} min`,
+                 d.huecoTotal >= 90 ? _ROJO : _GRIS]] : []),
              ])}
+             ${d.huecos && d.huecos.length ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">${d.huecos.slice(0, 3).map(h => `${_horaAr(h.desde)} → ${_horaAr(h.hasta)} · ${h.min} min`).join("<br/>")}</div>` : ""}
              ${_geoTop ? `<div style="padding-top:8px">${_geoTop}</div>` : ""}
            </div>` : ""}`
         );
