@@ -8330,11 +8330,24 @@ async function parteDelDia(token) {
   } else {
     for (const [nombre, d] of _personas) {
       const _geoTop = [...d.geos.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([g, n]) => `${g} ${n}`).join(", ");
-      _lineasManual.push(`   ${nombre.toUpperCase()} — ${d.enviados.length} mail(s) · ${d.mirados} sitio(s) mirado(s)${d.imports ? ` · ${d.imports} import(s) (${d.importados} cargados)` : ""}`);
-      if (_geoTop) _lineasManual.push(`      GEO: ${_geoTop}`);
-      for (const e of d.enviados.slice(0, 25)) _lineasManual.push(`      → ${e.dominio}${e.email ? `  ·  ${e.email}` : "  ·  (sin email registrado)"}`);
-      if (d.enviados.length > 25) _lineasManual.push(`      … y ${d.enviados.length - 25} más`);
-      if (!d.enviados.length && d.mirados) _lineasManual.push(`      Miró ${d.mirados} sitios (${d.conEmail} con email) pero no salió ningún mail.`);
+      // ⚠️ EL TITULAR SON LOS ENVÍOS, NO LOS "SITIOS MIRADOS" (Maxi 2026-08-25).
+      // Ese segundo número confundía: no son sitios que el MB decidió revisar, son los que
+      // la toolbar ANALIZÓ sola —`runEmailScraper` corre en el pipeline que se dispara al
+      // abrir la extensión en una pestaña—. Por eso a Agustina le figuraban 50 sitios con
+      // 37 de Estados Unidos: eso no es prospección, es navegación con la toolbar abierta.
+      // Lo que el user necesita saber es a QUÉ web y a QUÉ dirección le escribió cada uno.
+      _lineasManual.push(`   ${nombre.toUpperCase()} — ${d.enviados.length} mail(s) enviado(s) a mano${d.imports ? ` · ${d.imports} import(s) (${d.importados} cargados)` : ""}`);
+      if (d.enviados.length) {
+        for (const e of d.enviados.slice(0, 40)) {
+          _lineasManual.push(`      → ${String(e.dominio).padEnd(34)} ${e.email || "(sin email registrado)"}`);
+        }
+        if (d.enviados.length > 40) _lineasManual.push(`      … y ${d.enviados.length - 40} más`);
+      } else {
+        _lineasManual.push(`      No mandó ningún mail a mano hoy.`);
+      }
+      // El contexto va al final y con el nombre correcto: es lo que la toolbar analizó, no
+      // una decisión del MB.
+      if (d.mirados) _lineasManual.push(`      (la toolbar analizó ${d.mirados} sitios en sus sesiones${d.conEmail ? `, ${d.conEmail} con email` : ""}${_geoTop ? ` · ${_geoTop}` : ""})`);
       _lineasManual.push("");
     }
   }
@@ -8453,10 +8466,12 @@ async function parteDelDia(token) {
                </tr>`).join("")}
              </table>
              ${d.enviados.length > 40 ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:6px">… y ${d.enviados.length - 40} más</div>` : ""}`
-          : `<div style="font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};margin-top:6px">No salió ningún mail a mano.${d.mirados ? ` Miró ${d.mirados} sitios (${d.conEmail} con email).` : ""}</div>`;
+          : `<div style="font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};margin-top:6px">No mandó ningún mail a mano hoy.</div>`;
+        // El titular es lo que MANDÓ. Lo que la toolbar analizó va como contexto abajo, con
+        // el nombre correcto — antes decía "sitios" y se leía como decisión del MB.
         return _card(
-          `${_e(nombre)} · ${d.enviados.length} mail(s) · ${d.mirados} sitio(s)${d.imports ? ` · ${d.imports} import(s)` : ""}`,
-          `${_geoTop ? `<div style="margin-bottom:4px">${_geoTop}</div>` : ""}${_tabla}`
+          `${_e(nombre)} · ${d.enviados.length} mail(s) enviado(s) a mano${d.imports ? ` · ${d.imports} import(s)` : ""}`,
+          `${_tabla}${d.mirados ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:10px;border-top:1px solid ${_BORDE};margin-top:10px">La toolbar analizó ${d.mirados} sitios en sus sesiones${d.conEmail ? ` · ${d.conEmail} con email` : ""}${_geoTop ? `<div style="padding-top:5px">${_geoTop}</div>` : ""}</div>` : ""}`
         );
       }).join("")
     : _card("Sin actividad manual", `<div style="color:${_GRIS}">Hoy nadie usó la toolbar a mano, o el registro no llegó.</div>`);
