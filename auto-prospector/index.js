@@ -2982,9 +2982,16 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
   for (const url of sourcesToTry) {
     if (inserted >= targetCount) break;
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      // ⚠️ FETCH PELADO (Maxi 2026-08-25). Estas URLs salen de archivos ads.txt de terceros,
+      // o sea que las elige gente de afuera: es exactamente el vector SSRF que se cerró en la
+      // auditoría de seguridad del 04/08 con `fetchExternoSeguro`, y este llamado se había
+      // quedado sin la guardia. Además `res.json()` se traga el archivo entero sin tope, y acá
+      // vienen sellers.json de 18.000 publishers: con uno malicioso de 500 MB, el worker muere.
+      const res = await fetchExternoSeguro(url, { signal: AbortSignal.timeout(30000) });
       if (!res.ok) continue;
-      const data = await res.json().catch(() => null);
+      const _txt = (await res.text().catch(() => "")).slice(0, 8 * 1024 * 1024);   // 8 MB de techo
+      let data = null;
+      try { data = JSON.parse(_txt); } catch { data = null; }
       if (!data || !Array.isArray(data.sellers)) continue;
       const candidates = [...new Set(
         data.sellers
@@ -8989,7 +8996,7 @@ async function purgeByUrlOnly(token) {
   } catch {}
   // "No pude leer" ≠ "no queda nada". Ver el comentario de polishPool.
   if (rows === null) {
-    await saludPing(token, "url_purge", { status: "fail", detalle: "no se pudo leer el pool — se conserva el cursor" });
+    await saludPing(token, "url_purge", { status: "fail", cadenciaMin: 4320, detalle: "no se pudo leer el pool — se conserva el cursor" });
     log(`⚠️ url-purge: la consulta falló — NO apago el barrido`);
     return;
   }
@@ -8997,7 +9004,7 @@ async function purgeByUrlOnly(token) {
     await setConfigValue(token, "url_purge_enabled", "false").catch(() => {});
     await setConfigValue(token, "url_purge_cursor", "").catch(() => {});
     await setConfigValue(token, "url_purge_last_done", new Date().toISOString()).catch(() => {});
-    await saludPing(token, "url_purge", { status: "ok", detalle: "pool barrido completo" });
+    await saludPing(token, "url_pur, cadenciaMin: 4320ge", { status: "ok", detalle: "pool barrido completo" });
     log(`🧹 url-purge: pool barrido COMPLETO → flag OFF`);
     return;
   }
@@ -9051,7 +9058,7 @@ async function sweepBlockedFromProspects(token) {
   } catch {}
   // "No pude leer" ≠ "no queda nada". Ver el comentario de polishPool.
   if (rows === null) {
-    await saludPing(token, "purge_blocked", { status: "fail", detalle: "no se pudo leer el pool — se conserva el cursor" });
+    await saludPing(token, "purge_blocked", { status: "fail", cadenciaMin: 4320, detalle: "no se pudo leer el pool — se conserva el cursor" });
     log(`⚠️ purge-prospects: la consulta falló — NO apago el barrido`);
     return;
   }
@@ -9059,7 +9066,7 @@ async function sweepBlockedFromProspects(token) {
     await setConfigValue(token, "purge_blocked_prospects", "false").catch(() => {});
     await setConfigValue(token, "purge_cursor_ts", "").catch(() => {});
     await setConfigValue(token, "purge_blocked_last_done", new Date().toISOString()).catch(() => {});
-    await saludPing(token, "purge_blocked", { status: "ok", detalle: "pool barrido completo" });
+    await saludPing(token, "purge_block, cadenciaMin: 4320ed", { status: "ok", detalle: "pool barrido completo" });
     log(`🧹 purge-prospects: pool barrido COMPLETO → flag OFF`);
     return;
   }
@@ -11025,6 +11032,24 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // (pageviews/categoría/geo/publisher/discovery). Lo ÚNICO que lo bloquea es que esté en un
   // deal ACTIVO de Monday (ciclo actual). El auto-feeder sí aplica todos los filtros de calidad.
   const isManualImport = !!item.uploaded_by && !/autofeeder/i.test(String(item.uploaded_by));
+
+  // ── NO PAGAR DOS VECES POR LA MISMA RESPUESTA (Maxi 2026-08-25) ─────────────────────
+  // Cuando un dominio se difiere por el cupo diario de Anglo, su país queda guardado en el
+  // error_message. Al día siguiente el item vuelve a la cola y se le pide el tráfico a
+  // RapidAPI OTRA VEZ —un hit pago— sólo para volver a descubrir el mismo país y volver a
+  // diferirlo. Hoy hay 218 dominios en ese loop, cada uno quemando un hit por día.
+  // Si ya sabemos de qué país es, se evalúa el cupo ANTES de gastar.
+  {
+    const _paisPrevio = (String(item.error_message || "").match(/anglo_daily_quota:\s*([^—]+?)\s*—/) || [])[1];
+    if (_paisPrevio && _paisPrevio !== "?" && !isManualImport) {
+      const _sigueFuera = await _isAngloOverDailyQuota(token, _paisPrevio.trim(), []).catch(() => null);
+      if (_sigueFuera === true) {
+        await markCsvItem(token, item.id, "next_day", { error_message: String(item.error_message || "") });
+        log(`  🌎 ${domain} — ${_paisPrevio.trim()} sigue fuera de cuota Anglo → next_day SIN gastar RapidAPI`);
+        return;
+      }
+    }
+  }
 
   // 0. Blocklist check (hardcoded + admin) ANTES de gastar API
   // Fix 2026-05-13: el CSV worker no chequeaba admin blocklist, solo hardcoded.
@@ -20729,7 +20754,10 @@ async function saludWatchdog(token) {
       // aparecer; a esa altura ya perdimos una semana. Maxi 2026-08-25.
       const _mult = cad >= 720 ? 1.5 : 3;
       if (cad && okTs && _atrasoReal(okTs) > cad * _mult) {
-        atrasados.push(`${f.job} (hace ${_atrasoReal(okTs)} min de actividad, esperado cada ${cad})`);
+        // Los DOS números: el de reloj es el que duele (4 días caído se leía como "840 min"
+        // y parecía un retraso menor) y el activo es el que dispara. Maxi 2026-08-25.
+        const _pared = Math.round((Date.now() - okTs) / 60000);
+        atrasados.push(`${f.job} (hace ${Math.round(_pared / 60)}h reales / ${_atrasoReal(okTs)} min activos, esperado cada ${cad})`);
       }
       // "Nunca corrió" solo se reporta si la ventana ya lleva un rato abierta: al
       // arrancar el worker, TODOS los jobs están sin correr por definición.
@@ -20817,11 +20845,11 @@ async function saludWatchdog(token) {
       const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=not.eq.%5B%5D&select=id&limit=1`, {
         headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
       });
-      if (!r.ok) await saludPing(token, "pool_listos", { status: "fail", detalle: `la consulta falló: HTTP ${r.status}` });
+      if (!r.ok) await saludPing(token, "pool_listos", { status: "fail", cadenciaMin: 120, detalle: `la consulta falló: HTTP ${r.status}` });
       if (r.ok) {
         const listos = parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
         const piso = parseInt(cfg.salud_pool_minimo || "120", 10) || 120;
-        await saludPing(token, "pool_listos", { status: "ok", detalle: `${listos} leads con email`, real: listos, esperado: piso });
+        await saludPing(token, "pool_listo, cadenciaMin: 120s", { status: "ok", detalle: `${listos} leads con email`, real: listos, esperado: piso });
         if (listos < piso) {
           await saludAlerta(token, {
             clave: "pool-bajo", severidad: "error",
