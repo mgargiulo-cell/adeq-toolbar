@@ -19654,6 +19654,25 @@ async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning"
     if (severidad === "error" || severidad === "warning") {
       await _acumularEnResumen(token, { clave, titulo, cuerpo, severidad });
     }
+    // ⚠️ HAY COSAS QUE NO PUEDEN ESPERAR 72 HORAS (Maxi 2026-08-25).
+    // El resumen unificado es lo que pidió el user y está bien para el goteo de avisos.
+    // Pero una PARADA TOTAL —el descubrimiento en cero, el agente sin mandar un mail, la
+    // cola rechazando lotes enteros— no es un renglón para leer pasado mañana: son días de
+    // negocio perdidos. Ya pasó dos veces esta semana. Estas claves salen en el momento.
+    // El anti-spam de 60 minutos por tipo que ya tiene `_secAvisar` evita la avalancha.
+    const _ES_PARO = /^(agente-sin-enviar|salud-descubrimiento-parado|embudo-cortado|cola_rechaza_lote|autogoogle-no-encola|fuentes-mudas)/;
+    if (severidad === "error" && _ES_PARO.test(String(clave || ""))) {
+      try {
+        const _cfgAviso = await getConfig(token).catch(() => null);
+        if (_cfgAviso) {
+          await _secAvisar(token, _cfgAviso, {
+            titulo: `🛑 ${titulo}`,
+            cuerpo: `${cuerpo}\n\n— Esto se manda en el momento y no espera al resumen de 72h: es una parada, no un aviso.`,
+            kind: `paro_${String(clave).split("-")[0]}`,
+          });
+        }
+      } catch (e) { log(`⚠️ aviso inmediato de paro: ${e.message}`); }
+    }
   } catch (e) { log(`⚠️ saludAlerta: ${e.message}`); }
 }
 
@@ -20099,6 +20118,47 @@ async function vigilarEmbudoDeDescubrimiento(token) {
 // La causa fue el kill switch pausándose solo con reservas huérfanas, pero el
 // detector tiene que avisar sea cual sea la causa de la próxima vez.
 const ENVIOS_CERO_ALERTA_HORA = 15;   // hora Madrid: si a media tarde no salió nada, algo pasa
+// ── ¿LOS LEADS ESTÁN LLEGANDO AL CRM? (Maxi 2026-08-25) ──────────────────────
+// El detector que había exigía más de 3 fallos por hora y por MB para saltar. Los pushes
+// fallidos venían de a uno o dos por hora repartidos entre tres buzones, así que un 63% de
+// fallo sostenido durante catorce días no disparó UNA sola alerta. Y cada fallo es un
+// prospecto que YA recibió el pitch y quedó fuera del CRM: sin dueño, sin fechas de
+// follow-up, invisible para el MB. Se mide la TASA del día, que es lo que importa.
+async function vigilarLlegadaAMonday(token) {
+  try {
+    if (!(await _tocaCorrer(token, "monday_llegada", 12 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const desde = new Date(Date.now() - 24 * 3600_000).toISOString();
+    const _n = async (accion) => {
+      try {
+        const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.${accion}&created_at=gte.${desde}&select=id`,
+          { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+        if (!r.ok) return null;
+        return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch { return null; }
+    };
+    const ok = await _n("monday_ok");
+    const mal = await _n("monday_failed");
+    if (ok == null || mal == null) return;          // no pude medir ≠ está roto
+    const total = ok + mal;
+    if (total < 5) return;                          // sin muestra no se concluye
+    const pct = Math.round((mal / total) * 100);
+    await saludPing(token, "monday_llegada", {
+      status: pct > 20 ? "warn" : "ok", cadenciaMin: 12 * 60,
+      detalle: `${ok} entraron al CRM, ${mal} fallaron (${pct}%)`, real: ok, esperado: total,
+    });
+    if (pct > 20) {
+      await saludAlerta(token, {
+        clave: "monday-no-llegan", severidad: "error",
+        titulo: `📋 ${mal} de ${total} leads recibieron el mail y NO entraron al CRM (${pct}%)`,
+        cuerpo: `El mail se manda ANTES del push, así que cada fallo es un prospecto contactado que quedó sin dueño, sin fechas de follow-up e invisible en el board.\n`
+              + `  SELECT details->>'monday_error' FROM toolbar_agent_actions WHERE action='monday_failed' ORDER BY created_at DESC LIMIT 3;`,
+        metadata: { ok, mal, pct },
+      });
+    }
+  } catch (e) { log(`⚠️ vigilarLlegadaAMonday: ${e.message}`); }
+}
+
 async function vigilarAgenteFrenado(token) {
   try {
     if (!(await _tocaCorrer(token, "agente_frenado", 2 * 60))) return;
@@ -20460,10 +20520,34 @@ async function saludWatchdog(token) {
     // semana, así que esas 15 horas de gap son NORMALES, no una falla. Comparar contra
     // el reloj de pared hacía que todos los jobs parecieran caídos cada mañana.
     // Se acota el atraso a los minutos que la ventana activa lleva abierta hoy.
-    const _minsVentanaAbierta = Math.max(0, (_spainHour() - (parseInt(cfg.active_hours_start || "9", 10) || 9)) * 60);
+    // ⚠️ EL TECHO ERA "LO QUE VA DEL DÍA DE HOY" (Maxi 2026-08-25).
+    // Acotar el atraso a los minutos abiertos HOY deja un máximo de ~840 (9 a 23). Como se
+    // alerta a partir de 3× la cadencia, ningún job con cadencia mayor a 280 min podía
+    // reportarse atrasado NUNCA: los 12 jobs diarios (cadencia 1440 → umbral 4320) eran
+    // invisibles para el vigilante aunque llevaran una semana caídos.
+    // Ahora se acumulan los minutos activos de los días hábiles transcurridos, que es lo
+    // que la corrección original quería decir: no contar la noche ni el fin de semana,
+    // pero sí contar los días.
+    const _horaIni = parseInt(cfg.active_hours_start || "9", 10) || 9;
+    const _horaFin = parseInt(cfg.active_hours_end || "23", 10) || 23;
+    const _minsVentanaDiaria = Math.max(60, (_horaFin - _horaIni) * 60);
+    const _minsVentanaAbierta = Math.max(0, (_spainHour() - _horaIni) * 60);
+    const _diasHabilesDesde = (okTs) => {
+      let n = 0;
+      const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+      const d = new Date(okTs); d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() + 1);
+      while (d < hoy && n < 60) {
+        const wd = d.getDay();
+        if (wd !== 0 && wd !== 6) n++;
+        d.setDate(d.getDate() + 1);
+      }
+      return n;
+    };
     const _atrasoReal = (okTs) => {
       const pared = Math.round((Date.now() - okTs) / 60000);
-      return Math.min(pared, Math.max(_minsVentanaAbierta, 1));
+      const activos = _diasHabilesDesde(okTs) * _minsVentanaDiaria + _minsVentanaAbierta;
+      return Math.min(pared, Math.max(activos, 1));
     };
 
     const atrasados = [], rindenPoco = [], fallando = [];
@@ -20474,7 +20558,11 @@ async function saludWatchdog(token) {
       // job cuando su flag está en false: sin esto, similar_expansion (que arranca
       // apagado por default) figuraba "atrasado" para siempre.
       if (f.last_status === "off") continue;
-      if (cad && okTs && _atrasoReal(okTs) > cad * 3) {
+      // El multiplicador se afloja para los jobs frecuentes y se aprieta para los diarios.
+      // Con 3× fijo, un job de cadencia diaria necesitaba ~5 días hábiles caído para
+      // aparecer; a esa altura ya perdimos una semana. Maxi 2026-08-25.
+      const _mult = cad >= 720 ? 1.5 : 3;
+      if (cad && okTs && _atrasoReal(okTs) > cad * _mult) {
         atrasados.push(`${f.job} (hace ${_atrasoReal(okTs)} min de actividad, esperado cada ${cad})`);
       }
       // "Nunca corrió" solo se reporta si la ventana ya lleva un rato abierta: al
@@ -21603,6 +21691,7 @@ async function main() {
       await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
+      await vigilarLlegadaAMonday(token).catch(e => log(`⚠️ llegada a Monday: ${e.message}`));
       // Y que no se desperdicie un plan pago: los créditos de Apollo no se acumulan.
       await vigilarAprovechamientoDeApollo(token).catch(e => log(`⚠️ apollo uso: ${e.message}`));
 
