@@ -315,6 +315,27 @@ const COUNTRY_NAME_TO_CODE = Object.fromEntries(
 const _COUNTRY_NAME_TO_CODE_LC = Object.fromEntries(
   Object.entries(COUNTRY_CODES).map(([code, name]) => [String(name).toLowerCase(), code])
 );
+// ── EL TELÉFONO NO PUEDE COSTARNOS EL LEAD (Maxi 2026-08-25) ─────────────────────────
+// La columna phone de Monday exige el número en dígitos, sin espacios ni guiones ni
+// paréntesis. Se le mandaba el valor scrapeado tal cual, así que "224 112 112" —un
+// teléfono español perfectamente válido— hacía reventar el item ENTERO. Y encima el
+// scraper a veces trae cosas que no son teléfonos: "226.359375", "145 163.225".
+// Como el mail se manda ANTES del push, cada uno de esos casos era un prospecto que
+// recibió el pitch y quedó fuera del CRM: 143 en 14 días, sin dueño, sin fechas de
+// follow-up, invisible para el MB.
+// Devuelve el número listo para Monday, o "" si no parece un teléfono.
+function _telefonoParaMonday(raw) {
+  const txt = String(raw || "").trim();
+  if (!txt) return "";
+  // Un punto entre dígitos es un separador decimal, nunca un teléfono como los scrapeamos.
+  if (/\d\.\d/.test(txt)) return "";
+  const mas = txt.startsWith("+");
+  const dig = txt.replace(/\D/g, "");
+  if (dig.length < 7 || dig.length > 15) return "";     // rango E.164
+  if (/^(\d)\1+$/.test(dig)) return "";                 // 000000000, 111111111
+  return (mas ? "+" : "") + dig;
+}
+
 function _mondayPhoneIso(geo) {
   const g = String(geo || "").trim();
   if (!g) return "";
@@ -7962,7 +7983,12 @@ async function parteDelDia(token) {
   // 4. LIMPIEZA: URLs que YA ESTABAN en Prospects y se sacaron hoy por no cumplir.
   // Ojo con la fecha: se filtra por `updated_at` (cuándo se rechazó), no por `created_at`
   // (cuándo entró el lead). Es un error fácil y da números que no significan nada.
-  const purgadas = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.rejected&updated_at=gte.${desdeHoy}&select=id`);
+  // ⚠️ `updated_at` NO EXISTE en toolbar_review_queue (Maxi 2026-08-25). PostgREST devolvía
+  // 400, `_contar` se lo comía en el catch y devolvía 0. O sea que la métrica 4 —una de las
+  // cinco que pidió el user— venía marcando CERO todos los días desde que existe el parte.
+  // Si el barrido se descontrolara y vaciara el pool, el mail seguiría diciendo 0.
+  // La columna correcta es `rejected_at`, que se agregó el 24/08 justo para esto.
+  const purgadas = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?rejected_at=gte.${desdeHoy}&select=id`);
 
   // Reciclado de Monday: lo escribe sincronizarFinalizadosDeMonday en su pasada diaria.
   let _monday = null;
@@ -11226,13 +11252,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Maxi 2026-08-01: EL FILTRO DE CALIDAD CORRE SIEMPRE, venga de donde venga.
   // Antes los imports manuales lo salteaban y un banco cargado a mano entraba a Prospects.
   // Regla del user: "lo que un MB importa a mano, todo debe pasar el filtro siempre".
+  // ⚠️ `pub` SE DECLARA ACÁ AFUERA A PROPÓSITO (Maxi 2026-08-25).
+  // Estaba con `const` DENTRO del bloque de abajo, así que a la altura de la línea 11443
+  // —donde se guarda el lead— no existía. Cada dominio que llegaba al final del pipeline
+  // moría con `pub is not defined`: 238 dominios entre el 24 y el 25 de agosto y CERO
+  // altas nuevas a Prospects, cada uno habiendo gastado ya su crédito de SimilarWeb.
+  // El bloque queda igual; lo único que cambia es dónde vive la variable.
+  let pub = null;
   {
     // ⚠️ SIN EL 5º ARGUMENTO, LA REGLA DE LA PUERTA GRANDE NO EXISTE (Maxi 2026-08-24).
     // `scoreProspectable` lee el tráfico de `swData?.traffic`; sin pasarlo daba 0 y
     // `_apruebaPorAdsTxtYTrafico` devolvía false SIEMPRE. O sea que la regla del user
     // —"toda url con ads.txt y +400k sirve, no importa el rubro"— estaba escrita y no
     // se aplicaba a UN SOLO lead nuevo: todos los vetos por rubro seguían matando.
-    const pub = await classifyPublisher(token, domain, pageContent, swCategory, { traffic: effectivePageViews || visits || 0, geo: topCountry || "" });
+    pub = await classifyPublisher(token, domain, pageContent, swCategory, { traffic: effectivePageViews || visits || 0, geo: topCountry || "" });
     // ⚠️ EL VEREDICTO TIENE TRES ESTADOS, NO DOS (Maxi 2026-08-11).
     // Acá se miraba solo `!pub.ok` y se descartaba PERMANENTEMENTE, ignorando por
     // completo el `pub.retry` que la propia función devuelve para decir "no pude
@@ -12085,7 +12118,14 @@ async function runSession(token, cfg, sessionStart) {
   const toProcess     = [...likedSimilarDomains, ...candidates];
   const seenInSession = new Set(toProcess);
   // Dedup por organización: si ya vimos clarin.com.ar, saltar clarin.com.br/.es/.co
-  const seenOrgs = new Set(toProcess.map(coreDomain).filter(Boolean));
+  // ⚠️ ARRANCA VACÍO (Maxi 2026-08-25). Estaba pre-cargado con la organización de TODOS
+  // los dominios de la cola, así que cuando el loop sacaba el primero, su propia
+  // organización ya estaba adentro y se descartaba a sí mismo. Con la puerta cerrada
+  // desde la primera vuelta, el autopilot descartó el 100% de lo que descubrió durante
+  // cuatro meses. La vía de escape (`__seed:`) no existe: no se escribe en ningún lado.
+  // El `seenOrgs.add(org)` de más abajo ya hace el trabajo real, a medida que avanza,
+  // que es lo que este dedupe siempre quiso hacer: saltar HERMANOS de uno ya procesado.
+  const seenOrgs = new Set();
   let count = 0, added = 0, skipped = 0, lowScore = 0, discovered = 0, dupOrg = 0;
 
   while (toProcess.length > 0) {
@@ -13190,9 +13230,24 @@ async function runReengagementCycle(token) {
         // ⚠️ RUTA DE ALTO RIESGO (Maxi 2026-08-12): se le escribe a un dominio que
         // YA rebotó. Un segundo rebote duro sobre el mismo dominio es de lo que más
         // rápido quema la reputación. Acá NO alcanza con "riesgo": se exige "ok".
-        const _vr = await _verifyEmailMV(token, newEmail).catch(() => "riesgo");
+        // ⚠️ FALTABA `cfg` (Maxi 2026-08-25). La firma es (token, cfg, email); se llamaba
+        // con (token, email), así que `cfg` recibía el string del email y `email` quedaba
+        // undefined. La verificación reventaba SIEMPRE, el catch devolvía "riesgo", y como
+        // acá se exige "ok" estricto, NINGÚN re-engagement salió desde el 12/08.
+        // Peor: el `continue` se va sin cerrar la reserva creada unas líneas arriba, así que
+        // cada intento dejaba una fila colgada que después el cleanup barría como fallo, y
+        // esas reservas ocupaban el cupo de PRIMER contacto del buzón. Es la explicación de
+        // por qué sales@ y dhorovitz@ se clavaban en 6-8 envíos mientras mgargiulo@ llegaba a 20.
+        const _vr = await _verifyEmailMV(token, cfg, newEmail).catch(() => "riesgo");
         if (_vr !== "ok") {
           log(`  ⛔ re-engagement ${newEmail}: verificación dio "${_vr}" y el dominio ya rebotó — no se manda`);
+          if (reservedId) {
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ action: "skipped", reason: `reengagement_mv_${_vr}` }),
+            }).catch(() => {});
+          }
           continue;
         }
         await sendGmailServer(token, userEmail, { to: newEmail, subject, body: pitch.body, agentActionId: reservedId });
@@ -16590,7 +16645,19 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
         metadata: { to, bloqueantes: _rev.bloqueantes },
       }).catch(() => {});
     }
-    return { ok: false, error: `linter_${_rev.bloqueantes[0]}` };
+    // ⚠️ ACÁ SE DEVOLVÍA `{ok:false}` EN VEZ DE LANZAR (Maxi 2026-08-25).
+    // Ningún llamador miraba ese `ok`. El del agente hace
+    // `await Promise.race([sendGmailServer(...), timeout])` y justo después patchea la
+    // reserva a 'sent' sin condición: el mail NO salía y quedaba registrado como enviado,
+    // con el lead marcado como contactado en Monday y en review_queue. O sea, quemado para
+    // siempre sin haberle escrito nunca. 71 casos así el 18 y el 19 de agosto.
+    // Lanzando, el catch que YA existe en cada llamador hace lo correcto: marca el fallo,
+    // libera el cupo reservado y deja el lead disponible para el próximo ciclo.
+    // Es la misma lección que el linter: la protección vive DENTRO de la función, así
+    // ninguna ruta nueva se la saltea por olvido.
+    const _err = new Error(`linter_${_rev.bloqueantes[0]}`);
+    _err.linter = _rev.bloqueantes;
+    throw _err;
   }
   if (_rev.avisos.length) log(`  ⚠️ entregabilidad (${to}): ${_rev.avisos.join(", ")}`);
 
@@ -17115,8 +17182,8 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     // Como el mail se manda ANTES del push, el lead recibía el pitch y no quedaba en el CRM:
     // 15 leads perdidos el 16/07 (justo cuando entró la captura de teléfono). Ahora derivamos
     // el ISO del GEO; si no se puede, se OMITE la columna: mejor perder el teléfono que el lead.
-    ...(payload.phone && _mondayPhoneIso(payload.geo)
-      ? { [MONDAY_COL_PHONE]: { phone: String(payload.phone), countryShortName: _mondayPhoneIso(payload.geo) } }
+    ...(_telefonoParaMonday(payload.phone) && _mondayPhoneIso(payload.geo)
+      ? { [MONDAY_COL_PHONE]: { phone: _telefonoParaMonday(payload.phone), countryShortName: _mondayPhoneIso(payload.geo) } }
       : {}),
     // Maxi 2026-07-21 (pedido del user): marcar Comentarios="Agente" en TODO item del agente,
     // para diferenciar sus negociaciones de las que carga un MB a mano (el push manual —
@@ -17136,6 +17203,9 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
   if (payload.phone && !_mondayPhoneIso(payload.geo)) {
     log(`  ℹ️ Monday ${payload.domain}: sin ISO para el GEO "${payload.geo || "?"}" → push SIN teléfono (el lead entra igual)`);
   }
+  if (payload.phone && !_telefonoParaMonday(payload.phone)) {
+    log(`  ℹ️ Monday ${payload.domain}: "${payload.phone}" no parece un teléfono → push SIN teléfono (el lead entra igual)`);
+  }
   const query = `mutation ($board: ID!, $name: String!, $cols: JSON!) {
     create_item (board_id: $board, item_name: $name, column_values: $cols, create_labels_if_missing: true) { id }
   }`;
@@ -17150,7 +17220,39 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
   });
   if (!res.ok) throw new Error(`Monday HTTP ${res.status}`);
   const data = await res.json();
-  if (data?.errors) throw new Error(`Monday errors: ${JSON.stringify(data.errors).slice(0,500)}`);
+  if (data?.errors) {
+    // ── RED DE SEGURIDAD: NUNCA PERDER EL LEAD POR UNA COLUMNA OPCIONAL ──────────────
+    // (Maxi 2026-08-25.) El mail se manda ANTES del push, así que un item rechazado es un
+    // prospecto que YA recibió el pitch y queda fuera del CRM: sin dueño, sin fechas de
+    // follow-up, invisible. 143 casos en 14 días, todos por "invalid value ... for this
+    // column". El saneo de teléfono de arriba tapa la causa conocida; esto cubre la
+    // próxima, sea cual sea. Se reintenta UNA vez con lo imprescindible —nombre, email,
+    // fechas, estado, dueño— y se avisa qué se perdió.
+    const _err = JSON.stringify(data.errors).slice(0, 500);
+    if (/invalid value|correct data structure/i.test(_err)) {
+      const _minimos = {};
+      for (const k of [MONDAY_COL_EMAIL, MONDAY_COL_DATE, MONDAY_COL_FU1, MONDAY_COL_FU2,
+                       MONDAY_COL_ESTADO, MONDAY_COL_OWNER, MONDAY_COL_PITCH]) {
+        if (k && cols[k] !== undefined) _minimos[k] = cols[k];
+      }
+      const _descartadas = Object.keys(cols).filter(k => _minimos[k] === undefined);
+      log(`  ⚠️ Monday ${payload.domain}: rechazó el item; reintento sin ${_descartadas.join(", ")} para no perder el lead`);
+      const res2 = await fetch("https://api.monday.com/v2", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": monday_api_key, "API-Version": "2024-01" },
+        body: JSON.stringify({ query, variables: { board: boardId, name: itemName, cols: JSON.stringify(_minimos) } }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res2.ok) {
+        const d2 = await res2.json();
+        if (!d2?.errors && d2?.data?.create_item?.id) {
+          log(`  ✅ Monday ${payload.domain}: entró en el reintento (sin las columnas que rechazó)`);
+          return d2.data.create_item.id;
+        }
+      }
+    }
+    throw new Error(`Monday errors: ${_err}`);
+  }
   return data?.data?.create_item?.id || null;
 }
 
@@ -18488,7 +18590,9 @@ async function runAgentCycle(token, allFlags) {
             const _cuerpo2do = `${pitch.body}\n\n---\nPD: escribí también a ${email.split("@")[0]}@${domain} por las dudas — si no sos vos quien lleva esto, ignoralo sin problema.`;
             log(`  ➕ ${domain}: agente envía AL 2DO email ${secondCandidate.email} (score=${secondCandidate.score}, source=${secondCandidate.source})`);
             // Verificar también acá: esta ruta mandaba sin preguntar.
-            const _v2 = await _verifyEmailMV(token, secondCandidate.email).catch(() => "riesgo");
+            // Mismo bug que en el re-engagement: faltaba `cfg`. Acá el efecto era que el
+            // segundo email de un lead NUNCA se mandaba (siempre "riesgo" → throw).
+            const _v2 = await _verifyEmailMV(token, cfg, secondCandidate.email).catch(() => "riesgo");
             if (_v2 === "no") { log(`  ⛔ ${domain}: el 2º email no verifica — no se manda`); throw new Error("segundo_no_verifica"); }
             // Y separarlo en el tiempo: salían dos mensajes al MISMO dominio con el
             // MISMO asunto en menos de un segundo. Eso se ve desde afuera como un
@@ -19421,8 +19525,13 @@ async function guardarMetricasDelDia(token) {
     } catch {}
 
     // 3 y 4 · limpiados y emails hallados
-    const limpiados = await _contar(`toolbar_review_queue?status=eq.rejected&updated_at=gte.${hoy}T00:00:00&select=id`);
-    const hallados  = await _contar(`toolbar_review_queue?emails=not.eq.%5B%5D&updated_at=gte.${hoy}T00:00:00&created_at=lt.${hoy}T00:00:00&select=id`);
+    // Mismo bug de `updated_at` que en el parte diario: la columna no existe, las dos
+    // consultas devolvían 400 y el histórico guardaba 0 en estas dos series desde que se creó.
+    // Y `hallados` estaba además conceptualmente mal: contaba cualquier lead con email creado
+    // antes de hoy, no los RESCATADOS. Un rescate es "entró sin email y hoy tiene uno", que es
+    // exactamente lo que marca `email_found_at`.
+    const limpiados = await _contar(`toolbar_review_queue?rejected_at=gte.${hoy}T00:00:00&select=id`);
+    const hallados  = await _contar(`toolbar_review_queue?email_found_at=gte.${hoy}T00:00:00&select=id`);
     // Estado del pool al cierre
     const conEmail  = await _contar(`toolbar_review_queue?status=eq.pending&emails=not.eq.%5B%5D&select=id`);
     const sinEmail  = await _contar(`toolbar_review_queue?status=eq.pending&or=(emails.is.null,emails.eq.%5B%5D)&select=id`);
