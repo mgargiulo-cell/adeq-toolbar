@@ -1703,7 +1703,10 @@ async function _insertFeederRun(token, slotLabel, data) {
 // carril, no inyecta más → regulación automática + podemos analizar qué arrojó cada uno.
 const WAITING_POOL_CAP = 700;                       // el pool no debe pasar de esto (user 2026-07-01)
 const PER_SOURCE_ACTIVE_CAP = {
-  auto_feeder_sellers:  250,
+  // Maxi 2026-08-25: 250 → 150. Medido: sellers trae MUCHÍSIMO y pasa poco (8%), y con el
+  // carril lleno el feeder quemaba la vida del worker bajando archivos para descartarlos.
+  // El lugar que libera se lo lleva similar-expansion, que es la que mejor convierte.
+  auto_feeder_sellers:  150,
   auto_feeder_majestic: 150,   // autopilot (majestic/similar)
   auto_feeder_adstxt:   120,   // autopilot (ads.txt-graph)
   // Maxi 2026-08-11: 120 → 400. Los finalizados de Monday dejaron de ser una porción
@@ -1712,7 +1715,7 @@ const PER_SOURCE_ACTIVE_CAP = {
   // trabajó con nosotros— y con el carril viejo se estrangulaba sola.
   auto_feeder_monday:   400,
   autogoogle:           180,   // carril RESERVADO — nunca lo tapa un JSON
-  auto_feeder_similar:  150,   // Maxi 2026-07-16: expansión por similares desde Prospects
+  auto_feeder_similar:  250,   // Maxi 2026-08-25: 150 → 250. Es la fuente que MEJOR convierte (76% con email) y tenía el carril más chico. Expansión por similares desde Prospects
 };
 const DEFAULT_SOURCE_CAP = 150;
 
@@ -3081,7 +3084,12 @@ async function sincronizarFinalizadosDeMonday(token) {
       return 0;   // nunca re-prospectar a ciegas: alguien podría haber recibido el mail ayer
     }
     const enCola = await _dominiosActivosEnCola(token, todos);
-    const candidatos = todos.filter(d => !recientes.has(d) && !enCola.has(d)).slice(0, MONDAY_SYNC_MAX_POR_DIA);
+    // ⚠️ EL CORTE Y EL CONTEO ERAN LA MISMA VARIABLE (Maxi 2026-08-25). `reprospectables`
+    // guardaba `candidatos.length`, que ya venía cortado por el techo diario, así que el
+    // parte comparaba el techo contra sí mismo y siempre concluía "entró todo lo que se
+    // podía". Con 5.790 elegibles y un techo de 400, decía que el board quedaba al día.
+    const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d));
+    const candidatos = _elegibles.slice(0, MONDAY_SYNC_MAX_POR_DIA);
 
     let encolados = 0;
     if (candidatos.length) {
@@ -3104,7 +3112,7 @@ async function sincronizarFinalizadosDeMonday(token) {
       en_board: todos.length,
       contactados_recientes: todos.filter(d => recientes.has(d)).length,
       ya_en_cola: enCola.size,
-      reprospectables: candidatos.length,
+      reprospectables: _elegibles.length,      // los ELEGIBLES, no los que entraron en el techo
       encolados,
       techo: MONDAY_SYNC_MAX_POR_DIA,
     })).catch(() => {});
@@ -5587,6 +5595,12 @@ async function findAllEmails(domain, apolloApiKey, token = null) {
         emails.push(p.email);
         if (!firstContactName) firstContactName = `${p.first_name || ""} ${p.last_name || ""}`.trim();
       }
+    } else {
+      // ⚠️ UN 401/429/500 NO ES "ESTE SITIO NO TIENE A NADIE" (Maxi 2026-08-25).
+      // Apollo sin cuota, con la clave vencida o caído devolvía lo mismo que un dominio sin
+      // contactos: nada, y sin un solo log. El lead quedaba marcado como "sin gente" y no se
+      // reintentaba. Es el patrón de siempre: "no pude preguntar" leído como "la respuesta es no".
+      log(`  ⚠️ Apollo HTTP ${res.status} para ${domain} — NO es que no haya contactos, es que no pude preguntar`);
     }
   } catch {}
 
@@ -5655,6 +5669,12 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
     if (res.ok) {
       const data = await res.json();
       people = Array.isArray(data?.people) ? data.people : [];
+    } else {
+      // ⚠️ UN 401/429/500 NO ES "ESTE SITIO NO TIENE A NADIE" (Maxi 2026-08-25).
+      // Apollo sin cuota, con la clave vencida o caído devolvía lo mismo que un dominio sin
+      // contactos: nada, y sin un solo log. El lead quedaba marcado como "sin gente" y no se
+      // reintentaba. Es el patrón de siempre: "no pude preguntar" leído como "la respuesta es no".
+      log(`  ⚠️ Apollo HTTP ${res.status} para ${domain} — NO es que no haya contactos, es que no pude preguntar`);
     }
   } catch { return null; }
 
@@ -8035,15 +8055,20 @@ async function parteDelDia(token) {
   // lo disimula. Justamente eso pasó: Monday seguía trayendo unos pocos mientras Autopilot y
   // AutoGoogle estaban muertos hacía tres semanas, y el número global no lo mostraba.
   const _altas = await fetch(
-    `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=source`,
+    // `emails` además de `source`: la métrica 3 que pidió el user es "de las altas del DÍA,
+    // cuántas con email y cuántas sin". El parte mostraba el stock del pool entero, que es
+    // otra cosa: no dice si lo que entró HOY sirve para contactar. (Maxi 2026-08-25.)
+    `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=source,emails`,
     { headers: auth }
   ).then(r => r.ok ? r.json() : []).catch(() => []);
   // Monday va aparte de los demás imports: es el reciclado de ciclos finalizados, o sea gente
   // que YA trabajó con nosotros. Es la fuente de mejor calidad que hay y merece su propio
   // renglón — mezclada con sellers.json y los CSV no se nota si deja de entrar.
   let altaImport = 0, altaMonday = 0, altaAutopilot = 0, altaAutogoogle = 0, altaOtros = 0;
+  let altasConEmail = 0, altasSinEmail = 0;
   for (const a of (Array.isArray(_altas) ? _altas : [])) {
     const s = String(a.source || "").toLowerCase();
+    if (Array.isArray(a.emails) && a.emails.length) altasConEmail++; else altasSinEmail++;
     if (/autogoogle/.test(s)) altaAutogoogle++;
     else if (/monday/.test(s)) altaMonday++;
     else if (/autopilot|similar|majestic|radar/.test(s)) altaAutopilot++;
@@ -8248,6 +8273,7 @@ async function parteDelDia(token) {
     `5 · MONDAY FINALIZADOS reciclados a Prospects      ${altaMonday}`,
     ...(altaOtros > 0 ? [`    (otras fuentes: ${altaOtros})`] : []),
     `    Total de altas del día: ${altasHoy}`,
+    `    De esas, CON email: ${altasConEmail} · sin email: ${altasSinEmail}${altasHoy ? ` (${Math.round(100 * altasConEmail / altasHoy)}% contactable de entrada)` : ""}`,
     "",
     `6 · SACADAS DE PROSPECTS por no cumplir            ${_num(purgadas)}`,
     `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
@@ -8274,9 +8300,9 @@ async function parteDelDia(token) {
       `   ${_monday.en_board} ciclos finalizados en el board`,
       `   ${_monday.contactados_recientes} se saltean (contactados hace menos de 90 días)`,
       `   ${_monday.reprospectables} eran re-prospectables → ${_monday.encolados} entraron`,
-      ...(_monday.reprospectables > _monday.techo
-        ? [`   ⚠️ El techo de ${_monday.techo}/día se está quedando corto: quedan ${_monday.reprospectables - _monday.encolados} esperando.`]
-        : [`   ✅ Entró todo lo que se podía: el board queda al día.`]),
+      ...(_monday.encolados < _monday.reprospectables
+        ? [`   ⚠️ Quedaron ${_monday.reprospectables - _monday.encolados} sin entrar (techo ${_monday.techo}/día). A este ritmo son ${Math.ceil((_monday.reprospectables - _monday.encolados) / Math.max(1, _monday.techo))} días más.`]
+        : [`   ✅ Entró todo: el board queda al día.`]),
     ] : []),
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
     "",
@@ -8366,6 +8392,8 @@ async function parteDelDia(token) {
     ["Monday finalizados reciclados", altaMonday],
     ...(altaOtros > 0 ? [["Otras fuentes", altaOtros]] : []),
     ["Total de altas del día", altasHoy],
+    ["De esas, con email", `${altasConEmail}${altasHoy ? ` (${Math.round(100 * altasConEmail / altasHoy)}%)` : ""}`, altasHoy && altasConEmail / altasHoy < 0.5 ? _ROJO : _VERDE],
+    ["De esas, sin email", altasSinEmail],
   ]))}
 
   ${_card("El pool hoy", _kv([
@@ -16777,7 +16805,12 @@ function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, esProspe
   // Entidades numéricas: atrapa si alguien reintroduce el anti-linkify de los puntos.
   if (/&#\d+;/.test(b) || /&#\d+;/.test(String(html || ""))) bloqueantes.push("entidades_html_ofuscadas");
 
-  const urls = (String(html || b).match(/https?:\/\/[^\s"'<>)]+/gi) || [])
+  // ⚠️ SE JUZGABAN LOS LINKS DE LA FIRMA (Maxi 2026-08-25). `html` es el mail COMPLETO,
+  // firma incluida, y la firma de Gmail trae logo, web y redes. Es la misma trampa que ya
+  // frenó 79 envíos por "mayúsculas" al leer "ADEQ MEDIA" de la firma. Las reglas de
+  // CONTENIDO se juzgan sobre la plantilla; las estructurales (caracteres invisibles,
+  // homóglifos, largo de línea) sí van sobre el mail entero, que es lo que ve el filtro.
+  const urls = (String(plantilla != null ? plantilla : (html || b)).match(/https?:\/\/[^\s"'<>)]+/gi) || [])
     .filter(u => !/track-open|unsubscribe|\/unsub/i.test(u));
   if (_estricto && urls.length > 3) bloqueantes.push(`demasiados_links_${urls.length}`);
 
