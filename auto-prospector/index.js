@@ -21810,6 +21810,16 @@ async function main() {
       // Autoajuste: mueve perillas dentro de límites duros según la tendencia.
       await autoAjustarSegunMetricas(token).catch(e => log(`⚠️ autoajuste: ${e.message}`));
       // Reputación: freno automático por tasa de rebote + detector de silencio total.
+      // ⚠️ PRESUPUESTO DE TIEMPO PARA EL MANTENIMIENTO (Maxi 2026-08-25).
+      // Entre acá y el reparto de trabajo hay 37 jobs encadenados, uno detrás de otro, y
+      // Railway reinicia el worker cada ~7 minutos. La cola de prospectos es la ÚLTIMA de
+      // la fila: si el mantenimiento se pasa, el worker muere antes de llegar y la cola no
+      // corre NUNCA. Fue exactamente lo que pasó hoy — 200 pendientes, 0 en proceso, cero
+      // errores, durante horas.
+      // Todos estos jobs tienen su propia cadencia (`_tocaCorrer`), así que saltearlos una
+      // vuelta no los pierde: corren en la siguiente. Lo que no se puede perder es la cola.
+      const _LIMITE_MANTENIMIENTO = Date.now() + 3 * 60 * 1000;
+      const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
@@ -21822,15 +21832,15 @@ async function main() {
       await vigilarAprovechamientoDeApollo(token).catch(e => log(`⚠️ apollo uso: ${e.message}`));
 
       // Auto-pulido: re-enciende los barridos cada 10 días sin que nadie lo pida.
-      await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
+      if (_hayTiempo()) await maybeReprenderBarridos(token).catch(e => log(`⚠️ autoPulido: ${e.message}`));
       // Caza de emails: cada 3 días vuelve sobre los leads sin contacto.
-      await maybeCazaEmails(token).catch(e => log(`⚠️ cazaEmails: ${e.message}`));
+      if (_hayTiempo()) await maybeCazaEmails(token).catch(e => log(`⚠️ cazaEmails: ${e.message}`));
       // Barrido diario del 100% de los ciclos finalizados de Monday: vuelven a
       // Prospects con email nuevo, y el pipeline decide si siguen cumpliendo.
-      await sincronizarFinalizadosDeMonday(token).catch(e => log(`⚠️ mondaySync: ${e.message}`));
+      if (_hayTiempo()) await sincronizarFinalizadosDeMonday(token).catch(e => log(`⚠️ mondaySync: ${e.message}`));
       // 1×/semana: buscar sellers.json en Google para descubrir redes nuevas. Cada red
       // devuelve cientos de publishers sin gastar un crédito más.
-      await descubrirRedesPorSellersJson(token).catch(e => log(`⚠️ sellersDiscovery: ${e.message}`));
+      if (_hayTiempo()) await descubrirRedesPorSellersJson(token).catch(e => log(`⚠️ sellersDiscovery: ${e.message}`));
 
       // Promueve items waiting_pool → pending si hay espacio en review_queue.
       // Cada loop iteration lo intenta — items "preparados" por MBs entran
@@ -21867,15 +21877,15 @@ async function main() {
         await _measureFeederRuns(token).catch(e => log(`⚠️ feeder measure: ${e.message}`));
         await _checkAutoPauseAgent(token).catch(e => log(`⚠️ autopause: ${e.message}`));
         // Source performance aggregate (1× por día, guard interno)
-        await maybeRunSourcePerformanceAggregate(token).catch(e => log(`⚠️ source perf: ${e.message}`));
+        if (_hayTiempo()) await maybeRunSourcePerformanceAggregate(token).catch(e => log(`⚠️ source perf: ${e.message}`));
         // M2: síntesis de reglas del feedback 👍/👎 del email IA (1× por día, guard interno)
-        await maybeRunPitchRulesSynthesis(token).catch(e => log(`⚠️ pitch rules synth: ${e.message}`));
+        if (_hayTiempo()) await maybeRunPitchRulesSynthesis(token).catch(e => log(`⚠️ pitch rules synth: ${e.message}`));
         // Síntesis de reglas de basura desde los rechazos (botón rojo enseña al filtro)
-        await maybeRunProspectTrashSynthesis(token).catch(e => log(`⚠️ prospect trash synth: ${e.message}`));
+        if (_hayTiempo()) await maybeRunProspectTrashSynthesis(token).catch(e => log(`⚠️ prospect trash synth: ${e.message}`));
         // Maxi 2026-07-16: keywords frescas por Claude para AutoGoogle (1×/semana, gated).
-        await maybeGenerateFreshKeywords(token).catch(e => log(`⚠️ fresh keywords: ${e.message}`));
+        if (_hayTiempo()) await maybeGenerateFreshKeywords(token).catch(e => log(`⚠️ fresh keywords: ${e.message}`));
         // Maxi 2026-07-01: análisis 3×/semana (L/X/V) — marca prospects sospechosos de rechazo (⚠️)
-        await runSuspectRejectAnalysis(token).catch(e => log(`⚠️ suspect analysis: ${e.message}`));
+        if (_hayTiempo()) await runSuspectRejectAnalysis(token).catch(e => log(`⚠️ suspect analysis: ${e.message}`));
         // Maxi 2026-07-13: barrido on-demand del pool (purga no-publishers viejos por blocklist +
         // detector estructural). Gated por config purge_blocked_prospects='true'; se auto-apaga al terminar.
         // Maxi 2026-07-28: PRIMERO el barrido gratis por URL (sin red, sin créditos). Lo que
@@ -21890,20 +21900,20 @@ async function main() {
         // mantenimiento. Cada uno con su propio techo de tiempo.
         // 1. Barrido por URL: sin red, sin créditos, segundos. Limpia basura antes de que el
         //    pulido gaste un fetch en ella.
-        await purgeByUrlOnly(token).catch(e => log(`⚠️ url-purge: ${e.message}`));
+        if (_hayTiempo()) await purgeByUrlOnly(token).catch(e => log(`⚠️ url-purge: ${e.message}`));
         // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
         //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
-        await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
+        if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
         // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
         //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.
         // Maxi 2026-08-18: el agente de REVISIÓN. Re-arma solo la búsqueda de emails y el
         // repaso de calidad. Va antes de los barridos para que, si los arma, corran en esta
         // misma vuelta.
-        await agenteRevision(token).catch(e => log(`⚠️ agente revisión: ${e.message}`));
-        await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
-        await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
+        if (_hayTiempo()) await agenteRevision(token).catch(e => log(`⚠️ agente revisión: ${e.message}`));
+        if (_hayTiempo()) await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
+        if (_hayTiempo()) await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
         // Maxi 2026-07-16: expansión por similares desde los Prospects grandes (gated similar_expansion_enabled).
-        await runProspectSimilarExpansion(token).catch(e => log(`⚠️ similar-exp: ${e.message}`));
+        if (_hayTiempo()) await runProspectSimilarExpansion(token).catch(e => log(`⚠️ similar-exp: ${e.message}`));
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
