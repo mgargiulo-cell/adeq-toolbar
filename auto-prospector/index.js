@@ -10254,6 +10254,17 @@ const CORPORATE_BLOCKLIST = new Set([
 // TLDs o subcadenas que SIEMPRE indican sitios no-prospectables.
 // Política user 2026-05-26: rechazar agresivamente gov/edu/military/academic
 // en TODOS sus variantes nacionales. Estos sitios jamás compran publicidad.
+// Etiquetas institucionales, comparadas POR POSICIÓN y no por subcadena.
+const _ETIQUETA_TLD_INST  = new Set(["edu", "gov", "mil", "int"]);
+const _ETIQUETA_2N_INST   = new Set(["edu", "gov", "mil", "gob", "ac", "gouv", "gv"]);
+function _esInstitucional(dominio) {
+  const partes = String(dominio || "").toLowerCase().replace(/\.$/, "").split(".");
+  if (partes.length < 2) return false;
+  const tld = partes[partes.length - 1];
+  const seg = partes[partes.length - 2];
+  return _ETIQUETA_TLD_INST.has(tld) || _ETIQUETA_2N_INST.has(seg);
+}
+
 const BLOCKED_TLDS     = [
   ".edu", ".gov", ".mil", ".int",
   ".edu.", ".gov.", ".mil.", ".gob.", ".ac.", ".gouv.",
@@ -10443,7 +10454,14 @@ function isDomainBlocked(domain) {
   for (const b of CORPORATE_BLOCKLIST) { if (d.endsWith("." + b)) return "corporate/subdomain"; }
   // Marca por 2do-nivel en cualquier TLD/subdominio (news.google.at, rakuten.tv, fr.wix.com)
   if (BRAND_BLOCKLIST.has(coreDomain(d))) return "corporate/brand-root";
-  if (BLOCKED_TLDS.some(t => d.endsWith(t) || d.includes(t))) return "government/education";
+  // ⚠️ SE COMPARABA POR SUBCADENA (Maxi 2026-08-25). `d.includes(".mil")` bloqueaba
+  // `noticias.milenio.com` y `www.milanotoday.it` como si fueran sitios militares, y
+  // `.ac.` mataba a cualquier dominio con esas dos letras entre puntos. Se perdían
+  // publishers grandes sin dejar más rastro que "government/education".
+  // Ahora se mira la POSICIÓN de la etiqueta, que es lo que de verdad define un dominio
+  // institucional: o es el TLD (harvard.edu, army.mil) o es el sufijo de segundo nivel
+  // (deportes.gov.co, portal.ac.cr, sport.gouv.fr).
+  if (_esInstitucional(d)) return "government/education";
   if (ADULT_TLDS.some(t => d.endsWith(t))) return "adult-tld";
   if (ADULT_KEYWORDS.some(k => d.includes(k))) return "adult-keyword";
   // Blacklist geográfica: descarta dominios de USA/CA/RU/AU/NZ/UA por TLD
@@ -10928,6 +10946,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // Maxi 2026-07-01: TRAFFIC PRIMERO, SOLO. El page content (scrape) se difería a
   // después del floor de 350K para NO gastar scrape/API en sitios que se van a rechazar.
   // Antes traffic+content corrían en paralelo → todo sitio scrapeaba aunque fuera de 2K.
+  // `_ads` vive fuera del bloque: la "puerta grande" de más abajo necesita saber si el
+  // sitio tiene ads.txt para poder perdonarle el rubro (Maxi 2026-08-25).
+  let _ads = { state: "unknown", lines: 0 };
   // ── PUERTA 0: ads.txt (Maxi 2026-07-28, regla del user) ───────────────────────────────
   // "Sitios que no tienen ads.txt no entran a Prospects. Quien no tiene txt no puede monetizar."
   // Va ANTES de getTrafficData a propósito: es 1 request gratis y evita gastar un hit de
@@ -10936,7 +10957,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // vuelve a la cola en vez de descartarse. Descartar por fallas nuestras es exactamente el bug
   // que hoy nos costó 2.011 leads congelados.
   {
-    const _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
+    _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
     if (_ads.state === "no") {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: sin_ads_txt` });
       await _auditAdsTxt(token, domain, "no", "sin ads.txt", source, "proceso");
@@ -11177,7 +11198,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     try {
       const _dupRes = await fetch(
         // Mismo anclaje que arriba: sin el punto, empresas distintas se pisaban.
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(domain.eq.${encodeURIComponent(_root)},domain.like.*.${encodeURIComponent(_root)})&select=domain&limit=1`,
+        // Y `domain=neq.${domain}` porque si no el lead se encontraba A SÍ MISMO y se
+        // descartaba con "duplicado de sí mismo" (7 de 19 descartes decían eso).
+        // `status=neq.rejected` para no bloquear un dominio nuevo contra uno ya descartado.
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(domain.eq.${encodeURIComponent(_root)},domain.like.*.${encodeURIComponent(_root)})&domain=neq.${encodeURIComponent(domain)}&status=neq.rejected&select=domain&limit=1`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       );
       const _dup = _dupRes.ok ? await _dupRes.json() : [];
@@ -11208,7 +11232,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const blockedCat = isCategoryBlockedWorker(swCategory);
   // Maxi 2026-08-01: SIN excepción para imports manuales. Una categoría que vos bloqueaste
   // en la config es una decisión tuya — no la pisa el hecho de que el lead venga de un CSV.
-  if (blockedCat) {
+  // ⚠️ LA PUERTA GRANDE TAMBIÉN MANDA ACÁ (Maxi 2026-08-25).
+  // La regla del user es "toda url que tenga txt y más de 400k vistas sirve, no importa el
+  // rubro". Estaba implementada en `scoreProspectable`... que corre DESPUÉS de este veto,
+  // así que un sitio con ads.txt y tráfico de sobra igual moría acá por su categoría y
+  // nunca llegaba a la puerta que debía perdonarlo. La regla existía y no se aplicaba.
+  // Los vetos ESTRUCTURALES (gobierno, universidad, muerto) no pasan por acá: se filtran
+  // antes, en su propio chequeo. Esto solo perdona el RUBRO, que es lo que el user pidió.
+  if (blockedCat && _apruebaPorAdsTxtYTrafico(_ads, effectivePageViews)) {
+    log(`  🚪 ${domain} — categoría "${swCategory}" bloqueada PERO tiene ads.txt y ${effectivePageViews} pageviews → pasa por la puerta grande`);
+  } else if (blockedCat) {
     await markCsvItem(token, item.id, "skipped", {
       error_message: `category-blocked: "${swCategory}" matchea "${blockedCat}"`,
     });
