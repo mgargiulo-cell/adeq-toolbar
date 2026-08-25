@@ -3805,8 +3805,11 @@ async function maybeStartAutopilotSlot(token) {
       }
     }
   } catch {}
-  _autopilotLastSlot = slotLabel;
-  await setConfigValue(token, "autopilot_last_slot", slotLabel).catch(() => {});
+  // ⚠️ EL TURNO SE MARCA AL FINAL, NO ACÁ (Maxi 2026-08-25). Estaba justo antes de los
+  // guards de pacing y del chequeo de si el autopilot ya estaba prendido, así que un
+  // throttle de RapidAPI —o el propio autopilot apagado— quemaba el turno igual. Resultado:
+  // el autopilot corrió UNA vez en cuatro días teniendo un slot por hora disponible.
+  // Un turno solo se consume cuando de verdad se hizo el trabajo.
 
   // Maxi 2026-06-19: FRENO DE PACING. Como ahora hay slots cada hora, este guard
   // evita reventar el cupo: si gastamos RapidAPI más rápido que lo que va del
@@ -3827,12 +3830,18 @@ async function maybeStartAutopilotSlot(token) {
   try {
     const cfg = await getConfig(token);
     if (String(cfg.auto_prospecting_enabled || "").toLowerCase() === "true") {
+      // "Ya estaba prendido" SÍ cumple el propósito del turno: el autopilot está corriendo.
+      // Se marca para no repetir el chequeo (y el log) en cada vuelta del worker.
+      _autopilotLastSlot = slotLabel;
+      await setConfigValue(token, "autopilot_last_slot", slotLabel).catch(() => {});
       log(`🛰️ autopilot ${slotLabel}: ya estaba prendido — skip auto-trigger`);
       return;
     }
     await setConfigValue(token, "auto_prospecting_enabled", "true");
     await setConfigValue(token, "auto_session_user", "worker@autopilot");
     await setConfigValue(token, "auto_session_start", new Date().toISOString());
+    _autopilotLastSlot = slotLabel;
+    await setConfigValue(token, "autopilot_last_slot", slotLabel).catch(() => {});
     log(`🛰️ AUTOPILOT slot ${slotLabel} → ON (worker auto-apaga en ~20min)`);
   } catch (e) { log(`⚠️ maybeStartAutopilotSlot: ${e.message}`); }
 }
@@ -8601,15 +8610,24 @@ async function recheckAdsTxtUnknowns(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const minDias = parseInt(cfg.adstxt_recheck_min_days || "7", 10) || 7;
   const corte = new Date(Date.now() - minDias * 86400000).toISOString();
-  let filas = [];
+  // ⚠️ `null` NO ES LO MISMO QUE `[]` (Maxi 2026-08-25). Arrancaba en `[]`, así que si la
+  // consulta fallaba caía en el mismo camino que "no queda nada por re-chequear": marcaba
+  // el día como HECHO y no volvía a intentarlo hasta mañana. Un 500 de Supabase le regalaba
+  // el día entero al job que recupera los ads.txt que no se pudieron leer.
+  let filas = null;
   try {
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?verdict=eq.unknown&resolved_at=is.null&last_checked_at=lt.${encodeURIComponent(corte)}&order=last_checked_at.asc&limit=200&select=domain,checks,source`,
       { headers: auth }
     );
-    if (r.ok) filas = await r.json();
+    if (r.ok) { const j = await r.json(); if (Array.isArray(j)) filas = j; }
   } catch {}
-  if (!Array.isArray(filas) || filas.length === 0) {
+  if (filas === null) {
+    await saludPing(token, "adstxt_recheck", { status: "fail", cadenciaMin: 1440, detalle: "no se pudo leer la lista — NO se marca el día como hecho" });
+    log(`⚠️ re-chequeo ads.txt: la consulta falló — reintento en la próxima vuelta, sin quemar el día`);
+    return;
+  }
+  if (filas.length === 0) {
     _lastAdsRecheckDay = hoy;
     await setConfigValue(token, "adstxt_recheck_day", hoy).catch(() => {});
     return;
@@ -17663,8 +17681,21 @@ async function runAgentCycle(token, allFlags) {
     // para rows pre-migración.
     const focus = aCfg.focus;
     let geoClause = "";
-    if (focus.geosPriority.length > 0) {
-      const isoCodes = focus.geosPriority;
+    // ⚠️ SIN FOCO CONFIGURADO, LA VENTANA SE ELEGÍA SIN MIRAR EL GEO (Maxi 2026-08-25).
+    // La cascada por niveles ordena los 300 leads que ya llegaron, pero no puede poner
+    // adelante lo que la ventana no contiene. Medido sobre 219 envíos de 14 días: LATAM
+    // 13,7% y España 13,7%, contra Alemania, Francia, Japón, Grecia, Hungría, Países Bajos
+    // y Polonia copando el resto. O sea: el nivel 4 le ganaba al nivel 1 sistemáticamente.
+    // (El techo anglo sí se cumplía: 2,7%.)
+    // Ahora, cuando no hay foco explícito, el paso 1 pide niveles 1+2+3 —LATAM,
+    // Centroamérica y España— y el paso 2, que YA existe, completa con el resto del pool si
+    // no llena el lote. Nadie queda excluido; simplemente los prioritarios entran a la
+    // ventana en vez de depender de que aparezcan por azar.
+    const _isoPorDefecto = focus.geosPriority.length === 0
+      ? [...GEO_TIER1_LATAM, ...GEO_TIER2_CENTRAL, ...GEO_TIER3_SPAIN]
+      : [];
+    if (focus.geosPriority.length > 0 || _isoPorDefecto.length > 0) {
+      const isoCodes = focus.geosPriority.length > 0 ? focus.geosPriority : _isoPorDefecto;
       const names    = isoCodes.map(c => COUNTRY_CODES[c]).filter(Boolean);
       const ovList   = `{${isoCodes.join(",")}}`;
       const inList   = [...isoCodes, ...names].map(s => `"${s}"`).join(",");
@@ -20610,10 +20641,16 @@ const CAZA_EMAILS_REINTENTO_D = 7;   // no re-machacar el mismo dominio antes de
 
 async function maybeCazaEmails(token) {
   try {
-    if (!(await _tocaCorrer(token, "caza_emails", CAZA_EMAILS_CADA_DIAS * 24 * 60))) return;
+    // ⚠️ EL ORDEN DE LOS DOS GUARDS IMPORTA (Maxi 2026-08-25).
+    // `_tocaCorrer` marca el turno como consumido apenas se lo consulta. Estaba ANTES del
+    // chequeo de "hay otro barrido en curso", así que cada vez que el pulido estaba
+    // prendido —que es casi siempre— la caza gastaba su turno para no hacer nada y se
+    // auto-postergaba otros 3 días. Nunca corrió una sola vez.
+    // Primero se decide si corresponde correr; recién después se consume la cadencia.
     const cfg = await getConfig(token).catch(() => null);
     if (!cfg) return;
-    if (String(cfg.polish_pool || "") === "true") return;   // ya hay un barrido en curso
+    if (String(cfg.polish_pool || "") === "true") return;   // ya hay un barrido en curso, no gasta el turno
+    if (!(await _tocaCorrer(token, "caza_emails", CAZA_EMAILS_CADA_DIAS * 24 * 60))) return;
 
     const corte = new Date(Date.now() - CAZA_EMAILS_REINTENTO_D * 86400000).toISOString();
     let cuantos = 0;
