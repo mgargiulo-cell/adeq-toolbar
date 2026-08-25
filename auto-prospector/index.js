@@ -13498,6 +13498,21 @@ async function processManualReengagementQueue(token) {
         }
       }
 
+      // ⚠️ UN FALLO DE ENVÍO NO ES UN VEREDICTO (Maxi 2026-08-25).
+      // Las 125 filas de esta cola están en 'failed' con el motivo "gmail send failed:
+      // unknown", y ninguna se reintentó nunca: el Email Futuro no mandó UN SOLO mail en
+      // toda su vida. "unknown" es literalmente "no sé qué pasó", y se trataba como "no se
+      // puede". Ahora un fallo de ENVÍO vuelve a la cola con 6 horas de espera, hasta 3
+      // intentos; recién ahí se da por perdido. Los fallos de DATOS (sin email futuro, sin
+      // asunto o cuerpo original) sí son definitivos y siguen yendo a 'failed'.
+      const _esFalloDeEnvio = newStatus === "failed" && /gmail send failed|timeout|network|fetch|ECONN|socket/i.test(String(reason || ""));
+      const _intentoPrevio = parseInt(String(reason || "").match(/intento (\d+)/)?.[1] || "0", 10) || 0;
+      const _cuerpoPatch = (_esFalloDeEnvio && _intentoPrevio + 1 < 3)
+        ? { status: "pending", reason: `${reason} (intento ${_intentoPrevio + 1}, reintenta en 6h)`,
+            scheduled_for: new Date(Date.now() + 6 * 3600_000).toISOString(),
+            updated_at: new Date().toISOString() }
+        : { status: newStatus, reason, updated_at: new Date().toISOString() };
+
       // 5. Update row status
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?id=eq.${id}`, {
         method: "PATCH",
@@ -13505,7 +13520,7 @@ async function processManualReengagementQueue(token) {
           "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
           "Content-Type": "application/json", "Prefer": "return=minimal",
         },
-        body: JSON.stringify({ status: newStatus, reason, updated_at: new Date().toISOString() }),
+        body: JSON.stringify(_cuerpoPatch),
       }).catch(() => {});
 
       // Anti rate-limit Monday + Gmail
@@ -13660,6 +13675,27 @@ const BOUNCE_INFRA_DOMAINS = new Set([
 async function scanBouncesForUser(token, userEmail) {
   try {
     const accessToken = await getGmailAccessToken(userEmail);
+    // ── SOLO PUEDE REBOTAR ALGO A LO QUE LE ESCRIBIMOS (Maxi 2026-08-25) ────────────
+    // Cuando el rebote no trae la cabecera `X-Failed-Recipients`, el fallback saca
+    // CUALQUIER dirección del cuerpo del mensaje y blacklistea las tres primeras. Pero un
+    // rebote cita el mail original entero: firmas, pies, direcciones de terceros. Medido:
+    // 606 de las 883 direcciones de la lista negra nunca recibieron un mail nuestro.
+    // Y esa lista filtra candidatos en `isBouncedSync`, así que cada falso positivo es un
+    // contacto bueno que el agente ya no puede usar nunca más.
+    // Se carga una vez por scan el conjunto de destinatarios reales de los últimos 30 días.
+    // Si no se puede cargar queda null y el fallback NO blacklistea a nadie: sin saber a
+    // quién le escribimos, marcar contactos como rebotados es peor que no marcar ninguno.
+    let _destinatariosReales = null;
+    try {
+      const _d30 = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      const _r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=email_to&limit=5000`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      if (_r.ok) {
+        const _f = await _r.json();
+        if (Array.isArray(_f)) _destinatariosReales = new Set(_f.map(x => String(x.email_to || "").toLowerCase()).filter(Boolean));
+      }
+    } catch {}
     // Query Gmail AMPLIADA (Maxi 2026-06-17). Antes era muy estrecha — solo
     // capturaba subjects en inglés y 20 mensajes. Maxi reporta 5-10 rebotes/día
     // pero solo veíamos ~0.6/día. Cambios:
@@ -13743,7 +13779,12 @@ async function scanBouncesForUser(token, userEmail) {
             .filter(e => !e.includes("mailer-daemon") && !e.includes("postmaster") && e !== userEmail.toLowerCase())
             .filter(e => !BOUNCE_INFRA_DOMAINS.has(e.split("@")[1] || ""))
             .filter(e => (e.split("@")[1] || "") !== (userEmail.split("@")[1] || "").toLowerCase())
+            // El filtro que faltaba: tiene que ser alguien a quien le escribimos de verdad.
+            .filter(e => _destinatariosReales ? _destinatariosReales.has(e) : false)
           )].slice(0, 3); // top 3
+          if (!failedEmails.length && emailMatches.length) {
+            log(`  ℹ️ rebote sin X-Failed-Recipients: ninguna de las ${emailMatches.length} direcciones del cuerpo figura entre las que escribimos — no se blacklistea nada`);
+          }
         }
         // Hard vs soft bounce detection del body — el hard amerita retry inmediato
         const bodyText = extractMessageText(msg.payload || {}).toLowerCase();
@@ -19785,7 +19826,13 @@ const REBOTE_TECHO_DOMINIO = 0.03;  // 3% sumando los tres → freno
 // "¿tengo evidencia de que la tasa REAL supera el techo?" en vez de "¿el número de
 // esta semana quedó arriba?". Con 3/80 el límite inferior da 1,3%: no frena. Con
 // 30/400 da 5,3%: frena, y ahí sí hay un problema de verdad.
-const REBOTE_MUESTRA_MINIMA = 150;   // por debajo de esto no se concluye nada
+// Maxi 2026-08-25: 150 → 60. Con 150 el freno global NUNCA se podía activar: el sistema
+// manda ~60 mails por semana en total, así que la muestra no se alcanzaba jamás y el
+// vigilante de reputación era decorativo. 60 es el mismo piso que ya usa la alerta por
+// buzón. Quien decide si hay evidencia es Wilson, no el tamaño bruto: con 60 envíos y 2
+// rebotes el piso da 0,4% (no frena); con 60 y 8 da 6,4% (frena). Bajar el mínimo no
+// vuelve al freno nervioso — eso lo evita el límite inferior del intervalo.
+const REBOTE_MUESTRA_MINIMA = 60;
 
 function _wilsonLimiteInferior(exitos, total, z = 1.96) {
   if (!total) return 0;
