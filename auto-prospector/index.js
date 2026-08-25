@@ -17689,10 +17689,14 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
     `List-Unsubscribe: <mailto:${_mailBaja}?subject=Baja>`,
     "List-Unsubscribe-Post: List-Unsubscribe=One-Click",
   ] : [];
-  // El header solo no alcanza: el humano tiene que poder pedirlo leyendo el mail.
-  const _pieBaja = esProspeccion
-    ? `\n\n--\nSi preferis que no volvamos a escribirte, respondé "baja" y no te contactamos mas.`
-    : "";
+  // Maxi (2026-08-25): el pie visible SE SACA. Un primer contacto que ya trae su
+  // formulario de baja se lee como envío masivo, y eso mata la conversación antes de
+  // empezar — el costo comercial pesa más que la comodidad del opt-out en el cuerpo.
+  // El opt-out NO desaparece: sigue en la cabecera `List-Unsubscribe` de acá arriba,
+  // que es lo que Gmail y Yahoo exigen (RFC 8058) y lo que muestran como botón
+  // "Cancelar suscripción" arriba del mail. Invisible en el texto, presente para el
+  // cliente de correo. NO volver a poner el pie sin que Maxi lo pida.
+  const _pieBaja = "";
 
   // ── LAS DOS PARTES DICEN LO MISMO ─────────────────────────────────────────
   // Antes la HTML llevaba la firma (nombre, cargo, teléfono, links) y la plain no
