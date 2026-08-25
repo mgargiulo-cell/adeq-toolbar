@@ -8369,6 +8369,11 @@ async function parteDelDia(token) {
   // es la ventana horaria del AGENTE; esto es sobre personas que están en Argentina, y
   // mostrarles su propio día en otro huso sería inútil.
   const _HUECO_MIN = parseInt(cfg.parte_hueco_minutos || "30", 10) || 30;
+  // La jornada de referencia, en horas. Sirve para que "poca inactividad" no se confunda con
+  // "trabajó bien": lo que importa es cuánto de la jornada tuvo actividad, no si los ratos
+  // sueltos estaban pegados entre sí.
+  const _JORNADA_H = parseFloat(cfg.parte_jornada_horas || "9") || 9;   // 09:00 a 18:00 AR
+  const _JORNADA_MIN = Math.round(_JORNADA_H * 60);
   const _horaAr = (t) => new Date(t).toLocaleTimeString("es-AR", {
     timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit", hour12: false });
   for (const [, d] of _porPersona) {
@@ -8380,6 +8385,15 @@ async function parteDelDia(token) {
     }
     d.huecos.sort((a, b) => b.min - a.min);
     d.huecoTotal = d.huecos.reduce((a, h) => a + h.min, 0);
+    // ── LA INACTIVIDAD SE MIDE CONTRA LA JORNADA, NO CONTRA LA PROPIA VENTANA ──────────
+    // (Maxi 2026-08-25, corrección del user.) Con la versión anterior, alguien que abrió la
+    // toolbar 20 minutos y no hizo nada más figuraba "sin huecos: trabajó de corrido",
+    // mientras que alguien con 4h24 de ventana y dos pausas figuraba con 145 min de
+    // inactividad. El segundo trabajó muchísimo más y el reporte lo mostraba peor.
+    // El ancla correcta es la jornada laboral: cuánto de las horas del día tuvo actividad.
+    d.ventanaMin = (d.desde && d.hasta) ? Math.round((d.hasta - d.desde) / 60000) : 0;
+    d.activoMin  = Math.max(0, d.ventanaMin - d.huecoTotal);
+    d.coberturaPct = _JORNADA_MIN > 0 ? Math.round(100 * d.activoMin / _JORNADA_MIN) : null;
   }
 
   const _personas = [..._porPersona.entries()].sort((a, b) => (b[1].enviados.length + b[1].mirados) - (a[1].enviados.length + a[1].mirados));
@@ -8418,15 +8432,18 @@ async function parteDelDia(token) {
         if (_conv != null) _lineasManual.push(`      Aprovechamiento: le escribió a ${d.enviados.length} de las ${d.arriba} que servían (${_conv}%)`);
         if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
         if (d.desde) {
-          const _span = Math.round((d.hasta - d.desde) / 60000);
-          _lineasManual.push(`      Actividad (hora Argentina): de ${_horaAr(d.desde)} a ${_horaAr(d.hasta)} — ${Math.floor(_span / 60)}h ${_span % 60}min de punta a punta`);
+          const _hm = (m) => `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}min`;
+          // El titular es la COBERTURA de la jornada, no los huecos. Un día de 20 minutos sin
+          // pausas no es "trabajó de corrido": es que casi no hubo jornada que cubrir.
+          _lineasManual.push(`      Actividad en la toolbar (hora Argentina): ${_horaAr(d.desde)} → ${_horaAr(d.hasta)}`);
+          _lineasManual.push(`      Cobertura de la jornada: ${_hm(d.activoMin)} activos sobre ${_hm(_JORNADA_MIN)} (${d.coberturaPct}%)`);
           if (d.huecos.length) {
-            _lineasManual.push(`      Inactividad: ${d.huecoTotal} min en ${d.huecos.length} hueco(s) de más de ${_HUECO_MIN} min`);
+            _lineasManual.push(`      Dentro de esa ventana hubo ${d.huecoTotal} min de pausa en ${d.huecos.length} hueco(s):`);
             for (const h of d.huecos.slice(0, 3)) {
-              _lineasManual.push(`         · ${_horaAr(h.desde)} → ${_horaAr(h.hasta)}   (${h.min} min sin actividad)`);
+              _lineasManual.push(`         · ${_horaAr(h.desde)} → ${_horaAr(h.hasta)}   (${h.min} min)`);
             }
-          } else {
-            _lineasManual.push(`      Sin huecos de más de ${_HUECO_MIN} min: trabajó de corrido.`);
+          } else if (d.ventanaMin >= 120) {
+            _lineasManual.push(`      Sin pausas de más de ${_HUECO_MIN} min dentro de la ventana.`);
           }
         }
         if (_geoTop) _lineasManual.push(`      GEO: ${_geoTop}`);
@@ -8566,10 +8583,10 @@ async function parteDelDia(token) {
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
                ...(d.sesiones ? [["Toolbar abierta", `~${Math.round((d.segundos || 0) / 60)} min · ${d.sesiones} sesiones`]] : []),
                ...(d.desde ? [["Actividad (hora AR)", `${_horaAr(d.desde)} — ${_horaAr(d.hasta)}`]] : []),
-               ...(d.desde ? [["Inactividad", d.huecos.length
-                   ? `${d.huecoTotal} min en ${d.huecos.length} hueco(s)`
-                   : `sin huecos de +${_HUECO_MIN} min`,
-                 d.huecoTotal >= 90 ? _ROJO : _GRIS]] : []),
+               ...(d.desde ? [["Cobertura de la jornada",
+                   `${Math.floor(d.activoMin / 60)}h ${String(d.activoMin % 60).padStart(2, "0")}min de ${Math.round(_JORNADA_MIN / 60)}h (${d.coberturaPct}%)`,
+                   d.coberturaPct < 30 ? _ROJO : (d.coberturaPct < 60 ? "#b26a00" : _VERDE)]] : []),
+               ...(d.huecos && d.huecos.length ? [["Pausas dentro de la ventana", `${d.huecoTotal} min en ${d.huecos.length}`]] : []),
              ])}
              ${d.huecos && d.huecos.length ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">${d.huecos.slice(0, 3).map(h => `${_horaAr(h.desde)} → ${_horaAr(h.hasta)} · ${h.min} min`).join("<br/>")}</div>` : ""}
              ${_geoTop ? `<div style="padding-top:8px">${_geoTop}</div>` : ""}
