@@ -21975,6 +21975,16 @@ async function main() {
       const cfgShared = (flags.csvQueue || flags.agent) ? await getConfig(token) : null;
       const parallelTasks = [];
       let csvProcessed = 0;
+      // ⚠️ LATIDO DEL TRAMO FINAL (Maxi 2026-08-25). La cola dejó de procesar y no había
+      // forma de saber si el bucle siquiera LLEGABA hasta acá: entre los vigilantes y este
+      // punto corren dos docenas de jobs, y si uno se cuelga sin techo de tiempo, todo lo
+      // que viene después deja de existir en silencio. Ya pasó cuatro veces en este
+      // proyecto. Este ping dice "el bucle llegó al reparto de trabajo", que es la
+      // diferencia entre "la cola está frenada" y "la cola nunca fue llamada".
+      await saludPing(token, "loop_reparto", {
+        status: "ok", cadenciaMin: 15,
+        detalle: `csv=${flags.csvQueue} agent=${flags.agent} autopilot=${flags.autopilot}`,
+      }).catch(() => {});
       if (flags.csvQueue) {
         parallelTasks.push(
           // Sin batch — procesa TODA la cola hasta vaciarla. Agent corre en
