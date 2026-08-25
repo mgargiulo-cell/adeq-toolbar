@@ -17618,7 +17618,10 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
     // uso normal del board.
     // Si existe una columna dedicada (id en `monday_col_origen`), la marca va AHÍ, donde nadie
     // escribe a mano. Comentarios se sigue completando por compatibilidad mientras no exista.
-    ...(_mondayColOrigen ? { [_mondayColOrigen]: "Agente" } : {}),
+    // La columna Origen es de tipo Estado: se escribe con la forma {label}, no con un string
+    // pelado. Creada el 2026-08-25 (id color_mm6j5y1y) para que la marca deje de vivir en
+    // Comentarios, que es texto libre y el primer MB que escribe ahí la borra.
+    ...(_mondayColOrigen ? { [_mondayColOrigen]: { label: "Agente" } } : {}),
     [MONDAY_COL_PITCH]: "Agente",
   };
   if (payload.phone && !_mondayPhoneIso(payload.geo)) {
