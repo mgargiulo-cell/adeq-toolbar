@@ -8308,7 +8308,7 @@ async function parteDelDia(token) {
     // `is_new` y `page_views` además de lo anterior: el user quiere saber, por MB, cuántas
     // URLs abrió y cómo se reparten — nuevas vs ya conocidas, y por encima o por debajo del
     // piso de tráfico. "Para saber si trabajó y de qué manera". (Maxi 2026-08-25.)
-    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo,is_new,page_views&limit=2000`,
+    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo,is_new,page_views,created_at&limit=2000`,
     { headers: auth }
   ).then(r => r.ok ? r.json() : []).catch(() => []);
   for (const h of (Array.isArray(_hist) ? _hist : [])) {
@@ -8320,8 +8320,30 @@ async function parteDelDia(token) {
     else if (_pv > 0) f.abajo++;
     else f.sinDato++;
     if (String(h.email || "").includes("@")) f.conEmail++;
+    // Franja horaria del día: dice si trabajó de corrido o en dos ratos sueltos.
+    const _t = Date.parse(h.created_at || "");
+    if (_t) { f.desde = Math.min(f.desde || _t, _t); f.hasta = Math.max(f.hasta || _t, _t); }
     const g = String(h.geo || "").trim();
     if (g) f.geos.set(g, (f.geos.get(g) || 0) + 1);
+  }
+
+  // ── TIEMPO CON LA TOOLBAR ABIERTA (Maxi 2026-08-25, pedido del user) ────────────────
+  // `toolbar_usage_sessions` ya lo registraba y nadie lo miraba. Ojo con el dato: el
+  // `duration_sec` lo escribe solo el cierre limpio, y un popup que se cierra de golpe no
+  // dispara nada. Por eso se reconstruye desde started_at/ended_at, que el latido de 60s sí
+  // mantiene. Las sesiones de menos de un minuto no llegan a registrar fin: el número es un
+  // PISO, no un total, y así se muestra. Mentir con un total exacto sería peor.
+  const _sesiones = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_usage_sessions?started_at=gte.${desdeHoy}&select=user_email,started_at,ended_at,duration_sec&limit=2000`,
+    { headers: auth }
+  ).then(r => r.ok ? r.json() : []).catch(() => []);
+  for (const ses of (Array.isArray(_sesiones) ? _sesiones : [])) {
+    const f = _fila(_quien(ses.user_email));
+    f.sesiones = (f.sesiones || 0) + 1;
+    const _dur = Number(ses.duration_sec) || (ses.ended_at && ses.started_at
+      ? Math.max(0, (Date.parse(ses.ended_at) - Date.parse(ses.started_at)) / 1000) : 0);
+    f.segundos = (f.segundos || 0) + _dur;
+    if (_dur > 0) f.sesionesMedidas = (f.sesionesMedidas || 0) + 1;
   }
 
   // Las cargas masivas (sellers.json, Monday, CSV) que hizo cada uno a mano.
@@ -8361,7 +8383,16 @@ async function parteDelDia(token) {
       // una decisión del MB.
       if (d.mirados) {
         const _k = Math.round(_PISO_PARTE / 1000);
-        _lineasManual.push(`      URLs abiertas: ${d.mirados} · ${d.nuevas} nuevas / ${d.conocidas} ya conocidas · ${d.arriba} de +${_k}k / ${d.abajo} de -${_k}k / ${d.sinDato} sin dato de tráfico`);
+        const _hhmm = (t) => t ? new Date(t).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" }) : "";
+        const _min = Math.round((d.segundos || 0) / 60);
+        // La conversión es la señal de trabajo real: de las URLs que SÍ servían, ¿a cuántas
+        // les escribió? Abrir 50 y mandar 2 no se lee igual si 37 servían que si servían 2.
+        const _conv = d.arriba > 0 ? Math.round(100 * d.enviados.length / d.arriba) : null;
+        _lineasManual.push(`      URLs abiertas: ${d.mirados}  (${d.nuevas} nuevas · ${d.conocidas} ya conocidas)`);
+        _lineasManual.push(`      De esas: ${d.arriba} superan ${_k}k · ${d.abajo} por debajo · ${d.sinDato} sin dato de tráfico`);
+        if (_conv != null) _lineasManual.push(`      Aprovechamiento: le escribió a ${d.enviados.length} de las ${d.arriba} que servían (${_conv}%)`);
+        if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
+        if (d.desde) _lineasManual.push(`      Actividad: de ${_hhmm(d.desde)} a ${_hhmm(d.hasta)}`);
         if (_geoTop) _lineasManual.push(`      GEO: ${_geoTop}`);
       }
       _lineasManual.push("");
@@ -8495,6 +8526,10 @@ async function parteDelDia(token) {
                [`Superan ${Math.round(_PISO_PARTE / 1000)}k vistas`, d.arriba, d.arriba ? _VERDE : _GRIS],
                [`Por debajo de ${Math.round(_PISO_PARTE / 1000)}k`, d.abajo],
                ["Sin dato de tráfico", d.sinDato, d.sinDato ? _ROJO : _GRIS],
+               ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
+                   (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
+               ...(d.sesiones ? [["Toolbar abierta", `~${Math.round((d.segundos || 0) / 60)} min · ${d.sesiones} sesiones`]] : []),
+               ...(d.desde ? [["Actividad", `${new Date(d.desde).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" })} — ${new Date(d.hasta).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" })}`]] : []),
              ])}
              ${_geoTop ? `<div style="padding-top:8px">${_geoTop}</div>` : ""}
            </div>` : ""}`
