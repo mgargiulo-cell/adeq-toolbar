@@ -8300,6 +8300,79 @@ async function parteDelDia(token) {
 //
 // Se marca 'expired', no se borra: el dominio sigue registrado (no se vuelve a descubrir
 // gastando créditos) y se puede revivir con un UPDATE si algún día hiciera falta.
+// ── "NO HOY" NO ES "NO NUNCA" (Maxi 2026-08-25) ──────────────────────────────
+// Al sacar `skipped` de los estados reintentables se arregló que AutoGoogle
+// re-descubriera cada día los mismos dominios ya juzgados. Pero eso, solo, entierra
+// para siempre a 10.480 dominios cuyo rechazo era CONDICIONAL, no definitivo:
+//   9.414 · "pageviews N below min" — el sitio puede crecer, y sobre todo NUESTRO
+//           umbral se mueve solo entre 350K y 800K (autoAjustarSegunMetricas)
+//     713 · "geo_not_priority" — la cascada de GEO cambia cuando cambia el negocio
+// Un dominio rechazado con el umbral en 800K puede cumplir de sobra con el umbral en
+// 350K. Dejarlo afuera para siempre es exactamente el error que este proyecto ya
+// cometió ocho veces, nada más que al revés: un "no bajo las condiciones de hoy"
+// convertido en un "no" permanente.
+// La solución no es reintentar todos los días (eso era el bug) sino UNA revisión
+// periódica y acotada: los más viejos vuelven a `expired`, que sí es reintentable, y
+// re-entran por las vías normales sin inundar nada.
+const REVISAR_CONDICIONALES_CADA_DIAS = 7;
+const REVISAR_CONDICIONALES_ANTIGUEDAD = 45;   // días desde que se los descartó
+const REVISAR_CONDICIONALES_LOTE = 500;        // techo por pasada: re-entran de a poco
+async function revisarDescartesCondicionales(token) {
+  try {
+    if (!(await _tocaCorrer(token, "revisar_condicionales", REVISAR_CONDICIONALES_CADA_DIAS * 24 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const cfgAhora = await getConfig(token).catch(() => null);
+    const corte = new Date(Date.now() - REVISAR_CONDICIONALES_ANTIGUEDAD * 86_400_000).toISOString();
+    // El filtro por motivo se hace en JS a propósito. Un `or=(...)` de PostgREST con
+    // valores que llevan espacios necesita comillas dobles adentro, y esta base ya nos
+    // mordió una vez con la sintaxis de los operadores lógicos. Traer un lote y filtrar
+    // acá cuesta lo mismo y no depende de acertarle a un encoding.
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.skipped&uploaded_at=lt.${encodeURIComponent(corte)}&select=id,error_message&order=uploaded_at.asc&limit=1500`,
+      { headers: auth });
+    if (!r.ok) { log(`⚠️ revisarDescartesCondicionales: no pude leer (${r.status})`); return; }
+    const _todas = await r.json().catch(() => []);
+    // Solo los motivos que dependen de una condición que cambia. Un "gobierno", un
+    // "e-commerce" o un "dominio muerto" NO entran acá: esos no cambian.
+    // Y no todos los "tráfico bajo" merecen una segunda mirada: un sitio con 2.593 vistas
+    // no va a cumplir un umbral de 400.000 por más que pase un año, y liberarlo gasta un
+    // lugar de la cola y una llamada a la API para volver a rechazarlo. El motivo guarda
+    // el número, así que solo vuelven los que estaban CERCA (la mitad del umbral de hoy).
+    // Los de GEO no llevan número y vuelven todos: ahí lo que cambió es nuestra política.
+    const _umbralHoy = parseInt(cfgAhora?.agent_threshold_traffic || "400000", 10) || 400000;
+    const _mereceOtraMirada = (msg) => {
+      const m = String(msg || "");
+      // Nunca fue un veredicto: no pudimos mirarlo. Estos vuelven siempre.
+      if (/quota|cuota|\b429\b|timeout|unknown|sin datos|no data/i.test(m)) return true;
+      if (/geo_not_priority/i.test(m)) return true;
+      if (!/below min/i.test(m)) return false;
+      const pv = parseInt((m.match(/pageviews\s+(\d+)/i) || [])[1] || "0", 10);
+      return pv >= _umbralHoy * 0.5;
+    };
+    const filas = (Array.isArray(_todas) ? _todas : [])
+      .filter(f => _mereceOtraMirada(f.error_message))
+      .slice(0, REVISAR_CONDICIONALES_LOTE);
+    if (!filas.length) {
+      await saludPing(token, "revisar_condicionales", { status: "ok", cadenciaMin: REVISAR_CONDICIONALES_CADA_DIAS * 24 * 60, detalle: "no hay descartes condicionales viejos" });
+      return;
+    }
+    const ids = filas.map(f => f.id).filter(Boolean);
+    // `expired` y no `pending`: vuelven a estar disponibles para el descubrimiento, pero
+    // no se cuelan de prepo en la cola ni le sacan el lugar a lo que se descubrió hoy.
+    const p = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})`, {
+      method: "PATCH",
+      headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: "expired", error_message: "revisión periódica: el motivo del descarte era condicional (tráfico/GEO) y ya pasaron 90 días" }),
+    });
+    if (!p.ok) { log(`⚠️ revisarDescartesCondicionales: el PATCH falló (${p.status})`); return; }
+    log(`♻️ ${ids.length} descartes condicionales liberados para re-descubrimiento (tráfico/GEO, +90 días)`);
+    await saludPing(token, "revisar_condicionales", {
+      status: "ok", cadenciaMin: REVISAR_CONDICIONALES_CADA_DIAS * 24 * 60,
+      detalle: `${ids.length} liberados`, real: ids.length, esperado: ids.length,
+    });
+  } catch (e) { log(`⚠️ revisarDescartesCondicionales: ${e.message}`); }
+}
+
 const COLA_CADUCIDAD_DIAS = 30;
 async function caducarColaVieja(token) {
   const cfg = await getConfig(token);
@@ -21122,6 +21195,8 @@ async function main() {
         // el feeder lo ve en ESTA misma vuelta y vuelve a traer dominios de inmediato, en vez
         // de perder un ciclo.
         await caducarColaVieja(token).catch(e => log(`⚠️ caducidad cola: ${e.message}`));
+        // Antes del feeder, por lo mismo: lo que se libera ahora está disponible en esta vuelta.
+        await revisarDescartesCondicionales(token).catch(e => log(`⚠️ revisión condicionales: ${e.message}`));
         await maybeRunFeederSlot(token).catch(e => log(`⚠️ feeder slot: ${e.message}`));
         await maybeStartAutopilotSlot(token).catch(e => log(`⚠️ autopilot slot: ${e.message}`));
         await maybeRunAutoGoogleSlot(token).catch(e => log(`⚠️ autogoogle slot: ${e.message}`));
