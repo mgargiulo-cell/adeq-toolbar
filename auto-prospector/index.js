@@ -7889,11 +7889,17 @@ async function parteDelDia(token) {
   let mbs = [];
   try { mbs = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
   const lineasEnvio = [];
+  const envioPorMb = [];        // mismo dato que lineasEnvio pero sin formatear — lo usa la versión HTML
   let totalEnviado = 0;
   for (const mb of mbs) {
-    const n = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mb)}&action=eq.sent&created_at=gte.${desdeHoy}&select=id`);
+    // `details->>ui_origin=is.null` deja AFUERA los envíos manuales del MB. Regla del user:
+    // estas métricas son del AGENTE, no del trabajo a mano. Hasta hoy el filtro no hacía
+    // falta porque el registro manual estaba roto por RLS y no llegaba ninguna fila; una
+    // vez arreglado, sin este filtro un MB que manda 8 a mano aparecería cumpliendo el día.
+    const n = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mb)}&action=eq.sent&created_at=gte.${desdeHoy}&details->>ui_origin=is.null&select=id`);
     totalEnviado += n;
     lineasEnvio.push(`   ${n >= OBJETIVO_POR_MB ? "✅" : "🔴"} ${mb.split("@")[0]}: ${n}/${OBJETIVO_POR_MB}`);
+    envioPorMb.push({ mb: mb.split("@")[0], n });
   }
   const objetivoTotal = mbs.length * OBJETIVO_POR_MB;
 
@@ -8016,6 +8022,76 @@ async function parteDelDia(token) {
   if (backlog >= CSV_QUEUE_HALT_HIGH) problemas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): el feeder está frenado hasta que drene.`);
   if (conEmail < objetivoTotal * 2) problemas.push(`Quedan ${conEmail} contactables: menos de 2 días de envíos. Hay ${sinEmail} sin email esperando que se los busque.`);
 
+  // ── PARTE 2: EL TRABAJO A MANO DE CADA MB (Maxi 2026-08-25, pedido del user) ─────────
+  // Todo lo de arriba es del AGENTE. Esto es lo otro: qué hizo cada persona a mano hoy.
+  // Tres registros distintos, cada uno cuenta una cosa y ninguno cuenta las tres:
+  //   · toolbar_agent_actions (ui_origin=toolbar_manual) → el MAIL que salió, y a quién.
+  //   · toolbar_historial (source=manual)                → el SITIO que miró, con geo.
+  //   · toolbar_import_attempts                          → las cargas masivas que hizo.
+  // Ojo con el primero: estuvo roto por RLS (faltaba la policy de INSERT) hasta el 25/08,
+  // así que antes de esa fecha va a figurar en cero aunque hayan mandado.
+  const _NOMBRE_MB = { max: "Maximiliano", maxi: "Maximiliano", mgargiulo: "Maximiliano",
+                       agus: "Agustina", agustina: "Agustina", sales: "Agustina",
+                       diego: "Diego", dhorovitz: "Diego" };
+  const _quien = (s) => {
+    const k = String(s || "").split("@")[0].trim().toLowerCase();
+    return _NOMBRE_MB[k] || (k ? k.charAt(0).toUpperCase() + k.slice(1) : "sin identificar");
+  };
+  const _porPersona = new Map();
+  const _fila = (n) => {
+    if (!_porPersona.has(n)) _porPersona.set(n, { enviados: [], mirados: 0, conEmail: 0, geos: new Map(), imports: 0, importados: 0 });
+    return _porPersona.get(n);
+  };
+
+  // Los mails que de verdad salieron a mano.
+  const _manuales = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=eq.toolbar_manual&created_at=gte.${desdeHoy}&select=user_email,domain,email_to,created_at&order=created_at.asc&limit=500`,
+    { headers: auth }
+  ).then(r => r.ok ? r.json() : []).catch(() => []);
+  for (const m of (Array.isArray(_manuales) ? _manuales : [])) {
+    _fila(_quien(m.user_email)).enviados.push({ dominio: m.domain || "?", email: m.email_to || "" });
+  }
+
+  // Los sitios que miraron (con geo). No todos terminan en un envío.
+  const _hist = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo&limit=2000`,
+    { headers: auth }
+  ).then(r => r.ok ? r.json() : []).catch(() => []);
+  for (const h of (Array.isArray(_hist) ? _hist : [])) {
+    const f = _fila(_quien(h.media_buyer));
+    f.mirados++;
+    if (String(h.email || "").includes("@")) f.conEmail++;
+    const g = String(h.geo || "").trim();
+    if (g) f.geos.set(g, (f.geos.get(g) || 0) + 1);
+  }
+
+  // Las cargas masivas (sellers.json, Monday, CSV) que hizo cada uno a mano.
+  const _imports = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_import_attempts?at=gte.${desdeHoy}&select=user_email,source,inserted_count&limit=500`,
+    { headers: auth }
+  ).then(r => r.ok ? r.json() : []).catch(() => []);
+  for (const i of (Array.isArray(_imports) ? _imports : [])) {
+    const f = _fila(_quien(i.user_email));
+    f.imports++;
+    f.importados += parseInt(i.inserted_count || 0, 10) || 0;
+  }
+
+  const _personas = [..._porPersona.entries()].sort((a, b) => (b[1].enviados.length + b[1].mirados) - (a[1].enviados.length + a[1].mirados));
+  const _lineasManual = [];
+  if (!_personas.length) {
+    _lineasManual.push("   Hoy nadie usó la toolbar a mano (o el registro no llegó).");
+  } else {
+    for (const [nombre, d] of _personas) {
+      const _geoTop = [...d.geos.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([g, n]) => `${g} ${n}`).join(", ");
+      _lineasManual.push(`   ${nombre.toUpperCase()} — ${d.enviados.length} mail(s) · ${d.mirados} sitio(s) mirado(s)${d.imports ? ` · ${d.imports} import(s) (${d.importados} cargados)` : ""}`);
+      if (_geoTop) _lineasManual.push(`      GEO: ${_geoTop}`);
+      for (const e of d.enviados.slice(0, 25)) _lineasManual.push(`      → ${e.dominio}${e.email ? `  ·  ${e.email}` : "  ·  (sin email registrado)"}`);
+      if (d.enviados.length > 25) _lineasManual.push(`      … y ${d.enviados.length - 25} más`);
+      if (!d.enviados.length && d.mirados) _lineasManual.push(`      Miró ${d.mirados} sitios (${d.conEmail} con email) pero no salió ningún mail.`);
+      _lineasManual.push("");
+    }
+  }
+
   const ok = problemas.length === 0;
   const cuerpo = [
     ok ? "Todo en orden." : "⚠️ Hay cosas que revisar.",
@@ -8060,8 +8136,121 @@ async function parteDelDia(token) {
     ] : []),
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
     "",
+    "════════════════════════════════════════════",
+    "PARTE 2 — EL TRABAJO A MANO DE CADA MB",
+    "════════════════════════════════════════════",
+    ...(_lineasManual),
     `— Parte diario de la ADEQ Toolbar · ${hoy}`,
   ].join("\n");
+
+  // ── LA VERSIÓN VISUAL ────────────────────────────────────────────────────────────────
+  // Mismo contenido que el texto de arriba, ordenado para leerlo de un vistazo en el
+  // teléfono. Estilos INLINE a propósito: Gmail descarta los <style> del <head>.
+  // El texto plano se manda igual — es lo que ve un cliente sin HTML, y que las dos
+  // partes digan lo mismo es lo que evita que el multipart huela a spam.
+  const _e = (s) => String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const _VERDE = "#0f9d58", _ROJO = "#d93025", _GRIS = "#5f6368", _BORDE = "#e8eaed";
+  const _card = (titulo, dentro, color = "#202124") =>
+    `<div style="border:1px solid ${_BORDE};border-radius:10px;margin:0 0 14px 0;overflow:hidden">
+       <div style="background:#f8f9fa;padding:9px 14px;font:600 13px/1.3 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${color};border-bottom:1px solid ${_BORDE}">${titulo}</div>
+       <div style="padding:12px 14px;font:14px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#202124">${dentro}</div>
+     </div>`;
+  const _kv = (filas) =>
+    `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse">${
+      filas.map(([k, v, col]) => `<tr>
+        <td style="padding:4px 0;color:${_GRIS};font:13px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif">${_e(k)}</td>
+        <td style="padding:4px 0;text-align:right;font:600 14px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${col || "#202124"}">${_e(v)}</td>
+      </tr>`).join("")
+    }</table>`;
+
+  const _htmlEnvios = `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse">${
+    envioPorMb.map(({ mb, n }) => {
+      const bien = n >= OBJETIVO_POR_MB;
+      const pct = Math.min(100, Math.round((n / Math.max(1, OBJETIVO_POR_MB)) * 100));
+      return `<tr>
+        <td style="padding:5px 0;font:13px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif;width:34%">${_e(mb)}</td>
+        <td style="padding:5px 8px">
+          <div style="background:#eceff1;border-radius:6px;height:8px;width:100%">
+            <div style="background:${bien ? _VERDE : _ROJO};border-radius:6px;height:8px;width:${pct}%"></div>
+          </div>
+        </td>
+        <td style="padding:5px 0;text-align:right;font:600 13px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${bien ? _VERDE : _ROJO};width:20%">${n}/${OBJETIVO_POR_MB}</td>
+      </tr>`;
+    }).join("")
+  }</table>`;
+
+  const _htmlPersonas = _personas.length
+    ? _personas.map(([nombre, d]) => {
+        const _geoTop = [...d.geos.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4)
+          .map(([g, n]) => `<span style="display:inline-block;background:#f1f3f4;border-radius:10px;padding:2px 9px;margin:0 4px 4px 0;font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS}">${_e(g)} · ${n}</span>`).join("");
+        const _tabla = d.enviados.length
+          ? `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin-top:8px">
+               <tr>
+                 <td style="padding:5px 6px 5px 0;border-bottom:1px solid ${_BORDE};font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px">Web</td>
+                 <td style="padding:5px 0;border-bottom:1px solid ${_BORDE};font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px">Email</td>
+               </tr>
+               ${d.enviados.slice(0, 40).map(e => `<tr>
+                 <td style="padding:5px 6px 5px 0;border-bottom:1px solid #f5f5f5;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;word-break:break-all">${_e(e.dominio)}</td>
+                 <td style="padding:5px 0;border-bottom:1px solid #f5f5f5;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${e.email ? "#1a73e8" : _GRIS};word-break:break-all">${e.email ? _e(e.email) : "sin email registrado"}</td>
+               </tr>`).join("")}
+             </table>
+             ${d.enviados.length > 40 ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:6px">… y ${d.enviados.length - 40} más</div>` : ""}`
+          : `<div style="font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};margin-top:6px">No salió ningún mail a mano.${d.mirados ? ` Miró ${d.mirados} sitios (${d.conEmail} con email).` : ""}</div>`;
+        return _card(
+          `${_e(nombre)} · ${d.enviados.length} mail(s) · ${d.mirados} sitio(s)${d.imports ? ` · ${d.imports} import(s)` : ""}`,
+          `${_geoTop ? `<div style="margin-bottom:4px">${_geoTop}</div>` : ""}${_tabla}`
+        );
+      }).join("")
+    : _card("Sin actividad manual", `<div style="color:${_GRIS}">Hoy nadie usó la toolbar a mano, o el registro no llegó.</div>`);
+
+  const _htmlParte = `
+<div style="max-width:640px;margin:0 auto;padding:4px 2px;background:#ffffff">
+  <div style="padding:2px 2px 14px 2px">
+    <div style="font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};letter-spacing:1.2px;text-transform:uppercase">ADEQ Toolbar · ${_e(hoy)}</div>
+    <div style="font:700 26px/1.2 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${ok ? _VERDE : _ROJO};padding-top:4px">${ok ? "Todo en orden" : "Hay cosas que revisar"}</div>
+  </div>
+
+  <div style="font:700 12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};letter-spacing:1px;padding:2px 0 8px 2px">PARTE 1 · CÓMO ANDUVO EL AGENTE</div>
+
+  ${_card(`Envíos del agente — ${totalEnviado}/${objetivoTotal}`, _htmlEnvios, ok ? _VERDE : _ROJO)}
+
+  ${_card("De dónde salieron las altas de hoy", _kv([
+    ["Import (sellers.json, CSV)", altaImport],
+    ["Autopilot (similares, Majestic)", altaAutopilot],
+    ["AutoGoogle", altaAutogoogle],
+    ["Monday finalizados reciclados", altaMonday],
+    ...(altaOtros > 0 ? [["Otras fuentes", altaOtros]] : []),
+    ["Total de altas del día", altasHoy],
+  ]))}
+
+  ${_card("El pool hoy", _kv([
+    ["Contactables (con email)", `${conEmail}  ·  ~${diasDeStock} días de envíos`, conEmail < objetivoTotal * 2 ? _ROJO : _VERDE],
+    ["Sin email todavía", sinEmail],
+    ["En cola esperando", backlog],
+    ["Sacadas de Prospects por no cumplir", purgadas],
+    ["Emails encontrados hoy (no tenían)", emailsHallados],
+  ]))}
+
+  ${lineasFuente.length ? _card("Rendimiento por fuente (7 días)",
+    `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasFuente.join("\n"))}</pre>
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Menos de 10% que pasan = esa fuente gasta créditos para nada.</div>`) : ""}
+
+  ${_kwTop.length ? _card("AutoGoogle — qué búsquedas funcionan",
+    `${_agStats ? `<div style="font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-bottom:8px">Último slot ${_e(_agStats.slot)}: ${_agStats.searches} búsquedas → ${_agStats.found} encontrados → <b style="color:${_agStats.inserted > 0 ? _VERDE : _ROJO}">${_agStats.inserted} nuevos</b></div>` : ""}
+     ${_kwTop.map(k => `<div style="padding:2px 0;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif"><span style="color:${_VERDE}">●</span> ${_e(String(k.phrase).slice(0, 44))} — <b>${k.qualified}</b> útiles en ${k.searches}</div>`).join("")}
+     ${_kwMal.map(k => `<div style="padding:2px 0;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif"><span style="color:${_ROJO}">●</span> ${_e(String(k.phrase).slice(0, 44))} — 0 útiles en ${k.searches}</div>`).join("")}`) : ""}
+
+  ${problemas.length ? `<div style="border-left:4px solid ${_ROJO};background:#fdf2f1;border-radius:0 8px 8px 0;padding:12px 14px;margin:0 0 14px 0">
+     <div style="font:600 13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_ROJO};padding-bottom:6px">Qué revisar</div>
+     ${problemas.map(p => `<div style="font:13px/1.55 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#202124;padding:3px 0">• ${_e(p)}</div>`).join("")}
+   </div>` : ""}
+
+  <div style="font:700 12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};letter-spacing:1px;padding:14px 0 8px 2px;border-top:1px solid ${_BORDE};margin-top:6px">PARTE 2 · CÓMO TRABAJÓ CADA MB A MANO</div>
+  ${_htmlPersonas}
+
+  <div style="font:11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#9aa0a6;padding:8px 2px 0 2px">Parte diario de la ADEQ Toolbar · ${_e(hoy)}</div>
+</div>`;
 
   const dest = (cfg.security_alert_email || "mgargiulo@adeqmedia.com").trim();
   try {
@@ -8069,6 +8258,7 @@ async function parteDelDia(token) {
       to: dest,
       subject: `Toolbar ${hoy} — ${ok ? `✅ ${totalEnviado}/${objetivoTotal} envíos` : `⚠️ ${totalEnviado}/${objetivoTotal} envíos`}`,
       body: cuerpo,
+      htmlPropio: _htmlParte,
       agentActionId: null,
       esProspeccion: false,
     });
@@ -16123,7 +16313,7 @@ function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, esProspe
   return { ok: bloqueantes.length === 0, bloqueantes, avisos };
 }
 
-async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null, esProspeccion = true }) {
+async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null, esProspeccion = true, htmlPropio = "" }) {
   // Sanitización final del destinatario: aunque venga del review_queue, de un
   // reintento o de un email viejo/manual, acá lo limpiamos (saca %, control chars,
   // basura al inicio). Si queda inválido, NO enviamos (evita el caso "%hector@...").
@@ -16183,7 +16373,13 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
   const _firmaTexto = signatureHtml ? "\n\n" + _htmlATexto(signatureHtml) : "";
   const cuerpoTexto = `${body}${_firmaTexto}${_pieBaja}`;
   const _pieHtml = _pieBaja ? `\n<p style="color:#888;font-size:12px">${_pieBaja.trim().replace(/^--\n/, "")}</p>` : "";
-  const htmlBody = `${_textToHtmlServer(body)}${signatureHtml ? "\n<br/>\n" + signatureHtml : ""}${_pieHtml}${trackingPixel ? "\n" + trackingPixel : ""}`;
+  // `htmlPropio` (Maxi 2026-08-25): SOLO para correo interno (parte diario). Deja armar
+  // una versión HTML de verdad —tablas, colores— en vez de la conversión automática del
+  // texto. La parte plana sigue siendo `body`, así que las dos partes siguen diciendo lo
+  // mismo. Prohibido en prospección: ahí el texto y el HTML tienen que ser el mismo
+  // contenido palabra por palabra, que es lo que mira el filtro de spam.
+  const _htmlDelCuerpo = (htmlPropio && !esProspeccion) ? htmlPropio : _textToHtmlServer(body);
+  const htmlBody = `${_htmlDelCuerpo}${signatureHtml ? "\n<br/>\n" + signatureHtml : ""}${_pieHtml}${trackingPixel ? "\n" + trackingPixel : ""}`;
 
   const boundary = `----=adeq_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   const mime = [

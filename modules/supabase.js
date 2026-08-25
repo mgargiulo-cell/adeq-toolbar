@@ -293,6 +293,29 @@ export async function createManualSendTracking(accessToken, payload) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
+/**
+ * Corrige una fila de tracking cuando el envío NO salió.
+ * La fila se inserta ANTES de mandar porque el píxel de open necesita su id, así que
+ * un rechazo de Gmail dejaba un "sent" fantasma que después inflaba el parte diario.
+ * Maxi 2026-08-25.
+ */
+export async function markManualSendFailed(accessToken, actionId, motivo = "") {
+  const url = CONFIG.SUPABASE_URL;
+  const key = CONFIG.SUPABASE_ANON_KEY;
+  if (!accessToken || !actionId) return { ok: false, error: "auth required" };
+  try {
+    const res = await fetch(`${url}/rest/v1/toolbar_agent_actions?id=eq.${encodeURIComponent(actionId)}`, {
+      method: "PATCH",
+      headers: {
+        "apikey": key, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({ action: "failed", reason: String(motivo || "").slice(0, 300) }),
+    });
+    return res.ok ? { ok: true } : { ok: false, status: res.status };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 // ── Email Futuro / Reengagement queue ─────────────────────────
 // Encola un email "futuro" para que el agente lo envíe a los 11d si el
 // primer email no fue abierto. Update Monday columns: email + FU1 + FU2.

@@ -26,7 +26,7 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          setDomainGeo, getDomainGeo }                                                          from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
-import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, isEmailBounced } from "../modules/supabase.js";
+import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, markManualSendFailed, isEmailBounced } from "../modules/supabase.js";
 import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -5570,6 +5570,13 @@ async function bindButtons() {
 
     btn.textContent = "⏳ Sending...";
     const result = await sendEmail({ to: email, subject, body: bodyToSend, expectedFrom: state.loginEmail });
+
+    // La fila de tracking se escribe ANTES de mandar (hace falta su id para armar el
+    // píxel). Si Gmail después rechaza el envío, esa fila queda diciendo "sent" y el
+    // parte diario cuenta de más. Maxi 2026-08-25: si no salió, se corrige la fila.
+    if (!result.ok && trackingActionId) {
+      markManualSendFailed(state.accessToken, trackingActionId, result.error || "gmail error").catch(() => {});
+    }
 
     if (result.ok) {
       state.emailSentInSession = true; // unlock el push a Monday
