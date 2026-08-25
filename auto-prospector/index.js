@@ -7973,7 +7973,7 @@ async function parteDelDia(token) {
   // era invisible: no había forma de ver qué está funcionando sin entrar a la base.
   // Se muestran las 3 mejores y las peores, que es lo que permite decidir si el motor
   // está aprendiendo bien o girando sobre frases que no traen nada.
-  let _kwTop = [], _kwMal = [];
+  let _kwTop = [], _kwMal = [], _kwSinNinguna = 0;
   try {
     const kws = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.3&select=phrase,searches,fresh,qualified&order=qualified.desc&limit=200`,
@@ -7983,8 +7983,19 @@ async function parteDelDia(token) {
       const conRatio = kws.map(k => ({
         ...k, ratio: k.searches ? (k.qualified || 0) / k.searches : 0,
       })).sort((a, b) => b.ratio - a.ratio);
-      _kwTop = conRatio.slice(0, 3);
-      _kwMal = conRatio.filter(k => (k.qualified || 0) === 0 && k.searches >= 5).slice(0, 3);
+      // Maxi 2026-08-25: la verde exige qualified > 0. Antes era el top 3 a secas, así que
+      // cuando NINGUNA frase calificaba —que es justo lo que pasaba con la atribución rota—
+      // el mail listaba la misma frase con ✅ y con 🔴 al mismo tiempo. Un reporte que se
+      // contradice solo deja de leerse, y este era el único lugar donde se veía que el
+      // motor no estaba aprendiendo nada.
+      _kwTop = conRatio.filter(k => (k.qualified || 0) > 0).slice(0, 3);
+      const _yaVerdes = new Set(_kwTop.map(k => k.phrase));
+      _kwMal = conRatio.filter(k => (k.qualified || 0) === 0 && k.searches >= 5 && !_yaVerdes.has(k.phrase)).slice(0, 3);
+      // Ninguna frase calificó nunca: eso NO es "no hay datos", es una señal de que la
+      // cadena está cortada entre la búsqueda y Prospects. Se dice con todas las letras.
+      if (!_kwTop.length && kws.length >= 10) {
+        _kwSinNinguna = kws.length;
+      }
     }
   } catch {}
   let _agStats = null;
@@ -8018,6 +8029,7 @@ async function parteDelDia(token) {
       .filter(([, n]) => n === 0).map(([m]) => m);
     if (_mudos.length) problemas.push(`Hoy no trajo nada: ${_mudos.join(", ")}. Los demás sí, así que no es una caída general.`);
   }
+  if (_kwSinNinguna) problemas.push(`Ninguna de las ${_kwSinNinguna} búsquedas de AutoGoogle califica un solo lead. No es que las frases sean malas: la cadena está cortada entre la búsqueda y Prospects.`);
   if (sinEmail > 0 && emailsHallados === 0) problemas.push(`Hay ${sinEmail} leads sin email y hoy no se recuperó ninguno — revisar si la búsqueda de contactos está corriendo.`);
   if (backlog >= CSV_QUEUE_HALT_HIGH) problemas.push(`La cola tiene ${backlog} pendientes (tope ${CSV_QUEUE_HALT_HIGH}): el feeder está frenado hasta que drene.`);
   if (conEmail < objetivoTotal * 2) problemas.push(`Quedan ${conEmail} contactables: menos de 2 días de envíos. Hay ${sinEmail} sin email esperando que se los busque.`);
@@ -8116,9 +8128,10 @@ async function parteDelDia(token) {
       ...lineasFuente,
       `   Menos de 10% que pasan = esa fuente está gastando créditos para nada.`,
     ] : []),
-    ...(_kwTop.length ? [
+    ...((_kwTop.length || _kwMal.length || _kwSinNinguna) ? [
       ``,
       `AUTOGOOGLE — qué búsquedas están funcionando`,
+      ...(_kwSinNinguna ? [`   🔴 Ninguna de las ${_kwSinNinguna} frases califica un lead — la cadena está cortada, no son las frases.`] : []),
       ...(_agStats ? [`   Último slot ${_agStats.slot}: ${_agStats.searches} búsquedas → ${_agStats.found} encontrados → ${_agStats.inserted} nuevos`] : []),
       ...(_kwTop.map(k => `   ✅ "${String(k.phrase).slice(0, 44)}" — ${k.qualified} útiles en ${k.searches} búsquedas`)),
       ...(_kwMal.length ? _kwMal.map(k => `   🔴 "${String(k.phrase).slice(0, 44)}" — 0 útiles en ${k.searches} búsquedas`) : []),
@@ -8236,8 +8249,9 @@ async function parteDelDia(token) {
     `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasFuente.join("\n"))}</pre>
      <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Menos de 10% que pasan = esa fuente gasta créditos para nada.</div>`) : ""}
 
-  ${_kwTop.length ? _card("AutoGoogle — qué búsquedas funcionan",
+  ${(_kwTop.length || _kwMal.length || _kwSinNinguna) ? _card("AutoGoogle — qué búsquedas funcionan",
     `${_agStats ? `<div style="font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-bottom:8px">Último slot ${_e(_agStats.slot)}: ${_agStats.searches} búsquedas → ${_agStats.found} encontrados → <b style="color:${_agStats.inserted > 0 ? _VERDE : _ROJO}">${_agStats.inserted} nuevos</b></div>` : ""}
+     ${_kwSinNinguna ? `<div style="padding:2px 0;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_ROJO}">Ninguna de las ${_kwSinNinguna} frases califica un lead — la cadena está cortada, no son las frases.</div>` : ""}
      ${_kwTop.map(k => `<div style="padding:2px 0;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif"><span style="color:${_VERDE}">●</span> ${_e(String(k.phrase).slice(0, 44))} — <b>${k.qualified}</b> útiles en ${k.searches}</div>`).join("")}
      ${_kwMal.map(k => `<div style="padding:2px 0;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif"><span style="color:${_ROJO}">●</span> ${_e(String(k.phrase).slice(0, 44))} — 0 útiles en ${k.searches}</div>`).join("")}`) : ""}
 
