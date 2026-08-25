@@ -13365,7 +13365,35 @@ async function pickNextEmailCandidate(token, domain, excludeEmails = []) {
       const score = rankEmail(e, domain, lead.category || "");
       return score >= 0;
     });
-    if (!filtered.length) return null;
+    if (!filtered.length) {
+      // ⚠️ "NO TENGO OTRO EMAIL GUARDADO" ≠ "NO HAY OTRO EMAIL" (Maxi 2026-08-25).
+      // Acá se devolvía null y el reenganche marcaba el dominio `reengagement_exhausted`,
+      // que lo excluye PARA SIEMPRE. Pero solo se habían mirado los emails que ya estaban
+      // en la ficha: nunca se salía a buscar uno nuevo, que es exactamente lo que sí hace
+      // el reintento por rebote. El North Star es garantizar al menos un email por
+      // prospecto; agotarlo sin haber buscado es lo contrario.
+      // Búsqueda gratis (scrape del sitio) antes de darlo por perdido. Si aparece algo,
+      // se guarda en la ficha para que lo aprovechen también los demás caminos.
+      try {
+        const _nuevos = await scrapeEmailsForDomain(domain).catch(() => []);
+        const _utiles = [...new Set(_nuevos)]
+          .filter(e => !excludeEmails.includes(String(e).toLowerCase()))
+          .filter(e => !isBouncedSync(e))
+          .filter(e => _brandMatches(e, domain, "scrape"))
+          .filter(e => rankEmail(e, domain, lead.category || "") >= 0);
+        if (_utiles.length) {
+          log(`  🔍 ${domain}: no había alternativo guardado, pero el scrape encontró ${_utiles.length} → sigo`);
+          const _todos = [...new Set([...emails, ..._utiles])];
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ emails: _todos }),
+          }).catch(() => {});
+          return { email: _utiles[0], lead: { ...lead, emails: _todos } };
+        }
+      } catch (e) { log(`  ⚠️ ${domain}: no pude buscar un email alternativo (${e.message}) — no lo doy por agotado`); return null; }
+      return null;
+    }
     return { email: filtered[0], lead };
   } catch (e) {
     log(`⚠️ pickNextEmailCandidate ${domain}: ${e.message}`);
@@ -17729,6 +17757,12 @@ async function runAgentCycle(token, allFlags) {
   // mitad, el reintento volvía a empezar por agentUsers[0] y le daba otro batch, así
   // que el último del array podía no ser alcanzado NUNCA: el orden del array decidía
   // quién cobraba. Ahora se atiende primero al que está más atrasado contra su cupo.
+  // ⚠️ LIMPIAR ANTES DE CONTAR EL CUPO (Maxi 2026-08-25). La limpieza de reservas huérfanas
+  // corre una vez por vuelta del bucle, pero el momento en que el número IMPORTA es este:
+  // acá se mide cuánto le falta a cada buzón y se decide a quién atender. Con reservas
+  // colgadas sin barrer, un MB figura con el cupo más lleno de lo que está y pierde su turno.
+  // Es barato: un PATCH que casi siempre matchea cero filas.
+  await limpiarReservasHuerfanas(token).catch(() => {});
   const _ordenMbs = [];
   for (const u of allFlags.agentUsers) {
     const _cap = perUserCap[u.toLowerCase()] ?? _agentCfg(cfg).maxPerDay;

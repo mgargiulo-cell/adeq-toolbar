@@ -5584,7 +5584,7 @@ async function bindButtons() {
       const today = new Date().toISOString().split("T")[0];
       // Persistir el envío para tracking/historial (sin generar follow-ups,
       // los hace el CRM externo).
-      await saveSendDate(state.domain, { sendDate: today, pitch, email }).catch(() => {});
+      await saveSendDate(state.domain, { sendDate: today, pitch, email, mbEmail: state.loginEmail }).catch(() => {});
       // Marcar review_queue items de este dominio como contactados — desaparecen
       // de Prospects inmediato (otros MBs no los van a re-contactar).
       markReviewQueueAsContacted(state.accessToken, state.domain, state.loginEmail).catch(() => {});

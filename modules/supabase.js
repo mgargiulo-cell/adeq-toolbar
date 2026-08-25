@@ -1259,7 +1259,7 @@ export async function saveTrafficCache(domain, data) {
 // Tabla: toolbar_sendtrack — historial de pitches enviados por dominio.
 // (Los follow-ups los maneja el CRM externo, no la toolbar.)
 // ============================================================
-export async function saveSendDate(domain, { sendDate, pitch, email }) {
+export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail }) {
   const { sendtrack = {} } = await chrome.storage.local.get("sendtrack");
   sendtrack[domain] = { sendDate, pitch, email };
   await chrome.storage.local.set({ sendtrack });
@@ -1267,7 +1267,12 @@ export async function saveSendDate(domain, { sendDate, pitch, email }) {
   const { url, key } = await getConfig();
   if (url && key) {
     try {
-      await fetch(`${url}/rest/v1/toolbar_sendtrack`, {
+      // ⚠️ ANTES NO SE MIRABA LA RESPUESTA Y NO SE DECÍA DE QUIÉN ERA EL ENVÍO
+      // (Maxi 2026-08-25). `toolbar_sendtrack` es la única prueba de que a un dominio ya se
+      // le escribió —la usa el guard de "no re-contactar en 30 días"—, pero no guardaba el
+      // media buyer, así que no se podía atribuir un envío a nadie. Y si el insert fallaba,
+      // el envío quedaba sin registrar y el guard podía dejar que se le escribiera dos veces.
+      const res = await fetch(`${url}/rest/v1/toolbar_sendtrack`, {
         method: "POST",
         headers: {
           "Content-Type":  "application/json",
@@ -1280,12 +1285,21 @@ export async function saveSendDate(domain, { sendDate, pitch, email }) {
           send_date: sendDate,
           pitch:     pitch || "",
           email:     email || "",
+          mb_email:  (mbEmail || "").toLowerCase() || null,
         }),
       });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        console.warn("SendTrack save rechazado:", res.status, txt.slice(0, 200));
+        return { ok: false, status: res.status };
+      }
+      return { ok: true };
     } catch (err) {
       console.warn("SendTrack save failed:", err.message);
+      return { ok: false, error: err.message };
     }
   }
+  return { ok: false, error: "sin config" };
 }
 
 // ── CSV Queue — batch de dominios a procesar por el auto-prospector ───
