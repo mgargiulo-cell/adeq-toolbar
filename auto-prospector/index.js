@@ -11795,7 +11795,29 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     if (processed % 5 === 0) { try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {} }
 
     try {
-      await processCsvItem(token, item, cfg, apolloUsage, callsRef);
+      // ⚠️ TECHO DE TIEMPO POR DOMINIO (Maxi 2026-08-25). Railway reinicia el worker cada
+      // ~7 min por el tope de memoria, y al reiniciar los items en `processing` vuelven a
+      // `pending`. Si un dominio tarda más que eso —y el camino completo scrapea, consulta
+      // Apollo, MillionVerifier y Serper— nunca termina: se reclama, el worker muere, vuelve
+      // a pending, y otra vez. La cola gira en el vacío con 200 pendientes y CERO altas.
+      // Pasó exactamente eso al arreglar `pub is not defined`: los items dejaron de morir
+      // temprano y empezaron a recorrer el camino largo por primera vez.
+      // Con 4 minutos entran holgados varios por vuelta. Si uno se pasa, se marca y sigue
+      // el próximo: un dominio lento no puede bloquear a los 200 que tiene detrás.
+      const _TECHO_ITEM_MS = 4 * 60 * 1000;
+      try {
+        await Promise.race([
+          processCsvItem(token, item, cfg, apolloUsage, callsRef),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("item_timeout_4min")), _TECHO_ITEM_MS)),
+        ]);
+      } catch (e) {
+        if (String(e.message) === "item_timeout_4min") {
+          log(`  ⏱ ${item.domain}: pasó los 4 min — se marca y sigue el próximo (no bloquea la cola)`);
+          await markCsvItem(token, item.id, "error", { error_message: "item_timeout_4min: tardó más que la vida del worker" }).catch(() => {});
+        } else {
+          throw e;
+        }
+      }
     } catch (e) {
       await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500) });
       log(`  ❌ ${item.domain} — uncaught: ${e.message}`);
