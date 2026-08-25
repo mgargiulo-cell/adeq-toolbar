@@ -8501,7 +8501,15 @@ async function limpiarReservasHuerfanas(token) {
           "Content-Type": "application/json",
           "Prefer": "return=representation",
         },
-        body: JSON.stringify({ action: "failed", reason: "orphaned_reserve_crash_recovery" }),
+        // ⚠️ `reserve_expired`, NO `failed` (Maxi 2026-08-25). Una reserva que quedó
+        // colgada NO es un envío fallido: es contabilidad. Medido hoy: 104 huérfanas
+        // sobre 26 dominios —el mismo lead reservado 4 veces— y las 104 tenían otra
+        // fila del mismo día, o sea que el lead SÍ se había resuelto bien.
+        // Llamarlas "failed" hacía que `checkAgentKillSwitch` viera 100% de fallos y
+        // pausara al agente una hora. Se disparó cinco veces el 19 y el resultado fue
+        // el 20 y el 21 con CERO envíos. El patrón de siempre: "no pude confirmar"
+        // tratado como "falló".
+        body: JSON.stringify({ action: "reserve_expired", reason: "orphaned_reserve_crash_recovery" }),
       }
     );
     if (r.ok) {
@@ -14540,19 +14548,47 @@ async function getAgentDailyTotalSends(token, userEmail) {
 // Kill switch: si en la última hora hay > N fails consecutivos, auto-pausa 1h.
 async function checkAgentKillSwitch(token, userEmail, cfg) {
   try {
+    // ¿Este buzón ya está pausado de antes? Se respeta sin volver a evaluar.
+    try {
+      const _p = JSON.parse(cfg?.agent_paused_by_user || "{}");
+      const _hasta = Date.parse(_p[String(userEmail).toLowerCase()] || "");
+      if (_hasta && _hasta > Date.now()) {
+        log(`⏸️ ${userEmail}: pausado por kill switch hasta ${new Date(_hasta).toISOString()}`);
+        return true;
+      }
+    } catch {}
     const cutoff = new Date(Date.now() - 3600_000).toISOString();
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&created_at=gte.${cutoff}&select=action,reason&order=created_at.desc&limit=20`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&created_at=gte.${cutoff}&select=action,reason&order=created_at.desc&limit=80`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
     if (!Array.isArray(rows) || rows.length < 5) return false;
-    const fails = rows.filter(r => r.action === "failed").length;
-    const total = rows.length;
+    // Una reserva que quedó colgada NO es un envío fallido. Antes contaba como tal y
+    // este freno se disparaba solo: el 19/08 saltó cinco veces y dejó al agente sin
+    // mandar NADA el 20 y el 21. Cinturón y tirantes — el cleanup ya no las marca
+    // 'failed', pero las filas viejas siguen en la tabla y esta ventana las lee.
+    const _esRuidoDeReserva = (r) => r.action === "reserve_expired"
+      || String(r.reason || "").includes("orphaned_reserve_crash_recovery");
+    // Se traen 80 y se juzgan las 20 acciones REALES más recientes: si se leyeran solo
+    // 20 filas crudas, un rato de ruido de reservas dejaría la muestra en dos o tres.
+    const _reales = rows.filter(r => !_esRuidoDeReserva(r)).slice(0, 20);
+    if (_reales.length < 5) return false;      // sin muestra real no se frena a nadie
+    const fails = _reales.filter(r => r.action === "failed").length;
+    const total = _reales.length;
     const failRate = fails / total;
     if (failRate > 0.5) {
       const pauseUntil = new Date(Date.now() + 3600_000).toISOString();
-      await setConfigValue(token, "agent_paused_until", pauseUntil);
+      // ⚠️ ANTES ESCRIBÍA `agent_paused_until`, QUE ES GLOBAL (Maxi 2026-08-25).
+      // O sea que un problema del buzón de UNO frenaba a los TRES durante una hora,
+      // aunque los otros dos estuvieran enviando perfecto. El freno global sigue
+      // existiendo y está bien que exista, pero para lo que de verdad es global: la
+      // reputación del dominio por rebotes (vigilarReputacion). Un fail rate es de
+      // un buzón, así que se pausa ese buzón.
+      let _pausas = {};
+      try { _pausas = JSON.parse((await getConfig(token))?.agent_paused_by_user || "{}"); } catch {}
+      _pausas[String(userEmail).toLowerCase()] = pauseUntil;
+      await setConfigValue(token, "agent_paused_by_user", JSON.stringify(_pausas));
       log(`🚨 KILL SWITCH AGENT: fail rate ${Math.round(failRate*100)}% (${fails}/${total}) — pausado 1h hasta ${pauseUntil}`);
       await logAgentAction(token, userEmail, {
         domain: "(system)", action: "kill_switch", reason: `fail_rate_${Math.round(failRate*100)}_pct`,
@@ -17251,7 +17287,10 @@ async function runAgentCycle(token, allFlags) {
       break;
     }
     // Kill switch check
-    if (await checkAgentKillSwitch(token, userEmail, aCfg)) continue;
+    // Se le pasa `cfg` crudo, no `aCfg`: el freno necesita leer `agent_paused_by_user`,
+    // que `_agentCfg` no expone (arma un objeto con claves fijas). Con aCfg la pausa
+    // por buzón se leía siempre como vacía.
+    if (await checkAgentKillSwitch(token, userEmail, cfg)) continue;
     // Daily cap — por usuario (override) o global
     // Maxi 2026-07-27: el cap diario sale de TRES fuentes y la más específica gana en silencio.
     // El user pidió que cambiarlo desde el admin funcione y se note, así que dejamos explícito
@@ -18273,35 +18312,19 @@ async function runAgentCycle(token, allFlags) {
         //   midilibre.fr  ↔ midilibre.com        → match
         //   tudogostoso.com.br ↔ webedia-group.com → no match (parent corp distinct)
         //   lafm.com.co ↔ rcnradio.com.co        → no match (parent corp distinct)
-        const _recipientDom = (email.split("@")[1] || "").toLowerCase();
-        const _leadDom      = domain.toLowerCase().replace(/^www\./, "");
-        const _isWebmail    = /^(gmail|hotmail|outlook|live|yahoo|aol|icloud|protonmail|gmx|me)\.com$/.test(_recipientDom);
-        // Extraer brand: dominio sin TLD ni public suffix
-        const _stripTld = (d) => {
-          // Sacar public suffixes comunes (.com.ar, .com.br, .co.uk, .com.mx, etc.)
-          const parts = d.split(".");
-          if (parts.length <= 2) return parts[0]; // foo.com → foo
-          // Public suffixes de 2 niveles
-          const last2 = parts.slice(-2).join(".");
-          const TWO_LEVEL = new Set([
-            "com.ar","com.br","com.mx","com.co","com.pe","com.cl","com.ve","com.ec","com.uy",
-            "com.py","com.bo","com.gt","com.sv","com.hn","com.ni","com.cr","com.pa","com.do",
-            "co.uk","co.za","co.nz","co.jp","co.kr","co.id","co.in",
-            "com.tr","com.tw","com.hk","com.sg","com.my","com.au","com.eg","com.sa","com.ng",
-            "org.uk","ac.uk","gov.uk","com.pt","org.br","gov.br","edu.br",
-          ]);
-          if (TWO_LEVEL.has(last2)) return parts[parts.length - 3] || "";
-          return parts[parts.length - 2] || ""; // foo.bar.com → bar
-        };
-        const _recipientBrand = _stripTld(_recipientDom);
-        const _leadBrand      = _stripTld(_leadDom);
-        const _domMatches   = _recipientDom === _leadDom
-                            || _recipientDom.endsWith("." + _leadDom)
-                            || _leadDom.endsWith("." + _recipientDom)
-                            || (_recipientBrand && _recipientBrand === _leadBrand && _recipientBrand.length >= 4)
-                            || _isWebmail;
-        if (!_domMatches) {
-          log(`🚫 ${domain}: ABORT send — recipient ${email} brand mismatch (${_recipientBrand} ≠ ${_leadBrand}).`);
+        // ⚠️ ACÁ VIVÍA UNA SEGUNDA IMPLEMENTACIÓN DE LA REGLA DE MARCA (Maxi 2026-08-25).
+        // Copia propia, con su `_stripTld` y su lista TWO_LEVEL a mano, que se quedó
+        // congelada mientras `_brandMatches` evolucionaba. Desde el 28/07 la regla de
+        // verdad corre ANTES de la reserva, así que esta quedó de adorno... hasta hoy:
+        // al aflojar `_brandMatches` para que aceptara el contacto comercial de la casa
+        // editora (publicidad@webedia-group.com para 3djuegos.com), esos candidatos
+        // pasaban la primera puerta y esta segunda —más estricta y sin la noción de
+        // "el email salió del propio sitio"— los abortaba Y marcaba el lead `rejected`
+        // PARA SIEMPRE. O sea que el arreglo de hoy, sin esto, salía peor que el bug.
+        // Dos implementaciones de la misma regla siempre terminan discrepando: ahora
+        // hay UNA sola y esto es su red de seguridad, no un criterio paralelo.
+        if (!_brandMatches(email, domain, pickedSource)) {
+          log(`🚫 ${domain}: ABORT send — ${email} no pasa la regla de marca (fuente: ${pickedSource || "?"}).`);
           if (reservedId) {
             await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
               method: "PATCH",
@@ -19735,6 +19758,91 @@ async function vigilarEmbudoDeDescubrimiento(token) {
 // llamadas de 2.500 en 12 días —el 5,5%— y nadie se enteró, porque desde el punto de
 // vista de los guards eso es "todo en orden". Los créditos no se acumulan: lo que no
 // se usa antes del 12 de cada mes se pierde.
+// ── ¿EL AGENTE ESTÁ MANDANDO? (Maxi 2026-08-25) ──────────────────────────────
+// El 20 y el 21 de agosto el agente mandó CERO mails, los dos días enteros, y no
+// hubo ni una alerta que lo gritara: el parte diario lo mencionaba a las 21h como un
+// renglón más entre otros ocho. Dos días de silencio comercial no son un renglón.
+// La causa fue el kill switch pausándose solo con reservas huérfanas, pero el
+// detector tiene que avisar sea cual sea la causa de la próxima vez.
+const ENVIOS_CERO_ALERTA_HORA = 15;   // hora Madrid: si a media tarde no salió nada, algo pasa
+async function vigilarAgenteFrenado(token) {
+  try {
+    if (!(await _tocaCorrer(token, "agente_frenado", 2 * 60))) return;
+    if (_spainHour() < ENVIOS_CERO_ALERTA_HORA) return;
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    let mbs = [];
+    try { mbs = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+    if (!mbs.length) return;
+
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const desde = _madridMidnightUtcISO();
+    const _contar = async (u) => {
+      try {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(u)}&action=eq.sent&created_at=gte.${desde}&details->>ui_origin=is.null&select=id`,
+          { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+        if (!r.ok) return null;                       // no pude medir ≠ mandó cero
+        return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch { return null; }
+    };
+    const _porMb = [];
+    for (const u of mbs) _porMb.push({ u, n: await _contar(u) });
+    if (_porMb.every(x => x.n === null)) return;      // la base no contesta: no es noticia del agente
+    const _total = _porMb.reduce((a, x) => a + (x.n || 0), 0);
+
+    // ¿Hay con quién trabajar? Si el pool está vacío, cero envíos es consecuencia, no causa.
+    let _contactables = 0;
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`,
+        { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      if (r.ok) _contactables = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch {}
+
+    // Pausas vigentes: son la explicación más probable y hay que verlas en el mismo aviso.
+    let _pausados = [];
+    try {
+      const _p = JSON.parse(cfg.agent_paused_by_user || "{}");
+      _pausados = Object.entries(_p)
+        .filter(([, h]) => Date.parse(h || "") > Date.now())
+        .map(([u, h]) => `${u.split("@")[0]} hasta ${String(h).slice(11, 16)}`);
+    } catch {}
+    const _global = Date.parse(cfg.agent_paused_until || "") > Date.now();
+
+    const _mudos = _porMb.filter(x => x.n === 0).map(x => x.u.split("@")[0]);
+    const _grave = _total === 0 && _contactables > 0;
+    await saludPing(token, "agente_frenado", {
+      status: _grave ? "warn" : "ok", cadenciaMin: 2 * 60,
+      detalle: `${_total} envíos hoy · ${_contactables} contactables`,
+      real: _total, esperado: mbs.length * OBJETIVO_POR_MB,
+    });
+    if (_grave) {
+      await saludAlerta(token, {
+        clave: "agente-sin-enviar", severidad: "error",
+        titulo: `🛑 El agente no mandó NINGÚN mail hoy y hay ${_contactables} para contactar`,
+        cuerpo: [
+          `Son las ${_spainHour()}h y los ${mbs.length} buzones van en cero.`,
+          _pausados.length ? `Pausados por el kill switch: ${_pausados.join(", ")}` : "Ningún buzón figura pausado por el kill switch.",
+          _global ? "⚠️ La pausa GLOBAL (agent_paused_until) está activa — la pone el freno por rebotes." : "",
+          "",
+          "Qué mirar:",
+          "  SELECT action, reason, count(*) FROM toolbar_agent_actions",
+          "   WHERE created_at >= CURRENT_DATE GROUP BY 1,2 ORDER BY 3 DESC;",
+        ].filter(Boolean).join("\n"),
+        metadata: { total: _total, contactables: _contactables, pausados: _pausados, mudos: _mudos },
+      });
+    } else if (_mudos.length && _total > 0) {
+      // Uno solo en cero mientras los otros mandan: no es una caída general, es ese buzón.
+      await saludAlerta(token, {
+        clave: "buzon-mudo", severidad: "warning",
+        titulo: `📮 ${_mudos.join(", ")} no mandó nada hoy y los demás sí`,
+        cuerpo: `No es una caída general del agente: los otros buzones están enviando.\n${_pausados.length ? `Pausados: ${_pausados.join(", ")}` : "No figura pausado, así que el freno está en el pool o en su cupo."}`,
+        metadata: { mudos: _mudos, total: _total },
+      });
+    }
+  } catch (e) { log(`⚠️ vigilarAgenteFrenado: ${e.message}`); }
+}
+
 async function vigilarAprovechamientoDeApollo(token) {
   try {
     if (!(await _tocaCorrer(token, "aprovechamiento_apollo", 24 * 60))) return;
@@ -21154,6 +21262,7 @@ async function main() {
       // Y que ninguna fuente pueda morirse en silencio otra vez.
       await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
+      await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
       // Y que no se desperdicie un plan pago: los créditos de Apollo no se acumulan.
       await vigilarAprovechamientoDeApollo(token).catch(e => log(`⚠️ apollo uso: ${e.message}`));
 
