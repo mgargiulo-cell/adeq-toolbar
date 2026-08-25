@@ -1508,7 +1508,20 @@ async function _findKnownDomainsWorker(token, candidates) {
   // pending, processing, frozen, next_day, waiting_pool) sí siguen bloqueando.
   // `expired` entra acá: son dominios que caducaron esperando en la cola SIN haber sido
 // evaluados nunca. Dejarlos fuera los bloqueaba para las siete vías, para siempre.
-const _ESTADOS_REINTENTABLES = ["error", "skipped", "expired"];
+//
+// ⚠️ CORRECCIÓN (Maxi 2026-08-25): `skipped` SE SACÓ de esta lista. Al incluirlo se
+// invirtió el matiz de arriba: `skipped` no es "se cayó por un blip", es el VEREDICTO
+// del sistema. Medido sobre la cola real: 14.136 skipped son veredictos de verdad
+// (gobierno, e-commerce, GEO no prioritaria, dominio muerto) contra 31 que sí fueron
+// una falla nuestra. O sea que el 99,8% se re-descubría eternamente.
+// Lo que costó: AutoGoogle re-encontraba cada día los mismos 619 dominios de gobierno
+// ya rechazados, los daba por frescos, y al intentar encolarlos chocaba contra
+// UNIQUE(domain) → 409 → el LOTE ENTERO se perdía en silencio. AutoGoogle no metió un
+// solo dominio en la cola entre el 18 y el 25 de agosto mientras gastaba Serper todos
+// los días. Es otra vez el patrón de siempre, al revés: un "no" tratado como "no sé".
+// Los 31 que sí fueron falla nuestra se recuperan marcándolos `error` (SQL aparte);
+// el arreglo de fondo es que processCsvItem no escriba `skipped` cuando NO PUDO medir.
+const _ESTADOS_REINTENTABLES = ["error", "expired"];
   const tables = [
     { table: "toolbar_csv_queue",     col: "domain", filter: `&status=not.in.(${_ESTADOS_REINTENTABLES.join(",")})` },
     { table: "toolbar_review_queue",  col: "domain", filter: "" },
@@ -1896,23 +1909,41 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
     if (_p < slotsPending) { status = "pending"; _p++; }
     else if (_w < slotsWaiting) { status = "waiting_pool"; _w++; }
     else { status = "next_day"; }
-    const fila = { domain, status, source: sourceTag, uploaded_by: "worker@autofeeder", uploaded_at: new Date().toISOString() };
-    // Re-prospección deliberada (finalizados de Monday): la fila vieja se REACTIVA.
-    // Sin esto el insert la ignora en silencio y el dominio nunca vuelve a procesarse.
-    if (opts.reactivar) { fila.processed_at = null; fila.error_message = null; }
+    // La fila vieja se REACTIVA siempre que haya uno. Sin esto el insert la ignora
+    // en silencio y el dominio nunca vuelve a procesarse.
+    const fila = { domain, status, source: sourceTag, uploaded_by: "worker@autofeeder",
+                   uploaded_at: new Date().toISOString(), processed_at: null, error_message: null };
     return fila;
   });
   try {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue${opts.reactivar ? "?on_conflict=domain" : ""}`, {
+    // ⚠️ `on_conflict` SIEMPRE (Maxi 2026-08-25). Antes solo lo mandaba la re-prospección
+    // de Monday; el resto posteaba sin él y con `ignore-duplicates`, que PostgREST no
+    // puede aplicar sin saber contra qué constraint. Con UNIQUE(domain) en la tabla, UN
+    // solo dominio repetido en el lote devolvía 409 y `!res.ok` tiraba los otros 179 sin
+    // una línea de log. Es seguro hacer merge-duplicates de default: _findKnownDomainsWorker
+    // ya sacó todo lo que está en un estado terminal, así que lo único con lo que se puede
+    // chocar acá es un `error`/`expired`, que es justo lo que queremos reactivar.
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?on_conflict=domain`, {
       method: "POST",
       headers: {
         "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
         "Content-Type": "application/json",
-        "Prefer": `resolution=${opts.reactivar ? "merge-duplicates" : "ignore-duplicates"},return=representation`,
+        "Prefer": "resolution=merge-duplicates,return=representation",
       },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) return _empty();
+    if (!res.ok) {
+      // NUNCA en silencio: acá se perdían lotes enteros de dominios ya pagados con créditos.
+      const _detalle = await res.text().catch(() => "");
+      log(`❌ ${sourceTag}: la cola RECHAZÓ el lote entero de ${payload.length} (HTTP ${res.status}) — ${_detalle.slice(0, 240)}`);
+      await saludAlerta(token, {
+        clave: `cola_rechaza_lote_${sourceTag}`,
+        titulo: `La cola rechazó un lote entero de ${sourceTag}`,
+        cuerpo: `${payload.length} dominios ya descubiertos (y pagados) no entraron. HTTP ${res.status}. ${_detalle.slice(0, 300)}`,
+        severidad: "error",
+      }).catch(() => {});
+      return _empty();
+    }
     const rows = await res.json().catch(() => []);
     const _inserted = Array.isArray(rows) ? rows.map(r => r.domain).filter(Boolean) : [];
     return opts.returnDomains ? _inserted : _inserted.length;
@@ -2418,7 +2449,11 @@ async function _reconcileAutogoogleAttribution(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let rows = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?select=domain,phrase,injected_at&order=injected_at.asc&limit=500`, { headers: auth });
+    // Límite 500 → 2000 (Maxi 2026-08-25). Como ninguna fila calificaba (ver abajo),
+    // ninguna se borraba, y la consulta giraba SIEMPRE sobre las 500 más viejas mientras
+    // las otras 4.288 no se miraban nunca. Con el filtro arreglado las que califican se
+    // borran y la ventana avanza sola, pero hace falta margen para drenar el atraso.
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?select=domain,phrase,injected_at&order=injected_at.asc&limit=2000`, { headers: auth });
     if (r.ok) rows = await r.json();
   } catch {}
   if (!Array.isArray(rows) || rows.length === 0) return;
@@ -2427,7 +2462,17 @@ async function _reconcileAutogoogleAttribution(token) {
   for (let i = 0; i < domains.length; i += 150) {
     const slice = domains.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
     try {
-      const q = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?source=eq.autogoogle&domain=in.(${encodeURIComponent(slice)})&select=domain`, { headers: auth });
+      // ⚠️ EL FILTRO `source=eq.autogoogle` ROMPÍA TODO EL APRENDIZAJE (Maxi 2026-08-25).
+      // Hasta el 24/08 los leads de AutoGoogle se guardaban etiquetados "autopilot" —el bug
+      // de `getNextCsvItem`, que no pedía la columna `source`— así que esta consulta no
+      // encontraba NINGUNO y `qualified` quedaba en 0 para todas las frases. Medido:
+      // "becas disponibles" trajo 90 dominios frescos en 28 búsquedas y figura con
+      // qualified=0, igual que una frase que no trajo nada.
+      // Consecuencia: el motor no podía distinguir una frase que trae PUBLISHERS de una que
+      // trae dominios nuevos cualesquiera, y el sesgo del 65% terminaba premiando la novedad.
+      // El filtro además era redundante: si el dominio está en la tabla de atribución, vino
+      // de AutoGoogle por definición. Se saca.
+      const q = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=in.(${encodeURIComponent(slice)})&select=domain`, { headers: auth });
       if (q.ok) (await q.json()).forEach(x => x.domain && qualified.add(x.domain.toLowerCase()));
     } catch {}
   }
@@ -19338,6 +19383,69 @@ async function vigilarFuentesDeDescubrimiento(token) {
   } catch (e) { log(`⚠️ vigilarFuentesDeDescubrimiento: ${e.message}`); }
 }
 
+// ── EL MEDIO DE LA CADENA (Maxi 2026-08-25) ──────────────────────────────────
+// vigilarFuentesDeDescubrimiento mira el FINAL (¿llegó un lead a Prospects?). Eso deja
+// ciego todo el tramo del medio: una fuente puede estar buscando, gastando créditos y
+// encontrando dominios frescos todos los días, y no meter ni uno en la cola.
+// Es exactamente lo que pasó: AutoGoogle no encoló un solo dominio entre el 18 y el 25
+// de agosto —siete días de Serper pagado a la basura— mientras seguía escribiendo
+// atribución todos los días, así que desde afuera parecía viva.
+// Acá se compara descubrimiento contra encolado, que es donde se rompió.
+const _CARRIL_POR_FUENTE = {
+  autogoogle:     "autogoogle",
+  similar:        "auto_feeder_similar",
+  adstxt:         "auto_feeder_adstxt",
+  sellers_json:   "auto_feeder_sellers",
+  majestic:       "auto_feeder_majestic",
+  monday_refresh: "auto_feeder_monday",
+};
+async function vigilarEmbudoDeDescubrimiento(token) {
+  try {
+    if (!(await _tocaCorrer(token, "vigilar_embudo", 12 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const _desde = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    const rotas = [];
+    for (const [fuente, carril] of Object.entries(_CARRIL_POR_FUENTE)) {
+      let encolados = null;
+      try {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?source=eq.${encodeURIComponent(carril)}&uploaded_at=gte.${_desde}&select=id`,
+          { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+        if (!r.ok) continue;                        // no pude medir ≠ está rota
+        encolados = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch { continue; }
+      if (encolados === null || encolados > 0) continue;
+      // Encoló cero. ¿Es que no encontró nada (normal) o que encontró y se perdió (roto)?
+      // El pre-listado es el testigo: si crece, el descubrimiento funciona y el cuello
+      // está en la inyección.
+      let estacionados = 0;
+      try {
+        const b = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_discovery_backlog?source=eq.${encodeURIComponent(carril)}&found_at=gte.${_desde}&select=domain`,
+          { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+        if (b.ok) estacionados = parseInt((b.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch {}
+      if (estacionados > 0) {
+        rotas.push(`${fuente}: encontró ${estacionados} dominios en 3 días y encoló CERO (descubre y se pierde en el medio)`);
+      }
+    }
+    await saludPing(token, "embudo_descubrimiento", {
+      status: rotas.length ? "warn" : "ok", cadenciaMin: 12 * 60,
+      detalle: rotas.length ? `${rotas.length} fuente(s) descubren pero no encolan` : "las que descubren, encolan",
+      real: Object.keys(_CARRIL_POR_FUENTE).length - rotas.length,
+      esperado: Object.keys(_CARRIL_POR_FUENTE).length,
+    });
+    if (rotas.length) {
+      await saludAlerta(token, {
+        clave: "embudo-cortado", severidad: "error",
+        titulo: `🕳️ ${rotas.length} fuente(s) gastan créditos y no encolan nada`,
+        cuerpo: `${rotas.map(m => "· " + m).join("\n")}\n\nEstán buscando y pagando, pero los dominios no llegan a la cola.\nMirar primero si la cola rechazó lotes (alerta cola_rechaza_lote) y el cupo del carril.\n  SELECT source, max(uploaded_at)::date, count(*) FROM toolbar_csv_queue WHERE uploaded_at >= now() - interval '3 days' GROUP BY 1;`,
+        metadata: { rotas },
+      });
+    }
+  } catch (e) { log(`⚠️ vigilarEmbudoDeDescubrimiento: ${e.message}`); }
+}
+
 // ── ¿ESTAMOS USANDO LO QUE PAGAMOS? (Maxi 2026-08-24) ────────────────────────
 // Todos los detectores de este sistema vigilan que no nos PASEMOS de los topes.
 // Ninguno vigilaba lo contrario: un plan pago que se desaprovecha. Apollo llevaba 137
@@ -20762,6 +20870,7 @@ async function main() {
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
       // Y que ninguna fuente pueda morirse en silencio otra vez.
       await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
+      await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       // Y que no se desperdicie un plan pago: los créditos de Apollo no se acumulan.
       await vigilarAprovechamientoDeApollo(token).catch(e => log(`⚠️ apollo uso: ${e.message}`));
 
