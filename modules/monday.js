@@ -121,7 +121,7 @@ export async function pushToMonday(data) {
     // Maxi 2026-08-10: la marca de origen vivía SOLO en Comentarios, que es texto libre — el
     // primer MB que anota algo ahí la borra. De ahí el "a veces figura y a veces no". Si hay una
     // columna dedicada configurada, va ahí; Comentarios se sigue completando por compatibilidad.
-    ...(CONFIG.MONDAY_COLUMNS.origen ? { [CONFIG.MONDAY_COLUMNS.origen]: { label: "Manual" } } : {}),   // columna de tipo Estado: se escribe con {label}, no con un string pelado
+    ...(CONFIG.MONDAY_COLUMNS.origen ? { [CONFIG.MONDAY_COLUMNS.origen]: "Manual" } : {}),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   "Manual",
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),
@@ -159,7 +159,7 @@ export async function updateMonday({ itemId, traffic, email, geo, estado, fecha,
   //   company.besoccer.com creado 06/26 → null
   // Un push manual siempre lo hace un MB, así que la marca es correcta también al actualizar.
   const columnValues = {
-    ...(CONFIG.MONDAY_COLUMNS.origen ? { [CONFIG.MONDAY_COLUMNS.origen]: { label: "Manual" } } : {}),   // columna de tipo Estado: se escribe con {label}, no con un string pelado
+    ...(CONFIG.MONDAY_COLUMNS.origen ? { [CONFIG.MONDAY_COLUMNS.origen]: "Manual" } : {}),
     [CONFIG.MONDAY_COLUMNS.comentarios]:   "Manual",
     [CONFIG.MONDAY_COLUMNS.trafico]:       safe(String(traffic || "")),
     [CONFIG.MONDAY_COLUMNS.geo]:           safe(geo || ""),

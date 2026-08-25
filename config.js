@@ -40,7 +40,10 @@ export const CONFIG = {
     // sigue yendo a Comentarios. Para activarla: crear en el board una columna tipo Estado con
     // las opciones "Agente" y "Manual", y poner su id acá (y en toolbar_config.monday_col_origen
     // para que el worker la use también).
-    origen:          "color_mm6j5y1y",   // creada 2026-08-25: Estado con las opciones Agente / Manual
+    // Decisión del user (2026-08-25): NO hay columna dedicada. El estado Agente/Manual va en
+    // Comentarios y punto. Se probó una columna aparte y se descartó: no agregaba nada que
+    // Comentarios no diga ya. Dejar esto VACÍO.
+    origen:          "",
     email:           "email_mm2edcd3",   // email column (was text_mkrwahsz)
     telefono:        "tel_fono_1",
     // Reengagement / Email Futuro — el agente actualiza estas dos al disparar
