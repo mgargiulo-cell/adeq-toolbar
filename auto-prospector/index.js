@@ -2565,15 +2565,22 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Maxi 2026-07-15: cap mensual CONFIGURABLE (autogoogle_monthly_cap) sin deploy — con 50k créditos
   // pagos, el user regula el ritmo de gasto. + freshRate = rolling de dominios NUEVOS por búsqueda,
   // usado abajo para NO gastar créditos cuando el pool está saturado (spend inteligente).
-  let used = 0, monthlyCap = AUTOGOOGLE_MONTHLY_CAP, freshRate = 1.0;
+  let used = 0, monthlyCap = AUTOGOOGLE_MONTHLY_CAP, freshRate = 1.0, _agTopeDia = 300, _agUsadoDia = 0;
   try {
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period,autogoogle_monthly_cap,autogoogle_fresh_rate)&select=key,value`,
+      `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(autogoogle_serper_used,autogoogle_serper_period,autogoogle_monthly_cap,autogoogle_fresh_rate,autogoogle_serper_daily_cap,autogoogle_serper_used_day,autogoogle_serper_day)&select=key,value`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (r.ok) {
       const map = {}; (await r.json()).forEach(x => { map[x.key] = x.value; });
       if (map.autogoogle_serper_period === period) used = parseInt(map.autogoogle_serper_used || "0", 10) || 0;
+      // ⚠️ EL TOPE DIARIO SE VIGILABA PERO NO SE APLICABA (Maxi 2026-08-25).
+      // `autogoogle_serper_daily_cap` figura en los defaults y el vigilante de seguridad lo
+      // controla, pero ninguna línea lo hacía cumplir: solo existía el tope mensual. Un bug
+      // que dispare búsquedas puede quemar el mes en un día sin que nada lo frene.
+      _agTopeDia = parseInt(map.autogoogle_serper_daily_cap || "300", 10) || 300;
+      _agUsadoDia = (map.autogoogle_serper_day === _madridDateStr())
+        ? (parseInt(map.autogoogle_serper_used_day || "0", 10) || 0) : 0;
       if (map.autogoogle_monthly_cap) monthlyCap = Math.max(100, parseInt(map.autogoogle_monthly_cap, 10) || AUTOGOOGLE_MONTHLY_CAP);
       if (map.autogoogle_fresh_rate) freshRate = Math.max(0, Math.min(3, parseFloat(map.autogoogle_fresh_rate) || 1.0));
     }
@@ -2628,6 +2635,15 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Cap por lugar en el carril: no buscar más de lo que entra. freshRate = dominios nuevos por
   // búsqueda → para llenar _laneRoom slots alcanzan ~_laneRoom/freshRate búsquedas (piso 8).
   N = Math.min(N, Math.max(_pisoBusquedas, Math.ceil(_laneRoom / Math.max(0.2, freshRate))));
+  // El tope DIARIO, que hasta hoy se declaraba y no se aplicaba. Va al final para que
+  // ninguna de las escalas de arriba lo pueda pisar.
+  const _restaHoy = Math.max(0, _agTopeDia - _agUsadoDia);
+  if (_restaHoy <= 0) {
+    log(`🔎 AutoGoogle: tope diario de Serper alcanzado (${_agUsadoDia}/${_agTopeDia}) — no busco más hoy`);
+    await saludPing(token, "autogoogle", { status: "off", cadenciaMin: 240, detalle: `tope diario ${_agUsadoDia}/${_agTopeDia}` }).catch(() => {});
+    return;
+  }
+  N = Math.min(N, _restaHoy);
   // Pool = TODAS las frases de cascade (7549, 12 idiomas) desde keywordsData.js; fallback inline.
   // Maxi 2026-07-17 TURNO HISPANO: en los slots hispanos el pool se restringe al español
   // (672 frases) → descubrimiento LATAM/Centroamérica/España garantizado todos los días.
@@ -2765,11 +2781,11 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     }
     else { errCount++; lastStatus = status; _errSeguidos++; }
     if (queriesDone > 0 && queriesDone % 20 === 0) {
-      try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
+      try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); await setConfigValue(token, "autogoogle_serper_used_day", String(_agUsadoDia + queriesDone)); await setConfigValue(token, "autogoogle_serper_day", _madridDateStr()); } catch {}
       try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {}  // Maxi 2026-07-15 (F3): heartbeat dentro del loop largo
     }
   }
-  try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); } catch {}
+  try { await setConfigValue(token, "autogoogle_serper_used", String(used + queriesDone)); await setConfigValue(token, "autogoogle_serper_period", period); await setConfigValue(token, "autogoogle_serper_used_day", String(_agUsadoDia + queriesDone)); await setConfigValue(token, "autogoogle_serper_day", _madridDateStr()); } catch {}
   // Maxi 2026-07-15: surfacar el error de Serper a config (antes se tragaba → "cero silencioso" por semanas).
   if (errCount > 0) {
     const _emsg = `Serper status=${lastStatus} en ${errCount}/${kws.length} búsquedas`;
@@ -3135,7 +3151,7 @@ async function sincronizarFinalizadosDeMonday(token) {
 
     let encolados = 0;
     if (candidatos.length) {
-      encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true });
+      encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true });   // `reactivar` ya es el comportamiento por defecto (on_conflict+merge); se deja como documentación de la intención
       await _limpiarMarcaDeEmail(token, candidatos).catch(() => {});
     }
     log(`🔁 Monday finalizados: ${todos.length} en el board · ${recientes.size ? `${todos.filter(d => recientes.has(d)).length} contactados hace <${dias}d` : "0 recientes"} · ${enCola.size} ya en cola · ${candidatos.length} re-prospectables → ${encolados} encolados`);
@@ -3282,7 +3298,7 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     slice.forEach(d => sessionKnown.add(d));
     // merge-duplicates: si el dominio ya tiene fila vieja en la cola, se REACTIVA a
     // pending en vez de que el insert se ignore en silencio.
-    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday", { reactivar: true });
+    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday", { reactivar: true });   // idem: la reactivación es el default desde 2026-08-25
     // Y se borra la marca de "ya le busqué email": queremos buscarle uno NUEVO, que es
     // justo el sentido de volver sobre un cliente que ya cerró ciclo.
     await _limpiarMarcaDeEmail(token, slice).catch(() => {});
@@ -7965,9 +7981,12 @@ async function vigilarDescubrimiento(token) {
   if (!(await _tocaCorrer(token, "vigilante_descubrimiento", 60))) return;
 
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  // Un fallo devuelve -1, NO 0: "no pude contar" no puede disparar la alerta de
+  // "el descubrimiento está parado". (Maxi 2026-08-25.)
   const _contar = async (url) => {
     try {
       const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      if (!r.ok) return -1;
       return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
     } catch { return -1; }
   };
@@ -8050,8 +8069,10 @@ async function parteDelDia(token) {
   const hoy = _madridDateStr();
   if ((cfg.parte_diario_ultimo || "") === hoy) return;          // uno por día
   if (_spainHour() < 21) return;                                        // al cierre de la jornada
-  await setConfigValue(token, "parte_diario_ultimo", hoy).catch(() => {});
-
+  // ⚠️ LA MARCA SE PONE AL FINAL, NO ACÁ (Maxi 2026-08-25). Se marcaba el día como
+  // "parte enviado" ANTES de armarlo: si algo fallaba en el medio —una consulta, el mail—
+  // ese día simplemente no había parte y nadie se enteraba, porque el guard de arriba ya
+  // creía que estaba hecho. Ahora se marca recién cuando el mail salió.
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   // ⚠️ UN GLITCH NO ES UN CERO (Maxi 2026-08-25). Devolvía 0 tanto si la consulta fallaba
   // como si de verdad no había nada, así que un 500 de Supabase se leía como "hoy no pasó
@@ -8477,6 +8498,7 @@ async function parteDelDia(token) {
       agentActionId: null,
       esProspeccion: false,
     });
+    await setConfigValue(token, "parte_diario_ultimo", hoy).catch(() => {});
     log(`📬 parte del día enviado a ${dest} — ${totalEnviado}/${objetivoTotal} envíos`);
   } catch (e) {
     log(`🔴 no se pudo enviar el parte del día: ${e.message}`);
@@ -11390,7 +11412,14 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // antes de gastar scrape/Haiku: si la URL ya dice que no sirve (gobierno, universidad, casa
   // de apuestas, banco, SaaS, acortador, gigante), no se gasta nada más en este dominio.
   const _urlV = classifyByUrlOnly(domain, swCategory || "", effectivePageViews);
-  if (!_urlV.ok) {
+  // ⚠️ SOLO LOS VETOS ESTRUCTURALES (Maxi 2026-08-25). Este clasificador gratis también
+  // descarta por RUBRO —tienda, apuestas, comparador—, y corre ANTES de la puerta grande,
+  // así que un sitio con ads.txt y tráfico de sobra moría acá sin llegar a la regla del
+  // user ("toda url con txt y +400k sirve, no importa el rubro"). Es el mismo arreglo que
+  // ya se hizo para el veto por categoría de SimilarWeb, en el otro filtro que sobrevivía.
+  if (!_urlV.ok && !_VETO_ESTRUCTURAL.test(String(_urlV.reason || "")) && _apruebaPorAdsTxtYTrafico(_ads, effectivePageViews)) {
+    log(`  🚪 ${domain} — la URL sugiere "${_urlV.reason}" PERO tiene ads.txt y ${effectivePageViews} pageviews → pasa por la puerta grande`);
+  } else if (!_urlV.ok) {
     await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${_urlV.reason}` });
     log(`  🚯 ${domain} — descartado por URL (${_urlV.reason}) → sin gastar API`);
     return;
@@ -13203,7 +13232,7 @@ async function pickAnyTemplate(token, userEmail, language) {
     const scores = await _getTemplateScores(token);
     const totalRespuestas = pool.reduce((a, t) => a + ((scores.get(t.id)?.respuestas) || 0), 0);
     if (totalRespuestas >= RESPUESTAS_MIN_PARA_DECIDIR) {
-      const PISO = 0.15;                               // 15% garantizado por template
+      const PISO = Math.min(0.15, 0.6 / Math.max(1, pool.length));   // Maxi 2026-08-25: con 7+ borradores el piso sumaba >1 y el factor de mérito salía NEGATIVO
       const pesos = pool.map(t => {
         const s = scores.get(t.id) || {};
         const envios = s.sends || 0, resp = s.respuestas || 0;
@@ -14603,7 +14632,15 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       const _tpl = pickRandomTemplate(lead.language || "es");
       if (_tpl) {
         // fillTemplate recibe el template ENTERO y devuelve {body, subjects}.
-        const _lleno = fillTemplate(_tpl, { domain, sender_name: getSenderName(mbEmail) });
+        // fillTemplate lee `senderName` en camelCase; con `sender_name` el nombre de quien
+        // firma salía VACÍO. Se pasan también las variables que el template puede usar.
+        const _lleno = fillTemplate(_tpl, {
+          domain,
+          senderName: getSenderName(mbEmail),
+          geo: lead.geo || "",
+          traffic: lead.traffic || 0,
+          contactName: lead.contact_name || "",
+        });
         body    = _lleno.body || "";
         subject = subject || _lleno.subjects?.[0] || "";
       }
@@ -19908,9 +19945,12 @@ async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning"
 // Una fila por día, escrita al cierre de la jornada.
 async function guardarMetricasDelDia(token) {
   try {
+    // ⚠️ EL GATE HORARIO VA PRIMERO (Maxi 2026-08-25). `_tocaCorrer` consume el turno apenas
+    // se lo consulta: si la primera vuelta del día caía antes de las 21h, se gastaba la
+    // cadencia de 12h para no hacer nada y el snapshot no se escribía. Es el mismo bug que
+    // dejó a la caza de emails sin correr NUNCA.
+    if (_spainHour() < 21) return;                       // se corre cerca del cierre, con el día completo
     if (!(await _tocaCorrer(token, "metricas_diarias", 12 * 60))) return;
-    // Se corre cerca del cierre para que el día esté completo.
-    if (_spainHour() < 21) return;
     const hoy = _madridDateStr();
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const _contar = async (url) => {
@@ -19927,7 +19967,7 @@ async function guardarMetricasDelDia(token) {
     try {
       // Sin el filtro de ui_origin, el histórico guardaba los envíos manuales del MB como si
       // fueran del agente. Las métricas son del AGENTE, regla del user. (Maxi 2026-08-25.)
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hoy}T00:00:00&details->>ui_origin=is.null&select=user_email&limit=2000`, { headers: auth });
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_madridMidnightUtcISO()}&details->>ui_origin=is.null&select=user_email&limit=2000`, { headers: auth });
       if (r.ok) {
         const filas = await r.json();
         if (Array.isArray(filas)) {
@@ -19941,7 +19981,7 @@ async function guardarMetricasDelDia(token) {
     const porFuente = {};
     let altas = 0;
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${hoy}T00:00:00&select=source&limit=5000`, { headers: auth });
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${_madridMidnightUtcISO()}&select=source&limit=5000`, { headers: auth });
       if (r.ok) {
         const filas = await r.json();
         if (Array.isArray(filas)) {
@@ -19957,8 +19997,8 @@ async function guardarMetricasDelDia(token) {
     // Y `hallados` estaba además conceptualmente mal: contaba cualquier lead con email creado
     // antes de hoy, no los RESCATADOS. Un rescate es "entró sin email y hoy tiene uno", que es
     // exactamente lo que marca `email_found_at`.
-    const limpiados = await _contar(`toolbar_review_queue?rejected_at=gte.${hoy}T00:00:00&select=id`);
-    const hallados  = await _contar(`toolbar_review_queue?email_found_at=gte.${hoy}T00:00:00&select=id`);
+    const limpiados = await _contar(`toolbar_review_queue?rejected_at=gte.${_madridMidnightUtcISO()}&select=id`);
+    const hallados  = await _contar(`toolbar_review_queue?email_found_at=gte.${_madridMidnightUtcISO()}&select=id`);
     // Estado del pool al cierre
     const conEmail  = await _contar(`toolbar_review_queue?status=eq.pending&emails=not.eq.%5B%5D&select=id`);
     const sinEmail  = await _contar(`toolbar_review_queue?status=eq.pending&or=(emails.is.null,emails.eq.%5B%5D)&select=id`);
@@ -20754,8 +20794,8 @@ async function saludWatchdog(token) {
     // Ahora se acumulan los minutos activos de los días hábiles transcurridos, que es lo
     // que la corrección original quería decir: no contar la noche ni el fin de semana,
     // pero sí contar los días.
-    const _horaIni = parseInt(cfg.active_hours_start || "9", 10) || 9;
-    const _horaFin = parseInt(cfg.active_hours_end || "23", 10) || 23;
+    const _horaIni = parseInt(cfg.active_hours_start ?? cfg.agent_active_hours_start ?? "9", 10) || 9;   // la clave guardada lleva prefijo agent_
+    const _horaFin = parseInt(cfg.active_hours_end ?? cfg.agent_active_hours_end ?? "23", 10) || 23;
     const _minsVentanaDiaria = Math.max(60, (_horaFin - _horaIni) * 60);
     const _minsVentanaAbierta = Math.max(0, (_spainHour() - _horaIni) * 60);
     const _diasHabilesDesde = (okTs) => {
