@@ -1778,7 +1778,16 @@ async function _drainBacklog(token, sourceTag, room) {
     // _injectIntoCsvQueue descarte el resto Y yo los borre del pre-listado = pérdida definitiva
     // de dominios ya pagados. Con la lista real solo borro lo que de verdad entró.
     let insertedDomains = [];
-    if (usable.length) insertedDomains = await _injectIntoCsvQueue(token, usable, sourceTag, { returnDomains: true });  // sin parkOverflow → no re-estacionar
+    // ⚠️ EL PRE-LISTADO NO DRENABA (Maxi 2026-08-25). Los dominios que morían en la puerta
+    // ads.txt no volvían ni como "conocidos" ni como "insertados", así que no se borraban
+    // nunca. Y como el drenaje lee por `found_at.asc`, esos cadáveres encabezaban la cola
+    // en TODOS los slots siguientes: 317 dominios sin ads.txt tapando la cabeza desde el
+    // 27 de julio, re-fetcheados en cada pasada, mientras 2.000 dominios frescos ya
+    // PAGADOS con créditos de Serper esperaban detrás hasta morir por el TTL de 30 días.
+    // Un "no tiene ads.txt" es un veredicto definitivo: sale del pre-listado igual que si
+    // hubiera entrado. Los "unknown" siguen estacionados, que es lo correcto.
+    const _sinAds = new Set();
+    if (usable.length) insertedDomains = await _injectIntoCsvQueue(token, usable, sourceTag, { returnDomains: true, sinAdsOut: _sinAds });  // sin parkOverflow → no re-estacionar
     const inserted = insertedDomains.length;
 
     // Restaurar la ATRIBUCIÓN domain→keyword de los recuperados. Sin esto el yield no le
@@ -1799,12 +1808,12 @@ async function _drainBacklog(token, sourceTag, room) {
 
     // Sacar del pre-listado: los ya conocidos SIEMPRE; los usables solo si de verdad entraron
     // (si el carril se llenó mientras tanto, quedan estacionados para el próximo slot).
-    const consumed = [...new Set([...cands.filter(d => known.has(d)), ...insertedDomains])];
+    const consumed = [...new Set([...cands.filter(d => known.has(d)), ...insertedDomains, ..._sinAds])];
     for (let i = 0; i < consumed.length; i += 150) {
       const slice = consumed.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
       try { await fetch(`${SUPABASE_URL}/rest/v1/toolbar_discovery_backlog?domain=in.(${encodeURIComponent(slice)})`, { method: "DELETE", headers: auth }); } catch {}
     }
-    if (inserted) log(`  📦 pre-listado: ${inserted} ${sourceTag} recuperados GRATIS (0 créditos)${known.size ? ` · ${known.size} ya conocidos, limpiados` : ""}`);
+    if (inserted || _sinAds.size) log(`  📦 pre-listado: ${inserted} ${sourceTag} recuperados GRATIS (0 créditos)${known.size ? ` · ${known.size} ya conocidos, limpiados` : ""}${_sinAds.size ? ` · ${_sinAds.size} sin ads.txt, sacados del pre-listado` : ""}`);
     return inserted;
   } catch (e) { log(`  ⚠️ drain pre-listado: ${e.message}`); return 0; }
 }
@@ -1903,6 +1912,9 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
     }
     if (sinAds.size > 0) {
       const antes = domains.length;
+      // Se avisa al llamador cuáles murieron acá: `_drainBacklog` los necesita para poder
+      // sacarlos del pre-listado. Sin esto quedaban estacionados para siempre (Maxi 2026-08-25).
+      if (opts.sinAdsOut) sinAds.forEach(d => opts.sinAdsOut.add(d));
       domains = domains.filter(d => !sinAds.has(d));
       log(`📄 ${sourceTag}: ${sinAds.size}/${antes} descartados SIN ads.txt antes de entrar a la cola (0 API gastada) — ej: ${[...sinAds].slice(0, 5).join(", ")}`);
     }
@@ -2847,11 +2859,28 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     log(`🔎 AutoGoogle: ${found.size} dominios de ${queriesDone} búsquedas → ${freshCount} nuevos → ${inserted} encolados · freshRate ${_newRate} (spend inteligente)`);
     // Latido: si el motor deja de rendir, se ve el mismo día. Lo esperado es al menos
     // un dominio fresco cada dos búsquedas; por debajo de la mitad de eso, el vigilante avisa.
+    // ⚠️ EL PING MEDÍA `freshCount` Y NO `inserted` (Maxi 2026-08-25).
+    // El entregable de AutoGoogle es un dominio ENCOLADO, no uno "visto por primera vez".
+    // Midiendo lo segundo, el detector se declaraba 10× por encima de lo esperado en el
+    // mismo renglón en que decía "0 encolados", y dio verde los siete días que el motor
+    // gastó Serper sin traer una sola URL. Es la regla de oro al revés: hay que alertar
+    // sobre lo que NO pasó, no sobre lo que se intentó.
+    const _sinEncolar = queriesDone >= 10 && freshCount > 20 && inserted === 0;
     await saludPing(token, "autogoogle", {
-      status: "ok", cadenciaMin: 240,
+      status: _sinEncolar ? "fail" : "ok", cadenciaMin: 240,
       detalle: `${queriesDone} búsquedas → ${found.size} dominios → ${freshCount} nuevos → ${inserted} encolados`,
-      real: freshCount, esperado: Math.max(1, Math.round(queriesDone * 0.5)),
+      real: inserted, esperado: Math.max(1, Math.round(queriesDone * 0.15)),
     });
+    if (_sinEncolar) {
+      await saludAlerta(token, {
+        clave: "autogoogle-no-encola", severidad: "error",
+        titulo: "🔎 AutoGoogle encontró dominios y no encoló ninguno",
+        cuerpo: `${queriesDone} búsquedas, ${found.size} dominios, ${freshCount} frescos y CERO encolados.\n`
+              + `Se está pagando Serper para nada. Mirar el carril de autogoogle, la puerta ads.txt y si la cola rechazó el lote.\n`
+              + `  SELECT status, count(*) FROM toolbar_csv_queue WHERE source='autogoogle' AND uploaded_at >= now() - interval '2 days' GROUP BY 1;`,
+        metadata: { queriesDone, found: found.size, freshCount, inserted },
+      }).catch(() => {});
+    }
   } else {
     log(`🔎 AutoGoogle: 0 búsquedas exitosas (revisar autogoogle_last_error) — freshRate sin cambios`);
   }
@@ -4037,7 +4066,7 @@ async function runReenrichBadLeads(token) {
         // 4 vías que buscan email ya usan las mismas 3 fuentes.
         if (!foundEmail) {
           const _mDay = _madridNowParts().dateISO;
-          if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+          _sembrarTopeSerperContacto(cfg, _mDay);
           const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
           if (_serperContactCount < _ccap && !_serperContactTried.has(lead.domain)) {
             _serperContactTried.add(lead.domain);
@@ -9061,6 +9090,20 @@ let _lastPolishRunAt = 0;
 // Maxi 2026-07-16: control de gasto del fallback de contacto por Google (Serper). Cap DIARIO + dedup
 // para no quemar créditos (el user vio ~1500/día → a ese ritmo 50k no duran). Reset al cambiar el día Madrid.
 let _serperContactCount = 0, _serperContactDay = "", _serperContactTried = new Set();
+// ── EL TOPE TIENE QUE SOBREVIVIR AL REINICIO (Maxi 2026-08-25) ───────────────────────
+// El contador se PERSISTE en cada uso, pero de las cuatro vías que lo consultaban solo
+// UNA lo volvía a leer al arrancar. Las otras tres, al ver `_serperContactDay` vacío
+// —que es como queda tras cada reinicio del worker, o sea cada ~7 minutos— lo reseteaban
+// a cero. El tope de 250/día se re-armaba unas 200 veces por día. Es el mismo bug que ya
+// se había arreglado en 2026-08-04 para el cap de Serper y que nunca se portó acá.
+// Ahora las cuatro llaman a esto y no hay forma de que una se olvide.
+function _sembrarTopeSerperContacto(cfg, dia) {
+  if (_serperContactDay === dia) return;
+  _serperContactDay = dia;
+  const persistido = String(cfg?.serper_contact_used || "");
+  _serperContactCount = persistido.startsWith(dia + ":") ? (parseInt(persistido.split(":")[1], 10) || 0) : 0;
+  _serperContactTried.clear();
+}
 // Maxi 2026-07-15: ritmo subido para pulir el pool grande (1133 pendientes) en horas, no días.
 // Seguro ahora que (a) el cursor commitea por wave (sobrevive restarts) y (b) se arregló el OOM.
 // Es red-bound (fetch+scrape), no memoria → más concurrencia impacta poco en RSS.
@@ -9266,7 +9309,7 @@ async function polishPool(token) {
         //    AutoGoogle (que sigue buscando DOMINIOS nuevos para el cascade).
         if (!foundEmail && curEmails.length === 0) {
           const _mDay = _madridNowParts().dateISO;
-          if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+          _sembrarTopeSerperContacto(cfg, _mDay);
           const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
           if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
             _serperContactTried.add(domain);
@@ -14195,7 +14238,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       // alternativo, Serper suele encontrarlo. Mismo cap diario (250) y dedup compartido.
       if (newEmails.size === 0) {
         const _mDay = _madridNowParts().dateISO;
-        if (_serperContactDay !== _mDay) { _serperContactDay = _mDay; _serperContactCount = 0; _serperContactTried.clear(); }
+        _sembrarTopeSerperContacto(cfg2, _mDay);   // en esta función la config se llama cfg2
         const _ccap = parseInt((cfg2.serper_contact_daily_cap) || "250", 10) || 250;
         if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
           _serperContactTried.add(domain);
@@ -18005,12 +18048,7 @@ async function runAgentCycle(token, allFlags) {
               // ~200 veces por día. Medido: ~1500 llamadas reales contra un cap de 250.
               // Mismo patrón que ya usa _verifyEmailMV: al cambiar de día O tras un restart
               // (_serperContactDay arranca vacío), re-sembrar desde el valor persistido.
-              if (_serperContactDay !== _mDay) {
-                _serperContactDay = _mDay;
-                const _persist = String(cfg.serper_contact_used || "");
-                _serperContactCount = _persist.startsWith(_mDay + ":") ? (parseInt(_persist.split(":")[1], 10) || 0) : 0;
-                _serperContactTried.clear();
-              }
+              _sembrarTopeSerperContacto(cfg, _mDay);
               const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
               if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
                 _serperContactTried.add(domain);
@@ -18328,7 +18366,7 @@ async function runAgentCycle(token, allFlags) {
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ status: "rejected", validated_by: `admin_blocklist`, validated_at: new Date().toISOString() }),
+            body: JSON.stringify({ status: "rejected", validated_by: `admin_blocklist`, validated_at: new Date().toISOString(), rejected_at: new Date().toISOString() }),
           }).catch(() => {});
           continue;
         }
@@ -18549,7 +18587,7 @@ async function runAgentCycle(token, allFlags) {
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ status: "rejected", validated_by: "domain_mismatch_loop_guard", validated_at: new Date().toISOString() }),
+            body: JSON.stringify({ status: "rejected", validated_by: "domain_mismatch_loop_guard", validated_at: new Date().toISOString(), rejected_at: new Date().toISOString() }),
           }).catch(() => {});
           continue; // próximo lead
         }
