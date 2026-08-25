@@ -23,7 +23,13 @@ const CLOUDFLARE_API_TOKEN      = process.env.CLOUDFLARE_API_TOKEN || null; // o
 const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 const SERPER_API_KEY = (process.env.SERPER_API_KEY || "").trim() || null;  // AutoGoogle: keyword→Google. Sin key = AutoGoogle apagado (no rompe nada).
 
-const SESSION_LIMIT_MS  = 20 * 60 * 1000; // 20 minutos máx por sesión de autopilot — auto-corte
+// ⚠️ 20 min NO ENTRA EN LA VIDA DEL WORKER (Maxi 2026-08-25). Railway lo reinicia cada
+// ~7 minutos por el tope de memoria. Con un límite de 20, `runSession` no termina NUNCA:
+// no llega a la línea que apaga el flag, así que en la vuelta siguiente vuelve a entrar y
+// hace `continue`, salteando TODO lo que viene abajo — la cola, el agente, los feeders.
+// Comprobado en vivo: al prender el autopilot, la cola dejó de procesar en el acto.
+// 5 minutos entran holgados y la sesión se cierra sola, que es como fue pensada.
+const SESSION_LIMIT_MS  = 5 * 60 * 1000;
 const POLL_INTERVAL_MS  = 30 * 1000;   // Maxi 2026-07-03 perf: 20s→30s. El loop drena TODA la cola por iteración (runCsvQueue con Infinity) y el agent procesa todo su pool, así que este intervalo es entre lulls, NO entre items — subirlo NO frena el drenado, pero baja ~33% la frecuencia de la maintenance por-iteración (getConfig refresh, counts de promoteWaitlist/feeder, heartbeat) = menos Disk IO sobre Supabase
 const IDLE_INTERVAL_MS  = 120 * 1000;  // cuando autopilot está OFF (2 min)
 const IDLE_EXIT_MS      = 4 * 60 * 60 * 1000; // 4h sin trabajo → exit (subido de 30min para evitar restarts frecuentes 2026-05-13)
@@ -11822,7 +11828,7 @@ async function runSession(token, cfg, sessionStart) {
       // Hard cap a 20 min — el admin puede bajar pero NO superar el SESSION_LIMIT_MS.
       // Evita loops infinitos por configuración mal seteada.
       if (userLimits.autopilot_daily_minutes >= 5) {
-        const userMins = Math.min(userLimits.autopilot_daily_minutes, 20);
+        const userMins = Math.min(userLimits.autopilot_daily_minutes, 5);   // techo real: el worker reinicia a los ~7 min
         userSessionLimitMs = userMins * 60 * 1000;
       }
       if (userLimits.autopilot_enabled === false) {
