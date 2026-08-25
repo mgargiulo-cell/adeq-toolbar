@@ -9340,7 +9340,19 @@ async function auditarEmailsDelPool(token) {
       await saludApagado(token, "auditoria_emails", "flag apagado a propósito");
       return;
     }
-    if (!(await _tocaCorrer(token, "auditoria_emails", 24 * 60))) return;
+    // ── CADENCIA: 2 VECES POR SEMANA, NO DIARIA (Maxi 2026-08-25, criterio del user) ────
+    // "Por ahí es mejor aplicar todo el concepto al inicio y luego hacer solo una revisión
+    //  1/2 veces por semana. Buscar la forma más efectiva para no repetir procesos."
+    // Tiene razón: desde que el criterio se aplica en las DOS puertas de entrada
+    // (processCsvItem y el autopilot), lo que llega al pool ya viene filtrado y ordenado.
+    // Repasarlo todos los días es re-hacer un trabajo ya hecho.
+    // Lo que este barrido sigue aportando, y por eso no se elimina:
+    //   · emails que rebotaron DESPUÉS de entrar (el lead era bueno y dejó de serlo)
+    //   · leads que solo tienen genérico y merecen que se les busque uno mejor
+    //   · re-aplicar el criterio cuando las reglas cambian, como cambiaron hoy
+    // Nada de eso es urgente: el envío ya chequea rebotes en el momento, así que un email
+    // muerto en el pool no manda nada, solo infla la cuenta de contactables.
+    if (!(await _tocaCorrer(token, "auditoria_emails", 84 * 60))) return;   // ~2×/semana
 
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const cursor = cfg.auditoria_emails_cursor || "";
@@ -9354,13 +9366,13 @@ async function auditarEmailsDelPool(token) {
     } catch {}
     // "No pude leer" ≠ "terminé de auditar": se conserva el cursor y se reintenta.
     if (leads === null) {
-      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 24 * 60, detalle: "no se pudo leer el pool — se conserva el cursor" });
+      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 84 * 60, detalle: "no se pudo leer el pool — se conserva el cursor" });
       log(`⚠️ auditoría de emails: la consulta falló — reintento mañana sin perder el lugar`);
       return;
     }
     if (leads.length === 0) {
       await setConfigValue(token, "auditoria_emails_cursor", "").catch(() => {});
-      await saludPing(token, "auditoria_emails", { status: "ok", cadenciaMin: 24 * 60, detalle: "pool completo auditado → vuelvo a empezar" });
+      await saludPing(token, "auditoria_emails", { status: "ok", cadenciaMin: 84 * 60, detalle: "pool completo auditado → vuelvo a empezar" });
       log(`📧 auditoría de emails: recorrido completo, el cursor vuelve al principio`);
       return;
     }
@@ -9411,7 +9423,7 @@ async function auditarEmailsDelPool(token) {
               + `No toqué nada. Revisar antes de dejarla correr.`,
         metadata: { lote: leads.length, vaciarian: _vaciarian, rebotados: _rebotados, otraMarca: _otraMarca, basura: _basura },
       }).catch(() => {});
-      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 24 * 60, detalle: `freno de seguridad: vaciaría ${_vaciarian}/${leads.length}` });
+      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 84 * 60, detalle: `freno de seguridad: vaciaría ${_vaciarian}/${leads.length}` });
       log(`🛑 auditoría de emails: vaciaría ${_vaciarian} de ${leads.length} — freno de seguridad, no aplico`);
       return;
     }
@@ -9496,7 +9508,7 @@ async function auditarEmailsDelPool(token) {
       buscadosMejor: _buscados, mejorados: _mejorados,
     })).catch(() => {});
     await saludPing(token, "auditoria_emails", {
-      status: "ok", cadenciaMin: 24 * 60,
+      status: "ok", cadenciaMin: 84 * 60,
       detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_mejorados}/${_buscados} mejorados desde genérico · ${_dejadosSinEmail} sin contacto`,
       real: _aplicados, esperado: planes.length,
     });
@@ -11929,9 +11941,31 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     }
   }
   // Filtrar emails con dominio sin MX records ANTES de guardar
-  const emails = await validateEmailsBatch(rawEmails);
+  let emails = await validateEmailsBatch(rawEmails);
   if (rawEmails.length !== emails.length) {
     log(`  📧 ${domain}: ${rawEmails.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
+  }
+
+  // ── EL MISMO CRITERIO QUE AL ENVIAR, TAMBIÉN EN LA ENTRADA (Maxi 2026-08-25) ─────────
+  // `validateEmailsBatch` solo mira que no sea basura y que el dominio tenga MX. NO aplica
+  // el criterio de los MB, que hasta hoy vivía SOLO en el envío y en los barridos.
+  // Consecuencia medida: 25 leads del pool entran con un `soporte@` o un `noticias@` como
+  // único contacto, cuentan como CONTACTABLES en la métrica, y después el agente los rechaza
+  // al enviar. Son parte de los ~218 `all_candidates_undeliverable` diarios: no es que
+  // fallen, es que nunca fueron contactables.
+  // Acá NO se descarta el LEAD —la web puede ser excelente— se descarta el email que no
+  // sirve. Si no queda ninguno, entra como "sin email" y el pulido le busca uno de verdad:
+  // más honesto, y lo pone en la cola correcta desde el primer día.
+  {
+    const _antes = emails.length;
+    const _puntuados = emails
+      .map(e => ({ e, s: rankEmail(e, domain, category || "") }))
+      .filter(x => x.s >= 0)
+      .sort((a, b) => b.s - a.s);
+    emails = _puntuados.map(x => x.e);
+    if (_antes !== emails.length) {
+      log(`  📧 ${domain}: ${_antes - emails.length} email(s) fuera por el criterio de los MB${emails.length ? `; queda ${emails[0]}` : " — entra SIN email, el pulido le buscará uno"}`);
+    }
   }
 
   // Maxi 2026-06-18: GUARD anti-leads-fantasma. Si después de Apollo + scrape:
@@ -13032,9 +13066,20 @@ async function runSession(token, cfg, sessionStart) {
         if (i > 3) break;
       }
     }
-    const emails = await validateEmailsBatch(rawEmailsAuto);
+    let emails = await validateEmailsBatch(rawEmailsAuto);
     if (rawEmailsAuto.length !== emails.length) {
       log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
+    }
+    // Mismo criterio que en processCsvItem: el autopilot es la OTRA puerta de entrada a
+    // Prospects y tenía el mismo hueco. (Maxi 2026-08-25.)
+    {
+      const _antes = emails.length;
+      emails = emails
+        .map(e => ({ e, s: rankEmail(e, domain, category || "") }))
+        .filter(x => x.s >= 0)
+        .sort((a, b) => b.s - a.s)
+        .map(x => x.e);
+      if (_antes !== emails.length) log(`  📧 ${domain}: ${_antes - emails.length} email(s) fuera por el criterio de los MB${emails.length ? "" : " — entra SIN email"}`);
     }
 
     // Score final con emails encontrados
