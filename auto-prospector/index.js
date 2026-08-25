@@ -9416,6 +9416,59 @@ async function auditarEmailsDelPool(token) {
       return;
     }
 
+    // ── BUSCAR UNO MEJOR DONDE SOLO HAY EL "DE ÚLTIMA" ────────────────────────
+    // Criterio del media buyer, textual: "voy por el correo que dice el nombre del espacio
+    // —webmaster, editor, sales, encargado de ventas—; de última, si no hay, info o contacto".
+    // Medido sobre el pool: 187 de 762 leads (uno de cada cuatro) SOLO tienen el de última.
+    // A esos se les hace un scrape del sitio, que es GRATIS —no gasta Apollo ni Serper— para
+    // ver si en alguna página hay un publicidad@ o un editor@ que no habíamos capturado.
+    // Con techo: 20 por pasada y corte por tiempo. Un job en cadena sin techo se come la
+    // vida del worker y deja sin correr a todo lo que viene detrás; hoy pasó exactamente eso.
+    const _LIMITE_UPGRADE = 20;
+    const _CORTE_UPGRADE_MS = 90 * 1000;
+    const _finUpgrade = Date.now() + _CORTE_UPGRADE_MS;
+    let _mejorados = 0, _buscados = 0;
+    if (String(cfg.auditoria_emails_busca_mejor ?? "true") === "true") {
+      const _soloGenerico = leads.filter(l => {
+        const ms = (Array.isArray(l.emails) ? l.emails : []).filter(e => typeof e === "string" && e);
+        if (!ms.length) return false;
+        // "Solo genérico" = ninguno supera el umbral de rol/persona. 40 deja afuera a
+        // info@/contacto@ (15) y a los departamentos (8), y adentro a todo lo demás.
+        return ms.every(e => rankEmail(e, l.domain, l.category || "") < 40);
+      });
+      for (const lead of _soloGenerico) {
+        if (_buscados >= _LIMITE_UPGRADE || Date.now() > _finUpgrade) break;
+        _buscados++;
+        try {
+          const encontrados = await scrapeEmailsForDomain(lead.domain).catch(() => []);
+          const fuentes = lead.email_sources || {};
+          const yaEstan = new Set((lead.emails || []).map(e => String(e).toLowerCase()));
+          const mejores = [...new Set(encontrados)]
+            .filter(e => !yaEstan.has(String(e).toLowerCase()))
+            .filter(e => !isBouncedSync(e))
+            .filter(e => _brandMatches(e, lead.domain, "scrape"))
+            .map(e => ({ e, s: rankEmail(e, lead.domain, lead.category || "") }))
+            .filter(x => x.s >= 40)                       // solo si es MEJOR que el de última
+            .sort((a, b) => b.s - a.s);
+          if (mejores.length) {
+            const _nuevos = [...mejores.map(x => x.e), ...(lead.emails || [])];
+            const _srcs = { ...fuentes };
+            mejores.forEach(x => { _srcs[x.e.toLowerCase()] = { source: "scrape", url: `https://${lead.domain}` }; });
+            const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH",
+              headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ emails: _nuevos, email_sources: _srcs }),
+            }).catch(() => null);
+            if (r && r.ok) {
+              _mejorados++;
+              log(`  ⬆️ ${lead.domain}: solo tenía genérico → encontré ${mejores[0].e} (${mejores[0].s} pts)`);
+            }
+          }
+        } catch (e) { log(`  ⚠️ upgrade ${lead.domain}: ${e.message}`); }
+      }
+      if (_buscados) log(`📧 upgrade de contacto: ${_buscados} sitios revisados (gratis) → ${_mejorados} con un email MEJOR que el genérico`);
+    }
+
     // ── SEGUNDA PASADA: aplicar ───────────────────────────────────────────────
     let _aplicados = 0, _dejadosSinEmail = 0;
     for (const plan of planes) {
@@ -9440,10 +9493,11 @@ async function auditarEmailsDelPool(token) {
     await setConfigValue(token, "auditoria_emails_ultimo", JSON.stringify({
       fecha: _madridDateStr(), lote: leads.length, tirados: _tirados, rebotados: _rebotados,
       otraMarca: _otraMarca, basura: _basura, reordenados: _reordenados, sinEmail: _dejadosSinEmail,
+      buscadosMejor: _buscados, mejorados: _mejorados,
     })).catch(() => {});
     await saludPing(token, "auditoria_emails", {
       status: "ok", cadenciaMin: 24 * 60,
-      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_dejadosSinEmail} quedaron sin contacto`,
+      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_mejorados}/${_buscados} mejorados desde genérico · ${_dejadosSinEmail} sin contacto`,
       real: _aplicados, esperado: planes.length,
     });
     log(`📧 auditoría de emails: ${leads.length} leads revisados · ${_tirados} direcciones malas eliminadas · ${_dejadosSinEmail} leads quedaron sin email (polishPool les buscará otro)`);
@@ -16480,7 +16534,18 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   if (AD_SALES.test(local))        { score += 95; matchedRole = "AD_SALES"; }    // publicidad@/comercial@/ads@ = target ideal ADEQ
   else if (EXEC.test(local))       { score += 90; matchedRole = "EXEC"; }       // CEO/founder = jackpot
   else if (COMMERCIAL.test(local)) { score += 80; matchedRole = "COMMERCIAL"; }
-  else if (EDITORIAL.test(local))  { score += 60; matchedRole = "EDITORIAL"; }
+  // ── ORDEN DEL MEDIA BUYER (Maxi 2026-08-25, textual) ────────────────────────────────
+  // "Yo voy por el correo que dice el nombre del espacio con el que me quiero conectar, ya
+  //  sea el webmaster, editor, sales, encargado de ventas; o de última, si no hay, info o
+  //  contacto, o algún nombre como juan@aliados.com."
+  // O sea: primero el rol que NOMBRA el espacio, y recién después el genérico o la persona.
+  // EDITORIAL sube de 60 a 75 para quedar por encima de PERSON (70): un `editor@` es un rol
+  // nombrado, `juan.perez@` es la alternativa. Y WEBMASTER sale de la bolsa de genéricos,
+  // donde valía 15 — el MB lo nombra como objetivo principal y el código lo trataba como
+  // `info@`. (Hoy no hay ninguno en el pool, así que esto no cambia nada de inmediato: es
+  // para que cuando aparezca uno, se lo trate como lo que es.)
+  else if (EDITORIAL.test(local))  { score += 75; matchedRole = "EDITORIAL"; }
+  else if (/^webmaster([._-]|$)/i.test(local)) { score += 72; matchedRole = "WEBMASTER"; }
   // Maxi 2026-07-24 (auditoría respuestas 22-24): direcciones de DEPARTAMENTO / atención al
   // cliente que NO son contacto de venta de pauta y ni rebotan ni responden a un pitch de
   // inventario (denuncias@, soporte.epaper@, bok@, cskh@, rrhh@, cobranzas@…). Antes caían en
