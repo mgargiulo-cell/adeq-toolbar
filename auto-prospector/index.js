@@ -163,6 +163,7 @@ function classifyByUrlOnly(domain, category = "", traffic = 0) {
 
 // Fuente de dominios públicos rankeados (Majestic Million — top 1M sitios)
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
+let _majesticFalloAt = 0;   // último fallo de descarga, para el enfriamiento
 
 // Dominios de tech/redes sociales/marcas globales — no son publishers
 const EXCLUDE_DOMAINS = new Set([
@@ -425,6 +426,8 @@ function normalizeMondayGeo(raw) {
 // en práctica). No expira en memoria. Si Railway escala/reinicia, re-descarga.
 async function loadDomainPool() {
   if (domainPool !== null) return domainPool;
+  // Enfriamiento tras un fallo: el archivo pesa ~100 MB, no se reintenta en cada llamada.
+  if (_majesticFalloAt && Date.now() - _majesticFalloAt < 5 * 60 * 1000) return [];
 
   log("Descargando Majestic Million (puede tardar ~20s)...");
   try {
@@ -449,8 +452,16 @@ async function loadDomainPool() {
       log(`💾 Memoria post-pool: rss=${mb(m.rss)}MB, heapUsed=${mb(m.heapUsed)}MB, heapTotal=${mb(m.heapTotal)}MB, external=${mb(m.external)}MB`);
     } catch {}
   } catch (err) {
-    log(`⚠️ Error descargando pool: ${err.message} — se reintentará en la próxima sesión.`);
-    domainPool = []; // evitar retry inmediato; se reseteará al reiniciar
+    // ⚠️ NO CACHEAR EL FALLO COMO "NO HAY DOMINIOS" (Maxi 2026-08-25).
+    // Guardaba `[]`, y como el chequeo de arriba es `if (domainPool !== null)`, ese vacío se
+    // devolvía a TODOS los que preguntaran durante el resto del proceso. Para el feeder de
+    // Majestic eso es indistinguible de "el pool está agotado": deja de descubrir y no
+    // avisa. Otra vez "no pude bajarlo" leído como "no hay nada".
+    // Se deja en null (se reintenta) pero con un enfriamiento, para no bajar 100 MB en loop.
+    log(`⚠️ Error descargando el pool de Majestic: ${err.message} — NO es un pool vacío, es que no pude bajarlo`);
+    domainPool = null;
+    _majesticFalloAt = Date.now();
+    return [];
   }
   return domainPool;
 }
@@ -2870,7 +2881,12 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // SIEMPRE que hubo búsquedas exitosas, incluso con 0 nuevos (pool saturado → baja el rate → menos
   // búsquedas el próximo slot). Si todo falló (créditos/key) NO se ajusta (no es señal de saturación).
   if (queriesDone > 0) {
-    const _slotRate = freshCount / queriesDone;
+    // ⚠️ SE MEDÍA `freshCount` Y NO `inserted` (Maxi 2026-08-25). El "gasto inteligente"
+    // sube las búsquedas cuando el motor rinde. Pero medía "dominios que no conocía",
+    // no "dominios que entraron": durante los siete días que AutoGoogle encoló CERO, el
+    // rate siguió alto —encontraba de a cientos— y el sistema le AUMENTÓ el presupuesto de
+    // Serper mientras no traía una sola URL. El entregable es el dominio encolado.
+    const _slotRate = inserted / queriesDone;
     const _newRate = Math.round((0.6 * freshRate + 0.4 * _slotRate) * 1000) / 1000;
     try {
       await setConfigValue(token, "autogoogle_fresh_rate", String(_newRate));
@@ -3091,11 +3107,30 @@ async function sincronizarFinalizadosDeMonday(token) {
       return 0;   // nunca re-prospectar a ciegas: alguien podría haber recibido el mail ayer
     }
     const enCola = await _dominiosActivosEnCola(token, todos);
+    // ⚠️ FALTABA MIRAR PROSPECTS (Maxi 2026-08-25). `_dominiosActivosEnCola` solo mira la
+    // COLA. Un dominio que ya pasó la cola y está esperando en Prospects como `pending` no
+    // figuraba en ningún lado, así que el reciclado lo volvía a encolar: 88 dominios
+    // duplicando trabajo y gastando de nuevo el hit de RapidAPI para llegar al mismo lead
+    // que ya teníamos listo para contactar.
+    const _yaEnProspects = new Set();
+    try {
+      const auth2 = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+      for (let i = 0; i < todos.length; i += 200) {
+        const lote = todos.slice(i, i + 200).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=in.(${encodeURIComponent(lote)})&select=domain`,
+          { headers: auth2 });
+        if (!r.ok) continue;
+        const f = await r.json();
+        if (Array.isArray(f)) f.forEach(x => x.domain && _yaEnProspects.add(x.domain));
+      }
+    } catch (e) { log(`  ⚠️ monday: no pude cruzar contra Prospects (${e.message}) — sigo sin ese filtro`); }
+    if (_yaEnProspects.size) log(`  ℹ️ monday: ${_yaEnProspects.size} ya están esperando en Prospects — no se re-encolan`);
     // ⚠️ EL CORTE Y EL CONTEO ERAN LA MISMA VARIABLE (Maxi 2026-08-25). `reprospectables`
     // guardaba `candidatos.length`, que ya venía cortado por el techo diario, así que el
     // parte comparaba el techo contra sí mismo y siempre concluía "entró todo lo que se
     // podía". Con 5.790 elegibles y un techo de 400, decía que el board quedaba al día.
-    const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d));
+    const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d));
     const candidatos = _elegibles.slice(0, MONDAY_SYNC_MAX_POR_DIA);
 
     let encolados = 0;
