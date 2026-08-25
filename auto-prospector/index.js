@@ -8497,7 +8497,13 @@ async function parteDelDia(token) {
         _lineasManual.push(`      De esas: ${d.arriba} superan ${_k}k · ${d.abajo} por debajo · ${d.sinDato} sin dato de tráfico`);
         if (_conv != null) _lineasManual.push(`      Aprovechamiento: le escribió a ${d.enviados.length} de las ${d.arriba} que servían (${_conv}%)`);
         if (d.listos) _lineasManual.push(`      ⏳ Quedaron ${d.listos} SIN CONTACTAR: superan ${_k}k, ya tienen email y nunca se les escribió`);
-        if (d.retomables) _lineasManual.push(`         (+ ${d.retomables} contactados hace más de 30 días — se pueden retomar)`);
+        // ⚠️ NO SE DICE "se pueden retomar" (Maxi 2026-08-25, regla del user).
+        // "Solo se puede recontactar si no están en Monday o si están con ciclo finalizado,
+        //  sino no." Que hayan pasado 30 días NO alcanza: puede haber un deal vivo.
+        // Confirmarlo pide el estado de Monday por dominio, que hoy no está guardado —el
+        // sync recorre el board pero solo persiste un resumen—. Así que el parte informa el
+        // hecho y NO afirma lo que no puede verificar.
+        if (d.retomables) _lineasManual.push(`         (+ ${d.retomables} contactados hace más de 30 días — revisar en Monday: solo se retoman si no están o si el ciclo terminó)`);
         if (d.yaContactados) _lineasManual.push(`         (${d.yaContactados} ya contactados en los últimos 30 días — bien no escribirles)`);
         if (d.anglo) _lineasManual.push(`      🌎 Fuera del foco geográfico: ${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%) son anglo/Norteamérica`);
         if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
@@ -8652,7 +8658,7 @@ async function parteDelDia(token) {
                ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
                ...(d.listos ? [["Sin contactar y listos", `${d.listos}`, d.listos > 5 ? _ROJO : "#b26a00"]] : []),
-               ...(d.retomables ? [["Retomables (+30 días)", `${d.retomables}`]] : []),
+               ...(d.retomables ? [["Contactados hace +30 días", `${d.retomables} — revisar en Monday antes de retomar`]] : []),
                ...(d.yaContactados ? [["Ya contactados (30 días)", `${d.yaContactados}`, _GRIS]] : []),
                ...(d.anglo ? [["Fuera del foco (anglo)", `${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%)`,
                    (d.anglo / d.mirados) > 0.3 ? _ROJO : _GRIS]] : []),
