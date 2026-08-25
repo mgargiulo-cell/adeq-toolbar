@@ -9304,6 +9304,152 @@ const POLISH_CONC = 12;                // 8→12: más dominios en paralelo por 
 // Se corta la corrida a los 2 minutos y se sigue en la vuelta siguiente. El cursor se commitea
 // por wave, así que cortar no pierde nada ni repite trabajo.
 const POLISH_MAX_MS = 120 * 1000;
+// ════════════════════════════════════════════════════════════════════════════
+// AUDITOR DE EMAILS DEL POOL (Maxi 2026-08-25, pedido del user)
+// ════════════════════════════════════════════════════════════════════════════
+// "No tenemos un agente que analice las direcciones de emails TOTALES para
+//  identificar cuáles son incorrectas y reemplazarlas."
+//
+// El hueco era real. Había dos barridos y ninguno miraba esto:
+//   · polishPool     → busca email en los leads que NO tienen
+//   · purge/sweep    → saca URLs que no cumplen (banco, sin ads.txt…)
+//   · NADIE          → revisaba los emails YA GUARDADOS
+// Medido al escribirlo: 2.027 emails en 830 leads, y 17 leads guardaban una
+// dirección que YA HABÍA REBOTADO. A esos el agente les iba a escribir igual.
+//
+// No inventa criterios propios: reusa `rankEmail` (que ya sabe de basura,
+// departamentos irrelevantes, rebotes previos y roles comerciales) y
+// `_brandMatches` (que sabe si el correo es de la marca o de un WHOIS proxy).
+// Así el auditor y el envío juzgan con la MISMA vara — dos implementaciones de
+// la misma regla siempre terminan discrepando, y eso ya pasó dos veces acá.
+//
+// Qué hace con cada lead:
+//   1. puntúa todos sus emails con las reglas de hoy
+//   2. tira los que no pasan (rebotados, basura, de otra marca)
+//   3. REORDENA para que el mejor quede primero — el envío toma el primero
+//   4. si no sobrevive ninguno, lo deja SIN email a propósito: así polishPool
+//      lo agarra y le busca uno nuevo. Es mejor saber que no tenemos contacto
+//      que creer que tenemos uno que no sirve.
+const AUDITORIA_EMAILS_LOTE = 250;      // ~4 días para recorrer el pool entero
+const AUDITORIA_EMAILS_CORTE_SEGURIDAD = 0.30;   // si vaciaría más del 30%, NO aplica y avisa
+async function auditarEmailsDelPool(token) {
+  try {
+    const cfg = await getConfig(token).catch(() => null);
+    if (!cfg) return;
+    if (String(cfg.auditoria_emails_enabled ?? "true") !== "true") {
+      await saludApagado(token, "auditoria_emails", "flag apagado a propósito");
+      return;
+    }
+    if (!(await _tocaCorrer(token, "auditoria_emails", 24 * 60))) return;
+
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const cursor = cfg.auditoria_emails_cursor || "";
+    const clausula = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
+    let leads = null;
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D${clausula}&select=id,domain,emails,email_sources,category,created_at&order=created_at.asc&limit=${AUDITORIA_EMAILS_LOTE}`,
+        { headers: auth });
+      if (r.ok) { const j = await r.json(); if (Array.isArray(j)) leads = j; }
+    } catch {}
+    // "No pude leer" ≠ "terminé de auditar": se conserva el cursor y se reintenta.
+    if (leads === null) {
+      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 24 * 60, detalle: "no se pudo leer el pool — se conserva el cursor" });
+      log(`⚠️ auditoría de emails: la consulta falló — reintento mañana sin perder el lugar`);
+      return;
+    }
+    if (leads.length === 0) {
+      await setConfigValue(token, "auditoria_emails_cursor", "").catch(() => {});
+      await saludPing(token, "auditoria_emails", { status: "ok", cadenciaMin: 24 * 60, detalle: "pool completo auditado → vuelvo a empezar" });
+      log(`📧 auditoría de emails: recorrido completo, el cursor vuelve al principio`);
+      return;
+    }
+
+    // ── PRIMERA PASADA: decidir sin escribir nada ─────────────────────────────
+    const planes = [];
+    let _tirados = 0, _reordenados = 0, _rebotados = 0, _otraMarca = 0, _basura = 0;
+    for (const lead of leads) {
+      const originales = (Array.isArray(lead.emails) ? lead.emails : []).filter(e => typeof e === "string" && e);
+      if (!originales.length) continue;
+      const fuentes = lead.email_sources || {};
+      const evaluados = originales.map(e => {
+        const score  = rankEmail(e, lead.domain, lead.category || "");
+        const marca  = _brandMatches(e, lead.domain, _normSrc(fuentes[e.toLowerCase()]));
+        let motivo = "";
+        if (isBouncedSync(e))      motivo = "ya_reboto";
+        else if (score < 0)        motivo = "basura_o_departamento";
+        else if (!marca)           motivo = "otra_marca";
+        return { email: e, score, ok: !motivo, motivo };
+      });
+      const buenos = evaluados.filter(x => x.ok).sort((a, b) => b.score - a.score).map(x => x.email);
+      const malos  = evaluados.filter(x => !x.ok);
+      malos.forEach(m => {
+        _tirados++;
+        if (m.motivo === "ya_reboto") _rebotados++;
+        else if (m.motivo === "otra_marca") _otraMarca++;
+        else _basura++;
+      });
+      const cambioContenido = buenos.length !== originales.length;
+      const cambioOrden = !cambioContenido && buenos.some((e, i) => e !== originales[i]);
+      if (cambioOrden) _reordenados++;
+      if (cambioContenido || cambioOrden) {
+        planes.push({ id: lead.id, domain: lead.domain, buenos, vaciaria: buenos.length === 0, malos });
+      }
+    }
+
+    // ── FRENO DE SEGURIDAD ────────────────────────────────────────────────────
+    // Si una pasada dejaría sin email a más del 30% del lote, NO se aplica. Un
+    // cambio de reglas mal calibrado puede vaciar el pool en una noche, y de eso
+    // no se vuelve sin re-descubrir todo. Mejor avisar y que lo mire una persona.
+    const _vaciarian = planes.filter(p => p.vaciaria).length;
+    if (leads.length >= 20 && _vaciarian / leads.length > AUDITORIA_EMAILS_CORTE_SEGURIDAD) {
+      await saludAlerta(token, {
+        clave: "auditoria-emails-freno", severidad: "error",
+        titulo: `🛑 La auditoría de emails dejaría sin contacto al ${Math.round(100 * _vaciarian / leads.length)}% del lote — NO la apliqué`,
+        cuerpo: `${_vaciarian} de ${leads.length} leads se quedarían sin ningún email válido.\n`
+              + `Eso no parece un pool sucio, parece una regla mal calibrada (rankEmail o _brandMatches).\n`
+              + `No toqué nada. Revisar antes de dejarla correr.`,
+        metadata: { lote: leads.length, vaciarian: _vaciarian, rebotados: _rebotados, otraMarca: _otraMarca, basura: _basura },
+      }).catch(() => {});
+      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 24 * 60, detalle: `freno de seguridad: vaciaría ${_vaciarian}/${leads.length}` });
+      log(`🛑 auditoría de emails: vaciaría ${_vaciarian} de ${leads.length} — freno de seguridad, no aplico`);
+      return;
+    }
+
+    // ── SEGUNDA PASADA: aplicar ───────────────────────────────────────────────
+    let _aplicados = 0, _dejadosSinEmail = 0;
+    for (const plan of planes) {
+      const patch = { emails: plan.buenos };
+      // Sin ningún email válido: se deja explícitamente vacío para que polishPool lo
+      // agarre y le busque uno nuevo. Y se limpia la marca de rescate, si no el lead
+      // figuraría como "ya se le encontró email" para siempre.
+      if (plan.vaciaria) { patch.email_found_at = null; _dejadosSinEmail++; }
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${plan.id}`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify(patch),
+      }).catch(() => null);
+      if (r && r.ok) {
+        _aplicados++;
+        if (plan.malos.length) log(`  📧 ${plan.domain}: saco ${plan.malos.map(m => `${m.email} (${m.motivo})`).join(", ")}`);
+      }
+    }
+
+    const ultimo = leads[leads.length - 1]?.created_at || cursor;
+    await setConfigValue(token, "auditoria_emails_cursor", ultimo).catch(() => {});
+    await setConfigValue(token, "auditoria_emails_ultimo", JSON.stringify({
+      fecha: _madridDateStr(), lote: leads.length, tirados: _tirados, rebotados: _rebotados,
+      otraMarca: _otraMarca, basura: _basura, reordenados: _reordenados, sinEmail: _dejadosSinEmail,
+    })).catch(() => {});
+    await saludPing(token, "auditoria_emails", {
+      status: "ok", cadenciaMin: 24 * 60,
+      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_dejadosSinEmail} quedaron sin contacto`,
+      real: _aplicados, esperado: planes.length,
+    });
+    log(`📧 auditoría de emails: ${leads.length} leads revisados · ${_tirados} direcciones malas eliminadas · ${_dejadosSinEmail} leads quedaron sin email (polishPool les buscará otro)`);
+  } catch (e) { log(`⚠️ auditarEmailsDelPool: ${e.message}`); }
+}
+
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
@@ -22169,6 +22315,9 @@ async function main() {
         // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
         //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
         if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
+      // Va después del pulido a propósito: el pulido AGREGA emails y el auditor los JUZGA.
+      // Al revés, el auditor no vería lo que acaba de entrar.
+      if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
         // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
         //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.
         // Maxi 2026-08-18: el agente de REVISIÓN. Re-arma solo la búsqueda de emails y el
