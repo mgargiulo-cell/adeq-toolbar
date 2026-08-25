@@ -2960,6 +2960,22 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
     }));
   } catch {}
   const sourcesToTry = _todas.sort(() => Math.random() - 0.5);
+  // ⚠️ EL CARRIL SE MIRA ANTES DE BAJAR NADA (Maxi 2026-08-25).
+  // `_injectIntoCsvQueue` chequea el cupo del carril al FINAL, después de todo el trabajo.
+  // Con el carril lleno, este bucle igual se bajaba cientos de sellers.json —uno de ellos
+  // con 18.275 publishers—, calculaba miles de dominios frescos y los tiraba a la basura:
+  // "701 pubs → 536 frescos → 0 insertados", una y otra vez.
+  // Y como es el job número 30 de una cadena de 37, se comía la vida entera del worker
+  // (~7 min) y la COLA DE PROSPECTOS, que va última, no corría nunca. Ese fue el apagón de
+  // hoy: 200 pendientes, 0 en proceso, cero errores, durante horas.
+  // Si no hay lugar donde poner lo que se descubra, no se descubre.
+  const _cupoCarril = PER_SOURCE_ACTIVE_CAP["auto_feeder_sellers"] ?? DEFAULT_SOURCE_CAP;
+  const _usadoCarril = await _countActiveCsvBySource(token, "auto_feeder_sellers");
+  if (_usadoCarril >= _cupoCarril) {
+    log(`⏸️ sellers: carril lleno (${_usadoCarril}/${_cupoCarril}) — no bajo ningún sellers.json, sería trabajo tirado`);
+    return 0;
+  }
+
   for (const url of sourcesToTry) {
     if (inserted >= targetCount) break;
     try {
