@@ -9088,12 +9088,28 @@ async function polishPool(token) {
     return;
   }
   if (leads.length === 0) {
-    await setConfigValue(token, "polish_pool", "false").catch(() => {});
     await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
-    await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
     await setConfigValue(token, "polish_last_done", new Date().toISOString()).catch(() => {});
-    await saludPing(token, "polish_pool", { status: "ok", detalle: "pool completo pulido" });
-    log(`✨ polish: pool COMPLETO pulido → flag OFF`);
+    // ── EL BARRIDO VUELVE A EMPEZAR POR LOS MUDOS (Maxi 2026-08-25) ─────────────
+    // Antes, al terminar una pasada completa, apagaba `polish_only_missing` y el
+    // barrido entero. La próxima vez arrancaba de cero repasando el pool COMPLETO.
+    // Medido hoy: el pulido enriqueció 20 leads y solo UNO fue un rescate de verdad
+    // —los otros 19 ya tenían email— mientras 349 leads seguían mudos. O sea que
+    // gastaba su presupuesto en los que ya estaban resueltos.
+    // El North Star es que ningún prospecto se quede sin email, así que al terminar
+    // la pasada general se re-arma apuntando SOLO a los que no tienen ninguno. Si esa
+    // segunda pasada tampoco encuentra a nadie, ahí sí se apaga: significa que no
+    // queda un solo lead mudo, que es exactamente el objetivo.
+    if (!soloSinEmail) {
+      await setConfigValue(token, "polish_only_missing", "true").catch(() => {});
+      await saludPing(token, "polish_pool", { status: "ok", detalle: "pasada general lista → ahora solo los que no tienen email" });
+      log(`✨ polish: pool completo pulido → segunda pasada SOLO sobre los mudos`);
+      return;
+    }
+    await setConfigValue(token, "polish_pool", "false").catch(() => {});
+    await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
+    await saludPing(token, "polish_pool", { status: "ok", detalle: "no queda ningún lead sin email" });
+    log(`✨ polish: NO queda un solo lead sin email → flag OFF`);
     return;
   }
   let blocked = 0, enriched = 0, sinEmail = 0;
@@ -14172,8 +14188,29 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
 
     // Reusar el pitch del lead (snapshot) o regenerar — preferimos reusar
     // el pitch original que se generó cuando entró a review_queue
-    const subject = lead.pitch_subject || (lead.pitch_subjects?.[0]) || `Sobre ${domain}`;
-    const body    = lead.pitch || "Hola, quería ver si te puedo sumar algo desde ADEQ. Avisame si te interesa.";
+    // ⚠️ ACÁ HABÍA UN TEXTO GENÉRICO ESCRITO A MANO (Maxi 2026-08-25).
+    // "Hola, quería ver si te puedo sumar algo desde ADEQ. Avisame si te interesa."
+    // Tiene EXACTAMENTE 14 palabras y el linter bloquea por debajo de 15, así que
+    // ningún reintento con este cuerpo salía jamás: quedaba `linter:cuerpo_muy_corto_14`.
+    // Y aunque hubiera salido, era copy mío — la regla del user es que se manden SUS
+    // plantillas. Así que cuando el lead no tiene pitch guardado se usa una plantilla
+    // de verdad, en el idioma del sitio, igual que el primer contacto.
+    let subject = lead.pitch_subject || (lead.pitch_subjects?.[0]) || "";
+    let body    = lead.pitch || "";
+    if (!body) {
+      const _tpl = pickRandomTemplate(lead.language || "es");
+      if (_tpl) {
+        // fillTemplate recibe el template ENTERO y devuelve {body, subjects}.
+        const _lleno = fillTemplate(_tpl, { domain, sender_name: getSenderName(mbEmail) });
+        body    = _lleno.body || "";
+        subject = subject || _lleno.subjects?.[0] || "";
+      }
+    }
+    if (!subject) subject = `Sobre ${domain}`;
+    if (!body) {
+      log(`  ⏭️ ${domain}: sin pitch guardado y sin plantilla para "${lead.language || "?"}" — no se reintenta con un texto inventado`);
+      return;
+    }
 
     let retryActionId = null;
     let sendOk = false;
