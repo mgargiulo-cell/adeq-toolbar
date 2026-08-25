@@ -5984,6 +5984,18 @@ function _stripScrapePrefix(email) {
   // Decode URL-encoded chars (%20=space, %09=tab) y trim whitespace al inicio.
   // Caso real 2026-05-14: "%20info@ewdifh.com" salió enviado por el agente.
   try { email = decodeURIComponent(email); } catch {}
+  // ⚠️ ESCAPES DE HTML/JSON PEGADOS AL PRINCIPIO (Maxi 2026-08-25).
+  // El scrape agarra el email de un HTML donde antes viene un ">" codificado y se lo lleva
+  // pegado literal: `u003ecommercialquestions@condenast.com`. Medido: 37 direcciones del
+  // pool arruinadas así, y varias eran justo los contactos comerciales que buscamos —
+  // ads@omnicalculator.com, media@omnicalculator.com, commercialquestions@condenast.com.
+  // Mismo tipo de bug que la "C" de "Contato:" que ya se limpiaba abajo.
+  email = email.replace(/^(?:\\?u00(?:3e|3c|26)|&gt;|&lt;|&amp;|&#\d+;|[<>"'`])+/i, "")
+                 .replace(/(?:\\?u00(?:3e|3c)|&gt;|&lt;|[<>"'`])+$/i, "")
+                   // Etiqueta pegada adelante: "email: juan@x.com" — el scrape se lleva el rótulo.
+                   .replace(/^\s*(?:e-?mail|mail|correo|contacto|contato)\s*[:：]\s*/i, "")
+                   // Barras y comillas de escape que quedan al final del recorte del HTML.
+                   .replace(/[\\\/"'`\s]+$/, "");
   email = email.replace(/^[\s​ ]+/, "").trim();
   const [local, domain] = email.split("@");
   if (!local || !domain) return email;
@@ -8150,7 +8162,16 @@ async function parteDelDia(token) {
   const _porFuente = {};
   try {
     const filas = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?uploaded_at=gte.${_sem}&select=source,status`,
+      // ⚠️ SE MEDÍA LA COHORTE EQUIVOCADA (Maxi 2026-08-25). Filtraba por `uploaded_at`
+      // —cuándo ENTRÓ a la cola— y contaba los `done`, que pasan días después. O sea que
+      // medía gente que todavía no terminó de correr: el parte mostraba TODAS las fuentes
+      // en 0%, lo cual es imposible porque los leads estaban entrando igual.
+      // Es el mismo error que el freno por rebotes de esta mañana: numerador y denominador
+      // de poblaciones distintas. Con `processed_at` la pregunta es la correcta: "de lo que
+      // PROCESÉ esta semana, cuánto pasó". Números reales al corregirlo: similar 29%,
+      // adstxt 23%, majestic 16%, monday 15%, sellers 5% y autopilot 0% — este último sí
+      // era verdad, y es el que hay que mirar.
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${_sem}&select=source,status`,
       { headers: auth }
     ).then(r => r.ok ? r.json() : []).catch(() => []);
     for (const f of (Array.isArray(filas) ? filas : [])) {
@@ -20316,12 +20337,26 @@ async function saludAlerta(token, { clave, titulo, cuerpo, severidad = "warning"
     if (severidad === "error" && _ES_PARO.test(String(clave || ""))) {
       try {
         const _cfgAviso = await getConfig(token).catch(() => null);
-        if (_cfgAviso) {
+        // ⚠️ UN SOLO MAIL DE ALERTAS POR DÍA (Maxi 2026-08-25, pedido del user).
+        // Esta tarde puse el aviso inmediato para las paradas y el resultado fue una
+        // avalancha: el user recibió varios mails en una tarde. Su regla, textual: "no
+        // enviar varios mails al día de alertas; 1 mail resumen al día y máximo 1 mail
+        // alertas al día".
+        // El anti-spam de 60 minutos por TIPO no alcanzaba: seis tipos distintos son seis
+        // mails. Ahora el presupuesto es GLOBAL y diario. La primera parada del día se
+        // manda en el momento —que es lo que da valor: enterarse a tiempo— y el resto se
+        // acumula para el resumen. Nada se pierde, solo deja de sonar el teléfono.
+        const _hoyAviso = _madridDateStr();
+        const _yaMandeHoy = String(_cfgAviso?.salud_alerta_mail_dia || "") === _hoyAviso;
+        if (_cfgAviso && !_yaMandeHoy) {
+          await setConfigValue(token, "salud_alerta_mail_dia", _hoyAviso).catch(() => {});
           await _secAvisar(token, _cfgAviso, {
             titulo: `🛑 ${titulo}`,
-            cuerpo: `${cuerpo}\n\n— Esto se manda en el momento y no espera al resumen de 72h: es una parada, no un aviso.`,
-            kind: `paro_${String(clave).split("-")[0]}`,
+            cuerpo: `${cuerpo}\n\n— Primera parada del día, por eso te llega ahora. Lo que aparezca después va al resumen: un solo mail de alertas por día.`,
+            kind: "paro_del_dia",
           });
+        } else if (_yaMandeHoy) {
+          log(`📭 ${clave}: ya mandé el mail de alertas de hoy — esto va al resumen`);
         }
       } catch (e) { log(`⚠️ aviso inmediato de paro: ${e.message}`); }
     }
@@ -20996,7 +21031,9 @@ async function chequearAutenticacionPropia(token) {
 }
 
 // Cada cuánto, como MÁXIMO, se manda el mail de resumen.
-const RESUMEN_SALUD_CADA_HORAS = 72;
+// Maxi 2026-08-25: 72 → 24. El user quiere "1 mail resumen al día". El resumen recoge todo
+// lo que no salió como primera parada del día, así que nada se pierde.
+const RESUMEN_SALUD_CADA_HORAS = 24;
 
 // Acumula un hallazgo en el resumen pendiente. Deduplica por clave: si el mismo
 // problema aparece 40 veces en 3 días, en el mail va UNA línea con el conteo.
