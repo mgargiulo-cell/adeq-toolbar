@@ -16565,6 +16565,17 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|ajuda|apoyo|denuncias?|reclamos?|reclama[cç][õo]es|abonnements?|suscripciones|assinaturas|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|helpdesk|help|servicios?|servico|service|tickets?|customer[a-z]*|cliente[a-z]*|servicedesk)([._-]|$)/i.test(local)) { score -= 20; matchedRole = "MESA_DE_AYUDA"; }
   // Otros departamentos que no son mesa de ayuda: no venden pauta, pero tampoco
   // ensucian una cola de soporte. Siguen sendables como último recurso (North Star: ≥1 email).
+  // ── ÁREAS QUE LOS MB DESCARTAN SIEMPRE (Maxi 2026-08-25) ────────────────────────────
+  // Agus: "descarto las que son de otras áreas: suscripción, noticias, finanzas, atención al
+  // cliente". Diego: "descarto info, contacto, soporte, etc."
+  // `soporte@` y `suscripciones@` ya caían en MESA_DE_AYUDA (-20). Faltaban estas dos, que
+  // estaban en +15 junto a `info@` — o sea que podían ganarle a nada y recibir el pitch.
+  // Un buzón de redacción o de contabilidad no compra publicidad NUNCA: no es "peor que un
+  // comercial", es que no es el interlocutor. Negativo = descartado.
+  // (`prensa@`/`press@` NO entra acá: es un buzón atendido por humanos que sí reenvía.)
+  // `redaccion` NO está acá: la agarra antes EDITORIAL (+75), que es lo que Agus quiere.
+  else if (/^(noticias?|news|newsletter)([._-]|$)/i.test(local)) { score -= 10; matchedRole = "AREA_EQUIVOCADA"; }
+  else if (/^(finan|contab|administracion|administrativo|tesoreria|pagos?)/i.test(local)) { score -= 10; matchedRole = "AREA_EQUIVOCADA"; }
   else if (/^(rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|legal|privacy|privacidad|privacidade|\bdpo\b|abuse)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
   // Maxi 2026-07-27 (auditoría respuestas 23-27): buzones de IT / infraestructura / dominios /
   // registrar. NO son contacto de venta de pauta y jamás responden un pitch de inventario; peor,
