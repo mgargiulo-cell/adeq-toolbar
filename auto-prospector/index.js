@@ -1562,15 +1562,20 @@ const _ESTADOS_REINTENTABLES = ["error", "expired"];
           `${SUPABASE_URL}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}${filter || ""}`,
           { headers }
         );
-        if (!res.ok) return;
+        if (!res.ok) { known.incompleto = true; return; }
         const rows = await res.json();
         rows.forEach(r => {
           const v = r[col];
           if (typeof v === "string" && v) known.add(v.toLowerCase());
         });
-      } catch {}
+      } catch { known.incompleto = true; }
     }));
   }
+  // ⚠️ `incompleto` marca que alguna consulta falló (Maxi 2026-08-25). Antes el fallo se
+  // tragaba en silencio: el Set volvía a medias y los dominios que no se pudieron chequear
+  // pasaban por FRESCOS. Con el upsert que reactiva filas, eso significa re-prospectar
+  // dominios ya contactados. "No sé si lo conozco" no puede degradarse a "es nuevo": quien
+  // llame a esto tiene que poder decidir esperar a la próxima vuelta.
   return known;
 }
 
@@ -1777,6 +1782,7 @@ async function _drainBacklog(token, sourceTag, room) {
     // Re-dedup: pudo haber entrado por otra vía desde que se estacionó.
     const cands = rows.map(x => x.domain).filter(Boolean);
     const known = await _findKnownDomainsWorker(token, cands);
+    if (known.incompleto) { log(`  ⏸️ pre-listado ${sourceTag}: el dedup vino incompleto (Supabase) — no inyecto para no re-prospectar`); return 0; }
     const usable = cands.filter(d => !known.has(d)).slice(0, room);
 
     // returnDomains: necesito saber CUÁLES entraron, no cuántos. Si me guiara por el count y
@@ -2788,6 +2794,11 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     });
     if (_tirados) log(`  🧹 AutoGoogle: ${_tirados} dominios descartados GRATIS antes de gastar cuota (redes, wikis, gobiernos, tiendas)`);
     const known = await _findKnownDomainsWorker(token, cands);
+    if (known.incompleto) {
+      log(`  ⏸️ AutoGoogle: el dedup vino incompleto (Supabase) — no encolo nada este slot para no re-prospectar dominios ya vistos`);
+      await saludPing(token, "autogoogle", { status: "fail", cadenciaMin: 240, detalle: "dedup incompleto: no se encoló para no duplicar" }).catch(() => {});
+      return;
+    }
     let fresh = cands.filter(d => !known.has(d));
 
     // ── QUÉ 180 ENTRAN, NO CUÁNTOS (Maxi 2026-08-11) ──────────────────────────
@@ -14783,7 +14794,11 @@ async function _countAgentActionsToday(token, userEmail, actions, label) {
     const cutoffUtc = _madridMidnightUtcISO();
     // Timeout 5s: si Supabase está lento, no colgamos el worker entero por este conteo.
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(${actions.join(",")})&created_at=gte.${cutoffUtc}&select=id`,
+      // `details->>ui_origin=is.null` deja afuera los envíos MANUALES del MB (Maxi 2026-08-25).
+      // El cupo de 20/día es del AGENTE. Desde que se arregló el registro del envío manual
+      // —que estaba roto por RLS y no escribía ninguna fila—, un MB que mandaba 8 a mano le
+      // consumía 8 slots al agente sin que nadie lo viera.
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(${actions.join(",")})&created_at=gte.${cutoffUtc}&details->>ui_origin=is.null&select=id`,
       {
         headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
         signal: AbortSignal.timeout(5000),
@@ -18505,18 +18520,28 @@ async function runAgentCycle(token, allFlags) {
             `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff}&select=send_date,email&limit=1`,
             { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
           );
-          if (stRes.ok) {
-            const sentRows = await stRes.json();
-            if (Array.isArray(sentRows) && sentRows.length > 0) {
-              log(`  ⏭ ${domain}: skip — ya contactado ${sentRows[0].send_date} (sendtrack 30d guard)`);
-              await logAgentAction(token, userEmail, {
-                domain, action: "skipped", reason: "sendtrack_30d",
-                details: { last_send: sentRows[0].send_date, last_email: sentRows[0].email },
-              });
-              continue;
-            }
+          // ⚠️ FALLA CERRADO (Maxi 2026-08-25). Si la consulta se caía, el guard se salteaba
+          // y el mail salía igual: es la única protección contra re-contactar a alguien al
+          // que ya le escribimos hace menos de 30 días, y escribirle dos veces en un mes es
+          // de las formas más rápidas de que nos marquen como spam. Ante la duda, no se manda:
+          // el lead sigue en el pool y se reintenta en el próximo ciclo, no se pierde nada.
+          if (!stRes.ok) {
+            log(`  ⏸️ ${domain}: no pude verificar si ya lo contactamos (HTTP ${stRes.status}) — NO se manda, se reintenta`);
+            continue;
           }
-        } catch (e) { log(`  ⚠️ sendtrack guard ${domain}: ${e.message}`); }
+          const sentRows = await stRes.json();
+          if (Array.isArray(sentRows) && sentRows.length > 0) {
+            log(`  ⏭ ${domain}: skip — ya contactado ${sentRows[0].send_date} (sendtrack 30d guard)`);
+            await logAgentAction(token, userEmail, {
+              domain, action: "skipped", reason: "sendtrack_30d",
+              details: { last_send: sentRows[0].send_date, last_email: sentRows[0].email },
+            });
+            continue;
+          }
+        } catch (e) {
+          log(`  ⏸️ sendtrack guard ${domain}: ${e.message} — NO se manda, se reintenta`);
+          continue;
+        }
 
         // ── SALTO INSTANTÁNEO A LA SIGUIENTE DIRECCIÓN (Maxi 2026-07-27, regla del user) ──
         // Regla: "envío instantáneo a un nuevo email si el primero se detecta rechazado o inválido".
@@ -19757,7 +19782,9 @@ async function guardarMetricasDelDia(token) {
     const porMb = {};
     let enviados = 0;
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hoy}T00:00:00&select=user_email&limit=2000`, { headers: auth });
+      // Sin el filtro de ui_origin, el histórico guardaba los envíos manuales del MB como si
+      // fueran del agente. Las métricas son del AGENTE, regla del user. (Maxi 2026-08-25.)
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hoy}T00:00:00&details->>ui_origin=is.null&select=user_email&limit=2000`, { headers: auth });
       if (r.ok) {
         const filas = await r.json();
         if (Array.isArray(filas)) {
