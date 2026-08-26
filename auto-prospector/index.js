@@ -17842,7 +17842,11 @@ const SEC_UMBRALES = {
   proxy_llamadas_dia:      1500,   // uso total del proxy en el día (tope duro: 2000)
   proxy_no_autorizados_h:     3,   // intentos de un mail fuera de la allowlist, por hora
   pixel_floods_h:             1,   // una sola IP inundando el pixel ya es alerta
-  envios_dia_max:           150,   // envíos totales en un día (los 3 MB no deberían pasar esto)
+  // Maxi 2026-08-26: `envios_dia_max` medía TODO junto y quedó viejo al revivir el re-trabajo.
+  // El primer contacto ahora deriva su techo del cupo configurado (ver sección 4); acá queda
+  // solo el tope del re-trabajo, que no tiene cupo por regla de negocio y solo alarma si es
+  // un loop evidente.
+  retrabajo_dia_max:        400,   // re-enganche + 2º email + Email Futuro + reintento por rebote
   heartbeat_min:             25,   // minutos sin latido del worker
   // Disparadores de ataque (patrón que el user ya validó en su otro proyecto, 2026-08-04):
   flood_excesos_min:         40,   // ≥40 excesos de límite en 1 minuto = flood distribuido
@@ -17977,13 +17981,17 @@ async function securityWatchdog(token) {
   // vencida, no un atacante. Antes se contaban todos juntos y el mail avisaba "64 intentos de
   // acceso NO AUTORIZADO" por algo benigno — la alarma perdía valor justo por ser ruidosa.
   const _urlNoAut = `${SUPABASE_URL}/rest/v1/toolbar_security_events?kind=in.(proxy_usuario_no_autorizado,proxy_origen_no_permitido,jwt_invalido)&severity=neq.info&created_at=gte.${hace(1)}`;
-  const noAutorizados = await _count(`${_urlNoAut}&select=id`);
-  // Maxi 2026-08-10: el aviso decía "3 intentos" y nada más, así que para saber si era un ataque
-  // o un MB con la sesión vencida había que ir al SQL igual. Con el actor y el tipo en el propio
-  // mail se decide de un vistazo: si el mail es de un MB conocido, es una sesión caída.
+  // ── EL CONTADOR Y EL DETALLE TIENEN QUE MIRAR LO MISMO (Maxi 2026-08-26) ────────────────
+  // Estaban separados: `noAutorizados` era un COUNT crudo sobre la tabla, mientras que la lista
+  // de "Quién" leía 10 filas y recién ahí descartaba nuestras propias IPs. Resultado: el mail
+  // decía "33 intentos de acceso NO AUTORIZADO" y abajo no mostraba a nadie, porque los 33 eran
+  // el worker. Tres alertas en una mañana por algo que no existía.
+  // Ahora se lee UNA vez y se filtra UNA vez: el número que alarma es exactamente el mismo
+  // conjunto que se muestra. Si no hay a quién señalar, no hay alerta.
+  let noAutorizados = 0;
   let _quienes = "";
   try {
-    const r = await fetch(`${_urlNoAut}&select=kind,actor,detail&order=created_at.desc&limit=10`,
+    const r = await fetch(`${_urlNoAut}&select=kind,actor,detail&order=created_at.desc&limit=500`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
     if (r.ok) {
       const filas = await r.json();
@@ -18004,6 +18012,7 @@ async function securityWatchdog(token) {
         const _org = f.detail?.origin || "(sin origen)";
         const k = `${f.actor || "(sin identificar)"} · ${f.kind} · desde ${_org}`;
         porActor[k] = (porActor[k] || 0) + 1;
+        noAutorizados++;   // el contador cuenta lo MISMO que se lista, no la tabla entera
       }
       const lista = Object.entries(porActor).map(([k, n]) => `${k} ×${n}`).join(" | ");
       if (lista) _quienes = `\n  Quién: ${lista}`;
@@ -18044,10 +18053,39 @@ async function securityWatchdog(token) {
   } catch {}
 
   // ── 4. ENVÍOS DESBOCADOS (cuenta comprometida o bug de cap) ────────────────────────────
-  const enviosHoy = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,secondary_sent,bounce_retry_sent,future_sent)&created_at=gte.${hace(24)}&select=id`);
-  if (enviosHoy > SEC_UMBRALES.envios_dia_max) {
+  // ── QUÉ SE MIDE ACÁ, Y POR QUÉ NO ES EL TOTAL (Maxi 2026-08-26) ────────────────────────
+  // Esto contaba TODO junto —primer contacto + re-enganche + segundo email + Email Futuro +
+  // reintento por rebote— contra un techo fijo de 150. El 25/08 revivimos los cuatro caminos
+  // de re-trabajo que llevaban meses muertos, y el techo quedó viejo ESE MISMO DÍA: 62 primeros
+  // contactos + 87 de re-trabajo = 149, rozando el límite sin que pasara nada anormal.
+  // Tres alertas críticas en una mañana, una de ellas con kill switch automático.
+  //
+  // El error de fondo es mezclar dos cosas con reglas distintas:
+  //   · el PRIMER CONTACTO tiene cupo por MB (regla de negocio del user: 20/día c/u). Pasarse
+  //     ahí sí es señal de buzón comprometido o de cap roto.
+  //   · el RE-TRABAJO no tiene cupo a propósito ("re-trabajo aparte, sin límite"). Contarlo
+  //     contra un techo es alarmar por el sistema funcionando bien.
+  // Por eso el techo del primer contacto ahora se DERIVA del cupo configurado en vez de estar
+  // clavado: si mañana el user pone 30/día, el umbral se mueve solo.
+  // El cupo real sale de la MISMA cascada que usa el agente para enviar: primero el override
+  // del focus config, después `agent_max_per_day`, y 20 solo como último recurso. Si se leyera
+  // otra fuente, el umbral podría alarmar contra un número que ya nadie usa.
+  let _cupoMB = 0;
+  try { _cupoMB = Number(JSON.parse(cfg.agent_focus_config || "{}")?.daily_override) || 0; } catch {}
+  if (_cupoMB <= 0) _cupoMB = Number(cfg.agent_max_per_day) || 20;
+  const _buzones  = 3;
+  const _techoPrimero = Math.ceil(_cupoMB * _buzones * 1.5);   // 50% de aire sobre el cupo real
+  const primerContacto = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hace(24)}&select=id`);
+  if (primerContacto > _techoPrimero) {
     critico = true;
-    hallazgos.push(`• ${enviosHoy} mails en 24h — muy por encima de lo normal (umbral ${SEC_UMBRALES.envios_dia_max}). O se rompió el cap diario o alguien tiene acceso a un buzón.`);
+    hallazgos.push(`• ${primerContacto} PRIMEROS contactos en 24h, con un cupo de ${_cupoMB}/día por buzón (techo ${_techoPrimero}). El cap no está frenando: o se rompió, o alguien entró a un buzón.`);
+  }
+  // El re-trabajo no tiene cupo, pero un número absurdo sigue siendo señal de loop descontrolado
+  // (ya pasó: rebotes reenviándose en círculo). El umbral es alto a propósito.
+  const reTrabajo = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(re_sent,secondary_sent,bounce_retry_sent,future_sent)&created_at=gte.${hace(24)}&select=id`);
+  if (reTrabajo > SEC_UMBRALES.retrabajo_dia_max) {
+    critico = true;
+    hallazgos.push(`• ${reTrabajo} mails de re-trabajo en 24h (umbral ${SEC_UMBRALES.retrabajo_dia_max}). El re-trabajo no tiene cupo, pero esto es un loop: revisar reenvíos por rebote.`);
   }
 
   // ── EL REBOTE YA NO ALERTA (decisión del user 2026-08-04) ──────────────────────────────

@@ -150,7 +150,20 @@ serve(async (req) => {
   // La comparación es contra la key exacta que esta misma función tiene en su entorno. No
   // agrega riesgo: quien tenga esa key ya tiene acceso total a la base, el proxy es lo de
   // menos.
-  const _esWorker = !!serviceKey && jwt === serviceKey;
+  //
+  // ── 2026-08-26: NO ALCANZA CON UNA SOLA KEY ──────────────────────────────────────────
+  // El arreglo de arriba volvió a romperse solo, sin que nadie tocara el código. Supabase
+  // migró el proyecto al formato nuevo de claves (`sb_secret_…`) y lo que la función recibe
+  // en `SUPABASE_SERVICE_ROLE_KEY` dejó de ser el JWT legacy que el worker sigue mandando.
+  // Las dos claves son válidas y son del mismo proyecto; simplemente ya no son la MISMA
+  // cadena, así que la igualdad fallaba y cada llamada del worker volvía a contarse como
+  // intento de intrusión. Ocho días de Haiku/Apollo/embeddings fallando en silencio.
+  //
+  // La lección: comparar contra UNA sola cadena es frágil cuando el proveedor puede rotar
+  // el formato por su cuenta. `WORKER_KEY` es un secreto que ponemos NOSOTROS y que nadie
+  // más rota. Si algún día cambia, se cambia acá y en Railway a la vez.
+  const _workerKey = Deno.env.get("WORKER_KEY") || "";
+  const _esWorker = !!jwt && ((!!serviceKey && jwt === serviceKey) || (!!_workerKey && jwt === _workerKey));
 
   let userEmail: string;
   if (_esWorker) {
