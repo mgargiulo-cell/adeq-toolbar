@@ -8245,7 +8245,7 @@ async function _manualesDeMonday(token, dia) {
   try {
     const apiKey = await _getMondayApiKeyForFeeder(token);
     if (!apiKey) return out;
-    const q = `{ boards(ids: [1420268379]) { items_page(limit: 400, query_params: {rules: [{column_id: "deal_close_date", compare_value: ["EXACT", "${dia}"], operator: any_of}]}) { items { name column_values(ids: ["deal_owner","texto","email_mm2edcd3"]) { id text } } } } }`;
+    const q = `{ boards(ids: [1420268379]) { items_page(limit: 400, query_params: {rules: [{column_id: "deal_close_date", compare_value: ["EXACT", "${dia}"], operator: any_of}]}) { items { name column_values(ids: ["deal_owner","texto","email_mm2edcd3","texto6"]) { id text } } } } }`;
     const res = await fetch("https://api.monday.com/v2", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": apiKey, "API-Version": "2024-10" },
@@ -8263,6 +8263,7 @@ async function _manualesDeMonday(token, dia) {
           owner: cv.deal_owner || "",
           dominio: it.name || "?",
           email: _stripScrapePrefix(cv.email_mm2edcd3 || ""),
+          geo: cv.texto6 || "",       // "Top Geo" del board: el user lo quiere junto al envío
         });
       } else if (/agente/i.test(marca)) out.agente++;
       else out.sinMarca++;
@@ -8528,7 +8529,13 @@ async function parteDelDia(token) {
   // El piso con el que se separa "sirve" de "no sirve" en el parte. El user lo pidió en 500k;
   // el gate del sistema es `agent_threshold_traffic` (hoy 400k), que es otra cosa y más
   // estricta río abajo. Este número es solo para leer el trabajo del día.
-  const _PISO_PARTE = parseInt(cfg.parte_piso_trafico || "500000", 10) || 500000;
+  // ── EL PISO ES EL DEL SISTEMA, NO UNO INVENTADO PARA EL MAIL (Maxi 2026-08-26) ───────
+  // Estaba en 500k "para leer el trabajo del día", mientras el gate real que decide si una
+  // web entra a Prospects es `agent_threshold_traffic` (400k). Dos números distintos para la
+  // misma pregunta: el parte marcaba como floja una web de 450k que el sistema SÍ acepta.
+  // El user lo pidió explícito: "+400k páginas vistas y cuántas de menos, es decir NO
+  // prospectables". Se usa el umbral real; `parte_piso_trafico` sigue pudiendo pisarlo.
+  const _PISO_PARTE = parseInt(cfg.parte_piso_trafico || cfg.agent_threshold_traffic || "400000", 10) || 400000;
 
   // ── DE DÓNDE SALE EL CONTEO DE ENVÍOS A MANO (Maxi 2026-08-26) ───────────────────────
   // Salía de `toolbar_agent_actions`, y estaba MAL: el parte del 25/08 le contó 2 envíos a
@@ -8548,7 +8555,7 @@ async function parteDelDia(token) {
   const _manualesDesdeMonday = _monday.ok;
   if (_manualesDesdeMonday) {
     for (const m of _monday.manuales) {
-      _fila(_quien(m.owner)).enviados.push({ dominio: m.dominio, email: m.email });
+      _fila(_quien(m.owner)).enviados.push({ dominio: m.dominio, email: m.email, geo: m.geo });
     }
   } else {
     const _manuales = await fetch(
@@ -8559,6 +8566,20 @@ async function parteDelDia(token) {
       _fila(_quien(m.user_email)).enviados.push({ dominio: m.domain || "?", email: _stripScrapePrefix(m.email_to || "") });
     }
   }
+
+  // ── QUÉ SE MIDIÓ DE VERDAD Y QUÉ SALIÓ DE LA CACHÉ (Maxi 2026-08-26) ────────────────
+  // El user: "¿ya analizó SimilarWeb? ¿y si está cacheada con info anterior?". Una URL
+  // resuelta con caché no gastó crédito ni trajo dato fresco; contarla igual que una medida
+  // hoy infla el trabajo del día. `toolbar_traffic_cache.fetched_at` lo dice: si la entrada
+  // es anterior a hoy, cuando el MB la abrió le respondió la caché.
+  const _cacheAntes = new Set();
+  try {
+    const _tc = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeHoy}&select=domain&limit=40000`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    for (const c of (Array.isArray(_tc) ? _tc : [])) _cacheAntes.add(String(c.domain || "").toLowerCase());
+  } catch {}
 
   // Los sitios que miraron (con geo). No todos terminan en un envío.
   const _hist = await fetch(
@@ -8597,6 +8618,15 @@ async function parteDelDia(token) {
     }
     const g = String(h.geo || "").trim();
     if (g) f.geos.set(g, (f.geos.get(g) || 0) + 1);
+    // ── ¿ABRIÓ URLS DISTINTAS, O DEJÓ LA TOOLBAR CLAVADA EN UNA? (Maxi 2026-08-26) ────
+    // El user pidió detectar si "dejaron la tool perdida en una url sola en Chrome y no la
+    // cambiaron nunca, simulando que trabajan". El contador de URLs abiertas no lo ve: la
+    // toolbar re-analiza al volver a la pestaña, así que una sola web puede sumar decenas de
+    // filas y parecer una jornada entera. Lo que lo delata es la relación entre filas y
+    // dominios DISTINTOS.
+    (f.dominios = f.dominios || new Set()).add(String(h.domain || "").toLowerCase());
+    if (_cacheAntes.has(String(h.domain || "").toLowerCase())) f.cacheadas = (f.cacheadas || 0) + 1;
+    else f.medidas = (f.medidas || 0) + 1;
   }
 
   // ── TIEMPO CON LA TOOLBAR ABIERTA (Maxi 2026-08-25, pedido del user) ────────────────
@@ -8759,7 +8789,7 @@ async function parteDelDia(token) {
       _lineasManual.push(`   ${nombre.toUpperCase()} — ${d.enviados.length} mail(s) enviado(s) a mano${d.imports ? ` · ${d.imports} import(s) (${d.importados} cargados)` : ""}`);
       if (d.enviados.length) {
         for (const e of d.enviados.slice(0, 40)) {
-          _lineasManual.push(`      → ${String(e.dominio).padEnd(34)} ${e.email || "(sin email registrado)"}`);
+          _lineasManual.push(`      → ${String(e.dominio).padEnd(32)} ${String(e.email || "(sin email registrado)").padEnd(34)} ${e.geo || "—"}`);
         }
         if (d.enviados.length > 40) _lineasManual.push(`      … y ${d.enviados.length - 40} más`);
       } else {
@@ -8928,10 +8958,12 @@ async function parteDelDia(token) {
                <tr>
                  <td style="padding:5px 6px 5px 0;border-bottom:1px solid ${_BORDE};font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px">Web</td>
                  <td style="padding:5px 0;border-bottom:1px solid ${_BORDE};font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px">Email</td>
+                 <td style="padding:5px 0 5px 8px;border-bottom:1px solid ${_BORDE};font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px;white-space:nowrap">Geo</td>
                </tr>
                ${d.enviados.slice(0, 40).map(e => `<tr>
                  <td style="padding:5px 6px 5px 0;border-bottom:1px solid #f5f5f5;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;word-break:break-all">${_e(e.dominio)}</td>
                  <td style="padding:5px 0;border-bottom:1px solid #f5f5f5;font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${e.email ? "#1a73e8" : _GRIS};word-break:break-all">${e.email ? _e(e.email) : "sin email registrado"}</td>
+                 <td style="padding:5px 0 5px 8px;border-bottom:1px solid #f5f5f5;font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};white-space:nowrap">${e.geo ? _e(e.geo) : "—"}</td>
                </tr>`).join("")}
              </table>
              ${d.enviados.length > 40 ? `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:6px">… y ${d.enviados.length - 40} más</div>` : ""}`
@@ -8944,9 +8976,17 @@ async function parteDelDia(token) {
              <div style="font:600 11px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};text-transform:uppercase;letter-spacing:.4px;padding-bottom:6px">URLs abiertas con la toolbar</div>
              ${_kv([
                ["Total abiertas", d.mirados],
+               ["URLs distintas", `${d.dominios ? d.dominios.size : 0}${
+                   d.mirados && d.dominios && (d.dominios.size / d.mirados) < 0.25
+                     ? " — la toolbar estuvo casi siempre en la misma web" : ""}`,
+                   (d.mirados && d.dominios && (d.dominios.size / d.mirados) < 0.25) ? _ROJO : "#202124"],
+               ["Medidas hoy / de caché", `${d.medidas || 0} / ${d.cacheadas || 0}${
+                   d.mirados ? ` (${Math.round(100 * (d.medidas || 0) / d.mirados)}% con dato fresco)` : ""}`],
                ["Nuevas / ya conocidas", `${d.nuevas} / ${d.conocidas}`],
-               [`Superan ${Math.round(_PISO_PARTE / 1000)}k vistas`, d.arriba, d.arriba ? _VERDE : _GRIS],
-               [`Por debajo de ${Math.round(_PISO_PARTE / 1000)}k`, d.abajo],
+               [`Superan ${Math.round(_PISO_PARTE / 1000)}k vistas (prospectables)`,
+                   `${d.arriba}${d.mirados ? ` (${Math.round(100 * d.arriba / d.mirados)}%)` : ""}`, d.arriba ? _VERDE : _GRIS],
+               [`Por debajo de ${Math.round(_PISO_PARTE / 1000)}k (no prospectables)`,
+                   `${d.abajo}${d.mirados ? ` (${Math.round(100 * d.abajo / d.mirados)}%)` : ""}`],
                ["Sin dato de tráfico", d.sinDato, d.sinDato ? _ROJO : _GRIS],
                ...(d.arriba > 0 ? [["Le escribió a", `${d.enviados.length} de ${d.arriba} que servían (${Math.round(100 * d.enviados.length / d.arriba)}%)`,
                    (d.enviados.length / d.arriba) < 0.2 ? _ROJO : _VERDE]] : []),
