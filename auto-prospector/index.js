@@ -2224,9 +2224,9 @@ const _TLDS_POR_IDIOMA = {
 const _PAISES_POR_IDIOMA = {
   es: ["mx", "ar", "cl", "co", "pe", "uy", "es", "ve", "ec", "bo", "py", "cr", "gt", "do", "pa"],
   pt: ["br", "pt", "ao", "mz"],
-  it: ["it", "ch"],
-  fr: ["fr", "be", "ch", "ma", "sn", "ci", "dz", "tn"],
-  de: ["de", "ch", "be"],
+  it: ["it", "ch", "sm"],
+  fr: ["fr", "be", "ch", "lu", "ma", "sn", "ci", "dz", "tn"],
+  de: ["de", "at", "ch", "be", "lu"],       // faltaba Austria, que es mercado propio
   nl: ["nl", "be"],
   pl: ["pl"],
   tr: ["tr"],
@@ -2238,6 +2238,17 @@ const _PAISES_POR_IDIOMA = {
   id: ["id"],
   ja: ["jp"],
 };
+// ── EL FOCO GEOGRÁFICO, DICHO POR EL USER (2026-08-26) ─────────────────────────────────
+// "Focalizar en países de América Central, Sur, Europa y Asia. Oceanía, USA, Canadá, UK y
+// Rusia no." Las listas de arriba ya cumplen —no hay us/ca/gb/au/nz/ru en ninguna—, pero
+// eso era un accidente afortunado, no una regla: cualquiera podía agregar "gb" a la lista
+// de inglés sin que nada lo frenara. Este cinturón lo hace explícito y verificable.
+// Es una LISTA NEGRA y no blanca a propósito: una blanca habría que actualizarla cada vez
+// que se suma un idioma, y el olvido se traduce en un país que deja de buscarse en silencio.
+const _GL_FUERA_DE_FOCO = new Set(["us", "ca", "gb", "uk", "au", "nz", "ru", "by", "ie"]);
+for (const [lang, paises] of Object.entries(_PAISES_POR_IDIOMA)) {
+  _PAISES_POR_IDIOMA[lang] = paises.filter(p => !_GL_FUERA_DE_FOCO.has(String(p).toLowerCase()));
+}
 // Detección barata del idioma de una frase por palabras funcionales. No hace falta
 // nada sofisticado: alcanza para no buscar en portugués sobre Polonia.
 const _PISTAS_IDIOMA = [
@@ -2274,6 +2285,71 @@ function _paisParaFrase(frase, esHispano) {
   if (!idioma) { idioma = "es"; for (const [lang, re] of _PISTAS_IDIOMA) { if (re.test(frase)) { idioma = lang; break; } } }
   const paises = _PAISES_POR_IDIOMA[idioma] || _PAISES_POR_IDIOMA.es;
   return { gl: paises[Math.floor(Math.random() * paises.length)], hl: idioma };
+}
+
+// ── LA TABLA DE KEYWORDS DEL USER (Maxi 2026-08-26) ──────────────────────────────────────
+// `toolbar_keywords` tiene 99.888 frases cargadas a mano en seis idiomas (44.941 en español)
+// y AutoGoogle no la leía: el pool salía solo de keywordsData.js, 7.549 frases en el código.
+// El user lo detectó en el parte —"veo que ayer usaste solo esas cuatro"— y tenía razón.
+//
+// Se trae una MUESTRA, no la tabla: cargar 100k frases en un worker que ya reinicia por RAM
+// sería cambiar un problema por otro. El offset aleatorio hace que cada vuelta lea una zona
+// distinta, así que a lo largo del día se recorre toda la tabla sin tener nada grande en
+// memoria. La caché evita repetir la consulta dentro del mismo slot.
+const _KW_BASE_CACHE = { ts: 0, hispano: null, data: null };
+const _KW_BASE_TTL_MS = 30 * 60 * 1000;
+const _KW_BASE_CUPOS = { es: 1200, pt: 400, it: 300, fr: 300, ar: 200 };   // `en` queda afuera a propósito
+const _KW_BASE_TOTALES = { es: 44941, pt: 14949, it: 10000, fr: 8000, ar: 6999 };
+
+async function _muestraKeywordsDeLaBase(token, soloEspanol) {
+  const ahora = Date.now();
+  if (_KW_BASE_CACHE.data && _KW_BASE_CACHE.hispano === !!soloEspanol
+      && ahora - _KW_BASE_CACHE.ts < _KW_BASE_TTL_MS) return _KW_BASE_CACHE.data;
+
+  const out = {};
+  const langs = soloEspanol ? ["es"] : Object.keys(_KW_BASE_CUPOS);
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  for (const lang of langs) {
+    try {
+      const cupo  = _KW_BASE_CUPOS[lang] || 300;
+      const total = _KW_BASE_TOTALES[lang] || cupo;
+      // Arranque al azar dentro de la tabla. Se deja margen para no pedir un offset que
+      // caiga tan al final que devuelva menos filas que el cupo.
+      const off = Math.max(0, Math.floor(Math.random() * Math.max(1, total - cupo)));
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_keywords?lang=eq.${lang}&select=phrase&order=id.asc&offset=${off}&limit=${cupo}`,
+        { headers, signal: AbortSignal.timeout(15000) }
+      );
+      if (!r.ok) continue;
+      const filas = await r.json();
+      const frases = (Array.isArray(filas) ? filas : [])
+        .map(f => String(f.phrase || "").trim())
+        .filter(p => p.length >= 3 && p.length <= 80);
+      // ── MEZCLAR FRASES CORTAS Y LARGAS (Maxi 2026-08-26) ────────────────────────────
+      // No es un detalle de estilo: cambia QUÉ tipo de sitio devuelve Google. Una frase de
+      // una o dos palabras ("turismo rural") trae los portales grandes del tema; una de
+      // cuatro o más ("plantaciones de verduras en invernadero") cae en el long tail, que
+      // es justo donde viven los medios regionales que sí contestan un mail. Si la muestra
+      // sale ordenada por id, una carga entera de frases largas puede tapar a las cortas y
+      // el slot entero queda sesgado sin que se note.
+      // Se interleavea por longitud para que las tres formas sobrevivan al recorte de más
+      // abajo, que toma los primeros N después de mezclar.
+      const _cortas = frases.filter(p => p.split(/\s+/).length <= 2);
+      const _largas = frases.filter(p => p.split(/\s+/).length >= 4);
+      const _medias = frases.filter(p => { const n = p.split(/\s+/).length; return n === 3; });
+      const _mix = [];
+      for (let i = 0; i < Math.max(_cortas.length, _medias.length, _largas.length); i++) {
+        if (_cortas[i]) _mix.push(_cortas[i]);
+        if (_largas[i]) _mix.push(_largas[i]);
+        if (_medias[i]) _mix.push(_medias[i]);
+      }
+      if (_mix.length) out[lang] = _mix;
+    } catch { /* una consulta que falla no puede dejar sin keywords al slot entero */ }
+  }
+  const _n = Object.values(out).reduce((a, b) => a + b.length, 0);
+  if (_n) log(`  📚 keywords de la base: ${_n} frase(s) en ${Object.keys(out).length} idioma(s)`);
+  _KW_BASE_CACHE.ts = ahora; _KW_BASE_CACHE.hispano = !!soloEspanol; _KW_BASE_CACHE.data = out;
+  return out;
 }
 
 function _construirBusquedasDeHuella(esHispano, cuantas) {
@@ -2644,7 +2720,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     return;
   }
   N = Math.min(N, _restaHoy);
-  // Pool = TODAS las frases de cascade (7549, 12 idiomas) desde keywordsData.js; fallback inline.
+  // Pool = keywordsData.js (7.549 en 12 idiomas) + una muestra de `toolbar_keywords` (99.888).
   // Maxi 2026-07-17 TURNO HISPANO: en los slots hispanos el pool se restringe al español
   // (672 frases) → descubrimiento LATAM/Centroamérica/España garantizado todos los días.
   // ── SIN INGLÉS, Y MAYORMENTE ESPAÑOL (Maxi 2026-08-11, pedido del user) ─────
@@ -2661,6 +2737,9 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   try {
     if (_hispanicSlot) {
       pool = (_AG_KEYWORDS.es || []).filter(s => typeof s === "string" && s);
+      // El turno hispano también se alimenta de la base: es donde están las 44.941 en español.
+      const _esBase = (await _muestraKeywordsDeLaBase(token, true)).es || [];
+      pool.push(..._esBase);
       pool.forEach(q => _IDIOMA_DE_FRASE.set(q, "es"));
     } else {
       const _tomar = (lang, frac) => {
@@ -2687,6 +2766,21 @@ async function _runAutoGoogleSlot(token, slotLabel) {
         // enorme; los dos entran en el foco geográfico que pidió el user.
         ..._tomar("id", 0.15), ..._tomar("ja", 0.15),
       ];
+      // ── LAS 99.888 KEYWORDS DE LA BASE QUE NADIE LEÍA (Maxi 2026-08-26) ────────────
+      // El pool salía SOLO de keywordsData.js: 7.549 frases en el código. Mientras tanto
+      // `toolbar_keywords` tenía 99.888 cargadas por el user en seis idiomas —44.941 en
+      // español— y AutoGoogle no la abría nunca. El user lo vio en el parte: cuatro
+      // keywords usadas en todo un día, con miles disponibles.
+      //
+      // Se trae una MUESTRA al azar, no la tabla entera: 100k frases en memoria en un
+      // worker que ya reinicia por RAM sería cambiar un problema por otro. El offset
+      // aleatorio hace que cada vuelta agarre una zona distinta de la tabla, así que a lo
+      // largo del día se recorre todo sin cargar nada grande.
+      const _deLaBase = await _muestraKeywordsDeLaBase(token, false);
+      for (const [lang, frases] of Object.entries(_deLaBase)) {
+        for (const q of frases) _IDIOMA_DE_FRASE.set(q, lang);
+        pool.push(...frases);
+      }
       // Cinturón: si alguna vez vuelve a colarse inglés por otra vía, se filtra acá.
       const _enSet = new Set((_AG_KEYWORDS.en || []).map(s => String(s).toLowerCase()));
       pool = pool.filter(s => !_enSet.has(String(s).toLowerCase()));
@@ -2770,7 +2864,12 @@ async function _runAutoGoogleSlot(token, slotLabel) {
       // Paginación derivada del uso histórico: sin esto una frase devolvía SIEMPRE los
       // mismos 20, y como el ranking prefiere repetir las que más rindieron, el sistema
       // interpretaba su propia ceguera como "ya no hay mercado".
-      page: 1 + (( _yieldPorFrase.get(kw) || 0 ) % 4),
+      // Maxi 2026-08-26: TOPE EN PÁGINA 2. Llegaba hasta la 4 y el user cortó por lo sano:
+      // "siempre agarrar máximo pág 1 y 2 de Google, no más, porque no sirven". Tiene razón
+      // y se ve en los números: lo que Google manda a la página 3 de una búsqueda temática
+      // ya no son medios que monetizan, son agregadores y ruido. Cada página extra costaba
+      // un crédito de Serper para traer lo que después el filtro descarta igual.
+      page: 1 + (( _yieldPorFrase.get(kw) || 0 ) % 2),
     });
     if (ok) {
       queriesDone++; _errSeguidos = 0;
@@ -8127,6 +8226,52 @@ async function vigilarDescubrimiento(token) {
 // Este mail invierte eso: UNA pregunta por día, con el número que importa y, si falla, el
 // motivo. No compite con nada: si todo va bien son cuatro renglones.
 const OBJETIVO_POR_MB = 20;
+// ── LOS ENVÍOS A MANO SALEN DE MONDAY, NO DEL REGISTRO INTERNO (Maxi 2026-08-26) ─────────
+// El parte del 25/08 le contó 2 envíos a mano a Agustina cuando el board tenía 18 suyos ese
+// día. El user lo detectó comparando contra Monday, que es lo que él mira.
+//
+// La causa: el envío manual NO pasa por el worker, lo hace la extensión, y escribe en dos
+// lados con confiabilidad muy distinta —
+//   · el push a Monday siempre funciona (es el trabajo principal; si falla, se nota);
+//   · `createManualSendTracking` falla en silencio (el popup se come el error con un
+//     console.warn y manda el mail igual), así que `toolbar_agent_actions` ve una fracción.
+// Contar con el registro que falla en silencio es contar cualquier cosa.
+//
+// Se distingue agente de mano por la marca en Comentarios, que es la que escribe la propia
+// toolbar. Si Monday no contesta, `ok:false` y el parte AVISA que el número es parcial: un
+// conteo incompleto sin avisar es exactamente el bug que se está arreglando acá.
+async function _manualesDeMonday(token, dia) {
+  const out = { ok: false, manuales: [], agente: 0, sinMarca: 0 };
+  try {
+    const apiKey = await _getMondayApiKeyForFeeder(token);
+    if (!apiKey) return out;
+    const q = `{ boards(ids: [1420268379]) { items_page(limit: 400, query_params: {rules: [{column_id: "deal_close_date", compare_value: ["EXACT", "${dia}"], operator: any_of}]}) { items { name column_values(ids: ["deal_owner","texto","email_mm2edcd3"]) { id text } } } } }`;
+    const res = await fetch("https://api.monday.com/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": apiKey, "API-Version": "2024-10" },
+      body: JSON.stringify({ query: q }), signal: AbortSignal.timeout(25000),
+    });
+    if (!res.ok) return out;
+    const items = (await res.json())?.data?.boards?.[0]?.items_page?.items;
+    if (!Array.isArray(items)) return out;
+    for (const it of items) {
+      const cv = {};
+      for (const c of (it.column_values || [])) cv[c.id] = c.text || "";
+      const marca = String(cv.texto || "");
+      if (/manual/i.test(marca)) {
+        out.manuales.push({
+          owner: cv.deal_owner || "",
+          dominio: it.name || "?",
+          email: _stripScrapePrefix(cv.email_mm2edcd3 || ""),
+        });
+      } else if (/agente/i.test(marca)) out.agente++;
+      else out.sinMarca++;
+    }
+    out.ok = true;
+  } catch { /* queda ok:false y el parte lo dice */ }
+  return out;
+}
+
 async function parteDelDia(token) {
   const cfg = await getConfig(token);
   if (String(cfg.parte_diario_enabled ?? "true") === "false") return;
@@ -8153,12 +8298,31 @@ async function parteDelDia(token) {
   const _n0  = (v) => (v == null ? 0 : v);          // para cuentas donde null no sirve
   const desdeHoy = _madridMidnightUtcISO();
 
+  // ── LO QUE SALIÓ A MANO, SEGÚN MONDAY (Maxi 2026-08-26) ─────────────────────────────
+  // Se pide UNA vez y lo usan los dos bloques: los envíos del día (agente vs mano) y la
+  // PARTE 2. Monday es la fuente confiable para lo manual —ver el comentario largo en la
+  // PARTE 2—; el registro interno ve una fracción.
+  const _monday = await _manualesDeMonday(token, hoy);
+
   // 1. Envíos por MB — el número que define si el día se cumplió.
   let mbs = [];
   try { mbs = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
   const lineasEnvio = [];
   const envioPorMb = [];        // mismo dato que lineasEnvio pero sin formatear — lo usa la versión HTML
-  let totalEnviado = 0;
+  const manualPorMb = [];
+  let totalEnviado = 0, totalManual = 0;
+  // El dueño en Monday viene a veces como mail ("sales@adeqmedia.com") y a veces como nombre
+  // ("Maximiliano Gargiulo"). Se compara por las dos vías para no perder envíos por el formato.
+  const _mismoMb = (owner, mail) => {
+    const o = String(owner || "").toLowerCase();
+    const u = String(mail || "").toLowerCase();
+    if (!o || !u) return false;
+    if (o.includes(u)) return true;
+    const alias = { "mgargiulo@adeqmedia.com": ["maxi", "maximiliano", "gargiulo"],
+                    "sales@adeqmedia.com":     ["agus", "agustina", "blanco"],
+                    "dhorovitz@adeqmedia.com": ["diego", "horovitz"] };
+    return (alias[u] || []).some(a => o.includes(a));
+  };
   for (const mb of mbs) {
     // `details->>ui_origin=is.null` deja AFUERA los envíos manuales del MB. Regla del user:
     // estas métricas son del AGENTE, no del trabajo a mano. Hasta hoy el filtro no hacía
@@ -8166,8 +8330,18 @@ async function parteDelDia(token) {
     // vez arreglado, sin este filtro un MB que manda 8 a mano aparecería cumpliendo el día.
     const n = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mb)}&action=eq.sent&created_at=gte.${desdeHoy}&details->>ui_origin=is.null&select=id`);
     totalEnviado += n;
-    lineasEnvio.push(`   ${n >= OBJETIVO_POR_MB ? "✅" : "🔴"} ${mb.split("@")[0]}: ${n}/${OBJETIVO_POR_MB}`);
-    envioPorMb.push({ mb: mb.split("@")[0], n });
+    // A MANO, al lado del agente (pedido del user 2026-08-26): "ponelo junto con envíos de
+    // hoy, marcando los manuales vs los agente". El cupo de 20 es SOLO del agente, así que
+    // lo manual se muestra pero no cuenta contra el objetivo — si no, un MB que trabaja a
+    // mano parecería estar pasándose del límite.
+    const _manu = _monday.ok
+      ? _monday.manuales.filter(m => _mismoMb(m.owner, mb)).length
+      : null;
+    manualPorMb.push(_manu);
+    totalManual += _manu || 0;
+    const _sufijo = _manu == null ? "  · a mano: ?" : (_manu ? `  · a mano: ${_manu}` : "");
+    lineasEnvio.push(`   ${n >= OBJETIVO_POR_MB ? "✅" : "🔴"} ${mb.split("@")[0]}: ${n}/${OBJETIVO_POR_MB}${_sufijo}`);
+    envioPorMb.push({ mb: mb.split("@")[0], n, manual: _manu });
   }
   const objetivoTotal = mbs.length * OBJETIVO_POR_MB;
 
@@ -8185,7 +8359,7 @@ async function parteDelDia(token) {
     // `emails` además de `source`: la métrica 3 que pidió el user es "de las altas del DÍA,
     // cuántas con email y cuántas sin". El parte mostraba el stock del pool entero, que es
     // otra cosa: no dice si lo que entró HOY sirve para contactar. (Maxi 2026-08-25.)
-    `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=source,emails`,
+    `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desdeHoy}&select=source,emails,created_by`,
     { headers: auth }
   ).then(r => r.ok ? r.json() : []).catch(() => []);
   // Monday va aparte de los demás imports: es el reciclado de ciclos finalizados, o sea gente
@@ -8193,8 +8367,18 @@ async function parteDelDia(token) {
   // renglón — mezclada con sellers.json y los CSV no se nota si deja de entrar.
   let altaImport = 0, altaMonday = 0, altaAutopilot = 0, altaAutogoogle = 0, altaOtros = 0;
   let altasConEmail = 0, altasSinEmail = 0;
+  // ── QUIÉN DIO EL ALTA: EL AGENTE O UNA PERSONA (Maxi 2026-08-26) ─────────────────────
+  // El parte listaba las altas por FUENTE (import, autopilot, AutoGoogle...) pero no decía
+  // lo que el user quería saber: si las cargó el agente o las cargó un MB a mano. La columna
+  // `created_by` ya lo tiene — `worker@autofeeder` para el agente, el mail de la persona
+  // cuando la carga es manual — y nadie la estaba leyendo.
+  let altaAgente = 0;
+  const altaManualPorMb = new Map();
   for (const a of (Array.isArray(_altas) ? _altas : [])) {
     const s = String(a.source || "").toLowerCase();
+    const _por = String(a.created_by || "").toLowerCase();
+    if (!_por || /worker@|autofeeder|@backend/.test(_por)) altaAgente++;
+    else altaManualPorMb.set(_por, (altaManualPorMb.get(_por) || 0) + 1);
     if (Array.isArray(a.emails) && a.emails.length) altasConEmail++; else altasSinEmail++;
     if (/autogoogle/.test(s)) altaAutogoogle++;
     else if (/monday/.test(s)) altaMonday++;
@@ -8252,8 +8436,8 @@ async function parteDelDia(token) {
   const purgadas = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?rejected_at=gte.${desdeHoy}&select=id`);
 
   // Reciclado de Monday: lo escribe sincronizarFinalizadosDeMonday en su pasada diaria.
-  let _monday = null;
-  try { _monday = JSON.parse(cfg.monday_sync_ultimo || "null"); } catch {}
+  let _mondaySync = null;
+  try { _mondaySync = JSON.parse(cfg.monday_sync_ultimo || "null"); } catch {}
 
   // AutoGoogle: qué keywords están rindiendo. El sistema YA aprende solo (65% las mejores +
   // 35% exploración, con el yield por frase en toolbar_keyword_yield), pero ese aprendizaje
@@ -8346,13 +8530,34 @@ async function parteDelDia(token) {
   // estricta río abajo. Este número es solo para leer el trabajo del día.
   const _PISO_PARTE = parseInt(cfg.parte_piso_trafico || "500000", 10) || 500000;
 
-  // Los mails que de verdad salieron a mano.
-  const _manuales = await fetch(
-    `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=eq.toolbar_manual&created_at=gte.${desdeHoy}&select=user_email,domain,email_to,created_at&order=created_at.asc&limit=500`,
-    { headers: auth }
-  ).then(r => r.ok ? r.json() : []).catch(() => []);
-  for (const m of (Array.isArray(_manuales) ? _manuales : [])) {
-    _fila(_quien(m.user_email)).enviados.push({ dominio: m.domain || "?", email: m.email_to || "" });
+  // ── DE DÓNDE SALE EL CONTEO DE ENVÍOS A MANO (Maxi 2026-08-26) ───────────────────────
+  // Salía de `toolbar_agent_actions`, y estaba MAL: el parte del 25/08 le contó 2 envíos a
+  // Agustina cuando Monday tenía 18 suyos ese mismo día. El user lo detectó comparando.
+  //
+  // La causa: el envío manual no pasa por el worker, lo hace la extensión. Ahí escribe en
+  // DOS lados y solo uno es confiable —
+  //   · el push a Monday SIEMPRE funciona (es el trabajo principal, y si falla se ve);
+  //   · `createManualSendTracking` viene fallando en silencio (el popup se come el error
+  //     con un console.warn), así que agent_actions ve una fracción.
+  // Contar con el registro que falla en silencio es contar cualquier cosa. Monday es lo que
+  // el user ve y con lo que compara, así que el parte cuenta desde ahí.
+  //
+  // Se identifica por la marca "Manual" en Comentarios, que es la que escribe la extensión.
+  // Si Monday no contesta, se cae a agent_actions y el parte DICE que el número es parcial:
+  // un conteo incompleto sin avisar es exactamente el bug que estamos arreglando.
+  const _manualesDesdeMonday = _monday.ok;
+  if (_manualesDesdeMonday) {
+    for (const m of _monday.manuales) {
+      _fila(_quien(m.owner)).enviados.push({ dominio: m.dominio, email: m.email });
+    }
+  } else {
+    const _manuales = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=eq.toolbar_manual&created_at=gte.${desdeHoy}&select=user_email,domain,email_to,created_at&order=created_at.asc&limit=500`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    for (const m of (Array.isArray(_manuales) ? _manuales : [])) {
+      _fila(_quien(m.user_email)).enviados.push({ dominio: m.domain || "?", email: _stripScrapePrefix(m.email_to || "") });
+    }
   }
 
   // Los sitios que miraron (con geo). No todos terminan en un envío.
@@ -8533,6 +8738,13 @@ async function parteDelDia(token) {
 
   const _personas = [..._porPersona.entries()].sort((a, b) => (b[1].enviados.length + b[1].mirados) - (a[1].enviados.length + a[1].mirados));
   const _lineasManual = [];
+  // Si el conteo no vino de Monday, el número es una fracción y hay que DECIRLO. El 25/08
+  // este mismo bloque informó 2 envíos de Agustina cuando en el board había 18.
+  if (!_manualesDesdeMonday) {
+    _lineasManual.push("   ⚠️ Monday no contestó: los envíos a mano salen del registro interno,");
+    _lineasManual.push("      que viene incompleto. Tomá estos números como un piso, no como el total.");
+    _lineasManual.push("");
+  }
   if (!_personas.length) {
     _lineasManual.push("   Hoy nadie usó la toolbar a mano (o el registro no llegó).");
   } else {
@@ -8611,21 +8823,25 @@ async function parteDelDia(token) {
   const cuerpo = [
     ok ? "Todo en orden." : "⚠️ Hay cosas que revisar.",
     "",
-    `1 · ENVÍOS  ${totalEnviado}/${objetivoTotal}`,
+    `1 · ENVÍOS DE HOY — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : " · a mano: Monday no contestó"}`,
     ...lineasEnvio,
     "",
-    `2 · ALTAS POR IMPORT (sellers.json, CSV)           ${altaImport}`,
-    `3 · ALTAS POR AUTOPILOT (similares, Majestic)      ${altaAutopilot}`,
-    `4 · ALTAS POR AUTOGOOGLE                           ${altaAutogoogle}`,
-    `5 · MONDAY FINALIZADOS reciclados a Prospects      ${altaMonday}`,
+    `2 · BUZÓN PROSPECTS — ALTAS DEL DÍA`,
+    `    Import (sellers.json, CSV)                     ${altaImport}`,
+    `    Autopilot (similares, Majestic)                ${altaAutopilot}`,
+    `    AutoGoogle                                     ${altaAutogoogle}`,
+    `    Monday finalizados reciclados                  ${altaMonday}`,
     ...(altaOtros > 0 ? [`    (otras fuentes: ${altaOtros})`] : []),
     `    Total de altas del día: ${altasHoy}`,
+    `    Las dio el AGENTE: ${altaAgente}${altaManualPorMb.size
+        ? ` · a MANO: ${[...altaManualPorMb.entries()].map(([m, n]) => `${m.split("@")[0]} ${n}`).join(", ")}`
+        : " · a mano: ninguna"}`,
     `    De esas, CON email: ${altasConEmail} · sin email: ${altasSinEmail}${altasHoy ? ` (${Math.round(100 * altasConEmail / altasHoy)}% contactable de entrada)` : ""}`,
     "",
     `6 · SACADAS DE PROSPECTS por no cumplir            ${_num(purgadas)}`,
     `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
     "",
-    `PROSPECTS HOY  ${_num(conEmail)} contactables (~${diasDeStock} días de envíos) · ${_num(sinEmail)} sin email · ${_num(backlog)} en cola`,
+    `PUBLISHERS DISPONIBLES — PROSPECTS  ${_num(conEmail)} contactables (~${diasDeStock} días de envíos) · ${_num(sinEmail)} sin email · ${_num(backlog)} en cola`,
     ...(conEmail != null && objetivoTotal > 0 && (conEmail / objetivoTotal) < 10
       ? [`   🪫 Menos de 10 días de stock: el agente BAJÓ el ritmo de envío solo para no vaciar Prospects. Vuelve a 20/MB cuando el pool se recupere.`]
       : []),
@@ -8644,14 +8860,14 @@ async function parteDelDia(token) {
       ...(_kwMal.length ? _kwMal.map(k => `   🔴 "${String(k.phrase).slice(0, 44)}" — 0 útiles en ${k.searches} búsquedas`) : []),
       `   El motor ya se sesga solo hacia las verdes (65% mejores + 35% exploración).`,
     ] : []),
-    ...(_monday ? [
+    ...(_mondaySync ? [
       ``,
-      `RECICLADO DE MONDAY (última pasada: ${_monday.fecha})`,
-      `   ${_monday.en_board} ciclos finalizados en el board`,
-      `   ${_monday.contactados_recientes} se saltean (contactados hace menos de 90 días)`,
-      `   ${_monday.reprospectables} eran re-prospectables → ${_monday.encolados} entraron`,
-      ...(_monday.encolados < _monday.reprospectables
-        ? [`   ⚠️ Quedaron ${_monday.reprospectables - _monday.encolados} sin entrar (techo ${_monday.techo}/día). A este ritmo son ${Math.ceil((_monday.reprospectables - _monday.encolados) / Math.max(1, _monday.techo))} días más.`]
+      `RECICLADO DE MONDAY (última pasada: ${_mondaySync.fecha})`,
+      `   ${_mondaySync.en_board} ciclos finalizados en el board`,
+      `   ${_mondaySync.contactados_recientes} se saltean (contactados hace menos de 90 días)`,
+      `   ${_mondaySync.reprospectables} eran re-prospectables → ${_mondaySync.encolados} entraron`,
+      ...(_mondaySync.encolados < _mondaySync.reprospectables
+        ? [`   ⚠️ Quedaron ${_mondaySync.reprospectables - _mondaySync.encolados} sin entrar (techo ${_mondaySync.techo}/día). A este ritmo son ${Math.ceil((_mondaySync.reprospectables - _mondaySync.encolados) / Math.max(1, _mondaySync.techo))} días más.`]
         : [`   ✅ Entró todo: el board queda al día.`]),
     ] : []),
     ...(problemas.length ? ["", "QUÉ REVISAR", ...problemas.map(p => `   • ${p}`)] : []),
@@ -8685,7 +8901,7 @@ async function parteDelDia(token) {
     }</table>`;
 
   const _htmlEnvios = `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse">${
-    envioPorMb.map(({ mb, n }) => {
+    envioPorMb.map(({ mb, n, manual }) => {
       const bien = n >= OBJETIVO_POR_MB;
       const pct = Math.min(100, Math.round((n / Math.max(1, OBJETIVO_POR_MB)) * 100));
       return `<tr>
@@ -8696,6 +8912,9 @@ async function parteDelDia(token) {
           </div>
         </td>
         <td style="padding:5px 0;text-align:right;font:600 13px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${bien ? _VERDE : _ROJO};width:20%">${n}/${OBJETIVO_POR_MB}</td>
+        <td style="padding:5px 0 5px 10px;text-align:right;font:13px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${manual ? "#b26a00" : _GRIS};width:22%;white-space:nowrap">${
+          manual == null ? "a mano ?" : (manual ? `+${manual} a mano` : "—")
+        }</td>
       </tr>`;
     }).join("")
   }</table>`;
@@ -8763,20 +8982,24 @@ async function parteDelDia(token) {
 
   <div style="font:700 12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};letter-spacing:1px;padding:2px 0 8px 2px">PARTE 1 · CÓMO ANDUVO EL AGENTE</div>
 
-  ${_card(`Envíos del agente — ${totalEnviado}/${objetivoTotal}`, _htmlEnvios, ok ? _VERDE : _ROJO)}
+  ${_card(`Envíos de hoy — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : ""}`, _htmlEnvios, ok ? _VERDE : _ROJO)}
 
-  ${_card("De dónde salieron las altas de hoy", _kv([
+  ${_card("Buzón Prospects — Altas del día", _kv([
     ["Import (sellers.json, CSV)", altaImport],
     ["Autopilot (similares, Majestic)", altaAutopilot],
     ["AutoGoogle", altaAutogoogle],
     ["Monday finalizados reciclados", altaMonday],
     ...(altaOtros > 0 ? [["Otras fuentes", altaOtros]] : []),
     ["Total de altas del día", altasHoy],
+    ["Las dio el agente", altaAgente],
+    ["Las dio un MB a mano", altaManualPorMb.size
+      ? [...altaManualPorMb.entries()].map(([m, n]) => `${m.split("@")[0]} ${n}`).join(" · ")
+      : "ninguna", altaManualPorMb.size ? "#b26a00" : _GRIS],
     ["De esas, con email", `${altasConEmail}${altasHoy ? ` (${Math.round(100 * altasConEmail / altasHoy)}%)` : ""}`, altasHoy && altasConEmail / altasHoy < 0.5 ? _ROJO : _VERDE],
     ["De esas, sin email", altasSinEmail],
   ]))}
 
-  ${_card("El pool hoy", _kv([
+  ${_card("Publishers Disponibles — Prospects", _kv([
     ["Contactables (con email)", `${_num(conEmail)}  ·  ~${diasDeStock} días de envíos`, (conEmail != null && conEmail < objetivoTotal * 10) ? _ROJO : _VERDE],
     ...(conEmail != null && objetivoTotal > 0 && (conEmail / objetivoTotal) < 10
       ? [["Ritmo de envío", "BAJADO por stock — vuelve solo al recuperarse", _ROJO]] : []),
