@@ -401,3 +401,53 @@ export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic 
     return [];
   }
 }
+
+// ── LO QUE SE MANDÓ A MANO, SEGÚN EL BOARD (Maxi 2026-08-26) ────────────────────────────
+// El panel de Activity mostraba "Emails manual: 0" para los tres MB mientras Monday tenía 18
+// de Agustina en un solo día. Contaba desde `toolbar_api_usage`, que se llena desde el popup
+// y falla en silencio; el push a Monday, en cambio, es el trabajo principal y siempre ocurre.
+//
+// Es el MISMO cambio que se hizo en el parte diario del worker, y por la misma razón: la
+// fuente de verdad de lo manual es el board, no un contador interno que nadie mira cuando
+// falla. Si estos dos números vuelven a divergir, el equivocado es el interno.
+//
+// Devuelve { ok, items: [{owner, dominio, email, geo, fecha}] }. `ok:false` significa que
+// Monday no contestó — quien llame TIENE que decirlo en pantalla en vez de mostrar cero.
+export async function fetchManualSendsFromMonday({ desde, hasta } = {}) {
+  const col = CONFIG.MONDAY_COLUMNS;
+  try {
+    // El filtro por rango va del lado de Monday para no traerse el board entero: son 10.400+
+    // deals y el panel se abre seguido.
+    const rules = [`{ column_id: "${col.fecha_contacto}", compare_value: ["${desde}", "${hasta}"], operator: between }`];
+    const query = `{
+      boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
+        items_page(limit: 500, query_params: { rules: [${rules.join(",")}] }) {
+          items {
+            name
+            column_values(ids: ["${col.ejecutivo}", "${col.comentarios}", "${col.geo}", "${col.fecha_contacto}", "email_mm2edcd3"]) { id text }
+          }
+        }
+      }
+    }`;
+    const data = await mondayRequest(query, { timeoutMs: 25000 });
+    const items = data?.boards?.[0]?.items_page?.items;
+    if (!Array.isArray(items)) return { ok: false, items: [] };
+    const out = [];
+    for (const it of items) {
+      const cv = {};
+      for (const c of (it.column_values || [])) cv[c.id] = c.text || "";
+      // Solo lo hecho A MANO: la marca la escribe la propia toolbar en Comentarios.
+      if (!/manual/i.test(cv[col.comentarios] || "")) continue;
+      out.push({
+        owner:   cv[col.ejecutivo] || "",
+        dominio: it.name || "",
+        email:   cv["email_mm2edcd3"] || "",
+        geo:     cv[col.geo] || "",
+        fecha:   cv[col.fecha_contacto] || "",
+      });
+    }
+    return { ok: true, items: out };
+  } catch {
+    return { ok: false, items: [] };
+  }
+}

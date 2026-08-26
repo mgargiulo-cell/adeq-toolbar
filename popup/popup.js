@@ -2,7 +2,7 @@
 // ADEQ TOOLBAR — Popup v4
 // ============================================================
 
-import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText } from "../modules/monday.js";
+import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/monday.js";
 import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -533,7 +533,6 @@ function initAdminPanel() {
   });
   document.getElementById("agent-refresh-toggle")?.addEventListener("click", toggleRefreshEmptyLeads);
   document.getElementById("agent-feed-export-csv")?.addEventListener("click", _exportAgentFeedCsv);
-  document.getElementById("admin-export-comparator-csv")?.addEventListener("click", exportComparatorCsv);
   document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
   loadAdminActivity();
@@ -1429,57 +1428,6 @@ async function saveAgentFocus() {
   await loadAdminAgent();
 }
 
-// Exporta el comparador horizontal del admin como CSV.
-// Lee el DOM ya renderizado (contiene los datos del periodo + filtros aplicados).
-function exportComparatorCsv() {
-  const wrap = document.getElementById("admin-mb-comparator");
-  if (!wrap) { showToast("❌ Comparator not loaded", "error"); return; }
-  const rows = [];
-  // Iterar las filas del grid: cada label + 4 celdas (3 MBs + Agent)
-  const cells = wrap.querySelectorAll(".mbc-cell, .mbc-group-sep, .mbc-row-label");
-  let currentRow = [];
-  let isHeader = true;
-  let groupTitle = "";
-
-  // Approach simple: iterar children y agrupar por filas
-  const allChildren = [...wrap.children];
-  let i = 0;
-  while (i < allChildren.length) {
-    const node = allChildren[i];
-    if (node.classList.contains("mbc-row")) {
-      const cellsInRow = [...node.querySelectorAll(".mbc-cell")];
-      const rowVals = cellsInRow.map(c => (c.querySelector(".mbc-val")?.textContent || c.textContent || "").trim());
-      // Si es header, prepend "Métrica"
-      if (node.classList.contains("mbc-header")) {
-        rows.push(rowVals.map(v => `"${v.replace(/"/g, '""')}"`).join(","));
-      } else {
-        // Las row labels normales: primera celda es la métrica
-        rows.push((groupTitle ? `[${groupTitle}] ` : "") + rowVals.map(v => `"${v.replace(/"/g, '""')}"`).join(","));
-      }
-    } else if (node.classList.contains("mbc-group-sep")) {
-      groupTitle = (node.textContent || "").trim();
-    }
-    i++;
-  }
-
-  if (rows.length === 0) { showToast("❌ No data to export", "error"); return; }
-
-  // Filtros aplicados al título del archivo
-  const period = document.getElementById("admin-filter-period")?.value || "";
-  const userF = document.getElementById("admin-filter-user")?.value || "all";
-  const today = new Date().toISOString().split("T")[0];
-  const filename = `adeq-comparador-${period}-${userF.replace(/[^a-z0-9]/gi, "_")}-${today}.csv`;
-
-  const csv = "﻿" + rows.join("\n"); // BOM UTF-8 para Excel
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
-  showToast(`✅ CSV descargado: ${filename}`, "info");
-}
-
 async function toggleRefreshEmptyLeads() {
   // Lee estado actual + lo invierte
   const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
@@ -1603,244 +1551,148 @@ function _periodToRange(period) {
   }
 }
 
+// ── ACTIVITY, REESCRITA (Maxi 2026-08-26) ────────────────────────────────────────────────
+// El user sobre la versión anterior: "muchos datos, poca claridad, realmente no la uso".
+// Tenía razón, y además MENTÍA: mostraba "Emails manual 0" para los tres MB el mismo día que
+// Monday tenía 18 de Agustina, porque contaba desde `toolbar_api_usage`, que se llena desde
+// el popup y falla en silencio.
+//
+// Ahora muestra lo MISMO que el parte diario por mail —que es lo que el user sí lee— con un
+// filtro de período. Una sola forma de leer el trabajo del equipo en los dos lados: si el
+// panel y el mail dijeran cosas distintas, ninguno de los dos sirve.
+//
+// Lo manual sale de MONDAY. Si Monday no contesta, se dice en pantalla en vez de mostrar 0.
+const _NOMBRE_MB_ADMIN = {
+  "mgargiulo@adeqmedia.com": "Maxi", "sales@adeqmedia.com": "Agus", "dhorovitz@adeqmedia.com": "Diego",
+};
+const _nombreMb = (mail) => _NOMBRE_MB_ADMIN[String(mail || "").toLowerCase()] || String(mail || "").split("@")[0] || "?";
+// El dueño en Monday viene a veces como mail y a veces como nombre ("Maximiliano Gargiulo").
+const _ownerEsMb = (owner, mail) => {
+  const o = String(owner || "").toLowerCase(), u = String(mail || "").toLowerCase();
+  if (!o || !u) return false;
+  if (o.includes(u)) return true;
+  const alias = { "mgargiulo@adeqmedia.com": ["maxi", "maximiliano", "gargiulo"],
+                  "sales@adeqmedia.com": ["agus", "agustina", "blanco"],
+                  "dhorovitz@adeqmedia.com": ["diego", "horovitz"] };
+  return (alias[u] || []).some(a => o.includes(a));
+};
+
 async function loadAdminActivity() {
-  const summary = document.getElementById("admin-stats-summary");
-  if (summary) summary.querySelectorAll(".stat-num").forEach(el => { el.textContent = "..."; });
-  const period = document.getElementById("admin-filter-period")?.value || "last7";
+  const period     = document.getElementById("admin-filter-period")?.value || "last7";
   const userFilter = document.getElementById("admin-filter-user")?.value || "";
   const { from, to } = _periodToRange(period);
-
-  // Cargar lista de usuarios para el filtro (1 vez)
   await populateUserFilter();
 
-  // Fetch en paralelo: historial + sendtrack + api_usage
-  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-  // toolbar_historial usa media_buyer (NO user_email) — antes el filtro era erróneo y devolvía 0.
-  const histUserClause   = userFilter ? `&media_buyer=eq.${encodeURIComponent(userFilter)}` : "";
-  const queueUserClause  = userFilter ? `&created_by=eq.${encodeURIComponent(userFilter)}` : "";
-  const usageUserClause  = userFilter ? `&user_email=eq.${encodeURIComponent(userFilter)}` : "";
+  const elEnvios   = document.getElementById("admin-envios");
+  const elTrabajo  = document.getElementById("admin-trabajo");
+  const elManuales = document.getElementById("admin-manuales");
+  const elAviso    = document.getElementById("admin-activity-warning");
+  [elEnvios, elTrabajo, elManuales].forEach(el => {
+    if (el) el.innerHTML = `<div style="opacity:.6;font-style:italic">Cargando…</div>`;
+  });
 
-  // toolbar_bounce_retries — 1 row por cada bounce detectado (con mb_email).
-  // La usamos para calcular % bounce por MB en el comparador.
-  const bounceUserClause = userFilter ? `&mb_email=eq.${encodeURIComponent(userFilter.toLowerCase())}` : "";
-  const [histRes, trackRes, usageRes, sessionsRes, queueRes, agentActions, bounceRetries] = await Promise.all([
-    // toolbar_historial — sites analizados manualmente desde toolbar.
-    // Filtro por created_at (timestamp confiable) en vez de date (string DD/MM/YYYY).
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${from}&created_at=lte.${to}T23:59:59${histUserClause}&select=*&order=created_at.desc&limit=2000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${from}&send_date=lte.${to}&select=domain,send_date`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${from}&day=lte.${to}${usageUserClause}&select=*`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetchUsageStats(state.accessToken, { from, to, userEmail: userFilter }),
-    // toolbar_review_queue — DOS queries para capturar TODA la actividad:
-    // 1) Rows CREADOS en el rango (descubrimientos/imports del periodo)
-    // 2) Rows VALIDADOS en el rango (procesados desde Prospects en el periodo)
-    // Ej: Diego valida hoy un lead creado la semana pasada → si no lo traemos
-    // por validated_at, no contamos esa acción de Diego.
-    // Combinamos los 2 arrays + dedupe por id en el aggregator más abajo.
-    Promise.all([
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${from}&created_at=lte.${to}T23:59:59${queueUserClause}&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at,id&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?validated_at=gte.${from}&validated_at=lte.${to}T23:59:59&select=domain,traffic,geo,category,score,source,status,created_by,created_at,validated_by,validated_at,id&order=validated_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    ]).then(([byCreate, byValidate]) => {
-      // Dedupe por id (un row puede aparecer en ambos arrays)
-      const seen = new Set();
-      const merged = [];
-      [...byCreate, ...byValidate].forEach(r => {
-        if (!seen.has(r.id)) { seen.add(r.id); merged.push(r); }
-      });
-      return merged;
-    }),
-    // toolbar_agent_actions — el agente cuenta como "MB" más en el comparador.
-    // Filtramos action=sent (los exitosos) en el período.
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,monday_ok)&created_at=gte.${from}&created_at=lte.${to}T23:59:59&select=domain,user_email,action,pitch_subject,details,created_at&order=created_at.desc&limit=5000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${from}&created_at=lte.${to}T23:59:59${bounceUserClause}&select=mb_email,domain,bounce_type,created_at&order=created_at.desc&limit=3000`, { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+  const desdeISO = `${from}T00:00:00`, hastaISO = `${to}T23:59:59`;
+  const histUser = userFilter ? `&media_buyer=eq.${encodeURIComponent(userFilter)}` : "";
+
+  // El piso de tráfico es el MISMO que usa el sistema para decidir si una web entra a
+  // Prospects. Tener dos números para la misma pregunta ya nos hizo marcar como floja una
+  // web de 450k que el agente sí acepta.
+  const PISO = 400000;   // el mismo gate que usa el agente (agent_threshold_traffic)
+
+  const [hist, acciones, cacheVieja, monday] = await Promise.all([
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${desdeISO}&created_at=lte.${hastaISO}${histUser}&select=domain,media_buyer,page_views,is_new,geo,email,created_at&order=created_at.asc&limit=5000`,
+      { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${desdeISO}&created_at=lte.${hastaISO}&details->>ui_origin=is.null&select=user_email,domain,created_at&limit=5000`,
+      { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeISO}&select=domain&limit=40000`,
+      { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    fetchManualSendsFromMonday({ desde: from, hasta: to }),
   ]);
 
-
-  // ── Métricas ────────────────────────────────────────────────
-  // sites = analyses manuales (historial) + prospects agregados por worker (review_queue, dedup por domain).
-  const histDomains    = new Set(histRes.map(h => (h.domain || "").toLowerCase()).filter(Boolean));
-  const queueDomains   = new Set(queueRes.map(q => (q.domain || "").toLowerCase()).filter(Boolean));
-  const allDomains     = new Set([...histDomains, ...queueDomains]);
-  const sites          = allDomains.size;
-  // user 2026-05-29: SEPARACIÓN MB MANUAL vs AGENTE.
-  // Manual = lo que el MB hizo a mano desde el popup (api_usage o agent_actions
-  // con details.ui_origin='toolbar_manual').
-  // Agente = lo que el bot automatizado disparó (resto de agent_actions).
-  const popupOpens     = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._popup_opens   || 0, 10), 0);
-  const sitesManual    = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._sites_analyzed || 0, 10), 0);
-  const emailsManualFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent   || 0, 10), 0);
-  const mondayManualFromUsage = usageRes.reduce((acc, r) => acc + parseInt(r.by_provider?._monday_pushes || 0, 10), 0);
-  // Agente: solo lo que NO es ui_origin=toolbar_manual.
-  const isManualAction = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
-  // Maxi 2026-06-19 (fix): las tarjetas de arriba ("AGENTE AUTOMATIZADO acting
-  // for this MB") deben respetar el filtro USUARIO. Antes contaban agentActions
-  // GLOBAL (todos los MBs) → mostraba lo mismo para Maxi/Diego/Agus. El fetch de
-  // agent_actions NO filtra por user_email a propósito (el comparador de abajo
-  // necesita TODOS los MBs), así que filtramos acá una copia para las stat cards.
-  const agentActionsMB = userFilter
-    ? agentActions.filter(a => (a.user_email || "").toLowerCase() === userFilter.toLowerCase())
-    : agentActions;
-  const emailsAgent = agentActionsMB.filter(a => !isManualAction(a) && (a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent")).length;
-  const mondayAgent = agentActionsMB.filter(a => !isManualAction(a) && a.action === "monday_ok").length;
-  // Bounce rate del agente (rebotes / emails enviados por el agente).
-  const bouncesAgent = Array.isArray(bounceRetries) ? bounceRetries.length : 0;
-  const bouncePct = emailsAgent > 0 ? Math.round((bouncesAgent / emailsAgent) * 100) : 0;
-  // Totales (compat): los podemos seguir usando en otras vistas.
-  const emails = emailsManualFromUsage + emailsAgent;
-  const monday = mondayManualFromUsage + mondayAgent;
-  // toolbar_historial usa page_views/raw_visits (no 'traffic'). Combinar histórico + review_queue para tráfico.
-  const trafficOf      = (h) => parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
-  const allRows        = [...histRes, ...queueRes];
-  const above500k      = allRows.filter(h => trafficOf(h) >= 500000).length;
-  const below500k      = allRows.filter(h => { const t = trafficOf(h); return t > 0 && t < 500000; }).length;
-  // Tiempo REAL de autopilot (sumar duration_sec de sesiones kind=autopilot)
-  const apSec = sessionsRes
-    .filter(s => s.kind === "autopilot" && s.duration_sec)
-    .reduce((acc, s) => acc + s.duration_sec, 0);
-  const apTimeStr = apSec >= 3600
-    ? `${Math.floor(apSec / 3600)}h ${Math.round((apSec % 3600) / 60)}m`
-    : `${Math.round(apSec / 60)}m`;
-
-  // 👤 MB MANUAL
-  document.getElementById("stat-opens").textContent          = popupOpens.toLocaleString();
-  document.getElementById("stat-sites").textContent          = (sitesManual || sites).toLocaleString();
-  document.getElementById("stat-emails-manual").textContent  = emailsManualFromUsage.toLocaleString();
-  document.getElementById("stat-monday-manual").textContent  = mondayManualFromUsage.toLocaleString();
-  // 🤖 AGENTE
-  document.getElementById("stat-emails-agent").textContent   = emailsAgent.toLocaleString();
-  document.getElementById("stat-monday-agent").textContent   = mondayAgent.toLocaleString();
-  document.getElementById("stat-500k-up").textContent        = above500k.toLocaleString();
-  document.getElementById("stat-bounces").textContent        = emailsAgent > 0 ? `${bouncePct}%` : "—";
-
-  // Maxi 2026-06-17: Quickview compacto por MB — manual + agente + eficacia.
-  renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes);
-  renderAdminConversionBySource().catch(() => {});
-  renderAdminSourcePerformance().catch(() => {});
-
-  // Combinar fuentes para los renders. Normalizar review_queue rows al shape de historial.
-  // CADA review_queue row genera 1 row para el created_by (descubrió/importó) Y
-  // 1 row adicional para el validated_by (procesó). Así la "actividad" de cada MB
-  // refleja TODO lo que hizo, no solo lo que descubrió.
-  const queueAsHist = [];
-  queueRes.forEach(q => {
-    const baseRow = {
-      domain:       q.domain,
-      page_views:   q.traffic || 0,
-      raw_visits:   q.traffic || 0,
-      is_new:       true,
-      date:         q.created_at,
-      created_at:   q.created_at,
-      geo:          q.geo,
-      category:     q.category,
-      source:       q.source || "autopilot",
-      status:       q.status,
-      score:        q.score,
-    };
-    // Row 1: para el creador (quien lo metió al pool)
-    if (q.created_by) {
-      queueAsHist.push({ ...baseRow, media_buyer: q.created_by });
-    }
-    // Row 2: para el validador (quien lo procesó/mando mail). Filtra agentes y "agent:..."
-    // Solo cuenta MBs humanos en el comparador. El agente y procesos automáticos tienen su propia columna.
-    const _vb = q.validated_by || "";
-    const _isAutoProcess = _vb.startsWith("agent:") || _vb.startsWith("admin_blocklist") || _vb.startsWith("worker_") || _vb === "admin_blocklist_cleanup";
-    if (_vb && !_isAutoProcess && _vb !== q.created_by) {
-      queueAsHist.push({
-        ...baseRow,
-        media_buyer: q.validated_by,
-        date: q.validated_at || q.created_at,
-        created_at: q.validated_at || q.created_at,
-        source: "validated", // marca que esta row representa la VALIDACIÓN, no la creación
-      });
-    }
-  });
-  const combined = [...histRes, ...queueAsHist];
-
-  // Chart por día
-  renderAdminChart(combined, from, to);
-
-  // Comparador de Media Buyers — at-a-glance side-by-side (agente incluído como columna extra)
-  renderAdminComparator(combined, usageRes, sessionsRes, agentActions, bounceRetries);
-  // Maxi 2026-07-15 (Admin#4): renderSourcePerformance() ELIMINADO — pisaba nondeterministicamente el
-  // contenedor #admin-source-performance que renderAdminSourcePerformance (1697) llena con el panel "por
-  // motor" que la HTML rotula. Su tabla rolling-30d no tenía sección propia (su auto-inject nunca disparaba).
-
-  // Resumen narrativo por MB (cards con tips para 1:1)
-  renderAdminMBSummaries(combined, usageRes, sessionsRes, agentActions);
-}
-
-// Maxi 2026-06-17: tablero compacto por MB en la parte superior del admin
-// activity tab. Mostramos 1 fila por MB con: Manual (envío hecho a mano desde
-// la toolbar), Agente (envío automático del worker), Eficacia (validados/
-// enviados). Simple para que Maxi vea quien trabaja cuánto sin escarbar tablas.
-// Maxi 2026-06-18: conversion rate por source (apollo/informer/scrape/social/generic)
-// Mide respuestas REALES (excluye OOO) de toolbar_response_tracking en últimos 30d.
-async function renderAdminConversionBySource() {
-  const wrap = document.getElementById("admin-conversion-by-source");
-  if (!wrap) return;
-  try {
-    const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-    const since = new Date(Date.now() - 30 * 86400_000).toISOString();
-    const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${since}&select=source,response_type&limit=10000`,
-      { headers }
-    );
-    if (!res.ok) {
-      wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin data — la tabla aún no tiene envíos registrados.</div>';
-      return;
-    }
-    const rows = await res.json();
-    if (!Array.isArray(rows) || rows.length === 0) {
-      wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin envíos en los últimos 30 días. Esperá a que el agente registre actividad.</div>';
-      return;
-    }
-    // Agregar por source
-    const SOURCE_META = {
-      apollo:   { label: "🎯 Apollo",       color: "#7c3aed" },
-      informer: { label: "🔍 Informer",     color: "#0ea5e9" },
-      scrape:   { label: "🌐 Sitio (HTML)", color: "#10b981" },
-      generic:  { label: "📨 Genérico",     color: "#94a3b8" },
-      Facebook: { label: "📘 Facebook",     color: "#1877f2" },
-      YouTube:  { label: "▶️ YouTube",       color: "#ff0000" },
-      Twitter:  { label: "🐦 Twitter",      color: "#1da1f2" },
-      unknown:  { label: "❓ Unknown",      color: "#64748b" },
-    };
-    const counts = new Map();
-    for (const r of rows) {
-      const src = r.source || "unknown";
-      const c = counts.get(src) || { sent: 0, real: 0, ooo: 0 };
-      c.sent++;
-      if (r.response_type === "real") c.real++;
-      if (r.response_type === "ooo")  c.ooo++;
-      counts.set(src, c);
-    }
-    // Ordenar por conversion rate desc
-    const sorted = [...counts.entries()]
-      .map(([src, c]) => ({ src, ...c, rate: c.sent > 0 ? c.real / c.sent : 0 }))
-      .sort((a, b) => b.rate - a.rate);
-    const html = sorted.map(r => {
-      const meta = SOURCE_META[r.src] || SOURCE_META.unknown;
-      const ratePct = (r.rate * 100).toFixed(1);
-      const barWidth = Math.min(100, r.rate * 500); // 20% real = 100% bar
-      const rateColor = r.rate >= 0.05 ? "#16a34a" : r.rate >= 0.02 ? "#d97706" : "#dc2626";
-      return `
-        <div style="display:grid;grid-template-columns:120px 1fr 80px 80px;gap:6px;align-items:center;padding:4px 6px;background:#0f172a;border-radius:4px;border-left:3px solid ${meta.color}">
-          <div style="color:${meta.color};font-weight:700">${meta.label}</div>
-          <div style="background:#1e293b;height:8px;border-radius:4px;overflow:hidden;position:relative">
-            <div style="height:100%;width:${barWidth}%;background:${rateColor};border-radius:4px"></div>
-          </div>
-          <div style="text-align:right;color:${rateColor};font-weight:700">${ratePct}% real</div>
-          <div style="text-align:right;color:#94a3b8;font-size:10px">${r.real}/${r.sent} envíos${r.ooo > 0 ? ` · ${r.ooo} OOO` : ""}</div>
-        </div>
-      `;
-    }).join("");
-    wrap.innerHTML = html + `
-      <div style="font-size:10px;color:#64748b;text-align:center;padding-top:4px">
-        Tasa de respuesta REAL (excluye Out-of-Office). El agente usa estos números para rankear qué fuente priorizar.
-      </div>
-    `;
-  } catch (e) {
-    wrap.innerHTML = `<div style="opacity:.6;color:#dc2626">Error: ${esc(e.message || String(e))}</div>`;
+  if (elAviso) {
+    if (!monday.ok) {
+      elAviso.style.display = "block";
+      elAviso.textContent = "⚠️ Monday no contestó. Los envíos a mano no se pueden contar y quedan en blanco — NO son cero.";
+    } else elAviso.style.display = "none";
   }
+
+  const cacheAntes = new Set((cacheVieja || []).map(c => String(c.domain || "").toLowerCase()));
+  const MBS = ["mgargiulo@adeqmedia.com", "sales@adeqmedia.com", "dhorovitz@adeqmedia.com"]
+    .filter(m => !userFilter || m.toLowerCase() === userFilter.toLowerCase());
+
+  // ── ENVÍOS: agente vs mano ──────────────────────────────────────────────────────────
+  const filasEnvio = MBS.map(mb => {
+    const agente = acciones.filter(a => String(a.user_email || "").toLowerCase() === mb).length;
+    const mano   = monday.ok ? monday.items.filter(i => _ownerEsMb(i.owner, mb)).length : null;
+    return { mb, agente, mano };
+  });
+  if (elEnvios) {
+    const totA = filasEnvio.reduce((a, f) => a + f.agente, 0);
+    const totM = monday.ok ? filasEnvio.reduce((a, f) => a + (f.mano || 0), 0) : null;
+    elEnvios.innerHTML = filasEnvio.map(f => `
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="width:52px;font-weight:600">${esc(_nombreMb(f.mb))}</span>
+        <span style="color:#38bdf8">🤖 ${f.agente}</span>
+        <span style="color:${f.mano ? "#fbbf24" : "#64748b"}">👤 ${f.mano == null ? "?" : f.mano} a mano</span>
+      </div>`).join("") +
+      `<div style="margin-top:4px;padding-top:4px;border-top:1px solid #334155;color:#94a3b8">
+         Total: 🤖 ${totA} del agente · 👤 ${totM == null ? "?" : totM} a mano</div>`;
+  }
+
+  // ── CÓMO TRABAJÓ CADA UNO ───────────────────────────────────────────────────────────
+  if (elTrabajo) {
+    const bloques = MBS.map(mb => {
+      const nombre = _nombreMb(mb);
+      const filas = hist.filter(h => _ownerEsMb(h.media_buyer, mb) || String(h.media_buyer || "").toLowerCase() === nombre.toLowerCase());
+      if (!filas.length) return `<div style="opacity:.5">${esc(nombre)} — sin actividad registrada</div>`;
+      const distintos = new Set(filas.map(h => String(h.domain || "").toLowerCase()));
+      const cacheadas = filas.filter(h => cacheAntes.has(String(h.domain || "").toLowerCase())).length;
+      const medidas   = filas.length - cacheadas;
+      const arriba    = filas.filter(h => Number(h.page_views) >= PISO).length;
+      const abajo     = filas.filter(h => { const v = Number(h.page_views) || 0; return v > 0 && v < PISO; }).length;
+      const sinDato   = filas.filter(h => !Number(h.page_views)).length;
+      const pct = (n) => filas.length ? ` (${Math.round(100 * n / filas.length)}%)` : "";
+      // Si abrió muchas filas sobre pocos dominios, la toolbar estuvo casi siempre en la
+      // misma web: re-analiza al volver a la pestaña, así que una sola URL puede simular
+      // una jornada entera.
+      const clavada = filas.length >= 10 && (distintos.size / filas.length) < 0.25;
+      const geos = {};
+      filas.forEach(h => { const g = String(h.geo || "").trim(); if (g) geos[g] = (geos[g] || 0) + 1; });
+      const topGeo = Object.entries(geos).sort((a, b) => b[1] - a[1]).slice(0, 3)
+        .map(([g, n]) => `${esc(g)} ${n}`).join(" · ") || "—";
+      return `
+        <div style="border:1px solid #334155;border-radius:6px;padding:7px 9px">
+          <div style="font-weight:600;color:#f1f5f9;margin-bottom:3px">${esc(nombre)}</div>
+          <div>URLs abiertas: <b>${filas.length}</b> · distintas: <b style="color:${clavada ? "#f87171" : "#cbd5e1"}">${distintos.size}</b>${
+            clavada ? ` <span style="color:#f87171">— la toolbar estuvo casi siempre en la misma web</span>` : ""}</div>
+          <div>Medidas ahora: <b>${medidas}</b>${pct(medidas)} · de caché: <b>${cacheadas}</b>${pct(cacheadas)}</div>
+          <div>Prospectables (+${Math.round(PISO / 1000)}k): <b style="color:#34d399">${arriba}</b>${pct(arriba)} · por debajo: <b>${abajo}</b>${pct(abajo)} · sin dato: ${sinDato}</div>
+          <div style="color:#94a3b8">Geo: ${topGeo}</div>
+        </div>`;
+    });
+    elTrabajo.innerHTML = bloques.join("") || `<div style="opacity:.6">Sin datos en el período.</div>`;
+  }
+
+  // ── LO QUE SE MANDÓ A MANO ──────────────────────────────────────────────────────────
+  if (elManuales) {
+    if (!monday.ok) {
+      elManuales.innerHTML = `<div style="opacity:.7">No se pudo leer el board.</div>`;
+    } else {
+      const items = monday.items.filter(i => !userFilter || MBS.some(mb => _ownerEsMb(i.owner, mb)));
+      elManuales.innerHTML = items.length
+        ? items.slice(0, 120).map(i => `
+            <div style="display:flex;gap:8px;border-bottom:1px solid #1e293b;padding:2px 0">
+              <span style="width:46px;color:#94a3b8;flex:none">${esc(_nombreMb(i.owner) || i.owner)}</span>
+              <span style="flex:1;word-break:break-all">${esc(i.dominio)}</span>
+              <span style="flex:1;color:#7dd3fc;word-break:break-all">${esc(i.email || "—")}</span>
+              <span style="width:70px;color:#94a3b8;flex:none">${esc(i.geo || "—")}</span>
+            </div>`).join("") + (items.length > 120 ? `<div style="opacity:.6">… y ${items.length - 120} más</div>` : "")
+        : `<div style="opacity:.6">Nadie mandó nada a mano en el período.</div>`;
+    }
+  }
+
+  renderAdminSourcePerformance().catch(() => {});
 }
 
 // Maxi 2026-06-19: rendimiento por MOTOR de descubrimiento. Cruza lo que cada fuente
@@ -1895,72 +1747,6 @@ async function renderAdminSourcePerformance() {
   } catch (e) {
     wrap.innerHTML = `<div style="opacity:.6;color:#dc2626">Error: ${esc(e.message || String(e))}</div>`;
   }
-}
-
-function renderAdminMBQuickview(usageRes, agentActions, bounceRetries, queueRes) {
-  const wrap = document.getElementById("admin-mb-quickview");
-  if (!wrap) return;
-  const MB_INFO = [
-    { email: "mgargiulo@adeqmedia.com", name: "Maxi",  color: "#10b981" },
-    { email: "sales@adeqmedia.com",     name: "Agus",  color: "#ec4899" },
-    { email: "dhorovitz@adeqmedia.com", name: "Diego", color: "#a855f7" },
-  ];
-
-  const isManualAction = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
-
-  const rowsHtml = MB_INFO.map(mb => {
-    const emailLower = mb.email.toLowerCase();
-
-    // Manual emails: del api_usage._emails_sent + agent_actions con ui_origin=toolbar_manual
-    const manualFromUsage = (usageRes || []).filter(u => (u.user_email || "").toLowerCase() === emailLower)
-      .reduce((acc, r) => acc + parseInt(r.by_provider?._emails_sent || 0, 10), 0);
-    const manualFromActions = (agentActions || []).filter(a => (a.user_email || "").toLowerCase() === emailLower && isManualAction(a) && (a.action === "sent" || a.action === "monday_ok")).length;
-    const manualEmails = manualFromUsage + manualFromActions;
-
-    // Agente: agent_actions sin ui_origin=toolbar_manual
-    const agentEmails = (agentActions || []).filter(a =>
-      (a.user_email || "").toLowerCase() === emailLower &&
-      !isManualAction(a) &&
-      (a.action === "sent" || a.action === "re_sent" || a.action === "bounce_retry_sent")
-    ).length;
-
-    // Bounces detectados para este MB
-    const bounces = (bounceRetries || []).filter(b => (b.mb_email || "").toLowerCase() === emailLower).length;
-    const bouncePct = agentEmails > 0 ? Math.round((bounces / agentEmails) * 100) : 0;
-
-    // Validados (procesados desde Prospects) por este MB
-    const validated = (queueRes || []).filter(q => (q.validated_by || "").toLowerCase() === emailLower).length;
-    const totalSends = manualEmails + agentEmails;
-    const efficacy = totalSends > 0 ? Math.round((validated / totalSends) * 100) : 0;
-
-    // Color del badge eficacia
-    const effColor = efficacy >= 70 ? "#16a34a" : efficacy >= 40 ? "#d97706" : "#dc2626";
-    const bounceColor = bouncePct >= 10 ? "#dc2626" : bouncePct >= 5 ? "#d97706" : "#16a34a";
-
-    return `
-      <div style="display:grid;grid-template-columns:80px 1fr 1fr 90px 90px;gap:8px;align-items:center;padding:6px 8px;background:#0f172a;border-radius:4px;border-left:3px solid ${mb.color}">
-        <div style="color:${mb.color};font-weight:700">${mb.name}</div>
-        <div title="Manual desde la toolbar (analysis tab)">
-          👤 <strong>${manualEmails}</strong> <span style="opacity:.6">manual</span>
-        </div>
-        <div title="Agente automatizado (sent + re_sent + bounce_retry_sent)">
-          🤖 <strong>${agentEmails}</strong> <span style="opacity:.6">agente</span>
-        </div>
-        <div title="% rebote = bounces / agentEmails" style="color:${bounceColor};text-align:center;font-weight:600">
-          🚫 ${bounces} (${bouncePct}%)
-        </div>
-        <div title="Eficacia = validated / total enviados" style="color:${effColor};text-align:center;font-weight:700">
-          ✅ ${efficacy}%
-        </div>
-      </div>
-    `;
-  }).join("");
-
-  wrap.innerHTML = rowsHtml + `
-    <div style="font-size:10px;color:#64748b;text-align:center;padding-top:4px">
-      👤=manual desde toolbar · 🤖=agente automático · 🚫=rebotes detectados · ✅=eficacia (validated/sent)
-    </div>
-  `;
 }
 
 // ── Helper compartido: agrega métricas por user (usado por Comparator + Summaries) ──
@@ -2067,125 +1853,6 @@ function _aggregateByUser(historial, usage, sessions, agentActions) {
   return byUser;
 }
 
-// ── Comparador horizontal: tabla con métricas en filas, MBs en columnas ──
-// Pensado para "ver de un vistazo quién está produciendo y quién no".
-function renderAdminComparator(historial, usage, sessions, agentActions = [], bounceRetries = []) {
-  const wrap = document.getElementById("admin-mb-comparator");
-  if (!wrap) return;
-  const byUser = _aggregateByUser(historial, usage, sessions, agentActions);  // Maxi 2026-07-15 (Admin#1): pasar agentActions → emailsAgent/mondayAgent
-  // Bounces por MB — cada row en toolbar_bounce_retries = 1 bounce atribuido
-  // al MB que mandó el email original. % bounce = bounces / emails enviados.
-  const bouncesByUser = {};
-  (bounceRetries || []).forEach(r => {
-    const u = (r.mb_email || "").toLowerCase();
-    if (!u) return;
-    bouncesByUser[u] = (bouncesByUser[u] || 0) + 1;
-  });
-  // Agregar AGENTE como un "MB" más — agrega métricas de agent_actions sent.
-  const agentBucket = {
-    sites: agentActions.length,
-    autopilotSites: agentActions.length, manualSites: 0,
-    geos: {}, categories: {},
-    above500k: 0, below500k: 0,
-    emails: agentActions.length,
-    monday: agentActions.filter(a => a.details?.monday_item_id || true).length, // todos los sent llegan a Monday
-    claude: agentActions.filter(a => a.details?.source === "claude").length,
-    apSec: 0, popupSec: 0,
-    isAgent: true,
-  };
-  agentActions.forEach(a => {
-    const g = (a.details?.geo || "").trim();
-    if (g) agentBucket.geos[g] = (agentBucket.geos[g] || 0) + 1;
-    const t = parseInt(a.details?.traffic || 0, 10);
-    if (t >= 500000) agentBucket.above500k++;
-    else if (t > 0)  agentBucket.below500k++;
-  });
-
-  // Columnas: 3 MBs + 1 columna Agent (si hay actividad o no, siempre se muestra)
-  const mbs = TEAM_EMAILS.map(e => e.toLowerCase()).map(u => ({ user: u, ...byUser.get(u), bounces: bouncesByUser[u] || 0 }));
-  mbs.push({ user: "agent", ...agentBucket, bounces: 0 });
-
-  const shortName = (e) => ({
-    "mgargiulo@adeqmedia.com": "Maxi",
-    "dhorovitz@adeqmedia.com": "Diego",
-    "sales@adeqmedia.com":     "Agus",
-    "agent":                   "🤖 Agent",
-  })[e] || e.split("@")[0];
-
-  const fmtTime = (sec) => sec >= 3600 ? `${Math.floor(sec/3600)}h${Math.round((sec%3600)/60)}m` : `${Math.round(sec/60)}m`;
-  const topKey  = (obj) => Object.entries(obj).sort((a,b) => b[1]-a[1])[0]?.[0] || "—";
-  const pctConv = (mb) => mb.sites > 0 ? Math.round((mb.monday / mb.sites) * 100) : 0;
-
-  // Definición de filas: { label, group, get(mb) → value, fmt(value) → display, isBest higher/lower, colorFn(value) → class }
-  const groups = [
-    {
-      title: "USO MANUAL (👤 lo que hace el MB)",
-      rows: [
-        { label: "Aperturas toolbar",      get: m => m.opens || 0, fmt: v => v.toLocaleString() },
-        { label: "URLs analizadas",        get: m => m.sitesManual || m.sites, fmt: v => v.toLocaleString() },
-        { label: "Analysis / Prospects",   get: m => (m.manualSites || 0) + (m.autopilotSites || 0), fmt: (_, m) => `${m.manualSites || 0} / ${m.autopilotSites || 0}`, _help: "Analysis = manual desde Analysis tab. Prospects = pickeados del review_queue." },
-        { label: "Autopilot time",         get: m => m.apSec, fmt: v => fmtTime(v) },
-      ],
-    },
-    {
-      title: "QUALITY",
-      rows: [
-        { label: "% +500K visits", get: m => m.sites ? Math.round((m.above500k / m.sites) * 100) : 0, fmt: v => `${v}%` },
-        { label: "Top GEO",        get: m => Object.values(m.geos).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.geos), noBar: true },
-        { label: "Top Category",   get: m => Object.values(m.categories).reduce((a,b)=>a+b,0), fmt: (_, m) => topKey(m.categories), noBar: true },
-      ],
-    },
-    {
-      title: "OUTREACH (👤 MANUAL del MB)",
-      rows: [
-        { label: "Emails — manual",    get: m => m.emailsManual || 0, fmt: v => v.toLocaleString() },
-        { label: "Monday — manual",    get: m => m.mondayManual || 0, fmt: v => v.toLocaleString() },
-      ],
-    },
-    {
-      title: "OUTREACH (🤖 AGENTE automatizado)",
-      rows: [
-        { label: "Emails — agente",    get: m => m.emailsAgent || 0, fmt: v => v.toLocaleString() },
-        { label: "Monday — agente",    get: m => m.mondayAgent || 0, fmt: v => v.toLocaleString() },
-        { label: "Conv. push/site",    get: m => pctConv(m), fmt: v => `${v}%`, color: v => v >= 5 ? "good" : v >= 2 ? "warn" : "bad" },
-        { label: "% bounce",           get: m => m.emailsAgent > 0 ? Math.round((m.bounces / m.emailsAgent) * 100) : 0, fmt: (v, m) => m.emailsAgent > 0 ? `${v}% (${m.bounces})` : "—", color: v => v <= 3 ? "good" : v <= 8 ? "warn" : "bad", noBar: true },   /* Maxi 2026-07-15 (Admin#6): denominador emailsAgent (los bounces son de agente), no m.emails (manual) */
-      ],
-    },
-    {
-      title: "EFFICIENCY",
-      rows: [
-        { label: "Claude pitches", get: m => m.claude, fmt: v => v.toLocaleString() },
-        { label: "Mails / Push",   get: m => m.monday ? Math.round((m.emails / m.monday) * 10) / 10 : 0, fmt: v => v ? v.toFixed(1) : "—" },
-      ],
-    },
-  ];
-
-  const html = [];
-  html.push(`<div class="mbc-row mbc-header"><div class="mbc-cell mbc-row-label">Metric</div>${mbs.map(m => `<div class="mbc-cell"><strong>${shortName(m.user)}</strong></div>`).join("")}</div>`);
-  groups.forEach(g => {
-    html.push(`<div class="mbc-group-sep">${g.title}</div>`);
-    g.rows.forEach(row => {
-      const values = mbs.map(m => row.get(m));
-      const max = Math.max(1, ...values);
-      const bestIdx = values.indexOf(Math.max(...values));
-      html.push(`<div class="mbc-row"><div class="mbc-cell mbc-row-label">${esc(row.label)}</div>`);
-      mbs.forEach((m, i) => {
-        const v = values[i];
-        const display = row.fmt(v, m);
-        const isBest = v === values[bestIdx] && v > 0 && !row.noBar;
-        const colorCls = row.color ? ` mbc-${row.color(v)}` : "";
-        const barW = row.noBar ? 0 : Math.round((v / max) * 100);
-        html.push(`<div class="mbc-cell${isBest ? " mbc-best" : ""}${colorCls}">
-          ${barW > 0 ? `<div class="mbc-bar" style="--w:${barW}%"></div>` : ""}
-          <span class="mbc-val">${esc(String(display))}</span>
-        </div>`);
-      });
-      html.push(`</div>`);
-    });
-  });
-  wrap.innerHTML = html.join("");
-}
-
 // ── Source Performance — engagement rolling 30d por MB y source ──
 // Lee toolbar_source_performance (agregada por el worker 1×/día) y muestra
 // por MB qué source (apollo/informer/scrape/generic/manual) está produciendo
@@ -2193,15 +1860,9 @@ function renderAdminComparator(historial, usage, sessions, agentActions = [], bo
 // para auto-ajustar el pick de email source.
 async function renderSourcePerformance() {
   let wrap = document.getElementById("admin-source-performance");
-  if (!wrap) {
-    // Auto-inyectar el contenedor justo después del comparator si no existe.
-    const cmpEl = document.getElementById("admin-mb-comparator");
-    if (!cmpEl) return;
-    wrap = document.createElement("div");
-    wrap.id = "admin-source-performance";
-    wrap.style.cssText = "margin-top:16px;padding:10px;background:#0f172a;border-radius:6px";
-    cmpEl.parentNode.insertBefore(wrap, cmpEl.nextSibling);
-  }
+  // El comparador contra el que se auto-inyectaba ya no existe (Activity reescrita
+  // 2026-08-26). Si el contenedor no está, no hay nada que renderizar.
+  if (!wrap) return;
   wrap.innerHTML = `<div style="color:#94a3b8;font-size:11px">Loading source performance…</div>`;
   try {
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
@@ -2272,143 +1933,6 @@ async function renderSourcePerformance() {
   }
 }
 
-// ── Resumen narrativo por MB ──────────────────────────────
-// Genera cards con frases en lenguaje natural sobre la actividad de cada MB.
-// Pensado para que el admin lea durante un 1:1 ("mirá tu resumen").
-function renderAdminMBSummaries(historial, usage, sessions, agentActions = []) {
-  const wrap = document.getElementById("admin-mb-summaries");
-  if (!wrap) return;
-  // Agrupar todo por usuario
-  const byUser = new Map();
-  TEAM_EMAILS.forEach(e => byUser.set(e.toLowerCase(), {
-    sites: 0, autopilotSites: 0, geos: {}, categories: {},
-    above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0,
-    apSec: 0, popupSec: 0,
-  }));
-  historial.forEach(h => {
-    const u = _normalizeUserKey(h.media_buyer || h.user_email || h.created_by);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, claude: 0, apSec: 0, popupSec: 0 });
-    const o = byUser.get(u);
-    o.sites++;
-    if (!_isManualSource(h.source)) o.autopilotSites++;   // Maxi 2026-07-21: ver _isManualSource
-    const g = (h.geo || "").trim();
-    if (g) o.geos[g] = (o.geos[g] || 0) + 1;
-    const c = (h.category || "").trim();
-    if (c) o.categories[c] = (o.categories[c] || 0) + 1;
-    const traffic = parseInt(h.page_views || h.raw_visits || h.traffic || 0, 10);
-    if (traffic >= 500000) o.above500k++;
-    else if (traffic > 0)  o.below500k++;
-    // Cada row historial = 1 push Monday + 1 send (si hay email)
-    o.monday++;
-    if (h.email && /\@/.test(h.email)) o.emails++;
-  });
-  // user 2026-05-29: nueva separación MB MANUAL vs AGENTE.
-  // - emailsManual / mondayManual: lo que el MB hizo a mano desde el popup
-  //   (agent_actions con details.ui_origin='toolbar_manual' + api_usage popup).
-  // - emailsAgent / mondayAgent: lo que el agente automatizado hizo en su nombre.
-  // Los totales (emails/monday) se computan sumando ambos para retro-compat.
-  usage.forEach(r => {
-    const u = _normalizeUserKey(r.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, opens: 0, sitesManual: 0, claude: 0, apSec: 0, popupSec: 0 });
-    const o = byUser.get(u);
-    // SUMAR (api_usage tiene 1 row por día, hay que sumar todos los días)
-    o.opens        += parseInt(r.by_provider?._popup_opens    || 0, 10);
-    o.sitesManual  += parseInt(r.by_provider?._sites_analyzed || 0, 10);
-    o.emailsManual += parseInt(r.by_provider?._emails_sent    || 0, 10);
-    o.mondayManual += parseInt(r.by_provider?._monday_pushes  || 0, 10);
-    o.claude       += parseInt(r.by_provider?.anthropic || 0, 10);
-  });
-  sessions.forEach(s => {
-    const u = _normalizeUserKey(s.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, claude: 0, apSec: 0, popupSec: 0 });
-    const o = byUser.get(u);
-    if (s.kind === "autopilot") o.apSec += s.duration_sec || 0;
-    if (s.kind === "popup")     o.popupSec += s.duration_sec || 0;
-  });
-  // Agent actions: separar MANUAL (ui_origin='toolbar_manual') de AGENTE automatizado.
-  agentActions.forEach(a => {
-    const u = _normalizeUserKey(a.user_email);
-    if (!byUser.has(u)) byUser.set(u, { sites: 0, autopilotSites: 0, geos: {}, categories: {}, above500k: 0, below500k: 0, emails: 0, monday: 0, emailsManual: 0, emailsAgent: 0, mondayManual: 0, mondayAgent: 0, claude: 0, apSec: 0, popupSec: 0 });
-    const o = byUser.get(u);
-    const isManual = (a.details?.ui_origin || "") === "toolbar_manual";
-    if (a.action === "sent") {
-      // Los manuales ya fueron contados desde api_usage._emails_sent — evitar double-count.
-      if (!isManual) o.emailsAgent++;
-    }
-    if (a.action === "monday_ok") {
-      // Los manuales ya fueron contados desde api_usage._monday_pushes.
-      if (!isManual) o.mondayAgent++;
-    }
-    if (a.details?.source === "claude") o.claude++;
-  });
-  // Totales (compat con el resto del panel)
-  for (const o of byUser.values()) {
-    o.emails = o.emailsManual + o.emailsAgent;
-    o.monday = o.mondayManual + o.mondayAgent;
-  }
-
-  wrap.innerHTML = "";
-  [...byUser.entries()].sort((a, b) => b[1].sites - a[1].sites).forEach(([email, s]) => {
-    const card = document.createElement("div");
-    card.className = "mb-summary-card";
-
-    // Grade automático en base a actividad + conversion
-    let grade = "none", gradeLabel = "Sin actividad";
-    if (s.sites > 0) {
-      const conv = s.sites > 0 ? (s.monday / s.sites) * 100 : 0;
-      if (s.sites >= 30 && conv >= 5)      { grade = "high"; gradeLabel = "🔥 Activo y conversor"; }
-      else if (s.sites >= 30 && conv < 5)  { grade = "mid";  gradeLabel = "🟡 Activo, pocas conversiones"; }
-      else if (s.sites > 0)                { grade = "low";  gradeLabel = "🔻 Baja actividad"; }
-    }
-
-    // Top GEO + categoría
-    const topGeoArr = Object.entries(s.geos).sort((a, b) => b[1] - a[1]).slice(0, 3);
-    const topCatArr = Object.entries(s.categories).sort((a, b) => b[1] - a[1]).slice(0, 2);
-    const topGeoStr = topGeoArr.length
-      ? topGeoArr.map(([g, n]) => `${g} (${Math.round((n / s.sites) * 100)}%)`).join(", ")
-      : "—";
-    const topCatStr = topCatArr.length ? topCatArr.map(([c]) => c).join(", ") : "—";
-
-    // Tiempos legibles
-    const apHrs = Math.floor(s.apSec / 3600), apMin = Math.round((s.apSec % 3600) / 60);
-    const apTimeStr = s.apSec >= 3600 ? `${apHrs}h ${apMin}m` : `${Math.round(s.apSec / 60)}m`;
-    const popupHrs = Math.floor(s.popupSec / 3600), popupMin = Math.round((s.popupSec % 3600) / 60);
-    const popupTimeStr = s.popupSec >= 3600 ? `${popupHrs}h ${popupMin}m` : `${Math.round(s.popupSec / 60)}m`;
-
-    // Conversiones
-    const convPct = s.sites > 0 ? ((s.monday / s.sites) * 100).toFixed(1) : "0";
-    const emailPct = s.monday > 0 ? Math.round((s.emails / s.monday) * 100) : 0;
-
-    // Frases narrativas — solo las que tengan datos relevantes
-    const lines = [];
-    if (s.sites === 0) {
-      lines.push("No activity logged in this period.");
-    } else {
-      lines.push(`Analyzed <strong>${s.sites}</strong> sites (${s.autopilotSites} via autopilot, ${s.sites - s.autopilotSites} manual).`);
-      if (topGeoArr.length) lines.push(`Geographic focus: <strong>${topGeoStr}</strong>.`);
-      if (topCatArr.length) lines.push(`Top analyzed categories: <strong>${topCatStr}</strong>.`);
-      lines.push(`Calidad de leads: <strong>${s.above500k}</strong> sitios +500K vs <strong>${s.below500k}</strong> chicos.`);
-      if (s.emails > 0 || s.monday > 0) {
-        lines.push(`Outreach: <strong>${s.emails}</strong> emails enviados, <strong>${s.monday}</strong> pushes a Monday (conv: <strong>${convPct}%</strong>).`);
-      } else {
-        lines.push(`⚠️ Zero emails sent and zero Monday pushes — analyzed but didn't advance leads.`);
-      }
-      if (s.apSec > 0)    lines.push(`Tiempo Autopilot ON: <strong>${apTimeStr}</strong>.`);
-      if (s.popupSec > 0) lines.push(`Tiempo con toolbar abierta: <strong>${popupTimeStr}</strong>.`);
-      if (s.claude > 0)   lines.push(`Pitches generados con IA: <strong>${s.claude}</strong>.`);
-    }
-
-    card.innerHTML = `
-      <div class="head">
-        <span class="who">${esc(email)}</span>
-        <span class="grade ${grade}">${gradeLabel}</span>
-      </div>
-      <ul>${lines.map(l => `<li>${l}</li>`).join("")}</ul>
-    `;
-    wrap.appendChild(card);
-  });
-}
-
 let _userFilterPopulated = false;
 async function populateUserFilter() {
   if (_userFilterPopulated) return;
@@ -2442,52 +1966,6 @@ async function populateUserFilter() {
       });
     _userFilterPopulated = true;
   } catch {}
-}
-
-function renderAdminChart(historial, from, to) {
-  const canvas = document.getElementById("admin-chart");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  // Buckets por día
-  const days = [];
-  const start = new Date(from); const end = new Date(to);
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    days.push(d.toISOString().slice(0, 10));
-  }
-  // historial puede tener `created_at` (preferido), `date`, o `fecha` (legacy). Match por prefijo YYYY-MM-DD.
-  const counts = days.map(day => historial.filter(h => {
-    const ts = (h.created_at || h.date || h.fecha || "").toString();
-    return ts.startsWith(day);
-  }).length);
-  const max = Math.max(1, ...counts);
-
-  // Dibujar
-  const W = canvas.width = canvas.offsetWidth * 2; // retina
-  const H = canvas.height = 360;
-  ctx.scale(2, 2);
-  const w = W / 2; const h = H / 2;
-  ctx.clearRect(0, 0, w, h);
-  // Bars
-  const barW = (w - 40) / days.length;
-  ctx.font = "10px -apple-system, sans-serif";
-  ctx.textAlign = "center";
-  days.forEach((day, i) => {
-    const x = 20 + i * barW;
-    const barHeight = (counts[i] / max) * (h - 40);
-    ctx.fillStyle = "#38bdf8";
-    ctx.fillRect(x + 1, h - 20 - barHeight, barW - 2, barHeight);
-    // Label valor
-    if (counts[i] > 0) {
-      ctx.fillStyle = "#e2e8f0";
-      ctx.fillText(counts[i], x + barW / 2, h - 22 - barHeight);
-    }
-    // Label día (solo cada N para que entren)
-    const showLabel = days.length <= 14 || i % Math.ceil(days.length / 14) === 0;
-    if (showLabel) {
-      ctx.fillStyle = "#94a3b8";
-      ctx.fillText(day.slice(5), x + barW / 2, h - 6);
-    }
-  });
 }
 
 // ── Global toast helper para errores que antes iban silenciosos a console.
