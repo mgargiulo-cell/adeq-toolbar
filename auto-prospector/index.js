@@ -4536,15 +4536,26 @@ async function runReenrichBadLeads(token) {
           }
         } catch (e) { log(`  ⚠️ scrape ${lead.domain}: ${e.message}`); }
 
-        // 2) Apollo SOLO si scrape no encontró nada Y hay cupo. Maxi 2026-07-01:
-        // forceUnlock — el user pidió PAGAR Apollo cuando el scrape viene vacío (estos
-        // leads ya pasaron el filtro de tráfico). Respeta el cap mensual duro.
-        if (!foundEmail && apolloAvailable) {
+        // ── APOLLO TAMBIÉN CUANDO EL SCRAPE SOLO TRAJO UN BUZÓN GENÉRICO (Maxi 2026-08-27)
+        // Antes se llamaba SOLO si el scrape volvía vacío. Pero los números del propio pool
+        // dicen otra cosa: los emails de Apollo responden al 9,1% y los scrapeados del sitio
+        // al 0% (0 de 106). La diferencia es que Apollo devuelve una PERSONA con nombre y
+        // cargo, y el scrape suele devolver info@ o contacto@, que es una bandeja compartida
+        // que nadie mira.
+        // Encontrar un `info@` no es haber resuelto el lead: es haber encontrado lo peor que
+        // se podía encontrar. Si hay cupo, vale el crédito.
+        // El user lo pidió textual: "forzar gastar los créditos mensuales sí o sí y darle
+        // prioridad si se descubre un email con Apollo".
+        const _soloGenerico = foundEmail && _isGenericLocalPart(foundEmail);
+        if ((!foundEmail || _soloGenerico) && apolloAvailable) {
           try {
             const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
               traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true,
             });
             if (apolloRes?.email) {
+              // Apollo PISA al genérico: una persona con nombre vale más que una bandeja
+              // compartida. El genérico no se pierde — queda como respaldo en la lista.
+              if (_soloGenerico) log(`  🎯 ${lead.domain}: Apollo ${apolloRes.email} reemplaza al genérico ${foundEmail}`);
               foundEmail = apolloRes.email;
               foundSource = "apollo";
               foundContactName = apolloRes.contact_name || "";
@@ -4968,7 +4979,13 @@ function _daysLeftInApolloCycle() {
 // antes era ×1.15, que adelantaba el gasto). Nunca supera lo que queda ni el techo diario.
 function _apolloPacedDailyCap(monthRemaining) {
   if (monthRemaining <= 0) return 0;
-  const paced = Math.floor((monthRemaining / _daysLeftInApolloCycle()) * (1 - APOLLO_SAFETY_MARGIN));
+  // ⚠️ EL MARGEN SE APLICABA DOS VECES (Maxi 2026-08-27). `APOLLO_MONTHLY_HARD_CAP` ya es el
+  // plan MENOS el margen (2.500 → 2.250), y acá se volvía a descontar sobre el ritmo diario.
+  // Dos descuentos compuestos sobre un techo que ya era conservador garantizan terminar el
+  // ciclo con créditos sin usar — que es justo lo que el user pidió evitar: los créditos no
+  // se acumulan, lo que no se gasta se pierde.
+  // El techo mensual sigue siendo duro; lo que se saca es el segundo recorte.
+  const paced = Math.floor(monthRemaining / _daysLeftInApolloCycle());
   return Math.max(1, Math.min(monthRemaining, APOLLO_DAILY_BURST_MAX, paced));
 }
 
@@ -12207,6 +12224,63 @@ async function aparcarProspectOffline(token, d) {
 
 // Devuelve a Prospects lo aparcado cuya GEO ya NO está excluida. Corre una vez por hora: es
 // una consulta barata y el user espera que destildar un país tenga efecto el mismo día.
+// ── UN LEAD CUYO ÚNICO EMAIL REBOTÓ NO ES CONTACTABLE (Maxi 2026-08-27) ─────────────────
+// Pedido del user: "mails rechazados en bandeja de cada media buyer, re-contactar a otro
+// correo que se haya detectado".
+//
+// El reintento por rebote ya existe y elige bien la alternativa. El agujero está en los que
+// NO tienen alternativa: medido, 143 dominios quedaron con su ÚNICO email rebotado. Siguen
+// figurando como "contactables" en el pool —inflando el número que el user mira— pero no se
+// les puede escribir, y el pulido no los toca porque técnicamente "tienen email".
+//
+// Un email que rebotó no es un email. Se les limpia el contacto muerto para que el pulido
+// los agarre en su próxima pasada y les busque uno de verdad, que es el North Star.
+// El email rebotado NO se borra del historial: queda en `email_sources` como registro.
+async function reabrirLeadsRebotados(token) {
+  try {
+    if (!(await _tocaCorrer(token, "reabrir_rebotados", 6 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+
+    const rebotados = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=5000`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (!Array.isArray(rebotados) || !rebotados.length) return;
+    const muertos = new Set(rebotados.map(x => String(x.email || "").toLowerCase()).filter(Boolean));
+
+    const leads = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id,domain,emails,email_sources&limit=1500`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (!Array.isArray(leads) || !leads.length) return;
+
+    let reabiertos = 0;
+    for (const l of leads) {
+      const _mails = Array.isArray(l.emails) ? l.emails.map(e => String(e).toLowerCase()) : [];
+      if (!_mails.length) continue;
+      const _vivos = _mails.filter(e => !muertos.has(e));
+      if (_vivos.length) continue;                    // le queda al menos uno sano
+      // Todos rebotados: se vacía la lista para que el pulido lo tome como mudo. El
+      // `email_sources` queda intacto, así que no se pierde el rastro de qué se probó.
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${l.id}`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({
+          emails: [], email_intentos: 0, email_ultimo_intento: null,
+          email_ultimo_motivo: "todos_los_emails_rebotaron",
+        }),
+      }).catch(() => {});
+      reabiertos++;
+      if (reabiertos >= 200) break;                   // techo por vuelta
+    }
+    if (reabiertos) {
+      log(`  ♻️ ${reabiertos} lead(s) con TODOS sus emails rebotados → vuelven a la cola de búsqueda`);
+      await saludPing(token, "reabrir_rebotados", {
+        status: "ok", cadenciaMin: 6 * 60, real: reabiertos,
+        detalle: `${reabiertos} lead(s) reabiertos para buscarles otro contacto`,
+      }).catch(() => {});
+    }
+  } catch (e) { log(`⚠️ reabrirLeadsRebotados: ${e.message}`); }
+}
+
 async function revivirProspectsOffline(token) {
   try {
     if (!(await _tocaCorrer(token, "revivir_offline", 60))) return;
@@ -23869,6 +23943,7 @@ async function main() {
       await revivirProspectsOffline(token).catch(e => log(`⚠️ prospects-2: ${e.message}`));
       // El pool se rellena cuando hay lugar, no una vez por día (ver rellenarWaitingPool).
       await rellenarWaitingPool(token).catch(e => log(`⚠️ pool: ${e.message}`));
+      await reabrirLeadsRebotados(token).catch(e => log(`⚠️ reabrir rebotados: ${e.message}`));
       await purgarColaVieja(token).catch(e => log(`⚠️ purga: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
