@@ -263,8 +263,10 @@
         <input id="cap-dhorovitz" type="number" min="0" max="200" class="form-input" style="font-size:11px;padding:3px 6px;width:100%" placeholder="—" />
       </div>
 
-      <details style="margin:10px 0 6px">
-      <summary style="cursor:pointer;font-size:10px;color:#94a3b8;padding:4px 0;user-select:none;text-transform:uppercase;letter-spacing:.4px">🌍 GEOs y categorías (se tocan poco)</summary>
+      <!-- Maxi 2026-08-28: el cuadro de GEOs estaba plegado en un <details> desde el 27/08
+           ("se tocan poco") y el user lo buscó y no lo encontró: "no veo más el panel para
+           bloquear geo de envío y geos de feeder". Sí lo usa — vuelve a estar SIEMPRE visible.
+           No volver a plegarlo. -->
       <div style="display:flex;gap:4px;margin:10px 0 6px">
         <button type="button" id="focus-mode-agent" class="focus-mode-btn" data-mode="agent"
           style="flex:1;padding:6px;border:none;border-radius:4px;font-size:10px;font-weight:700;cursor:pointer">🤖 Agente (envío)</button>
@@ -280,8 +282,6 @@
       <!-- Row 3: Categorías -->
       <div style="font-size:10px;color:#94a3b8;margin:6px 0 4px;text-transform:uppercase;letter-spacing:.4px">📁 Categorías prioridad</div>
       <div id="agent-focus-categories-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;padding:6px;background:#0f172a;border-radius:4px"></div>
-
-      </details>
 
       <!-- Maxi 2026-06-18: Override DAILY ELIMINADO. El cap diario único es
            "Max envíos/día" de arriba — aplica a los 3 MBs. Weekly target sigue
