@@ -10630,6 +10630,9 @@ async function polishPool(token) {
 // (350K pageviews + detector publisher). Gated por similar_expansion_enabled='true'. Cursor por created_at.
 // RapidAPI-gated (no gasta si estamos cerca del cap mensual) + cooldown + lote chico (control de costo).
 let _lastSimilarExpAt = 0;
+// Punto de arranque rotativo de la cadena de mantenimiento. Sin esto, el orden es fijo y los
+// últimos trabajos no corren nunca (ver el bloque de mantenimiento en el ciclo principal).
+let _vueltaMantenimiento = 0;
 const SIMILAR_EXP_COOLDOWN_MS = 5 * 60 * 1000;
 const SIMILAR_EXP_BATCH = 6;
 async function runProspectSimilarExpansion(token) {
@@ -23701,11 +23704,38 @@ async function main() {
         // Maxi 2026-08-18: el agente de REVISIÓN. Re-arma solo la búsqueda de emails y el
         // repaso de calidad. Va antes de los barridos para que, si los arma, corran en esta
         // misma vuelta.
-        if (_hayTiempo()) await agenteRevision(token).catch(e => log(`⚠️ agente revisión: ${e.message}`));
-        if (_hayTiempo()) await recheckAdsTxtUnknowns(token).catch(e => log(`⚠️ ads.txt recheck: ${e.message}`));
-        if (_hayTiempo()) await sweepBlockedFromProspects(token).catch(e => log(`⚠️ purge prospects: ${e.message}`));
-        // Maxi 2026-07-16: expansión por similares desde los Prospects grandes (gated similar_expansion_enabled).
-        if (_hayTiempo()) await runProspectSimilarExpansion(token).catch(e => log(`⚠️ similar-exp: ${e.message}`));
+        // ── EL QUE VA ÚLTIMO NUNCA CORRE: SE ROTA (Maxi 2026-08-27) ──────────────────
+        // El comentario de arriba ya avisaba que "lo que va último puede no ejecutarse nunca",
+        // y pasó: `similar_expansion` es el séptimo de la cadena y estuvo 26 HORAS sin correr
+        // con `esperado cada 60 min` — no fallaba, no lo llamaban. `autopilot_similares`
+        // llevaba 146 horas. Los dos son motores de descubrimiento, así que el pool se
+        // alimenta de menos fuentes sin que nada dé error.
+        //
+        // Con el worker reiniciando cada ~7 min y `_hayTiempo()` cortando la cadena, un orden
+        // FIJO garantiza que la cola de atrás se muera de hambre. Se rota el punto de arranque
+        // en cada vuelta: cada trabajo pasa por ser el primero cada tantas iteraciones.
+        //
+        // El barrido por URL y el pulido quedan FUERA de la rotación, siempre primeros: son lo
+        // gratis y lo que el user marcó como prioridad (ningún prospecto sin email).
+        {
+          const _rotativos = [
+            ["agente revisión",  agenteRevision],
+            ["ads.txt recheck",  recheckAdsTxtUnknowns],
+            ["purge prospects",  sweepBlockedFromProspects],
+            ["similar-exp",      runProspectSimilarExpansion],
+          ];
+          _vueltaMantenimiento++;
+          const _desde = _vueltaMantenimiento % _rotativos.length;
+          for (let i = 0; i < _rotativos.length; i++) {
+            if (!_hayTiempo()) {
+              const [_pendiente] = _rotativos[(_desde + i) % _rotativos.length];
+              log(`  ⏭️ sin tiempo en esta vuelta: ${_pendiente} queda para la próxima (arranca ahí)`);
+              break;
+            }
+            const [_nombre, _fn] = _rotativos[(_desde + i) % _rotativos.length];
+            await _fn(token).catch(e => log(`⚠️ ${_nombre}: ${e.message}`));
+          }
+        }
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 

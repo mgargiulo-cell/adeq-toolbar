@@ -2548,7 +2548,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   flushPendingMarks().catch(() => {});
 
   // ── Cargar API keys desde Supabase (requiere JWT válido) ──
-  const apiKeys = await fetchApiKeys(auth.accessToken);
+  const apiKeys = await fetchApiKeys(auth.accessToken, (auth?.user || "").toLowerCase().trim());
   if (!apiKeys) {
     showError("Could not load API configuration. Check your connection or sign in again.");
     return;
@@ -2557,10 +2557,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   const loginEmail   = (auth?.user || "").toLowerCase().trim();
   const userMondayKey = apiKeys[`monday_api_key_${loginEmail}`];
   CONFIG.MONDAY_API_KEY = userMondayKey || apiKeys.monday_api_key || "";
-  CONFIG.RAPIDAPI_KEY   = apiKeys.rapidapi_key    || "";
+  // ── LAS KEYS QUE NO SE USAN NO SE BAJAN (Maxi 2026-08-27) ────────────────────────
+  // `rapidapi_key` y `apollo_api_key` se descargaban al navegador en CADA apertura de la
+  // toolbar y no las usaba nadie: SimilarWeb y Apollo salen por el proxy justamente para
+  // que la key se quede del lado del servidor. Su único consumidor era `CONFIG_DIAG`, un
+  // objeto que está definido y no se referencia en ningún lado — código muerto.
+  // Es el mismo hallazgo que con Gemini el 04/08: dos keys menos viviendo en memoria del
+  // cliente, donde cualquier extensión o devtools abierto las puede leer.
+  // ⚠️ Si algún día hace falta llamar directo, va por el proxy — no se vuelve a bajar.
   // GEMINI_API_KEY eliminada (auditoría 2026-08-04): se descargaba al navegador y NUNCA se usaba
   // — modules/gemini.js no tiene un solo fetch. Una key menos viviendo en memoria del cliente.
-  CONFIG.APOLLO_API_KEY = apiKeys.apollo_api_key  || "";
+
 
   // Usuario autenticado — ocultar login y mostrar app
   document.getElementById("login-screen").style.display = "none";
@@ -6574,11 +6581,9 @@ async function runDiagnostic() {
   btn.disabled = false; btn.textContent = "▶ Testear";
 }
 
-const CONFIG_DIAG = {
-  get RAPIDAPI_KEY()  { return CONFIG.RAPIDAPI_KEY; },
-  get RAPIDAPI_HOST() { return CONFIG.RAPIDAPI_TRAFFIC_HOST; },
-  get APOLLO_KEY()    { return CONFIG.APOLLO_API_KEY; },
-};
+// CONFIG_DIAG se eliminó (Maxi 2026-08-27): era el único lector de RAPIDAPI_KEY y
+// APOLLO_API_KEY en el cliente, y no lo referenciaba nadie. Mantenerlo obligaba a seguir
+// bajando dos API keys al navegador para alimentar código muerto.
 
 // ============================================================
 // LOGIN / AUTH

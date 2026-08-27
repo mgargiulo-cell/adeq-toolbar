@@ -470,11 +470,22 @@ export async function createNotification(accessToken, payload) {
 }
 
 // Carga las API keys desde toolbar_config (requiere JWT de usuario autenticado)
-export async function fetchApiKeys(accessToken) {
+// ── SOLO LO QUE SE USA (Maxi 2026-08-27) ─────────────────────────────────────────────
+// Esto pedía la tabla `toolbar_config` ENTERA en cada apertura de la toolbar: Apollo,
+// RapidAPI, Anthropic, Voyage, MillionVerifier, Serper, todas las keys viajando al navegador.
+// Y de todo eso el popup usaba DOS valores, los dos de Monday.
+//
+// Cada key que baja al cliente es una key que vive en memoria del navegador, donde la puede
+// leer cualquier extensión instalada o cualquiera con las devtools abiertas. Las que salen
+// por el proxy no tienen ningún motivo para estar ahí — para eso existe el proxy.
+// Monday sí se queda: la extensión le pega directo al board, no hay proxy en el medio.
+export async function fetchApiKeys(accessToken, loginEmail = "") {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
+  const _propia = `monday_api_key_${String(loginEmail || "").toLowerCase().trim()}`;
+  const _pedidas = [`"${_propia}"`, '"monday_api_key"'].join(",");
   try {
-    const res = await fetch(`${url}/rest/v1/toolbar_config?select=key,value`, {
+    const res = await fetch(`${url}/rest/v1/toolbar_config?key=in.(${_pedidas})&select=key,value`, {
       headers: {
         "apikey":        key,
         "Authorization": `Bearer ${accessToken}`,
