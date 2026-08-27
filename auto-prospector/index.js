@@ -10326,7 +10326,17 @@ async function polishPool(token) {
     const usage = await getApolloUsageToday(token);
     if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) apolloAvailable = false;
   }
-  const soloSinEmail = String(cfg.polish_only_missing || "") === "true";
+  // ── LOS MUDOS PRIMERO, NO AL FINAL (Maxi 2026-08-27) ────────────────────────────────
+  // El ciclo era: pasada general por TODO el pool y, recién al terminarla, una pasada solo
+  // sobre los que no tienen email. Con el pool en 1.673 pendientes, "terminar la general"
+  // toma días — y mientras tanto el presupuesto se gasta en leads que YA tienen email.
+  // Medido hoy: 237 leads sin un solo intento registrado (`email_intentos = 0`), esperando
+  // su turno detrás de una cola de leads ya resueltos.
+  //
+  // El North Star del user es que ningún prospecto se quede sin email. Entonces los mudos
+  // van PRIMERO por defecto, y la pasada general es lo que se hace con lo que sobra.
+  // El default se invierte: sin config, `true`.
+  const soloSinEmail = String(cfg.polish_only_missing ?? "true") !== "false";
   const cursor = cfg.polish_cursor_ts || "";
   const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
   // ⚠️ "La query falló" ≠ "terminé de recorrer el pool". Antes los dos casos
@@ -10373,19 +10383,24 @@ async function polishPool(token) {
     // la pasada general se re-arma apuntando SOLO a los que no tienen ninguno. Si esa
     // segunda pasada tampoco encuentra a nadie, ahí sí se apaga: significa que no
     // queda un solo lead mudo, que es exactamente el objetivo.
-    if (!soloSinEmail) {
-      await setConfigValue(token, "polish_only_missing", "true").catch(() => {});
-      await saludPing(token, "polish_pool", { status: "ok", detalle: "pasada general lista → ahora solo los que no tienen email" });
-      log(`✨ polish: pool completo pulido → segunda pasada SOLO sobre los mudos`);
+    if (soloSinEmail) {
+      // No quedan mudos elegibles (todos con backoff vigente o ninguno sin email): recién ahí
+      // tiene sentido gastar el presupuesto repasando el pool entero.
+      await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
+      await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
+      await saludPing(token, "polish_pool", { status: "ok", detalle: "sin mudos elegibles → pasada general" });
+      log(`✨ polish: ningún lead mudo elegible → paso a la pasada general`);
       return;
     }
     // Con el backoff de 3 días, "no hay elegibles" NO significa "no quedan mudos": significa
     // que a todos se los intentó hace poco. Apagar el barrido acá lo dejaría muerto con 344
     // leads sin email esperando. Se vuelve a la pasada general, que sí tiene trabajo, y los
     // mudos reaparecen solos cuando vence su backoff. (Maxi 2026-08-25.)
-    await setConfigValue(token, "polish_only_missing", "false").catch(() => {});
-    await saludPing(token, "polish_pool", { status: "ok", detalle: "los mudos están todos en backoff → vuelvo a la pasada general" });
-    log(`✨ polish: ningún mudo elegible ahora (backoff 3d) → vuelvo a la pasada general`);
+    // Terminó la pasada general: se vuelve a los mudos, que es la prioridad.
+    await setConfigValue(token, "polish_only_missing", "true").catch(() => {});
+    await setConfigValue(token, "polish_cursor_ts", "").catch(() => {});
+    await saludPing(token, "polish_pool", { status: "ok", detalle: "pasada general lista → vuelvo a los mudos" });
+    log(`✨ polish: pool completo repasado → vuelvo a los que no tienen email`);
     return;
   }
   let blocked = 0, enriched = 0, sinEmail = 0;
@@ -12225,6 +12240,30 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // (pageviews/categoría/geo/publisher/discovery). Lo ÚNICO que lo bloquea es que esté en un
   // deal ACTIVO de Monday (ciclo actual). El auto-feeder sí aplica todos los filtros de calidad.
   const isManualImport = !!item.uploaded_by && !/autofeeder/i.test(String(item.uploaded_by));
+
+  // ── SI YA ESTÁ EN PROSPECTS, NO SE VUELVE A PAGAR (Maxi 2026-08-27) ─────────────────
+  // El chequeo de duplicado vivía al FINAL, dentro de `saveToReviewQueue`: para cuando
+  // decía "dup" ya habíamos pagado el tráfico de RapidAPI, corrido el descubrimiento de
+  // email, quizá gastado un crédito de Apollo y generado el pitch. Todo para tirarlo.
+  // Medido: 176 dominios en 14 días con `review_queue_insert_fail:dup`.
+  //
+  // El dedupe de la inyección no alcanza: entre que el dominio entra a la cola y se procesa
+  // pueden pasar días, y en el medio otra vía —similar-expansion, ads.txt-graph, un import
+  // del MB— lo puede haber metido en Prospects. La cola no se entera.
+  // Una consulta al principio cuesta nada y ahorra la cadena entera.
+  if (!isManualImport) {
+    try {
+      const yaEsta = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=eq.pending&select=id&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      ).then(r => r.ok ? r.json() : null).catch(() => null);
+      if (Array.isArray(yaEsta) && yaEsta.length) {
+        await markCsvItem(token, item.id, "skipped", { error_message: "ya_estaba_en_prospects" });
+        log(`  ⏭️ ${domain} — ya está en Prospects → salteado SIN gastar un crédito`);
+        return;
+      }
+    } catch { /* si no se puede consultar, se sigue: el chequeo del final lo agarra igual */ }
+  }
 
   // ── NO PAGAR DOS VECES POR LA MISMA RESPUESTA (Maxi 2026-08-25) ─────────────────────
   // Cuando un dominio se difiere por el cupo diario de Anglo, su país queda guardado en el
@@ -20671,7 +20710,18 @@ async function runAgentCycle(token, allFlags) {
           body: JSON.stringify({ status: "validated", validated_by: `agent:${userEmail}`, validated_at: new Date().toISOString() }),
         });
 
-        // 8. Log success completo de Monday (NO duplica action='sent', solo confirma Monday OK)
+        // 8. Log del resultado de Monday (NO duplica action='sent', solo confirma qué pasó)
+        //
+        // ── SE REGISTRA SIEMPRE, NO SOLO AL CREAR (Maxi 2026-08-27) ──────────────────
+        // Estaba gateado en `if (mondayItemId)`. Cuando el item YA existía en el board, el
+        // push lo actualiza y no devuelve id nuevo → no se registraba nada, y desde la base
+        // el envío parecía no haber llegado al CRM. Medido: 81 de 238 envíos en 5 días sin
+        // registro. Fui a verificar contra el board y los 12 que revisé ESTABAN todos: no
+        // faltaba el lead, faltaba el renglón.
+        //
+        // Es el mismo patrón de siempre al revés — "no lo anoté" leído como "no pasó" — y
+        // costó media hora de auditoría sobre un problema que no existía. Ahora se distingue
+        // creado de actualizado, para que la próxima vez el dato conteste solo.
         if (mondayItemId) {
           await logAgentAction(token, userEmail, {
             domain, action: "monday_ok", reason: "ok",
@@ -20685,6 +20735,12 @@ async function runAgentCycle(token, allFlags) {
               geo: leadGeo,
               language: lead.language,
             },
+          });
+        } else {
+          await logAgentAction(token, userEmail, {
+            domain, action: "monday_ok", reason: "actualizado_ya_existia",
+            pitch_subject: subject,
+            details: { email, source, traffic: leadTraffic, geo: leadGeo, language: lead.language },
           });
         }
 
