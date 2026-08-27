@@ -30,7 +30,8 @@ async function rapidFetch(path) {
   try {
     const res = await callProxy("rapidapi", path, { method: "GET" });
     if (!res.ok) {
-      ultimoErrorTrafico = res.status === 401 ? "sesión vencida — volvé a entrar"
+      ultimoErrorTrafico = res.status === 0   ? "sin conexión — reintentá en un momento"
+        : res.status === 401 ? "sesión vencida — volvé a entrar"
         : res.status === 429 ? "cuota de SimilarWeb agotada este mes"
         : res.status === 403 ? "el proxy rechazó la llamada"
         : res.status === 503 ? "freno de emergencia activo (kill switch)"

@@ -227,11 +227,20 @@ export async function callProxy(provider, path, opts = {}) {
   // Pre-check: si ya pasamos el límite del mes, NO hacer la request.
   // Solo aplica a provider === "rapidapi" (Apollo/Gemini/Anthropic tienen sus propios contadores).
   if (provider === "rapidapi") {
-    if (!_monthState || _monthState.period !== currentPeriod()) {
-      await loadMonthlyCounter();
+    // Maxi 2026-08-27: estas dos leen `toolbar_config` por red y estaban SIN guardia, o sea
+    // antes del try del bucle. Con la red caída tiraban el mismo "Failed to fetch" que
+    // acabamos de arreglar abajo, y encima antes de intentar la llamada real. Un contador que
+    // no se pudo leer no puede bloquear un envío: se sigue con lo que haya en memoria y el
+    // cap se re-chequea en la próxima llamada.
+    try {
+      if (!_monthState || _monthState.period !== currentPeriod()) {
+        await loadMonthlyCounter();
+      }
+      // Cap personal del usuario tiene prioridad sobre el global.
+      await loadUserPersonalCap();
+    } catch (e) {
+      console.warn("[apiProxy] no pude leer los contadores de cuota:", e?.message);
     }
-    // Cap personal del usuario tiene prioridad sobre el global.
-    await loadUserPersonalCap();
     if (_userCapReached()) {
       console.warn(`[apiProxy] ⛔ Cap PERSONAL del usuario alcanzado: ${_userPersonalUsed}/${_userPersonalCap}`);
       try { _onCapReachedCb?.({ used: _userPersonalUsed, limit: _userPersonalCap, period: _monthState?.period, scope: "user" }); } catch {}
@@ -263,15 +272,42 @@ export async function callProxy(provider, path, opts = {}) {
   let yaRenove = false;   // el refresh por 401 se intenta UNA sola vez por llamada
 
   while (attempt <= MAX_RETRIES) {
-    let res = await fetch(proxyUrl(), {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${_sbAuthToken}`,
-        "apikey":        CONFIG.SUPABASE_ANON_KEY,
-      },
-      body: payload,
-    });
+    // ── EL BUCLE DE REINTENTOS NO REINTENTABA LO ÚNICO QUE DEBÍA (Maxi 2026-08-27) ─────
+    // `fetch` estaba suelto, sin try. Un fallo de RED —el TypeError "Failed to fetch"— no es
+    // un status HTTP: es una excepción, así que salía disparada hacia afuera de callProxy sin
+    // pasar por el bucle. O sea que el retry cubría los 5xx del servidor, que son raros, y
+    // dejaba pasar de largo el corte de red, que es lo que de verdad ocurre: el service worker
+    // se duerme, el wifi parpadea, y la llamada se pierde entera al primer intento.
+    //
+    // Es exactamente lo que el user viene reportando como "❌ Failed to fetch" en SimilarWeb y
+    // Apollo. Las dos APIs responden perfecto contra el proxy —probado el 27/08—, el problema
+    // nunca estuvo del lado de la API ni de la key.
+    let res = null, errRed = null;
+    try {
+      res = await fetch(proxyUrl(), {
+        method: "POST",
+        headers: {
+          "Content-Type":  "application/json",
+          "Authorization": `Bearer ${_sbAuthToken}`,
+          "apikey":        CONFIG.SUPABASE_ANON_KEY,
+        },
+        body: payload,
+      });
+    } catch (e) { errRed = e; }
+
+    if (errRed) {
+      // Se trata como reintentable, que es lo que es. Si ya no quedan intentos, se devuelve
+      // un resultado normal en vez de explotar: el caller decide qué mostrar.
+      if (attempt === MAX_RETRIES) {
+        console.warn(`[apiProxy] ${provider}${path}: sin conexión tras ${attempt + 1} intentos — ${errRed?.message}`);
+        return { ok: false, status: 0, data: null, text: "", error: errRed?.message || "network_error", red: true };
+      }
+      const espera = BASE_BACKOFF_MS * Math.pow(2, attempt) + Math.random() * 250;
+      console.warn(`[apiProxy] ${provider}${path}: fallo de red, reintento en ${Math.round(espera)}ms`);
+      await new Promise(r => setTimeout(r, espera));
+      attempt++;
+      continue;
+    }
 
     // ── AUTO-CURACIÓN DEL TOKEN VENCIDO (Maxi 2026-08-18) ────────────────────────────
     // Un 401 acá es, casi siempre, el JWT que venció mientras el panel estaba abierto.
