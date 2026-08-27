@@ -785,6 +785,104 @@ function _isWeekendSpain() {
   return day === "Sat" || day === "Sun";
 }
 
+// ── EL POOL SE RELLENA CUANDO HAY LUGAR, NO UNA VEZ POR DÍA (Maxi 2026-08-27) ───────────
+// El tope de 700 existe para que no se amontonen filas activas a la vez. Pero la promoción
+// desde `next_day` corría SOLO en el rollover diario, así que en la práctica funcionaba como
+// un techo de 700 por DÍA: el pool se llenaba a la mañana, se consumía en unas horas, y el
+// resto del día la cola quedaba vacía con 1.146 dominios esperando al día siguiente. Eso es
+// lo que el user ve como "el Queue Status se traba".
+//
+// Ahora se rellena en cada ciclo mientras haya lugar. El tope se respeta igual —nunca hay más
+// de 700 activos—, pero deja de limitar cuántos pasan en un día.
+// ── LA COLA SE LIMPIA SOLA (Maxi 2026-08-27, pedido del user) ───────────────────────────
+// "El Queue Status, que no se trabe, que sea inteligente para purgar las tareas que realizan
+//  los MB y el agente automático día tras día."
+//
+// La cola tenía 26.358 filas y 18.618 eran terminales de hace más de un mes: `done` (ya está
+// en Prospects) y `skipped` (ya se decidió que no entra). No aportan nada y hacen más lento
+// cada conteo por carril, que corre en cada ciclo de cada feeder.
+//
+// Solo se borra lo TERMINAL y viejo. `error` NO se toca: son los que hay que poder mirar
+// cuando algo falla, y son pocos. Nada activo se borra por definición.
+// ⚠️ LO QUE NO SE PUEDE BORRAR, Y POR QUÉ ────────────────────────────────────────────────
+// `skipped` NO se toca NUNCA. Esas filas son la MEMORIA del sistema: el dedupe de las siete
+// vías de descubrimiento pregunta contra esta tabla para saber qué ya se evaluó. Borrarlas
+// haría que AutoGoogle vuelva a descubrir los 14.136 dominios ya rechazados —gobierno,
+// e-commerce, dominios muertos—, los dé por frescos y los pague de nuevo. Eso ya pasó entre
+// el 18 y el 25 de agosto: AutoGoogle no metió UN solo dominio en la cola durante una semana
+// mientras gastaba Serper todos los días.
+//
+// `done` sí se puede, pero solo cuando el dominio quedó en Prospects: ahí el dedupe lo
+// encuentra igual y no se pierde memoria. Los `done` sin respaldo en Prospects (1.780 hoy) se
+// quedan por la misma razón que los skipped.
+// `error` tampoco: son los que hay que poder mirar cuando algo falla, y son pocos.
+const _PURGA_DIAS = 30;
+async function purgarColaVieja(token) {
+  try {
+    if (!(await _tocaCorrer(token, "purga_cola", 24 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const corte = new Date(Date.now() - _PURGA_DIAS * 86400000).toISOString();
+    // Se piden los candidatos y se confirma uno por uno contra Prospects antes de borrar.
+    const cand = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_at=lt.${corte}&select=id,domain&limit=2000`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (!Array.isArray(cand) || !cand.length) return;
+
+    const conRespaldo = [];
+    for (let i = 0; i < cand.length; i += 200) {
+      const lote = cand.slice(i, i + 200);
+      const lista = lote.map(x => `"${String(x.domain).replace(/"/g, "")}"`).join(",");
+      const enProspects = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=in.(${lista})&select=domain`,
+        { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      const set = new Set((enProspects || []).map(r => String(r.domain).toLowerCase()));
+      for (const c of lote) if (set.has(String(c.domain).toLowerCase())) conRespaldo.push(c.id);
+    }
+    if (!conRespaldo.length) return;
+
+    let borradas = 0;
+    for (let i = 0; i < conRespaldo.length; i += 200) {
+      const ids = conRespaldo.slice(i, i + 200);
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})`,
+        { method: "DELETE", headers: { ...auth, "Prefer": "return=minimal" } });
+      if (r.ok) borradas += ids.length;
+    }
+    if (borradas) log(`  🧹 cola: ${borradas} fila(s) done de +${_PURGA_DIAS} días borradas (el dominio sigue en Prospects)`);
+    await saludPing(token, "purga_cola", {
+      status: "ok", cadenciaMin: 24 * 60, real: borradas,
+      detalle: `${borradas} done de +${_PURGA_DIAS} días (con respaldo en Prospects)`,
+    }).catch(() => {});
+  } catch (e) { log(`⚠️ purgarColaVieja: ${e.message}`); }
+}
+
+async function rellenarWaitingPool(token) {
+  try {
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const _contar = async (estado) => {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.${estado}&select=id`,
+        { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    };
+    const enPool = await _contar("waiting_pool");
+    const room = Math.max(0, WAITING_POOL_CAP - enPool);
+    // Se rellena recién cuando bajó de la mitad: si se hiciera con cualquier hueco, serían
+    // dos consultas por ciclo para mover tres filas.
+    if (room < Math.floor(WAITING_POOL_CAP / 2)) return;
+
+    const idsRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.next_day&order=uploaded_at.asc&limit=${room}&select=id`,
+      { headers: auth });
+    const ids = idsRes.ok ? (await idsRes.json().catch(() => [])).map(r => r.id) : [];
+    if (!ids.length) return;
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})`, {
+      method: "PATCH",
+      headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: "waiting_pool" }),
+    });
+    log(`  🔁 pool rellenado: ${ids.length} next_day → waiting_pool (había ${enPool}/${WAITING_POOL_CAP})`);
+  } catch (e) { log(`⚠️ rellenarWaitingPool: ${e.message}`); }
+}
+
 // ¿Toca el rollover diario de next_day? La marca vive en config, no en memoria, así
 // que un restart no la borra. Devuelve true UNA sola vez por día calendario español.
 async function _tocaRolloverNextDay(token, todaySpain) {
@@ -23375,6 +23473,9 @@ async function main() {
       await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
       // Prospects-2: devuelve a la cola lo aparcado cuya GEO volvió a habilitarse.
       await revivirProspectsOffline(token).catch(e => log(`⚠️ prospects-2: ${e.message}`));
+      // El pool se rellena cuando hay lugar, no una vez por día (ver rellenarWaitingPool).
+      await rellenarWaitingPool(token).catch(e => log(`⚠️ pool: ${e.message}`));
+      await purgarColaVieja(token).catch(e => log(`⚠️ purga: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
       await vigilarLlegadaAMonday(token).catch(e => log(`⚠️ llegada a Monday: ${e.message}`));
