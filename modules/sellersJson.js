@@ -476,3 +476,46 @@ export async function probeSellersJson(domains, onProgress) {
   results.sort((a, b) => b.pubs - a.pubs);
   return results;
 }
+
+// ── LO QUE EL ads.txt REGALA EN CADA ANÁLISIS (Maxi 2026-08-27, pedido del user) ─────────
+// "sellers.json de empresas no se están agregando al listado cuando se autodescubren desde
+//  el /ads.txt del análisis de las webs."
+//
+// Era cierto, aunque no por un bug: el descubrimiento manual se removió el 2026-05-11 por
+// pedido del propio user ("feature poco útil") y quedó sin llamador. Ahora vuelve, pero
+// distinto: en vez de un botón que hay que acordarse de apretar, cada análisis contribuye
+// solo. El MB no hace nada extra.
+//
+// Cada red que aparece en un ads.txt publica su propio sellers.json con miles de publishers.
+// El worker ya acumula redes por su cuenta; esto hace que el trabajo manual alimente LA MISMA
+// lista en vez de correr en paralelo.
+//
+// Se escribe en una TABLA con UNIQUE(domain) y no en el JSON de config: dos MB analizando a la
+// vez harían read-modify-write sobre el mismo array y el segundo pisaría al primero. Es el
+// mismo error que ya nos comió hits del contador mensual.
+export async function registrarAdSystems(supabaseUrl, anonKey, accessToken, systems, vistoEn = "") {
+  if (!Array.isArray(systems) || !systems.length || !accessToken) return 0;
+  // Las cuatro grandes ya están en el pool desde el día uno: no aportan nada y son el 90% de
+  // cualquier ads.txt.
+  const YA_CONOCIDAS = new Set([
+    "google.com", "doubleclick.net", "googlesyndication.com", "adx.google.com",
+  ]);
+  const nuevas = [...new Set(systems.map(s => String(s).toLowerCase().trim()))]
+    .filter(d => d && !YA_CONOCIDAS.has(d))
+    .slice(0, 60);                       // un ads.txt puede tener cientos; no hace falta todo
+  if (!nuevas.length) return 0;
+  try {
+    const res = await fetch(`${supabaseUrl}/rest/v1/toolbar_adsystem_seen?on_conflict=domain`, {
+      method: "POST",
+      headers: {
+        "apikey": anonKey, "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(nuevas.map(d => ({
+        domain: d, last_seen: new Date().toISOString(), visto_en: vistoEn || null,
+      }))),
+    });
+    return res.ok ? nuevas.length : 0;
+  } catch { return 0; }
+}

@@ -3826,7 +3826,21 @@ async function descubrirRedesPorSellersJson(token) {
       if (r.ok) { const rows = await r.json(); descubiertas = JSON.parse(rows?.[0]?.value || "[]"); }
     } catch {}
     const conocidas = new Set([..._KNOWN_SELLER_HOSTS, ...descubiertas.map(d => String(d).toLowerCase())]);
-    const nuevas = [...hosts].filter(h => !conocidas.has(h) && !EXCLUDE_DOMAINS.has(h)).slice(0, 15);
+    // ── LO QUE VIERON LOS MB ANALIZANDO A MANO (Maxi 2026-08-27) ────────────────────────
+    // La extensión ahora registra en `toolbar_adsystem_seen` las redes que aparecen en el
+    // ads.txt de cada web que un MB analiza. Son candidatas de primera: alguien ya miró ese
+    // sitio y esa red le está vendiendo inventario de verdad, hoy.
+    // Van ANTES que las de la búsqueda genérica porque vienen del trabajo real del equipo.
+    let _delEquipo = [];
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_adsystem_seen?validada=is.null&select=domain&order=veces.desc,last_seen.desc&limit=40`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      if (r.ok) _delEquipo = (await r.json()).map(x => String(x.domain || "").toLowerCase()).filter(Boolean);
+    } catch {}
+    const nuevas = [...new Set([..._delEquipo, ...hosts])]
+      .filter(h => !conocidas.has(h) && !EXCLUDE_DOMAINS.has(h)).slice(0, 15);
+    if (_delEquipo.length) log(`  🧩 sellers-discovery: ${_delEquipo.length} red(es) vista(s) por los MB al analizar a mano`);
     if (!nuevas.length) {
       await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 7 * 24 * 60, detalle: `${hosts.size} hosts, ninguno nuevo`, real: 0 });
       return 0;
@@ -3838,6 +3852,19 @@ async function descubrirRedesPorSellersJson(token) {
       const pubs = await _publishersFromSellersJson(net).catch(() => []);
       if (Array.isArray(pubs) && pubs.length >= 20) { validas.push(net); log(`  🌐 sellers.json nuevo: ${net} → ${pubs.length} publishers`); }
     }
+    // Se marca el veredicto en la tabla para no volver a probar lo mismo cada semana —
+    // tanto lo que sirvió como lo que no. Una red sin sellers.json real no mejora sola.
+    try {
+      const _auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+                      "Content-Type": "application/json", "Prefer": "return=minimal" };
+      for (const net of nuevas) {
+        if (!_delEquipo.includes(net)) continue;
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_adsystem_seen?domain=eq.${encodeURIComponent(net)}`, {
+          method: "PATCH", headers: _auth,
+          body: JSON.stringify({ validada: validas.includes(net) }),
+        }).catch(() => {});
+      }
+    } catch {}
     if (validas.length) {
       const _todas = [...new Set([...descubiertas, ...validas])].slice(0, 200);
       await setConfigValue(token, "discovered_sellers_networks", JSON.stringify(_todas)).catch(() => {});

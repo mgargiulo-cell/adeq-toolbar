@@ -157,9 +157,26 @@ async function checkAdsTxt(baseUrl) {
   if (!text) return { exists: false, entries: 0, hasGoogle: false };
 
   const lines = text.split("\n").filter(l => l.trim() && !l.startsWith("#"));
+  // ── LAS EMPRESAS DEL ads.txt SE GUARDAN (Maxi 2026-08-27, pedido del user) ────────────
+  // Cada línea de un ads.txt nombra una red publicitaria, y cada red publica su propio
+  // sellers.json con miles de publishers adentro. O sea que analizar UNA web a mano nos está
+  // regalando la puerta de entrada a miles más — y hasta hoy esa lista se leía para contar
+  // renglones y se tiraba.
+  // El worker ya acumula redes por su cuenta (`discovered_sellers_networks`, ~180 hoy); esto
+  // hace que el trabajo manual del MB alimente la MISMA lista en vez de correr en paralelo.
+  const systems = [...new Set(lines.map(l => {
+    const limpio = l.split("#")[0].trim();
+    const primero = limpio.split(",")[0].trim().toLowerCase();
+    // Las líneas de configuración (subdomain=, contact=, ownerdomain=) no son redes.
+    if (!primero || /^(subdomain|contact|cname|ownerdomain|managerdomain)/i.test(primero)) return "";
+    // Un dominio de verdad: algo.algo, sin espacios ni protocolo.
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(primero)) return "";
+    return primero.replace(/^www\./, "");
+  }).filter(Boolean))];
   return {
     exists:    lines.length > 0,
     entries:   lines.length,
+    systems,
     hasGoogle: text.toLowerCase().includes("google.com/doubleclick") || text.toLowerCase().includes("adx.google.com"),
     hasEzoic:  text.toLowerCase().includes("ezoic"),
     raw:       text.substring(0, 500),

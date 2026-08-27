@@ -3347,6 +3347,15 @@ async function runAuditCheck() {
     } catch {}
     state.techStack  = audit.techStack;
     state.adsTxt     = audit.adsTxt;
+    // Las redes del ads.txt se suman al listado compartido: cada análisis manual aporta
+    // puertas de entrada nuevas para el feeder de sellers.json. No bloquea la UI.
+    if (audit.adsTxt?.systems?.length && state.accessToken) {
+      import("../modules/sellersJson.js")
+        .then(({ registrarAdSystems }) => registrarAdSystems(
+          CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken,
+          audit.adsTxt.systems, state.domain))
+        .catch(() => {});
+    }
     state.revenueGap = audit.revenueGap;
     state.partners   = audit.allPartners;
 
