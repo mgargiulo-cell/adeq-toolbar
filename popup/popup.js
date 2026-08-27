@@ -6231,6 +6231,29 @@ async function startCascade() {
   try {
     await runCascade(seed, onProgress);
 
+    // ── MARCAR LO QUE YA CONOCEMOS (Maxi 2026-08-27) ──────────────────────────────────
+    // La cascada devolvía los similares crudos, sin cruzarlos contra lo que ya tenemos. El
+    // MB terminaba analizando de a uno —un hit de RapidAPI cada vez— para descubrir que ese
+    // dominio ya estaba en Prospects, o que ya se había rechazado, o que está bloqueado.
+    // `findKnownDomains` ya cruza csv_queue + review_queue + historial + sendtrack +
+    // blocklist; solo faltaba llamarla desde acá.
+    // No se ESCONDEN: se marcan. Que un similar ya esté en el pool es información útil
+    // (confirma que la semilla es buena), y esconderlo dejaría al MB pensando que la
+    // cascada no encontró nada.
+    try {
+      const _doms = cascadeResults.map(r => r.domain).filter(Boolean);
+      if (_doms.length && state.accessToken) {
+        const { findKnownDomains } = await import("../modules/sellersJson.js");
+        const _yaConocidos = await findKnownDomains(
+          CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, _doms);
+        if (_yaConocidos?.size) {
+          window._cascadeKnown = _yaConocidos;
+          const _n = cascadeResults.filter(r => _yaConocidos.has(String(r.domain).toLowerCase())).length;
+          if (_n) statusEl.dataset.known = String(_n);
+        }
+      }
+    } catch { /* si falla el cruce, la cascada sigue funcionando igual */ }
+
     if (cascadeResults.length === 0) {
       // Maxi 2026-08-10: este mensaje decía SIEMPRE "con esos filtros", incluso cuando la fuente
       // no había devuelto un solo sitio. Son dos problemas distintos y se veían igual: el user
@@ -6241,7 +6264,10 @@ async function startCascade() {
       actionsEl.style.display = "none";
     } else {
       const limitMsg = cascadeResults.length >= CASCADE_LIMIT ? ` (limit ${CASCADE_LIMIT})` : "";
-      statusEl.textContent = `✅ ${cascadeResults.length} prospects${limitMsg}${filteredCount ? ` · ${filteredCount} filtered out` : ""}`;
+      const _yaN = parseInt(statusEl.dataset.known || "0", 10) || 0;
+      statusEl.textContent = `✅ ${cascadeResults.length} prospects${limitMsg}`
+        + (filteredCount ? ` · ${filteredCount} filtrados` : "")
+        + (_yaN ? ` · ${_yaN} que YA tenemos (no los analices)` : "");
       // Maxi 2026-06-22: re-render PAGINADO (30/página) — reemplaza el volcado streaming.
       renderCascadePage(1);
       // Defensive: forzar visibilidad + setAttribute para evitar que algún
@@ -6268,7 +6294,11 @@ function appendCascadeItem(site, container) {
   item.innerHTML = `
     <input type="checkbox" />
     <img class="cascade-favicon" loading="lazy" src="https://www.google.com/s2/favicons?domain=${esc(site.domain)}&sz=16" onerror="this.style.display='none'" />
-    <span class="cascade-domain" title="${esc(site.domain)}" style="flex:1">${esc(site.domain)}</span>
+    <span class="cascade-domain" title="${esc(site.domain)}" style="flex:1">${esc(site.domain)}${
+      (window._cascadeKnown instanceof Set && window._cascadeKnown.has(String(site.domain).toLowerCase()))
+        ? ` <span style="font-size:9px;background:#334155;color:#94a3b8;border-radius:8px;padding:1px 6px;margin-left:4px" title="Ya está en Prospects, en la cola, en el historial o bloqueado — analizarlo gasta un crédito para nada">ya lo tenemos</span>`
+        : ""
+    }</span>
     <button class="cascade-open-one btn btn-sm btn-secondary" title="Abrir esta URL" style="padding:2px 8px;font-size:11px">↗ Open</button>
   `;
   item.querySelector(".cascade-open-one")?.addEventListener("click", (e) => {
