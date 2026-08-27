@@ -10614,8 +10614,31 @@ async function runProspectSimilarExpansion(token) {
   let _porCursor = false;      // true = barrido viejo; false = hallazgos frescos
   let seeds = null;
   try {
+    // ── 0) LOS QUE NOS CONTESTARON (Maxi 2026-08-27) ────────────────────────────────
+    // La mejor semilla no es la que puntúa bien: es la que YA respondió un mail. Un score
+    // alto dice que el sitio se parece a lo que buscamos; una respuesta dice que ese tipo de
+    // publisher nos contesta, que es lo único que termina en una venta.
+    // Hay 128 dominios con respuesta real (sin contar los out-of-office) y la expansión no
+    // los estaba mirando: se expandía por puntaje, que es el proxy, teniendo el resultado.
+    // Es lo que haría el MB — "buscame más como los que me contestaron".
+    try {
+      const rResp = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?responded_at=not.is.null&response_type=neq.out_of_office&select=domain,responded_at&order=responded_at.desc&limit=60`,
+        { headers: auth });
+      if (rResp.ok) {
+        const jr = await rResp.json();
+        const sinExpandir = [...new Set((Array.isArray(jr) ? jr : [])
+          .map(x => String(x.domain || "").toLowerCase()).filter(Boolean))]
+          .filter(d => !_yaExpandidos.has(d));
+        if (sinExpandir.length) {
+          seeds = sinExpandir.slice(0, SIMILAR_EXP_BATCH).map(d => ({ domain: d, created_at: null }));
+          log(`🔗 similar-exp: ${seeds.length} semilla(s) que YA NOS CONTESTARON — la mejor señal que tenemos`);
+        }
+      }
+    } catch { /* si falla, se sigue por puntaje */ }
+
     // 1) Hallazgos recientes que ya pasaron todos los filtros y puntúan bien.
-    const rFresco = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&score=gte.${PROSPECT_SCORE_MIN}&select=domain,created_at,score&order=created_at.desc&limit=40`, { headers: auth });
+    const rFresco = seeds !== null ? { ok: false } : await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.350000&score=gte.${PROSPECT_SCORE_MIN}&select=domain,created_at,score&order=created_at.desc&limit=40`, { headers: auth });
     if (rFresco.ok) {
       const j = await rFresco.json();
       if (Array.isArray(j)) {
@@ -10677,7 +10700,12 @@ async function runProspectSimilarExpansion(token) {
   await saludPing(token, "similar_expansion", {
     status: "ok", cadenciaMin: 60,
     detalle: `${seeds.length} semillas → ${injected} similares`,
-    real: injected, esperado: seeds.length,   // se espera al menos 1 similar nuevo por semilla
+    // ⚠️ Esperar UN similar nuevo POR SEMILLA (Maxi 2026-08-27) era una alarma condenada a
+    // sonar para siempre. A medida que el pool madura, los similares de un buen publisher son
+    // cada vez más dominios que YA tenemos — que es señal de que el motor funciona, no de que
+    // falla. El resumen venía marcando "similar_expansion 1 de 6" como si fuera un problema.
+    // Lo que sí importa es que la corrida no vuelva vacía del todo.
+    real: injected, esperado: 1,
   });
 }
 
