@@ -285,7 +285,11 @@ function resetAnalysisUI() {
   const inputIds = [
     "form-pv-display", "form-subject", "pitch-text",
     "form-fecha", "form-telefono", "form-email-search",
-    "form-email-futuro",
+    // ⚠️ LOS TRES slots de adicionales (Maxi 2026-08-28). Solo se limpiaba el primero: los
+    // slots 2 y 3 retenían los emails de la web ANTERIOR, y al mandar desde la siguiente el
+    // pitch de la web B le llegaba al contacto de la web A — con el nombre de otro dominio
+    // en el asunto. El user pidió testear esta sección y este era el agujero más caro.
+    "form-email-futuro", "form-email-futuro-2", "form-email-futuro-3",
   ];
   // También limpiar el status text del email futuro
   const futStatus = document.getElementById("email-futuro-status");
@@ -5124,10 +5128,15 @@ async function bindButtons() {
       const futureSlots = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
       const sentMsgs  = [];
       const failMsgs  = [];
+      const _yaEnviados = new Set([email.toLowerCase()]);   // dedupe: principal + entre slots
       for (const slotId of futureSlots) {
         const futureEmail = document.getElementById(slotId)?.value?.trim()?.toLowerCase();
         if (!futureEmail || !futureEmail.includes("@")) continue;
-        if (futureEmail === email.toLowerCase()) { failMsgs.push(`⏭️ ${futureEmail} igual al principal`); continue; }
+        // Dedupe contra el principal Y entre los propios slots: el mismo email tipeado en
+        // dos slots salía DOS veces — dos mails idénticos al mismo buzón en el mismo minuto,
+        // que es la firma clásica del spam. (Maxi 2026-08-28)
+        if (_yaEnviados.has(futureEmail)) { failMsgs.push(`⏭️ ${futureEmail} repetido`); continue; }
+        _yaEnviados.add(futureEmail);
         const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }));
         if (bFut.bounced) { failMsgs.push(`🚫 ${futureEmail} bounced`); continue; }
         // Mandar EL MISMO subject + body al adicional

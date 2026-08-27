@@ -597,9 +597,12 @@
       </div>
       <div id="apollo-result" class="apollo-result"></div>
 
-      <!-- Maxi 2026-06-18: Adicionales (hasta 3) — salen EN PARALELO el día 0
-           junto con el original. NO se encolan. Si el original rebota / OOO,
-           Monday se actualiza con el primer adicional que respondió OK. -->
+      <!-- Maxi 2026-06-18: Adicionales (hasta 3) — salen EN PARALELO el día 0 junto con el
+           original. NO se encolan.
+           ⚠️ Maxi 2026-08-28 (auditoría): la promesa original decía además "si el original
+           rebota, Monday se actualiza con el primer adicional que respondió OK" — eso NUNCA
+           se implementó: `manual_extra` se escribe en response_tracking y nadie lo lee.
+           No re-prometerlo hasta que exista. -->
       <div id="email-futuro-block" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--surface-3)">
         <label class="form-label" style="font-size:11px">📨 Contactos Adicionales</label>
         <input id="form-email-futuro"   class="form-input" type="email" placeholder="Adicional 1" autocomplete="off" style="margin-bottom:4px" />
