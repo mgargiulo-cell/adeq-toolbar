@@ -1098,6 +1098,35 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
         return "dup";
       }
     }
+    // ── UN LEAD YA CONTACTADO NO PUEDE VOLVER A PROSPECTS (Maxi 2026-08-27) ────────────
+    // Regla del user, textual: "si están en Prospects son 100% NO contactados".
+    // Se estaba rompiendo. El chequeo de arriba busca solo filas `pending`; cuando el agente
+    // manda un mail, la fila queda `validated`, así que el chequeo NO la encuentra — y el
+    // upsert de abajo (`on_conflict=domain` + merge) la pisa devolviéndole `status:pending`.
+    // El lead contactado resucita en el pool.
+    //
+    // Caso medido: placar.com.br entró 18:01, se le mandó el mail 18:23, y volvió a figurar
+    // pendiente. El agente lo re-evaluó y lo salteó NUEVE veces en un día. Hoy hay 72
+    // dominios así, y explican los 687 salteos que le comían el turno.
+    //
+    // El re-prospect deliberado sigue vivo: `monday_refresh` re-trabaja ciclos finalizados,
+    // pero solo pasados los 90 días. Lo que se corta es la resurrección de algo que se
+    // contactó HACE POCO, que es siempre un error.
+    try {
+      const _corte30 = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+      const _st = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${_corte30}&select=send_date&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      if (_st.ok) {
+        const _f = await _st.json();
+        if (Array.isArray(_f) && _f.length) {
+          log(`  ⏭️ saveToReviewQueue ${domain}: se le escribió el ${_f[0].send_date} — NO vuelve a Prospects`);
+          return "contactado_hace_poco";
+        }
+      }
+      // Si la consulta falla NO se bloquea: el guard de 30 días del envío sigue estando y
+      // falla cerrado. Perder un lead nuevo por un glitch sería peor.
+    } catch {}
   } catch {}
 
   // Payload completo. Campos "core" (domain/traffic/status) son imprescindibles;
@@ -12779,6 +12808,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // nunca llegaba a la puerta que debía perdonarlo. La regla existía y no se aplicaba.
   // Los vetos ESTRUCTURALES (gobierno, universidad, muerto) no pasan por acá: se filtran
   // antes, en su propio chequeo. Esto solo perdona el RUBRO, que es lo que el user pidió.
+  // La puerta grande perdona el RUBRO, no el TIPO DE NEGOCIO. Un banco o una plataforma de
+  // streaming con ads.txt y tráfico sigue sin ser un publisher al que venderle display.
+  const _nunca = _categoriaNuncaProspectable(swCategory);
+  if (_nunca) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: `no_prospectable_tipo: "${swCategory}" es ${_nunca} (ni con ads.txt ni con tráfico)`,
+    });
+    log(`  ⛔ ${domain} — "${swCategory}" es ${_nunca}: no es un publisher de display, no entra`);
+    return;
+  }
   if (blockedCat && _apruebaPorAdsTxtYTrafico(_ads, effectivePageViews)) {
     log(`  🚪 ${domain} — categoría "${swCategory}" bloqueada PERO tiene ads.txt y ${effectivePageViews} pageviews → pasa por la puerta grande`);
   } else if (blockedCat) {
@@ -17249,6 +17288,43 @@ function scoreGeo(geo) {
 
 // Categorías que descartan el lead (gate duro)
 const BLOCKED_CATEGORIES = new Set(["adult","streaming","gambling"]);
+
+// ── LO QUE NO PERDONA NI LA PUERTA GRANDE (Maxi 2026-08-27) ─────────────────────────────
+// El 25/08 se puso una "puerta grande": con ads.txt y +400k pageviews, la categoría se
+// perdona ("no importa el rubro"). Hoy el user la matizó: *"si tiene y cumple requisito
+// sirve, PERO se debe analizar para ver si es banco, e-commerce, pornografía, streaming, sin
+// contenido, etc."* O sea: ads.txt + tráfico es condición NECESARIA, no suficiente.
+//
+// Se ve en el pool: fox.com, xumo.com, zattoo.com y willow.tv están en Prospects como
+// `streaming`, y ae.opodo.com como `travel` — vende vuelos, que es de los ejemplos que el
+// propio user enseñó como no prospectable. Los cuatro entraron por la puerta grande.
+//
+// La diferencia entre las dos listas: `BLOCKED_CATEGORIES` es "rubro que preferimos evitar"
+// y la puerta grande lo puede perdonar. Esta es "no es un publisher que venda display
+// nuestro", y no hay tráfico que lo cambie.
+const CATEGORIAS_NUNCA = [
+  // Plataformas de video/TV: monetizan su propio inventario, no venden display a terceros.
+  "streaming", "video_streaming", "tv_streaming", "arts_and_entertainment/streaming",
+  // Adulto y apuestas: fuera del portfolio y un riesgo de marca.
+  "adult", "pornography", "gambling", "casino", "betting",
+  // Banca y finanzas reguladas: no compran display programático de este tipo.
+  "banking", "banks", "finance/banking", "insurance", "credit_cards", "brokerage",
+  // E-commerce y marketplaces: venden producto, no espacio.
+  "ecommerce", "e-commerce", "marketplace", "shopping", "retail", "classifieds",
+  "coupons", "deals", "price_comparison",
+  // Viajes transaccionales (vuelos/hoteles): el user los enseñó como no prospectables.
+  "travel/booking", "airlines", "hotels", "car_rental", "flight",
+  // Sin contenido propio: no hay dónde poner un banner.
+  "web_portals", "search_engines", "url_shorteners", "file_sharing", "cloud_storage",
+  "web_hosting", "domain_registrar", "saas", "developer_tools",
+];
+// Se matchea por INCLUSIÓN porque SimilarWeb devuelve rutas ("finance/banking",
+// "e_commerce_and_shopping/marketplace") y no una etiqueta plana.
+function _categoriaNuncaProspectable(cat) {
+  const c = String(cat || "").toLowerCase().replace(/[\s-]+/g, "_");
+  if (!c) return null;
+  return CATEGORIAS_NUNCA.find(x => c.includes(x.replace(/[\s-]+/g, "_"))) || null;
+}
 
 // Ad networks ADEQ partner — si el sitio YA tiene muchas, hay menos espacio para nosotros
 const ADEQ_PARTNER_NETWORKS = new Set([
