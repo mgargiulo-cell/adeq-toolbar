@@ -2269,21 +2269,80 @@ const _PISTAS_IDIOMA = [
 // de módulo porque el pool se arma en un lado y el targeting se resuelve en otro.
 const _IDIOMA_DE_FRASE = new Map();
 
+// ── LOS BLOQUEOS DEL USER MANDAN ANTES DE BUSCAR (Maxi 2026-08-27) ──────────────────────
+// "Si yo hago blocks, las búsquedas de autopilot y AutoGoogle deben ser inteligentes para
+//  saber eso y trabajar un paso antes del resultado: no simplemente bloquear la URL, sino
+//  desde la búsqueda intentar no obtener las URLs o el idioma de lo bloqueado."
+//
+// Hasta hoy el bloqueo actuaba al FINAL: se buscaba en Estados Unidos, Google devolvía sitios
+// de Estados Unidos, se pagaba el crédito de Serper, se resolvía el tráfico con RapidAPI —y
+// recién ahí se descartaba por GEO. El filtro llegaba después de gastar.
+//
+// Ahora los países excluidos por el user se sacan de la baraja ANTES de elegir el `gl`, así
+// que Google nunca llega a devolver esos resultados. Se refresca al empezar cada slot.
+let _GL_BLOQUEADOS_USER = new Set();
+async function _refrescarGeosBloqueadas(token) {
+  try {
+    const cfg = await getConfig(token);
+    const fuera = new Set();
+    for (const clave of ["worker_discovery_config", "agent_focus_config"]) {
+      let c = {};
+      try { c = JSON.parse(cfg[clave] || "{}"); } catch {}
+      for (const g of (c.geos_excluded || [])) {
+        const v = String(g).trim();
+        if (!v) continue;
+        // La lista del user puede venir como ISO ("GB") o como nombre ("United Kingdom").
+        // `gl` de Google es siempre ISO en minúscula, así que se normaliza a eso.
+        const iso = COUNTRY_CODES[v.toUpperCase()] ? v.toUpperCase()
+                  : (Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === v) || "");
+        if (iso) fuera.add(iso.toLowerCase());
+      }
+    }
+    _GL_BLOQUEADOS_USER = fuera;
+    if (fuera.size) log(`  🚫 GEOs excluidas por el user, fuera de la búsqueda: ${[...fuera].join(", ")}`);
+  } catch { /* si no se puede leer, no se bloquea nada: mejor buscar de más que no buscar */ }
+}
+// El TLD no siempre es el código ISO del país, y esa diferencia deja pasar bloqueos: el Reino
+// Unido usa `.uk` pero su ISO es GB, así que una búsqueda `site:.uk` se colaba entera aunque
+// el user tuviera GB excluido. Lo mismo con Grecia (.gr/GR está bien) — el problemático es el
+// puñado de casos históricos.
+const _TLD_A_ISO = { uk: "gb", su: "ru", tp: "tl", ac: "sh", eu: "" };
+const _glPermitido = (cc) => {
+  const v = String(cc || "").toLowerCase();
+  if (!v) return false;
+  const iso = _TLD_A_ISO[v] !== undefined ? _TLD_A_ISO[v] : v;
+  if (!iso) return true;                      // .eu no es un país: no se puede bloquear
+  return !_GL_BLOQUEADOS_USER.has(iso);
+};
+
 function _paisParaFrase(frase, esHispano) {
   // El TLD explícito de la query manda sobre cualquier heurística: si dice site:.br,
   // hay que buscar desde Brasil.
   const _tld = String(frase).match(/site:\.(?:com\.)?([a-z]{2})\b/i);
   if (_tld) {
     const cc = _tld[1].toLowerCase();
+    // Si el user bloqueó ese país, esta búsqueda no tiene sentido: devolvería justo lo que
+    // se va a descartar. Se marca para que el slot la saltee sin gastar el crédito.
+    if (!_glPermitido(cc)) return { gl: cc, hl: "es", bloqueado: true };
     const idioma = Object.keys(_PAISES_POR_IDIOMA).find(l => _PAISES_POR_IDIOMA[l].includes(cc)) || "es";
     return { gl: cc, hl: idioma };
   }
-  if (esHispano) return { gl: HISPANIC_GL[Math.floor(Math.random() * HISPANIC_GL.length)], hl: "es" };
+  if (esHispano) {
+    const hisp = HISPANIC_GL.filter(_glPermitido);
+    const lista = hisp.length ? hisp : HISPANIC_GL;   // si bloqueó TODO el mundo hispano, no me quedo mudo
+    return { gl: lista[Math.floor(Math.random() * lista.length)], hl: "es" };
+  }
   // 1º el dato exacto (anotado al armar el pool). 2º la heurística, para las frases
   // que vienen de otro lado: las huellas, las frescas de Claude y las sugeridas por Google.
   let idioma = _IDIOMA_DE_FRASE.get(frase) || "";
   if (!idioma) { idioma = "es"; for (const [lang, re] of _PISTAS_IDIOMA) { if (re.test(frase)) { idioma = lang; break; } } }
-  const paises = _PAISES_POR_IDIOMA[idioma] || _PAISES_POR_IDIOMA.es;
+  const todos   = _PAISES_POR_IDIOMA[idioma] || _PAISES_POR_IDIOMA.es;
+  const paises  = todos.filter(_glPermitido);
+  if (!paises.length) {
+    // Todos los países de ese idioma están bloqueados: buscar igual sería pagar por resultados
+    // que ya sabemos que se descartan. Se avisa para que el slot saltee la frase.
+    return { gl: todos[0] || "es", hl: idioma, bloqueado: true };
+  }
   return { gl: paises[Math.floor(Math.random() * paises.length)], hl: idioma };
 }
 
@@ -2720,6 +2779,8 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     return;
   }
   N = Math.min(N, _restaHoy);
+  // Los bloqueos del user se leen ANTES de elegir países, para que no lleguen a la búsqueda.
+  await _refrescarGeosBloqueadas(token);
   // Pool = keywordsData.js (7.549 en 12 idiomas) + una muestra de `toolbar_keywords` (99.888).
   // Maxi 2026-07-17 TURNO HISPANO: en los slots hispanos el pool se restringe al español
   // (672 frases) → descubrimiento LATAM/Centroamérica/España garantizado todos los días.
@@ -2848,14 +2909,20 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const kwDomains = new Map();  // Maxi 2026-07-16: keyword → dominios que trajo (para calcular el yield)
   const _contexto = new Map();  // dominio → señales del resultado (título, snippet, posición…)
   const _sugeridasGoogle = new Set();
-  let queriesDone = 0, errCount = 0, lastStatus = 0, _errSeguidos = 0;
+  let queriesDone = 0, errCount = 0, lastStatus = 0, _errSeguidos = 0, _salteadasPorGeo = 0;
   for (const [_i, kw] of kws.entries()) {
     // Corte temprano: si Serper viene fallando en serie (429/403 por créditos), seguir
     // gastando las N búsquedas restantes no arregla nada. Antes el loop terminaba igual.
     if (_errSeguidos >= 3) { log(`  🛑 AutoGoogle: 3 errores seguidos de Serper (${lastStatus}) — corto el slot`); break; }
     // País apareado con el IDIOMA de la frase: buscar una frase en portugués con gl=pl
     // (17 de cada 19 veces, con la rotación vieja) es tirar el crédito.
-    const { gl, hl } = _paisParaFrase(kw, _hispanicSlot);
+    const { gl, hl, bloqueado } = _paisParaFrase(kw, _hispanicSlot);
+    if (bloqueado) {
+      // La frase solo puede buscarse en países que el user excluyó. Gastar el crédito acá
+      // sería pagar por resultados que el filtro de GEO va a tirar después.
+      _salteadasPorGeo++;
+      continue;
+    }
     // Una porción del slot va al endpoint de NOTICIAS: cada resultado es por definición
     // un medio que publica, con fecha. Es el instrumento de precisión que faltaba.
     const _esNews = !/inurl:|filetype:|site:/i.test(kw) && (_i % 5 === 0);
@@ -3019,7 +3086,8 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     const _sinEncolar = queriesDone >= 10 && freshCount > 20 && inserted === 0;
     await saludPing(token, "autogoogle", {
       status: _sinEncolar ? "fail" : "ok", cadenciaMin: 240,
-      detalle: `${queriesDone} búsquedas → ${found.size} dominios → ${freshCount} nuevos → ${inserted} encolados`,
+      detalle: `${queriesDone} búsquedas → ${found.size} dominios → ${freshCount} nuevos → ${inserted} encolados`
+        + (_salteadasPorGeo ? ` · ${_salteadasPorGeo} salteada(s) por GEO bloqueada (crédito ahorrado)` : ""),
       real: inserted, esperado: Math.max(1, Math.round(queriesDone * 0.15)),
     });
     if (_sinEncolar) {
