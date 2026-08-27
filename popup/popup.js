@@ -8733,6 +8733,10 @@ function _renderCountryPanel(filter = "") {
 async function loadProspectsTab(opts = {}) {
   // opts.keepPage: mantener la página actual (lo usa el auto-refresh de 15 min para
   // NO sacar al MB de su lugar). Filtros y ↻ manual arrancan en página 1.
+  initProspectsGlobalSearch();   // la lupa global se cablea una sola vez (dataset.wired)
+  // Si hay una búsqueda global activa, el refresh normal no la pisa: el MB está mirando
+  // resultados del pool entero y un auto-refresh se los borraría abajo del mouse.
+  if ((document.getElementById("prospects-global-search-input")?.value || "").trim().length >= 2 && opts.keepPage) return;
   const listEl  = document.getElementById("prospects-list");
   const statsEl = document.getElementById("prospects-stats");
   if (!listEl) return;
@@ -9050,6 +9054,67 @@ async function loadProspectsTab(opts = {}) {
     statsEl.innerHTML = `<strong>${sample.length}</strong> visibles · <strong>${globalPool}</strong> en pool global · enviaste <strong>${sentFromProspects}/${DAILY_SEND_CAP}</strong> hoy`;
   }
   renderProspectsPage(_keepPage);  // 1 normalmente; la página actual si es auto-refresh
+}
+
+// ── LA LUPA GLOBAL (Maxi 2026-08-28, pedido del user) ────────────────────────────────────
+// "Una lupa que busca en ALL: tiene adentro el 100% de los candidatos." Justo arriba del
+// primer candidato, a todo el ancho. La lupita del encabezado filtra solo lo YA CARGADO
+// (ventana de hasta 3.000, 1.000 visibles); esta le pregunta al SERVIDOR por el pool entero,
+// ignorando todos los filtros — si el candidato existe, lo encuentra.
+let _gsTimer = null;
+function initProspectsGlobalSearch() {
+  const input = document.getElementById("prospects-global-search-input");
+  const clear = document.getElementById("prospects-global-search-clear");
+  const status = document.getElementById("prospects-global-search-status");
+  if (!input || input.dataset.wired) return;
+  input.dataset.wired = "1";
+
+  const _volver = () => {
+    input.value = "";
+    if (clear) clear.style.display = "none";
+    if (status) status.style.display = "none";
+    loadProspectsTab();
+  };
+  clear?.addEventListener("click", _volver);
+
+  input.addEventListener("input", () => {
+    clearTimeout(_gsTimer);
+    const term = input.value.trim();
+    if (clear) clear.style.display = term ? "inline-block" : "none";
+    if (!term) { _volver(); return; }
+    if (term.length < 2) return;
+    _gsTimer = setTimeout(async () => {
+      const listEl = document.getElementById("prospects-list");
+      if (!listEl) return;
+      if (status) { status.style.display = "block"; status.textContent = "⏳ Buscando en todo el pool…"; }
+      try {
+        // PostgREST rompe el or=() con comas y paréntesis adentro del término — se sacan.
+        // Un dominio o un título no los necesitan para encontrarse.
+        const safe = term.replace(/[,()]/g, " ").trim();
+        const cols = "id,domain,traffic,geo,geos_all,language,category,contact_name,contact_phone,emails,email_sources,pitch_subject,pitch_subjects,score,ad_networks,page_title,status,validated_by,validated_at,created_at,source,monday_item_id,created_by,suspect_reject,suspect_reason";
+        const r = await fetch(
+          `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(domain.ilike.*${encodeURIComponent(safe)}*,page_title.ilike.*${encodeURIComponent(safe)}*)&select=${cols}&order=created_at.desc&limit=100`,
+          { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } });
+        const rows = r.ok ? await r.json() : [];
+        // La paginación del listado normal no aplica acá: se muestran directo.
+        document.getElementById("prospects-pagination")?.style?.setProperty("display", "none");
+        if (!Array.isArray(rows) || rows.length === 0) {
+          listEl.innerHTML = `<div class="cascade-empty">Sin resultados para "${esc(term)}" en el pool completo.</div>`;
+          if (status) status.textContent = `0 resultados en el 100% del pool`;
+          return;
+        }
+        listEl.innerHTML = rows.map(x => renderProspectCard(x)).join("");
+        listEl.querySelectorAll(".pcard").forEach(card => {
+          const id = parseInt(card.dataset.id);
+          const data = rows.find(x => x.id === id);
+          if (data) initProspectCard(card, data);
+        });
+        if (status) status.textContent = `${rows.length} resultado(s) buscando en el 100% del pool${rows.length === 100 ? " (tope 100 — afiná el término)" : ""}`;
+      } catch (e) {
+        if (status) status.textContent = `❌ ${e.message}`;
+      }
+    }, 350);
+  });
 }
 
 const PROSPECTS_PAGE_SIZE = 50;

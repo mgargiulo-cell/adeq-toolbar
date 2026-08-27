@@ -1220,6 +1220,18 @@
     </div>
   </section>
 
+  <!-- Maxi 2026-08-28 (pedido del user): la lupa GLOBAL, justo arriba del primer candidato.
+       Busca sobre el 100% del pool en el SERVIDOR, ignorando todos los filtros de arriba.
+       La lupita chica del encabezado filtra solo lo ya cargado (hasta 1000 visibles); esta
+       encuentra cualquier candidato aunque esté fuera de la ventana. -->
+  <div id="prospects-global-search" style="display:flex;gap:6px;align-items:center;margin:8px 0 6px">
+    <input id="prospects-global-search-input" type="text" placeholder="🔍 Buscar en TODO el pool (dominio o título) — ignora los filtros"
+      style="flex:1;font-size:12px;padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text)" />
+    <button id="prospects-global-search-clear" title="Volver al listado normal"
+      style="display:none;font-size:11px;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);color:var(--text);cursor:pointer">✕</button>
+  </div>
+  <div id="prospects-global-search-status" style="display:none;font-size:11px;color:var(--text-muted);margin-bottom:6px"></div>
+
   <div id="prospects-list">
     <div class="cascade-empty">⏳ Loading...</div>
   </div>
