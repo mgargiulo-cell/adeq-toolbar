@@ -7392,9 +7392,36 @@ async function initSellersJsonImport(refreshAll) {
   // Persistir lista en chrome.storage.local. Cada user puede tener su lista
   // (no es un setting compartido del equipo).
   const STORAGE_KEY = "sellers_companies_v1";
+  // ── LAS REDES DESCUBIERTAS ENTRAN SOLAS A LA LISTA (Maxi 2026-08-28) ────────────────
+  // El user: "las URL encontradas en /ads.txt, que se traducen en nuevas compañías para
+  // extraer sellers.json, ¿se autoagregan día tras día? No veo nuevas."
+  // No se autoagregaban: esta lista era la estática del código o la editada a mano, y las
+  // 236 redes que el worker ya validó (`discovered_sellers_networks`) + las que los MB ven
+  // al analizar (`toolbar_adsystem_seen` con sellers.json confirmado) vivían en la base sin
+  // llegar nunca al selector. El descubrimiento funcionaba; la vidriera no.
+  // Se fusionan acá, deduplicadas por dominio. Las manuales del MB van primero y nunca se
+  // pisan; las autodescubiertas se marcan con 🌱.
   const loadList = async () => {
     const { [STORAGE_KEY]: stored } = await chrome.storage.local.get(STORAGE_KEY);
-    return Array.isArray(stored) && stored.length ? stored : DEFAULT_SELLERS_COMPANIES;
+    const base = Array.isArray(stored) && stored.length ? stored : DEFAULT_SELLERS_COMPANIES;
+    const vistos = new Set(base.map(c => String(c.url || c.name || "").replace(/^https?:\/\/(www\.)?/, "").split("/")[0].toLowerCase()).filter(Boolean));
+    const extra = [];
+    try {
+      const hdrs = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
+      const [cfgR, seenR] = await Promise.all([
+        fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.discovered_sellers_networks&select=value`, { headers: hdrs }).then(r => r.ok ? r.json() : []).catch(() => []),
+        fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_adsystem_seen?validada=eq.true&select=domain&order=last_seen.desc&limit=200`, { headers: hdrs }).then(r => r.ok ? r.json() : []).catch(() => []),
+      ]);
+      let redes = [];
+      try { redes = JSON.parse(cfgR?.[0]?.value || "[]"); } catch {}
+      for (const d of [...redes, ...(seenR || []).map(x => x.domain)]) {
+        const dom = String(d || "").toLowerCase().replace(/^www\./, "").trim();
+        if (!dom || vistos.has(dom)) continue;
+        vistos.add(dom);
+        extra.push({ name: `🌱 ${dom}`, url: `https://${dom}/sellers.json`, auto: true });
+      }
+    } catch { /* sin red no hay autodescubiertas, la lista manual sigue andando */ }
+    return [...base, ...extra];
   };
   const saveList = async (list) => chrome.storage.local.set({ [STORAGE_KEY]: list });
 

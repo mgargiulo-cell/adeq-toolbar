@@ -4059,7 +4059,9 @@ const SELLERS_DISCOVERY_BUSQUEDAS = 5;
 async function descubrirRedesPorSellersJson(token) {
   try {
     if (!SERPER_API_KEY) return 0;
-    if (!(await _tocaCorrer(token, "sellers_discovery", 7 * 24 * 60))) return 0;   // 1×/semana
+    // Maxi 2026-08-28: semanal → DIARIO. El user quiere ver redes nuevas día tras día, y el
+    // costo es mínimo: validar ~15 candidatas nuevas son 15 fetches de sellers.json.
+    if (!(await _tocaCorrer(token, "sellers_discovery", 24 * 60))) return 0;
 
     const consultas = [
       `inurl:sellers.json "seller_type" "PUBLISHER"`,
@@ -4076,7 +4078,7 @@ async function descubrirRedesPorSellersJson(token) {
       domains.forEach(d => hosts.add(d));
     }
     if (!hosts.size) {
-      await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 7 * 24 * 60, detalle: "0 hosts en la búsqueda", real: 0 });
+      await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 24 * 60, detalle: "0 hosts en la búsqueda", real: 0 });
       return 0;
     }
 
@@ -4104,7 +4106,7 @@ async function descubrirRedesPorSellersJson(token) {
       .filter(h => !conocidas.has(h) && !EXCLUDE_DOMAINS.has(h)).slice(0, 15);
     if (_delEquipo.length) log(`  🧩 sellers-discovery: ${_delEquipo.length} red(es) vista(s) por los MB al analizar a mano`);
     if (!nuevas.length) {
-      await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 7 * 24 * 60, detalle: `${hosts.size} hosts, ninguno nuevo`, real: 0 });
+      await saludPing(token, "sellers_discovery", { status: "ok", cadenciaMin: 24 * 60, detalle: `${hosts.size} hosts, ninguno nuevo`, real: 0 });
       return 0;
     }
 
@@ -4128,12 +4130,15 @@ async function descubrirRedesPorSellersJson(token) {
       }
     } catch {}
     if (validas.length) {
-      const _todas = [...new Set([...descubiertas, ...validas])].slice(0, 200);
+      // Maxi 2026-08-28: SIN tope. Había un .slice(0, 200) que recortaba la lista — el user
+      // pidió lo contrario, textual: "no debe ser estática, se debe acrecentar infinitamente".
+      // Cada red validada es una puerta a miles de publishers y no cuesta nada guardarla.
+      const _todas = [...new Set([...descubiertas, ...validas])];
       await setConfigValue(token, "discovered_sellers_networks", JSON.stringify(_todas)).catch(() => {});
       log(`🌐 sellers-discovery: ${validas.length} red(es) nueva(s) → las va a explotar el feeder de ads.txt-graph`);
     }
     await saludPing(token, "sellers_discovery", {
-      status: "ok", cadenciaMin: 7 * 24 * 60,
+      status: "ok", cadenciaMin: 24 * 60,
       detalle: `${hosts.size} hosts, ${nuevas.length} candidatas, ${validas.length} con sellers.json real`,
       real: validas.length, esperado: 1,
     });
