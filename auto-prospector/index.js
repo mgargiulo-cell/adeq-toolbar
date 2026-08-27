@@ -18009,7 +18009,35 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
   // ── EL LINTER, JUSTO ANTES DE SALIR ───────────────────────────────────────
   // Vive acá adentro y no en los callers, para que ninguna ruta futura se lo pueda
   // saltear por olvido.
-  const _rev = revisarEntregabilidad({ to, subject, body: cuerpoTexto, cuerpo: body, html: htmlBody, mime, esProspeccion });
+  // ── LA FIRMA NO ES LA PLANTILLA (Maxi 2026-08-27) ─────────────────────────
+  // Tercera vez que esta trampa frena envíos reales: 79 el 18-19/08, 68 el 25/08 y 88 en los
+  // últimos tres días, todos con `linter:mayusculas:MEDIA,ARGENTINA` — que son "ADEQ MEDIA" y
+  // "BUENOS AIRES, ARGENTINA" de la firma de Gmail, leídas como si fueran gritos nuestros.
+  //
+  // La causa está en los caminos de RE-envío: el Email Futuro y los reintentos reenvían
+  // `original_body`, que es un mail que YA SALIÓ y por lo tanto ya trae la firma adentro.
+  // Al pasarlo como `cuerpo`, las reglas de estilo la juzgan.
+  //
+  // Se venía arreglando pidiéndole a cada caller que no pasara `cuerpo`. No funcionó: son
+  // varios caminos y basta que uno se olvide. Ahora se recorta acá, en el único lugar por el
+  // que pasan todos. La firma la generamos nosotros, así que se puede detectar y cortar sin
+  // adivinar: si el texto del caller ya la contiene, se le saca antes de juzgar el estilo.
+  let _plantilla = body;
+  if (_firmaTexto) {
+    const _f = _firmaTexto.trim();
+    const _i = _plantilla.indexOf(_f);
+    if (_i > 0) _plantilla = _plantilla.slice(0, _i);
+    else {
+      // La firma pudo haber cambiado desde aquel envío (Gmail la re-renderiza). Se cae a la
+      // primera línea que la firma y el cuerpo comparten, que en la práctica es el nombre.
+      const _primera = _f.split("\n").map(x => x.trim()).filter(x => x.length > 3)[0];
+      if (_primera) {
+        const _j = _plantilla.indexOf(_primera);
+        if (_j > 0) _plantilla = _plantilla.slice(0, _j);
+      }
+    }
+  }
+  const _rev = revisarEntregabilidad({ to, subject, body: cuerpoTexto, cuerpo: _plantilla, html: htmlBody, mime, esProspeccion });
   if (!_rev.ok) {
     log(`  🛑 NO SE ENVÍA a ${to} — el linter lo frenó: ${_rev.bloqueantes.join(", ")}`);
     if (_workerToken && userEmail) {
@@ -21444,7 +21472,13 @@ async function vigilarReputacion(token) {
 // Esto mira fuente por fuente.
 const _FUENTES_VIGILADAS = {
   // fuente en Prospects : cada cuántos días debería producir al menos un lead
-  autopilot:      3,
+  //
+  // ⚠️ `autopilot` NO va acá (Maxi 2026-08-27). Dejó de ser una fuente el 24/08, cuando cada
+  // motor pasó a escribir su propio nombre; hoy es una etiqueta residual que ya nadie usa.
+  // El monitor la seguía vigilando y avisaba "29 días sin producir" todos los días: una
+  // fuente que no existe no puede producir. Es el mismo patrón que ya nos costó tres alertas
+  // falsas — arreglamos algo y el vigilante siguió mirando el nombre viejo.
+  // REGLA: si se renombra o se retira una fuente, hay que sacarla de acá en el mismo commit.
   autogoogle:     3,
   similar:        5,
   adstxt:         5,
@@ -21476,7 +21510,7 @@ async function vigilarFuentesDeDescubrimiento(token) {
     }
     await saludPing(token, "fuentes_descubrimiento", {
       status: "ok", cadenciaMin: 12 * 60,
-      detalle: mudas.length ? `${mudas.length} fuente(s) muda(s)` : "las 7 producen",
+      detalle: mudas.length ? `${mudas.length} fuente(s) muda(s)` : `las ${Object.keys(_FUENTES_VIGILADAS).length} producen`,
       real: Object.keys(_FUENTES_VIGILADAS).length - mudas.length,
       esperado: Object.keys(_FUENTES_VIGILADAS).length,
     });
