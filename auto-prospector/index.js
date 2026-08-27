@@ -23006,6 +23006,42 @@ async function _boletinPorSeccion(token) {
         : "Cero re-envíos en 24h — si hay cola de re-enganche esperando, algo lo frena.",
     ]);
 
+    // ── QUÉ TIPO DE EMAIL RESPONDE (Maxi 2026-08-28, pedido del user) ─────
+    // "Control de los tipos de emails que van teniendo más respuestas, en % sobre el total."
+    // Se clasifica el destinatario por TIPO (persona de Apollo, adicional manual, rol
+    // comercial, genérico, persona scrapeada) y se mide la respuesta REAL (sin out-of-office)
+    // sobre 30 días — con menos ventana el % baila demasiado para decidir nada.
+    try {
+      const _d30 = new Date(Date.now() - 30 * 86400_000).toISOString();
+      const _rt = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${_d30}&select=email_sent_to,source,responded_at,response_type&limit=5000`);
+      if (Array.isArray(_rt) && _rt.length >= 30) {
+        const _tipoDe = (r) => {
+          const e = String(r.email_sent_to || "").toLowerCase();
+          if (r.source === "manual_extra") return "manual (adicional)";
+          if (r.source === "apollo") return "apollo (persona)";
+          if (/^(publicidad|pub|ads|adsales|sales|ventas|comercial|marketing|anuncie|reklam|werbung)@/.test(e)) return "rol comercial";
+          if (/^(info|contact|contacto|contato|hello|hola|mail|admin|general|redaccion|redacao|prensa|press)@/.test(e)) return "genérico (info@)";
+          return "persona con nombre";
+        };
+        const _agg = {};
+        for (const r of _rt) {
+          const t = _tipoDe(r);
+          (_agg[t] = _agg[t] || { n: 0, ok: 0 }).n++;
+          if (r.responded_at && r.response_type !== "out_of_office") _agg[t].ok++;
+        }
+        const _lineas = Object.entries(_agg)
+          .filter(([, v]) => v.n >= 10)
+          .sort((a, b) => (b[1].ok / b[1].n) - (a[1].ok / a[1].n))
+          .map(([t, v]) => `${t}: ${(100 * v.ok / v.n).toFixed(1)}% (${v.ok} de ${v.n})`);
+        if (_lineas.length) {
+          _nota("TIPOS DE EMAIL QUE RESPONDEN (30d)", "ℹ️", [
+            _lineas.join(" · "),
+            "El agente ya prioriza por esta señal (Apollo pisa al genérico); si un tipo se dispara, avisame y ajustamos el ranking.",
+          ]);
+        }
+      }
+    } catch {}
+
     // ── CUOTAS DE APIS ────────────────────────────────────────────────────
     const _rapid = parseInt(cfg.rapidapi_calls_month || "0", 10);
     const _rLim = parseInt(cfg.rapidapi_monthly_limit || "40000", 10);
