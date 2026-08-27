@@ -10603,9 +10603,28 @@ async function polishPool(token) {
   // volvía sobre los mismos 348 leads mudos hasta 13 veces, gastando su presupuesto en
   // sitios que ya demostraron no tener email visible mientras el resto del pool esperaba.
   // Una semana es tiempo de sobra para que un sitio publique un contacto nuevo.
-  const _corteIntento = new Date(Date.now() - 3 * 86_400_000).toISOString();   // 3 días: medido, con 7 quedaban 19 elegibles de 344
+  // ── BACKOFF QUE CRECE CON LOS INTENTOS (Maxi 2026-08-27) ────────────────────────────
+  // El backoff era FIJO en 3 días para todos. Medido hoy sobre los 562 leads mudos: hay 217
+  // con DIEZ O MÁS intentos, y entre todos se llevaron el 65% de los 3.339 intentos hechos
+  // para producir CERO emails. Cada tres días vuelven a la cola, se les hace el crawl
+  // completo, y vuelven a no encontrar nada. El presupuesto del barrido se va ahí mientras
+  // los leads nuevos —que son los que de verdad rinden— esperan turno.
+  //
+  // Un sitio que no publicó un contacto en diez pasadas no lo va a publicar en la once. Pero
+  // TAMPOCO se abandona: los sitios cambian, y cada tanto sumamos una vía nueva de
+  // descubrimiento (RSS, Certificate Transparency, MX). Por eso el backoff crece en vez de
+  // cortar: 3 días los primeros, 10 los del medio, 30 los tercos.
+  //
+  // El efecto es que el mismo presupuesto alcanza para muchos más leads distintos.
+  const _backoffPorIntentos = (n) => n <= 3 ? 3 : n <= 7 ? 10 : 30;
+  const _corte = (dias) => new Date(Date.now() - dias * 86_400_000).toISOString();
   const sinEmailClause = soloSinEmail
-    ? `&and=(or(emails.is.null,emails.eq.%5B%5D),or(email_ultimo_intento.is.null,email_ultimo_intento.lt.${encodeURIComponent(_corteIntento)}))`
+    ? `&and=(or(emails.is.null,emails.eq.%5B%5D),or(`
+      + `email_ultimo_intento.is.null,`
+      + `and(email_intentos.lte.3,email_ultimo_intento.lt.${encodeURIComponent(_corte(3))}),`
+      + `and(email_intentos.gte.4,email_intentos.lte.7,email_ultimo_intento.lt.${encodeURIComponent(_corte(10))}),`
+      + `and(email_intentos.gte.8,email_ultimo_intento.lt.${encodeURIComponent(_corte(30))})`
+      + `))`
     : "";
   let leads = null;
   try {
@@ -10853,6 +10872,17 @@ async function polishPool(token) {
                 : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
                 : `rechazados_por_ranking:${_diagEmail.rechazados.join("|").slice(0, 120)}`,
             }),
+          }).catch(() => {});
+          // Queda el rastro COMPLETO en su propia tabla: la columna del lead se pisa en cada
+          // intento y se pierde la historia. Acá se puede agrupar y verificar a mano.
+          const _mot = !_diagEmail ? "no_se_pudo_leer_el_sitio"
+                     : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
+                     : "rechazados_por_ranking";
+          registrarDiagSinEmail(token, {
+            domain, intento: (lead.email_intentos || 0) + 1, fase: "pulido",
+            crudos: _diagEmail?.crudos || 0, rechazados: _diagEmail?.rechazados || [],
+            motivo: _mot,
+            comentario: _comentarioSinEmail({ ..._diagEmail, waf: false }),
           }).catch(() => {});
         }
       } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
@@ -12457,6 +12487,64 @@ async function aparcarProspectOffline(token, d) {
 // Un email que rebotó no es un email. Se les limpia el contacto muerto para que el pulido
 // los agarre en su próxima pasada y les busque uno de verdad, que es el North Star.
 // El email rebotado NO se borra del historial: queda en `email_sources` como registro.
+// ── EL REGISTRO EN CASTELLANO DE POR QUÉ FALLÓ CADA COSA (Maxi 2026-08-27) ──────────────
+// Pedido del user: "sería bueno tener un feedback de los que no encontró el email, con
+//  comentarios reales en una tabla, para aprender de eso y verificar. Y lo mismo con los
+//  descartes."
+//
+// Hasta ahora el motivo vivía en una columna del propio lead y se PISABA en cada intento: se
+// veía el último y se perdía la historia. Con una tabla aparte queda el rastro completo, se
+// puede agrupar ("¿cuántos fallan por WAF?") y se puede verificar a mano ("este dice que no
+// publica email — a ver si es cierto").
+//
+// El comentario se escribe como se lo explicaría a una persona, no como un código de error.
+// Un `no_encontrado` no enseña nada; "leí 14 páginas y ninguna publica un email, el sitio
+// solo tiene formulario de contacto" sí dice qué probar después.
+async function registrarDiagSinEmail(token, d) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({
+        domain: d.domain, intento: d.intento || 1, fase: d.fase || "pulido",
+        emails_crudos: d.crudos || 0,
+        candidatos_rechazados: Array.isArray(d.rechazados) && d.rechazados.length ? d.rechazados.slice(0, 5) : null,
+        motivo: d.motivo, comentario: d.comentario || null,
+        paginas_leidas: d.paginas ?? null,
+        bloqueado_por_waf: !!d.waf,
+      }),
+    });
+  } catch { /* el diagnóstico nunca puede romper el barrido */ }
+}
+
+async function registrarDiagDescarte(token, d) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_diag_descartes`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "return=minimal",
+      },
+      body: JSON.stringify({
+        domain: d.domain, etapa: d.etapa, motivo: d.motivo, comentario: d.comentario || null,
+        categoria: d.categoria || null, geo: d.geo || null, traffic: d.traffic || null,
+        tenia_ads_txt: d.adsTxt ?? null, decidido_por: d.por || "worker",
+      }),
+    });
+  } catch { }
+}
+
+// Traduce el diagnóstico técnico a una frase que explique qué pasó y qué se podría probar.
+function _comentarioSinEmail(d) {
+  if (d.waf) return "El sitio está detrás de un WAF (Cloudflare) que bloquea el crawler antes de servir el HTML. No es que no tenga email: no lo pudimos leer. Vale probar por MX/DMARC, Certificate Transparency o buscando el dominio en Google.";
+  if (!d.crudos) return `Se leyeron ${d.paginas ?? "varias"} páginas (home, contacto, publicidad, legales) y NINGUNA publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo.`;
+  if (d.rechazados?.length) return `La web SÍ publica ${d.crudos} dirección(es), pero el ranking las rechazó a todas: ${d.rechazados.slice(0, 3).join(", ")}. Si alguna parece legítima, el filtro está siendo demasiado estricto y hay que revisarlo.`;
+  return "No se encontró contacto y no quedó registro de candidatos. Revisar si el crawl llegó a correr.";
+}
+
 async function reabrirLeadsRebotados(token) {
   try {
     if (!(await _tocaCorrer(token, "reabrir_rebotados", 6 * 60))) return;
@@ -12714,6 +12802,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
     if (_ads.state === "no") {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: sin_ads_txt` });
+      registrarDiagDescarte(token, {
+        domain, etapa: "puerta_0_ads_txt", motivo: "sin_ads_txt", adsTxt: false,
+        comentario: "No publica /ads.txt, que es la prueba de que vende display. Regla del user: sin ads.txt no entra. Si el sitio SÍ monetiza, puede ser que el archivo esté detrás de Cloudflare — eso lo reintenta recheckAdsTxtUnknowns.",
+      }).catch(() => {});
       await _auditAdsTxt(token, domain, "no", "sin ads.txt", source, "proceso");
       log(`  📄 ${domain} — SIN ads.txt → no monetiza, descartado (0 API gastada)`);
       return;
@@ -13007,6 +13099,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     await markCsvItem(token, item.id, "skipped", {
       error_message: `no_prospectable_tipo: "${swCategory}" es ${_nunca} (ni con ads.txt ni con tráfico)`,
     });
+    registrarDiagDescarte(token, {
+      domain, etapa: "tipo_de_negocio", motivo: `tipo_no_prospectable:${_nunca}`,
+      categoria: swCategory, geo: topCountry || "", traffic: effectivePageViews, adsTxt: true,
+      comentario: `Tiene ads.txt y tráfico de sobra, pero es "${swCategory}" → ${_nunca}. No es un publisher al que se le venda display: monetiza su propio inventario o vende producto. Regla del user (27/08): aunque cumpla los requisitos, banco/ecommerce/porno/streaming no entran.`,
+    }).catch(() => {});
     log(`  ⛔ ${domain} — "${swCategory}" es ${_nunca}: no es un publisher de display, no entra`);
     return;
   }
@@ -13128,6 +13225,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         motivo: `geo_excluida:${topCountry || iso}`,
       });
       await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
+      registrarDiagDescarte(token, {
+        domain, etapa: "geo_bloqueada", motivo: `geo_excluida:${topCountry || iso}`,
+        categoria: category, geo: topCountry || iso, traffic: effectivePageViews, adsTxt: true,
+        comentario: `Cumple todo salvo el país: ${topCountry || iso} está destildado hoy. NO se pierde — quedó aparcado en Prospects-2 y vuelve solo si se vuelve a habilitar ese país.`,
+      }).catch(() => {});
       log(`  🅿️ ${domain} — GEO ${topCountry || iso} excluida hoy → aparcado en Prospects-2 (no se pierde)`);
       return;
     }
@@ -19980,7 +20082,16 @@ async function runAgentCycle(token, allFlags) {
     // estaban incrustados acá, así que no había forma de pedir el pool SIN el foco de GEO
     // cuando ese foco no llenaba el lote.
     const _urlPool = (orden, filtros = "") =>
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gte.${aCfg.thresholdTraffic}${filtros}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
+      // ── LO QUE EL MB YA DIJO QUE NO SIRVE, NO SE ENVÍA (Maxi 2026-08-27) ──────────────
+      // `suspect_reject=true` marca los leads que Haiku identificó como del MISMO TIPO que
+      // los que el media buyer descartó, usando sus propios comentarios ("es un cine",
+      // "compañía de internet", "casinos online"). Esa marca existía SOLO para pintar un ⚠️
+      // en la toolbar: el agente automático la ignoraba y mandaba igual.
+      // Medido: 31 mails salieron a sitios ya marcados. Cada uno gasta un envío del cupo
+      // diario y quema reputación con alguien que nunca iba a comprar.
+      // Se sacan del pool del agente. NO se borran: siguen en Prospects para que el MB
+      // confirme o levante la marca, que es como estaba pensado.
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&traffic=gte.${aCfg.thresholdTraffic}${filtros}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
     const _hdrsPool = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
     // ══════════════════════════════════════════════════════════════════════════════════
@@ -22882,6 +22993,36 @@ async function enviarResumenSalud(token) {
         const _top = Object.entries(_porMotivo).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
         _errs.push("SIN EMAIL — por qué:");
         for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n} caso(s). Ej: ${v.ej.join(", ")}`);
+      }
+
+      // 1b) El comentario REAL de un caso concreto, para poder verificarlo a mano.
+      // Un porcentaje no se puede comprobar; un dominio con su explicación sí.
+      const _diagSE = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${_desdeResumenISO}&select=domain,motivo,comentario&order=created_at.desc&limit=200`,
+        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      if (Array.isArray(_diagSE) && _diagSE.length) {
+        const _porMot = {};
+        for (const d of _diagSE) (_porMot[d.motivo] = _porMot[d.motivo] || []).push(d);
+        _errs.push("", "SIN EMAIL — un caso de cada tipo, para verificar:");
+        for (const [mot, arr] of Object.entries(_porMot).slice(0, 4)) {
+          const ej = arr[0];
+          _errs.push(`   · ${mot} (${arr.length} casos) — ej. ${ej.domain}`);
+          if (ej.comentario) _errs.push(`     ${ej.comentario}`);
+        }
+      }
+
+      // 1c) Descartes del descubrimiento, con el motivo explicado.
+      const _diagDesc = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_diag_descartes?created_at=gte.${_desdeResumenISO}&select=domain,etapa,motivo,comentario&order=created_at.desc&limit=300`,
+        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      if (Array.isArray(_diagDesc) && _diagDesc.length) {
+        const _porEtapa = {};
+        for (const d of _diagDesc) (_porEtapa[d.etapa] = _porEtapa[d.etapa] || []).push(d);
+        _errs.push("", `DESCARTES DEL DESCUBRIMIENTO (${_diagDesc.length}) — por qué:`);
+        for (const [et, arr] of Object.entries(_porEtapa).sort((a, b) => b[1].length - a[1].length).slice(0, 4)) {
+          _errs.push(`   · ${et} → ${arr.length}. Ej: ${arr.slice(0, 2).map(x => x.domain).join(", ")}`);
+          if (arr[0].comentario) _errs.push(`     ${arr[0].comentario}`);
+        }
       }
 
       // 2) Por qué el agente saltea envíos.
