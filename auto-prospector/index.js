@@ -848,6 +848,21 @@ async function purgarColaVieja(token) {
       if (r.ok) borradas += ids.length;
     }
     if (borradas) log(`  🧹 cola: ${borradas} fila(s) done de +${_PURGA_DIAS} días borradas (el dominio sigue en Prospects)`);
+
+    // ── `toolbar_import_queue`: la mitad de la tabla estaba muerta (Maxi 2026-08-27) ─────
+    // 400.552 filas, de las cuales 194.896 ya vencieron. La tabla tiene `expires_at` desde
+    // el diseño y los dos lectores lo respetan —o sea que las vencidas NO bloquean ninguna
+    // re-importación, la lógica está bien—, pero nadie las borraba nunca. Es peso muerto que
+    // engorda cada consulta de dedupe.
+    // Se borran solo las que vencieron hace más de una semana: si algo las leyera con un
+    // reloj corrido, ese margen lo cubre.
+    try {
+      const _corteImp = new Date(Date.now() - 7 * 86400000).toISOString();
+      const ri = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_import_queue?expires_at=lt.${_corteImp}`,
+        { method: "DELETE", headers: { ...auth, "Prefer": "count=exact,return=minimal" } });
+      const _bi = parseInt((ri.headers.get("content-range") || "").match(/\/?(\d+)$/)?.[1] || "0", 10);
+      if (_bi) log(`  🧹 import_queue: ${_bi} fila(s) vencidas hace +7 días borradas`);
+    } catch (e) { log(`  ⚠️ purga import_queue: ${e.message}`); }
     await saludPing(token, "purga_cola", {
       status: "ok", cadenciaMin: 24 * 60, real: borradas,
       detalle: `${borradas} done de +${_PURGA_DIAS} días (con respaldo en Prospects)`,
