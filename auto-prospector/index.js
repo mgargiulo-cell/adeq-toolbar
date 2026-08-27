@@ -2335,6 +2335,23 @@ const _PAISES_POR_IDIOMA = {
   // Idiomas nuevos: sin esta entrada, sus frases no tendrían país y no se buscarían.
   id: ["id"],
   ja: ["jp"],
+  // ── LOS IDIOMAS QUE EL POOL YA MOSTRABA Y NO BUSCÁBAMOS (Maxi 2026-08-27) ─────────────
+  // Grecia era el 8º país del pool (85 publishers) y no teníamos UNA sola keyword en griego.
+  // Lo mismo con Hungría (25), Vietnam (20), Taiwán (15), Corea (12), Malasia (8), Chequia,
+  // Bulgaria y Serbia. Esos publishers llegaban de rebote —por una búsqueda en otro idioma—
+  // en vez de buscarse a propósito.
+  // Todos caen dentro del foco que fijó el user: Europa y Asia, sin anglo.
+  el: ["gr", "cy"],
+  ro: ["ro", "md"],
+  hu: ["hu"],
+  cs: ["cz"],
+  bg: ["bg"],
+  sr: ["rs", "ba", "me"],
+  vi: ["vn"],
+  th: ["th"],
+  ko: ["kr"],
+  zh: ["tw", "hk", "sg"],      // sin `cn`: Google no opera ahí
+  ms: ["my", "sg", "bn"],
 };
 // ── EL FOCO GEOGRÁFICO, DICHO POR EL USER (2026-08-26) ─────────────────────────────────
 // "Focalizar en países de América Central, Sur, Europa y Asia. Oceanía, USA, Canadá, UK y
@@ -2455,8 +2472,17 @@ function _paisParaFrase(frase, esHispano) {
 // memoria. La caché evita repetir la consulta dentro del mismo slot.
 const _KW_BASE_CACHE = { ts: 0, hispano: null, data: null };
 const _KW_BASE_TTL_MS = 30 * 60 * 1000;
-const _KW_BASE_CUPOS = { es: 1200, pt: 400, it: 300, fr: 300, ar: 200 };   // `en` queda afuera a propósito
-const _KW_BASE_TOTALES = { es: 44941, pt: 14949, it: 10000, fr: 8000, ar: 6999 };
+// Maxi 2026-08-27: se suman los once idiomas nuevos. Los cupos son chicos a propósito —son
+// 40 frases cada uno contra las 44.941 del español—, pero alcanzan para que cada slot toque
+// esos mercados en vez de llegar a ellos de rebote. `en` sigue afuera a propósito.
+const _KW_BASE_CUPOS = {
+  es: 1200, pt: 400, it: 300, fr: 300, ar: 200,
+  el: 40, ro: 40, hu: 40, cs: 40, bg: 40, sr: 40, vi: 40, th: 40, ko: 40, zh: 40, ms: 40,
+};
+const _KW_BASE_TOTALES = {
+  es: 45241, pt: 14949, it: 10000, fr: 8000, ar: 6999,
+  el: 40, ro: 40, hu: 40, cs: 40, bg: 40, sr: 40, vi: 40, th: 40, ko: 40, zh: 40, ms: 40,
+};
 
 async function _muestraKeywordsDeLaBase(token, soloEspanol) {
   const ahora = Date.now();
