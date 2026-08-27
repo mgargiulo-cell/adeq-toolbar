@@ -1866,11 +1866,101 @@ const PER_SOURCE_ACTIVE_CAP = {
   // del reparto del feeder y pasaron a ser un barrido DIARIO del 100% del board
   // (sincronizarFinalizadosDeMonday). Es la mejor fuente que tenemos —gente que ya
   // trabajó con nosotros— y con el carril viejo se estrangulaba sola.
-  auto_feeder_monday:   400,
+  // Maxi 2026-08-27: 400 → 700. El user quiere el board de finalizados SIEMPRE en cero, y con
+  // 5.540 esperando el carril era el cuello: el barrido tenía permiso para 400 y encolaba 248
+  // porque el carril ya estaba lleno. Subir el techo del barrido sin subir el carril no habría
+  // cambiado nada.
+  // No se pone en 5.540 de una: volcar todo el board a la cola de golpe la tapa y frena a las
+  // otras fuentes —ya pasó en agosto, 1.716 dominios trabados—. A 700/día se vacía en ocho
+  // días y después el barrido solo tiene que seguirle el ritmo a los finalizados nuevos.
+  auto_feeder_monday:   700,
   autogoogle:           180,   // carril RESERVADO — nunca lo tapa un JSON
   auto_feeder_similar:  250,   // Maxi 2026-08-25: 150 → 250. Es la fuente que MEJOR convierte (76% con email) y tenía el carril más chico. Expansión por similares desde Prospects
 };
 const DEFAULT_SOURCE_CAP = 150;
+
+// ── LOS CARRILES SE AJUSTAN SOLOS SEGÚN LO QUE RINDE CADA FUENTE (Maxi 2026-08-27) ───────
+// Los números de arriba están bien pensados, pero son ESTÁTICOS: salieron de mediciones de
+// una fecha puntual y se quedan clavados hasta que alguien vuelva a medir a mano. Cuando una
+// fuente se degrada —o mejora— el reparto no se entera.
+// Medido hoy sobre 14 días: similar convierte 27,8%, monday 24,7%, adstxt 17,7%, majestic
+// 15,9%, autogoogle 10,8% y sellers 9,3%. Sellers tiene el segundo carril más grande y el
+// peor rendimiento.
+//
+// Reglas del ajuste, para que no se coma a sí mismo:
+//  · el TOTAL no cambia — se reparte distinto, no se agranda;
+//  · piso del 40% del cap base: una fuente que baja un mes no puede quedar estrangulada, o no
+//    tendría cómo demostrar que se recuperó. Es el error clásico de optimizar sin explorar;
+//  · techo del 200%, para que un pico no vacíe a las demás;
+//  · sin datos suficientes (menos de 50 procesados) NO se toca: no se decide con ruido.
+const _CAP_PISO = 0.4, _CAP_TECHO = 2.0, _CAP_MIN_MUESTRA = 50;
+// `auto_feeder_monday` queda FUERA del reparto por rendimiento. Su carril de 400 no salió de
+// competir contra las otras fuentes: es el tamaño que necesita el barrido diario del board
+// completo (`sincronizarFinalizadosDeMonday`). Meterlo en la comparación lo bajaba a 289 y
+// estrangulaba ese barrido —que además es la mejor fuente que tenemos, gente que YA trabajó
+// con nosotros—. Un cap que existe por una razón operativa no se optimiza por yield.
+const _CARRILES_FIJOS = new Set(["auto_feeder_monday"]);
+let _capsDinamicos = null;
+
+async function recalcularCarrilesPorRendimiento(token) {
+  try {
+    // El worker reinicia cada ~7 min y `_capsDinamicos` vive en memoria: sin esto se perdería
+    // el cálculo en cada reinicio y el reparto volvería al fijo hasta la próxima vuelta de 12h.
+    if (!_capsDinamicos) {
+      try {
+        const _cfg = await getConfig(token);
+        const _g = JSON.parse(_cfg.carriles_dinamicos || "null");
+        if (_g && typeof _g === "object") _capsDinamicos = _g;
+      } catch {}
+    }
+    if (!(await _tocaCorrer(token, "recalcular_carriles", 12 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const desde = new Date(Date.now() - 14 * 86400_000).toISOString();
+    const filas = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde}&select=source,status&limit=20000`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (!Array.isArray(filas) || filas.length < 200) return;   // muestra chica: no se toca nada
+
+    const stats = {};
+    for (const f of filas) {
+      const src = String(f.source || "");
+      if (!(src in PER_SOURCE_ACTIVE_CAP) || _CARRILES_FIJOS.has(src)) continue;
+      (stats[src] = stats[src] || { n: 0, ok: 0 }).n++;
+      if (f.status === "done") stats[src].ok++;
+    }
+    const conDatos = Object.entries(stats).filter(([, v]) => v.n >= _CAP_MIN_MUESTRA);
+    if (conDatos.length < 3) return;                            // sin con qué comparar
+
+    const total = conDatos.reduce((a, [src]) => a + (PER_SOURCE_ACTIVE_CAP[src] || DEFAULT_SOURCE_CAP), 0);
+    // El rendimiento se suaviza con +1/+10: una fuente con 2 de 3 no puede parecer mejor que
+    // una con 200 de 900 solo por tener pocos datos.
+    const pesos = conDatos.map(([src, v]) => [src, (v.ok + 1) / (v.n + 10)]);
+    const sumaPesos = pesos.reduce((a, [, w]) => a + w, 0) || 1;
+
+    const nuevos = {};
+    for (const [src, w] of pesos) {
+      const base = PER_SOURCE_ACTIVE_CAP[src] || DEFAULT_SOURCE_CAP;
+      const ideal = Math.round((w / sumaPesos) * total);
+      nuevos[src] = Math.max(Math.round(base * _CAP_PISO), Math.min(Math.round(base * _CAP_TECHO), ideal));
+    }
+    _capsDinamicos = nuevos;
+    await setConfigValue(token, "carriles_dinamicos", JSON.stringify(nuevos)).catch(() => {});
+    const _resumen = conDatos
+      .map(([src, v]) => `${src.replace("auto_feeder_", "")} ${Math.round(100 * v.ok / v.n)}%→${nuevos[src]}`)
+      .join(" · ");
+    log(`  ⚖️ carriles recalculados por rendimiento: ${_resumen}`);
+    await saludPing(token, "carriles_dinamicos", {
+      status: "ok", cadenciaMin: 12 * 60, real: Object.keys(nuevos).length,
+      detalle: _resumen,
+    }).catch(() => {});
+  } catch (e) { log(`⚠️ recalcularCarrilesPorRendimiento: ${e.message}`); }
+}
+
+// El cap efectivo: el dinámico si ya se calculó, si no el de la tabla de arriba.
+function _capDeFuente(sourceTag) {
+  if (_capsDinamicos && _capsDinamicos[sourceTag] != null) return _capsDinamicos[sourceTag];
+  return PER_SOURCE_ACTIVE_CAP[sourceTag] ?? DEFAULT_SOURCE_CAP;
+}
 
 async function _countActiveCsvBySource(token, sourceTag) {
   try {
@@ -2036,7 +2126,7 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
   }
   if (!domains || domains.length === 0) return 0;
   // CARRIL de la fuente: si ya llenó su cupo activo, no inyectar más.
-  const laneCap  = PER_SOURCE_ACTIVE_CAP[sourceTag] ?? DEFAULT_SOURCE_CAP;
+  const laneCap  = _capDeFuente(sourceTag);   // dinámico por rendimiento; cae al fijo si aún no se calculó
   const laneUsed = await _countActiveCsvBySource(token, sourceTag);
   const laneRoom = Math.max(0, laneCap - laneUsed);
   // Maxi 2026-07-17 (pedido del user): PRE-LISTADO. Antes el excedente del carril se DESCARTABA
@@ -2273,18 +2363,96 @@ const _CIUDADES = {
   do: ["Santiago de los Caballeros", "La Romana"],
   it: ["Napoli", "Torino", "Palermo", "Bologna", "Firenze", "Bari", "Catania", "Verona"],
   fr: ["Lyon", "Marseille", "Toulouse", "Bordeaux", "Lille", "Nantes", "Strasbourg", "Rennes"],
+  // ── LOS PAÍSES QUE YA BUSCÁBAMOS SIN CIUDADES (Maxi 2026-08-27) ──────────────────────
+  // La plantilla "medio + ciudad" es la que mejor rinde de todas, y solo cubría 17 países
+  // —todos LATAM más Italia y Francia—. Alemania, Grecia, Polonia, Turquía, Vietnam y el
+  // resto se buscaban SOLO con temas sueltos, que es el patrón que peor funciona.
+  // Se usan ciudades SECUNDARIAS a propósito: la capital devuelve los medios nacionales que
+  // ya conocemos; la segunda y tercera ciudad es donde vive el diario regional que monetiza
+  // y que todavía no tenemos.
+  de: ["München", "Hamburg", "Köln", "Frankfurt", "Stuttgart", "Dortmund", "Leipzig", "Bremen"],
+  at: ["Graz", "Linz", "Salzburg", "Innsbruck"],
+  ch: ["Zürich", "Basel", "Lausanne", "Bern"],
+  nl: ["Rotterdam", "Utrecht", "Eindhoven", "Groningen", "Tilburg"],
+  be: ["Antwerpen", "Gent", "Charleroi", "Liège"],
+  pl: ["Kraków", "Wrocław", "Poznań", "Gdańsk", "Łódź", "Katowice"],
+  tr: ["İzmir", "Bursa", "Antalya", "Adana", "Konya", "Gaziantep"],
+  gr: ["Θεσσαλονίκη", "Πάτρα", "Ηράκλειο", "Λάρισα", "Βόλος"],
+  ro: ["Cluj-Napoca", "Timișoara", "Iași", "Constanța", "Brașov"],
+  hu: ["Debrecen", "Szeged", "Miskolc", "Pécs", "Győr"],
+  cz: ["Brno", "Ostrava", "Plzeň", "Olomouc"],
+  bg: ["Пловдив", "Варна", "Бургас", "Русе"],
+  rs: ["Novi Sad", "Niš", "Kragujevac"],
+  pt: ["Porto", "Braga", "Coimbra", "Faro", "Funchal"],
+  id: ["Surabaya", "Bandung", "Medan", "Semarang", "Makassar", "Yogyakarta"],
+  vn: ["Đà Nẵng", "Hải Phòng", "Cần Thơ", "Huế", "Nha Trang"],
+  th: ["เชียงใหม่", "ขอนแก่น", "ภูเก็ต", "หาดใหญ่"],
+  my: ["Johor Bahru", "Penang", "Ipoh", "Kuching", "Kota Kinabalu"],
+  kr: ["부산", "인천", "대구", "광주", "대전"],
+  tw: ["高雄", "台中", "台南", "新竹"],
+  jp: ["大阪", "名古屋", "福岡", "札幌", "仙台", "広島"],
+  ma: ["Casablanca", "Marrakech", "Fès", "Tanger"],
+  eg: ["الإسكندرية", "الجيزة", "المنصورة", "أسيوط"],
 };
+// ── LA PLANTILLA QUE MÁS RINDE, EN TODOS LOS IDIOMAS QUE BUSCAMOS (Maxi 2026-08-27) ──────
+// "medio + ciudad" rinde 1,83 calificados cada 100 búsquedas contra 0,23 de un tema suelto:
+// ocho veces más. Y solo existía en cuatro idiomas, justo después de haber sumado once
+// idiomas nuevos con sus países mapeados. Griego, húngaro, rumano, vietnamita y compañía
+// tenían país para buscar pero ninguna plantilla que los aprovechara.
+// Se suman también variantes de HUELLA COMERCIAL por ciudad ("mídia kit", "anuncie"), que es
+// el segundo patrón que mejor rinde: combina las dos señales que funcionan.
 const _PLANTILLAS_CIUDAD = {
-  es: [`diario digital {ciudad}`, `noticias {ciudad} hoy portal`, `periódico local {ciudad}`, `medio digital {ciudad} publicidad`],
-  pt: [`jornal digital {ciudad}`, `notícias {ciudad} hoje portal`, `portal de notícias {ciudad}`],
-  it: [`giornale online {ciudad}`, `notizie {ciudad} oggi`, `quotidiano locale {ciudad}`],
-  fr: [`journal en ligne {ciudad}`, `actualités {ciudad} aujourd'hui`, `média local {ciudad}`],
+  es: [`diario digital {ciudad}`, `noticias {ciudad} hoy portal`, `periódico local {ciudad}`,
+       `medio digital {ciudad} publicidad`, `portal de noticias {ciudad}`,
+       `"anunciate" OR "tarifas publicitarias" diario {ciudad}`],
+  pt: [`jornal digital {ciudad}`, `notícias {ciudad} hoje portal`, `portal de notícias {ciudad}`,
+       `jornal local {ciudad}`, `"mídia kit" OR "anuncie conosco" portal {ciudad}`],
+  it: [`giornale online {ciudad}`, `notizie {ciudad} oggi`, `quotidiano locale {ciudad}`,
+       `"pubblicità" OR "media kit" giornale {ciudad}`],
+  fr: [`journal en ligne {ciudad}`, `actualités {ciudad} aujourd'hui`, `média local {ciudad}`,
+       `"régie publicitaire" OR "kit média" journal {ciudad}`],
+  de: [`nachrichten {ciudad} heute`, `lokalzeitung {ciudad} online`, `"mediadaten" zeitung {ciudad}`],
+  nl: [`nieuws {ciudad} vandaag`, `regionale krant {ciudad}`, `"adverteren" nieuwssite {ciudad}`],
+  pl: [`wiadomości {ciudad} dzisiaj`, `lokalna gazeta {ciudad}`, `"reklama" portal {ciudad}`],
+  tr: [`{ciudad} haberleri bugün`, `yerel gazete {ciudad}`, `"reklam" haber sitesi {ciudad}`],
+  ar: [`أخبار {ciudad} اليوم`, `صحيفة {ciudad} الإلكترونية`, `"إعلانات" موقع أخبار {ciudad}`],
+  id: [`berita {ciudad} hari ini`, `portal berita {ciudad}`, `"pasang iklan" berita {ciudad}`],
+  ja: [`{ciudad} ニュース 今日`, `{ciudad} 地域 情報サイト`, `{ciudad} 広告掲載 メディア`],
+  // Los once idiomas que se sumaron hoy: ya tenían país, ahora tienen con qué buscarlo.
+  el: [`ειδήσεις {ciudad} σήμερα`, `τοπική εφημερίδα {ciudad}`, `"διαφήμιση" ενημερωτικό site {ciudad}`],
+  ro: [`știri {ciudad} azi`, `ziar local {ciudad}`, `"publicitate" portal {ciudad}`],
+  hu: [`{ciudad} hírek ma`, `helyi újság {ciudad}`, `"hirdetés" hírportál {ciudad}`],
+  cs: [`zprávy {ciudad} dnes`, `místní noviny {ciudad}`, `"reklama" zpravodajský web {ciudad}`],
+  bg: [`новини {ciudad} днес`, `местен вестник {ciudad}`, `"реклама" новинарски сайт {ciudad}`],
+  sr: [`vesti {ciudad} danas`, `lokalne novine {ciudad}`, `"oglašavanje" portal {ciudad}`],
+  vi: [`tin tức {ciudad} hôm nay`, `báo địa phương {ciudad}`, `"quảng cáo" trang tin {ciudad}`],
+  th: [`ข่าว {ciudad} วันนี้`, `หนังสือพิมพ์ท้องถิ่น {ciudad}`, `"ลงโฆษณา" เว็บข่าว {ciudad}`],
+  ko: [`{ciudad} 뉴스 오늘`, `{ciudad} 지역 신문`, `{ciudad} 광고 문의 언론사`],
+  zh: [`{ciudad} 新闻 今天`, `{ciudad} 地方 新聞網`, `{ciudad} 廣告刊登 媒體`],
+  ms: [`berita {ciudad} hari ini`, `akhbar tempatan {ciudad}`, `"iklan" portal berita {ciudad}`],
 };
-const _IDIOMA_DE_PAIS = { br: "pt", it: "it", fr: "fr" };
+// Sin esto, una ciudad alemana se buscaría con la plantilla en español ("diario digital
+// München") y no encontraría nada. El default sigue siendo `es` porque el grueso del pool es
+// hispano; acá va todo lo que NO lo es.
+const _IDIOMA_DE_PAIS = {
+  br: "pt", pt: "pt",
+  it: "it", fr: "fr", ma: "fr",
+  de: "de", at: "de", ch: "de",
+  nl: "nl", be: "nl",
+  pl: "pl", tr: "tr",
+  gr: "el", ro: "ro", hu: "hu", cz: "cs", bg: "bg", rs: "sr",
+  id: "id", vn: "vi", th: "th", my: "ms",
+  kr: "ko", tw: "zh", jp: "ja",
+  eg: "ar",
+};
 
 function _construirBusquedasPorCiudad(esHispano, cuantas) {
+  // En el turno hispano solo entran países de habla hispana. Antes se excluían br/it/fr a
+  // mano; con 40 países en la lista esa lista negra ya no alcanza —se colarían Alemania,
+  // Grecia o Japón en un slot que existe justamente para garantizar LATAM y España—.
+  // Ahora se decide por el IDIOMA del país, que es el dato correcto.
   const paises = esHispano
-    ? Object.keys(_CIUDADES).filter(p => !["br", "it", "fr"].includes(p))
+    ? Object.keys(_CIUDADES).filter(p => (_IDIOMA_DE_PAIS[p] || "es") === "es")
     : Object.keys(_CIUDADES);
   const out = [];
   for (let i = 0; i < cuantas; i++) {
@@ -3060,8 +3228,23 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // Google nos repita Clarín e Infobae. La huella comercial, en cambio, solo aparece en
   // sitios que MONETIZAN, así que filtra sola y casi todo lo que trae es prospectable.
   // Los temas bajan a exploración pura, que es el rol que les corresponde.
-  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.45)));
-  const _porCiudad       = _construirBusquedasPorCiudad(_hispanicSlot, Math.max(1, Math.round(N * 0.20)));
+  // ── EL REPARTO SALE DE LO QUE RINDE, NO DE LA INTUICIÓN (Maxi 2026-08-27) ──────────────
+  // Medido sobre las 1.561 frases con historial (4.558 búsquedas):
+  //   · "medio + ciudad"    → 1,83 calificados cada 100 búsquedas
+  //   · huella comercial    → 0,67
+  //   · tema genérico       → 0,23
+  // O sea que buscar "medio local <ciudad>" rinde OCHO VECES lo que un tema suelto. Y los
+  // temas se llevaban el 66% de las búsquedas (3.017 de 4.558) para aportar un tercio de los
+  // resultados. Un buscador profesional no reparte parejo: apuesta donde pega.
+  //
+  // Por qué funciona: "diario digital Tucumán" describe EXACTAMENTE lo que buscamos —un medio
+  // regional que vende display—, mientras que "trastornos del sueño" devuelve cualquier cosa
+  // que hable del tema, casi siempre un portal grande que ya conocemos.
+  //
+  // Los temas NO se eliminan: bajan a exploración pura. Es la parte que descubre nichos que
+  // ninguna plantilla nuestra imaginó, y sin eso el motor se encierra en lo que ya sabe.
+  const _huellaPublisher = _construirBusquedasDeHuella(_hispanicSlot, Math.max(2, Math.round(N * 0.30)));
+  const _porCiudad       = _construirBusquedasPorCiudad(_hispanicSlot, Math.max(2, Math.round(N * 0.45)));
   // Explotar el propio éxito: los pares de un publisher que YA validamos.
   const _porSsp          = await _construirBusquedasPorSspRegional(token, Math.max(1, Math.round(N * 0.10))).catch(() => []);
   const _dirigidas = [..._huellaPublisher, ..._porCiudad, ..._porSsp];
@@ -3339,7 +3522,7 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
   // (~7 min) y la COLA DE PROSPECTOS, que va última, no corría nunca. Ese fue el apagón de
   // hoy: 200 pendientes, 0 en proceso, cero errores, durante horas.
   // Si no hay lugar donde poner lo que se descubra, no se descubre.
-  const _cupoCarril = PER_SOURCE_ACTIVE_CAP["auto_feeder_sellers"] ?? DEFAULT_SOURCE_CAP;
+  const _cupoCarril = _capDeFuente("auto_feeder_sellers");
   const _usadoCarril = await _countActiveCsvBySource(token, "auto_feeder_sellers");
   if (_usadoCarril >= _cupoCarril) {
     log(`⏸️ sellers: carril lleno (${_usadoCarril}/${_cupoCarril}) — no bajo ningún sellers.json, sería trabajo tirado`);
@@ -3403,7 +3586,15 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
 // `processCsvItem`, así que la URL se re-valida sola (ads.txt, tráfico, clasificador
 // de publisher) y se les busca contacto de nuevo.
 const MONDAY_FINALIZADO_STAGE = 5;          // deal_stage index del board 1420268379
-const MONDAY_SYNC_MAX_POR_DIA = 400;        // techo para no inundar la cola de una
+// ── EL OBJETIVO ES LLEGAR A CERO (Maxi 2026-08-27, pedido del user) ─────────────────────
+// "El barrido diario de Monday está perfecto para intentar estar siempre en cero: que todas
+//  las webs en ciclo finalizado vuelvan a Prospects."
+// Con techo 400 y 5.540 re-prospectables esperando, el barrido tardaría catorce días en
+// vaciar la cola —y cada día entran finalizados nuevos, así que en la práctica no llegaba
+// nunca—. Encima ayer encoló 248 de los 400 que tenía permitidos: el carril ya estaba lleno.
+// Es la fuente que MEJOR convierte (24,7%) y la única de gente que ya trabajó con nosotros.
+// Se sube el techo y se hace configurable, para poder ajustarlo sin deployar.
+const MONDAY_SYNC_MAX_POR_DIA = 400;        // default; lo pisa `monday_sync_techo_dia`
 
 // ── EL ESTADO DE MONDAY, GUARDADO PARA PODER CONSULTARLO (Maxi 2026-08-25) ──────────
 // Regla del user, verificada contra las 11 etiquetas del board: solo se re-contacta si el
@@ -3463,6 +3654,7 @@ async function sincronizarFinalizadosDeMonday(token) {
     if (!cfg) return 0;
     if (String(cfg.monday_sync_finalizados ?? "true") !== "true") return 0;   // ON por default
     if (!(await _tocaCorrer(token, "monday_sync_finalizados", 24 * 60))) return 0;
+    const _techoDia = parseInt(cfg.monday_sync_techo_dia || "", 10) || MONDAY_SYNC_MAX_POR_DIA;
 
     const mondayApiKey = await _getMondayApiKeyForFeeder(token);
     if (!mondayApiKey) {
@@ -3534,7 +3726,7 @@ async function sincronizarFinalizadosDeMonday(token) {
     // parte comparaba el techo contra sí mismo y siempre concluía "entró todo lo que se
     // podía". Con 5.790 elegibles y un techo de 400, decía que el board quedaba al día.
     const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d));
-    const candidatos = _elegibles.slice(0, MONDAY_SYNC_MAX_POR_DIA);
+    const candidatos = _elegibles.slice(0, _techoDia);
 
     let encolados = 0;
     if (candidatos.length) {
@@ -3559,7 +3751,7 @@ async function sincronizarFinalizadosDeMonday(token) {
       ya_en_cola: enCola.size,
       reprospectables: _elegibles.length,      // los ELEGIBLES, no los que entraron en el techo
       encolados,
-      techo: MONDAY_SYNC_MAX_POR_DIA,
+      techo: _techoDia,
     })).catch(() => {});
     if (candidatos.length && encolados === 0) {
       await saludAlerta(token, {
@@ -20252,7 +20444,7 @@ async function runAgentCycle(token, allFlags) {
           source: _normSrc(_sourcesMap[e.toLowerCase()]),
           score:  rankEmail(e, domain, lead.category),
         }));
-        const ranked = _rankedAll
+        let ranked = _rankedAll   // `let`: en un re-contacto se reordena para probar otra dirección
           .filter(x => x.score >= 0)
           // Maxi 2026-07-14 (auditoría rebotes): informer (WHOIS) + freemail = email del REGISTRANTE
           // del dominio, NO el contacto comercial → nunca sirve y suele rebotar (caso rudnypc@gmail de
@@ -20270,6 +20462,34 @@ async function runAgentCycle(token, allFlags) {
             if (sa !== sb) return sb - sa;     // dentro del tier: ranking dinámico
             return b.score - a.score;          // desempate final: rankEmail
           });
+        // ── EN UN RE-CONTACTO, PROBAR OTRA DIRECCIÓN (Maxi 2026-08-27, pedido del user) ────
+        // "Que todas las webs en ciclo finalizado vuelvan a Prospects con un mail distinto al
+        //  que está en Monday, idealmente."
+        // Si ya le escribimos a este dominio y no pasó nada, insistir con LA MISMA casilla es
+        // repetir el experimento que ya falló. `toolbar_sendtrack` guarda qué dirección se usó
+        // cada vez, así que no hace falta ir a buscarlo a Monday: el dato ya está en casa.
+        //
+        // Es una PREFERENCIA, no un veto: si la única dirección buena es la que ya se usó, se
+        // manda igual —mejor re-contactar al mismo buzón que no contactar—. Por eso se
+        // reordena en vez de filtrar.
+        let _yaUsados = new Set();
+        try {
+          const _r = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&select=email&limit=10`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+          if (_r.ok) {
+            const _f = await _r.json();
+            if (Array.isArray(_f)) _yaUsados = new Set(_f.map(x => String(x.email || "").toLowerCase()).filter(Boolean));
+          }
+        } catch {}
+        if (_yaUsados.size && ranked.length > 1) {
+          const _frescos = ranked.filter(x => !_yaUsados.has(String(x.email).toLowerCase()));
+          const _repetidos = ranked.filter(x => _yaUsados.has(String(x.email).toLowerCase()));
+          if (_frescos.length) {
+            ranked = [..._frescos, ..._repetidos];
+            log(`  🔄 ${domain}: ya se escribió a ${[..._yaUsados].join(", ")} → se prueba primero ${_frescos[0].email}`);
+          }
+        }
         let email = ranked[0]?.email;
         let pickedSource = ranked[0]?.source || "";   // attribution para toolbar_source_performance (se reasigna si hay salto a otra dirección)
         // Log diagnóstico — ver qué pasó con cada candidate
@@ -24021,6 +24241,7 @@ async function main() {
       await rellenarWaitingPool(token).catch(e => log(`⚠️ pool: ${e.message}`));
       await reabrirLeadsRebotados(token).catch(e => log(`⚠️ reabrir rebotados: ${e.message}`));
       await purgarColaVieja(token).catch(e => log(`⚠️ purga: ${e.message}`));
+      await recalcularCarrilesPorRendimiento(token).catch(e => log(`⚠️ carriles: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
       await vigilarLlegadaAMonday(token).catch(e => log(`⚠️ llegada a Monday: ${e.message}`));
