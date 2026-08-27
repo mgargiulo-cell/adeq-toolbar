@@ -11875,6 +11875,101 @@ async function updateMondayItem(itemId, columnValues, mondayApiKey) {
   return data?.data?.change_multiple_column_values;
 }
 
+// ── PROSPECTS-2: EL BUZÓN DE LO YA PAGADO (Maxi 2026-08-27, pedido del user) ────────────
+// "Si hago un block de descubrimiento sobre una geo, el agente gasta crédito; si bien lo
+//  descubrí y cumple requisitos, no lo agrega a Prospects. Debería quedar en un segundo buzón
+//  oculto para no perder el caché. Y si en algún momento se destilda ese país, entran a
+//  Prospects esos candidatos ya validados."
+//
+// Cuando una web cae por GEO excluida ya nos costó el crédito de RapidAPI y el trabajo de
+// resolver tráfico, país y categoría. Descartarla quema esa plata dos veces: hoy, y de nuevo
+// el día que el user vuelva a habilitar ese país y haya que redescubrirla desde cero.
+//
+// Se aparca con TODO lo que ya sabemos. `revivirProspectsOffline` la devuelve sola cuando la
+// GEO deja de estar excluida.
+async function aparcarProspectOffline(token, d) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_prospects_offline?on_conflict=domain`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify({
+        domain: cleanDomain(d.domain), traffic: d.traffic || null, page_views: d.pageViews || null,
+        geo: d.geo || null, geos_all: Array.isArray(d.geosAll) ? d.geosAll : null,
+        language: d.language || null, category: d.category || null,
+        page_title: d.pageTitle || null,
+        ad_networks: Array.isArray(d.adNetworks) ? d.adNetworks.map(String) : null,
+        source: d.source || null, motivo: d.motivo || "sin_motivo",
+      }),
+    });
+  } catch (e) { log(`  ⚠️ no pude aparcar ${d.domain} en Prospects-2: ${e.message}`); }
+}
+
+// Devuelve a Prospects lo aparcado cuya GEO ya NO está excluida. Corre una vez por hora: es
+// una consulta barata y el user espera que destildar un país tenga efecto el mismo día.
+async function revivirProspectsOffline(token) {
+  try {
+    if (!(await _tocaCorrer(token, "revivir_offline", 60))) return;
+    const cfg = await getConfig(token);
+    let wd = {};
+    try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
+    const excluidas = new Set((wd.geos_excluded || []).map(s => String(s).toUpperCase().trim()));
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+
+    const filas = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_prospects_offline?revived_at=is.null&select=id,domain,traffic,page_views,geo,geos_all,language,category,page_title,ad_networks,source&limit=500`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (!Array.isArray(filas) || !filas.length) return;
+
+    // Solo revive lo que dejó de estar excluido. Se compara igual que en el descubrimiento
+    // —código ISO o nombre del país— porque el aparcado guarda lo que hubiera entrado ahí.
+    // El aparcado guarda el país tal como lo vio el descubrimiento: a veces el ISO ("AR") y a
+    // veces el nombre ("Argentina"). Se comparan las dos formas, porque la lista de excluidos
+    // del user puede estar escrita de cualquiera de las dos.
+    const _isoDePais = (nombre) => Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === nombre) || "";
+    const revivibles = filas.filter(f => {
+      const g = String(f.geo || "").toUpperCase().trim();
+      if (!g) return false;
+      const iso = String(_isoDePais(f.geo) || "").toUpperCase();
+      const nom = String(COUNTRY_CODES[g] || "").toUpperCase();
+      return !excluidas.has(g) && !(iso && excluidas.has(iso)) && !(nom && excluidas.has(nom));
+    });
+    if (!revivibles.length) {
+      log(`  🅿️ Prospects-2: ${filas.length} aparcado(s), ninguno revivible todavía`);
+      return;
+    }
+
+    let ok = 0;
+    for (const f of revivibles) {
+      // Se re-inyecta a la COLA, no directo a Prospects: así vuelve a pasar por las puertas
+      // (ads.txt, idioma, detector de no-publisher) con las reglas de HOY, que pueden haber
+      // cambiado desde que se aparcó. Lo que se ahorra es el crédito de RapidAPI, porque el
+      // tráfico ya está en `toolbar_traffic_cache`.
+      const met = await _injectIntoCsvQueue(token, [f.domain], f.source || "prospects_offline",
+        { reactivar: true }).catch(() => 0);
+      if (met) {
+        ok++;
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_prospects_offline?id=eq.${f.id}`, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ revived_at: new Date().toISOString() }),
+        }).catch(() => {});
+      }
+    }
+    log(`  ♻️ Prospects-2: ${ok} de ${revivibles.length} revivido(s) — su GEO volvió a estar habilitada`);
+    if (ok) {
+      await saludPing(token, "prospects_offline", {
+        status: "ok", cadenciaMin: 60, real: ok,
+        detalle: `${ok} revivido(s) de ${filas.length} aparcado(s)`,
+      }).catch(() => {});
+    }
+  } catch (e) { log(`⚠️ revivirProspectsOffline: ${e.message}`); }
+}
+
 async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSessionRef) {
   const { rapidapi_key, apollo_api_key } = cfg;
   const domain = item.domain;
@@ -12392,8 +12487,22 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     const nm  = String(topCountry || "").toUpperCase();
     const geoMatches = (set) => set.length && set.some(v => v === iso || v === nm);
     if (geoExc.length && geoMatches(geoExc)) {
+      // ── NO SE TIRA LO QUE YA SE PAGÓ (Maxi 2026-08-27, pedido del user) ──────────────
+      // Para llegar hasta acá ya gastamos el crédito de RapidAPI, resolvimos el tráfico, la
+      // GEO y la categoría. La web CUMPLE los requisitos; lo único que falla es que su país
+      // está destildado HOY. Tirarla es quemar plata dos veces: la de ahora, y la de volver
+      // a descubrirla desde cero si mañana el user destilda ese país.
+      //
+      // Va a un buzón oculto. Si la GEO deja de estar excluida, `revivirProspectsOffline`
+      // la devuelve a Prospects sin gastar un crédito más.
+      await aparcarProspectOffline(token, {
+        domain, traffic: visits, pageViews: effectivePageViews ?? null,
+        geo: topCountry || iso, geosAll: geosAllIso, category,
+        pageTitle, adNetworks, source: item.source || "",
+        motivo: `geo_excluida:${topCountry || iso}`,
+      });
       await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
-      log(`  🏭 ${domain} — GEO ${topCountry || iso} EXCLUIDO por config del worker`);
+      log(`  🅿️ ${domain} — GEO ${topCountry || iso} excluida hoy → aparcado en Prospects-2 (no se pierde)`);
       return;
     }
     // Maxi 2026-07-24 BUG FIX: geos_priority YA NO es un filtro DURO acá. Estaba descartando TODO
@@ -23196,6 +23305,8 @@ async function main() {
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
       // Y que ninguna fuente pueda morirse en silencio otra vez.
       await vigilarFuentesDeDescubrimiento(token).catch(e => log(`⚠️ fuentes: ${e.message}`));
+      // Prospects-2: devuelve a la cola lo aparcado cuya GEO volvió a habilitarse.
+      await revivirProspectsOffline(token).catch(e => log(`⚠️ prospects-2: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
       await vigilarLlegadaAMonday(token).catch(e => log(`⚠️ llegada a Monday: ${e.message}`));
