@@ -3,7 +3,7 @@
 // ============================================================
 
 import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/monday.js";
-import { getTraffic, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
+import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch }                                                                     from "../modules/gemini.js";
@@ -1093,6 +1093,17 @@ async function loadAdminAgent() {
   setVal("agent-cfg-active-end",   cfg.agent_active_hours_end,    20);
   document.getElementById("agent-stat-cap").textContent = cfg.agent_max_per_day || "10";
 
+  // Cupos por persona. Si no hay override, el campo queda VACÍO (no en 0): vacío significa
+  // "usa el default", cero significaría "no mandes nada". Confundirlos apagaría un buzón.
+  let _capsPorUsuario = {};
+  try { _capsPorUsuario = JSON.parse(cfg.agent_max_per_day_by_user || "{}"); } catch {}
+  for (const [mail, id] of Object.entries({ "mgargiulo@adeqmedia.com": "cap-mgargiulo",
+                                            "sales@adeqmedia.com":     "cap-sales",
+                                            "dhorovitz@adeqmedia.com": "cap-dhorovitz" })) {
+    const el = document.getElementById(id);
+    if (el) el.value = (_capsPorUsuario[mail] ?? "") === "" ? "" : String(_capsPorUsuario[mail]);
+  }
+
   // Focus config (JSON) — DOS sets: 🤖 agente (envío) y 🏭 worker (descubrimiento)
   let focus = { geos_priority: [], geos_excluded: [], categories_priority: [], weekly_target: 0, daily_override: 0 };
   try { focus = { ...focus, ...JSON.parse(cfg.agent_focus_config || "{}") }; } catch {}
@@ -1372,11 +1383,24 @@ async function saveAgentThresholds() {
     agent_active_hours_start: parseInt(document.getElementById("agent-cfg-active-start").value, 10) || 9,
     agent_active_hours_end:   parseInt(document.getElementById("agent-cfg-active-end").value, 10) || 23,
   };
-  // Maxi 2026-06-17: si el admin baja el cap global (ej. 30→15), también
-  // limpiamos `agent_max_per_day_by_user` para que NO siga overrideando.
-  // Antes Diego/Agus quedaban en 15 hardcoded; ahora con UI unificada el cap
-  // global gana sobre el override per-usuario.
-  updates.agent_max_per_day_by_user = "{}";
+  // ── EL CUPO POR PERSONA SE GUARDA, NO SE BORRA (Maxi 2026-08-27) ─────────────────
+  // Esto hacía `= "{}"` en cada save: el worker soportaba cupos por MB desde siempre, pero
+  // no había UI para cargarlos y el propio botón de guardar los destruía. Se podían poner
+  // por SQL y se perdían al primer clic. El user lo pidió explícito: "debe ser la opción por
+  // media buyer, elegir un número por persona diario".
+  // Vacío = ese MB usa el default global de arriba. Es la diferencia entre "sin override" y
+  // "cero envíos", que no es lo mismo y por eso se distingue el campo vacío del 0.
+  const _CAPS_UI = { "mgargiulo@adeqmedia.com": "cap-mgargiulo",
+                     "sales@adeqmedia.com":     "cap-sales",
+                     "dhorovitz@adeqmedia.com": "cap-dhorovitz" };
+  const _porUsuario = {};
+  for (const [mail, id] of Object.entries(_CAPS_UI)) {
+    const raw = (document.getElementById(id)?.value ?? "").trim();
+    if (raw === "") continue;                     // sin override
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n >= 0) _porUsuario[mail] = n;
+  }
+  updates.agent_max_per_day_by_user = JSON.stringify(_porUsuario);
 
   // Maxi 2026-07-15 (Admin#2): capturar el modo activo al store y escribir AMBAS configs (agente Y worker).
   // Antes leía los inputs RAW y escribía SOLO agent_focus_config → (1) worker_discovery_config no se podía
@@ -3177,7 +3201,10 @@ async function runTrafficCheck(opts = {}) {
     }
     if (!data) {
       metricEl.textContent = "No data"; metricEl.className = "metric";
-      filterEl.textContent = "Configure your RapidAPI key"; filterEl.className = "filter-tag fail";
+      // Maxi 2026-08-27: decía SIEMPRE "Configure your RapidAPI key", aunque la key estuviera
+      // bien. Ahora dice qué falló de verdad (ver `ultimoErrorTrafico` en traffic.js).
+      filterEl.textContent = ultimoErrorTrafico || "Sin datos para este dominio";
+      filterEl.className = "filter-tag fail";
       return;
     }
 

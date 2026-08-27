@@ -19,9 +19,32 @@ const SOURCE_CONFIDENCE = {
 };
 
 // Every RapidAPI call now goes through the Edge Function proxy (keys stay server-side)
+// ── EL ERROR REAL, NO UNA CONJETURA (Maxi 2026-08-27) ────────────────────────────────
+// Cuando esto fallaba, la UI decía "Configure your RapidAPI key" pasara lo que pasara: red
+// caída, sesión vencida, cuota agotada, dominio bloqueado. El user fue a revisar una key que
+// estaba perfecta —probada contra el proxy, responde bien— porque el mensaje se lo indicaba.
+// Un diagnóstico inventado es peor que no dar ninguno: manda a arreglar lo que no está roto.
+// Se guarda el motivo verdadero para que la UI lo muestre.
+export let ultimoErrorTrafico = "";
 async function rapidFetch(path) {
-  const res = await callProxy("rapidapi", path, { method: "GET" });
-  return { ok: res.ok, status: res.status, data: res.data };
+  try {
+    const res = await callProxy("rapidapi", path, { method: "GET" });
+    if (!res.ok) {
+      ultimoErrorTrafico = res.status === 401 ? "sesión vencida — volvé a entrar"
+        : res.status === 429 ? "cuota de SimilarWeb agotada este mes"
+        : res.status === 403 ? "el proxy rechazó la llamada"
+        : res.status === 503 ? "freno de emergencia activo (kill switch)"
+        : `la API respondió HTTP ${res.status}`;
+    } else ultimoErrorTrafico = "";
+    return { ok: res.ok, status: res.status, data: res.data };
+  } catch (e) {
+    // "Failed to fetch" es un TypeError: la request no llegó a completarse. Casi siempre es
+    // el service worker dormido o la red, NO la key.
+    ultimoErrorTrafico = /failed to fetch/i.test(e?.message || "")
+      ? "no se pudo conectar (red o extensión dormida) — reintentá"
+      : (e?.message || "error desconocido");
+    return { ok: false, status: 0, data: null };
+  }
 }
 
 // ISO 3166-1 numeric → alpha-2 (top countries we care about for monetization)
