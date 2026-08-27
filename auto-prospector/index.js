@@ -21800,12 +21800,32 @@ async function vigilarReputacion(token) {
     } catch { return; }
     if (!Array.isArray(envios) || envios.length < REBOTE_MUESTRA_MINIMA) return;   // sin evidencia, no se concluye
 
+    // ── UN VEREDICTO DE MILLIONVERIFIER NO ES UN REBOTE (Maxi 2026-08-27) ──────────────
+    // `toolbar_bounced_emails` guarda DOS cosas distintas: los rebotes de verdad que devuelve
+    // el SMTP, y las direcciones que MillionVerifier marcó como no entregables ANTES de
+    // enviar. Las segundas nunca salieron: son envíos EVITADOS, o sea el sistema funcionando.
+    //
+    // Contarlas acá infla el rebote alrededor del 50% —medido: 38 de 111 en 14 días eran
+    // `mv_undeliverable`— y este vigilante PAUSA los envíos 12 horas cuando el dominio pasa
+    // el 3%. O sea que el sistema se frenaba a sí mismo usando como prueba de fracaso
+    // justamente lo que había prevenido. Es el mismo error de siempre: numerador y
+    // denominador de poblaciones distintas.
+    //
+    // El denominador son los mails que SALIERON; el numerador tiene que ser, solo, los que
+    // volvieron.
     let rebotados = new Set();
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email&limit=3000`, { headers: auth });
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle&limit=3000`, { headers: auth });
       if (!r.ok) return;
       const f = await r.json();
-      if (Array.isArray(f)) rebotados = new Set(f.map(x => String(x.email || "").toLowerCase()));
+      if (Array.isArray(f)) {
+        rebotados = new Set(f
+          .filter(x => {
+            const _m = `${x.reason || ""} ${x.detalle || ""}`.toLowerCase();
+            return !/mv_undeliverable|millionverifier|pre_send|no_enviado/.test(_m);
+          })
+          .map(x => String(x.email || "").toLowerCase()));
+      }
     } catch { return; }
 
     const porBuzon = {};

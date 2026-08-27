@@ -327,9 +327,20 @@ serve(async (req) => {
 
   // TOPE GLOBAL del día, sumando a todos los usuarios. Las cuotas por usuario no alcanzan:
   // con N cuentas son N×500 llamadas. Este es el techo duro del gasto diario.
+  // ⚠️ EL WORKER NO CUENTA ACÁ (Maxi 2026-08-27) ─────────────────────────────────────
+  // Este tope existe para acotar el gasto de los USUARIOS: con N cuentas serían N×500
+  // llamadas. Pero sumaba también al worker, que arriba tiene su propio techo, más alto a
+  // propósito (hasta 5.000 de Anthropic). O sea que un día pesado del worker —perfectamente
+  // legítimo y dentro de SU cuota— podía empujar este total por encima de 2.000 y dejar a
+  // los tres MB sin SimilarWeb ni Apollo, mientras el worker seguía andando.
+  // Nunca pasó (el pico medido en 3 semanas fue 422), pero el día que pase se vería como un
+  // "Failed to fetch" inexplicable justo cuando el equipo está trabajando.
+  // Cada lado con su propio techo: el del worker ya se chequeó en el `if` de arriba.
   const { data: globalRows } = await supabase
-    .from("toolbar_api_usage").select("total").eq("day", today);
-  const globalTotal = (globalRows || []).reduce((a: number, r: any) => a + (r.total || 0), 0);
+    .from("toolbar_api_usage").select("total,user_email").eq("day", today);
+  const globalTotal = (globalRows || [])
+    .filter((r: any) => !String(r.user_email || "").startsWith("worker"))
+    .reduce((a: number, r: any) => a + (r.total || 0), 0);
   if (globalTotal > CUOTA_GLOBAL_DIA) {
     await registrarIncidente(supabase, "proxy_cuota_global", "critical", userEmail, { globalTotal, limite: CUOTA_GLOBAL_DIA });
     return json(429, { error: "Tope global diario alcanzado", used: globalTotal, limit: CUOTA_GLOBAL_DIA }, origin);
