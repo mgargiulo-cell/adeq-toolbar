@@ -18130,12 +18130,36 @@ async function _secLog(token, kind, severity, actor, detail) {
 }
 
 // Mail de alerta. Va desde el buzón del propio dueño para que nunca lo filtre spam.
-async function _secAvisar(token, cfg, { titulo, cuerpo, kind }) {
+async function _secAvisar(token, cfg, { titulo, cuerpo, kind, forzar = false }) {
   const dest = (cfg.security_alert_email || "mgargiulo@adeqmedia.com").trim();
-  // Anti-spam: un mail por tipo cada 60 min. Si algo está roto no queremos 200 mails.
-  const ultimaKey = `security_last_alert_${kind}`;
-  const ultima = Date.parse(cfg[ultimaKey] || "") || 0;
-  if (Date.now() - ultima < 60 * 60 * 1000) return false;
+  // ── UN MAIL DE ALERTA POR DÍA, DE VERDAD (Maxi 2026-08-27) ──────────────────────────
+  // El freno era de 60 minutos POR TIPO. El 27/08 llegaron dos mails de la misma alarma con
+  // 73 minutos de diferencia: pasó el filtro por trece minutos. Y el camino "crítico" ni
+  // siquiera entraba al presupuesto diario que ya existía para los paros, así que tenía vía
+  // libre para sonar todo el día.
+  //
+  // Ahora el presupuesto es GLOBAL y por día calendario: una alerta por día, la primera, que
+  // es la que tiene valor. Todo lo demás va al resumen. El user lo pidió textual: "no se
+  // respeta el enviar 1 solo para resumen y 1 solo para alertas".
+  //
+  // Y se deduplica por CONTENIDO además de por día: la misma causa repetida no vuelve a
+  // sonar aunque cambie de día. Lo que se repite treinta veces no es una alerta, es un
+  // estado, y los estados van al resumen.
+  const _hoy = _madridDateStr();
+  const _firma = `${kind}|${String(cuerpo || "").replace(/\d+/g, "#").slice(0, 300)}`;
+  // `salud_resumen` es el resumen diario, no una alerta: tiene su propio canal y su propia
+  // cadencia, así que ni consume ni respeta el presupuesto de alertas.
+  const _esResumen = kind === "salud_resumen";
+  if (!forzar && !_esResumen) {
+    if (String(cfg.security_alert_mail_dia || "") === _hoy) {
+      log(`📭 alerta "${kind}": ya salió el mail de alertas de hoy — esto va al resumen`);
+      return false;
+    }
+    if (String(cfg.security_alert_firma || "") === _firma) {
+      log(`📭 alerta "${kind}": misma causa que la anterior — no vuelvo a sonar`);
+      return false;
+    }
+  }
   try {
     await sendGmailServer(token, dest, {
       to: dest,
@@ -18144,7 +18168,10 @@ async function _secAvisar(token, cfg, { titulo, cuerpo, kind }) {
       agentActionId: null,
       esProspeccion: false,       // correo interno: sin baja, sin reglas de estilo
     });
-    await setConfigValue(token, ultimaKey, new Date().toISOString()).catch(() => {});
+    if (!_esResumen) {
+      await setConfigValue(token, "security_alert_mail_dia", _hoy).catch(() => {});
+      await setConfigValue(token, "security_alert_firma", _firma).catch(() => {});
+    }
     log(`🚨 alerta de seguridad enviada a ${dest}: ${titulo}`);
     return true;
   } catch (e) {
@@ -18338,10 +18365,37 @@ async function securityWatchdog(token) {
   if (_cupoMB <= 0) _cupoMB = Number(cfg.agent_max_per_day) || 20;
   const _buzones  = 3;
   const _techoPrimero = Math.ceil(_cupoMB * _buzones * 1.5);   // 50% de aire sobre el cupo real
-  const primerContacto = await _count(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${hace(24)}&select=id`);
-  if (primerContacto > _techoPrimero) {
+  // ── SE MIDE EL MISMO DÍA QUE MIDE EL CAP (Maxi 2026-08-27) ──────────────────────────
+  // Ayer esto contaba 24h CORRIDAS contra un cupo que es POR DÍA CALENDARIO, y hoy activó
+  // el kill switch solo: el 26 el freno le comió la mañana al agente, mandó sus 60 juntos a
+  // la tarde, y sumado a lo del 27 la ventana móvil vio 102 sobre un techo de 90. El cap
+  // nunca se rompió — 20/20/20 los dos días, exacto.
+  //
+  // Es el mismo error de siempre: numerador y denominador de poblaciones distintas. Si el
+  // cap se resetea a medianoche de Madrid, la vigilancia tiene que contar desde esa misma
+  // medianoche. Cualquier ventana móvil va a solapar dos días y disparar sola.
+  //
+  // Y como el cupo es POR BUZÓN, se compara por buzón: 102 repartidos entre tres no dice
+  // nada, pero 45 en uno solo con cupo de 20 sí. Un total agregado esconde justamente el
+  // caso que esta alarma existe para detectar.
+  const _desdeMedianoche = _madridMidnightUtcISO();
+  const _porBuzon = {};
+  try {
+    const _filas = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_desdeMedianoche}&details->>ui_origin=is.null&select=user_email&limit=2000`,
+      { headers: auth }
+    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    for (const f of (Array.isArray(_filas) ? _filas : [])) {
+      const u = String(f.user_email || "?").toLowerCase();
+      _porBuzon[u] = (_porBuzon[u] || 0) + 1;
+    }
+  } catch {}
+  // El margen es sobre el cupo DE UN BUZÓN, no sobre la suma de los tres.
+  const _techoBuzon = Math.ceil(_cupoMB * 1.5);
+  const _excedidos = Object.entries(_porBuzon).filter(([, n]) => n > _techoBuzon);
+  if (_excedidos.length) {
     critico = true;
-    hallazgos.push(`• ${primerContacto} PRIMEROS contactos en 24h, con un cupo de ${_cupoMB}/día por buzón (techo ${_techoPrimero}). El cap no está frenando: o se rompió, o alguien entró a un buzón.`);
+    hallazgos.push(`• Un buzón se pasó del cupo diario HOY: ${_excedidos.map(([u, n]) => `${u.split("@")[0]}=${n}`).join(", ")} (cupo ${_cupoMB}/día, techo ${_techoBuzon}). El cap no está frenando: o se rompió, o alguien entró a ese buzón.`);
   }
   // El re-trabajo no tiene cupo, pero un número absurdo sigue siendo señal de loop descontrolado
   // (ya pasó: rebotes reenviándose en círculo). El umbral es alto a propósito.
@@ -18505,11 +18559,18 @@ async function securityWatchdog(token) {
   //
   // Ahora solo lo CRÍTICO (freno automático activado) manda mail al instante, porque
   // ahí el sistema se detuvo y hay que saberlo ya. Lo demás entra al resumen de 72h.
+  // Maxi 2026-08-27: el mail se forzaba SIEMPRE que algo fuera "crítico", aunque no hubiera
+  // frenado nada — y con el título "freno automático activado" igual. Así llegó el aviso de
+  // las 11:47 diciendo "Ninguna — solo aviso" bajo un título que anunciaba un freno.
+  // Ahora solo rompe el presupuesto diario lo que DE VERDAD detuvo el sistema: ahí el mail
+  // vale porque algo dejó de funcionar. Un crítico que no frenó nada es un aviso, y como
+  // tal respeta el "un mail por día".
   if (critico) {
     await _secAvisar(token, cfg, {
-      kind: "critico",
-      titulo: "ALERTA CRÍTICA — freno automático activado",
+      kind: freno ? "critico_freno" : "critico_aviso",
+      titulo: freno ? "ALERTA CRÍTICA — freno automático activado" : "Aviso: algo raro, sin frenar nada",
       cuerpo,
+      forzar: freno,
     });
   } else {
     await saludAlerta(token, {
