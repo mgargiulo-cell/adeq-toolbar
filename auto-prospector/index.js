@@ -24369,7 +24369,12 @@ async function main() {
       // errores, durante horas.
       // Todos estos jobs tienen su propia cadencia (`_tocaCorrer`), así que saltearlos una
       // vuelta no los pierde: corren en la siguiente. Lo que no se puede perder es la cola.
-      const _LIMITE_MANTENIMIENTO = Date.now() + 3 * 60 * 1000;
+      // Configurable sin deployar: `mantenimiento_techo_min` en toolbar_config. El límite
+      // real son los ~7 min de vida del worker — cada minuto más acá es un minuto menos para
+      // la cola de prospectos, que va después. Subirlo solo si, ya con las vueltas
+      // alternadas, algún job sigue quedándose sin turno (se ve en toolbar_health_check).
+      const _techoMant = Math.min(5, Math.max(2, parseInt((await getConfig(token).catch(() => ({}))).mantenimiento_techo_min || "3", 10) || 3));
+      const _LIMITE_MANTENIMIENTO = Date.now() + _techoMant * 60 * 1000;
       const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
