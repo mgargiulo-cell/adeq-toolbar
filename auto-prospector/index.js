@@ -823,8 +823,14 @@ async function purgarColaVieja(token) {
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const corte = new Date(Date.now() - _PURGA_DIAS * 86400000).toISOString();
     // Se piden los candidatos y se confirma uno por uno contra Prospects antes de borrar.
+    // ⚠️ POR `processed_at`, NO por `uploaded_at` (Maxi 2026-08-28). El primer corte fue por
+    // fecha de SUBIDA, y una fila subida en julio que recién se procesó HOY quedaba vieja al
+    // instante: la purga la borró el mismo día de terminada. Se llevó 429 filas done — justo
+    // las que el análisis por fuente y el recálculo de carriles necesitan para saber quién
+    // convierte. El análisis daba 0% en todas las fuentes con 194 altas entrando por día.
+    // Lo que envejece a una fila terminal es cuánto hace que TERMINÓ, no cuándo entró.
     const cand = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&uploaded_at=lt.${corte}&select=id,domain&limit=2000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&processed_at=lt.${corte}&select=id,domain&limit=2000`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
     if (!Array.isArray(cand) || !cand.length) return;
 
