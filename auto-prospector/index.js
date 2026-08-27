@@ -18621,6 +18621,33 @@ async function _secFrenar(token, motivo) {
 // Minutos que tiene que aguantar la calma antes de soltar un freno automático.
 const SEC_AUTO_RECUPERACION_MIN = 30;
 
+// ── EL RECORTE POR STOCK, EN UN SOLO LUGAR (Maxi 2026-08-27) ────────────────────────────
+// El agente baja su ritmo solo cuando el pool tiene menos de 10 días de stock: es una regla
+// del user para que no se coma su propio inventario. La alerta de "no llegó a los 20 envíos"
+// no lo sabía y avisaba de un recorte deliberado como si fuera una falla.
+// Ahora los dos leen el MISMO cálculo: si el agente recorta a 10, la alerta espera 10.
+async function _topePorStock(token, cfg) {
+  if (String(cfg.agent_regular_por_stock ?? "true") !== "true") return null;
+  const objetivoDias = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
+  let contactables = null;
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } });
+    if (r.ok) contactables = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch {}
+  if (contactables == null) return null;          // no pude medir ≠ hay que recortar
+  let users = [];
+  try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+  const porDia = Math.max(1, users.length) * (parseInt(cfg.agent_max_per_day || "20", 10) || 20);
+  const dias = contactables / porDia;
+  const tope = dias >= objetivoDias        ? null
+             : dias >= objetivoDias * 0.7  ? 15
+             : dias >= objetivoDias * 0.4  ? 10
+             : 5;
+  return tope == null ? null : { dias, contactables, tope };
+}
+
 async function securityWatchdog(token) {
   const cfg = await getConfig(token);
 
@@ -22273,6 +22300,13 @@ async function _acumularEnResumen(token, item) {
     if (ya) {
       ya.veces = (ya.veces || 1) + 1;
       ya.cuerpo = item.cuerpo;                       // el detalle más reciente
+      // ⚠️ EL TÍTULO TAMBIÉN (Maxi 2026-08-27). Se actualizaba el cuerpo y NO el título, así
+      // que el mail decía "⏰ 1 trabajo(s) sin correr" y abajo listaba TRES: el título había
+      // quedado congelado en la primera vez que se levantó la alerta, cuando efectivamente
+      // era uno solo. Es el mismo error que ya nos costó el "33 intentos de acceso" sin
+      // nadie a quien señalar — el número que encabeza tiene que describir lo que se muestra.
+      ya.titulo = item.titulo;
+      ya.severidad = item.severidad;                 // puede haber empeorado desde la primera
       ya.ultima = new Date().toISOString();
     } else {
       pend.push({ ...item, veces: 1, primera: new Date().toISOString(), ultima: new Date().toISOString() });
@@ -22325,17 +22359,59 @@ async function enviarResumenSalud(token) {
       partes.push("");
     }
 
-    const graves = pend.filter(p => p.severidad === "error");
-    const leves  = pend.filter(p => p.severidad !== "error");
+    // ── LO NUEVO ARRIBA, LO QUE SIGUE IGUAL ABAJO Y EN UNA LÍNEA (Maxi 2026-08-27) ──────
+    // El user, textual: "cada falso aviso es tiempo perdido". El problema no era solo que
+    // algunas alertas midieran mal: es que TODAS renacían cada 24 horas aunque nada hubiera
+    // cambiado. Así llegaban renglones como "se repitió 37 veces" — y un problema que lleva
+    // 37 días igual no es una alerta, es un ESTADO. Mezclarlo con lo que pasó hoy hace que
+    // haya que releer el mismo texto todos los días para encontrar la línea nueva.
+    //
+    // Un estado que no cambia no necesita párrafo: necesita un renglón que diga desde cuándo.
+    // Lo que aparece por PRIMERA vez, en cambio, es lo accionable y va arriba con su detalle.
+    // `salud_resumen_pendiente` se vacía después de cada resumen, así que `primera` solo
+    // sabe de las últimas 24h y no alcanza para decir "esto lleva una semana igual".
+    // `salud_cronicos` NO se vacía: guarda desde cuándo se ve cada clave. Es lo que permite
+    // distinguir "apareció hoy" de "lleva 37 días" — que es justamente la diferencia entre
+    // una alerta y un estado.
+    let _vistos = {};
+    try { _vistos = JSON.parse(cfg.salud_cronicos || "{}"); } catch {}
+    const _ahoraISO = new Date().toISOString();
+    for (const p of pend) if (!_vistos[p.clave]) _vistos[p.clave] = _ahoraISO;
+    // Las claves que ya no aparecen se olvidan: si el problema se resolvió y vuelve dentro de
+    // un mes, es una novedad otra vez y tiene que volver a llamar la atención.
+    const _clavesAhora = new Set(pend.map(p => p.clave));
+    for (const k of Object.keys(_vistos)) if (!_clavesAhora.has(k)) delete _vistos[k];
+    await setConfigValue(token, "salud_cronicos", JSON.stringify(_vistos)).catch(() => {});
+
+    const _dias = (clave) => {
+      const t = Date.parse(_vistos[clave] || "");
+      return t ? Math.floor((Date.now() - t) / 86_400_000) : 0;
+    };
+    const _CRONICO_DIAS = 3;    // tres días viéndolo igual = ya no es noticia
+    const _esCronico = (p) => _dias(p.clave) >= _CRONICO_DIAS;
+
+    const graves   = pend.filter(p => p.severidad === "error" && !_esCronico(p));
+    const leves    = pend.filter(p => p.severidad !== "error" && !_esCronico(p));
+    const cronicos = pend.filter(_esCronico);
+
     if (graves.length) {
-      partes.push(`🔴 NECESITA UNA MANO (${graves.length}):`);
-      graves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — se repitió ${p.veces} veces` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`));
+      partes.push(`🔴 NUEVO — NECESITA UNA MANO (${graves.length}):`);
+      graves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — ${p.veces} veces` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`));
       partes.push("");
     }
     if (leves.length) {
-      partes.push(`🟡 PARA MIRAR CUANDO PUEDAS (${leves.length}):`);
+      partes.push(`🟡 NUEVO — PARA MIRAR CUANDO PUEDAS (${leves.length}):`);
       leves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` (${p.veces}×)` : ""}`));
       partes.push("");
+    }
+    if (cronicos.length) {
+      partes.push(`⏳ SIGUE IGUAL — ya lo sabés, no hay novedad (${cronicos.length}):`);
+      cronicos.forEach(p => partes.push(`   · ${p.titulo} — sin cambios desde hace ${_dias(p.clave)} día(s)`));
+      partes.push(`   (Si alguno de estos ya no te sirve, se apaga con su clave en toolbar_config.)`);
+      partes.push("");
+    }
+    if (!graves.length && !leves.length && cronicos.length) {
+      partes.splice(1, 0, "Nada nuevo hoy. Lo de abajo ya lo venías viendo.\n");
     }
     partes.push("El detalle completo:\n  SELECT * FROM toolbar_health_check ORDER BY estado, job;");
 
@@ -22550,21 +22626,41 @@ async function saludWatchdog(token) {
     // ── 2. El KPI del negocio: ¿salieron los 20 por MB? ────────────────────
     // Se evalúa recién a las 19h Madrid: antes de eso "van 8" es normal.
     if (_spainHour() >= 19 && !_isWeekendSpain()) {
-      const objetivo = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
+      // ── SE COMPARA CONTRA EL CUPO QUE DE VERDAD RIGE (Maxi 2026-08-27) ────────────────
+      // Esto medía contra `agent_max_per_day` a secas, y el agente usa una cascada de tres
+      // fuentes más un recorte. Dos formas de que la alerta mienta:
+      //   · un cupo POR PERSONA (`agent_max_per_day_by_user`) — desde hoy se edita en el
+      //     panel, así que en cuanto el user le ponga 10 a alguien, esta alerta iba a gritar
+      //     "no llegó a 20" todos los días sobre alguien que cumplió su cupo exacto;
+      //   · el RECORTE POR STOCK, que es una regla del propio user: cuando el pool baja de
+      //     10 días, el agente frena solo para no comerse su inventario. Avisar de eso es
+      //     avisar de que el sistema funciona.
+      // Un aviso que se dispara cuando todo anda bien entrena a ignorar los avisos.
       let users = [];
       try { users = JSON.parse(cfg.agent_enabled_users || "[]"); } catch {}
+      let perUser = {};
+      try { perUser = JSON.parse(cfg.agent_max_per_day_by_user || "{}"); } catch {}
+      let _override = 0;
+      try { _override = Number(JSON.parse(cfg.agent_focus_config || "{}")?.daily_override) || 0; } catch {}
+      const _global = _override || parseInt(cfg.agent_max_per_day || "20", 10) || 20;
+      // ¿Está el agente recortando a propósito por falta de stock?
+      const _recorte = await _topePorStock(token, cfg).catch(() => null);
       const flojos = [];
       for (const u of users) {
         const n = await getAgentDailyCount(token, u).catch(() => null);
         if (n == null) continue;                       // no pudimos medir ≠ no mandó
-        if (n < objetivo) flojos.push(`${u}: ${n} de ${objetivo}`);
+        const _suyo = Number(perUser[(u || "").toLowerCase()]) || _global;
+        const objetivoReal = _recorte ? Math.min(_suyo, _recorte.tope) : _suyo;
+        if (n < objetivoReal) flojos.push(`${u}: ${n} de ${objetivoReal}`);
       }
       if (flojos.length) {
         await saludAlerta(token, {
           clave: "envios-incompletos", severidad: "error",
-          titulo: `📮 El agente no llegó a los ${objetivo} envíos`,
-          cuerpo: `${flojos.join("\n")}\n\nMirá qué lo frenó:\n  SELECT reason, count(*) FROM toolbar_agent_actions\n   WHERE action='skipped' AND created_at::date = CURRENT_DATE GROUP BY 1 ORDER BY 2 DESC;`,
-          metadata: { objetivo, detalle: flojos },
+          titulo: `📮 El agente no llegó a su cupo`,
+          cuerpo: `${flojos.join("\n")}`
+            + (_recorte ? `\n\n(El cupo de hoy está RECORTADO a ${_recorte.tope}/MB por stock bajo — es la regla de no vaciar Prospects.)` : "")
+            + `\n\nMirá qué lo frenó:\n  SELECT reason, count(*) FROM toolbar_agent_actions\n   WHERE action='skipped' AND created_at::date = CURRENT_DATE GROUP BY 1 ORDER BY 2 DESC;`,
+          metadata: { detalle: flojos, recorte: _recorte?.tope || null },
         });
       }
     }
