@@ -22279,7 +22279,15 @@ async function chequearAutenticacionPropia(token) {
     }
     const dm = (dmarc || []).find(t => /^v=DMARC1/i.test(t));
     if (!dm) problemas.push("NO hay DMARC en _dmarc");
-    else if (/p=none/i.test(dm)) problemas.push("el DMARC está en p=none (monitoreo). Cuando los reportes alineen, subir a p=quarantine");
+    // ── `p=none` NO ES UN PROBLEMA (Maxi 2026-08-27) ──────────────────────────────────
+    // Esto lo listaba como falla y el aviso llegaba TODOS LOS DÍAS. No es una falla: es la
+    // primera etapa deliberada de un despliegue de DMARC —se monitorea con `rua` hasta que
+    // los reportes alineen, y recién ahí se endurece—. Verificado contra el DNS real: el
+    // registro existe, con rua y ruf, y el SPF es `-all`. Está bien puesto.
+    // Subir a `p=quarantine` es una DECISIÓN del user, no un pendiente del sistema, y una
+    // alerta diaria sobre una decisión ajena es ruido puro. Lo único que sí es un problema
+    // es que el DMARC no exista o no reporte a ningún lado.
+    else if (!/rua=/i.test(dm)) problemas.push("el DMARC no tiene `rua=`, así que no llega ningún reporte y no hay con qué decidir endurecerlo");
 
     if (problemas.length) {
       await saludAlerta(token, {
