@@ -745,9 +745,19 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
     };
     const name = ISO_TO_NAME[g] || g;
     const enc = encodeURIComponent(name);
-    // Match: ISO en geos_all (array contains) OR geo (legacy) == name OR
-    // geo (legacy) prefix-match con ISO/name (cubre ambos formatos).
-    geoClause = `&or=(geos_all.cs.{${g}},geo.eq.${enc},geo.ilike.${enc}*,geo.eq.${encodeURIComponent(g)},geo.ilike.${encodeURIComponent(g)}*)`;
+    // ── EL PREFIJO DEL ISO PESCABA PAÍSES AJENOS (Maxi 2026-08-27) ──────────────────
+    // Había un `geo.ilike.<ISO>*` para cubrir las filas que guardan el código en vez del
+    // nombre. Dos letras como prefijo son demasiado poco: medido sobre el pool real,
+    //   · filtrar CH (Suiza)      devolvía Chile y China
+    //   · filtrar MA (Marruecos)  devolvía Malaysia
+    //   · filtrar SE (Suecia)     devolvía Serbia
+    //   · filtrar IN (India)      devolvía India + Indonesia
+    // Es exactamente lo que el user reportó como "los filtros no filtran lo correcto".
+    //
+    // El caso que ese prefijo quería cubrir —filas con el ISO crudo, como las 12 que hoy
+    // dicen "SK"— se resuelve con la igualdad exacta, que ya está. El prefijo del NOMBRE sí
+    // se queda: ahí el valor es el país completo y no hay ambigüedad de dos letras.
+    geoClause = `&or=(geos_all.cs.{${g}},geo.eq.${enc},geo.ilike.${enc}*,geo.eq.${encodeURIComponent(g)})`;
   }
   try {
     // Política user 2026-05-18: NO ordenar por score — el score no se usa para
