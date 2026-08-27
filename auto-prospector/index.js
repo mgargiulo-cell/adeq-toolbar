@@ -24460,12 +24460,29 @@ async function main() {
         // 1. Barrido por URL: sin red, sin créditos, segundos. Limpia basura antes de que el
         //    pulido gaste un fetch en ella.
         if (_hayTiempo()) await purgeByUrlOnly(token).catch(e => log(`⚠️ url-purge: ${e.message}`));
+        // ── EL PRESUPUESTO SE ALTERNA EN VEZ DE COMPARTIRSE (Maxi 2026-08-27) ─────────────
+        // El techo del mantenimiento son 3 minutos y el pulido solo tiene permiso para 2.
+        // Compartiendo la vuelta, lo que va después del pulido no corría NUNCA: la rotación
+        // que agregué hoy repartía justicia entre los cuatro últimos... de un tiempo que ya
+        // estaba agotado. Medido: `auditoria_emails` 50 HORAS sin correr, `similar_expansion`
+        // 27, con su carril libre y sus flags prendidos. No fallaban — no les llegaba el turno.
+        //
+        // Ahora las vueltas se alternan: en la par corre el pulido (+ su auditor, que juzga lo
+        // que el pulido acaba de agregar); en la impar, la cadena de mantenimiento con TODO el
+        // presupuesto. El worker cicla cada ~7 min, así que el pulido pasa de correr cada 7 a
+        // cada 14 — sigue siendo muchas veces por día — y el mantenimiento pasa de nunca a
+        // cada 14. La cola de prospectos, que va después, no pierde su lugar: el techo global
+        // de 3 min no cambia.
+        _vueltaMantenimiento++;
+        const _vueltaPar = (_vueltaMantenimiento % 2) === 0;
+        if (_vueltaPar) {
         // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
         //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
         if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
       // Va después del pulido a propósito: el pulido AGREGA emails y el auditor los JUZGA.
       // Al revés, el auditor no vería lo que acaba de entrar.
       if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
+        }
         // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
         //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.
         // Maxi 2026-08-18: el agente de REVISIÓN. Re-arma solo la búsqueda de emails y el
@@ -24484,14 +24501,13 @@ async function main() {
         //
         // El barrido por URL y el pulido quedan FUERA de la rotación, siempre primeros: son lo
         // gratis y lo que el user marcó como prioridad (ningún prospecto sin email).
-        {
+        if (!_vueltaPar) {
           const _rotativos = [
             ["agente revisión",  agenteRevision],
             ["ads.txt recheck",  recheckAdsTxtUnknowns],
             ["purge prospects",  sweepBlockedFromProspects],
             ["similar-exp",      runProspectSimilarExpansion],
           ];
-          _vueltaMantenimiento++;
           const _desde = _vueltaMantenimiento % _rotativos.length;
           for (let i = 0; i < _rotativos.length; i++) {
             if (!_hayTiempo()) {
