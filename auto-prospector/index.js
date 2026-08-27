@@ -19315,6 +19315,29 @@ async function runAgentCycle(token, allFlags) {
   //
   // Es complementario a `autoAjustarSegunMetricas`, que regula la ENTRADA (cuánto descubrir).
   // Uno abre la canilla y el otro cierra el desagüe; no se pisan.
+  // ── LOS YA CONTACTADOS SE CARGAN UNA VEZ, NO UNO POR UNO (Maxi 2026-08-27) ──────────
+  // El guard de 30 días hacía UNA consulta por candidato, justo antes de mandar. Hoy fueron
+  // 687 consultas para 687 descartes: el turno se gastaba caminando leads que ya sabíamos
+  // que no iban a salir, y el agente cerró el día en 51 de 60 con 984 enviables en el pool.
+  // No le faltaban candidatos, le faltaba tiempo.
+  // Se trae el set completo de una y se filtra en memoria. El guard por dominio se queda
+  // igual —es la última defensa antes de mandar y falla cerrado—, pero ahora casi nunca
+  // tiene que preguntar.
+  let _contactados30d = null;
+  try {
+    const _corte = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+    const _r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${_corte}&select=domain&limit=20000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (_r.ok) {
+      const _f = await _r.json();
+      if (Array.isArray(_f)) _contactados30d = new Set(_f.map(x => String(x.domain || "").toLowerCase()));
+    }
+  } catch {}
+  // `null` = no se pudo cargar. En ese caso NO se filtra nada en memoria y decide el guard
+  // por dominio, que falla cerrado. Nunca se manda de más por no haber podido leer.
+  if (_contactados30d) log(`  📋 ${_contactados30d.size} dominio(s) contactados en 30 días — se filtran antes del ciclo`);
+
   const _DIAS_STOCK_OBJETIVO = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
   let _recorteStock = null;
   if (String(cfg.agent_regular_por_stock ?? "true") === "true") {
@@ -19776,7 +19799,7 @@ async function runAgentCycle(token, allFlags) {
     // No filtramos por sendtrack acá — la regla real es:
     // "no mandar si el dominio está EN MONDAY EN ESTADO ACTIVO".
     // Eso lo chequeamos PER LEAD abajo (más fresco que cachear sendtrack).
-    const fresh = scored;
+    let fresh = scored;   // `let`: se le sacan los ya contactados antes del ciclo
 
     // ── ORDEN DE INTENTO (Maxi 2026-08-04) ─────────────────────────────────────────────
     // El pool venía SIN ordenar, así que se probaban los leads en el orden que los devolvía
@@ -19808,6 +19831,15 @@ async function runAgentCycle(token, allFlags) {
       if (ta !== tb) return ta - tb;                                        // 1º el nivel GEO
       return (_rankIntento(b) - _rankIntento(a)) || ((b.score || 0) - (a.score || 0));
     });
+    // Los ya contactados en 30 días se sacan ANTES de recorrer, no de a uno adentro del
+    // ciclo. Si no se pudo cargar el set (`null`), no se filtra: decide el guard por dominio,
+    // que falla cerrado. Nunca se manda de más por no haber podido leer.
+    if (_contactados30d) {
+      const _antes = fresh.length;
+      fresh = fresh.filter(l => !_contactados30d.has(String(l.domain || "").toLowerCase()));
+      const _sacados = _antes - fresh.length;
+      if (_sacados) log(`  🧹 ${_sacados} candidato(s) ya contactados en 30 días, fuera del ciclo antes de empezar`);
+    }
     const _conEmail = fresh.filter(_tieneEmail).length;
     log(`🤖 Agent ${userEmail}: pool de ${fresh.length} candidatos, ${_conEmail} ya con email (se prueban primero)`);
 
