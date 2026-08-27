@@ -21807,11 +21807,21 @@ async function aggregateProspectTrashRules(token) {
   rows = (rows || []).filter(x => (x.reason || "").trim().length > 2);
   if (rows.length < 3) return; // poca señal todavía
   const list = rows.slice(0, 60).map((x, i) => `${i + 1}. ${x.domain || "?"} [${x.category || "?"}] — "${(x.reason || "").trim().slice(0, 160)}"`).join("\n");
+  // ── LOS APROBADOS SON CONTRAEJEMPLOS (Maxi 2026-08-28, pedido del user) ─────────────
+  // Cuando el MB aprueba una duda desde el filtro Alert (✓), queda un `liked` con el motivo
+  // de la sospecha. Son las reglas pescando de más: sin pasarlos al destilador, el sistema
+  // solo aprendía a rechazar y nunca a aflojar — cada semana más estricto, nunca al revés.
+  let _aprobados = [];
+  try {
+    const ra = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?action=eq.liked&reason=like.aprobada*&created_at=gte.${since}&select=domain,category,reason&order=created_at.desc&limit=40`, { headers: auth });
+    if (ra.ok) _aprobados = await ra.json();
+  } catch {}
+  const listOk = (_aprobados || []).slice(0, 30).map((x, i) => `${i + 1}. ${x.domain || "?"} [${x.category || "?"}] — "${(x.reason || "").trim().slice(0, 140)}"`).join("\n");
   const userMsg = `Estos son sitios que el media buyer RECHAZÓ de su lista de prospects de PUBLICIDAD, con el motivo. Detectá PATRONES de CONTENIDO (qué TIPO de sitios NO sirven) y destilá reglas cortas y accionables para descartar futuros similares. IGNORÁ el GEO/país — lo que importa es el CONTENIDO/tipo de sitio.
 
 RECHAZADOS:
 ${list}
-
+${listOk ? `\nAPROBADOS (el media buyer revisó estas DUDAS y dijo que SÍ sirven — tus reglas NO deben matchear webs como estas; si una regla las pescaría, suavizala o eliminala):\n${listOk}\n` : ""}
 Devolveme SOLO JSON: { "rules": ["regla corta 1", "regla corta 2", ...] }
 - Máximo 8 reglas, en español, concretas y por CONTENIDO (ej: "e-commerce / tiendas de venta", "blog corporativo de una empresa de servicios", "portal de gobierno o municipio", "sitio de cursos/universidad", "directorio o agregador sin contenido propio", "landing de un producto/SaaS").
 - Basate en patrones REALES de los motivos, no inventes.`;

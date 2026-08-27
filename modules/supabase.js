@@ -723,12 +723,22 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
       dateClause = `&created_at=gte.${tzDay(d30)}T00:00:00-03:00`;
     }
   }
-  const sourceClause = sourceFilter ? `&source=eq.${encodeURIComponent(sourceFilter)}` : "";
+  // Un filtro de fuente puede ser una FAMILIA (lista con comas): "autopilot" dejó de ser una
+  // etiqueta el 24/08 cuando cada motor pasó a escribir su nombre, y el chip quedó mostrando
+  // 1 fila mientras las 558 de similar/adstxt/majestic no se podían filtrar desde ningún lado.
+  const sourceClause = !sourceFilter ? ""
+    : sourceFilter.includes(",")
+      ? `&source=in.(${sourceFilter.split(",").map(x => encodeURIComponent(x.trim())).join(",")})`
+      : `&source=eq.${encodeURIComponent(sourceFilter)}`;
   // Maxi 2026-06-30: filtro por owner. "_AGENT_" = lo que cargó el agente autónomo
   // (created_by vacío/null, sin owner manual). Un email real = carga manual de ese MB
   // (los imports/CSV setean created_by con el email; el worker autónomo lo deja vacío).
   let userClause = "";
-  if (userFilter === "_AGENT_")   userClause = `&or=(created_by.is.null,created_by.eq.)`;
+  // ── EL CHIP "AGENT" DEVOLVÍA LISTA VACÍA (Maxi 2026-08-28) ──────────────────────────
+  // Filtraba created_by nulo o vacío, pero el worker escribe `worker@autofeeder` desde hace
+  // meses: las 1.009 filas del agente en el pool no matcheaban NINGUNA. Clic en Agent = cero
+  // resultados, con mil leads del agente a la vista bajo All.
+  if (userFilter === "_AGENT_")   userClause = `&or=(created_by.is.null,created_by.eq.,created_by.like.worker@*)`;
   else if (userFilter)            userClause = `&created_by=eq.${encodeURIComponent(userFilter)}`;
   // Geo filter: matchea contra `geo` (NAME en inglés, legacy) o `geos_all`
   // (ISO array). Acepta ISO 2-letter (AR, BR, ES, MX, etc.). El worker guarda

@@ -9333,7 +9333,8 @@ function renderProspectCard(r) {
              los prospects contra los comentarios de descarte y marca suspect_reject=true en
              las que son del MISMO tipo que las rechazadas. Se enciende la ⚠️ al lado de la X. -->
         ${r.suspect_reject
-          ? `<span class="pcard-similar-alert" title="⚠️ Sospechosa: parecida a un tipo que descartaste${r.suspect_reason ? ` (${esc(r.suspect_reason)})` : ""}. Revisá si conviene rechazarla." style="color:#f59e0b;font-size:14px;cursor:help;line-height:1">⚠️</span>`
+          ? `<span class="pcard-similar-alert" title="⚠️ Sospechosa: parecida a un tipo que descartaste${r.suspect_reason ? ` (${esc(r.suspect_reason)})` : ""}. Revisá si conviene rechazarla." style="color:#f59e0b;font-size:14px;cursor:help;line-height:1">⚠️</span>
+             <button class="btn btn-sm pcard-approve-btn" title="✓ ESTÁ BIEN — sacala de Alert y enseñale al agente que este tipo SÍ sirve${r.suspect_reason ? `. La duda era: ${esc(r.suspect_reason)}` : ""}" style="padding:3px 7px;color:#16a34a;background:transparent;border:1px solid var(--border)">✓</button>`
           : ""}
         <button class="btn btn-sm pcard-reject-btn" title="❌ Descartar — no sirve + el agente aprende a evitar tipos similares" style="padding:3px 7px;color:#e53e3e;background:transparent;border:1px solid var(--border)">❌</button>
       </div>
@@ -10119,6 +10120,43 @@ function initProspectCard(card, data) {
   // Maxi 2026-06-22: RECHAZO INTELIGENTE — el MB escribe POR QUÉ no sirve, Claude
   // deduce el TIPO de web, y el agente aprende por TIPO (no por geo/categoría).
   //   1er click → revela el comentario.  2do click → confirma (Claude analiza + aprende).
+  // ── EL LADO QUE FALTABA DE ALERT (Maxi 2026-08-28, pedido del user) ────────────────
+  // "Alert = las dudas, para que yo comente y las descarte o las apruebe. Así a diario
+  //  analizo las Alert y nutro de comentarios al agente para que autoaprenda."
+  // El ❌ ya enseñaba qué NO sirve; faltaba el ✓ que enseña qué SÍ. Sin él, una duda
+  // aprobada quedaba marcada para siempre y el destilador de reglas nunca se enteraba de
+  // sus falsos positivos — solo aprendía a rechazar, nunca a aflojar.
+  card.querySelector(".pcard-approve-btn")?.addEventListener("click", async () => {
+    const btn = card.querySelector(".pcard-approve-btn");
+    if (btn) { btn.disabled = true; btn.textContent = "⏳"; }
+    try {
+      const _hdrs = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" };
+      await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${data.id}`, {
+        method: "PATCH", headers: _hdrs,
+        body: JSON.stringify({ suspect_reject: false, suspect_reason: null }),
+      });
+      // El contraejemplo que le enseña al destilador que esa regla pescó de más.
+      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback`, {
+        method: "POST", headers: _hdrs,
+        body: JSON.stringify({
+          user_email: (state.loginEmail || "").toLowerCase(), domain: data.domain,
+          action: "liked",
+          reason: `aprobada en revisión de Alert${data.suspect_reason ? ` — la duda era: ${String(data.suspect_reason).slice(0, 150)}` : ""}`,
+          category: data.category || "", geo: data.geo || "",
+        }),
+      }).catch(() => {});
+      card.querySelector(".pcard-similar-alert")?.remove();
+      if (btn) { btn.textContent = "✅"; setTimeout(() => btn.remove(), 900); }
+      if ((window._prospectsTypeFilter || "all") === "alert") {
+        setTimeout(() => { card.style.transition = "opacity .3s"; card.style.opacity = "0"; setTimeout(() => card.remove(), 320); }, 900);
+      }
+      showToast(`✓ ${data.domain} aprobada — el agente aprende que este tipo sirve`, "info");
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = "✓"; }
+      showToast(`❌ No se pudo aprobar: ${e.message}`, "error");
+    }
+  });
+
   card.querySelector(".pcard-reject-btn")?.addEventListener("click", async () => {
     const btn = card.querySelector(".pcard-reject-btn");
     const reasonEl = card.querySelector(".pcard-dislike-reason");
