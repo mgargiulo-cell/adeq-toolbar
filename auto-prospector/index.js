@@ -22884,6 +22884,120 @@ async function _acumularCuracion(token, texto) {
  * UN solo mail cada 72 horas con todo junto: lo que se arregló solo y lo que
  * necesita una mano. Si no hay nada pendiente, no manda nada.
  */
+// ── EL BOLETÍN POR SECCIÓN (Maxi 2026-08-27, pedido del user) ───────────────────────────
+// "Cómo rindió cada sección, qué problemas tuvo, si se trabó, si cumplió funciones — un
+//  análisis completo que llegue por mail para ver si hay algo por optimizar."
+//
+// Cada sección del sistema recibe una nota con el MISMO formato: veredicto + los dos o tres
+// números que permiten juzgarla + qué mirar si está mal. El veredicto sale de comparar el
+// número contra lo que la sección DEBERÍA haber hecho, no contra un umbral inventado:
+// el envío contra su cupo, el feeder contra sus carriles, el pulido contra su cola.
+// Va dentro del resumen diario que ya existe — la regla del user sigue siendo un mail de
+// resumen y uno de alertas por día, no tres.
+async function _boletinPorSeccion(token) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const desde24 = new Date(Date.now() - 24 * 3600_000).toISOString();
+  const out = [];
+  const _cnt = async (url) => {
+    try {
+      const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+    } catch { return null; }
+  };
+  const _rows = async (url) => {
+    try { const r = await fetch(url, { headers: auth }); return r.ok ? await r.json() : []; } catch { return []; }
+  };
+  const _nota = (titulo, veredicto, lineas) => {
+    out.push(`${veredicto} ${titulo}`);
+    for (const l of lineas) out.push(`     ${l}`);
+  };
+
+  try {
+    const cfg = await getConfig(token).catch(() => ({}));
+
+    // ── ENVÍO ─────────────────────────────────────────────────────────────
+    const _envios = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${desde24}&select=user_email&limit=500`);
+    const _porMb = {};
+    for (const e of _envios) { const u = String(e.user_email || "?").split("@")[0]; _porMb[u] = (_porMb[u] || 0) + 1; }
+    const _cupo = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
+    const _tot = _envios.length, _obj = _cupo * 3;
+    _nota("ENVÍO", _tot >= _obj * 0.9 ? "✅" : _tot >= _obj * 0.6 ? "🟡" : "🔴", [
+      `${_tot} de ${_obj} (${Object.entries(_porMb).map(([u, n]) => `${u} ${n}`).join(" · ") || "nadie"})`,
+      ...(_tot < _obj * 0.9 ? ["Qué mirar: los skips en ERRORES CONCRETOS de abajo dicen qué lo frenó."] : []),
+    ]);
+
+    // ── DESCUBRIMIENTO (feeders) ──────────────────────────────────────────
+    const _proc = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=source,status&limit=5000`);
+    const _porSrc = {};
+    for (const f of _proc) {
+      const k = String(f.source || "?").replace(/^auto_feeder_/, "");
+      (_porSrc[k] = _porSrc[k] || { n: 0, ok: 0 }).n++;
+      if (f.status === "done") _porSrc[k].ok++;
+    }
+    const _altas = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=id`);
+    const _fuentes = Object.entries(_porSrc).sort((a, b) => b[1].n - a[1].n);
+    _nota("DESCUBRIMIENTO", (_altas ?? 0) >= 15 ? "✅" : (_altas ?? 0) >= 5 ? "🟡" : "🔴", [
+      `${_altas ?? "?"} alta(s) nuevas en Prospects en 24h.`,
+      `Por fuente (procesados→pasaron): ${_fuentes.map(([k, v]) => `${k} ${v.n}→${v.ok}`).join(" · ") || "nada procesado"}`,
+      ...((_altas ?? 0) < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en toolbar_diag_descartes."] : []),
+    ]);
+
+    // ── BÚSQUEDA DE EMAILS ────────────────────────────────────────────────
+    const _mudos = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
+    const _rescatados = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desde24}&select=id`);
+    const _diag24 = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${desde24}&select=motivo&limit=500`);
+    const _porMot = {};
+    for (const d of _diag24) _porMot[d.motivo] = (_porMot[d.motivo] || 0) + 1;
+    _nota("BÚSQUEDA DE EMAILS", (_rescatados ?? 0) > 0 || (_mudos ?? 1) < 100 ? "✅" : "🟡", [
+      `${_rescatados ?? "?"} email(s) encontrados hoy a leads que no tenían · quedan ${_mudos ?? "?"} sin email.`,
+      ...(Object.keys(_porMot).length ? [`Por qué fallan: ${Object.entries(_porMot).map(([m, n]) => `${m} ${n}`).join(" · ")}`] : []),
+    ]);
+
+    // ── COLA ──────────────────────────────────────────────────────────────
+    const _cola = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool,next_day,error)&select=status&limit=10000`);
+    const _porSt = {};
+    for (const c of _cola) _porSt[c.status] = (_porSt[c.status] || 0) + 1;
+    const _drenado = _proc.length;
+    _nota("COLA", _drenado >= 100 ? "✅" : _drenado >= 30 ? "🟡" : "🔴", [
+      `Drenó ${_drenado} en 24h. Ahora: ${Object.entries(_porSt).map(([k, v]) => `${k} ${v}`).join(" · ") || "vacía"}.`,
+      ...((_porSt.error || 0) > 20 ? [`⚠️ ${_porSt.error} en error — el detalle está en ERRORES CONCRETOS.`] : []),
+      ...(_drenado < 30 ? ["Qué mirar: si pending>0 y drena 0, el ciclo de la cola no está corriendo — pedir los logs de Railway."] : []),
+    ]);
+
+    // ── MONDAY (reciclado hacia cero) ─────────────────────────────────────
+    let _mSync = null;
+    try { _mSync = JSON.parse(cfg.monday_sync_ultimo || "null"); } catch {}
+    if (_mSync) {
+      const _resta = Math.max(0, (_mSync.reprospectables || 0) - (_mSync.encolados || 0));
+      _nota("MONDAY → PROSPECTS", _resta === 0 ? "✅" : _resta < 1000 ? "🟡" : "🔴", [
+        `Barrido ${_mSync.fecha}: ${_mSync.encolados} entraron, ${_resta} siguen esperando (objetivo: cero).`,
+        ...(_resta > 0 ? [`A ${_mSync.encolados || 1}/día se vacía en ~${Math.ceil(_resta / Math.max(1, _mSync.encolados || 1))} día(s).`] : []),
+      ]);
+    }
+
+    // ── RE-TRABAJO ────────────────────────────────────────────────────────
+    const _ret = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(re_sent,secondary_sent,future_sent,bounce_retry_sent)&created_at=gte.${desde24}&select=action&limit=500`);
+    const _porAcc = {};
+    for (const r of _ret) _porAcc[r.action] = (_porAcc[r.action] || 0) + 1;
+    _nota("RE-TRABAJO", _ret.length > 0 ? "✅" : "🟡", [
+      _ret.length
+        ? `${_ret.length} en 24h: ${Object.entries(_porAcc).map(([k, v]) => `${k.replace("_sent", "")} ${v}`).join(" · ")}`
+        : "Cero re-envíos en 24h — si hay cola de re-enganche esperando, algo lo frena.",
+    ]);
+
+    // ── CUOTAS DE APIS ────────────────────────────────────────────────────
+    const _rapid = parseInt(cfg.rapidapi_calls_month || "0", 10);
+    const _rLim = parseInt(cfg.rapidapi_monthly_limit || "40000", 10);
+    const _apo = parseInt(cfg.apollo_calls_month || "0", 10);
+    _nota("APIS", "ℹ️", [
+      `SimilarWeb ${_rapid}/${_rLim} este ciclo · Apollo ${_apo}/2250 (el pacing apunta a gastarlo entero).`,
+    ]);
+  } catch (e) {
+    out.push(`(el boletín por sección falló: ${e.message})`);
+  }
+  return out;
+}
+
 async function enviarResumenSalud(token) {
   try {
     const cfg = await getConfig(token).catch(() => null);
@@ -22903,6 +23017,15 @@ async function enviarResumenSalud(token) {
 
     const dias = RESUMEN_SALUD_CADA_HORAS / 24;
     const partes = [`Resumen de los últimos ${dias} días.\n`];
+
+    // El boletín por sección va PRIMERO: es la foto general. Las alertas y errores de abajo
+    // son el detalle de lo que acá salga en amarillo o rojo.
+    try {
+      const _boletin = await _boletinPorSeccion(token);
+      if (_boletin.length) {
+        partes.push("📋 CÓMO RINDIÓ CADA SECCIÓN (24h):", ..._boletin, "");
+      }
+    } catch (e) { partes.push(`(boletín por sección: ${e.message})`, ""); }
 
     if (curado.length) {
       partes.push(`✅ SE ARREGLÓ SOLO (${curado.length}) — no tenés que hacer nada:`);
