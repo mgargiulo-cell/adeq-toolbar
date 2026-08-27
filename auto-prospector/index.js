@@ -10502,10 +10502,22 @@ async function polishPool(token) {
         // 4) buscar email: scrape gratis (páginas internas multilingües) + REDES SOCIALES (FB/IG/Twitter)
         //    + website-informer/WHOIS — todo adentro de scrapeEmailsForDomain — y Apollo capado si vacío.
         let foundEmail = null, foundSource = null, foundName = "";
+        let _diagEmail = null;      // qué se encontró y qué se descartó, para el motivo real
         const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
         const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut }).catch(() => []);
         if (Array.isArray(scraped) && scraped.length) {
-          const ranked = scraped.map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+          // ── QUÉ SE ENCONTRÓ Y POR QUÉ SE DESCARTÓ (Maxi 2026-08-27, pedido del user) ────
+          // El motivo que se guardaba era siempre "no_encontrado", que junta dos cosas muy
+          // distintas: "no había nada en la web" y "había, pero lo rechacé". Caso real:
+          // portal-islam.id publica `portalislam@yahoo.com` en texto plano en /contact, el
+          // home linkea esa página, y el lead figura "no_encontrado" tras 2 intentos.
+          // Sin este dato hay que ir a mano, sitio por sitio, a adivinar qué pasó.
+          const _todos = scraped.map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) }));
+          const ranked = _todos.filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+          _diagEmail = {
+            crudos: scraped.length,
+            rechazados: _todos.filter(r => r.score <= 0).map(r => r.email).slice(0, 3),
+          };
           if (ranked.length) {
             foundEmail = ranked[0].email;
             const _le = foundEmail.toLowerCase();
@@ -10596,7 +10608,12 @@ async function polishPool(token) {
             body: JSON.stringify({
               email_intentos: (lead.email_intentos || 0) + 1,
               email_ultimo_intento: new Date().toISOString(),
-              email_ultimo_motivo: "no_encontrado",
+              // El motivo REAL, no una etiqueta genérica. Distingue los tres casos que
+              // importan: la web no publica nada, publica pero lo rechaza el ranking, o el
+              // sitio nos bloquea. Cada uno se arregla distinto.
+              email_ultimo_motivo: !_diagEmail ? "no_se_pudo_leer_el_sitio"
+                : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
+                : `rechazados_por_ranking:${_diagEmail.rechazados.join("|").slice(0, 120)}`,
             }),
           }).catch(() => {});
         }
@@ -22436,6 +22453,72 @@ async function enviarResumenSalud(token) {
     if (!graves.length && !leves.length && cronicos.length) {
       partes.splice(1, 0, "Nada nuevo hoy. Lo de abajo ya lo venías viendo.\n");
     }
+    // ── ERRORES CONCRETOS, NO SOLO EL ESTADO (Maxi 2026-08-27, pedido del user) ─────────
+    // "Que el email informe de errores concretos además del resumen de actividad para poder
+    //  pasártelos y solucionarlos."
+    // El resumen decía QUÉ trabajo anda mal pero no CON QUÉ dato falló, así que había que ir
+    // a la base a buscar el detalle antes de poder contarme nada. Ahora el mail trae los
+    // motivos reales agrupados, con un ejemplo de cada uno: se copia y pega y ya se puede
+    // trabajar sobre eso.
+    try {
+      const _errs = [];
+      const _auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+      const _desdeResumenISO = new Date(Date.now() - RESUMEN_SALUD_CADA_HORAS * 3600_000).toISOString();
+
+      // 1) Por qué los leads se quedan sin email — el motivo REAL, agrupado.
+      const _sinMail = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&email_ultimo_motivo=not.is.null&select=domain,email_ultimo_motivo&limit=400`,
+        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      if (Array.isArray(_sinMail) && _sinMail.length) {
+        const _porMotivo = {};
+        for (const l of _sinMail) {
+          // Los motivos con detalle traen el ejemplo pegado; se agrupa por el prefijo.
+          const _k = String(l.email_ultimo_motivo || "").split(":")[0];
+          (_porMotivo[_k] = _porMotivo[_k] || { n: 0, ej: [] }).n++;
+          if (_porMotivo[_k].ej.length < 2) _porMotivo[_k].ej.push(l.domain);
+        }
+        const _top = Object.entries(_porMotivo).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
+        _errs.push("SIN EMAIL — por qué:");
+        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n} caso(s). Ej: ${v.ej.join(", ")}`);
+      }
+
+      // 2) Por qué el agente saltea envíos.
+      const _skips = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&created_at=gte.${_desdeResumenISO}&select=reason,domain&limit=800`,
+        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      if (Array.isArray(_skips) && _skips.length) {
+        const _porRazon = {};
+        for (const a of _skips) {
+          const _k = String(a.reason || "(sin motivo)").split(":").slice(0, 2).join(":");
+          (_porRazon[_k] = _porRazon[_k] || { n: 0, ej: [] }).n++;
+          if (_porRazon[_k].ej.length < 2 && a.domain) _porRazon[_k].ej.push(a.domain);
+        }
+        const _top = Object.entries(_porRazon).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
+        _errs.push("", "ENVÍOS SALTEADOS — por qué:");
+        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}${v.ej.length ? `. Ej: ${v.ej.join(", ")}` : ""}`);
+      }
+
+      // 3) Lo que la cola no pudo procesar, con el error textual.
+      const _errCola = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.error&select=domain,error_message&order=uploaded_at.desc&limit=60`,
+        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      if (Array.isArray(_errCola) && _errCola.length) {
+        const _porErr = {};
+        for (const e of _errCola) {
+          const _k = String(e.error_message || "(vacío)").slice(0, 60);
+          (_porErr[_k] = _porErr[_k] || { n: 0, ej: [] }).n++;
+          if (_porErr[_k].ej.length < 2) _porErr[_k].ej.push(e.domain);
+        }
+        const _top = Object.entries(_porErr).sort((a, b) => b[1].n - a[1].n).slice(0, 4);
+        _errs.push("", `COLA — ${_errCola.length} en error:`);
+        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}. Ej: ${v.ej.join(", ")}`);
+      }
+
+      if (_errs.length) {
+        partes.push("", "🧾 ERRORES CONCRETOS (copiá y pegá esto para que lo arregle):", ...(_errs.map(l => l)), "");
+      }
+    } catch (e) { partes.push("", `(No se pudo armar el detalle de errores: ${e.message})`); }
+
     partes.push("El detalle completo:\n  SELECT * FROM toolbar_health_check ORDER BY estado, job;");
 
     const _titulo = graves.length
