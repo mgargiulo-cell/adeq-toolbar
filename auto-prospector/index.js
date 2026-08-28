@@ -20552,6 +20552,10 @@ async function runAgentCycle(token, allFlags) {
         // open_rate * (1 - bounce_rate) observado en últimos 30d. Con sample
         // chico o ε-greedy 10%, fallback al hardcoded apollo > informer > scrape.
         // Threshold: solo score >= 0 (positivo); negativo = no mandar.
+        // El orden aprendido de tipos de email vive en memoria y el worker reinicia cada
+        // ~7 min: sin esto se perdería en cada arranque y volvería al default, tirando a la
+        // basura el reajuste semanal. La caché interna evita releer la config cada vuelta.
+        await _cargarTierOrden(cfg).catch(() => {});
         const SOURCE_RANK = await getDynamicSourceRank(token, userEmail);
         const _sourcesMap = lead.email_sources || {};
         // Filtra bounced ANTES de rankear: si el #1 ya rebotó, no perdemos el
@@ -21440,6 +21444,88 @@ function _sourceHardTier(source) {
 //   1 = informer NO-comercial (WHOIS/registrar — baja calidad, ver auditoría 2026-07-13)
 //   0 = genérico (info@/contacto@)
 // Así el orden queda: apollo > publicidad@ > persona scrapeada > informer > genérico.
+// ── EL ORDEN DE LOS TIERS LO DECIDEN LAS RESPUESTAS (Maxi 2026-08-28, pedido del user) ──
+// "Dale automáticamente más prioridad a los que más responden, 4 reajustes por mes, uno por
+//  semana." Hasta hoy el orden era fijo por decisión: apollo > rol comercial > persona >
+// genérico. La medición real le da la razón a Apollo (9,3%) pero el resto baila — y un orden
+// clavado no se entera si mañana los roles comerciales empiezan a contestar el doble.
+//
+// Una vez por semana se mide la respuesta REAL (sin out-of-office) por tipo sobre 90 días
+// —con 30 la muestra de Apollo es demasiado chica para decidir— y se reordena. Salvaguardas:
+//   · suavizado (ok+1)/(n+10): un tipo con 2 de 3 no le gana a uno con 20 de 200;
+//   · mínimo 15 envíos por tipo — sin muestra se queda el orden vigente para ese tipo;
+//   · el resultado se guarda en config y se LOGUEA: cada reajuste queda visible en el resumen.
+const _TIER_ORDEN_DEFAULT = ["apollo", "rol", "persona", "generico"];
+let _tierOrdenCache = { orden: null, ts: 0 };
+
+function _tipoDeEmailParaRanking(email, source) {
+  const src = String(source || "").toLowerCase();
+  const local = String(email || "").toLowerCase().split("@")[0];
+  if (src === "apollo" || src === "manual") return "apollo";
+  if (AD_SALES_LOCAL.test(local)) return "rol";
+  if (_sourceHardTier(source) === 1) return "persona";
+  return "generico";
+}
+
+async function reajustarPrioridadTiposEmail(token) {
+  try {
+    if (!(await _tocaCorrer(token, "reajuste_tipos_email", 7 * 24 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const d90 = new Date(Date.now() - 90 * 86400_000).toISOString();
+    const filas = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${d90}&select=email_sent_to,source,responded_at,response_type&limit=8000`,
+      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    if (!Array.isArray(filas) || filas.length < 100) return;   // sin muestra no se toca nada
+
+    const agg = {};
+    for (const r of filas) {
+      // manual_extra es un canal, no un tipo: se clasifica por el local-part igual que el resto.
+      const t = _tipoDeEmailParaRanking(r.email_sent_to, r.source === "manual_extra" ? "" : r.source);
+      (agg[t] = agg[t] || { n: 0, ok: 0 }).n++;
+      if (r.responded_at && r.response_type !== "out_of_office") agg[t].ok++;
+    }
+    const orden = [..._TIER_ORDEN_DEFAULT].sort((a, b) => {
+      const va = agg[a], vb = agg[b];
+      // Sin muestra suficiente conserva su posición por defecto (Infinity-safe: se comparan
+      // solo los medidos; el resto empata y el sort estable respeta el default).
+      const sa = va && va.n >= 15 ? (va.ok + 1) / (va.n + 10) : null;
+      const sb = vb && vb.n >= 15 ? (vb.ok + 1) / (vb.n + 10) : null;
+      if (sa == null && sb == null) return 0;
+      if (sa == null) return 1;
+      if (sb == null) return -1;
+      // ⚠️ MARGEN MÍNIMO: solo reordena una diferencia que SIGNIFIQUE algo. Con los datos
+      // reales de hoy genérico da 6,5% y persona 6,3% — eso es un empate, no una señal, y
+      // sin margen un decimal pondría un info@ por encima de una persona con nombre, que es
+      // justo la regla que el user pidió al revés. Se exige 15% relativo de ventaja para
+      // mover el orden; por debajo, gana el que ya estaba (el sort es estable).
+      const _mejor = Math.max(sa, sb);
+      if (Math.abs(sa - sb) / (_mejor || 1) < 0.15) return 0;
+      return sb - sa;
+    });
+    const medido = Object.fromEntries(Object.entries(agg).map(([t, v]) => [t, `${v.ok}/${v.n} (${(100 * v.ok / v.n).toFixed(1)}%)`]));
+    await setConfigValue(token, "email_tier_ranking", JSON.stringify({ orden, medido, fecha: new Date().toISOString().slice(0, 10) }));
+    _tierOrdenCache = { orden, ts: Date.now() };
+    const _cambio = JSON.stringify(orden) !== JSON.stringify(_TIER_ORDEN_DEFAULT);
+    log(`  🎯 reajuste semanal de tipos de email: ${orden.join(" > ")} — ${Object.entries(medido).map(([t, v]) => `${t} ${v}`).join(" · ")}`);
+    await _acumularCuracion(token, `Reajuste semanal de prioridad de emails: ${orden.join(" > ")}${_cambio ? " (CAMBIÓ el orden por las respuestas medidas)" : " (mismo orden, los datos lo confirman)"}`).catch(() => {});
+  } catch (e) { log(`⚠️ reajustarPrioridadTiposEmail: ${e.message}`); }
+}
+
+// El orden vigente, con caché de 1h. Si nunca se midió, el default.
+function _tierPrioridad(tipo) {
+  const orden = _tierOrdenCache.orden || _TIER_ORDEN_DEFAULT;
+  const idx = orden.indexOf(tipo);
+  // Prioridad más alta = número más alto (misma semántica que _pickTier de siempre).
+  return idx === -1 ? 0 : (orden.length - idx);
+}
+async function _cargarTierOrden(cfg) {
+  if (_tierOrdenCache.orden && Date.now() - _tierOrdenCache.ts < 3600_000) return;
+  try {
+    const g = JSON.parse(cfg.email_tier_ranking || "null");
+    if (g && Array.isArray(g.orden) && g.orden.length === 4) _tierOrdenCache = { orden: g.orden, ts: Date.now() };
+  } catch {}
+}
+
 function _pickTier(email, source) {
   const src = String(source || "").toLowerCase();
   const local = String(email || "").toLowerCase().split("@")[0];
@@ -21447,11 +21533,10 @@ function _pickTier(email, source) {
   // técnicos/registrar (domainmanagement@, net-manage@…) de baja calidad. Se baja al nivel más bajo
   // salvo que el local sea un rol comercial explícito. apollo/manual siguen tier 4.
   if (src === "informer") return AD_SALES_LOCAL.test(local) ? 3 : 1;
-  const st = _sourceHardTier(source);
-  if (st === 2) return 4;                                          // apollo/manual nominal
-  if (AD_SALES_LOCAL.test(local)) return 3;                        // rol comercial/publicidad
-  if (st === 1) return 2;                                          // persona scrapeada
-  return 0;                                                        // genérico
+  // El orden entre los cuatro tipos sale del reajuste semanal por respuestas medidas
+  // (`reajustarPrioridadTiposEmail`). Si nunca se midió, `_TIER_ORDEN_DEFAULT` reproduce
+  // exactamente el orden fijo de siempre: apollo > rol > persona > genérico.
+  return _tierPrioridad(_tipoDeEmailParaRanking(email, source));
 }
 const SOURCE_PERF_WINDOW_DAYS = 30;
 const SOURCE_PERF_MIN_SENT = 50;       // sample mínimo por (mb, source) para usar dinámico
@@ -24568,6 +24653,8 @@ async function main() {
       await reabrirLeadsRebotados(token).catch(e => log(`⚠️ reabrir rebotados: ${e.message}`));
       await purgarColaVieja(token).catch(e => log(`⚠️ purga: ${e.message}`));
       await recalcularCarrilesPorRendimiento(token).catch(e => log(`⚠️ carriles: ${e.message}`));
+      // Reajuste SEMANAL de la prioridad por tipo de email según respuestas reales.
+      await reajustarPrioridadTiposEmail(token).catch(e => log(`⚠️ tipos email: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
       await vigilarLlegadaAMonday(token).catch(e => log(`⚠️ llegada a Monday: ${e.message}`));
