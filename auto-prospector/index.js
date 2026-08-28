@@ -19108,6 +19108,24 @@ async function _secFrenar(token, motivo) {
 // Minutos que tiene que aguantar la calma antes de soltar un freno automático.
 const SEC_AUTO_RECUPERACION_MIN = 30;
 
+// ── DORMIDO NO ES MUERTO (Maxi 2026-08-28) ──────────────────────────────────────────────
+// Fuera del horario de España y los fines de semana el worker hace `continue` antes de
+// escribir nada, así que `auto_heartbeat_at` y `worker_commit` quedan congelados en el último
+// momento activo. Consecuencia: de noche y todo el fin de semana el sistema se ve IDÉNTICO a
+// un worker caído — y el vigilante tiene una alerta por "sin latido hace 25 minutos".
+// Me pasó a mí ahora: vi el latido de las 21:01 a las 00:25 y di el worker por muerto; estaba
+// perfecto, dormido por horario. Si me confundió a mí con la base delante, la alerta de las
+// 3 AM confunde a cualquiera.
+// Late igual mientras duerme, y deja la versión desplegada actualizada.
+async function _latirDormido(token) {
+  try {
+    await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString());
+    await setConfigValue(token, "worker_dormido", `${new Date().toISOString()} — fuera de horario/fin de semana`);
+    const _sha = (process.env.RAILWAY_GIT_COMMIT_SHA || "").slice(0, 7);
+    if (_sha) await setConfigValue(token, "worker_commit", _sha);
+  } catch { /* si no se puede escribir, no se frena el ciclo */ }
+}
+
 // ── EL RECORTE POR STOCK, EN UN SOLO LUGAR (Maxi 2026-08-27) ────────────────────────────
 // El agente baja su ritmo solo cuando el pool tiene menos de 10 días de stock: es una regla
 // del user para que no se coma su propio inventario. La alerta de "no llegó a los 20 envíos"
@@ -24389,6 +24407,7 @@ async function main() {
         if (_isWeekendSpain()) {
           if (iterCount === 1 || iterCount % 30 === 0) {
             log(`💤 Fin de semana en España (weekday=${_spainWeekday()}) — worker dormido hasta lunes`);
+            await _latirDormido(token);
           }
           // Sleep largo fuera de active hours — ahorro CPU/Railway. Antes era
           // POLL_INTERVAL_MS (20s) que loopeaba sin trabajo. IDLE_INTERVAL_MS (120s)
@@ -24399,6 +24418,7 @@ async function main() {
         if (_isOutsideActiveHours(ghStart, ghEnd)) {
           if (iterCount === 1 || iterCount % 30 === 0) {
             log(`💤 Fuera de horario España (h=${_spainHour()}, activo=${ghStart}-${ghEnd}) — worker pausado`);
+            await _latirDormido(token);
           }
           // Sleep largo fuera de active hours (ver comentario arriba).
           await sleep(IDLE_INTERVAL_MS);
