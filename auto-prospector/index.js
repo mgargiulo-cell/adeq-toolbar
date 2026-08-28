@@ -19108,6 +19108,102 @@ async function _secFrenar(token, motivo) {
 // Minutos que tiene que aguantar la calma antes de soltar un freno automático.
 const SEC_AUTO_RECUPERACION_MIN = 30;
 
+// ── LA TABLA DE CONTROL DE PLANTILLAS (Maxi 2026-08-28, pedido del user) ────────────────
+// "Las plantillas que más responden por idioma son las que más se usan. En 20 días
+//  analizamos y cambiamos las que no responden. Hacé una tabla para tener control."
+//
+// ⚠️ Al ir a implementar el sesgo descubrí que YA EXISTE: `pickAnyTemplate` elige ponderado
+// por respuestas reales, con piso de participación, y su pool ya viene filtrado por idioma.
+// Yo le había dicho al user que se elegían al azar mirando `pickRandomTemplate` — eso es
+// SOLO el fallback de cuando no hay borradores. Agregar un segundo ponderador encima habría
+// multiplicado los sesgos sin que se pudiera saber cuál manda.
+//
+// Lo que de verdad faltaba es la TABLA. Este job mide semanalmente y deja la foto en
+// `toolbar_template_perf`: enviados, respuestas, % y puesto POR IDIOMA. Comparar entre
+// idiomas no mediría la plantilla sino el mercado (Alemania 14,6% vs Argentina 0%), así que
+// el ranking es siempre dentro del mismo idioma.
+//
+// El `peso` que se guarda es informativo — muestra cuánto MERECERÍA salir cada una según su
+// rendimiento, para que el user compare contra lo que el selector hace de hecho.
+const TPL_VENTANA_DIAS = 90;
+const TPL_MIN_MUESTRA = 20;      // por plantilla; con menos no se juzga, se explora
+const TPL_PESO_PISO = 0.5;       // nunca baja de la mitad del peso parejo
+const TPL_PESO_TECHO = 2.5;      // ni sube más de 2,5×
+
+async function reajustarPlantillasPorRespuesta(token) {
+  try {
+    if (!(await _tocaCorrer(token, "reajuste_plantillas", 7 * 24 * 60))) return;
+    const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const desde = new Date(Date.now() - TPL_VENTANA_DIAS * 86400_000).toISOString();
+
+    // El idioma vive en el lead, no en el tracking: se cruza por dominio.
+    const [tr, acts, leads] = await Promise.all([
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${desde}&select=agent_action_id,domain,responded_at,response_type&limit=8000`, { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?template_id=not.is.null&created_at=gte.${desde}&select=id,template_id&limit=8000`, { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []),
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=domain,language&limit=10000`, { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []),
+    ]);
+    if (!Array.isArray(tr) || tr.length < 50) return;
+
+    const tplPorAccion = new Map((acts || []).map(a => [a.id, a.template_id]));
+    const idiomaPorDom = new Map((leads || []).map(l => [String(l.domain || "").toLowerCase(), (l.language || "").toLowerCase()]));
+
+    const agg = {};   // idioma → template_id → {n, ok}
+    for (const r of tr) {
+      const tpl = tplPorAccion.get(r.agent_action_id);
+      if (!tpl) continue;
+      const idioma = idiomaPorDom.get(String(r.domain || "").toLowerCase()) || "";
+      if (!idioma) continue;                          // sin idioma no se puede comparar justo
+      const porIdioma = (agg[idioma] = agg[idioma] || {});
+      const v = (porIdioma[tpl] = porIdioma[tpl] || { n: 0, ok: 0 });
+      v.n++;
+      if (r.responded_at && r.response_type !== "out_of_office") v.ok++;
+    }
+
+    const pesos = {};
+    const filas = [];
+    for (const [idioma, tpls] of Object.entries(agg)) {
+      const conMuestra = Object.entries(tpls).filter(([, v]) => v.n >= TPL_MIN_MUESTRA);
+      if (conMuestra.length < 2) continue;            // con una sola no hay a quién preferir
+      // Suavizado: una plantilla con 2 de 3 no le gana a una con 14 de 168.
+      const score = (v) => (v.ok + 1) / (v.n + 10);
+      const prom = conMuestra.reduce((a, [, v]) => a + score(v), 0) / conMuestra.length;
+      pesos[idioma] = {};
+      const orden = conMuestra.sort((a, b) => score(b[1]) - score(a[1]));
+      orden.forEach(([tpl, v], i) => {
+        const peso = Math.max(TPL_PESO_PISO, Math.min(TPL_PESO_TECHO, score(v) / (prom || 1)));
+        pesos[idioma][tpl] = Number(peso.toFixed(3));
+        filas.push({
+          idioma, template_id: tpl, enviados: v.n, respuestas: v.ok,
+          pct: Number((100 * v.ok / v.n).toFixed(2)), peso: Number(peso.toFixed(3)),
+          puesto: i + 1, ventana_dias: TPL_VENTANA_DIAS,
+        });
+      });
+    }
+    if (!filas.length) return;
+
+    // La foto de la semana, para que el user pueda mirar la evolución en 20 días.
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_template_perf?on_conflict=medido_el,idioma,template_id`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(filas),
+    }).catch(() => {});
+
+    const _res = Object.entries(pesos).map(([l, t]) => {
+      const top = Object.entries(t).sort((a, b) => b[1] - a[1])[0];
+      return `${l}: mejor ${top[0]} (×${top[1]})`;
+    }).join(" · ");
+    log(`  📝 reajuste semanal de plantillas — ${_res}`);
+    await _acumularCuracion(token, `Reajuste semanal de plantillas por respuesta (${filas.length} medidas): ${_res}`).catch(() => {});
+  } catch (e) { log(`⚠️ reajustarPlantillasPorRespuesta: ${e.message}`); }
+}
+
+// ⚠️ NO se agrega un segundo selector ponderado (Maxi 2026-08-28). `pickAnyTemplate` YA elige
+// sesgado por respuestas reales, con piso de participación, y su pool ya viene filtrado por
+// idioma — o sea que la comparación ya es justa entre plantillas del mismo idioma. Meter otra
+// ponderación encima multiplicaría los sesgos y haría imposible saber cuál manda.
+// Este job SOLO MIDE y deja la foto semanal en `toolbar_template_perf`, que es la tabla de
+// control que el user va a mirar en 20 días para decidir cuáles reescribe.
+
 // ── DORMIDO NO ES MUERTO (Maxi 2026-08-28) ──────────────────────────────────────────────
 // Fuera del horario de España y los fines de semana el worker hace `continue` antes de
 // escribir nada, así que `auto_heartbeat_at` y `worker_commit` quedan congelados en el último
@@ -23145,6 +23241,29 @@ async function _boletinPorSeccion(token) {
       }
     } catch {}
 
+    // ── PLANTILLAS: la peor de cada idioma, para reescribirla ──────────────
+    // El user va a revisar esto a los 20 días. Que le llegue la conclusión, no la tabla:
+    // la mejor y la peor de cada idioma es lo único accionable de un ranking.
+    try {
+      const _tp = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_template_perf?order=medido_el.desc,idioma.asc,puesto.asc&limit=60`);
+      if (Array.isArray(_tp) && _tp.length) {
+        const _ultima = _tp[0].medido_el;
+        const _porIdioma = {};
+        for (const r of _tp.filter(x => x.medido_el === _ultima)) (_porIdioma[r.idioma] = _porIdioma[r.idioma] || []).push(r);
+        const _l = Object.entries(_porIdioma)
+          .filter(([, arr]) => arr.length >= 2)
+          .map(([idioma, arr]) => {
+            const mejor = arr[0], peor = arr[arr.length - 1];
+            return `${idioma}: mejor ${mejor.template_id} ${mejor.pct}% · peor ${peor.template_id} ${peor.pct}% (${peor.enviados} envíos)`;
+          });
+        if (_l.length) {
+          _nota("PLANTILLAS POR IDIOMA", "ℹ️", [..._l,
+            "La peor de cada idioma es la candidata a reescribir. Historial: toolbar_template_perf.",
+          ]);
+        }
+      }
+    } catch {}
+
     // ── CUOTAS DE APIS ────────────────────────────────────────────────────
     const _rapid = parseInt(cfg.rapidapi_calls_month || "0", 10);
     const _rLim = parseInt(cfg.rapidapi_monthly_limit || "40000", 10);
@@ -24675,6 +24794,7 @@ async function main() {
       await recalcularCarrilesPorRendimiento(token).catch(e => log(`⚠️ carriles: ${e.message}`));
       // Reajuste SEMANAL de la prioridad por tipo de email según respuestas reales.
       await reajustarPrioridadTiposEmail(token).catch(e => log(`⚠️ tipos email: ${e.message}`));
+      await reajustarPlantillasPorRespuesta(token).catch(e => log(`⚠️ plantillas: ${e.message}`));
       await vigilarEmbudoDeDescubrimiento(token).catch(e => log(`⚠️ embudo: ${e.message}`));
       await vigilarAgenteFrenado(token).catch(e => log(`⚠️ agente frenado: ${e.message}`));
       await vigilarLlegadaAMonday(token).catch(e => log(`⚠️ llegada a Monday: ${e.message}`));
