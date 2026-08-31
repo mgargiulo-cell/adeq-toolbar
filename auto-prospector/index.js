@@ -13945,7 +13945,9 @@ async function runSession(token, cfg, sessionStart) {
       // disfrazado de similar-discovery, y eso es exactamente la "baja calidad" del pool.
       // Degradar está bien; degradar sin avisar, no.
       await saludPing(token, "autopilot_similares", {
-        status: _soloSimilares === 0 ? "fail" : "ok", cadenciaMin: 120,
+        // A pedido: `runSession` corre SOLO si un MB prende el toggle, y se apaga sola al
+        // terminar. No tiene horario que incumplir → sin cadencia (ver saludPing).
+        status: _soloSimilares === 0 ? "fail" : "ok", cadenciaMin: 0,
         detalle: `${_soloSimilares} similares desde ${seedDomains.size} semillas (+${_deRadar} de Radar)`,
         real: _soloSimilares, esperado: Math.max(10, seedDomains.size * 3),
       });
@@ -17390,7 +17392,19 @@ const _GL_LOCAL_PARTS = [
   "plataforma","plataformas","platform","platforms","sistema","sistemas","tic","tic-admin","tic.adm","tecnologia","tecnologias","tech-admin",
   "foco","servicioalcliente","servicio-al-cliente","servicio-cliente","atencionalcliente","atencion-al-cliente","customerservice","customer-service","customercare","customer-care",
   "office","oficina","secretaria","secretariat","reception",
-  "redaction","redazione","redaktion","redactie","editorial",
+  // ⚠️ ACÁ ESTUVO "redaction","redazione","redaktion","redactie","editorial" (sacado 2026-08-31).
+  // Era la MISMA palabra tratada al revés según el idioma: `redaccion@` (es), `redacao@` (pt) y
+  // `editor@` puntuaban 115 y se enviaban, mientras `redazione@` (it), `redaktion@` (de),
+  // `redaction@` (fr), `redactie@` (nl) y `editorial@` morían en esta lista — y encima 90 líneas
+  // más abajo la regla EDITORIAL de esta misma función les da +75, o sea que era código muerto.
+  // Medido: 163 leads en 7 días quedaron sin email por ranking; en la muestra, la casilla de
+  // redacción EN EL DOMINIO PROPIO del medio era la única que el sitio publicaba
+  // (valsusaoggi.it, dueruote.it, varesenews.it, come-on-fc.com, santemagazine.fr, reader.gr).
+  // Descartarla es perder el lead entero, y choca de frente con el North Star: garantizar ≥1 email.
+  // Pega justo en la Europa no hispana, que es adonde va la cascada GEO después de LATAM/España.
+  // El buzón de redacción lo lee una persona del medio: no es infraestructura, que es lo que esta
+  // lista existe para cazar. Si alguna vez se decide que la redacción NO es un destino válido, va
+  // como PENALTY en el scoring —una decisión de negocio, visible y medible—, no acá.
   "trustandsafety","trust-?and-?safety","trust-?safety","safety","safety-?team","trust-?ops",
   "whois","registrant","registry","registrar","domain-?ops","domain-?abuse","ndomains",
   // Manejo de dominios/DNS (caso real domains@latinregistrar.com.br se coló al agent 2026-05-13)
@@ -18114,7 +18128,12 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // Regex hoisteado a módulo (AD_SALES_LOCAL) — misma fuente de verdad que _pickTier.
   const AD_SALES   = AD_SALES_LOCAL;
   const COMMERCIAL = /^(?:(?:business|partnership|partner|propaganda|director|gerente|manager|jefe|brand|media)|(?:bd|head)\b)/i;
-  const EDITORIAL  = /^(editor|editor-in-chief|chief-editor|redacao|redaccion|redazione|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
+  // Maxi 2026-08-31: faltaban los idiomas europeos. `redazione` (it) ya estaba pero moría en la
+  // lista negra; `redaktion` (de), `redaction` (fr), `redactie` (nl), `redakcja` (pl), `redakce`
+  // (cz), `szerkesztoseg` (hu) y `syntaxi` (gr) no figuraban en ningún lado. Y `editorial` no
+  // entraba por el `\b`: después de "editor" viene una "i", que es carácter de palabra, así que
+  // la alternativa fallaba y caía en PERSON_LIKELY (+55) en vez de EDITORIAL (+75).
+  const EDITORIAL  = /^(editor|editorial|editor-in-chief|chief-editor|redacao|redaccion|redazione|redaktion|redaction|redactie|redakcja|redakce|redaktsiya|szerkesztoseg|syntaxi|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
   const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
 
   // ORDEN: chequear generics PRIMERO (antes que "single name"), sino palabras
@@ -22260,7 +22279,15 @@ async function saludPing(token, job, { status = "ok", detalle = "", cadenciaMin 
       last_detail: (detalle || "").slice(0, 300),
       updated_at: ahora,
     };
-    if (cadenciaMin != null) fila.esperado_cada_min = cadenciaMin;
+    // ── TRABAJOS A PEDIDO (Maxi 2026-08-31) ────────────────────────────────────────
+    // `cadenciaMin: 0` = este job NO tiene horario, lo dispara una persona. La vista
+    // solo marca ATRASADO cuando hay cadencia esperada, así que guardar NULL lo saca
+    // del reloj sin sacarlo del panel: se lo sigue juzgando por su ÚLTIMO RESULTADO.
+    // Sin esto, un job manual se pone rojo para siempre apenas nadie lo prende — que es
+    // lo que pasó con `autopilot_similares`: 10 días en rojo con su última corrida
+    // exitosa (847 similares). Un job que nadie pidió no está atrasado, está esperando.
+    if (cadenciaMin === 0) fila.esperado_cada_min = null;
+    else if (cadenciaMin != null) fila.esperado_cada_min = cadenciaMin;
     if (real     != null)    fila.real_ultimo     = real;
     if (esperado != null)    fila.esperado_ultimo = esperado;
 
@@ -23122,6 +23149,15 @@ async function _acumularCuracion(token, texto) {
 // resumen y uno de alertas por día, no tres.
 async function _boletinPorSeccion(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  // ── LA MISMA VENTANA QUE EL CUPO (Maxi 2026-08-31) ──────────────────────────────────
+  // El bloque de ENVÍO usaba 24h CORRIDAS mientras la alerta de "no llegó a su cupo" usa el
+  // día calendario. Resultado: el MISMO mail decía "72 de 60, 24 cada uno" arriba y "16 de
+  // 20" abajo. Los dos números eran correctos y se contradecían, que es la peor forma de
+  // informar — obliga a desconfiar de todo el resto.
+  // El cupo se resetea a medianoche de Madrid, así que el informe cuenta desde ahí.
+  // Las otras métricas (altas, cola, re-trabajo) SÍ se quedan en 24h corridas: son caudales,
+  // no cupos, y ahí la ventana móvil es la lectura correcta.
+  const _hoyMadrid = _madridMidnightUtcISO();
   const desde24 = new Date(Date.now() - 24 * 3600_000).toISOString();
   const out = [];
   const _cnt = async (url) => {
@@ -23142,7 +23178,7 @@ async function _boletinPorSeccion(token) {
     const cfg = await getConfig(token).catch(() => ({}));
 
     // ── ENVÍO ─────────────────────────────────────────────────────────────
-    const _envios = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${desde24}&select=user_email&limit=500`);
+    const _envios = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${_hoyMadrid}&select=user_email&limit=500`);
     const _porMb = {};
     for (const e of _envios) { const u = String(e.user_email || "?").split("@")[0]; _porMb[u] = (_porMb[u] || 0) + 1; }
     const _cupo = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
@@ -23152,7 +23188,7 @@ async function _boletinPorSeccion(token) {
     try { _nBuzones = (JSON.parse(cfg.agent_enabled_users || "[]") || []).length; } catch {}
     if (_nBuzones < 1) _nBuzones = 1;
     const _tot = _envios.length, _obj = _cupo * _nBuzones;
-    _nota("ENVÍO", _tot >= _obj * 0.9 ? "✅" : _tot >= _obj * 0.6 ? "🟡" : "🔴", [
+    _nota("ENVÍO (hoy)", _tot >= _obj * 0.9 ? "✅" : _tot >= _obj * 0.6 ? "🟡" : "🔴", [
       `${_tot} de ${_obj} (${Object.entries(_porMb).map(([u, n]) => `${u} ${n}`).join(" · ") || "nadie"})`,
       ...(_tot < _obj * 0.9 ? ["Qué mirar: los skips en ERRORES CONCRETOS de abajo dicen qué lo frenó."] : []),
     ]);
