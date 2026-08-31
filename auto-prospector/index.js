@@ -20057,6 +20057,33 @@ async function runAgentCycle(token, allFlags) {
     _ordenMbs.push({ u, falta: _hechos == null ? Number.MAX_SAFE_INTEGER : _cap - _hechos });
   }
   _ordenMbs.sort((a, b) => b.falta - a.falta);
+
+  // ── LOS REBOTES SE ESCANEAN DE TODO EL QUE ENVÍA, NO SOLO DEL AGENTE ────────────────
+  // (Maxi 2026-08-31) El scan de abajo vive dentro del bucle de MBs, que recorre
+  // `agent_enabled_users`. Cuando hoy sacamos a mgargiulo del agente, su buzón dejó de
+  // escanearse en el mismo movimiento — y él sigue enviando A MANO desde la toolbar.
+  // El daño no es perderse un número: la lista de rebotes es COMPARTIDA. Una dirección que
+  // rebota en un envío manual y no se anota queda habilitada para que el agente le escriba
+  // desde otro buzón, y ahí pagamos el rebote dos veces, con la reputación de dos cuentas.
+  // Quién envía y quién se escanea son dos preguntas distintas y ahora se responden por
+  // separado: se escanea a cualquiera que haya enviado en los últimos 30 días.
+  try {
+    const _d30 = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const _r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=user_email&limit=5000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (_r.ok) {
+      const _f = await _r.json();
+      const _delAgente = new Set(allFlags.agentUsers.map(u => String(u).toLowerCase()));
+      const _extras = [...new Set((Array.isArray(_f) ? _f : [])
+        .map(x => String(x.user_email || "").toLowerCase()).filter(Boolean))]
+        .filter(u => !_delAgente.has(u));
+      for (const u of _extras) {
+        log(`📬 scanBounces extra: ${u} envía pero no está en el agente — se escanea igual`);
+        scanBouncesForUser(token, u).catch(() => {});
+      }
+    }
+  } catch {}
   const _usuariosOrdenados = _ordenMbs.map(x => x.u);
   if (_usuariosOrdenados.length > 1) {
     log(`🤖 orden de atención (más atrasado primero): ${_ordenMbs.map(x => `${x.u.split("@")[0]}(faltan ${x.falta === Number.MAX_SAFE_INTEGER ? "?" : x.falta})`).join(" → ")}`);
