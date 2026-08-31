@@ -19869,13 +19869,21 @@ function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail }
 async function pushToCrmPropio(token, prospectos, contexto = "envio") {
   const lista = (Array.isArray(prospectos) ? prospectos : [prospectos]).filter(p => p && p.domain);
   if (!lista.length) return { enviados: 0, apagado: false };
-  if (!CRM_SYNC_SECRET) return { enviados: 0, apagado: true };
+  // Apagado NO es caído. Se late igual con `cadenciaMin: 0` (trabajo a pedido) para que el
+  // panel diga "apagado" en vez de quedar en rojo o desaparecer — un feed que no figura en
+  // ningún lado es el que nadie nota que nunca se prendió.
+  const _apagar = async (motivo) => {
+    await saludPing(token, "crm_sync", { status: "ok", cadenciaMin: 0, detalle: `apagado (${motivo})` }).catch(() => {});
+    return { enviados: 0, apagado: true };
+  };
+  if (!CRM_SYNC_SECRET) return _apagar("falta CRM_SYNC_SECRET en Railway");
   try {
     const cfg = await getConfig(token).catch(() => ({}));
-    if (String(cfg.crm_propio_enabled || "") !== "true") return { enviados: 0, apagado: true };
-  } catch { return { enviados: 0, apagado: true }; }
+    if (String(cfg.crm_propio_enabled || "") !== "true") return _apagar("crm_propio_enabled no está en true");
+  } catch { return _apagar("no se pudo leer la config"); }
 
   let ok = 0;
+  const _pedidos = lista.length;
   // Lotes de 100: es el máximo que declara el endpoint en su GET.
   for (let i = 0; i < lista.length; i += 100) {
     const lote = lista.slice(i, i + 100);
@@ -19905,6 +19913,18 @@ async function pushToCrmPropio(token, prospectos, contexto = "envio") {
       log(`🟠 CRM propio (${contexto}): ${e.message} — el envío NO se ve afectado`);
     }
   }
+  // ── SU DETECTOR (regla de oro: nada se entrega sin uno) ────────────────────────────
+  // Un feed que deja de andar en silencio es peor que no tenerlo: el board se queda quieto y
+  // parece que no hubo actividad, que es indistinguible de un día flojo. Se reusa el sistema
+  // de salud que ya existe en vez de inventar otro, así entra solo al informe diario y al
+  // vigilante. `real` vs `esperado` hace que la vista lo marque "rinde poco" cuando entran
+  // menos de los que se mandaron — que es exactamente el caso a cazar.
+  await saludPing(token, "crm_sync", {
+    status: ok === 0 && _pedidos > 0 ? "fail" : "ok",
+    cadenciaMin: 1440,
+    detalle: `${ok} de ${_pedidos} prospectos al CRM propio (${contexto})`,
+    real: ok, esperado: _pedidos,
+  }).catch(() => {});
   return { enviados: ok, apagado: false };
 }
 
@@ -23608,6 +23628,24 @@ async function _boletinPorSeccion(token) {
            _peor >= 3 ? "Un buzón muy por encima del resto suele ser la fuente de sus leads, no el buzón." : "Todos por debajo del 3%."]);
       }
     } catch {}
+
+    // ── CRM PROPIO ──────────────────────────────────────────────────────────────────────
+    // Solo aparece cuando está prendido. Mientras dure la convivencia con Monday, este
+    // renglón es el que permite ver si las dos columnas cuadran: si el CRM recibió menos
+    // prospectos que envíos hubo, algo se está perdiendo por el camino y hay que mirarlo
+    // ANTES de apagar Monday, que es el único momento en que sale barato.
+    if (String(cfg.crm_propio_enabled || "") === "true") {
+      try {
+        const _h = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_health?job=eq.crm_sync&select=last_detail,last_status,real_ultimo,esperado_ultimo&limit=1`);
+        const _f = _h && _h[0];
+        if (_f) {
+          const _r = Number(_f.real_ultimo || 0), _e = Number(_f.esperado_ultimo || 0);
+          _nota("CRM PROPIO", _f.last_status === "fail" ? "🔴" : (_e && _r < _e) ? "🟡" : "✅",
+            [String(_f.last_detail || "sin datos"),
+             (_e && _r < _e) ? "Entraron menos de los que se mandaron: revisar antes de apagar Monday." : "El feed y los envíos cuadran."]);
+        }
+      } catch {}
+    }
 
     const _apo = parseInt(cfg.apollo_calls_month || "0", 10);
     if (_esDiaDeLento) _nota("APIS", "ℹ️", [
