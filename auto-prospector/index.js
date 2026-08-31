@@ -15728,30 +15728,50 @@ async function scanBouncesForUser(token, userEmail) {
         if (Array.isArray(_f)) _destinatariosReales = new Set(_f.map(x => String(x.email_to || "").toLowerCase()).filter(Boolean));
       }
     } catch {}
-    // Query Gmail AMPLIADA (Maxi 2026-06-17). Antes era muy estrecha — solo
-    // capturaba subjects en inglés y 20 mensajes. Maxi reporta 5-10 rebotes/día
-    // pero solo veíamos ~0.6/día. Cambios:
-    //   - Subjects: agregamos patrones que en realidad llegan (Mail Delivery,
-    //     wasn't delivered, address rejected) + español + portugués + italiano
-    //   - Sender: además de daemons, sumamos common bounce senders + "bounce@"
-    //   - Window: 7 días (era 1d) con dedupe vía isBouncedSync → no reprocesa
-    //   - maxResults: 100 (era 20) → cubre el peor día
-    //   - in:anywhere → Spam + Papelera incluidos (ya estaba)
+    // ── EL `AND` ENTRE DOS LISTAS DE PALABRAS ERA EL AGUJERO (Maxi 2026-08-31) ──────────
+    // La consulta exigía `from:(daemons)` Y ADEMÁS `subject:(lista de frases)`. Alcanzaba con
+    // que UNA de las dos fallara para que el rebote fuera invisible — y fallaba siempre con
+    // Microsoft 365 / Exchange, que es medio internet publisher.
+    //
+    // Exchange titula el rebote `Undeliverable: <asunto original>`. La lista tenía
+    // `undelivered`, que es OTRA palabra: Gmail no las une. Y el texto que sí reconoceríamos
+    // ("couldn't be delivered") va en el CUERPO, no en el asunto, así que `subject:` no lo ve.
+    //
+    // Medido el 31/08 contra el buzón de Maxi, 90 días: la consulta vieja no veía NINGUNO de
+    // estos, y los ocho estaban ausentes de `toolbar_bounced_emails`:
+    //   riosvictor@gallito.com.uy ("wasn't found")     · angelo.giacomobello@drmax.it
+    //   comercial@kiwilimon.com · kiwipro@kiwilimon.com ("group isn't set up to receive")
+    //   comercial@grupofolha.com.br ("only accepts messages from its organization")
+    //   sales@renote.ai ("a mail flow rule has blocked your message") · news@emirates247.com
+    //   noviny@joj.sk (4 destinatarios, buzón lleno)
+    // Y en la tabla, 492 de 523 rebotes de 90 días habían quedado con `tipo` NULL: ni siquiera
+    // los que entraban se estaban clasificando.
+    //
+    // Ahora las dos condiciones van en OR, no en AND: un rebote se reconoce por venir de un
+    // daemon O por titularse como rebote. Ensanchar la red es seguro porque cada mensaje se
+    // verifica DESPUÉS, uno por uno (`_pareceRebote`): tiene que traer cabecera de DSN
+    // (multipart/report, X-Failed-Recipients, Auto-Submitted) o texto de rebote en el cuerpo.
+    // Sin esa verificación, `from:(delivery)` se traería respuestas de personas reales.
+    // maxResults sube a 200: con el OR entra más, y el dedupe por ID de mensaje evita reprocesar.
     const q = encodeURIComponent(
-      'from:(mailer-daemon OR postmaster OR mail-daemon OR bounce OR no-reply-bounce OR returns OR delivery) ' +
-      'subject:(' +
-        'undelivered OR "delivery status" OR "returned mail" OR "failure notice" OR ' +
-        '"mail delivery" OR "delivery failed" OR "wasn\'t delivered" OR "address rejected" OR ' +
-        '"could not be delivered" OR "permanent failure" OR "delivery problem" OR ' +
-        '"no se ha entregado" OR "mensaje no entregado" OR "devuelto al remitente" OR ' +
-        '"correo no entregado" OR "fallo en la entrega" OR ' +
-        '"não foi entregue" OR "mensagem não entregue" OR "devolvido" OR ' +
-        '"non recapitato" OR "consegna non riuscita" OR ' +
-        '"non distribué" OR "n\'a pas pu être remis"' +
-      ') newer_than:7d in:anywhere'
+      '{' +
+        'from:(mailer-daemon OR postmaster OR mail-daemon OR bounce OR no-reply-bounce OR returns OR delivery) ' +
+        'subject:(' +
+          'undeliverable OR undelivered OR "delivery status" OR "returned mail" OR "failure notice" OR ' +
+          '"mail delivery" OR "delivery failed" OR "wasn\'t delivered" OR "address rejected" OR ' +
+          '"could not be delivered" OR "permanent failure" OR "delivery problem" OR ' +
+          // Exchange traduce el prefijo al idioma del servidor del destinatario.
+          '"no se ha entregado" OR "mensaje no entregado" OR "devuelto al remitente" OR ' +
+          '"correo no entregado" OR "fallo en la entrega" OR "no entregado" OR ' +
+          '"não foi entregue" OR "mensagem não entregue" OR "devolvido" OR ' +
+          '"non recapitato" OR "consegna non riuscita" OR ' +
+          '"non distribué" OR "n\'a pas pu être remis" OR ' +
+          '"unzustellbar" OR "nicht zugestellt" OR "onbestelbaar" OR "niedostarczone"' +
+        ')' +
+      '} newer_than:7d in:anywhere'
     );
     const listRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=100`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=200`,
       { headers: { "Authorization": `Bearer ${accessToken}` } }
     );
     if (!listRes.ok) {
@@ -15792,6 +15812,22 @@ async function scanBouncesForUser(token, userEmail) {
         const msg = await msgRes.json();
         // Buscar el header X-Failed-Recipients o parsear body
         const headers = msg.payload?.headers || [];
+        // ── VERIFICAR QUE ESTO SEA UN REBOTE (Maxi 2026-08-31) ────────────────────────
+        // La consulta ahora es un OR ancho, así que puede traer una respuesta de una persona
+        // de verdad cuya dirección contenga "delivery" o "returns". El filtro no puede ser otra
+        // lista de frases: se apoya en lo que un rebote tiene POR NORMA (RFC 3464) y una
+        // respuesta humana no. Basta con UNA de las tres señales.
+        const _hdr = (n) => (headers.find(h => h.name?.toLowerCase() === n)?.value || "");
+        const _cuerpoCheck = extractMessageText(msg.payload || {});
+        const _pareceRebote =
+          /multipart\/report|report-type=[\s"']*delivery-status/i.test(_hdr("content-type")) ||
+          !!_hdr("x-failed-recipients") ||
+          /auto-replied|auto-generated/i.test(_hdr("auto-submitted")) ||
+          /couldn'?t be delivered|could not be delivered|delivery has failed|wasn'?t found at|was not found at|delivery status notification|undeliverable|permanent(ly)? failed|status: [45]\.\d\.\d|diagnostic-code/i.test(_cuerpoCheck);
+        if (!_pareceRebote) {
+          await markBounceMsgSeen(token, id).catch(() => {});
+          continue;
+        }
         const failedHeader = headers.find(h => h.name?.toLowerCase() === "x-failed-recipients");
         let failedEmails = [];
         if (failedHeader?.value) {
@@ -15814,6 +15850,29 @@ async function scanBouncesForUser(token, userEmail) {
             // El filtro que faltaba: tiene que ser alguien a quien le escribimos de verdad.
             .filter(e => _destinatariosReales ? _destinatariosReales.has(e) : false)
           )].slice(0, 3); // top 3
+          // ── LISTAS DE DISTRIBUCIÓN (Maxi 2026-08-31) ──────────────────────────────
+          // Cuando le escribimos a un GRUPO, Exchange rebota nombrando a los miembros, no al
+          // grupo: `noviny@joj.sk` vuelve como "Delivery has failed to these recipients or
+          // groups: dinkova@joj.sk, vlkova@joj.sk, mako@joj.sk". Ninguno figura entre los que
+          // escribimos, así que el filtro de arriba los tira TODOS y el rebote se pierde entero.
+          // Y esto pega justo donde más duele: `comercial@`, `redazione@`, `prensa@` — las
+          // direcciones que más buscamos — suelen ser grupos, no buzones.
+          // Si el rebote no señala a nadie conocido pero las direcciones que falla están en un
+          // dominio donde escribimos a UNA sola dirección, esa es la que rebotó. Se exige que
+          // sea una sola: con dos o más no se puede saber cuál falló, y adivinar acá quema un
+          // contacto bueno para siempre (el error de las 606 direcciones del 25/08).
+          if (!failedEmails.length && emailMatches.length && _destinatariosReales) {
+            const _domsFallados = new Set(emailMatches.map(e => (e.toLowerCase().split("@")[1] || ""))
+              .filter(d => d && !BOUNCE_INFRA_DOMAINS.has(d) && d !== (userEmail.split("@")[1] || "").toLowerCase()));
+            for (const _d of _domsFallados) {
+              const _nuestras = [..._destinatariosReales].filter(e => e.endsWith("@" + _d));
+              if (_nuestras.length === 1) {
+                failedEmails.push(_nuestras[0]);
+                log(`  ↩️ rebote de lista de distribución en ${_d}: le escribimos solo a ${_nuestras[0]} → se le imputa a esa`);
+              }
+            }
+            failedEmails = [...new Set(failedEmails)].slice(0, 3);
+          }
           if (!failedEmails.length && emailMatches.length) {
             log(`  ℹ️ rebote sin X-Failed-Recipients: ninguna de las ${emailMatches.length} direcciones del cuerpo figura entre las que escribimos — no se blacklistea nada`);
           }
@@ -15822,6 +15881,8 @@ async function scanBouncesForUser(token, userEmail) {
         const bodyText = extractMessageText(msg.payload || {}).toLowerCase();
         const isHardBounce =
           /address not found|no se ha encontrado la dirección|endereço não encontrado|indirizzo non trovato|n'a pas été trouvée|nicht gefunden/i.test(bodyText) ||
+          // Exchange no dice "address not found", dice "<local> wasn't found at <dominio>".
+          /wasn'?t found at|was not found at|recipient unknown|unknown recipient|recipient not found/i.test(bodyText) ||
           /550[\s-]?5\.1\.1|550[\s-]?user unknown|user does not exist|no such user|mailbox unavailable|recipient does not exist/i.test(bodyText) ||
           /permanent failure|permanent error/i.test(bodyText);
         const isSoftBounce =
@@ -15838,6 +15899,10 @@ async function scanBouncesForUser(token, userEmail) {
         const _tipoRebote =
           /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|does not exist.{0,20}domain/i.test(bodyText) ? "dominio_inexistente"
           : /mailbox full|over quota|quota exceeded|insufficient storage|buz[oó]n lleno|caixa.{0,10}cheia/i.test(bodyText) ? "buzon_lleno"
+          // Exchange/M365 rechaza por REGLA de la organización, no por reputación. Son casos
+          // distintos: acá el buzón existe y funciona, simplemente no acepta correo de afuera.
+          // Sin estas frases caían en "desconocido" y el agente reintentaba contra el mismo lugar.
+          : /isn'?t set up to receive|only accepts messages from|not allowed to send to|external communication is not allowed|mail flow rule|has blocked your message|no permitido|not permitted to send/i.test(bodyText) ? "bloqueado"
           : /blocked|blacklist|spam|reputation|policy|rejected due to|not authorized|denied|550[\s-]?5\.7\./i.test(bodyText) ? "bloqueado"
           : isHardBounce ? "usuario_inexistente"
           : isSoftBounce ? "temporal"
