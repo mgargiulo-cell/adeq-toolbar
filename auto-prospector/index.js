@@ -16822,17 +16822,38 @@ async function getAgentWeeklyCount(token, userEmail) {
 // distribuían en torno a la medianoche. Ahora es estricto día calendario
 // España: 00:00 → 23:59 reset.
 // Medianoche de HOY en España, en ISO UTC. Compartido por los dos contadores diarios.
+// ── DEPENDÍA DE LA ZONA HORARIA DE LA MÁQUINA (Maxi 2026-08-31) ───────────────────────
+// `new Date("2026-08-31T00:00:00")` —sin Z— se interpreta en la hora LOCAL del proceso, así
+// que el resultado cambiaba según dónde corriera. Medido:
+//   TZ=UTC                → 30/08 22:00Z = 31/08 00:00 en Madrid  ✅
+//   TZ=Europe/Madrid      → 30/08 20:00Z = 30/08 22:00 en Madrid  ❌ dos horas antes
+//   TZ=America/Buenos_Aires → 31/08 01:00Z = 31/08 03:00 en Madrid ❌ tres horas después
+// Railway corre en UTC, así que en producción daba bien y por eso nunca se notó. Pero de eso
+// dependen el cupo diario, el kill switch y el informe: el día que Railway defina TZ, los tres
+// se rompen a la vez y EN SILENCIO, porque un cupo mal cortado no tira ningún error.
+// Ahora no se interpreta ninguna fecha en hora local: se prueban los dos offsets posibles de
+// Madrid (CEST +2 en verano, CET +1 en invierno) y se queda con el que Madrid ve como las
+// 00:00 de hoy. Se verifica el resultado en vez de calcularlo a ciegas.
 function _madridMidnightUtcISO() {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
+  const dia = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit"
-  });
-  const todaySpain = fmt.format(new Date()); // "YYYY-MM-DD"
-  // Offset de Madrid (CEST = +02 verano, CET = +01 invierno) resuelto contra UTC.
-  const probe = new Date(`${todaySpain}T00:00:00`);
-  const madridStr = probe.toLocaleString("en-US", { timeZone: "Europe/Madrid" });
-  const utcStr = probe.toLocaleString("en-US", { timeZone: "UTC" });
-  const offsetMs = new Date(madridStr).getTime() - new Date(utcStr).getTime();
-  return new Date(probe.getTime() - offsetMs).toISOString();
+  }).format(new Date()); // "YYYY-MM-DD" en Madrid
+  const verEnMadrid = (d) => {
+    const p = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }).formatToParts(d);
+    const g = (t) => p.find(x => x.type === t)?.value;
+    return { fecha: `${g("year")}-${g("month")}-${g("day")}`, hora: g("hour"), min: g("minute") };
+  };
+  for (const offH of [2, 1]) {   // CEST, CET
+    const cand = new Date(Date.parse(`${dia}T00:00:00.000Z`) - offH * 3600_000);
+    const v = verEnMadrid(cand);
+    if (v.fecha === dia && (v.hora === "00" || v.hora === "24") && v.min === "00") return cand.toISOString();
+  }
+  // Sin fallback silencioso: si ninguno cerró, se avisa y se usa +2 (el caso de 8 meses al año).
+  log(`🚨 _madridMidnightUtcISO no pudo resolver la medianoche de ${dia} — se usa CEST(+2). Revisar.`);
+  return new Date(Date.parse(`${dia}T00:00:00.000Z`) - 2 * 3600_000).toISOString();
 }
 
 // Contador genérico de acciones del día (calendario España) para un buzón.
@@ -23282,6 +23303,19 @@ async function _boletinPorSeccion(token) {
   // no cupos, y ahí la ventana móvil es la lectura correcta.
   const _hoyMadrid = _madridMidnightUtcISO();
   const desde24 = new Date(Date.now() - 24 * 3600_000).toISOString();
+  // ── LO QUE NO CAMBIA DE UN DÍA PARA EL OTRO, UNA VEZ POR SEMANA (Maxi 2026-08-31) ────
+  // Tres secciones miran ventanas de 30 días: qué TIPO de email responde, qué PLANTILLA
+  // responde por idioma, y el consumo de APIs del ciclo. Entre ayer y hoy se mueven
+  // decimales, pero ocupaban lugar todos los días y empujaban hacia abajo lo que sí cambió.
+  // Un mail que se lee todos los días compite contra sí mismo: cada renglón que siempre dice
+  // lo mismo entrena a saltear, y el día que ese renglón cambie tampoco se va a leer.
+  // Van los lunes, que es cuando se mira la semana. Las alertas siguen siendo diarias: si
+  // una API se pasa de cuota o una plantilla se rompe, eso entra por el canal de alertas,
+  // que no depende de esto.
+  // Se usa `_spainWeekday()`, que ya resuelve el día con Intl. La forma corta
+  // (`new Date(x.toLocaleString(...)).getDay()`) vuelve a interpretar una fecha en la hora
+  // local del proceso — el mismo error que acabamos de sacar de _madridMidnightUtcISO().
+  const _esDiaDeLento = _spainWeekday() === 1;   // lunes en España
   const out = [];
   const _cnt = async (url) => {
     try {
@@ -23403,7 +23437,7 @@ async function _boletinPorSeccion(token) {
           .sort((a, b) => (b[1].ok / b[1].n) - (a[1].ok / a[1].n))
           .map(([t, v]) => `${t}: ${(100 * v.ok / v.n).toFixed(1)}% (${v.ok} de ${v.n})`);
         if (_lineas.length) {
-          _nota("TIPOS DE EMAIL QUE RESPONDEN (30d)", "ℹ️", [
+          if (_esDiaDeLento) _nota("TIPOS DE EMAIL QUE RESPONDEN (30d)", "ℹ️", [
             _lineas.join(" · "),
             "El agente ya prioriza por esta señal (Apollo pisa al genérico); si un tipo se dispara, avisame y ajustamos el ranking.",
           ]);
@@ -23427,7 +23461,7 @@ async function _boletinPorSeccion(token) {
             return `${idioma}: mejor ${mejor.template_id} ${mejor.pct}% · peor ${peor.template_id} ${peor.pct}% (${peor.enviados} envíos)`;
           });
         if (_l.length) {
-          _nota("PLANTILLAS POR IDIOMA", "ℹ️", [..._l,
+          if (_esDiaDeLento) _nota("PLANTILLAS POR IDIOMA", "ℹ️", [..._l,
             "La peor de cada idioma es la candidata a reescribir. Historial: toolbar_template_perf.",
           ]);
         }
@@ -23437,8 +23471,35 @@ async function _boletinPorSeccion(token) {
     // ── CUOTAS DE APIS ────────────────────────────────────────────────────
     const _rapid = parseInt(cfg.rapidapi_calls_month || "0", 10);
     const _rLim = parseInt(cfg.rapidapi_monthly_limit || "40000", 10);
+    // ── REBOTES POR BUZÓN (Maxi 2026-08-31) ────────────────────────────────────────────
+    // El boletín contaba nueve cosas y ninguna era el rebote, que es lo único que se lleva
+    // puesta la reputación de una cuenta y lo que puede dejar un buzón frenado un día entero.
+    // El 31/08 sales@ estaba en 6,5% y dhorovitz@ en 1,0% con el MISMO mix de fuentes: un
+    // buzón rebotaba seis veces más que otro y el mail diario no lo decía en ningún lado.
+    // Va POR BUZÓN a propósito: el promedio de los tres escondía justamente ese caso.
+    try {
+      const _envs = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to&limit=5000`);
+      const _reb  = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email&limit=3000`);
+      const _setReb = new Set((_reb || []).map(x => String(x.email || "").toLowerCase()));
+      const _porMb = {};
+      for (const e of (_envs || [])) {
+        const u = String(e.user_email || "").toLowerCase(); if (!u) continue;
+        _porMb[u] = _porMb[u] || { n: 0, r: 0 };
+        _porMb[u].n++;
+        if (_setReb.has(String(e.email_to || "").toLowerCase())) _porMb[u].r++;
+      }
+      const _filas = Object.entries(_porMb).map(([u, v]) => ({ u: u.split("@")[0], n: v.n, r: v.r, pct: v.n ? (100 * v.r / v.n) : 0 }))
+        .sort((a, b) => b.pct - a.pct);
+      if (_filas.length) {
+        const _peor = _filas[0].pct;
+        _nota("REBOTES (7d)", _peor >= 5 ? "🔴" : _peor >= 3 ? "🟡" : "✅",
+          [_filas.map(f => `${f.u} ${f.pct.toFixed(1)}% (${f.r}/${f.n})`).join(" · "),
+           _peor >= 3 ? "Un buzón muy por encima del resto suele ser la fuente de sus leads, no el buzón." : "Todos por debajo del 3%."]);
+      }
+    } catch {}
+
     const _apo = parseInt(cfg.apollo_calls_month || "0", 10);
-    _nota("APIS", "ℹ️", [
+    if (_esDiaDeLento) _nota("APIS", "ℹ️", [
       `SimilarWeb ${_rapid}/${_rLim} este ciclo · Apollo ${_apo}/2250 (el pacing apunta a gastarlo entero).`,
     ]);
   } catch (e) {
@@ -23455,6 +23516,7 @@ async function enviarResumenSalud(token) {
     if (Date.now() - ultima < RESUMEN_SALUD_CADA_HORAS * 3600 * 1000) return;
 
     let pend = [], curado = [];
+    let _rojasBoletin = [], _amarBoletin = [], _lineaEnvio = "";
     try { pend   = JSON.parse(cfg.salud_resumen_pendiente || "[]"); } catch {}
     try { curado = JSON.parse(cfg.salud_resumen_curado || "[]"); } catch {}
     // Nada que contar → no se molesta a nadie, pero se corre la ventana igual para
@@ -23465,6 +23527,8 @@ async function enviarResumenSalud(token) {
     }
 
     const dias = RESUMEN_SALUD_CADA_HORAS / 24;
+    // El titular se calcula abajo, cuando ya se sabe qué salió rojo. Este renglón es un
+    // marcador de posición: se reemplaza antes de mandar.
     const partes = [`Resumen de los últimos ${dias} días.\n`];
 
     // El boletín por sección va PRIMERO: es la foto general. Las alertas y errores de abajo
@@ -23473,6 +23537,11 @@ async function enviarResumenSalud(token) {
       const _boletin = await _boletinPorSeccion(token);
       if (_boletin.length) {
         partes.push("📋 CÓMO RINDIÓ CADA SECCIÓN (24h):", ..._boletin, "");
+        _rojasBoletin  = _boletin.filter(l => l.startsWith("🔴")).map(l => l.slice(2).trim());
+        _amarBoletin   = _boletin.filter(l => l.startsWith("🟡")).map(l => l.slice(2).trim());
+        // El renglón de ENVÍO es el número que primero se busca: se sube al titular.
+        const _iEnv = _boletin.findIndex(l => l.includes("ENVÍO"));
+        if (_iEnv >= 0 && _boletin[_iEnv + 1]) _lineaEnvio = _boletin[_iEnv + 1].trim();
       }
     } catch (e) { partes.push(`(boletín por sección: ${e.message})`, ""); }
 
@@ -23537,6 +23606,25 @@ async function enviarResumenSalud(token) {
     }
     if (!graves.length && !leves.length && cronicos.length) {
       partes.splice(1, 0, "Nada nuevo hoy. Lo de abajo ya lo venías viendo.\n");
+    }
+    // ── EL TITULAR: QUE CONTESTE "¿CÓMO VENIMOS?" SIN SCROLLEAR (Maxi 2026-08-31) ───────
+    // El mail abría con "Resumen de los últimos N días" y caía directo en nueve secciones.
+    // Para saber si había que hacer algo, había que leerlas todas — y son las mismas nueve
+    // todos los días, así que la respuesta estaba ahí pero costaba encontrarla.
+    // Ahora la primera línea dice el veredicto y la segunda el número que siempre se busca.
+    // No agrega ningún dato nuevo: ordena los que ya estaban.
+    {
+      const _pendientes = graves.length + _rojasBoletin.length;
+      const _tibios = leves.length + _amarBoletin.length;
+      const _quePasa = [...new Set([...(_rojasBoletin || []), ...graves.map(g => g.titulo)])].slice(0, 3);
+      partes[0] =
+        (_pendientes
+          ? `🔴 ${_pendientes} cosa(s) necesitan una mano: ${_quePasa.join(" · ")}`
+          : _tibios
+            ? `🟡 Nada roto. ${_tibios} cosa(s) para mirar cuando puedas.`
+            : `✅ Todo en orden.`)
+        + (_lineaEnvio ? `\n${_lineaEnvio}` : "")
+        + `\n(Detalle de las últimas ${dias * 24} horas.)\n`;
     }
     // ── ERRORES CONCRETOS, NO SOLO EL ESTADO (Maxi 2026-08-27, pedido del user) ─────────
     // "Que el email informe de errores concretos además del resumen de actividad para poder
