@@ -19417,7 +19417,13 @@ async function securityWatchdog(token) {
   let _cupoMB = 0;
   try { _cupoMB = Number(JSON.parse(cfg.agent_focus_config || "{}")?.daily_override) || 0; } catch {}
   if (_cupoMB <= 0) _cupoMB = Number(cfg.agent_max_per_day) || 20;
-  const _buzones  = 3;
+  // ⚠️ El número de buzones se DERIVA de la config, no se clava (Maxi 2026-08-28). Estaba en
+  // 3 fijo, y el día que el user sacó a Maxi del agente el techo quedó 50% alto — o sea que
+  // la alarma habría dejado pasar un abuso real sin decir nada. Es la misma lección de
+  // siempre: un número clavado es una bomba de tiempo.
+  let _buzones = 0;
+  try { _buzones = (JSON.parse(cfg.agent_enabled_users || "[]") || []).length; } catch {}
+  if (_buzones < 1) _buzones = 1;
   const _techoPrimero = Math.ceil(_cupoMB * _buzones * 1.5);   // 50% de aire sobre el cupo real
   // ── SE MIDE EL MISMO DÍA QUE MIDE EL CAP (Maxi 2026-08-27) ──────────────────────────
   // Ayer esto contaba 24h CORRIDAS contra un cupo que es POR DÍA CALENDARIO, y hoy activó
@@ -23140,7 +23146,12 @@ async function _boletinPorSeccion(token) {
     const _porMb = {};
     for (const e of _envios) { const u = String(e.user_email || "?").split("@")[0]; _porMb[u] = (_porMb[u] || 0) + 1; }
     const _cupo = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
-    const _tot = _envios.length, _obj = _cupo * 3;
+    // El objetivo sale de cuántos buzones tiene el agente HOY, no de un 3 fijo: si no, el
+    // boletín pide 60 con dos buzones y marca 🔴 un día perfecto.
+    let _nBuzones = 0;
+    try { _nBuzones = (JSON.parse(cfg.agent_enabled_users || "[]") || []).length; } catch {}
+    if (_nBuzones < 1) _nBuzones = 1;
+    const _tot = _envios.length, _obj = _cupo * _nBuzones;
     _nota("ENVÍO", _tot >= _obj * 0.9 ? "✅" : _tot >= _obj * 0.6 ? "🟡" : "🔴", [
       `${_tot} de ${_obj} (${Object.entries(_porMb).map(([u, n]) => `${u} ${n}`).join(" · ") || "nadie"})`,
       ...(_tot < _obj * 0.9 ? ["Qué mirar: los skips en ERRORES CONCRETOS de abajo dicen qué lo frenó."] : []),
