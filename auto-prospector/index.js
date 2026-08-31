@@ -16720,6 +16720,13 @@ async function rescueFailedMondayPushes(token) {
           estado_idx: 3,          // Propuesta Vigente (T) — igual que el push normal
         }, AGENT_DEFAULTS.monday_board_id);
         if (!itemId) throw new Error("push devolvió item vacío");
+        // El rescate también alimenta al CRM propio: si no, los leads recuperados serían
+        // justo los que faltan en el board nuevo, y son los que más cuesta volver a encontrar.
+        await pushToCrmPropio(token, _crmPayload({
+          domain: p.domain, email: p.email, geo: p.geo, traffic: p.traffic,
+          language: p.language, phone: p.contact_phone,
+          userEmail: p.sender_user || row.user_email,
+        }), "rescate").catch(() => {});
         await logAgentAction(token, p.sender_user || row.user_email, {
           domain: p.domain, action: "monday_recovered", reason: "repushed_ok",
           details: { monday_item_id: itemId, original_action_id: row.id, sent_at: p.sent_at },
@@ -19806,6 +19813,101 @@ async function _recentGeoSendCounts(token, userEmail, days = 7) {
   return out;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// CRM PROPIO (console.adeqmedia.com) — PREPARADO, APAGADO (Maxi 2026-08-31)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Va a reemplazar a Monday. Mientras tanto convive: cada push a Monday manda el MISMO
+// prospecto también acá. Los dos en paralelo es lo que permite comparar conteos día a día
+// antes de cortar; sin ese solapamiento, la migración se prueba en vivo y a ciegas.
+//
+// DOS LLAVES PARA QUE NO SE PRENDA SOLO:
+//   1. `crm_propio_enabled` en toolbar_config — arranca en "false". Prender y apagar NO
+//      necesita deploy, que es lo que uno quiere el día que algo sale mal.
+//   2. `CRM_SYNC_SECRET` en las variables de Railway. Sin secreto no sale ni un request.
+// Si falta cualquiera de las dos, la función devuelve sin hacer nada y sin ruido: eso NO es
+// un fallback silencioso, es el estado apagado esperado.
+//
+// NUNCA puede romper un envío. El mail ya salió cuando esto corre; que el CRM esté caído no
+// puede costar un lead. Todo va en try/catch y el error se registra, no se propaga.
+const CRM_SYNC_URL = process.env.CRM_SYNC_URL || "https://console.adeqmedia.com/api/crm/sync-toolbar";
+const CRM_SYNC_SECRET = process.env.CRM_SYNC_SECRET || "";
+
+// El idioma del CRM es el del PITCH, no el del sitio. La toolbar detecta 20+ idiomas pero el
+// pitch se escribe en 5, y todo lo que no es uno de esos cinco sale en inglés (`?? 0` en el
+// mapa de Monday). Por eso un sitio húngaro o griego figura como "Ingles" en el board, y está
+// bien: describe en qué idioma le escribimos.
+// ⚠️ Hay que mandar la ETIQUETA, no el ISO. Si se manda "en" en vez de "Ingles", el CRM acepta
+// la fila pero la marca como idioma no soportado y ese prospecto se queda sin plantilla el día
+// del follow-up — falla recién a los 5 días y lejos de la causa.
+const CRM_IDIOMA_LABEL = { en: "Ingles", es: "Español", it: "Italiano", pt: "Portugues", ar: "Árabe" };
+function _crmIdioma(lang) { return CRM_IDIOMA_LABEL[String(lang || "").toLowerCase()] || "Ingles"; }
+
+function _crmFecha(offsetDias = 0) {
+  return new Date(Date.now() + offsetDias * 86_400_000).toISOString().split("T")[0];
+}
+
+// Arma el prospecto con la MISMA semántica que el push a Monday, para que las dos columnas
+// digan lo mismo mientras convivan. Si divergen acá, la comparación de la fase 5 no sirve.
+function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail }) {
+  return {
+    domain,
+    email: email || "",
+    deal_stage: "Propuesta Vigente (T)",   // idéntico al estado_idx 3 de Monday
+    ejecutivo_name: userEmail || "",
+    fecha_contacto: _crmFecha(0),
+    fecha_fu1: _crmFecha(5),               // mismos offsets que MONDAY_COL_FU1
+    fecha_fu2: _crmFecha(10),              // y MONDAY_COL_FU2
+    top_geo: normalizeMondayGeo(geo),
+    pageviews: formatTrafficForMonday(traffic),
+    language: _crmIdioma(language),
+    phone: phone || "",
+    comments: "Agente",                    // la misma marca que se escribe en Monday
+    source: "toolbar",
+  };
+}
+
+async function pushToCrmPropio(token, prospectos, contexto = "envio") {
+  const lista = (Array.isArray(prospectos) ? prospectos : [prospectos]).filter(p => p && p.domain);
+  if (!lista.length) return { enviados: 0, apagado: false };
+  if (!CRM_SYNC_SECRET) return { enviados: 0, apagado: true };
+  try {
+    const cfg = await getConfig(token).catch(() => ({}));
+    if (String(cfg.crm_propio_enabled || "") !== "true") return { enviados: 0, apagado: true };
+  } catch { return { enviados: 0, apagado: true }; }
+
+  let ok = 0;
+  // Lotes de 100: es el máximo que declara el endpoint en su GET.
+  for (let i = 0; i < lista.length; i += 100) {
+    const lote = lista.slice(i, i + 100);
+    try {
+      const r = await fetch(CRM_SYNC_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Toolbar-Secret": CRM_SYNC_SECRET },
+        body: JSON.stringify({ prospects: lote }),
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok || !j) {
+        log(`🟠 CRM propio (${contexto}): HTTP ${r.status} en lote de ${lote.length} — no se sincronizó`);
+        continue;
+      }
+      ok += j.ok || 0;
+      // PROHIBIDO EL FALLBACK SILENCIOSO. El endpoint separa `errores` (no entró) de
+      // `avisos` (entró pero va a romper algo después, tipo un idioma sin plantilla).
+      // Los dos se logean nombrando el dominio: un rechazo que no dice CUÁL falló obliga a
+      // reintentar el lote entero y esconde el patrón.
+      for (const e of (j.errores || [])) {
+        log(`  🔴 CRM rechazó ${e.domain || "(sin dominio)"} [pos ${e.index}]: ${e.motivo}`);
+      }
+      for (const a of (j.avisos || [])) {
+        log(`  🟡 CRM avisa sobre ${a.domain}: ${a.motivo}`);
+      }
+    } catch (e) {
+      log(`🟠 CRM propio (${contexto}): ${e.message} — el envío NO se ve afectado`);
+    }
+  }
+  return { enviados: ok, apagado: false };
+}
+
 async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
   // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
@@ -21555,6 +21657,15 @@ async function runAgentCycle(token, allFlags) {
             },
           });
         }
+
+        // 5-bis. El mismo prospecto al CRM propio. Va DESPUÉS del bloque de Monday y por
+        // fuera de su try/catch a propósito: si Monday falla, el prospecto igual tiene que
+        // llegar al CRM — son dos destinos independientes y hoy uno solo caído nos deja el
+        // lead sin rastro. Apagado hasta que `crm_propio_enabled` sea "true".
+        await pushToCrmPropio(token, _crmPayload({
+          domain, email, geo: leadGeo, traffic: leadTraffic,
+          language: lead.language, phone: lead.contact_phone, userEmail,
+        }), "envio").catch(() => {});
 
         // 6. Track en sendtrack para no re-enviar (siempre, mail YA salió)
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
