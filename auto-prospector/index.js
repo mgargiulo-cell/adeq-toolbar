@@ -15719,9 +15719,16 @@ async function scanBouncesForUser(token, userEmail) {
     // quién le escribimos, marcar contactos como rebotados es peor que no marcar ninguno.
     let _destinatariosReales = null;
     try {
-      const _d30 = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      // 90 días, no 30 (Maxi 2026-08-31). Este conjunto es lo único que identifica a quién le
+      // rebotó cuando el rebote no trae `X-Failed-Recipients` — que es SIEMPRE en Exchange.
+      // Verificado: hay envíos desde estos buzones que la toolbar no registró (a mano desde
+      // Gmail, o el follow-up que dispara Monday), y también re-contactos de leads viejos.
+      // Con 30 días, el rebote de un lead contactado hace más tiempo no matchea a nadie y se
+      // descarta entero. Ampliar la ventana no afloja el filtro: sigue exigiendo que la
+      // dirección esté entre las que escribimos, solo que mirando más atrás.
+      const _d30 = new Date(Date.now() - 90 * 86_400_000).toISOString();
       const _r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=email_to&limit=5000`,
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=email_to&limit=20000`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
       if (_r.ok) {
         const _f = await _r.json();
