@@ -18124,6 +18124,17 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // ser un contacto real ("sistemas.diariodovale@ no lo veo mal") → van a PENALTY abajo, no a reject.
   if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return -1;
   if (/^(domainmanagement|domainadmin|domainname|dominios?)([._-]|$)/i.test(local)) return -1;
+  // ── ARTEFACTOS DE ESCAPE HTML/JSON (Maxi 2026-08-31) ──────────────────────────────
+  // Caso real: le escribimos a `u003eenquiry@mytvsuper.com` y rebotó. `\u003e` es un ">"
+  // escapado en JSON; al leer el sitio se perdió la barra y quedó pegado al local-part.
+  // Puntuaba 40 y se enviaba. La dirección de verdad existe (`enquiry@`), así que el
+  // scrape no solo mandó a una dirección rota: además quemó la buena, porque el dominio
+  // suma un rebote. Cubre \u003e (>), \u0026 (&), \u0027 ('), \u003c (<) y familia.
+  if (/^[ux]00[0-9a-f]{2}./i.test(local)) return -1;
+  // Buzones de informes DMARC/SPF: los llena un robot con XML todos los días y no los lee
+  // nadie. `dmarcreport@opopular.com.br` puntuaba 95 —el ranking lo leía como nombre de
+  // persona— y se envió. `dmca` ya estaba en la lista de basura; `dmarc` no.
+  if (/(^|[._-])(dmarc|spf|rua|ruf)([._-]|report|rep|$)/i.test(local)) return -1;
   // Maxi 2026-07-14 (auditoría rebotes 11-15/07): "owner@" bare = etiqueta de WHOIS/informer, NO un
   // buzón real → rebotó 4/4 (cnnturk/expansion/arealme/vetogate). El ranking lo tomaba como EXEC (+90)
   // y lo mandaba primero. Un dueño real escribe desde su nombre, no owner@. Reject (source-agnóstico).
