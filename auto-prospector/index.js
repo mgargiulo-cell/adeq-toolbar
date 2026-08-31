@@ -10126,7 +10126,7 @@ async function purgeByUrlOnly(token) {
     await setConfigValue(token, "url_purge_enabled", "false").catch(() => {});
     await setConfigValue(token, "url_purge_cursor", "").catch(() => {});
     await setConfigValue(token, "url_purge_last_done", new Date().toISOString()).catch(() => {});
-    await saludPing(token, "url_pur, cadenciaMin: 4320ge", { status: "ok", detalle: "pool barrido completo" });
+    await saludPing(token, "url_purge", { status: "ok", cadenciaMin: 4320, detalle: "pool barrido completo" });
     log(`🧹 url-purge: pool barrido COMPLETO → flag OFF`);
     return;
   }
@@ -10188,7 +10188,7 @@ async function sweepBlockedFromProspects(token) {
     await setConfigValue(token, "purge_blocked_prospects", "false").catch(() => {});
     await setConfigValue(token, "purge_cursor_ts", "").catch(() => {});
     await setConfigValue(token, "purge_blocked_last_done", new Date().toISOString()).catch(() => {});
-    await saludPing(token, "purge_block, cadenciaMin: 4320ed", { status: "ok", detalle: "pool barrido completo" });
+    await saludPing(token, "purge_blocked", { status: "ok", cadenciaMin: 4320, detalle: "pool barrido completo" });
     log(`🧹 purge-prospects: pool barrido COMPLETO → flag OFF`);
     return;
   }
@@ -22364,6 +22364,19 @@ const SALUD_PING_THROTTLE_MS = 60 * 1000;
  */
 async function saludPing(token, job, { status = "ok", detalle = "", cadenciaMin = null, real = null, esperado = null } = {}) {
   try {
+    // ── EL NOMBRE DEL JOB TIENE QUE SER UN NOMBRE (Maxi 2026-08-31) ─────────────────────
+    // Un reemplazo mal anclado metió el texto de las opciones DENTRO del literal en tres
+    // llamadas: `"pool_listo, cadenciaMin: 120s"`, `"url_pur, cadenciaMin: 4320ge"`,
+    // `"purge_block, cadenciaMin: 4320ed"`. El daño no fue cosmético: el ping de ÉXITO se
+    // escribía bajo el nombre roto, así que la fila real del job no recibía nunca un OK y
+    // solo podía juntar fallos. Un job que anda parecía un job que nunca anduvo, y encima
+    // aparecían tres trabajos fantasma en el panel.
+    // Estuvo así al menos desde el 28/08 sin que nadie lo notara, porque el sistema no tiene
+    // forma de saber que "pool_listo, cadenciaMin: 120s" no es un job legítimo. Ahora sí.
+    if (!/^[a-z0-9_]{2,60}$/i.test(String(job || ""))) {
+      log(`🚨 saludPing con nombre de job inválido: ${JSON.stringify(job)} — se ignora el ping. Es un bug de código, no un fallo del job.`);
+      return;
+    }
     // Un "ok" repetido se puede saltear; un fallo o un cambio de estado SIEMPRE se escribe.
     const prev = _SALUD_ULTIMO_PING.get(job);
     const mismoEstado = prev && prev.status === status;
@@ -23871,7 +23884,7 @@ async function saludWatchdog(token) {
       if (r.ok) {
         const listos = parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
         const piso = parseInt(cfg.salud_pool_minimo || "120", 10) || 120;
-        await saludPing(token, "pool_listo, cadenciaMin: 120s", { status: "ok", detalle: `${listos} leads con email`, real: listos, esperado: piso });
+        await saludPing(token, "pool_listos", { status: "ok", cadenciaMin: 120, detalle: `${listos} leads con email`, real: listos, esperado: piso });
         if (listos < piso) {
           await saludAlerta(token, {
             clave: "pool-bajo", severidad: "error",
