@@ -19431,14 +19431,59 @@ async function securityWatchdog(token) {
   const hace = (h) => new Date(Date.now() - h * 3600_000).toISOString();
   const hoy  = new Date().toISOString().slice(0, 10);
 
-  // ── 1. GASTO PIRATA EN EL PROXY ────────────────────────────────────────────────────────
+  // ── 1. USO DEL PROXY ───────────────────────────────────────────────────────────────────
+  // ⚠️ ESTA SECCIÓN APAGÓ EL SISTEMA SOLO, POR NADA, EL 31/08 A LAS 20:17.
+  // Se llamaba "GASTO PIRATA" pero medía el volumen TOTAL, nuestro worker incluido: de las
+  // 1.515 llamadas que dispararon el kill switch, 1.268 eran `worker@backend` haciendo su
+  // trabajo. El sistema se acusó a sí mismo de robarse las claves y se apagó.
+  //
+  // Y el techo de 1.500 no era un detector, era una cuenta regresiva. Medido sobre 7 días:
+  // worker@backend 734 llamadas/día · sales@ 115 · dhorovitz@ 50 → el uso normal ronda las
+  // 900 y un día cargado pasa 1.500 sin que pase nada raro. Cada mejora que le sacamos al
+  // agente empuja ese número para arriba. Es el falso positivo n.º 3 otra vez, textual:
+  // "un umbral fijo es una bomba de tiempo".
+  //
+  // DOS CAMBIOS, y el segundo es el que importa:
+  //  a) El techo se DERIVA del uso real de las dos semanas previas, no de una constante.
+  //  b) EL VOLUMEN DE NUESTRAS PROPIAS IDENTIDADES YA NO ES CRÍTICO Y NO APAGA NADA.
+  //     Gastar de más es un problema de plata, no una intrusión, y frenar el negocio entero
+  //     por eso cuesta más que el gasto. La señal de seguridad de verdad es OTRA: una
+  //     identidad DESCONOCIDA usando nuestro proxy. Eso sí frena, aunque sean 3 llamadas.
+  // El user, textual (2026-09-01): "No quiero que suceda más, el killswitch es un grave error".
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=eq.${hoy}&select=user_email,total`, { headers: auth });
     const filas = r.ok ? await r.json() : [];
     const totalDia = filas.reduce((a, f) => a + (f.total || 0), 0);
-    if (totalDia > SEC_UMBRALES.proxy_llamadas_dia) {
+
+    // Quién es "nuestro": el worker, los buzones del agente, y cualquier identidad que ya
+    // venía usando el proxy antes de hoy. Lo que interesa no es cuánto se usa sino QUIÉN
+    // aparece de nuevo — una cuenta que nunca estuvo y hoy consume es la señal real.
+    let _conocidas = new Set(["worker@backend"]);
+    try { (JSON.parse(cfg.agent_enabled_users || "[]") || []).forEach(u => _conocidas.add(String(u).toLowerCase())); } catch {}
+    let _baseDiaria = 0;
+    try {
+      const _desde = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+      const _h = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${_desde}&day=lt.${hoy}&select=user_email,total,day`, { headers: auth });
+      const _hist = _h.ok ? await _h.json() : [];
+      _hist.forEach(f => _conocidas.add(String(f.user_email || "").toLowerCase()));
+      const _porDia = {};
+      _hist.forEach(f => { _porDia[f.day] = (_porDia[f.day] || 0) + (f.total || 0); });
+      const _dias = Object.values(_porDia);
+      if (_dias.length) _baseDiaria = _dias.reduce((a, b) => a + b, 0) / _dias.length;
+    } catch {}
+
+    const _desconocidas = filas.filter(f => !_conocidas.has(String(f.user_email || "").toLowerCase()) && (f.total || 0) > 0);
+    // Techo derivado: 2,5× el promedio de las dos semanas previas, con el valor de config como
+    // piso para que un arranque sin historial no alarme por 10 llamadas.
+    const _techoUso = Math.max(SEC_UMBRALES.proxy_llamadas_dia, Math.ceil(_baseDiaria * 2.5));
+
+    if (_desconocidas.length) {
+      // ESTO SÍ es seguridad: alguien que no debería estar, está.
       critico = true;
-      hallazgos.push(`• Uso del proxy DISPARADO: ${totalDia} llamadas hoy (umbral ${SEC_UMBRALES.proxy_llamadas_dia}).\n  Por usuario: ${filas.map(f => `${f.user_email}=${f.total}`).join(", ")}`);
+      hallazgos.push(`• IDENTIDAD DESCONOCIDA usando el proxy: ${_desconocidas.map(f => `${f.user_email}=${f.total}`).join(", ")}.\n  No es ni el worker ni un buzón del agente ni nadie que lo hubiera usado antes.`);
+    } else if (totalDia > _techoUso) {
+      // Volumen alto de gente nuestra: se avisa, NO se frena. `critico` queda como está.
+      hallazgos.push(`• Uso del proxy alto: ${totalDia} llamadas hoy (lo normal son ~${Math.round(_baseDiaria)}/día; aviso a partir de ${_techoUso}).\n  Por usuario: ${filas.map(f => `${f.user_email}=${f.total}`).join(", ")}\n  Son todas identidades nuestras, así que NO se frenó nada — es gasto, no intrusión. Revisá si algún job entró en loop.`);
     }
   } catch {}
 
@@ -23590,7 +23635,13 @@ async function enviarResumenSalud(token) {
 
     if (graves.length) {
       partes.push(`🔴 NUEVO — NECESITA UNA MANO (${graves.length}):`);
-      graves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — ${p.veces} veces` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`));
+      // La hora importa: una alerta guarda el número del momento en que saltó, y el boletín de
+      // arriba mide al momento de mandar el mail. Sin la hora, "11 de 158" acá y "18 de 191"
+      // arriba parecen una contradicción cuando son la misma cuenta en dos momentos del día.
+      graves.forEach(p => {
+        const _h = p.ultima ? new Date(p.ultima).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" }) : "";
+        partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — ${p.veces} veces` : ""}${_h ? ` (medido ${_h})` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`);
+      });
       partes.push("");
     }
     if (leves.length) {
@@ -23614,12 +23665,21 @@ async function enviarResumenSalud(token) {
     // Ahora la primera línea dice el veredicto y la segunda el número que siempre se busca.
     // No agrega ningún dato nuevo: ordena los que ya estaban.
     {
-      const _pendientes = graves.length + _rojasBoletin.length;
+      // ⚠️ EL NÚMERO Y LA LISTA TIENEN QUE SER EL MISMO CONJUNTO (Maxi 2026-09-01).
+      // Este titular salió diciendo "6 cosa(s) necesitan una mano" y nombraba TRES: sumaba
+      // las alertas graves más los rojos del boletín, pero después mostraba solo los rojos y
+      // encima cortados en 3. Es la regla que ya teníamos escrita para el vigilante y la
+      // rompí acá: si el mail no puede señalar a los seis, no puede decir seis.
+      // Ahora se cuenta exactamente lo que se nombra, y si hay que recortar se avisa.
+      const _todoRojo = [...new Set([...(_rojasBoletin || []), ...graves.map(g => g.titulo)])];
+      const _pendientes = _todoRojo.length;
       const _tibios = leves.length + _amarBoletin.length;
-      const _quePasa = [...new Set([...(_rojasBoletin || []), ...graves.map(g => g.titulo)])].slice(0, 3);
+      const _quePasa = _pendientes > 3
+        ? `${_todoRojo.slice(0, 3).join(" · ")} y ${_pendientes - 3} más`
+        : _todoRojo.join(" · ");
       partes[0] =
         (_pendientes
-          ? `🔴 ${_pendientes} cosa(s) necesitan una mano: ${_quePasa.join(" · ")}`
+          ? `🔴 ${_pendientes} cosa(s) necesitan una mano: ${_quePasa}`
           : _tibios
             ? `🟡 Nada roto. ${_tibios} cosa(s) para mirar cuando puedas.`
             : `✅ Todo en orden.`)
