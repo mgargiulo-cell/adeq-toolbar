@@ -6718,6 +6718,17 @@ function _sanitizeEmail(raw) {
 // personas sobre genéricos y capea a 15. NO se aplica a emails de Apollo.
 // opts.urlByEmail: Map email→URL de origen. Si el email lo publicó el PROPIO sitio del lead,
 // es su contacto aunque el dominio del mail sea otro (auditoría empírica 2026-08-04).
+// TLD de país (ISO 3166-1 alpha-2) + los que se usan como país sin serlo (uk, eu, su, ac).
+// Sirve para descartar artefactos de texto que PARECEN email: `good@all.he` no es una
+// dirección, `contacto@medio.io` sí. Solo se consulta para TLDs de dos letras.
+const TLD_PAIS_VALIDOS = new Set(("ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz "
+ + "ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr "
+ + "ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp "
+ + "ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt "
+ + "mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw "
+ + "sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug "
+ + "um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw uk eu su ac").split(/\s+/));
+
 function _cleanScrapedEmails(list, leadDomain, opts = {}) {
   const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
   const urlByEmail = opts.urlByEmail || null;
@@ -6775,7 +6786,26 @@ function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     // 9 emails extraídos y devolvía []), radio1.hu → hirdetes@mediamoment.hu (venta de pauta),
     // radioagricultura.cl → vradnic@agricultura.cl (gerente general),
     // elfinancierocr.com → 7 emails @nacion.com (mismo grupo).
-    const publicadoPorElSitio = vieneDelPropioSitio(e);
+    // ⚠️ LA PROCEDENCIA NO PUEDE RESCATAR UNA DIRECCIÓN QUE NO EXISTE (Maxi 2026-09-01).
+    // Al revivir la regla de procedencia aparecieron artefactos que antes tapaba el filtro
+    // cross-domain: en ronaldo7.net salieron `1323-a-look@ronaldo-roots-and-early-days.html`
+    // (un trozo de URL leído como email) y `good@all.he`. Los dos "vienen del propio sitio",
+    // así que la regla los rescataba y se habrían enviado — un rebote garantizado y encima
+    // ensuciando la reputación del dominio.
+    // Se exige que la parte del dominio termine en algo que pueda ser un TLD de verdad: 2 a 24
+    // letras, y nunca una extensión de archivo. Es barato y corta justo esta familia.
+    const _tldAparente = (dom.split(".").pop() || "");
+    // Un TLD de DOS letras solo es válido si es un código de país de verdad. `good@all.he`
+    // salió del texto de una nota y `.he` no existe; `.fr` o `.io` sí. Los de 3+ letras se
+    // aceptan salvo que sean una extensión de archivo (el caso `...-early-days.html`).
+    // (No se reusa COUNTRY_CODES: tiene 86 entradas y le faltan .uk .io .tv .me .eu, así que
+    // rechazaría dominios legítimos — peor que el problema que arregla.)
+    const _dominioPlausible = dom.includes(".") && dom.length >= 4
+      && (_tldAparente.length === 2
+            ? TLD_PAIS_VALIDOS.has(_tldAparente)
+            : /^[a-z]{3,24}$/.test(_tldAparente)
+              && !/^(html?|php|aspx?|jsp|jpe?g|png|gif|webp|svg|css|js|json|xml|pdf|zip|mp[34]|txt|woff2?|ico|rss|amp)$/.test(_tldAparente));
+    const publicadoPorElSitio = _dominioPlausible && vieneDelPropioSitio(e);
     const esCasaEditora = casasEditoras.has(dom) || [...casasEditoras].some(c => dom.endsWith("." + c));
     if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole && !publicadoPorElSitio && !esCasaEditora) continue;
     seen.add(e);
@@ -7397,7 +7427,22 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // opts.urlByEmail: Map opcional — recibe email→URL de origen para tracking UI
   // (user 2026-06-17: poder mostrar de qué URL salió cada scraped email).
   const informerOut = opts.informerOut || null;
-  const urlByEmail  = opts.urlByEmail  || null;
+  // ── LA REGLA DE PROCEDENCIA ESTABA MUERTA EN EL PULIDO (Maxi 2026-09-01) ────────────
+  // `_cleanScrapedEmails` tiene desde el 04/08 la regla más importante para los grupos
+  // editores: un email impreso en la página de contacto DEL PROPIO SITIO es su contacto,
+  // aunque el buzón viva en el dominio de la casa matriz. Esa regla se apoya en `urlByEmail`,
+  // el mapa que dice DÓNDE se encontró cada dirección.
+  // Pero el mapa solo existía si el que llamaba lo pasaba. La ficha de la extensión lo pasa y
+  // el camino automático también — `polishPool` NO, y es justamente el que recorre los cientos
+  // de leads sin email. Ahí `urlByEmail` quedaba en null, `vieneDelPropioSitio` devolvía
+  // siempre false y el cross-domain se descartaba sin mirar de dónde salió.
+  // Caso testigo (reproducido paso a paso): lafranceagricole.fr. El crawler visita
+  // /contact_publicite/p89 —la página de PUBLICIDAD, el buzón que más nos sirve—, baja 71 KB,
+  // extrae `serviceclients@ngpa.fr`… y lo tira, porque ngpa.fr (el grupo editor) no es el
+  // dominio del sitio. El lead quedaba como "no_se_pudo_leer_el_sitio" cuando el sitio se leyó
+  // perfecto. El user lo encontró a mano en dos clics.
+  // Se crea siempre el mapa: sin él, media función se apaga en silencio.
+  const urlByEmail  = opts.urlByEmail  || new Map();
   // Maxi 2026-06-17 v4: socialOut Map recibe emails extraídos de redes
   // sociales (FB business email, YT contact for business). Source: "Facebook",
   // "YouTube", "Twitter".
