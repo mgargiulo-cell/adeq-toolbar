@@ -17769,8 +17769,19 @@ const CATEGORIAS_NUNCA = [
   // E-commerce y marketplaces: venden producto, no espacio.
   "ecommerce", "e-commerce", "marketplace", "shopping", "retail", "classifieds",
   "coupons", "deals", "price_comparison",
-  // Viajes transaccionales (vuelos/hoteles): el user los enseñó como no prospectables.
+  // Viajes TRANSACCIONALES (vender pasajes/hoteles): el user los enseñó como no prospectables.
+  // ⚠️ Maxi 2026-09-01: estos nombres se habían escrito a ojo y NINGUNO matcheaba lo que
+  // devuelve SimilarWeb de verdad. Caso testigo: omio.it (venta de pasajes, el user lo marcó
+  // como "NO VA") llega como `travel_and_tourism/air_travel` y pasaba limpio.
+  // Se agregan los nombres REALES de la taxonomía, verificados contra las categorías que hay
+  // hoy en el pool.
+  // ⚠️ NO se bloquea `travel` a secas ni `travel_and_tourism/travel_and_tourism` (27 leads):
+  // ahí conviven las agencias con las REVISTAS de viajes, que sí son publishers y son
+  // exactamente el tipo de sitio que queremos. Bloquear por esa etiqueta perdería lo bueno
+  // junto con lo malo. Lo mismo con `finance` a secas: un diario económico es un publisher.
   "travel/booking", "airlines", "hotels", "car_rental", "flight",
+  "air_travel", "accommodation_and_hotels", "ground_transportation",
+  "travel_agencies", "tour_operators", "rail_and_bus_stations",
   // Sin contenido propio: no hay dónde poner un banner.
   "web_portals", "search_engines", "url_shorteners", "file_sharing", "cloud_storage",
   "web_hosting", "domain_registrar", "saas", "developer_tools",
