@@ -25204,7 +25204,36 @@ async function main() {
         // cada 14. La cola de prospectos, que va después, no pierde su lugar: el techo global
         // de 3 min no cambia.
         _vueltaMantenimiento++;
-        const _vueltaPar = (_vueltaMantenimiento % 2) === 0;
+        // ── LA ALTERNANCIA SE ADAPTA A LA COLA (Maxi 2026-09-01) ──────────────────────
+        // El 27/08 puse esta alternancia porque el pulido se comía el presupuesto y dejaba
+        // sin turno al resto del mantenimiento. Resolvió eso y creó lo otro: el pulido pasó a
+        // correr cada ~14 min en vez de cada ~7, y "encontrarle mail a las URLs que no tienen"
+        // —uno de los cuatro criterios del user— quedó irregular, entre 3 y 102 por día sin
+        // patrón. Medido hoy: 771 leads sin email, de los cuales **140 no se intentaron NUNCA**
+        // y 244 llevan más de 3 días sin que nadie los toque.
+        //
+        // No es falta de capacidad: el pulido hace lotes de 45 y en las 14 horas activas daría
+        // de sobra para 771. Es falta de TURNO. Y un reparto fijo siempre le va a errar a una
+        // cola que cambia de tamaño todo el tiempo — el mismo error de los umbrales fijos.
+        //
+        // Ahora el turno se decide por la cola real: si hay leads que nunca se intentaron, el
+        // pulido corre en TODAS las vueltas hasta drenarlos; cuando baja del piso, vuelve a
+        // alternar y el mantenimiento recupera su mitad. Se prioriza al lead virgen, que es el
+        // que más rinde: un sitio no intentado tiene mucha más chance de dar email que uno que
+        // ya falló diez veces (para esos ya está el backoff creciente dentro de polishPool).
+        let _colaVirgen = 0;
+        try {
+          const _r = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&or=(email_intentos.is.null,email_intentos.eq.0)&select=id`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
+          if (_r.ok) _colaVirgen = parseInt((_r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+        } catch {}
+        const _pisoVirgen = parseInt(cfg.polish_cola_piso || "50", 10) || 50;
+        const _modoPulido = _colaVirgen >= _pisoVirgen;
+        const _vueltaPar = _modoPulido || (_vueltaMantenimiento % 2) === 0;
+        if (_modoPulido && (_vueltaMantenimiento % 5) === 1) {
+          log(`🔎 Pulido en modo cola: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen}) — se lleva todas las vueltas hasta drenar`);
+        }
         if (_vueltaPar) {
         // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
         //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
