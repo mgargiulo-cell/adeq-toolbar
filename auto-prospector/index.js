@@ -17979,8 +17979,24 @@ async function _verifyEmailMV(token, cfg, email) {
     // perderíamos el lead entero. La respuesta correcta no es sí/no, son tres estados, y el
     // caller ya prueba candidatos en orden — así que puede preferir el limpio y dejar el dudoso
     // de reserva.
+    // ── CATCH-ALL Y "UNKNOWN" NO SON LA MISMA COSA (Maxi 2026-09-01) ──────────────────
+    // Estaban los tres en el mismo saco "riesgo". Medido sobre 14 días, no es lo mismo:
+    //     ok         331 enviados →  6 rebotes →  1,8%
+    //     catch_all  361 enviados → 17 rebotes →  4,7%
+    //     unknown     80 enviados →  8 rebotes → 10,0%   ← el peor, y el grupo más chico
+    // Un catch-all es un dominio corporativo que acepta todo: rebota más, pero muchísimos
+    // publishers legítimos son así y bloquearlos costaría el 57% del volumen para ahorrar 17
+    // rebotes. No vale la pena. `unknown`/`risky` es otra cosa: MillionVerifier fue a mirar y
+    // no pudo confirmar que la casilla exista, y ahí uno de cada diez rebota.
+    // Se separan para poder tratarlos distinto: el catch-all sigue siendo enviable como último
+    // recurso, el dudoso no.
+    // ⚠️ Ojo con NO meter acá los fallos NUESTROS (tope diario, error de red, timeout): esos
+    // devuelven "riesgo" más arriba y siguen siendo enviables, porque son ausencia de
+    // información y no un veredicto. Tratar "no sé" como "no" es el error que ya pagamos ocho
+    // veces en este proyecto.
     const estado = (res === "invalid" || res === "disposable") ? "no"
-                 : (res === "catch_all" || res === "unknown" || res === "risky") ? "riesgo"
+                 : (res === "unknown" || res === "risky") ? "dudoso"
+                 : (res === "catch_all") ? "riesgo"
                  : "ok";
     const deliverable = estado !== "no";
     if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
@@ -17994,6 +18010,7 @@ async function _verifyEmailMV(token, cfg, email) {
     }).catch(() => {});
     if (estado === "no")     log(`  🚫 MV: ${lower} = ${res} (no entregable) → skip envío`);
     if (estado === "riesgo")  log(`  ⚠️ MV: ${lower} = ${res} (dominio catch-all: acepta todo, puede rebotar) → queda de reserva`);
+    if (estado === "dudoso")  log(`  ⚠️ MV: ${lower} = ${res} (no pudo confirmar la casilla; este grupo rebota 1 de cada 10) → no va como primer contacto`);
     return estado;
   } catch { return "riesgo"; }                             // timeout/red → fail-open, pero como reserva
 }
@@ -21432,15 +21449,26 @@ async function runAgentCycle(token, allFlags) {
         // el user cargue millionverifier_api_key → sin key devuelve true y NO cambia nada. Con
         // key: si el buzón es invalid/disposable, NO enviamos (evita el rebote) y marcamos el
         // email como bounced local para que NO se re-elija y el re-enrich busque otro contacto.
-        if ((await _verifyEmailMV(token, cfg, email)) === "no") {
+        // `dudoso` se frena igual que `no` (Maxi 2026-09-01): el lead NO se pierde, sale por
+        // el mismo camino que ya existe —se marca y el re-enrich le busca otra dirección—.
+        // Cuesta ~6 envíos por día y evita ~8 rebotes cada 14; el catch-all sigue pasando.
+        const _mvEstado = await _verifyEmailMV(token, cfg, email);
+        if (_mvEstado === "no" || _mvEstado === "dudoso") {
           if (reservedId) {
             fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
               method: "PATCH",
               headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify({ action: "skipped", reason: "mv_undeliverable" }),
+              body: JSON.stringify({ action: "skipped", reason: _mvEstado === "dudoso" ? "mv_dudoso" : "mv_undeliverable" }),
             }).catch(() => {});
           }
-          markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+          // ⚠️ SOLO se quema la dirección cuando MV dice que NO EXISTE. Un `dudoso` es una
+          // casilla que no se pudo confirmar, no una probada mala: blacklistearla sería
+          // perderla para siempre por una duda, y encima el dominio quedaría penalizado por
+          // `riesgoRebotePorDominio`. Se saltea este envío y se le busca otra dirección; si
+          // más adelante no aparece ninguna mejor, sigue disponible.
+          if (_mvEstado === "no") {
+            markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+          }
           continue; // próximo lead — el re-enrich le buscará otro email
         }
         // Maxi 2026-08-18: TECHO DE TIEMPO al envío completo. La lección del apagón del 12 al 18
