@@ -7443,6 +7443,12 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // perfecto. El user lo encontró a mano en dos clics.
   // Se crea siempre el mapa: sin él, media función se apaga en silencio.
   const urlByEmail  = opts.urlByEmail  || new Map();
+  // ── CÓMO LE FUE AL CRAWL, NO SOLO QUÉ ENCONTRÓ (Maxi 2026-09-01) ────────────────────
+  // Quien llama solo recibía la lista de emails. Con la lista vacía no había forma de saber
+  // si el sitio no se pudo abrir o si se abrió entero y no publica ninguna dirección — dos
+  // problemas con soluciones OPUESTAS (uno se reintenta, el otro se busca por otra vía) que
+  // el informe venía mostrando como el mismo renglón.
+  const _stats = opts.statsOut || null;
   // Maxi 2026-06-17 v4: socialOut Map recibe emails extraídos de redes
   // sociales (FB business email, YT contact for business). Source: "Facebook",
   // "YouTube", "Twitter".
@@ -7598,10 +7604,12 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       }
       if (url === base && !_homeHtmlCache) _homeHtmlCache = html;   // para el JSON-LD
       for (const f of _facetasComerciales(html, url)) discovered.add(f);   // ?cat=obchod, ?dept=ventas
+      if (_stats) _stats.ok = (_stats.ok || 0) + 1;
       return; // éxito → no reintentar
     } catch (e) {
       const isTimeout = e?.name === "TimeoutError" || e?.name === "AbortError";
       if (_attempt === 0 && isTimeout) { _attempt++; timeout = Math.round(timeout * 1.6); continue; }
+      if (_stats) { _stats.fail = (_stats.fail || 0) + 1; if (isTimeout) _stats.timeouts = (_stats.timeouts || 0) + 1; }
       return;
     }
    }
@@ -8017,6 +8025,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Las casas editoras probadas se devuelven por opts (un Set que el caller pasa vacío) en vez
   // de cambiar el tipo de retorno: hay 6 callers y todos esperan un array de strings.
   if (opts.casasEditorasOut) for (const c of _casasEditoras) opts.casasEditorasOut.add(c);
+  if (_stats) _stats.waf = _wafBloquea;
   return _cleanScrapedEmails([...emails], domain, { urlByEmail, casasEditoras: _casasEditoras });
 }
 
@@ -10621,6 +10630,25 @@ async function auditarEmailsDelPool(token) {
   } catch (e) { log(`⚠️ auditarEmailsDelPool: ${e.message}`); }
 }
 
+// ── POR QUÉ ESTE LEAD SIGUE SIN EMAIL (Maxi 2026-09-01) ────────────────────────────────
+// Cuatro casos, cada uno con una salida distinta. Antes eran uno solo y por eso el informe
+// mandaba a mirar donde no era:
+//   waf_nos_bloqueo            → el sitio nos cierra la puerta. Vale reintentar más adelante
+//                                o ir por MX/Certificate Transparency, que no crawlean.
+//   no_se_pudo_leer_el_sitio   → de verdad no se pudo abrir NINGUNA página (caído, DNS, TLS).
+//   la_web_no_publica_ningun_email → se leyó bien y no hay dirección. Suele ser formulario:
+//                                queda la vía de redes o Apollo. Insistir con el crawl no sirve.
+//   rechazados_por_ranking     → sí publica, pero el filtro las descartó. Acá el que puede
+//                                estar mal somos nosotros, y por eso lleva los ejemplos pegados.
+function _motivoSinEmail(diag, stats) {
+  const ok   = Number(stats?.ok || 0);
+  const fail = Number(stats?.fail || 0);
+  if (stats?.waf) return "waf_nos_bloqueo";
+  if (ok === 0 && fail > 0) return "no_se_pudo_leer_el_sitio";
+  if (!diag || diag.crudos === 0) return "la_web_no_publica_ningun_email";
+  return `rechazados_por_ranking:${(diag.rechazados || []).join("|").slice(0, 120)}`;
+}
+
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
@@ -10817,7 +10845,8 @@ async function polishPool(token) {
         let foundEmail = null, foundSource = null, foundName = "";
         let _diagEmail = null;      // qué se encontró y qué se descartó, para el motivo real
         const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut }).catch(() => []);
+        const _crawlStats = { ok: 0, fail: 0, timeouts: 0, waf: false };
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats }).catch(() => []);
         if (Array.isArray(scraped) && scraped.length) {
           // ── QUÉ SE ENCONTRÓ Y POR QUÉ SE DESCARTÓ (Maxi 2026-08-27, pedido del user) ────
           // El motivo que se guardaba era siempre "no_encontrado", que junta dos cosas muy
@@ -10924,21 +10953,32 @@ async function polishPool(token) {
               // El motivo REAL, no una etiqueta genérica. Distingue los tres casos que
               // importan: la web no publica nada, publica pero lo rechaza el ranking, o el
               // sitio nos bloquea. Cada uno se arregla distinto.
-              email_ultimo_motivo: !_diagEmail ? "no_se_pudo_leer_el_sitio"
-                : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
-                : `rechazados_por_ranking:${_diagEmail.rechazados.join("|").slice(0, 120)}`,
+              // ── EL MOTIVO AHORA DESCRIBE LO QUE PASÓ (Maxi 2026-09-01) ─────────────
+              // `no_se_pudo_leer_el_sitio` significaba en realidad "no se produjo diagnóstico"
+              // y se usaba para TODO: el sitio caído, el bloqueado por WAF y el que se leyó
+              // entero y no publica mail. Tres problemas con soluciones distintas —reintentar,
+              // buscar por otra vía, o darlo por agotado— bajo la misma etiqueta.
+              // Costó caro: lafranceagricole.fr figuraba así mientras el crawler le bajaba
+              // 71 KB de su página de publicidad. Estuve buscando un problema de lectura que
+              // no existía. Ahora el motivo sale de `_crawlStats`, que cuenta lo que de verdad
+              // ocurrió, en vez de asumirlo.
+              email_ultimo_motivo: _motivoSinEmail(_diagEmail, _crawlStats),
             }),
           }).catch(() => {});
           // Queda el rastro COMPLETO en su propia tabla: la columna del lead se pisa en cada
           // intento y se pierde la historia. Acá se puede agrupar y verificar a mano.
-          const _mot = !_diagEmail ? "no_se_pudo_leer_el_sitio"
-                     : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
-                     : "rechazados_por_ranking";
+          const _mot = _motivoSinEmail(_diagEmail, _crawlStats).split(":")[0];
           registrarDiagSinEmail(token, {
             domain, intento: (lead.email_intentos || 0) + 1, fase: "pulido",
             crudos: _diagEmail?.crudos || 0, rechazados: _diagEmail?.rechazados || [],
             motivo: _mot,
-            comentario: _comentarioSinEmail({ ..._diagEmail, waf: false }),
+            // `paginas_leidas` estaba SIEMPRE en 0 (559 filas seguidas) porque nadie lo llenaba,
+            // y el comentario venía con `waf: false` clavado, así que la rama del WAF no se
+            // activaba nunca desde acá. Dos valores inventados en la misma llamada: el informe
+            // decía con seguridad cosas que nadie había medido.
+            paginas: _crawlStats.ok,
+            waf: _crawlStats.waf,
+            comentario: _comentarioSinEmail({ ..._diagEmail, ..._crawlStats, paginas: _crawlStats.ok }),
           }).catch(() => {});
         }
       } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
@@ -12595,8 +12635,21 @@ async function registrarDiagDescarte(token, d) {
 
 // Traduce el diagnóstico técnico a una frase que explique qué pasó y qué se podría probar.
 function _comentarioSinEmail(d) {
+  if (d.ok === 0 && d.fail > 0) return `No se pudo abrir NINGUNA de las ${d.fail} página(s) que se intentaron${d.timeouts ? ` (${d.timeouts} por timeout)` : ""}. El sitio puede estar caído, lento o con problemas de DNS/TLS. Vale reintentar más adelante antes de darlo por perdido.`;
   if (d.waf) return "El sitio está detrás de un WAF (Cloudflare) que bloquea el crawler antes de servir el HTML. No es que no tenga email: no lo pudimos leer. Vale probar por MX/DMARC, Certificate Transparency o buscando el dominio en Google.";
-  if (!d.crudos) return `Se leyeron ${d.paginas ?? "varias"} páginas (home, contacto, publicidad, legales) y NINGUNA publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo.`;
+  // ⚠️ Este renglón AFIRMABA "se leyeron varias páginas" siempre, porque nadie pasaba
+  // `d.paginas` y el `?? "varias"` tapaba el hueco. Salía igual cuando el sitio no se había
+  // podido abrir. Así fue como lafranceagricole.fr quedó explicado como ilegible mientras el
+  // crawler le bajaba 71 KB de su página de publicidad, y me mandó a buscar donde no era.
+  // Ahora, si no sabemos cuántas páginas se leyeron, se dice que no se sabe.
+  if (!d.ok && d.ok !== 0 && !d.paginas) {
+    return "No quedó registro de cuántas páginas se leyeron, así que no se puede afirmar por qué falta el email. Si se repite en este dominio, mirarlo a mano.";
+  }
+  if (!d.crudos) {
+    const _leidas = d.paginas ?? d.ok ?? 0;
+    const _fallidas = d.fail ? ` (${d.fail} no respondieron)` : "";
+    return `Se leyeron ${_leidas} página(s)${_fallidas} —home, contacto, publicidad, legales— y ninguna publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo; insistir con el crawl no va a cambiar nada.`;
+  }
   if (d.rechazados?.length) return `La web SÍ publica ${d.crudos} dirección(es), pero el ranking las rechazó a todas: ${d.rechazados.slice(0, 3).join(", ")}. Si alguna parece legítima, el filtro está siendo demasiado estricto y hay que revisarlo.`;
   return "No se encontró contacto y no quedó registro de candidatos. Revisar si el crawl llegó a correr.";
 }
