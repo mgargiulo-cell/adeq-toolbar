@@ -841,7 +841,12 @@ async function purgarColaVieja(token) {
     const cand = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&processed_at=lt.${corte}&select=id,domain&limit=2000`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(cand) || !cand.length) return;
+    if (!Array.isArray(cand) || !cand.length) {
+      // Mismo caso: hoy hay CERO filas de +30 días para purgar. Que no haya basura es una
+      // buena noticia, y venía reportada como un job muerto desde el 27/08.
+      await saludPing(token, "purga_cola", { status: "ok", cadenciaMin: 1440, detalle: "nada viejo para purgar" }).catch(() => {});
+      return;
+    }
 
     const conRespaldo = [];
     for (let i = 0; i < cand.length; i += 200) {
@@ -11079,7 +11084,13 @@ async function runProspectSimilarExpansion(token) {
   try {
     const _cap  = PER_SOURCE_ACTIVE_CAP.auto_feeder_similar ?? DEFAULT_SOURCE_CAP;
     const _room = Math.max(0, _cap - await _countActiveCsvBySource(token, "auto_feeder_similar"));
-    if (_room <= 0) { log("🔗 similar-exp SKIP: carril lleno — 0 hits RapidAPI"); return; }
+    if (_room <= 0) {
+      // Saltear por carril lleno es la decisión CORRECTA —no gasta créditos de RapidAPI—,
+      // pero callarse la hacía indistinguible de estar muerto. Se late igual.
+      log("🔗 similar-exp SKIP: carril lleno — 0 hits RapidAPI");
+      await saludPing(token, "similar_expansion", { status: "ok", cadenciaMin: 60, detalle: "carril lleno: no hacía falta expandir" }).catch(() => {});
+      return;
+    }
     if (await _drainBacklog(token, "auto_feeder_similar", _room) >= _room) {
       log("🔗 similar-exp: carril llenado con el pre-listado — 0 hits RapidAPI gastados 💰");
       return;
@@ -12690,13 +12701,26 @@ async function reabrirLeadsRebotados(token) {
     const rebotados = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=5000`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(rebotados) || !rebotados.length) return;
+    if (!Array.isArray(rebotados) || !rebotados.length) {
+      await saludPing(token, "reabrir_rebotados", { status: "ok", cadenciaMin: 360, detalle: "no hay rebotes registrados" }).catch(() => {});
+      return;
+    }
     const muertos = new Set(rebotados.map(x => String(x.email || "").toLowerCase()).filter(Boolean));
 
     const leads = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id,domain,emails,email_sources&limit=1500`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(leads) || !leads.length) return;
+    // ── "NADA QUE HACER" NO ES "NO CORRÍ" (Maxi 2026-09-02) ──────────────────────────
+    // Estos returns eran mudos: el job corría, no encontraba trabajo y se iba sin pingear.
+    // El monitor entonces lo daba por ATRASADO. Medido hoy: `cadencia_reabrir_rebotados`
+    // decía que había corrido a las 09:02 mientras la salud mostraba su última corrida el
+    // 31/08 — tres días de rojo por un job que funcionaba perfecto.
+    // Es la misma familia que "dormido no es muerto" y el trabajo a pedido. Un job que no
+    // tuvo trabajo tiene que decirlo, no callarse.
+    if (!Array.isArray(leads) || !leads.length) {
+      await saludPing(token, "reabrir_rebotados", { status: "ok", cadenciaMin: 360, detalle: "sin leads rebotados para reabrir" }).catch(() => {});
+      return;
+    }
 
     let reabiertos = 0;
     for (const l of leads) {
