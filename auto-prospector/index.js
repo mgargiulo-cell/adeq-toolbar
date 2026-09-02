@@ -275,6 +275,15 @@ function matchesExcludeKeyword(domain) {
 }
 
 function isDomainAllowed(domain) {
+  // ⚠️ ESTO TIRABA EL PROCESO (Maxi 2026-09-02). `TypeError: domain.includes is not a
+  // function`, 14 veces sin capturar. Le llegaban OBJETOS `{title, domain}` desde el cache
+  // de similares: alguna rama guardó la respuesta cruda de la API en vez del dominio, y 117
+  // filas del cache quedaron así. Como el error salía por unhandledRejection, no lo agarraba
+  // ningún try/catch y se llevaba puesto el ciclo entero.
+  // Se acepta lo que venga y se extrae el dominio si es un objeto: una función de filtro
+  // NUNCA puede voltear el proceso por un dato mal formado.
+  if (domain && typeof domain === "object") domain = domain.domain || domain.url || domain.name || "";
+  domain = String(domain || "");
   if (!domain || !domain.includes(".")) return false;
   if (EXCLUDE_DOMAINS.has(domain)) return false;
   if (isUniversityDomain(domain)) return false;
@@ -6090,7 +6099,12 @@ async function findSimilarSites(domain, rapidApiKey) {
   const cachedSimilar = await getSimilarSitesCacheServer(cleanD);
   if (cachedSimilar) {
     log(`  💾 similar-sites cache HIT ${cleanD} (${cachedSimilar.length} sitios — sin gastar hit)`);
-    return cachedSimilar.filter(d => isDomainAllowed(d));
+    // La rama que va a la API pasa cada sitio por `cleanDomain`; ésta usaba lo guardado tal
+    // cual y por eso los objetos viejos llegaban crudos hasta el filtro. Se normaliza igual
+    // que la otra rama, así las dos devuelven lo mismo.
+    return cachedSimilar
+      .map(d => (d && typeof d === "object") ? cleanDomain(d.domain || d.url || d.name || "") : cleanDomain(String(d || "")))
+      .filter(d => d && isDomainAllowed(d));
   }
   const [swSites, ssSites] = await Promise.all([
     (async () => {
