@@ -542,14 +542,20 @@
 
         <label class="form-label">Estado</label>
         <select id="form-estado" class="form-select">
-          <option value="9">Masivo - Agus</option>
-          <option value="6">Masivo - Diego</option>
-          <option value="10">Masivo - Max</option>
-          <option value="8">Mail No Enviado</option>
+          <!-- ⚠️ Estos son los estados que el CRM ACEPTA (crm-board-schema.ts · ESTADOS).
+               El vocabulario pasó de 15 etiquetas a 6 el 02/09: ya no existen los tres
+               "Masivo - *" ni "Mail No Enviado", y seguían acá. Elegir uno de esos no daba
+               error: el CRM lo guardaba como "Propuesta Vigente" con un aviso que el MB
+               nunca ve, o sea el prospecto quedaba en un estado distinto del que se eligió.
+               "Personalizado" NO se ofrece a propósito: es un DISPARADOR — ponerlo manda el
+               mail personalizado. Eso se decide desde el tablero, no cargando un prospecto.
+               Los value siguen siendo los índices del board original; _estadoLabel lee la
+               etiqueta de acá, así que agregar o sacar una opción alcanza. -->
           <option value="1">En Negociacion</option>
           <option value="3">Propuesta Vigente</option>
           <option value="4">Propuesta Vigente (T)</option>
           <option value="5">Ciclo Finalizado</option>
+          <option value="0">LIVE</option>
         </select>
 
         <label class="form-label">Language</label>

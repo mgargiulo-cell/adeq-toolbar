@@ -5717,8 +5717,15 @@ async function getRejectionPatterns(token) {
 // con dueño trabajándolo. Todo lo demás (Ciclo Finalizado, Mail No Enviado, Descartado,
 // o que NO esté en Monday) se re-prospecta. Los nombres deben coincidir EXACTO con las
 // labels de la columna deal_stage del board 1420268379.
+// Estados con un deal VIVO: no se re-prospecta. Se conservan las etiquetas viejas del board
+// de Monday (PAUSADO, Masivo - *) aunque el CRM ya no las emita: una fila vieja puede tenerlas
+// y sacarlas sólo serviría para desbloquear un dominio por un cambio de nomenclatura.
+// "Personalizado" es del vocabulario nuevo y es un DISPARADOR: ponerlo manda el mail
+// personalizado del MB. Mientras esa tanda sale, el dominio no puede estar libre para que el
+// agente le mande un pitch en frío encima.
 const MONDAY_BLOCKED_STATES = new Set([
   "LIVE", "En Negociacion", "Propuesta Vigente", "Propuesta Vigente (T)",
+  "Personalizado",
   "PAUSADO", "Masivo - Diego", "Masivo - Agus", "Masivo - Max",
 ]);
 // Helper: ¿este estado de Monday bloquea el re-prospect? (true = NO sumar)
