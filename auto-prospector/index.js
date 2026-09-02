@@ -25474,7 +25474,13 @@ async function main() {
       // alternadas, algún job sigue quedándose sin turno (se ve en toolbar_health_check).
       const _techoMant = Math.min(5, Math.max(2, parseInt((await getConfig(token).catch(() => ({}))).mantenimiento_techo_min || "3", 10) || 3));
       const _LIMITE_MANTENIMIENTO = Date.now() + _techoMant * 60 * 1000;
+
+      const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
       // ── EL PULIDO VA PRIMERO CUANDO HAY COLA (Maxi 2026-09-02) ────────────────────────
+      // ⚠️ Va DESPUÉS de `_hayTiempo` y del techo: los dos se declaran con const y usarlos
+      // antes tira "Cannot access before initialization". Me pasó dos veces seguidas hoy
+      // —primero con `cfg`, después con `_hayTiempo`— y el bucle cortaba ahí, en silencio
+      // para todo lo que venía detrás.
       // El presupuesto de mantenimiento son 3 minutos y antes del pulido corrían cinco tareas
       // que se lo comían. Resultado: `polish_pool` no corrió NI UNA VEZ desde el 01/09 14:35
       // —justo cuando toqué su turno— porque nunca llegaba a ejecutarse. Es el problema que el
@@ -25502,8 +25508,6 @@ async function main() {
         if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
         if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
       }
-
-      const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
