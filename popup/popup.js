@@ -3013,6 +3013,9 @@ function initTabs() {
             await initProspectsTab();
             await initAutopilot();
             await loadProspectsTab();
+            // El contador de la cola se refresca al entrar a la pestaña, no cada 30s: la cola
+            // solo cambia cuando el propio MB guarda o manda, así que sondear sería gasto puro.
+            try { window._colaRefrescarContador?.(); } catch {}
           } else if (tabId === "import") {
             await initCsvQueue();
           }
@@ -4891,6 +4894,225 @@ async function bindButtons() {
   document.getElementById("form-pv-display")?.addEventListener("input", (e) => {
     state.traffic = parseTrafficText(e.target.value);
     checkMondayChanged();
+  });
+
+  // ── El panel de la cola, en la pestaña Prospects ──────────────────────────────────────
+  // El user lo pidió así: ver URL + email + GEO + idioma, tildar los que quiera (o todos) y
+  // mandarlos. El botón solo aparece si hay algo guardado, para no ensuciar la barra siempre.
+  let _colaFilas = [];
+
+  async function _colaCargar() {
+    const r = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.por_enviar&select=id,domain,emails,geo,language,traffic,monday_payload,created_at&order=created_at.desc&limit=300`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } });
+    _colaFilas = r.ok ? await r.json().catch(() => []) : [];
+    return _colaFilas;
+  }
+
+  window._colaRefrescarContador = _colaRefrescarContador;
+  // Primera carga: si el MB abre la toolbar y ya tenía cosas guardadas, el número tiene que
+  // estar ahí sin que haga nada. Se espera al token para no pedir sin credenciales.
+  setTimeout(() => { if (state.accessToken) _colaRefrescarContador(); }, 1200);
+  async function _colaRefrescarContador() {
+    try {
+      await _colaCargar();
+      const btn = document.getElementById("btn-ver-cola");
+      const num = document.getElementById("cola-count");
+      if (!btn || !num) return;
+      num.textContent = String(_colaFilas.length);
+      // Nunca se oculta: con la cola vacía queda apagado pero visible, para que se sepa que
+      // existe. Con contenido, verde.
+      const hay = _colaFilas.length > 0;
+      btn.style.background = hay ? "#1e7d32" : "transparent";
+      btn.style.color      = hay ? "#fff" : "var(--muted)";
+      btn.style.border     = hay ? "none" : "1px solid var(--border)";
+      if (document.getElementById("cola-panel")?.style.display === "block") _colaPintar();
+    } catch {}
+  }
+
+  const _IDIOMA_TXT = { 0: "Inglés", 1: "Español", 2: "Italiano", 3: "Portugués", 5: "?", 6: "Árabe" };
+
+  function _colaPintar() {
+    const cont = document.getElementById("cola-lista");
+    if (!cont) return;
+    if (!_colaFilas.length) { cont.innerHTML = '<div style="color:var(--muted);padding:6px">La cola está vacía.</div>'; _colaSel(); return; }
+    cont.innerHTML = _colaFilas.map(f => {
+      const mail = Array.isArray(f.emails) && f.emails.length ? f.emails[0] : "—";
+      const idi = _IDIOMA_TXT[Number(f.monday_payload?.idioma ?? f.language)] ?? (f.language || "—");
+      // Un prospecto guardado SIN haber mandado el mail es legítimo (se guarda en un click),
+      // pero tiene que verse: si no, entra al CRM como contactado y nunca lo fue.
+      const sinMail = f.monday_payload?.mail_enviado === false
+        ? ' <span title="Todavía no se le mandó el mail" style="color:#fbbf24">✉︎?</span>' : "";
+      return `<label style="display:flex;align-items:center;gap:6px;padding:4px 2px;border-bottom:1px solid var(--border);cursor:pointer">
+        <input type="checkbox" class="cola-chk" data-id="${f.id}" />
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.domain}">${f.domain}${sinMail}</span>
+        <span style="width:34%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)" title="${mail}">${mail}</span>
+        <span style="width:74px;color:var(--muted)">${f.geo || "—"}</span>
+        <span style="width:60px;color:var(--muted)">${idi}</span>
+      </label>`;
+    }).join("");
+    cont.querySelectorAll(".cola-chk").forEach(c => c.addEventListener("change", _colaSel));
+    _colaSel();
+  }
+
+  function _colaMarcados() {
+    return [...document.querySelectorAll(".cola-chk:checked")].map(c => c.dataset.id);
+  }
+  function _colaSel() {
+    const n = _colaMarcados().length;
+    const el = document.getElementById("cola-sel");
+    if (el) el.textContent = n ? `${n} marcado(s)` : "";
+  }
+
+  document.getElementById("btn-ver-cola")?.addEventListener("click", async () => {
+    const p = document.getElementById("cola-panel");
+    if (!p) return;
+    const abrir = p.style.display !== "block";
+    p.style.display = abrir ? "block" : "none";
+    if (abrir) { await _colaCargar(); _colaPintar(); }
+  });
+
+  document.getElementById("cola-check-all")?.addEventListener("change", (e) => {
+    document.querySelectorAll(".cola-chk").forEach(c => { c.checked = e.target.checked; });
+    _colaSel();
+  });
+
+  document.getElementById("btn-cola-enviar")?.addEventListener("click", async () => {
+    const ids = _colaMarcados();
+    const out = document.getElementById("cola-result");
+    if (!ids.length) { out.textContent = "Marcá al menos uno."; out.style.color = "var(--muted)"; return; }
+    if (!confirm(`Se van a crear ${ids.length} item(s) en Monday. ¿Confirmás?`)) return;
+    const btn = document.getElementById("btn-cola-enviar");
+    btn.disabled = true;
+    let ok = 0; const fallaron = [];
+    for (const [i, id] of ids.entries()) {
+      const f = _colaFilas.find(x => String(x.id) === String(id));
+      if (!f) continue;
+      out.textContent = `Enviando ${i + 1} de ${ids.length}…`; out.style.color = "var(--muted)";
+      try {
+        const mp = f.monday_payload || {};
+        await pushToMonday({
+          domain: f.domain,
+          traffic: mp.traffic_text || formatTraffic(f.traffic),
+          email: (Array.isArray(f.emails) && f.emails[0]) || "",
+          geo: f.geo, idioma: mp.idioma, pitch: f.pitch || "",
+          estado: mp.estado, fecha: mp.fecha, ejecutivo: mp.ejecutivo,
+          loginEmail: state.loginEmail,
+        });
+        // Uno por uno y marcando al vuelo: si el lote se corta a la mitad, lo que ya entró
+        // NO se reenvía. Un duplicado en el CRM es más caro que reintentar el resto.
+        await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${f.id}`, {
+          method: "PATCH",
+          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                     "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ status: "validated", validated_at: new Date().toISOString(), validated_by: state.loginEmail }),
+        }).catch(() => {});
+        ok++;
+      } catch (e) {
+        fallaron.push(`${f.domain}: ${String(e.message || e).slice(0, 60)}`);
+      }
+    }
+    // Decir CUÁL falló, no solo cuántos: si el mail no puede señalar a nadie, el MB tiene que
+    // revisar los 40 a mano para encontrar los 2 que no entraron.
+    out.innerHTML = fallaron.length
+      ? `✅ ${ok} enviado(s) · ❌ ${fallaron.length} fallaron:<br>` + fallaron.slice(0, 6).map(x => `· ${x}`).join("<br>")
+      : `✅ Los ${ok} entraron a Monday.`;
+    out.style.color = fallaron.length ? "#fca5a5" : "#86efac";
+    btn.disabled = false;
+    await _colaRefrescarContador();
+    _colaPintar();
+  });
+
+  document.getElementById("btn-cola-borrar")?.addEventListener("click", async () => {
+    const ids = _colaMarcados();
+    const out = document.getElementById("cola-result");
+    if (!ids.length) { out.textContent = "Marcá al menos uno."; out.style.color = "var(--muted)"; return; }
+    if (!confirm(`Sacar ${ids.length} de la cola? Quedan en Prospects como pendientes, no se borran.`)) return;
+    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${ids.join(",")})`, {
+      method: "PATCH",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                 "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ status: "pending" }),
+    }).catch(() => {});
+    out.textContent = `Se sacaron ${ids.length} de la cola.`; out.style.color = "var(--muted)";
+    await _colaRefrescarContador(); _colaPintar();
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // COLA "POR ENVIAR A MONDAY" (Maxi 2026-09-02, pedido del user)
+  // ══════════════════════════════════════════════════════════════════════════════════════
+  // Durante la migración de CRM los MB no pueden empujar a Monday. Si esperan, pierden horas
+  // de prospección. Con esto siguen igual —analizan, mandan el mail— y en vez de empujar
+  // guardan el prospecto en una cola que después se manda toda junta desde Prospects.
+  //
+  // Las validaciones son EXACTAMENTE las del botón verde y por eso viven en una función
+  // compartida: si mañana cambia un requisito y quedan dos copias, la cola se llena de
+  // prospectos que Monday después rechaza, y el MB se entera recién al mandar el lote.
+  function _validarProspectoMonday(res) {
+    const v = getMondayFormValues();
+    if (v.email && !isValidEmail(v.email)) {
+      res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return null;
+    }
+    if (!v.geo) {
+      res.textContent = "❌ GEO required. Fill the GEO field before saving.";
+      res.className = "push-result error";
+      document.getElementById("form-geo")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return null;
+    }
+    const traffic = state.traffic || state.visits || 0;
+    if (!traffic) {
+      res.textContent = "❌ Page Views required. SimilarWeb returned no data — fill manually or re-analyze.";
+      res.className = "push-result error"; return null;
+    }
+    // ⚠️ NO se exige haber mandado el mail (Maxi 2026-09-02, corrección del user).
+    // Lo había puesto asumiendo que el mail sale igual y solo se pospone el CRM. El pedido
+    // real es otro: "lo mismo que enviar a Monday pero dejar todo pre-grabado en hold", en UN
+    // click. Pedirle al MB que mande el mail antes de poder guardar rompe justamente lo que
+    // esto viene a resolver — no frenar la prospección durante la migración.
+    // Las validaciones de DATOS sí quedan (GEO, tráfico, formato del email): sin ellas el
+    // registro no sirve el día que se manda, y el MB se enteraría recién ahí.
+    // Se anota si el mail salió o no, para poder marcarlo en la lista: que sea de un click no
+    // significa que después no se vea cuáles quedaron sin contactar.
+    return { ...v, traffic, mailEnviado: !!state.emailSentInSession };
+  }
+
+  document.getElementById("btn-guardar-cola")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-guardar-cola");
+    const res = document.getElementById("push-result");
+    const v = _validarProspectoMonday(res);
+    if (!v) return;
+    const orig = btn.textContent;
+    btn.disabled = true; btn.textContent = "⏳ Guardando…";
+    try {
+      const fila = {
+        domain: state.domain,
+        traffic: v.traffic,
+        geo: v.geo,
+        language: String(v.idioma ?? ""),
+        emails: v.email ? [v.email] : [],
+        pitch: v.pitch || "",
+        status: "por_enviar",
+        source: "manual_cola",
+        created_by: state.loginEmail,
+        // Lo que la tabla no tiene y Monday sí necesita, guardado tal cual para que el envío
+        // en lote no tenga que reconstruir nada ni volver a preguntarle al MB.
+        monday_payload: { estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma, traffic_text: formatTraffic(v.traffic), mail_enviado: v.mailEnviado },
+      };
+      const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
+        method: "POST",
+        headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                   "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify(fila),
+      });
+      if (!r.ok) throw new Error((await r.text()).slice(0, 160));
+      res.textContent = "📥 Guardado en la cola — lo mandás desde Prospects › Por enviar";
+      res.className = "push-result ok";
+      _colaRefrescarContador();
+    } catch (e) {
+      res.textContent = "❌ No se pudo guardar: " + String(e.message || e).slice(0, 140);
+      res.className = "push-result error";
+    }
+    btn.disabled = false; btn.textContent = orig;
   });
 
   document.getElementById("btn-push-monday").addEventListener("click", async () => {
@@ -11039,6 +11261,44 @@ async function secToggle() {
   await secPintar();
 }
 
+// ── RESTABLECER OPERACIÓN (Maxi 2026-09-02, pedido del user) ─────────────────────────────
+// Soltar el kill switch no alcanza. Cuando el agente aparece en "0 de 40" casi nunca es el
+// kill switch: es `agent_paused_until`, la pausa de 12 h por rebote del dominio, que es otra
+// llave y desde la toolbar no se podía tocar.
+// El caso que lo motivó: el 02/09 el agente pasó el día entero en cero con el kill switch en
+// `false`. La pausa vencía 11 horas después y al vencer se volvía a disparar, porque la tasa
+// de rebote se mide sobre 7 días — frenar los envíos vacía el denominador y empuja la tasa
+// PARA ARRIBA. El freno se garantizaba a sí mismo y no había salida desde acá.
+// El RPC valida la allowlist y deja registro. NO desarma la defensa: si la causa sigue, el
+// vigilante vuelve a frenar en la próxima vuelta. Es una salida de emergencia, no un
+// interruptor para dejar apagado.
+async function secRestablecer() {
+  const btn = document.getElementById("sec-restore-btn");
+  if (!btn) return;
+  if (!confirm("Suelta el freno de emergencia Y la pausa por rebote, y el agente vuelve a enviar.\n\n"
+             + "Si la causa sigue (por ejemplo el rebote alto), el vigilante va a frenar de nuevo solo.\n\n¿Restablecer?")) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/restablecer_operacion`, {
+      method: "POST",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ p_motivo: "botón Restablecer del panel" }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const res = await r.json();
+    // Decir QUÉ se soltó y no un "listo" genérico: si no había nada frenado, el user tiene que
+    // saberlo — quiere decir que el "0 de 40" viene de otro lado y hay que mirar ahí.
+    alert(res?.nada_que_soltar
+      ? "No había ningún freno puesto.\n\nSi el agente igual no envía, la causa es otra: miralo en el informe o pedímelo."
+      : `Listo. Se soltó: ${(res?.soltados || []).join(", ")}.\n\nEl agente retoma en la próxima vuelta (unos minutos).`);
+  } catch (e) {
+    alert("No se pudo restablecer: " + String(e).slice(0, 200));
+  }
+  btn.disabled = false; btn.textContent = orig;
+  await secPintar();
+}
+
 // Reporte de 1 clic: junta los últimos incidentes y el estado, y lo deja en el portapapeles.
 async function secCopiarReporte() {
   const btn = document.getElementById("sec-report-btn");
@@ -11159,5 +11419,7 @@ function secInit() {
   if (b && !b.dataset.wired) { b.dataset.wired = "1"; b.addEventListener("click", secToggle); }
   if (r && !r.dataset.wired) { r.dataset.wired = "1"; r.addEventListener("click", secCopiarReporte); }
   if (t && !t.dataset.wired) { t.dataset.wired = "1"; t.addEventListener("change", secToggleDefensa); }
+  const rs = document.getElementById("sec-restore-btn");
+  if (rs && !rs.dataset.wired) { rs.dataset.wired = "1"; rs.addEventListener("click", secRestablecer); }
   secPintar();
 }

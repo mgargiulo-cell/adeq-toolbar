@@ -354,7 +354,9 @@ export async function scrapeContactPages(baseUrl) {
   const fetchOne = async (path) => {
     try {
       const url      = new URL(path, baseUrl).href;
-      const response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(4000) });
+      // 4000 → 2500 ms. Una página de contacto que tarda más de 2,5 s es rarísima, y tenemos
+      // 65 intentos: perder una lenta cuesta mucho menos que hacer esperar a todas las demás.
+      const response = await fetch(url, { method: "GET", signal: AbortSignal.timeout(2500) });
       if (!response.ok) return;
       const html = await response.text();
       filterEmails(extractEmailsFromText(html)).forEach(e => emails.add(e));
@@ -363,7 +365,13 @@ export async function scrapeContactPages(baseUrl) {
 
   // Concurrencia limitada (chunks de 5) para no disparar 25 fetch a la vez.
   // Cortamos temprano si ya juntamos varios correos buenos.
-  const CONCURRENT = 5;
+  // ── MENOS OLAS, MISMAS RUTAS (Maxi 2026-09-02) ────────────────────────────────────────
+  // Son 65 rutas de contacto. De a 5 son 13 olas, y `Promise.all` hace que cada ola espere a
+  // la MÁS LENTA: una sola ruta que cuelga le cuesta 4 segundos a las otras cuatro.
+  // De a 14 son 5 olas. No se prueba ni una ruta más ni una menos —el resultado es idéntico—,
+  // solo se reparte distinto. El navegador encola lo que no puede mandar junto, así que no
+  // hay riesgo de saturar al sitio.
+  const CONCURRENT = 14;
   for (let i = 0; i < paths.length && emails.size < 12; i += CONCURRENT) {
     await Promise.all(paths.slice(i, i + CONCURRENT).map(fetchOne));
   }

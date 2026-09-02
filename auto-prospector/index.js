@@ -275,6 +275,15 @@ function matchesExcludeKeyword(domain) {
 }
 
 function isDomainAllowed(domain) {
+  // ⚠️ ESTO TIRABA EL PROCESO (Maxi 2026-09-02). `TypeError: domain.includes is not a
+  // function`, 14 veces sin capturar. Le llegaban OBJETOS `{title, domain}` desde el cache
+  // de similares: alguna rama guardó la respuesta cruda de la API en vez del dominio, y 117
+  // filas del cache quedaron así. Como el error salía por unhandledRejection, no lo agarraba
+  // ningún try/catch y se llevaba puesto el ciclo entero.
+  // Se acepta lo que venga y se extrae el dominio si es un objeto: una función de filtro
+  // NUNCA puede voltear el proceso por un dato mal formado.
+  if (domain && typeof domain === "object") domain = domain.domain || domain.url || domain.name || "";
+  domain = String(domain || "");
   if (!domain || !domain.includes(".")) return false;
   if (EXCLUDE_DOMAINS.has(domain)) return false;
   if (isUniversityDomain(domain)) return false;
@@ -832,7 +841,12 @@ async function purgarColaVieja(token) {
     const cand = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&processed_at=lt.${corte}&select=id,domain&limit=2000`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(cand) || !cand.length) return;
+    if (!Array.isArray(cand) || !cand.length) {
+      // Mismo caso: hoy hay CERO filas de +30 días para purgar. Que no haya basura es una
+      // buena noticia, y venía reportada como un job muerto desde el 27/08.
+      await saludPing(token, "purga_cola", { status: "ok", cadenciaMin: 1440, detalle: "nada viejo para purgar" }).catch(() => {});
+      return;
+    }
 
     const conRespaldo = [];
     for (let i = 0; i < cand.length; i += 200) {
@@ -967,12 +981,26 @@ async function getDailyGlobalCounters(token) {
           { headers: { ..._auth, "Prefer": "count=exact", "Range": "0-0" } });
         const _atascados = parseInt((nr.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
         await saludPing(token, "next_day_rollover", { status: "ok", cadenciaMin: 24 * 60, detalle: `${_atascados} en next_day`, real: _atascados });
-        if (_atascados > 500) {
+        // ── ATASCO ES QUE CREZCA, NO QUE SEA GRANDE (Maxi 2026-09-02) ──────────────
+        // El umbral era 500 fijo. Pero `next_day` es un BUFFER: el pool tiene capacidad 700
+        // y cada relleno mueve ~400, así que 1.249 en cola son dos rellenos de reserva —
+        // operación normal, no atasco. La alerta saltaba con el sistema funcionando y encima
+        // mientras el descubrimiento producía 273 altas por día.
+        // Lo que de verdad importa es si la cola CRECE: que sea grande y estable significa
+        // que hay reserva; que suba día tras día significa que entra más de lo que sale.
+        // Se compara contra ayer y se exige, además, que pase de tres rellenos de fondo.
+        let _ayer = 0;
+        try { _ayer = parseInt(cfg.next_day_ayer || "0", 10) || 0; } catch {}
+        await setConfigValue(token, "next_day_ayer", String(_atascados)).catch(() => {});
+        const _techoCola = WAITING_POOL_CAP * 3;
+        if (_atascados > _techoCola && _atascados > _ayer) {
           await saludAlerta(token, {
             clave: "next-day-atascado", severidad: "warning",
-            titulo: `🚧 ${_atascados} dominios atascados en next_day`,
-            cuerpo: `Esas filas consumen cupo del carril de su fuente, así que los feeders se saltean solos sin gastar créditos. El waiting_pool está en ${_wNow}/${WAITING_POOL_CAP}.`,
-            metadata: { next_day: _atascados, waiting_pool: _wNow },
+            titulo: `🚧 next_day creciendo: ${_atascados} (ayer ${_ayer})`,
+            cuerpo: `Pasa los ${_techoCola} de reserva sana (3 rellenos del pool) Y creció respecto a ayer: entra más de lo que sale.\n`
+                  + `Esas filas consumen cupo del carril de su fuente, así que los feeders se saltean solos sin gastar créditos.\n`
+                  + `El waiting_pool está en ${_wNow}/${WAITING_POOL_CAP}.`,
+            metadata: { next_day: _atascados, ayer: _ayer, waiting_pool: _wNow },
           });
         }
       } catch {}
@@ -6090,7 +6118,12 @@ async function findSimilarSites(domain, rapidApiKey) {
   const cachedSimilar = await getSimilarSitesCacheServer(cleanD);
   if (cachedSimilar) {
     log(`  💾 similar-sites cache HIT ${cleanD} (${cachedSimilar.length} sitios — sin gastar hit)`);
-    return cachedSimilar.filter(d => isDomainAllowed(d));
+    // La rama que va a la API pasa cada sitio por `cleanDomain`; ésta usaba lo guardado tal
+    // cual y por eso los objetos viejos llegaban crudos hasta el filtro. Se normaliza igual
+    // que la otra rama, así las dos devuelven lo mismo.
+    return cachedSimilar
+      .map(d => (d && typeof d === "object") ? cleanDomain(d.domain || d.url || d.name || "") : cleanDomain(String(d || "")))
+      .filter(d => d && isDomainAllowed(d));
   }
   const [swSites, ssSites] = await Promise.all([
     (async () => {
@@ -6718,6 +6751,17 @@ function _sanitizeEmail(raw) {
 // personas sobre genéricos y capea a 15. NO se aplica a emails de Apollo.
 // opts.urlByEmail: Map email→URL de origen. Si el email lo publicó el PROPIO sitio del lead,
 // es su contacto aunque el dominio del mail sea otro (auditoría empírica 2026-08-04).
+// TLD de país (ISO 3166-1 alpha-2) + los que se usan como país sin serlo (uk, eu, su, ac).
+// Sirve para descartar artefactos de texto que PARECEN email: `good@all.he` no es una
+// dirección, `contacto@medio.io` sí. Solo se consulta para TLDs de dos letras.
+const TLD_PAIS_VALIDOS = new Set(("ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt bv bw by bz "
+ + "ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr "
+ + "ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp "
+ + "ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt "
+ + "mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw "
+ + "sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug "
+ + "um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw uk eu su ac").split(/\s+/));
+
 function _cleanScrapedEmails(list, leadDomain, opts = {}) {
   const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
   const urlByEmail = opts.urlByEmail || null;
@@ -6775,7 +6819,26 @@ function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     // 9 emails extraídos y devolvía []), radio1.hu → hirdetes@mediamoment.hu (venta de pauta),
     // radioagricultura.cl → vradnic@agricultura.cl (gerente general),
     // elfinancierocr.com → 7 emails @nacion.com (mismo grupo).
-    const publicadoPorElSitio = vieneDelPropioSitio(e);
+    // ⚠️ LA PROCEDENCIA NO PUEDE RESCATAR UNA DIRECCIÓN QUE NO EXISTE (Maxi 2026-09-01).
+    // Al revivir la regla de procedencia aparecieron artefactos que antes tapaba el filtro
+    // cross-domain: en ronaldo7.net salieron `1323-a-look@ronaldo-roots-and-early-days.html`
+    // (un trozo de URL leído como email) y `good@all.he`. Los dos "vienen del propio sitio",
+    // así que la regla los rescataba y se habrían enviado — un rebote garantizado y encima
+    // ensuciando la reputación del dominio.
+    // Se exige que la parte del dominio termine en algo que pueda ser un TLD de verdad: 2 a 24
+    // letras, y nunca una extensión de archivo. Es barato y corta justo esta familia.
+    const _tldAparente = (dom.split(".").pop() || "");
+    // Un TLD de DOS letras solo es válido si es un código de país de verdad. `good@all.he`
+    // salió del texto de una nota y `.he` no existe; `.fr` o `.io` sí. Los de 3+ letras se
+    // aceptan salvo que sean una extensión de archivo (el caso `...-early-days.html`).
+    // (No se reusa COUNTRY_CODES: tiene 86 entradas y le faltan .uk .io .tv .me .eu, así que
+    // rechazaría dominios legítimos — peor que el problema que arregla.)
+    const _dominioPlausible = dom.includes(".") && dom.length >= 4
+      && (_tldAparente.length === 2
+            ? TLD_PAIS_VALIDOS.has(_tldAparente)
+            : /^[a-z]{3,24}$/.test(_tldAparente)
+              && !/^(html?|php|aspx?|jsp|jpe?g|png|gif|webp|svg|css|js|json|xml|pdf|zip|mp[34]|txt|woff2?|ico|rss|amp)$/.test(_tldAparente));
+    const publicadoPorElSitio = _dominioPlausible && vieneDelPropioSitio(e);
     const esCasaEditora = casasEditoras.has(dom) || [...casasEditoras].some(c => dom.endsWith("." + c));
     if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole && !publicadoPorElSitio && !esCasaEditora) continue;
     seen.add(e);
@@ -7397,7 +7460,28 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // opts.urlByEmail: Map opcional — recibe email→URL de origen para tracking UI
   // (user 2026-06-17: poder mostrar de qué URL salió cada scraped email).
   const informerOut = opts.informerOut || null;
-  const urlByEmail  = opts.urlByEmail  || null;
+  // ── LA REGLA DE PROCEDENCIA ESTABA MUERTA EN EL PULIDO (Maxi 2026-09-01) ────────────
+  // `_cleanScrapedEmails` tiene desde el 04/08 la regla más importante para los grupos
+  // editores: un email impreso en la página de contacto DEL PROPIO SITIO es su contacto,
+  // aunque el buzón viva en el dominio de la casa matriz. Esa regla se apoya en `urlByEmail`,
+  // el mapa que dice DÓNDE se encontró cada dirección.
+  // Pero el mapa solo existía si el que llamaba lo pasaba. La ficha de la extensión lo pasa y
+  // el camino automático también — `polishPool` NO, y es justamente el que recorre los cientos
+  // de leads sin email. Ahí `urlByEmail` quedaba en null, `vieneDelPropioSitio` devolvía
+  // siempre false y el cross-domain se descartaba sin mirar de dónde salió.
+  // Caso testigo (reproducido paso a paso): lafranceagricole.fr. El crawler visita
+  // /contact_publicite/p89 —la página de PUBLICIDAD, el buzón que más nos sirve—, baja 71 KB,
+  // extrae `serviceclients@ngpa.fr`… y lo tira, porque ngpa.fr (el grupo editor) no es el
+  // dominio del sitio. El lead quedaba como "no_se_pudo_leer_el_sitio" cuando el sitio se leyó
+  // perfecto. El user lo encontró a mano en dos clics.
+  // Se crea siempre el mapa: sin él, media función se apaga en silencio.
+  const urlByEmail  = opts.urlByEmail  || new Map();
+  // ── CÓMO LE FUE AL CRAWL, NO SOLO QUÉ ENCONTRÓ (Maxi 2026-09-01) ────────────────────
+  // Quien llama solo recibía la lista de emails. Con la lista vacía no había forma de saber
+  // si el sitio no se pudo abrir o si se abrió entero y no publica ninguna dirección — dos
+  // problemas con soluciones OPUESTAS (uno se reintenta, el otro se busca por otra vía) que
+  // el informe venía mostrando como el mismo renglón.
+  const _stats = opts.statsOut || null;
   // Maxi 2026-06-17 v4: socialOut Map recibe emails extraídos de redes
   // sociales (FB business email, YT contact for business). Source: "Facebook",
   // "YouTube", "Twitter".
@@ -7553,10 +7637,12 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       }
       if (url === base && !_homeHtmlCache) _homeHtmlCache = html;   // para el JSON-LD
       for (const f of _facetasComerciales(html, url)) discovered.add(f);   // ?cat=obchod, ?dept=ventas
+      if (_stats) _stats.ok = (_stats.ok || 0) + 1;
       return; // éxito → no reintentar
     } catch (e) {
       const isTimeout = e?.name === "TimeoutError" || e?.name === "AbortError";
       if (_attempt === 0 && isTimeout) { _attempt++; timeout = Math.round(timeout * 1.6); continue; }
+      if (_stats) { _stats.fail = (_stats.fail || 0) + 1; if (isTimeout) _stats.timeouts = (_stats.timeouts || 0) + 1; }
       return;
     }
    }
@@ -7972,6 +8058,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Las casas editoras probadas se devuelven por opts (un Set que el caller pasa vacío) en vez
   // de cambiar el tipo de retorno: hay 6 callers y todos esperan un array de strings.
   if (opts.casasEditorasOut) for (const c of _casasEditoras) opts.casasEditorasOut.add(c);
+  if (_stats) _stats.waf = _wafBloquea;
   return _cleanScrapedEmails([...emails], domain, { urlByEmail, casasEditoras: _casasEditoras });
 }
 
@@ -10576,6 +10663,25 @@ async function auditarEmailsDelPool(token) {
   } catch (e) { log(`⚠️ auditarEmailsDelPool: ${e.message}`); }
 }
 
+// ── POR QUÉ ESTE LEAD SIGUE SIN EMAIL (Maxi 2026-09-01) ────────────────────────────────
+// Cuatro casos, cada uno con una salida distinta. Antes eran uno solo y por eso el informe
+// mandaba a mirar donde no era:
+//   waf_nos_bloqueo            → el sitio nos cierra la puerta. Vale reintentar más adelante
+//                                o ir por MX/Certificate Transparency, que no crawlean.
+//   no_se_pudo_leer_el_sitio   → de verdad no se pudo abrir NINGUNA página (caído, DNS, TLS).
+//   la_web_no_publica_ningun_email → se leyó bien y no hay dirección. Suele ser formulario:
+//                                queda la vía de redes o Apollo. Insistir con el crawl no sirve.
+//   rechazados_por_ranking     → sí publica, pero el filtro las descartó. Acá el que puede
+//                                estar mal somos nosotros, y por eso lleva los ejemplos pegados.
+function _motivoSinEmail(diag, stats) {
+  const ok   = Number(stats?.ok || 0);
+  const fail = Number(stats?.fail || 0);
+  if (stats?.waf) return "waf_nos_bloqueo";
+  if (ok === 0 && fail > 0) return "no_se_pudo_leer_el_sitio";
+  if (!diag || diag.crudos === 0) return "la_web_no_publica_ningun_email";
+  return `rechazados_por_ranking:${(diag.rechazados || []).join("|").slice(0, 120)}`;
+}
+
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
@@ -10772,7 +10878,8 @@ async function polishPool(token) {
         let foundEmail = null, foundSource = null, foundName = "";
         let _diagEmail = null;      // qué se encontró y qué se descartó, para el motivo real
         const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut }).catch(() => []);
+        const _crawlStats = { ok: 0, fail: 0, timeouts: 0, waf: false };
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats }).catch(() => []);
         if (Array.isArray(scraped) && scraped.length) {
           // ── QUÉ SE ENCONTRÓ Y POR QUÉ SE DESCARTÓ (Maxi 2026-08-27, pedido del user) ────
           // El motivo que se guardaba era siempre "no_encontrado", que junta dos cosas muy
@@ -10879,21 +10986,32 @@ async function polishPool(token) {
               // El motivo REAL, no una etiqueta genérica. Distingue los tres casos que
               // importan: la web no publica nada, publica pero lo rechaza el ranking, o el
               // sitio nos bloquea. Cada uno se arregla distinto.
-              email_ultimo_motivo: !_diagEmail ? "no_se_pudo_leer_el_sitio"
-                : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
-                : `rechazados_por_ranking:${_diagEmail.rechazados.join("|").slice(0, 120)}`,
+              // ── EL MOTIVO AHORA DESCRIBE LO QUE PASÓ (Maxi 2026-09-01) ─────────────
+              // `no_se_pudo_leer_el_sitio` significaba en realidad "no se produjo diagnóstico"
+              // y se usaba para TODO: el sitio caído, el bloqueado por WAF y el que se leyó
+              // entero y no publica mail. Tres problemas con soluciones distintas —reintentar,
+              // buscar por otra vía, o darlo por agotado— bajo la misma etiqueta.
+              // Costó caro: lafranceagricole.fr figuraba así mientras el crawler le bajaba
+              // 71 KB de su página de publicidad. Estuve buscando un problema de lectura que
+              // no existía. Ahora el motivo sale de `_crawlStats`, que cuenta lo que de verdad
+              // ocurrió, en vez de asumirlo.
+              email_ultimo_motivo: _motivoSinEmail(_diagEmail, _crawlStats),
             }),
           }).catch(() => {});
           // Queda el rastro COMPLETO en su propia tabla: la columna del lead se pisa en cada
           // intento y se pierde la historia. Acá se puede agrupar y verificar a mano.
-          const _mot = !_diagEmail ? "no_se_pudo_leer_el_sitio"
-                     : _diagEmail.crudos === 0 ? "la_web_no_publica_ningun_email"
-                     : "rechazados_por_ranking";
+          const _mot = _motivoSinEmail(_diagEmail, _crawlStats).split(":")[0];
           registrarDiagSinEmail(token, {
             domain, intento: (lead.email_intentos || 0) + 1, fase: "pulido",
             crudos: _diagEmail?.crudos || 0, rechazados: _diagEmail?.rechazados || [],
             motivo: _mot,
-            comentario: _comentarioSinEmail({ ..._diagEmail, waf: false }),
+            // `paginas_leidas` estaba SIEMPRE en 0 (559 filas seguidas) porque nadie lo llenaba,
+            // y el comentario venía con `waf: false` clavado, así que la rama del WAF no se
+            // activaba nunca desde acá. Dos valores inventados en la misma llamada: el informe
+            // decía con seguridad cosas que nadie había medido.
+            paginas: _crawlStats.ok,
+            waf: _crawlStats.waf,
+            comentario: _comentarioSinEmail({ ..._diagEmail, ..._crawlStats, paginas: _crawlStats.ok }),
           }).catch(() => {});
         }
       } catch (e) { log(`  ⚠️ polish ${domain}: ${e.message}`); }
@@ -10966,7 +11084,13 @@ async function runProspectSimilarExpansion(token) {
   try {
     const _cap  = PER_SOURCE_ACTIVE_CAP.auto_feeder_similar ?? DEFAULT_SOURCE_CAP;
     const _room = Math.max(0, _cap - await _countActiveCsvBySource(token, "auto_feeder_similar"));
-    if (_room <= 0) { log("🔗 similar-exp SKIP: carril lleno — 0 hits RapidAPI"); return; }
+    if (_room <= 0) {
+      // Saltear por carril lleno es la decisión CORRECTA —no gasta créditos de RapidAPI—,
+      // pero callarse la hacía indistinguible de estar muerto. Se late igual.
+      log("🔗 similar-exp SKIP: carril lleno — 0 hits RapidAPI");
+      await saludPing(token, "similar_expansion", { status: "ok", cadenciaMin: 60, detalle: "carril lleno: no hacía falta expandir" }).catch(() => {});
+      return;
+    }
     if (await _drainBacklog(token, "auto_feeder_similar", _room) >= _room) {
       log("🔗 similar-exp: carril llenado con el pre-listado — 0 hits RapidAPI gastados 💰");
       return;
@@ -12550,8 +12674,21 @@ async function registrarDiagDescarte(token, d) {
 
 // Traduce el diagnóstico técnico a una frase que explique qué pasó y qué se podría probar.
 function _comentarioSinEmail(d) {
+  if (d.ok === 0 && d.fail > 0) return `No se pudo abrir NINGUNA de las ${d.fail} página(s) que se intentaron${d.timeouts ? ` (${d.timeouts} por timeout)` : ""}. El sitio puede estar caído, lento o con problemas de DNS/TLS. Vale reintentar más adelante antes de darlo por perdido.`;
   if (d.waf) return "El sitio está detrás de un WAF (Cloudflare) que bloquea el crawler antes de servir el HTML. No es que no tenga email: no lo pudimos leer. Vale probar por MX/DMARC, Certificate Transparency o buscando el dominio en Google.";
-  if (!d.crudos) return `Se leyeron ${d.paginas ?? "varias"} páginas (home, contacto, publicidad, legales) y NINGUNA publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo.`;
+  // ⚠️ Este renglón AFIRMABA "se leyeron varias páginas" siempre, porque nadie pasaba
+  // `d.paginas` y el `?? "varias"` tapaba el hueco. Salía igual cuando el sitio no se había
+  // podido abrir. Así fue como lafranceagricole.fr quedó explicado como ilegible mientras el
+  // crawler le bajaba 71 KB de su página de publicidad, y me mandó a buscar donde no era.
+  // Ahora, si no sabemos cuántas páginas se leyeron, se dice que no se sabe.
+  if (!d.ok && d.ok !== 0 && !d.paginas) {
+    return "No quedó registro de cuántas páginas se leyeron, así que no se puede afirmar por qué falta el email. Si se repite en este dominio, mirarlo a mano.";
+  }
+  if (!d.crudos) {
+    const _leidas = d.paginas ?? d.ok ?? 0;
+    const _fallidas = d.fail ? ` (${d.fail} no respondieron)` : "";
+    return `Se leyeron ${_leidas} página(s)${_fallidas} —home, contacto, publicidad, legales— y ninguna publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo; insistir con el crawl no va a cambiar nada.`;
+  }
   if (d.rechazados?.length) return `La web SÍ publica ${d.crudos} dirección(es), pero el ranking las rechazó a todas: ${d.rechazados.slice(0, 3).join(", ")}. Si alguna parece legítima, el filtro está siendo demasiado estricto y hay que revisarlo.`;
   return "No se encontró contacto y no quedó registro de candidatos. Revisar si el crawl llegó a correr.";
 }
@@ -12564,13 +12701,26 @@ async function reabrirLeadsRebotados(token) {
     const rebotados = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=5000`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(rebotados) || !rebotados.length) return;
+    if (!Array.isArray(rebotados) || !rebotados.length) {
+      await saludPing(token, "reabrir_rebotados", { status: "ok", cadenciaMin: 360, detalle: "no hay rebotes registrados" }).catch(() => {});
+      return;
+    }
     const muertos = new Set(rebotados.map(x => String(x.email || "").toLowerCase()).filter(Boolean));
 
     const leads = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id,domain,emails,email_sources&limit=1500`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(leads) || !leads.length) return;
+    // ── "NADA QUE HACER" NO ES "NO CORRÍ" (Maxi 2026-09-02) ──────────────────────────
+    // Estos returns eran mudos: el job corría, no encontraba trabajo y se iba sin pingear.
+    // El monitor entonces lo daba por ATRASADO. Medido hoy: `cadencia_reabrir_rebotados`
+    // decía que había corrido a las 09:02 mientras la salud mostraba su última corrida el
+    // 31/08 — tres días de rojo por un job que funcionaba perfecto.
+    // Es la misma familia que "dormido no es muerto" y el trabajo a pedido. Un job que no
+    // tuvo trabajo tiene que decirlo, no callarse.
+    if (!Array.isArray(leads) || !leads.length) {
+      await saludPing(token, "reabrir_rebotados", { status: "ok", cadenciaMin: 360, detalle: "sin leads rebotados para reabrir" }).catch(() => {});
+      return;
+    }
 
     let reabiertos = 0;
     for (const l of leads) {
@@ -15704,6 +15854,83 @@ const BOUNCE_INFRA_DOMAINS = new Set([
 
 // Worker job: escanea INBOX por mailer-daemon en últimos 24h, parsea destinatario
 // que rebotó, persiste en toolbar_bounced_emails. Corre 1 vez por loop iter.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// EL REBOTE LLEGA EN EL IDIOMA DEL SERVIDOR DEL DESTINATARIO (Maxi 2026-09-02)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Regla del user: "todos estos avisos pueden llegar en varios idiomas, tenelo en cuenta".
+// Tiene razón y era un agujero: los idiomas estaban escritos en TRES lugares distintos —la
+// búsqueda de Gmail, `isHardBounce` y la clasificación— cada uno con una lista diferente.
+// `isHardBounce` cubría 6 idiomas y el chequeo de "no existe" cubría inglés y medio español,
+// así que un rebote alemán o japonés se detectaba pero se clasificaba mal.
+//
+// Los idiomas salen de a dónde enviamos DE VERDAD (30 días): Brasil 170 · España 85 ·
+// México 44 · EE.UU. 43 · Argentina 37 · Francia 35 · Italia 34 · Alemania 32 · Japón 22.
+// Se suman los del pool que todavía no recibieron volumen (NL, PL, TR, EL, HU, RU).
+//
+// UN SOLO lugar para las tres preguntas. Si mañana aparece un idioma nuevo, se agrega acá y
+// vale para todo el circuito.
+
+// 1. LA CASILLA NO EXISTE — el rebote más definitivo.
+const REBOTE_NO_EXISTE = new RegExp([
+  // códigos SMTP: valen en cualquier idioma y son lo más confiable
+  "550[\\s-]?5\\.1\\.1", "recipnotfound", "nosuchuser",
+  // inglés
+  "does ?n[o']?t exist", "address not found", "user unknown", "unknown user", "no such user",
+  "recipient not found", "recipient unknown", "invalid recipient", "unrouteable address",
+  "was ?n[o']?t found at", "mailbox unavailable",
+  // La redacción EXACTA de Gmail, que es la que más llega y no usa ninguna de las de arriba:
+  // "your message wasn't delivered to X because the address couldn't be found".
+  "could ?n[o']?t be found", "was ?n[o']?t delivered", "unable to receive mail",
+  // español
+  "no existe", "no se ha encontrado la direcci", "direcci[oó]n.{0,12}no.{0,12}encontrada",
+  "usuario desconocido", "destinatario no encontrado", "destinatario desconocido",
+  // portugués
+  "n[aã]o existe", "endere[cç]o.{0,12}n[aã]o.{0,12}encontrado", "usu[aá]rio desconhecido",
+  "destinat[aá]rio n[aã]o encontrado",
+  // italiano
+  "non esiste", "indirizzo.{0,12}non.{0,12}trovato", "utente sconosciuto", "destinatario non trovato",
+  // francés
+  "n['’\\s]?existe pas", "adresse.{0,12}introuvable", "n['’\\s]?a pas [eé]t[eé] trouv", "utilisateur inconnu",
+  "destinataire inconnu",
+  // alemán
+  "nicht gefunden", "existiert nicht", "unbekannter empf[aä]nger", "empf[aä]nger unbekannt",
+  // neerlandés · polaco · turco · húngaro
+  "bestaat niet", "onbekende ontvanger",
+  "nie istnieje", "nieznany u[zż]ytkownik", "nie znaleziono adresu",
+  "bulunamad", "mevcut de[gğ]il", "bilinmeyen al[iı]c",
+  "nem tal[aá]lhat", "nem l[eé]tezik",
+  // griego · ruso · japonés
+  "δεν βρέθηκε", "δεν υπάρχει",
+  "не существует", "не найден",
+  "存在しません", "見つかりません",
+].join("|"), "i");
+
+// 2. NO SE PUDO ENTREGAR, sin decir por qué. El caso Postfix: igual de definitivo.
+const REBOTE_INDELIVERABLE = new RegExp([
+  "could not be delivered", "couldn['’\\s]?t be delivered", "delivery (?:has )?failed",
+  "permanent (?:fatal )?(?:error|failure)", "returned to sender", "undeliverable",
+  "delivery to the following recipient failed permanently",
+  "no se pudo entregar", "no ha podido entregarse", "no se ha entregado", "mensaje devuelto",
+  "n[aã]o foi poss[ií]vel entregar", "n[aã]o foi entregue", "mensagem devolvida",
+  "non [eè] stato possibile consegnare", "non recapitato", "consegna non riuscita",
+  "n['’\\s]?a pas pu [eê]tre remis", "non distribu", "[eé]chec de la remise",
+  "konnte nicht zugestellt werden", "unzustellbar", "nicht zugestellt",
+  "kon niet worden bezorgd", "onbestelbaar",
+  "nie mo[zż]na dostarczy", "niedostarczone",
+  "配信できませんでした", "送信できませんでした",
+].join("|"), "i");
+
+// 3. BUZÓN LLENO — lo ÚNICO transitorio. La casilla existe y la semana que viene entra,
+// así que esta dirección NO se quema. Ojo: Exchange escribe "mailbox IS full", con el verbo
+// en el medio; la regex vieja pedía "mailbox full" exacto y por eso los daba por perdidos.
+const REBOTE_BUZON_LLENO = new RegExp([
+  "mailbox (?:is )?full", "mailbox.{0,15}full", "over quota", "quota exceeded",
+  "insufficient storage", "buz[oó]n (?:est[aá] )?lleno", "cuota excedida",
+  "caixa.{0,12}cheia", "casella.{0,12}piena", "quota superata",
+  "bo[iî]te.{0,12}pleine", "quota d[eé]pass", "postfach.{0,12}voll", "kontingent",
+  "postbus vol", "skrzynka.{0,12}pe[lł]na", "容量", "いっぱい",
+].join("|"), "i");
+
 async function scanBouncesForUser(token, userEmail) {
   try {
     const accessToken = await getGmailAccessToken(userEmail);
@@ -15773,7 +16000,17 @@ async function scanBouncesForUser(token, userEmail) {
           '"não foi entregue" OR "mensagem não entregue" OR "devolvido" OR ' +
           '"non recapitato" OR "consegna non riuscita" OR ' +
           '"non distribué" OR "n\'a pas pu être remis" OR ' +
-          '"unzustellbar" OR "nicht zugestellt" OR "onbestelbaar" OR "niedostarczone"' +
+          '"unzustellbar" OR "nicht zugestellt" OR "onbestelbaar" OR "niedostarczone" OR ' +
+          // Los asuntos también llegan en el idioma del servidor del destinatario. Estos son
+          // los idiomas a los que de verdad enviamos (30 días): Brasil, España, México,
+          // EE.UU., Argentina, Francia, Italia, Alemania, Japón — más los del pool.
+          '"mensaje devuelto" OR "correo devuelto" OR "no se pudo entregar" OR ' +
+          '"mensagem devolvida" OR "falha na entrega" OR "posta non consegnata" OR ' +
+          '"[eé]chec de la remise" OR "courrier non distribu" OR ' +
+          '"nicht zustellbar" OR "postkecske" OR "kézbesíthetetlen" OR ' +
+          '"teslim edilemedi" OR "iletilemedi" OR "niet bezorgd" OR ' +
+          '"配信不能" OR "配信できませんでした" OR "送信できませんでした" OR ' +
+          '"δεν παραδόθηκε" OR "не доставлено"' +
         ')' +
       '} newer_than:7d in:anywhere'
     );
@@ -15886,15 +16123,10 @@ async function scanBouncesForUser(token, userEmail) {
         }
         // Hard vs soft bounce detection del body — el hard amerita retry inmediato
         const bodyText = extractMessageText(msg.payload || {}).toLowerCase();
-        const isHardBounce =
-          /address not found|no se ha encontrado la dirección|endereço não encontrado|indirizzo non trovato|n'a pas été trouvée|nicht gefunden/i.test(bodyText) ||
-          // Exchange no dice "address not found", dice "<local> wasn't found at <dominio>".
-          /wasn'?t found at|was not found at|recipient unknown|unknown recipient|recipient not found/i.test(bodyText) ||
-          /550[\s-]?5\.1\.1|550[\s-]?user unknown|user does not exist|no such user|mailbox unavailable|recipient does not exist/i.test(bodyText) ||
-          /permanent failure|permanent error/i.test(bodyText);
-        const isSoftBounce =
-          /4\d\d[\s-]?\d\.\d\.\d|mailbox full|over quota|temporarily|temporary failure|try again later|rate limit/i.test(bodyText) &&
-          !isHardBounce;
+        // Los tres usan el MISMO set multilingüe de arriba: antes cada uno tenía su lista y
+        // por eso un rebote alemán o japonés se detectaba pero se clasificaba mal.
+        const isHardBounce = REBOTE_NO_EXISTE.test(bodyText) || REBOTE_INDELIVERABLE.test(bodyText);
+        const isSoftBounce = (REBOTE_BUZON_LLENO.test(bodyText) || /4\d\d[\s-]?\d\.\d\.\d|temporarily|temporary failure|try again later|rate limit/i.test(bodyText)) && !isHardBounce;
         const bounceType = isHardBounce ? "hard" : (isSoftBounce ? "soft" : "unknown");
         // ── APRENDER EL PORQUÉ, NO SOLO ANOTAR EL QUÉ (Maxi 2026-08-25, pedido del user) ──
         // Ya existía el reintento a otra dirección cuando algo rebota, pero no había
@@ -15903,14 +16135,26 @@ async function scanBouncesForUser(token, userEmail) {
         // direcciones en el mismo lugar y también rebotaron.
         // "hard/soft" no alcanza para decidir: un buzón lleno y un dominio muerto son los
         // dos "no entregado" y piden cosas opuestas. Estas cinco categorías sí deciden.
+        // ── QUÉ ES UN REBOTE, SEGÚN EL USER (2026-09-02) ──────────────────────────────
+        // Textual: "rebote = undeliverable, no hay otro tipo de rebote", y se oficializa con
+        // el aviso de Gmail que dice "Address not found / la dirección no se ha encontrado".
+        // O sea: rebote es SOLO que la casilla (o el dominio) NO EXISTE.
+        // Buzón lleno NO es rebote: la casilla existe y la semana que viene entra.
+        // Bloqueado por política tampoco: la casilla existe, la organización nos rechaza.
+        //
+        // ⚠️ EL ORDEN IMPORTA Y ESTABA AL REVÉS. "bloqueado" se evaluaba ANTES que
+        // "no existe", así que un rechazo que decía `550 5.1.1 RESOLVER.ADR.RECIPNOTFOUND;
+        // not found` terminaba etiquetado como bloqueado. Caso real:
+        // rahier.raphael@sudinfo.be. Ahora el "no existe" se pregunta PRIMERO, porque el
+        // 5.1.1 es la respuesta definitiva del servidor y no admite otra lectura.
         const _tipoRebote =
-          /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|does not exist.{0,20}domain/i.test(bodyText) ? "dominio_inexistente"
-          : /mailbox full|over quota|quota exceeded|insufficient storage|buz[oó]n lleno|caixa.{0,10}cheia/i.test(bodyText) ? "buzon_lleno"
-          // Exchange/M365 rechaza por REGLA de la organización, no por reputación. Son casos
-          // distintos: acá el buzón existe y funciona, simplemente no acepta correo de afuera.
-          // Sin estas frases caían en "desconocido" y el agente reintentaba contra el mismo lugar.
-          : /isn'?t set up to receive|only accepts messages from|not allowed to send to|external communication is not allowed|mail flow rule|has blocked your message|no permitido|not permitted to send/i.test(bodyText) ? "bloqueado"
-          : /blocked|blacklist|spam|reputation|policy|rejected due to|not authorized|denied|550[\s-]?5\.7\./i.test(bodyText) ? "bloqueado"
+          /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|dominio no existe|dom[ií]nio n[aã]o existe/i.test(bodyText) ? "dominio_inexistente"
+          // El "no existe" se pregunta PRIMERO: el 5.1.1 es la respuesta definitiva del
+          // servidor. Antes se preguntaba "¿bloqueado?" antes y un RECIPNOTFOUND terminaba
+          // etiquetado como bloqueado (caso real: rahier.raphael@sudinfo.be).
+          : REBOTE_NO_EXISTE.test(bodyText) ? "usuario_inexistente"
+          : REBOTE_BUZON_LLENO.test(bodyText) ? "buzon_lleno"
+          : /blocked|blacklist|spam|reputation|policy|rejected due to|not authorized|denied|550[\s-]?5\.7\.|isn'?t set up to receive|only accepts messages from|mail flow rule|acceso denegado|acesso negado|accesso negato|acc[eè]s refus|zugriff verweigert/i.test(bodyText) ? "bloqueado"
           : isHardBounce ? "usuario_inexistente"
           : isSoftBounce ? "temporal"
           : "desconocido";
@@ -15922,10 +16166,28 @@ async function scanBouncesForUser(token, userEmail) {
             // es TRANSITORIO → NO blacklistear el email para siempre (la semana que viene
             // puede entrar). Solo hard/unknown matan el contacto. El retry a un alternativo
             // igual se dispara abajo, así tenemos cobertura sin quemar el email soft.
-            if (bounceType !== "soft") {
+            // SOLO se quema la dirección cuando NO EXISTE. Antes se blacklisteaba también al
+            // bloqueado por política y a todo lo "unknown": direcciones que existen y andan,
+            // perdidas para siempre por un rechazo que no era suyo. Medido hoy: 22 bloqueados
+            // y 3 buzones llenos quemados sin motivo.
+            // ── QUÉ SE QUEMA Y QUÉ NO (Maxi 2026-09-02) ──────────────────────────────
+            // El user definió rebote = UNDELIVERABLE: el mensaje no se pudo entregar. Los
+            // ejemplos que pasó cubren tres formas distintas y ninguna comparte texto:
+            //   "Address not found / no se ha encontrado la dirección"  (Gmail, 550 5.1.1)
+            //   "User unknown" dentro de un transcript de sesión         (550-5.1.1 con guion)
+            //   "your message could not be delivered to one or more recipients" (Postfix,
+            //    SIN código SMTP y sin decir por qué — solo la dirección y el dominio)
+            // Por eso no alcanza con buscar "no existe": hay servidores que rebotan sin dar
+            // ningún diagnóstico y el rebote es igual de definitivo.
+            //
+            // La pregunta que decide no es "por qué rebotó" sino "¿tiene sentido volver a
+            // escribirle a esta dirección?". Lo ÚNICO transitorio es el buzón lleno: la
+            // semana que viene entra. Todo lo demás es permanente y se quema.
+            const _esRebote = _tipoRebote !== "buzon_lleno" && _tipoRebote !== "temporal";
+            if (_esRebote) {
               await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
             } else {
-              log(`  ↩️ soft bounce ${failed} — transitorio, NO se blacklistea (se podrá reintentar)`);
+              log(`  ↩️ ${failed}: ${_tipoRebote} — la dirección EXISTE, no es rebote → no se blacklistea`);
             }
             detected++;
             // user 2026-05-29: TODO rebote detectado (hard, soft/buzón-lleno o unknown)
@@ -17731,8 +17993,19 @@ const CATEGORIAS_NUNCA = [
   // E-commerce y marketplaces: venden producto, no espacio.
   "ecommerce", "e-commerce", "marketplace", "shopping", "retail", "classifieds",
   "coupons", "deals", "price_comparison",
-  // Viajes transaccionales (vuelos/hoteles): el user los enseñó como no prospectables.
+  // Viajes TRANSACCIONALES (vender pasajes/hoteles): el user los enseñó como no prospectables.
+  // ⚠️ Maxi 2026-09-01: estos nombres se habían escrito a ojo y NINGUNO matcheaba lo que
+  // devuelve SimilarWeb de verdad. Caso testigo: omio.it (venta de pasajes, el user lo marcó
+  // como "NO VA") llega como `travel_and_tourism/air_travel` y pasaba limpio.
+  // Se agregan los nombres REALES de la taxonomía, verificados contra las categorías que hay
+  // hoy en el pool.
+  // ⚠️ NO se bloquea `travel` a secas ni `travel_and_tourism/travel_and_tourism` (27 leads):
+  // ahí conviven las agencias con las REVISTAS de viajes, que sí son publishers y son
+  // exactamente el tipo de sitio que queremos. Bloquear por esa etiqueta perdería lo bueno
+  // junto con lo malo. Lo mismo con `finance` a secas: un diario económico es un publisher.
   "travel/booking", "airlines", "hotels", "car_rental", "flight",
+  "air_travel", "accommodation_and_hotels", "ground_transportation",
+  "travel_agencies", "tour_operators", "rail_and_bus_stations",
   // Sin contenido propio: no hay dónde poner un banner.
   "web_portals", "search_engines", "url_shorteners", "file_sharing", "cloud_storage",
   "web_hosting", "domain_registrar", "saas", "developer_tools",
@@ -17986,8 +18259,24 @@ async function _verifyEmailMV(token, cfg, email) {
     // perderíamos el lead entero. La respuesta correcta no es sí/no, son tres estados, y el
     // caller ya prueba candidatos en orden — así que puede preferir el limpio y dejar el dudoso
     // de reserva.
+    // ── CATCH-ALL Y "UNKNOWN" NO SON LA MISMA COSA (Maxi 2026-09-01) ──────────────────
+    // Estaban los tres en el mismo saco "riesgo". Medido sobre 14 días, no es lo mismo:
+    //     ok         331 enviados →  6 rebotes →  1,8%
+    //     catch_all  361 enviados → 17 rebotes →  4,7%
+    //     unknown     80 enviados →  8 rebotes → 10,0%   ← el peor, y el grupo más chico
+    // Un catch-all es un dominio corporativo que acepta todo: rebota más, pero muchísimos
+    // publishers legítimos son así y bloquearlos costaría el 57% del volumen para ahorrar 17
+    // rebotes. No vale la pena. `unknown`/`risky` es otra cosa: MillionVerifier fue a mirar y
+    // no pudo confirmar que la casilla exista, y ahí uno de cada diez rebota.
+    // Se separan para poder tratarlos distinto: el catch-all sigue siendo enviable como último
+    // recurso, el dudoso no.
+    // ⚠️ Ojo con NO meter acá los fallos NUESTROS (tope diario, error de red, timeout): esos
+    // devuelven "riesgo" más arriba y siguen siendo enviables, porque son ausencia de
+    // información y no un veredicto. Tratar "no sé" como "no" es el error que ya pagamos ocho
+    // veces en este proyecto.
     const estado = (res === "invalid" || res === "disposable") ? "no"
-                 : (res === "catch_all" || res === "unknown" || res === "risky") ? "riesgo"
+                 : (res === "unknown" || res === "risky") ? "dudoso"
+                 : (res === "catch_all") ? "riesgo"
                  : "ok";
     const deliverable = estado !== "no";
     if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
@@ -18001,6 +18290,7 @@ async function _verifyEmailMV(token, cfg, email) {
     }).catch(() => {});
     if (estado === "no")     log(`  🚫 MV: ${lower} = ${res} (no entregable) → skip envío`);
     if (estado === "riesgo")  log(`  ⚠️ MV: ${lower} = ${res} (dominio catch-all: acepta todo, puede rebotar) → queda de reserva`);
+    if (estado === "dudoso")  log(`  ⚠️ MV: ${lower} = ${res} (no pudo confirmar la casilla; este grupo rebota 1 de cada 10) → no va como primer contacto`);
     return estado;
   } catch { return "riesgo"; }                             // timeout/red → fail-open, pero como reserva
 }
@@ -18316,6 +18606,15 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // Generics — OK pero baja conversión. Cobertura multi-idioma (PT/IT/FR/DE/ES).
   // CHEQUEADO ANTES que single-name para que "contato" no se cuele como persona.
   else if (IS_GENERIC.test(local)) score += 15;
+  // ── LOCALES DE 2-3 LETRAS: 19% DE REBOTE (Maxi 2026-09-02) ────────────────────────────
+  // Medido sobre 30 días: los locales de hasta 3 caracteres rebotan al 19,0%, contra 4,5% de
+  // los comerciales y 0% de los editoriales. Mirando cuáles son, se entiende: `gp@`, `al@`,
+  // `v_t@`, `tld@`, `it@` — iniciales y códigos de departamento raspados del texto, no
+  // buzones publicados.
+  // NO se rechazan: `ads@shorouknews.com` también es de 3 letras y es exactamente el buzón de
+  // venta de pauta que buscamos. Por eso los roles conocidos (AD_SALES, EXEC, COMMERCIAL,
+  // EDITORIAL) ya puntuaron arriba y no llegan hasta acá; este castigo solo alcanza al que no
+  // se pudo identificar como nada. Queda de último recurso en vez de competir de igual a igual.
   // Single name (juan@x.com) — could be person or generic
   else if (/^[a-z]{3,12}$/.test(local) && /[aeiou]/.test(local)) { score += 30; matchedRole = "SINGLE_NAME"; }
 
@@ -18324,6 +18623,26 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // cross-domain (era -15). Un founder@gmail SÍ es una persona válida.
   // Para cross-corporate (-50): revertir parcialmente (-25) si es EXEC, ya
   // que founder@otra-empresa puede ser advisor/board (real pero menos directo).
+  // ── LOCALES DE 2-3 LETRAS: 19% DE REBOTE (Maxi 2026-09-02) ────────────────────────────
+  // Medido sobre 30 días: los locales de hasta 3 caracteres rebotan al 19,0%, contra 4,5% de
+  // los comerciales y 0% de los editoriales. Mirando cuáles son se entiende por qué: `gp@`,
+  // `al@`, `v_t@`, `tld@`, `it@` — iniciales y códigos de departamento raspados del texto,
+  // no buzones publicados.
+  // Va DESPUÉS de la cadena de roles y no adentro: `tld@` e `it@` los agarraba la rama de
+  // genéricos (+15) antes de llegar al castigo, así que dependía de qué rama matcheara primero.
+  // Se exceptúan los roles que SÍ identificamos —`ads@` es de 3 letras y es exactamente el
+  // buzón de venta de pauta que buscamos, y rebota poco—. El castigo alcanza solo a lo que no
+  // se pudo identificar como nada: queda de último recurso en vez de competir de igual a igual.
+  // Abreviaturas de rol que SÍ son un contacto real y miden 2-3 letras: `pr@` (prensa /
+  // relaciones públicas), `rp@`, `mkt@`, `com@`. Sin esta excepción se perdía `pr@`, que es
+  // un buzón atendido por una persona del medio.
+  const _ROLES_CORTOS_OK = /^(pr|rp|mkt|com|ads|sac)$/;
+  if (_localSinSep.length <= 3 && !_ROLES_CORTOS_OK.test(_localSinSep)
+      && !["AD_SALES", "EXEC", "COMMERCIAL", "EDITORIAL"].includes(matchedRole)) {
+    score -= 40;
+    matchedRole = "INICIALES_SOSPECHOSAS";
+  }
+
   if (matchedRole && (matchedRole === "AD_SALES" || matchedRole === "EXEC" || matchedRole === "COMMERCIAL" || matchedRole === "EDITORIAL" || matchedRole === "PERSON")) {
     if (isFreeWebmail && cleanSite && dom !== cleanSite) {
       score += 15; // cancela el -15 inicial
@@ -19438,14 +19757,119 @@ async function securityWatchdog(token) {
   const hace = (h) => new Date(Date.now() - h * 3600_000).toISOString();
   const hoy  = new Date().toISOString().slice(0, 10);
 
-  // ── 1. GASTO PIRATA EN EL PROXY ────────────────────────────────────────────────────────
+  // ── 1. USO DEL PROXY ───────────────────────────────────────────────────────────────────
+  // ⚠️ ESTA SECCIÓN APAGÓ EL SISTEMA SOLO, POR NADA, EL 31/08 A LAS 20:17.
+  // Se llamaba "GASTO PIRATA" pero medía el volumen TOTAL, nuestro worker incluido: de las
+  // 1.515 llamadas que dispararon el kill switch, 1.268 eran `worker@backend` haciendo su
+  // trabajo. El sistema se acusó a sí mismo de robarse las claves y se apagó.
+  //
+  // Y el techo de 1.500 no era un detector, era una cuenta regresiva. Medido sobre 7 días:
+  // worker@backend 734 llamadas/día · sales@ 115 · dhorovitz@ 50 → el uso normal ronda las
+  // 900 y un día cargado pasa 1.500 sin que pase nada raro. Cada mejora que le sacamos al
+  // agente empuja ese número para arriba. Es el falso positivo n.º 3 otra vez, textual:
+  // "un umbral fijo es una bomba de tiempo".
+  //
+  // DOS CAMBIOS, y el segundo es el que importa:
+  //  a) El techo se DERIVA del uso real de las dos semanas previas, no de una constante.
+  //  b) EL VOLUMEN DE NUESTRAS PROPIAS IDENTIDADES YA NO ES CRÍTICO Y NO APAGA NADA.
+  //     Gastar de más es un problema de plata, no una intrusión, y frenar el negocio entero
+  //     por eso cuesta más que el gasto. La señal de seguridad de verdad es OTRA: una
+  //     identidad DESCONOCIDA usando nuestro proxy. Eso sí frena, aunque sean 3 llamadas.
+  // El user, textual (2026-09-01): "No quiero que suceda más, el killswitch es un grave error".
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=eq.${hoy}&select=user_email,total`, { headers: auth });
     const filas = r.ok ? await r.json() : [];
     const totalDia = filas.reduce((a, f) => a + (f.total || 0), 0);
-    if (totalDia > SEC_UMBRALES.proxy_llamadas_dia) {
+
+    // Quién es "nuestro": el worker, los buzones del agente, y cualquier identidad que ya
+    // venía usando el proxy antes de hoy. Lo que interesa no es cuánto se usa sino QUIÉN
+    // aparece de nuevo — una cuenta que nunca estuvo y hoy consume es la señal real.
+    let _conocidas = new Set(["worker@backend"]);
+    try { (JSON.parse(cfg.agent_enabled_users || "[]") || []).forEach(u => _conocidas.add(String(u).toLowerCase())); } catch {}
+    let _baseDiaria = 0;
+    try {
+      const _desde = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+      const _h = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${_desde}&day=lt.${hoy}&select=user_email,total,day`, { headers: auth });
+      const _hist = _h.ok ? await _h.json() : [];
+      _hist.forEach(f => _conocidas.add(String(f.user_email || "").toLowerCase()));
+      const _porDia = {};
+      _hist.forEach(f => { _porDia[f.day] = (_porDia[f.day] || 0) + (f.total || 0); });
+      const _dias = Object.values(_porDia);
+      if (_dias.length) _baseDiaria = _dias.reduce((a, b) => a + b, 0) / _dias.length;
+    } catch {}
+
+    const _desconocidas = filas.filter(f => !_conocidas.has(String(f.user_email || "").toLowerCase()) && (f.total || 0) > 0);
+    // Techo derivado: 2,5× el promedio de las dos semanas previas, con el valor de config como
+    // piso para que un arranque sin historial no alarme por 10 llamadas.
+    const _techoUso = Math.max(SEC_UMBRALES.proxy_llamadas_dia, Math.ceil(_baseDiaria * 2.5));
+
+    if (_desconocidas.length) {
+      // ESTO SÍ es seguridad: alguien que no debería estar, está.
       critico = true;
-      hallazgos.push(`• Uso del proxy DISPARADO: ${totalDia} llamadas hoy (umbral ${SEC_UMBRALES.proxy_llamadas_dia}).\n  Por usuario: ${filas.map(f => `${f.user_email}=${f.total}`).join(", ")}`);
+      hallazgos.push(`• IDENTIDAD DESCONOCIDA usando el proxy: ${_desconocidas.map(f => `${f.user_email}=${f.total}`).join(", ")}.\n  No es ni el worker ni un buzón del agente ni nadie que lo hubiera usado antes.`);
+    } else if (totalDia > _techoUso) {
+      // Volumen alto de gente nuestra: se avisa, NO se frena. `critico` queda como está.
+      hallazgos.push(`• Uso del proxy alto: ${totalDia} llamadas hoy (lo normal son ~${Math.round(_baseDiaria)}/día; aviso a partir de ${_techoUso}).\n  Por usuario: ${filas.map(f => `${f.user_email}=${f.total}`).join(", ")}\n  Son todas identidades nuestras, así que NO se frenó nada — es gasto, no intrusión. Revisá si algún job entró en loop.`);
+    }
+  } catch {}
+
+  // ── 1b. CONSUMO ANORMAL DE UNA API PAGA (Maxi 2026-09-02, pedido del user) ─────────────
+  // Textual: "el kill switch es para evitar que alguien me ataque y se gasten de más créditos
+  // en apollo o similar web... que salte por consumo de rapidapi, apollo y todos los
+  // consumibles que tenemos".
+  // Hasta ahora el vigilante miraba el TOTAL del proxy, que mezcla todo y no distingue si el
+  // que se disparó es Anthropic (barato) o Apollo (créditos contados). Ahora se mira proveedor
+  // por proveedor.
+  //
+  // El techo se DERIVA del consumo real de cada uno (14 días), no se clava. Medido hoy:
+  // anthropic ~501/día · apollo ~60 · rapidapi ~11 · voyage ~1. Un techo fijo para todos
+  // sería absurdo con esa dispersión, y además se volvería falso positivo apenas crezca el
+  // volumen legítimo — que es el error que venimos pagando toda la semana.
+  //
+  // DOS NIVELES, porque no es lo mismo gastar de más que estar bajo ataque:
+  //   4× la base  → AVISA. Puede ser un job en loop o un día cargado.
+  //   10× la base → FRENA. Ese perfil no lo produce el uso normal.
+  // El piso absoluto evita que pasar de 1 a 5 llamadas dispare nada.
+  try {
+    const _hoyRows = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=eq.${hoy}&select=by_provider`, { headers: auth })
+      .then(r => r.ok ? r.json() : []).catch(() => []);
+    const _desde14 = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+    const _histRows = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${_desde14}&day=lt.${hoy}&select=day,by_provider`, { headers: auth })
+      .then(r => r.ok ? r.json() : []).catch(() => []);
+
+    const _sumar = (rows) => {
+      const acc = {};
+      for (const r of (Array.isArray(rows) ? rows : [])) {
+        const bp = r?.by_provider || {};
+        for (const [k, v] of Object.entries(bp)) acc[k] = (acc[k] || 0) + (parseInt(v, 10) || 0);
+      }
+      return acc;
+    };
+    const _hoyPorProv = _sumar(_hoyRows);
+    // Promedio POR DÍA CON ACTIVIDAD: dividir por 14 cuando el agente duerme fin de semana
+    // hundiría la base y volvería todo sospechoso los lunes.
+    const _porDia = {};
+    for (const r of (Array.isArray(_histRows) ? _histRows : [])) {
+      const bp = r?.by_provider || {};
+      for (const [k, v] of Object.entries(bp)) {
+        _porDia[k] = _porDia[k] || {};
+        _porDia[k][r.day] = (_porDia[k][r.day] || 0) + (parseInt(v, 10) || 0);
+      }
+    }
+    const PISO_ABS = { anthropic: 2000, apollo: 250, rapidapi: 400, serper: 600, voyage: 500, millionverifier: 400 };
+    for (const [prov, usoHoy] of Object.entries(_hoyPorProv)) {
+      const dias = Object.values(_porDia[prov] || {}).filter(n => n > 0);
+      if (dias.length < 3) continue;                       // sin historia no se juzga
+      const base = dias.reduce((a, b) => a + b, 0) / dias.length;
+      const piso = PISO_ABS[prov] ?? 500;
+      const techoAviso = Math.max(piso, Math.ceil(base * 4));
+      const techoFreno = Math.max(piso * 3, Math.ceil(base * 10));
+      if (usoHoy > techoFreno) {
+        critico = true;
+        hallazgos.push(`• GASTO DISPARADO en ${prov}: ${usoHoy} llamadas hoy contra ${Math.round(base)}/día de promedio (${dias.length} días).\n  Eso es ${(usoHoy / Math.max(1, base)).toFixed(0)}× lo normal — no lo produce el uso del agente.`);
+      } else if (usoHoy > techoAviso) {
+        hallazgos.push(`• ${prov} va alto: ${usoHoy} llamadas hoy contra ${Math.round(base)}/día de promedio. NO se frenó nada — puede ser un día cargado o un job en loop. Vale mirar si sigue mañana.`);
+      }
     }
   } catch {}
 
@@ -20322,20 +20746,20 @@ async function runAgentCycle(token, allFlags) {
         else {
         const _pct = Math.round((Math.min(_rebotes, _enviados) / _enviados) * 100);
         const _piso = _wilsonLimiteInferior(Math.min(_rebotes, _enviados), _enviados) * 100;
+        // El rebote AVISA, no frena (Maxi 2026-09-02, regla del user). Mismo motivo que el
+        // freno del dominio: el techo del 2% quedó por debajo del piso real desde que medimos
+        // bien, así que frenar acá dejaba buzones apagados de forma permanente por un número
+        // que siempre fue así. El camino correcto es arreglar la elección del email —de ahí
+        // salen los rebotes—, no apagar el buzón.
         if (_piso >= _pctMax) {
-          log(`🩺 ${userEmail}: rebote ${_pct}% en 7d, piso estadístico ${_piso.toFixed(1)}% (${_rebotes}/${_enviados}, tope ${_pctMax}%) — FRENO el envío`);
-          await logAgentAction(token, userEmail, {
-            domain: "_cycle_", action: "skipped", reason: `rebote_alto_${_pct}pct`,
-            details: { rebotes: _rebotes, enviados: _enviados, tope: _pctMax },
-          });
+          log(`🩺 ${userEmail}: rebote ${_pct}% en 7d, piso estadístico ${_piso.toFixed(1)}% (${_rebotes}/${_enviados}, tope ${_pctMax}%) — AVISO, sigo enviando`);
           await saludAlerta(token, {
-            clave: `rebote-alto-${userEmail}`, severidad: "error",
-            titulo: "🩺 Freno un buzón por rebotes",
+            clave: `rebote-alto-${userEmail}`, severidad: "warn",
+            titulo: "🩺 Un buzón rebota por encima del resto",
             cuerpo: `${userEmail} lleva ${_pct}% de rebote en los últimos 7 días (${_rebotes} de ${_enviados}, piso estadístico ${_piso.toFixed(1)}%).\n`
-                  + `Paro sus envíos por hoy para proteger la reputación de la cuenta.\n`
-                  + `Si los rebotes vienen de una fuente concreta, conviene revisarla antes de mañana.`,
+                  + `NO se frenó nada: el rebote se corrige eligiendo mejor la dirección, no apagando el buzón.\n`
+                  + `Si un buzón se despega mucho del resto, suele ser la FUENTE de sus leads y no el buzón.`,
           }).catch(() => {});
-          continue;   // próximo MB
         }
         }
       }
@@ -21509,15 +21933,26 @@ async function runAgentCycle(token, allFlags) {
         // el user cargue millionverifier_api_key → sin key devuelve true y NO cambia nada. Con
         // key: si el buzón es invalid/disposable, NO enviamos (evita el rebote) y marcamos el
         // email como bounced local para que NO se re-elija y el re-enrich busque otro contacto.
-        if ((await _verifyEmailMV(token, cfg, email)) === "no") {
+        // `dudoso` se frena igual que `no` (Maxi 2026-09-01): el lead NO se pierde, sale por
+        // el mismo camino que ya existe —se marca y el re-enrich le busca otra dirección—.
+        // Cuesta ~6 envíos por día y evita ~8 rebotes cada 14; el catch-all sigue pasando.
+        const _mvEstado = await _verifyEmailMV(token, cfg, email);
+        if (_mvEstado === "no" || _mvEstado === "dudoso") {
           if (reservedId) {
             fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
               method: "PATCH",
               headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify({ action: "skipped", reason: "mv_undeliverable" }),
+              body: JSON.stringify({ action: "skipped", reason: _mvEstado === "dudoso" ? "mv_dudoso" : "mv_undeliverable" }),
             }).catch(() => {});
           }
-          markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+          // ⚠️ SOLO se quema la dirección cuando MV dice que NO EXISTE. Un `dudoso` es una
+          // casilla que no se pudo confirmar, no una probada mala: blacklistearla sería
+          // perderla para siempre por una duda, y encima el dominio quedaría penalizado por
+          // `riesgoRebotePorDominio`. Se saltea este envío y se le busca otra dirección; si
+          // más adelante no aparece ninguna mejor, sigue disponible.
+          if (_mvEstado === "no") {
+            markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+          }
           continue; // próximo lead — el re-enrich le buscará otro email
         }
         // Maxi 2026-08-18: TECHO DE TIEMPO al envío completo. La lección del apagón del 12 al 18
@@ -22944,8 +23379,19 @@ async function vigilarReputacion(token) {
     // Ya pausado: no volver a pausar. El 21/08 esto se re-disparó 6 veces seguidas y
     // extendió la pausa indefinidamente, dejando a los tres buzones en 0 de 20.
     const _yaPausado = Date.parse(cfg?.agent_paused_until || "") > Date.now();
+    // ── EL REBOTE YA NO FRENA NADA (Maxi 2026-09-02, regla del user) ────────────────────
+    // Textual: "No hagas pausa por rebote nunca, es normal el rebote hasta que acomodemos la
+    // identificación correcta de scraping". Y tiene razón por dos motivos:
+    //  a) La tasa se mide sobre 7 días, así que FRENAR VACÍA EL DENOMINADOR y empuja la tasa
+    //     para arriba. Al vencer, la pausa se re-disparaba sola: el 02/09 el agente pasó el día
+    //     entero en cero y el informe mostraba "PAUSADO 12h, 2 veces · no llegó a su cupo, 15
+    //     veces". El freno se garantizaba a sí mismo.
+    //  b) El techo del 3% se calibró cuando veíamos la MITAD de los rebotes (los de Exchange
+    //     eran invisibles hasta el 31/08). Medido bien, la tasa real es 5,5-6,5% estable desde
+    //     el 25/08: no empeoró, siempre fue así. Un techo por debajo del piso real no es un
+    //     umbral, es un candado.
+    // El aviso SE MANTIENE —el user quiere enterarse— pero informa, no frena.
     if (_pisoDominio > REBOTE_TECHO_DOMINIO && !_yaPausado) {
-      await setConfigValue(token, "agent_paused_until", new Date(Date.now() + 12 * 3600_000).toISOString()).catch(() => {});
       await saludAlerta(token, {
         clave: "reputacion-dominio", severidad: "error",
         titulo: `🔥 Rebote del ${(tasaDominio * 100).toFixed(1)}% — envío PAUSADO 12h`,
@@ -23739,7 +24185,13 @@ async function enviarResumenSalud(token) {
 
     if (graves.length) {
       partes.push(`🔴 NUEVO — NECESITA UNA MANO (${graves.length}):`);
-      graves.forEach(p => partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — ${p.veces} veces` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`));
+      // La hora importa: una alerta guarda el número del momento en que saltó, y el boletín de
+      // arriba mide al momento de mandar el mail. Sin la hora, "11 de 158" acá y "18 de 191"
+      // arriba parecen una contradicción cuando son la misma cuenta en dos momentos del día.
+      graves.forEach(p => {
+        const _h = p.ultima ? new Date(p.ultima).toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" }) : "";
+        partes.push(`   · ${p.titulo}${p.veces > 1 ? ` — ${p.veces} veces` : ""}${_h ? ` (medido ${_h})` : ""}\n     ${String(p.cuerpo || "").split("\n").join("\n     ")}`);
+      });
       partes.push("");
     }
     if (leves.length) {
@@ -23763,12 +24215,21 @@ async function enviarResumenSalud(token) {
     // Ahora la primera línea dice el veredicto y la segunda el número que siempre se busca.
     // No agrega ningún dato nuevo: ordena los que ya estaban.
     {
-      const _pendientes = graves.length + _rojasBoletin.length;
+      // ⚠️ EL NÚMERO Y LA LISTA TIENEN QUE SER EL MISMO CONJUNTO (Maxi 2026-09-01).
+      // Este titular salió diciendo "6 cosa(s) necesitan una mano" y nombraba TRES: sumaba
+      // las alertas graves más los rojos del boletín, pero después mostraba solo los rojos y
+      // encima cortados en 3. Es la regla que ya teníamos escrita para el vigilante y la
+      // rompí acá: si el mail no puede señalar a los seis, no puede decir seis.
+      // Ahora se cuenta exactamente lo que se nombra, y si hay que recortar se avisa.
+      const _todoRojo = [...new Set([...(_rojasBoletin || []), ...graves.map(g => g.titulo)])];
+      const _pendientes = _todoRojo.length;
       const _tibios = leves.length + _amarBoletin.length;
-      const _quePasa = [...new Set([...(_rojasBoletin || []), ...graves.map(g => g.titulo)])].slice(0, 3);
+      const _quePasa = _pendientes > 3
+        ? `${_todoRojo.slice(0, 3).join(" · ")} y ${_pendientes - 3} más`
+        : _todoRojo.join(" · ");
       partes[0] =
         (_pendientes
-          ? `🔴 ${_pendientes} cosa(s) necesitan una mano: ${_quePasa.join(" · ")}`
+          ? `🔴 ${_pendientes} cosa(s) necesitan una mano: ${_quePasa}`
           : _tibios
             ? `🟡 Nada roto. ${_tibios} cosa(s) para mirar cuando puedas.`
             : `✅ Todo en orden.`)
@@ -25186,7 +25647,40 @@ async function main() {
       // alternadas, algún job sigue quedándose sin turno (se ve en toolbar_health_check).
       const _techoMant = Math.min(5, Math.max(2, parseInt((await getConfig(token).catch(() => ({}))).mantenimiento_techo_min || "3", 10) || 3));
       const _LIMITE_MANTENIMIENTO = Date.now() + _techoMant * 60 * 1000;
+
       const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
+      // ── EL PULIDO VA PRIMERO CUANDO HAY COLA (Maxi 2026-09-02) ────────────────────────
+      // ⚠️ Va DESPUÉS de `_hayTiempo` y del techo: los dos se declaran con const y usarlos
+      // antes tira "Cannot access before initialization". Me pasó dos veces seguidas hoy
+      // —primero con `cfg`, después con `_hayTiempo`— y el bucle cortaba ahí, en silencio
+      // para todo lo que venía detrás.
+      // El presupuesto de mantenimiento son 3 minutos y antes del pulido corrían cinco tareas
+      // que se lo comían. Resultado: `polish_pool` no corrió NI UNA VEZ desde el 01/09 14:35
+      // —justo cuando toqué su turno— porque nunca llegaba a ejecutarse. Es el problema que el
+      // propio código ya documentaba ("el que va último nunca corre") y yo lo empeoré.
+      // Buscarle email a los leads que no tienen es uno de los cuatro criterios del user, así
+      // que cuando hay cola virgen se ejecuta ANTES que nada. Sin cola, mantiene su lugar en
+      // la alternancia y el resto del mantenimiento recupera su tiempo.
+      let _colaVirgen = 0;
+      try {
+        const _r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&or=(email_intentos.is.null,email_intentos.eq.0)&select=id`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
+        if (_r.ok) _colaVirgen = parseInt((_r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch {}
+      // ⚠️ `cfg` NO existe en este punto del bucle: la última definición está dentro de otra
+      // función. Al mover el bloque acá arriba lo usé igual y tiraba ReferenceError, que el
+      // try/catch del bucle se tragaba en silencio — por eso el pulido no corría y NI SIQUIERA
+      // aparecía su log. Mismo patrón de siempre: un error que no se distingue de "no pasó
+      // nada". Se lee la config como hace la línea del techo, dos más arriba.
+      const _cfgPulido = await getConfig(token).catch(() => ({}));
+      const _pisoVirgen = parseInt(_cfgPulido.polish_cola_piso || "50", 10) || 50;
+      const _modoPulido = _colaVirgen >= _pisoVirgen;
+      if (_modoPulido) {
+        log(`🔎 Pulido primero: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen})`);
+        if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
+        if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
+      }
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
       await chequearAutenticacionPropia(token).catch(e => log(`⚠️ dns propio: ${e.message}`));
@@ -25293,7 +25787,11 @@ async function main() {
         // cada 14. La cola de prospectos, que va después, no pierde su lugar: el techo global
         // de 3 min no cambia.
         _vueltaMantenimiento++;
-        const _vueltaPar = (_vueltaMantenimiento % 2) === 0;
+        // La alternancia clásica sigue valiendo para cuando NO hay cola virgen: el pulido y el
+        // mantenimiento se turnan. Con cola, el pulido ya corrió arriba y acá se saltea, así
+        // que la cadena de mantenimiento conserva sus vueltas en vez de quedarse sin ninguna
+        // (que es lo que provoqué ayer al forzar `_vueltaPar` siempre en true).
+        const _vueltaPar = !_modoPulido && (_vueltaMantenimiento % 2) === 0;
         if (_vueltaPar) {
         // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
         //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
