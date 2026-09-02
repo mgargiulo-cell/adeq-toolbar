@@ -8854,6 +8854,31 @@ const OBJETIVO_POR_MB = 20;
 // conteo incompleto sin avisar es exactamente el bug que se está arreglando acá.
 async function _manualesDeMonday(token, dia) {
   const out = { ok: false, manuales: [], agente: 0, sinMarca: 0 };
+
+  // ── El CRM primero (Maxi 2026-09-02) ──────────────────────────────────────────────────
+  // Los MB ya no cargan en Monday: el botón de la toolbar escribe en el board. Si esto
+  // siguiera preguntándole a Monday, el parte diario diría "0 envíos manuales" todos los
+  // días sin que nada avise — un cero se lee como un dato, no como un dato que falta.
+  // Monday queda de respaldo por si el endpoint no responde; el día que se apague del todo,
+  // el respaldo simplemente devuelve vacío y el aviso lo dice.
+  if (CRM_SYNC_URL && CRM_SYNC_SECRET) {
+    try {
+      const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/manuales")}?dia=${encodeURIComponent(dia)}`,
+        { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(20000) });
+      if (r.ok) {
+        const j = await r.json();
+        if (j && j.ok) {
+          out.ok = true;
+          out.manuales = Array.isArray(j.manuales) ? j.manuales : [];
+          out.agente = Number(j.agente) || 0;
+          return out;
+        }
+      } else if (r.status !== 404) {
+        log(`  ⚠️ /manuales HTTP ${r.status} — se usa Monday de respaldo`);
+      }
+    } catch (e) { log(`  ⚠️ /manuales: ${e.message} — se usa Monday de respaldo`); }
+  }
+
   try {
     const apiKey = await _getMondayApiKeyForFeeder(token);
     if (!apiKey) return out;
@@ -20438,6 +20463,15 @@ async function pushToCrmPropio(token, prospectos, contexto = "envio") {
   return { enviados: ok, apagado: false };
 }
 
+/**
+ * Monday apagado a propósito. NO es un error: se usa para salir del push sin que el catch
+ * lo confunda con una falla y dispare el rescate. Una clase propia y no un string porque el
+ * catch tiene que distinguirlo con certeza de un fallo real de red o de la API.
+ */
+class _MondayApagado extends Error {
+  constructor() { super("monday_enabled=false"); this.name = "_MondayApagado"; }
+}
+
 async function pushToMondayServer(monday_api_key, payload, boardId) {
   // Crea item nuevo en Monday con todas las columnas. Usado solo cuando agent
   // decide enviar (no antes). Imita el botón "Push to Monday" del popup.
@@ -21727,10 +21761,15 @@ async function runAgentCycle(token, allFlags) {
         // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──
         // Si el send falla, NO ensuciamos Monday con items "Mail No Enviado".
 
-        // 3. Pre-check Monday config (early exit si falta API key)
+        // 3. Config de Monday. ⚠️ La falta de key SÓLO frena si Monday sigue prendido.
+        //    Antes cortaba con `continue` sin importar nada: con Monday apagado, el agente
+        //    habría dejado de MANDAR MAILS por una credencial que ya no se usa. Es el mismo
+        //    patrón de siempre — "no pude registrar" tratado como "no mando" —, y acá el
+        //    costo era el envío del día entero.
+        const mondayEnabled = String(cfg.monday_enabled ?? "true").toLowerCase() === "true";
         const mondayUserId = (cfg[`monday_user_id_${userEmail.toLowerCase()}`] || "").trim();
         const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || monday_api_key_default).trim();
-        if (!mondayApiKey) {
+        if (mondayEnabled && !mondayApiKey) {
           await logAgentAction(token, userEmail, { domain, action: "failed", reason: "no_monday_api_key" });
           continue;
         }
@@ -22161,9 +22200,13 @@ async function runAgentCycle(token, allFlags) {
           }
         } catch (e) { log(`  ⚠️ agente 2do email ${domain}: ${e.message}`); }
 
-        // 5. Push to Monday CON estado correcto desde el inicio (Propuesta Vigente T = idx 3)
+        // 5. Push al CRM. Monday quedó apagado (`monday_enabled`), pero el push se conserva
+        //    detrás del interruptor: si hay que volver, es cambiar una fila de config y no
+        //    revertir un deploy. El registro que vale ahora es pushToCrmPropio, más abajo,
+        //    que viene escribiendo en paralelo desde el 31/08.
         let mondayItemId = null;
         try {
+          if (!mondayEnabled) throw new _MondayApagado();
           mondayItemId = await pushToMondayServer(mondayApiKey, {
             domain, email, geo: leadGeo, traffic_text: formatTrafficForMonday(leadTraffic),
             phone: lead.contact_phone || "",
@@ -22172,6 +22215,11 @@ async function runAgentCycle(token, allFlags) {
             estado_idx: 3, // Propuesta Vigente (T)
           }, AGENT_DEFAULTS.monday_board_id);
         } catch (mondayErr) {
+          // Monday apagado a propósito NO es una falla. Sin esta salida, cada envío quedaría
+          // logueado como `monday_failed` con su retry_payload y el rescate intentaría
+          // reponerlo para siempre en un board que ya nadie mira.
+          if (mondayErr instanceof _MondayApagado) { /* el CRM propio es el registro */ }
+          else {
           // Audit P1 fix: Gmail OK + Monday FAIL = lead recibió pitch pero no
           // hay tracking en CRM. Antes solo log; ahora guardamos el payload
           // COMPLETO en details.retry_payload para que admin pueda re-push manual
@@ -22197,6 +22245,7 @@ async function runAgentCycle(token, allFlags) {
               },
             },
           });
+          }
         }
 
         // 5-bis. El mismo prospecto al CRM propio. Va DESPUÉS del bloque de Monday y por

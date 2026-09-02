@@ -327,7 +327,7 @@ function resetAnalysisUI() {
 
   // 7) Reset botón push-monday a "Send" (no "Update")
   const pushBtn = document.getElementById("btn-push-monday");
-  if (pushBtn) pushBtn.textContent = "🚀 Send to Monday";
+  if (pushBtn) pushBtn.textContent = "🚀 Enviar al CRM";
 
   // 8) Esconder pulgares/status del pitch (solo se muestran después de generar)
   ["btn-pitch-like", "btn-pitch-dislike"].forEach(id => {
@@ -3039,23 +3039,32 @@ async function runDuplicateCheck() {
   const el = document.getElementById("duplicate-result");
   try {
     // Usar caché de sesión solo si ya confirmamos que ES duplicado.
-    // Si el caché dice "no encontrado", siempre re-consulta Monday porque
-    // el ítem puede haberse creado en este mismo browser session.
+    // Si el caché dice "no encontrado", siempre se re-consulta el CRM porque
+    // la ficha puede haberse creado en esta misma sesión del browser.
     let result;
     const sess = await getSessionCache(state.domain);
     if (sess?.duplicate?.found === true) {
       result = sess.duplicate;
     } else {
-      result = await checkDuplicate(state.domain);
+      result = await buscarEnCrm(state.domain);
     }
     state.duplicate = result;
 
+    if (result.indeterminado) {
+      // No se pudo preguntar. Decirlo, en vez de dar por libre lo que no se verificó.
+      el.textContent = "⚠️ no pude consultar el CRM — verificá antes de escribir";
+      el.className   = "status-badge duplicate";
+    }
     if (result.found) {
-      el.textContent = `⚠️ DUPLICATE · ${result.status} · ${result.ejecutivo || "—"}`;
+      // Un negocio cerrado hace poco es el caso que más importa avisar: el sitio figura
+      // "descartado" pero está en los 60 días de descanso que pidió el user.
+      el.textContent = result.descansando
+        ? `⛔ CERRADO HACE POCO · faltan ${result.diasParaReintentar} días para reintentar`
+        : `⚠️ YA ESTÁ EN EL CRM · ${result.status}${result.board ? ` · ${result.board}` : ""} · ${result.ejecutivo || "—"}`;
       el.className   = "status-badge duplicate";
       state.mondayItemId = result.itemId;
       fillMondayFormFromDuplicate(result);
-      document.getElementById("btn-push-monday").textContent = "🔄 Update in Monday";
+      document.getElementById("btn-push-monday").textContent = "🔄 Actualizar en el CRM";
 
       // Si es duplicado re-prospectable (Ciclo Finalizado / Mail No Enviado),
       // los datos en Monday pueden tener meses → forzar refresh de tráfico.
@@ -4874,7 +4883,7 @@ async function bindButtons() {
     const changed = Object.keys(snap).some(k => cur[k] !== snap[k]);
     if (changed) {
       btn.disabled    = false;
-      btn.textContent = state.duplicate?.found ? "🔄 Update in Monday" : "🚀 Send to Monday";
+      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en el CRM" : "🚀 Enviar al CRM";
       btn.classList.remove("btn-sent");
     } else {
       btn.disabled    = true;
@@ -5104,6 +5113,93 @@ async function bindButtons() {
     return { ...v, traffic, mailEnviado: !!state.emailSentInSession };
   }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// EL EMISOR AL CRM BOARD — reemplaza a Monday (Maxi 2026-09-02, corte pedido por el user)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Monday quedó obsoleto: sus 10.564 items y los 18 tableros de negociaciones ya están
+// migrados, y el user apagó sus 101 automatizaciones. Los botones conservan el nombre que
+// los MB conocen, pero escriben acá.
+//
+// El board es IDEMPOTENTE por dominio (verificado: se reenvió el mismo con www. y siguieron
+// 2 filas, no 3). Por eso NO hay rama "crear vs actualizar" como en Monday: el mismo POST
+// sirve para las dos cosas y desaparece toda la lógica de mondayItemId, que era donde se
+// perdían los pushes cuando el id no estaba.
+const _BOARD_IDIOMA = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
+const _BOARD_EJEC   = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
+// El board pide la ETIQUETA del estado; el formulario lo guarda como ÍNDICE. Traducir acá es
+// obligatorio: mandar el índice crudo hace que el CRM no lo reconozca y le ponga su default.
+const _BOARD_ESTADO = { 0:"LIVE", 1:"En Negociacion", 2:"Descartado", 3:"Propuesta Vigente",
+                        4:"Rebotado", 5:"Ciclo Finalizado", 6:"Masivo - Diego", 7:"Avanzado",
+                        8:"Mail No Enviado", 9:"Masivo - Agus", 10:"Masivo - Max" };
+
+// ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
+// Devuelve la MISMA forma que devolvía aquél para no tocar a los seis lugares que la
+// consumen — lo único nuevo es `descansando`, que Monday no sabía: un negocio cerrado hace
+// menos de 60 días existe pero NO hay que escribirle todavía.
+async function buscarEnCrm(domain) {
+  try {
+    const r = await fetch(
+      `${CONFIG.CRM_BOARD_URL.replace("/sync-toolbar", "/ficha")}?domain=${encodeURIComponent(domain)}`,
+      { headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET } },
+    );
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    if (!j.found) return { found: false };
+    return {
+      found: true, itemId: null,
+      status: j.estado || "", ejecutivo: j.ejecutivo || "", trafico: j.pageviews || "",
+      email: j.email || "", geo: j.top_geo || "", fecha: j.fecha_contacto || "",
+      idioma: j.idioma || "", board: j.board || "",
+      descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0,
+    };
+  } catch (e) {
+    // ⚠️ NO se devuelve `{found:false}` ante un error: eso le diría al MB "está libre,
+    // dale" justo cuando no pudimos verificar, que es el error caro. Se marca `indeterminado`
+    // y el cartel lo dice.
+    console.warn("buscarEnCrm:", e.message);
+    return { found: false, indeterminado: true, motivo: e.message };
+  }
+}
+
+async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono }) {
+  const hoy = new Date();
+  const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
+  const contacto = /^\d{4}-\d{2}-\d{2}$/.test(String(fecha || "")) ? fecha : mas(0);
+  const cuerpo = {
+    domain,
+    email: email || "",
+    deal_stage: _BOARD_ESTADO[Number(estado)] || "Propuesta Vigente",
+    ejecutivo_name: _BOARD_EJEC[ejecutivo] || state.loginEmail,
+    fecha_contacto: contacto,
+    // Las fechas de seguimiento se calculan desde el contacto, no desde hoy: si el MB carga
+    // un prospecto contactado la semana pasada, los follow-ups tienen que salir cuando le
+    // corresponden y no cinco días después de haberlo cargado.
+    fecha_fu1: new Date(Date.parse(contacto) + 5 * 86400000).toISOString().slice(0, 10),
+    fecha_fu2: new Date(Date.parse(contacto) + 10 * 86400000).toISOString().slice(0, 10),
+    top_geo: geo || "",
+    pageviews: typeof traffic === "number" ? formatTraffic(traffic) : (traffic || ""),
+    language: _BOARD_IDIOMA[Number(idioma)] || "Ingles",
+    phone: telefono || "",
+    comments: pitch || "",
+    source: "toolbar",
+  };
+  const r = await fetch(CONFIG.CRM_BOARD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+    body: JSON.stringify({ prospects: [cuerpo] }),
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j) throw new Error(`el CRM respondió HTTP ${r.status}`);
+  // Un `errores` con contenido es un rechazo REAL aunque el HTTP sea 200. Tratarlo como
+  // éxito dejaría al MB creyendo que cargó un prospecto que no existe.
+  if (Array.isArray(j.errores) && j.errores.length) throw new Error(j.errores[0].motivo || "rechazado por el CRM");
+  // Los avisos no frenan pero se ven: ahí aparece el idioma sin plantilla o el estado
+  // desconocido, que después se traducen en un follow-up que no sale.
+  (j.avisos || []).forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
+  return j;
+}
+
   document.getElementById("btn-guardar-cola")?.addEventListener("click", async () => {
     const btn = document.getElementById("btn-guardar-cola");
     const res = document.getElementById("push-result");
@@ -5221,7 +5317,7 @@ async function bindButtons() {
       return;
     }
     // Guard #3: no dejar pushear NI updatear Monday si todavía no se mandó email
-    // en esta sesión. Aplica también a duplicados (botón "🔄 Update in Monday")
+    // en esta sesión. Aplica también a duplicados (botón "🔄 Actualizar en el CRM")
     // para evitar que se actualice un item sin haber re-mandado el pitch.
     if (!state.emailSentInSession) {
       const action = state.duplicate?.found ? "update" : "push";
@@ -5237,28 +5333,22 @@ async function bindButtons() {
     const wasNewPush = !state.duplicate?.found;
 
     try {
-      if (state.duplicate?.found && state.mondayItemId) {
-        await updateMonday({
-          itemId: state.mondayItemId,
-          traffic: formatTraffic(state.traffic),
-          email, geo, idioma, pitch, estado, fecha, ejecutivo,
-          loginEmail: state.loginEmail,
-        });
-        res.textContent = "✅ Updated in Monday"; res.className = "push-result ok";
-        incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
-      } else {
-        const item = await pushToMonday({
-          domain: state.domain,
-          traffic: formatTraffic(state.traffic),
-          email, geo, idioma, pitch, estado, fecha, ejecutivo,
-          loginEmail: state.loginEmail,
-        });
-        state.mondayItemId = item?.id;
-        res.textContent = `✅ Created: ${item?.name || state.domain}`; res.className = "push-result ok";
-        incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
+      // El board es idempotente por dominio: el mismo POST crea o actualiza. Se cayó la rama
+      // "update si tengo itemId", que en Monday era donde se perdían los pushes cuando el id
+      // no estaba a mano.
+      const nuevo = !state.duplicate?.found;
+      await enviarAlBoard({
+        domain: state.domain, traffic: state.traffic,
+        email, geo, idioma, pitch, estado, fecha, ejecutivo,
+        telefono: state.contactPhone || "",
+      });
+      res.textContent = nuevo ? `✅ Cargado en el CRM: ${state.domain}` : `✅ Actualizado en el CRM: ${state.domain}`;
+      res.className = "push-result ok";
+      incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
-        // Actualizar caché de sesión: ahora sí es duplicado para futuras subpáginas
-        state.duplicate = { found: true, itemId: item?.id, status: "", ejecutivo: state.mediaBuyer, email, geo };
+      if (nuevo) {
+        // Caché de sesión: ahora sí es duplicado para futuras subpáginas del mismo sitio.
+        state.duplicate = { found: true, itemId: null, status: "", ejecutivo: state.mediaBuyer, email, geo };
         setSessionCache(state.domain, {
           duplicate:     state.duplicate,
           trafficData:   state.trafficData,
@@ -5271,7 +5361,7 @@ async function bindButtons() {
       }
       // Guardar snapshot — bloquea el botón hasta que algo cambie
       state.mondaySnapshot = getMondayFormValues();
-      btn.textContent      = "✅ Ya en Monday";
+      btn.textContent      = "✅ Ya en el CRM";
       btn.classList.add("btn-sent");
 
       // Incrementar contador de Monday pushes con contexto (nuevo/dup, +400k o no)
@@ -5295,7 +5385,7 @@ async function bindButtons() {
     } catch (err) {
       res.textContent = `❌ ${err.message}`; res.className = "push-result error";
       btn.disabled    = false;
-      btn.textContent = state.duplicate?.found ? "🔄 Update in Monday" : "🚀 Send to Monday";
+      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en el CRM" : "🚀 Enviar al CRM";
     }
   });
 
@@ -10797,11 +10887,9 @@ async function validateProspect(card, data, doSendEmail) {
   await ensureFreshToken();
 
   try {
-    // 1. Push to Monday — UPDATE si vino de Monday Refresh (tiene monday_item_id),
-    //    CREATE si es Autopilot/CSV externo (item nuevo).
-    //    En AMBOS casos pisamos TODAS las columnas con la data fresca del review_queue
-    //    + lo que el user editó en la card (geo, email, date, etc.).
-    const mondayItemId = data.monday_item_id || null;
+    // 1. Carga en el CRM. El board es idempotente por dominio, así que da igual si el
+    //    prospecto vino de Autopilot, de un CSV o del refresh: el mismo POST crea o pisa,
+    //    con la data fresca del review_queue más lo que el MB editó en la card.
     // Date desde el campo editable de la card (DD/MM/YYYY → YYYY-MM-DD para Monday)
     const dateInput = card.querySelector(".pcard-date")?.value?.trim() || "";
     let fechaISO = new Date().toISOString().split("T")[0];
@@ -10823,11 +10911,7 @@ async function validateProspect(card, data, doSendEmail) {
       fecha:     fechaISO,
       loginEmail: state.loginEmail,
     };
-    if (mondayItemId) {
-      await updateMonday({ ...mondayPayload, itemId: mondayItemId });
-    } else {
-      await pushToMonday(mondayPayload);
-    }
+    await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "" });
     // Bump counter para Activity admin panel. Antes solo se hacía desde Analysis,
     // las cargas desde Prospects (validate + push/send) no se contaban.
     incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
