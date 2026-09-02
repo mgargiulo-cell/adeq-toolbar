@@ -4604,7 +4604,21 @@ async function maybeStartAutopilotSlot(token) {
 // "sí o sí", y el reparto por slot ya se auto-ajusta (si un slot manda 2 de 4, el siguiente
 // intenta 6). Lo que faltaba era una última pasada: si a las 20 un MB va en 14, sin este slot
 // esos 6 envíos se pierden hasta mañana. Con las horas activas hasta las 23, entra cómodo.
-const AGENT_SLOTS = [9, 12, 15, 18, 20, 21];
+// ⚠️ TURNOS DE ENVÍO — regla del user (02/09): "salen siempre en horario laboral español y
+// latino, ponelos a las 13 hs horario Madrid". La ventana arranca a las 13 porque es cuando
+// se solapan las dos regiones: 13 h en Madrid son las 8 de la mañana en Argentina, 7 en
+// Colombia y Perú, 6 en México. Antes de eso, un mail que sale "temprano" para España llega
+// de madrugada a LatAm.
+//
+// Los turnos viejos eran [9, 12, 15, 18, 20, 21] y tres estaban mal: las 9 de Madrid son las
+// 4 de la mañana en Buenos Aires, y a las 20-21 ya no trabaja nadie en ninguna de las dos.
+//
+// ⚠️ POR QUÉ SIGUEN SIENDO VARIOS Y NO UNO SOLO A LAS 13: el cupo es de 20 por casilla, y
+// mandarlos todos juntos desde la misma dirección es la huella que Gmail lee como spam.
+// El sistema ya viene de una racha de rebotes; espaciarlos protege la reputación sin sacar
+// nada de la ventana. Los cinco turnos caen dentro del horario laboral de las dos regiones.
+// Si preferís uno solo, es cambiar esta línea por [13].
+const AGENT_SLOTS = [13, 14, 15, 16, 17];
 let _agentLastSlot = "";
 
 // Slots ya ejecutados HOY, persistido: "2026-08-06:9,12,15". Vive en config para sobrevivir
