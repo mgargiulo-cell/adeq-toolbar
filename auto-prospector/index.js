@@ -25474,6 +25474,29 @@ async function main() {
       // alternadas, algún job sigue quedándose sin turno (se ve en toolbar_health_check).
       const _techoMant = Math.min(5, Math.max(2, parseInt((await getConfig(token).catch(() => ({}))).mantenimiento_techo_min || "3", 10) || 3));
       const _LIMITE_MANTENIMIENTO = Date.now() + _techoMant * 60 * 1000;
+      // ── EL PULIDO VA PRIMERO CUANDO HAY COLA (Maxi 2026-09-02) ────────────────────────
+      // El presupuesto de mantenimiento son 3 minutos y antes del pulido corrían cinco tareas
+      // que se lo comían. Resultado: `polish_pool` no corrió NI UNA VEZ desde el 01/09 14:35
+      // —justo cuando toqué su turno— porque nunca llegaba a ejecutarse. Es el problema que el
+      // propio código ya documentaba ("el que va último nunca corre") y yo lo empeoré.
+      // Buscarle email a los leads que no tienen es uno de los cuatro criterios del user, así
+      // que cuando hay cola virgen se ejecuta ANTES que nada. Sin cola, mantiene su lugar en
+      // la alternancia y el resto del mantenimiento recupera su tiempo.
+      let _colaVirgen = 0;
+      try {
+        const _r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&or=(email_intentos.is.null,email_intentos.eq.0)&select=id`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
+        if (_r.ok) _colaVirgen = parseInt((_r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+      } catch {}
+      const _pisoVirgen = parseInt(cfg.polish_cola_piso || "50", 10) || 50;
+      const _modoPulido = _colaVirgen >= _pisoVirgen;
+      if (_modoPulido) {
+        log(`🔎 Pulido primero: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen})`);
+        if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
+        if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
+      }
+
       const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
@@ -25581,46 +25604,11 @@ async function main() {
         // cada 14. La cola de prospectos, que va después, no pierde su lugar: el techo global
         // de 3 min no cambia.
         _vueltaMantenimiento++;
-        // ── LA ALTERNANCIA SE ADAPTA A LA COLA (Maxi 2026-09-01) ──────────────────────
-        // El 27/08 puse esta alternancia porque el pulido se comía el presupuesto y dejaba
-        // sin turno al resto del mantenimiento. Resolvió eso y creó lo otro: el pulido pasó a
-        // correr cada ~14 min en vez de cada ~7, y "encontrarle mail a las URLs que no tienen"
-        // —uno de los cuatro criterios del user— quedó irregular, entre 3 y 102 por día sin
-        // patrón. Medido hoy: 771 leads sin email, de los cuales **140 no se intentaron NUNCA**
-        // y 244 llevan más de 3 días sin que nadie los toque.
-        //
-        // No es falta de capacidad: el pulido hace lotes de 45 y en las 14 horas activas daría
-        // de sobra para 771. Es falta de TURNO. Y un reparto fijo siempre le va a errar a una
-        // cola que cambia de tamaño todo el tiempo — el mismo error de los umbrales fijos.
-        //
-        // Ahora el turno se decide por la cola real: si hay leads que nunca se intentaron, el
-        // pulido corre en TODAS las vueltas hasta drenarlos; cuando baja del piso, vuelve a
-        // alternar y el mantenimiento recupera su mitad. Se prioriza al lead virgen, que es el
-        // que más rinde: un sitio no intentado tiene mucha más chance de dar email que uno que
-        // ya falló diez veces (para esos ya está el backoff creciente dentro de polishPool).
-        let _colaVirgen = 0;
-        try {
-          const _r = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&or=(email_intentos.is.null,email_intentos.eq.0)&select=id`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
-          if (_r.ok) _colaVirgen = parseInt((_r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
-        } catch {}
-        const _pisoVirgen = parseInt(cfg.polish_cola_piso || "50", 10) || 50;
-        const _modoPulido = _colaVirgen >= _pisoVirgen;
-        // ⚠️ AYER ESTO DEJÓ SIN CORRER A TODO EL MANTENIMIENTO (Maxi 2026-09-02).
-        // Estaba escrito `_vueltaPar = _modoPulido || (vuelta % 2) === 0`, y la cadena de
-        // mantenimiento cuelga de `if (!_vueltaPar)`. Con el modo cola encendido, `_vueltaPar`
-        // quedaba SIEMPRE en true y la cadena entera no se ejecutaba nunca: similar_expansion,
-        // reabrir_rebotados, purga_cola y sellers_discovery llevaban entre 10 y 46 horas sin
-        // correr. Hice exactamente lo que la alternancia existía para evitar, y encima con la
-        // misma forma de error: una condición que decide DOS cosas a la vez.
-        // Ahora el modo cola le da al pulido 2 de cada 3 vueltas en vez de todas. Drena igual
-        // de rápido en la práctica y el mantenimiento conserva su tercio.
-        const _cicloTres = _vueltaMantenimiento % 3;
-        const _vueltaPar = _modoPulido ? (_cicloTres !== 0) : ((_vueltaMantenimiento % 2) === 0);
-        if (_modoPulido && (_vueltaMantenimiento % 5) === 1) {
-          log(`🔎 Pulido en modo cola: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen}) — se lleva todas las vueltas hasta drenar`);
-        }
+        // La alternancia clásica sigue valiendo para cuando NO hay cola virgen: el pulido y el
+        // mantenimiento se turnan. Con cola, el pulido ya corrió arriba y acá se saltea, así
+        // que la cadena de mantenimiento conserva sus vueltas en vez de quedarse sin ninguna
+        // (que es lo que provoqué ayer al forzar `_vueltaPar` siempre en true).
+        const _vueltaPar = !_modoPulido && (_vueltaMantenimiento % 2) === 0;
         if (_vueltaPar) {
         // 2. PULIDO — busca email para los leads que no tienen. Es el pedido explícito del user,
         //    así que va antes que cualquier mantenimiento. Techo: 2 min por vuelta.
