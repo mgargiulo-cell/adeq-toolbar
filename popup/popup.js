@@ -4910,6 +4910,9 @@ async function bindButtons() {
   }
 
   window._colaRefrescarContador = _colaRefrescarContador;
+  // Primera carga: si el MB abre la toolbar y ya tenía cosas guardadas, el número tiene que
+  // estar ahí sin que haga nada. Se espera al token para no pedir sin credenciales.
+  setTimeout(() => { if (state.accessToken) _colaRefrescarContador(); }, 1200);
   async function _colaRefrescarContador() {
     try {
       await _colaCargar();
@@ -4917,7 +4920,12 @@ async function bindButtons() {
       const num = document.getElementById("cola-count");
       if (!btn || !num) return;
       num.textContent = String(_colaFilas.length);
-      btn.style.display = _colaFilas.length ? "inline-block" : "none";
+      // Nunca se oculta: con la cola vacía queda apagado pero visible, para que se sepa que
+      // existe. Con contenido, verde.
+      const hay = _colaFilas.length > 0;
+      btn.style.background = hay ? "#1e7d32" : "transparent";
+      btn.style.color      = hay ? "#fff" : "var(--muted)";
+      btn.style.border     = hay ? "none" : "1px solid var(--border)";
       if (document.getElementById("cola-panel")?.style.display === "block") _colaPintar();
     } catch {}
   }
@@ -4931,9 +4939,13 @@ async function bindButtons() {
     cont.innerHTML = _colaFilas.map(f => {
       const mail = Array.isArray(f.emails) && f.emails.length ? f.emails[0] : "—";
       const idi = _IDIOMA_TXT[Number(f.monday_payload?.idioma ?? f.language)] ?? (f.language || "—");
+      // Un prospecto guardado SIN haber mandado el mail es legítimo (se guarda en un click),
+      // pero tiene que verse: si no, entra al CRM como contactado y nunca lo fue.
+      const sinMail = f.monday_payload?.mail_enviado === false
+        ? ' <span title="Todavía no se le mandó el mail" style="color:#fbbf24">✉︎?</span>' : "";
       return `<label style="display:flex;align-items:center;gap:6px;padding:4px 2px;border-bottom:1px solid var(--border);cursor:pointer">
         <input type="checkbox" class="cola-chk" data-id="${f.id}" />
-        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.domain}">${f.domain}</span>
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.domain}">${f.domain}${sinMail}</span>
         <span style="width:34%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)" title="${mail}">${mail}</span>
         <span style="width:74px;color:var(--muted)">${f.geo || "—"}</span>
         <span style="width:60px;color:var(--muted)">${idi}</span>
@@ -5052,15 +5064,16 @@ async function bindButtons() {
       res.textContent = "❌ Page Views required. SimilarWeb returned no data — fill manually or re-analyze.";
       res.className = "push-result error"; return null;
     }
-    // El mail SÍ se manda igual: lo único que se pospone es el registro en el CRM. Sin este
-    // guard la cola juntaría prospectos a los que nunca se les escribió.
-    if (!state.emailSentInSession) {
-      res.textContent = "❌ Send the email first (Send via Gmail) before saving to the queue.";
-      res.className = "push-result error";
-      document.getElementById("btn-send-gmail")?.scrollIntoView({ behavior: "smooth", block: "center" });
-      return null;
-    }
-    return { ...v, traffic };
+    // ⚠️ NO se exige haber mandado el mail (Maxi 2026-09-02, corrección del user).
+    // Lo había puesto asumiendo que el mail sale igual y solo se pospone el CRM. El pedido
+    // real es otro: "lo mismo que enviar a Monday pero dejar todo pre-grabado en hold", en UN
+    // click. Pedirle al MB que mande el mail antes de poder guardar rompe justamente lo que
+    // esto viene a resolver — no frenar la prospección durante la migración.
+    // Las validaciones de DATOS sí quedan (GEO, tráfico, formato del email): sin ellas el
+    // registro no sirve el día que se manda, y el MB se enteraría recién ahí.
+    // Se anota si el mail salió o no, para poder marcarlo en la lista: que sea de un click no
+    // significa que después no se vea cuáles quedaron sin contactar.
+    return { ...v, traffic, mailEnviado: !!state.emailSentInSession };
   }
 
   document.getElementById("btn-guardar-cola")?.addEventListener("click", async () => {
@@ -5083,7 +5096,7 @@ async function bindButtons() {
         created_by: state.loginEmail,
         // Lo que la tabla no tiene y Monday sí necesita, guardado tal cual para que el envío
         // en lote no tenga que reconstruir nada ni volver a preguntarle al MB.
-        monday_payload: { estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma, traffic_text: formatTraffic(v.traffic) },
+        monday_payload: { estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma, traffic_text: formatTraffic(v.traffic), mail_enviado: v.mailEnviado },
       };
       const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
         method: "POST",

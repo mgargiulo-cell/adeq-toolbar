@@ -1138,8 +1138,11 @@
       <div class="card-title" style="margin:0;flex:1;font-size:13px">📋 Review Prospects</div>
       <!-- Cola "Por enviar": aparece SOLO si hay algo guardado, para no ensuciar la barra el
            99% del tiempo. El contador va en el botón para que se vea sin abrir nada. -->
+      <!-- SIEMPRE visible (Maxi 2026-09-02): lo tenía oculto hasta que hubiera algo guardado y
+           el user lo fue a buscar y no lo encontró. Una función que no se ve no existe. Cuando
+           la cola está vacía se muestra apagado, pero se muestra. -->
       <button id="btn-ver-cola" type="button" title="Prospectos guardados esperando a Monday"
-              style="display:none;font-size:10px;padding:2px 7px;background:#1e7d32;color:#fff;border:none;border-radius:4px;cursor:pointer;white-space:nowrap">
+              style="font-size:10px;padding:2px 7px;background:#1e7d32;color:#fff;border:none;border-radius:4px;cursor:pointer;white-space:nowrap">
         📥 Por enviar (<span id="cola-count">0</span>)
       </button>
       <input id="prospects-name-filter" type="text" placeholder="🔎" title="Buscar dominio" style="font-size:10px;padding:2px 5px;width:60px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)" />
