@@ -976,12 +976,26 @@ async function getDailyGlobalCounters(token) {
           { headers: { ..._auth, "Prefer": "count=exact", "Range": "0-0" } });
         const _atascados = parseInt((nr.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
         await saludPing(token, "next_day_rollover", { status: "ok", cadenciaMin: 24 * 60, detalle: `${_atascados} en next_day`, real: _atascados });
-        if (_atascados > 500) {
+        // ── ATASCO ES QUE CREZCA, NO QUE SEA GRANDE (Maxi 2026-09-02) ──────────────
+        // El umbral era 500 fijo. Pero `next_day` es un BUFFER: el pool tiene capacidad 700
+        // y cada relleno mueve ~400, así que 1.249 en cola son dos rellenos de reserva —
+        // operación normal, no atasco. La alerta saltaba con el sistema funcionando y encima
+        // mientras el descubrimiento producía 273 altas por día.
+        // Lo que de verdad importa es si la cola CRECE: que sea grande y estable significa
+        // que hay reserva; que suba día tras día significa que entra más de lo que sale.
+        // Se compara contra ayer y se exige, además, que pase de tres rellenos de fondo.
+        let _ayer = 0;
+        try { _ayer = parseInt(cfg.next_day_ayer || "0", 10) || 0; } catch {}
+        await setConfigValue(token, "next_day_ayer", String(_atascados)).catch(() => {});
+        const _techoCola = WAITING_POOL_CAP * 3;
+        if (_atascados > _techoCola && _atascados > _ayer) {
           await saludAlerta(token, {
             clave: "next-day-atascado", severidad: "warning",
-            titulo: `🚧 ${_atascados} dominios atascados en next_day`,
-            cuerpo: `Esas filas consumen cupo del carril de su fuente, así que los feeders se saltean solos sin gastar créditos. El waiting_pool está en ${_wNow}/${WAITING_POOL_CAP}.`,
-            metadata: { next_day: _atascados, waiting_pool: _wNow },
+            titulo: `🚧 next_day creciendo: ${_atascados} (ayer ${_ayer})`,
+            cuerpo: `Pasa los ${_techoCola} de reserva sana (3 rellenos del pool) Y creció respecto a ayer: entra más de lo que sale.\n`
+                  + `Esas filas consumen cupo del carril de su fuente, así que los feeders se saltean solos sin gastar créditos.\n`
+                  + `El waiting_pool está en ${_wNow}/${WAITING_POOL_CAP}.`,
+            metadata: { next_day: _atascados, ayer: _ayer, waiting_pool: _wNow },
           });
         }
       } catch {}
@@ -19765,6 +19779,66 @@ async function securityWatchdog(token) {
     } else if (totalDia > _techoUso) {
       // Volumen alto de gente nuestra: se avisa, NO se frena. `critico` queda como está.
       hallazgos.push(`• Uso del proxy alto: ${totalDia} llamadas hoy (lo normal son ~${Math.round(_baseDiaria)}/día; aviso a partir de ${_techoUso}).\n  Por usuario: ${filas.map(f => `${f.user_email}=${f.total}`).join(", ")}\n  Son todas identidades nuestras, así que NO se frenó nada — es gasto, no intrusión. Revisá si algún job entró en loop.`);
+    }
+  } catch {}
+
+  // ── 1b. CONSUMO ANORMAL DE UNA API PAGA (Maxi 2026-09-02, pedido del user) ─────────────
+  // Textual: "el kill switch es para evitar que alguien me ataque y se gasten de más créditos
+  // en apollo o similar web... que salte por consumo de rapidapi, apollo y todos los
+  // consumibles que tenemos".
+  // Hasta ahora el vigilante miraba el TOTAL del proxy, que mezcla todo y no distingue si el
+  // que se disparó es Anthropic (barato) o Apollo (créditos contados). Ahora se mira proveedor
+  // por proveedor.
+  //
+  // El techo se DERIVA del consumo real de cada uno (14 días), no se clava. Medido hoy:
+  // anthropic ~501/día · apollo ~60 · rapidapi ~11 · voyage ~1. Un techo fijo para todos
+  // sería absurdo con esa dispersión, y además se volvería falso positivo apenas crezca el
+  // volumen legítimo — que es el error que venimos pagando toda la semana.
+  //
+  // DOS NIVELES, porque no es lo mismo gastar de más que estar bajo ataque:
+  //   4× la base  → AVISA. Puede ser un job en loop o un día cargado.
+  //   10× la base → FRENA. Ese perfil no lo produce el uso normal.
+  // El piso absoluto evita que pasar de 1 a 5 llamadas dispare nada.
+  try {
+    const _hoyRows = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=eq.${hoy}&select=by_provider`, { headers: auth })
+      .then(r => r.ok ? r.json() : []).catch(() => []);
+    const _desde14 = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+    const _histRows = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_api_usage?day=gte.${_desde14}&day=lt.${hoy}&select=day,by_provider`, { headers: auth })
+      .then(r => r.ok ? r.json() : []).catch(() => []);
+
+    const _sumar = (rows) => {
+      const acc = {};
+      for (const r of (Array.isArray(rows) ? rows : [])) {
+        const bp = r?.by_provider || {};
+        for (const [k, v] of Object.entries(bp)) acc[k] = (acc[k] || 0) + (parseInt(v, 10) || 0);
+      }
+      return acc;
+    };
+    const _hoyPorProv = _sumar(_hoyRows);
+    // Promedio POR DÍA CON ACTIVIDAD: dividir por 14 cuando el agente duerme fin de semana
+    // hundiría la base y volvería todo sospechoso los lunes.
+    const _porDia = {};
+    for (const r of (Array.isArray(_histRows) ? _histRows : [])) {
+      const bp = r?.by_provider || {};
+      for (const [k, v] of Object.entries(bp)) {
+        _porDia[k] = _porDia[k] || {};
+        _porDia[k][r.day] = (_porDia[k][r.day] || 0) + (parseInt(v, 10) || 0);
+      }
+    }
+    const PISO_ABS = { anthropic: 2000, apollo: 250, rapidapi: 400, serper: 600, voyage: 500, millionverifier: 400 };
+    for (const [prov, usoHoy] of Object.entries(_hoyPorProv)) {
+      const dias = Object.values(_porDia[prov] || {}).filter(n => n > 0);
+      if (dias.length < 3) continue;                       // sin historia no se juzga
+      const base = dias.reduce((a, b) => a + b, 0) / dias.length;
+      const piso = PISO_ABS[prov] ?? 500;
+      const techoAviso = Math.max(piso, Math.ceil(base * 4));
+      const techoFreno = Math.max(piso * 3, Math.ceil(base * 10));
+      if (usoHoy > techoFreno) {
+        critico = true;
+        hallazgos.push(`• GASTO DISPARADO en ${prov}: ${usoHoy} llamadas hoy contra ${Math.round(base)}/día de promedio (${dias.length} días).\n  Eso es ${(usoHoy / Math.max(1, base)).toFixed(0)}× lo normal — no lo produce el uso del agente.`);
+      } else if (usoHoy > techoAviso) {
+        hallazgos.push(`• ${prov} va alto: ${usoHoy} llamadas hoy contra ${Math.round(base)}/día de promedio. NO se frenó nada — puede ser un día cargado o un job en loop. Vale mirar si sigue mañana.`);
+      }
     }
   } catch {}
 
