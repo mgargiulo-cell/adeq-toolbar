@@ -18435,6 +18435,15 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // Generics — OK pero baja conversión. Cobertura multi-idioma (PT/IT/FR/DE/ES).
   // CHEQUEADO ANTES que single-name para que "contato" no se cuele como persona.
   else if (IS_GENERIC.test(local)) score += 15;
+  // ── LOCALES DE 2-3 LETRAS: 19% DE REBOTE (Maxi 2026-09-02) ────────────────────────────
+  // Medido sobre 30 días: los locales de hasta 3 caracteres rebotan al 19,0%, contra 4,5% de
+  // los comerciales y 0% de los editoriales. Mirando cuáles son, se entiende: `gp@`, `al@`,
+  // `v_t@`, `tld@`, `it@` — iniciales y códigos de departamento raspados del texto, no
+  // buzones publicados.
+  // NO se rechazan: `ads@shorouknews.com` también es de 3 letras y es exactamente el buzón de
+  // venta de pauta que buscamos. Por eso los roles conocidos (AD_SALES, EXEC, COMMERCIAL,
+  // EDITORIAL) ya puntuaron arriba y no llegan hasta acá; este castigo solo alcanza al que no
+  // se pudo identificar como nada. Queda de último recurso en vez de competir de igual a igual.
   // Single name (juan@x.com) — could be person or generic
   else if (/^[a-z]{3,12}$/.test(local) && /[aeiou]/.test(local)) { score += 30; matchedRole = "SINGLE_NAME"; }
 
@@ -18443,6 +18452,26 @@ function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
   // cross-domain (era -15). Un founder@gmail SÍ es una persona válida.
   // Para cross-corporate (-50): revertir parcialmente (-25) si es EXEC, ya
   // que founder@otra-empresa puede ser advisor/board (real pero menos directo).
+  // ── LOCALES DE 2-3 LETRAS: 19% DE REBOTE (Maxi 2026-09-02) ────────────────────────────
+  // Medido sobre 30 días: los locales de hasta 3 caracteres rebotan al 19,0%, contra 4,5% de
+  // los comerciales y 0% de los editoriales. Mirando cuáles son se entiende por qué: `gp@`,
+  // `al@`, `v_t@`, `tld@`, `it@` — iniciales y códigos de departamento raspados del texto,
+  // no buzones publicados.
+  // Va DESPUÉS de la cadena de roles y no adentro: `tld@` e `it@` los agarraba la rama de
+  // genéricos (+15) antes de llegar al castigo, así que dependía de qué rama matcheara primero.
+  // Se exceptúan los roles que SÍ identificamos —`ads@` es de 3 letras y es exactamente el
+  // buzón de venta de pauta que buscamos, y rebota poco—. El castigo alcanza solo a lo que no
+  // se pudo identificar como nada: queda de último recurso en vez de competir de igual a igual.
+  // Abreviaturas de rol que SÍ son un contacto real y miden 2-3 letras: `pr@` (prensa /
+  // relaciones públicas), `rp@`, `mkt@`, `com@`. Sin esta excepción se perdía `pr@`, que es
+  // un buzón atendido por una persona del medio.
+  const _ROLES_CORTOS_OK = /^(pr|rp|mkt|com|ads|sac)$/;
+  if (_localSinSep.length <= 3 && !_ROLES_CORTOS_OK.test(_localSinSep)
+      && !["AD_SALES", "EXEC", "COMMERCIAL", "EDITORIAL"].includes(matchedRole)) {
+    score -= 40;
+    matchedRole = "INICIALES_SOSPECHOSAS";
+  }
+
   if (matchedRole && (matchedRole === "AD_SALES" || matchedRole === "EXEC" || matchedRole === "COMMERCIAL" || matchedRole === "EDITORIAL" || matchedRole === "PERSON")) {
     if (isFreeWebmail && cleanSite && dom !== cleanSite) {
       score += 15; // cancela el -15 inicial
@@ -20371,20 +20400,20 @@ async function runAgentCycle(token, allFlags) {
         else {
         const _pct = Math.round((Math.min(_rebotes, _enviados) / _enviados) * 100);
         const _piso = _wilsonLimiteInferior(Math.min(_rebotes, _enviados), _enviados) * 100;
+        // El rebote AVISA, no frena (Maxi 2026-09-02, regla del user). Mismo motivo que el
+        // freno del dominio: el techo del 2% quedó por debajo del piso real desde que medimos
+        // bien, así que frenar acá dejaba buzones apagados de forma permanente por un número
+        // que siempre fue así. El camino correcto es arreglar la elección del email —de ahí
+        // salen los rebotes—, no apagar el buzón.
         if (_piso >= _pctMax) {
-          log(`🩺 ${userEmail}: rebote ${_pct}% en 7d, piso estadístico ${_piso.toFixed(1)}% (${_rebotes}/${_enviados}, tope ${_pctMax}%) — FRENO el envío`);
-          await logAgentAction(token, userEmail, {
-            domain: "_cycle_", action: "skipped", reason: `rebote_alto_${_pct}pct`,
-            details: { rebotes: _rebotes, enviados: _enviados, tope: _pctMax },
-          });
+          log(`🩺 ${userEmail}: rebote ${_pct}% en 7d, piso estadístico ${_piso.toFixed(1)}% (${_rebotes}/${_enviados}, tope ${_pctMax}%) — AVISO, sigo enviando`);
           await saludAlerta(token, {
-            clave: `rebote-alto-${userEmail}`, severidad: "error",
-            titulo: "🩺 Freno un buzón por rebotes",
+            clave: `rebote-alto-${userEmail}`, severidad: "warn",
+            titulo: "🩺 Un buzón rebota por encima del resto",
             cuerpo: `${userEmail} lleva ${_pct}% de rebote en los últimos 7 días (${_rebotes} de ${_enviados}, piso estadístico ${_piso.toFixed(1)}%).\n`
-                  + `Paro sus envíos por hoy para proteger la reputación de la cuenta.\n`
-                  + `Si los rebotes vienen de una fuente concreta, conviene revisarla antes de mañana.`,
+                  + `NO se frenó nada: el rebote se corrige eligiendo mejor la dirección, no apagando el buzón.\n`
+                  + `Si un buzón se despega mucho del resto, suele ser la FUENTE de sus leads y no el buzón.`,
           }).catch(() => {});
-          continue;   // próximo MB
         }
         }
       }
@@ -22995,8 +23024,19 @@ async function vigilarReputacion(token) {
     // Ya pausado: no volver a pausar. El 21/08 esto se re-disparó 6 veces seguidas y
     // extendió la pausa indefinidamente, dejando a los tres buzones en 0 de 20.
     const _yaPausado = Date.parse(cfg?.agent_paused_until || "") > Date.now();
+    // ── EL REBOTE YA NO FRENA NADA (Maxi 2026-09-02, regla del user) ────────────────────
+    // Textual: "No hagas pausa por rebote nunca, es normal el rebote hasta que acomodemos la
+    // identificación correcta de scraping". Y tiene razón por dos motivos:
+    //  a) La tasa se mide sobre 7 días, así que FRENAR VACÍA EL DENOMINADOR y empuja la tasa
+    //     para arriba. Al vencer, la pausa se re-disparaba sola: el 02/09 el agente pasó el día
+    //     entero en cero y el informe mostraba "PAUSADO 12h, 2 veces · no llegó a su cupo, 15
+    //     veces". El freno se garantizaba a sí mismo.
+    //  b) El techo del 3% se calibró cuando veíamos la MITAD de los rebotes (los de Exchange
+    //     eran invisibles hasta el 31/08). Medido bien, la tasa real es 5,5-6,5% estable desde
+    //     el 25/08: no empeoró, siempre fue así. Un techo por debajo del piso real no es un
+    //     umbral, es un candado.
+    // El aviso SE MANTIENE —el user quiere enterarse— pero informa, no frena.
     if (_pisoDominio > REBOTE_TECHO_DOMINIO && !_yaPausado) {
-      await setConfigValue(token, "agent_paused_until", new Date(Date.now() + 12 * 3600_000).toISOString()).catch(() => {});
       await saludAlerta(token, {
         clave: "reputacion-dominio", severidad: "error",
         titulo: `🔥 Rebote del ${(tasaDominio * 100).toFixed(1)}% — envío PAUSADO 12h`,
