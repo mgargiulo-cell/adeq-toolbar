@@ -5126,15 +5126,60 @@ async function bindButtons() {
         // en lote no tenga que reconstruir nada ni volver a preguntarle al MB.
         monday_payload: { estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma, traffic_text: formatTraffic(v.traffic), mail_enviado: v.mailEnviado },
       };
-      const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
-        method: "POST",
-        headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
-                   "Content-Type": "application/json", "Prefer": "return=minimal" },
-        body: JSON.stringify(fila),
-      });
+      // ⚠️ EL DOMINIO ES ÚNICO EN LA TABLA (Maxi 2026-09-02).
+      // El insert a secas reventaba con "duplicate key violates
+      // toolbar_review_queue_domain_key" cada vez que el MB guardaba un sitio que YA estaba en
+      // Prospects — que es el caso NORMAL, no la excepción: casi todo lo que analiza ya pasó
+      // por el pool (2.395 pendientes + 712 congelados). El MB veía un error de Postgres crudo
+      // y perdía el trabajo hecho.
+      //
+      // Por qué NO alcanza con un upsert a secas: `merge-duplicates` pisa todas las columnas
+      // del payload, y dos de ellas no son nuestras para pisar —
+      //   · `source`: si el dominio lo trajo `autogoogle`, escribirle "manual_cola" encima
+      //     falsea la métrica de altas por fuente, que es con la que decidimos en qué feeder
+      //     invertir. El dato de origen es histórico: se conserva.
+      //   · `created_at`: es la antigüedad real en el pool.
+      // Por eso se mira primero y se actualiza sólo lo que el MB acaba de cargar.
+      const _prev = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(state.domain)}&select=id,status,source,monday_item_id`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } },
+      ).then(x => x.ok ? x.json() : []).catch(() => []);
+      const _ya = Array.isArray(_prev) && _prev[0];
+
+      let r;
+      if (_ya) {
+        delete fila.source;        // el origen es histórico, no se reescribe
+        delete fila.created_by;    // idem: quién lo dio de alta
+        r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${_ya.id}`, {
+          method: "PATCH",
+          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                     "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify(fila),
+        });
+      } else {
+        r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
+          method: "POST",
+          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                     "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify(fila),
+        });
+      }
       if (!r.ok) throw new Error((await r.text()).slice(0, 160));
-      res.textContent = "📥 Guardado en la cola — lo mandás desde Prospects › Por enviar";
-      res.className = "push-result ok";
+
+      // Decir QUÉ pasó, no sólo que salió bien. El caso que importa es el tercero: si el
+      // prospecto ya había sido contactado, el MB tiene que saberlo ANTES de mandarlo, porque
+      // lo que sale del otro lado es un primer contacto. No se bloquea —él sabrá si lo está
+      // re-trabajando a propósito—, pero no puede pasar callado.
+      if (_ya && (_ya.status === "validated" || _ya.monday_item_id)) {
+        res.textContent = "📥 Guardado ⚠️ ojo: este dominio YA figura contactado — al mandarlo se actualiza la ficha, no se crea otra";
+        res.className = "push-result warn";
+      } else if (_ya) {
+        res.textContent = `📥 Guardado — ya estaba en Prospects (${_ya.source || "sin origen"}) y pasó a la cola`;
+        res.className = "push-result ok";
+      } else {
+        res.textContent = "📥 Guardado en la cola — lo mandás desde Prospects › Por enviar";
+        res.className = "push-result ok";
+      }
       _colaRefrescarContador();
     } catch (e) {
       res.textContent = "❌ No se pudo guardar: " + String(e.message || e).slice(0, 140);

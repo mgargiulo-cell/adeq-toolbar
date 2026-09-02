@@ -967,6 +967,12 @@ input.form-pv-display { font-weight: 700; }
 .push-result { margin-top: var(--sp-2); font-size: var(--fs-base); text-align: center; min-height: 16px; }
 .push-result.ok    { color: var(--success-text); font-weight: 600; }
 .push-result.error { color: var(--danger); font-weight: 600; }
+/* Guardado PERO con algo que mirar (ej: el dominio ya figura contactado). Sin esta regla el
+   aviso salía con el color de un texto normal y se leía como un éxito más — un aviso que no
+   se distingue del "todo bien" no avisa nada. */
+.push-result.warn  { color: #92400e; font-weight: 600; background: #fef3c7;
+                     border: 1px solid #f59e0b; border-radius: var(--radius-sm);
+                     padding: var(--sp-1) var(--sp-2); }
 
 /* ---- CASCADE ---- */
 .seed-row   { display: flex; gap: var(--sp-2); align-items: center; }
