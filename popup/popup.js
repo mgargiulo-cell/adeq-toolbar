@@ -11039,6 +11039,44 @@ async function secToggle() {
   await secPintar();
 }
 
+// ── RESTABLECER OPERACIÓN (Maxi 2026-09-02, pedido del user) ─────────────────────────────
+// Soltar el kill switch no alcanza. Cuando el agente aparece en "0 de 40" casi nunca es el
+// kill switch: es `agent_paused_until`, la pausa de 12 h por rebote del dominio, que es otra
+// llave y desde la toolbar no se podía tocar.
+// El caso que lo motivó: el 02/09 el agente pasó el día entero en cero con el kill switch en
+// `false`. La pausa vencía 11 horas después y al vencer se volvía a disparar, porque la tasa
+// de rebote se mide sobre 7 días — frenar los envíos vacía el denominador y empuja la tasa
+// PARA ARRIBA. El freno se garantizaba a sí mismo y no había salida desde acá.
+// El RPC valida la allowlist y deja registro. NO desarma la defensa: si la causa sigue, el
+// vigilante vuelve a frenar en la próxima vuelta. Es una salida de emergencia, no un
+// interruptor para dejar apagado.
+async function secRestablecer() {
+  const btn = document.getElementById("sec-restore-btn");
+  if (!btn) return;
+  if (!confirm("Suelta el freno de emergencia Y la pausa por rebote, y el agente vuelve a enviar.\n\n"
+             + "Si la causa sigue (por ejemplo el rebote alto), el vigilante va a frenar de nuevo solo.\n\n¿Restablecer?")) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/rpc/restablecer_operacion`, {
+      method: "POST",
+      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ p_motivo: "botón Restablecer del panel" }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const res = await r.json();
+    // Decir QUÉ se soltó y no un "listo" genérico: si no había nada frenado, el user tiene que
+    // saberlo — quiere decir que el "0 de 40" viene de otro lado y hay que mirar ahí.
+    alert(res?.nada_que_soltar
+      ? "No había ningún freno puesto.\n\nSi el agente igual no envía, la causa es otra: miralo en el informe o pedímelo."
+      : `Listo. Se soltó: ${(res?.soltados || []).join(", ")}.\n\nEl agente retoma en la próxima vuelta (unos minutos).`);
+  } catch (e) {
+    alert("No se pudo restablecer: " + String(e).slice(0, 200));
+  }
+  btn.disabled = false; btn.textContent = orig;
+  await secPintar();
+}
+
 // Reporte de 1 clic: junta los últimos incidentes y el estado, y lo deja en el portapapeles.
 async function secCopiarReporte() {
   const btn = document.getElementById("sec-report-btn");
@@ -11159,5 +11197,7 @@ function secInit() {
   if (b && !b.dataset.wired) { b.dataset.wired = "1"; b.addEventListener("click", secToggle); }
   if (r && !r.dataset.wired) { r.dataset.wired = "1"; r.addEventListener("click", secCopiarReporte); }
   if (t && !t.dataset.wired) { t.dataset.wired = "1"; t.addEventListener("change", secToggleDefensa); }
+  const rs = document.getElementById("sec-restore-btn");
+  if (rs && !rs.dataset.wired) { rs.dataset.wired = "1"; rs.addEventListener("click", secRestablecer); }
   secPintar();
 }

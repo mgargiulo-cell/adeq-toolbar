@@ -172,6 +172,15 @@
       <button id="sec-panic-btn" class="btn" style="width:100%;background:#b3261e;color:#fff;font-weight:700;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:12px">
         🛑 FRENAR TODO AHORA
       </button>
+      <!-- Soltar el kill switch NO alcanza: el agente casi siempre queda en "0 de 40" por
+           `agent_paused_until`, la pausa de 12 h por rebote, que es otra llave. Este botón
+           suelta las dos de una. -->
+      <button id="sec-restore-btn" class="btn" style="width:100%;background:#1e7d32;color:#fff;font-weight:700;padding:10px;border:none;border-radius:8px;cursor:pointer;font-size:12px;margin-top:8px">
+        🟢 RESTABLECER OPERACIÓN
+      </button>
+      <div id="sec-restore-info" style="font-size:10px;color:#94a3b8;margin-top:5px;line-height:1.4">
+        Suelta el freno de emergencia y la pausa por rebote. Si la causa sigue, el vigilante vuelve a frenar.
+      </div>
       <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
         <label class="toggle-switch" title="Si está apagado, el vigilante detecta y avisa pero no frena solo">
           <input id="sec-auto-toggle" type="checkbox" checked />
