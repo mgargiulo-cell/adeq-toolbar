@@ -50,7 +50,7 @@ export async function getMondayBoardIndex() {
     // un solo aviso. Se RELANZA para que el consumidor —que ya tiene un catch que pinta el
     // cartel en pantalla— se entere. Tragarme el error acá anulaba ese cartel: la promesa
     // resolvía "bien" con un Map vacío y el catch del popup no corría nunca.
-    console.warn("[getMondayBoardIndex] el CRM no contestó:", e.message);
+    console.warn("[getMondayBoardIndex] ADEQ no contestó:", e.message);
     throw e;
   }
 }
@@ -145,7 +145,7 @@ export async function fetchManualSendsFromMonday({ desde, hasta } = {}) {
       })),
     };
   } catch (e) {
-    console.warn("[fetchManualSendsFromMonday] el CRM no contestó:", e.message);
+    console.warn("[fetchManualSendsFromMonday] ADEQ no contestó:", e.message);
     return { ok: false, items: [], motivo: e.message };
   }
 }

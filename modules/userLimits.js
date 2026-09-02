@@ -152,7 +152,7 @@ export async function checkUserCanDo(accessToken, email, action) {
       return { allowed: false, reason: `Límite diario de emails alcanzado (${usage.emails}/${limit.daily_emails_cap}).` };
     }
     if (action === "push_monday" && usage.monday >= limit.daily_monday_cap) {
-      return { allowed: false, reason: `Límite diario de cargas al CRM alcanzado (${usage.monday}/${limit.daily_monday_cap}).` };
+      return { allowed: false, reason: `Límite diario de cargas a ADEQ alcanzado (${usage.monday}/${limit.daily_monday_cap}).` };
     }
   }
   return { allowed: true };

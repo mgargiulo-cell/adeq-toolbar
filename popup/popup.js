@@ -338,7 +338,7 @@ function resetAnalysisUI() {
 
   // 7) Reset botón push-monday a "Send" (no "Update")
   const pushBtn = document.getElementById("btn-push-monday");
-  if (pushBtn) pushBtn.textContent = "🚀 Enviar al CRM";
+  if (pushBtn) pushBtn.textContent = "🚀 Enviar a ADEQ";
 
   // 8) Esconder pulgares/status del pitch (solo se muestran después de generar)
   ["btn-pitch-like", "btn-pitch-dislike"].forEach(id => {
@@ -1286,7 +1286,7 @@ async function _refreshAgentFeed() {
     window._lastAgentFeedRows = rows;
     const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨", cycle_no_candidates: "🔍", cycle_heartbeat: "💓", reserved: "⏳" };
     const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444", cycle_no_candidates: "#94a3b8", cycle_heartbeat: "#64748b", reserved: "#64748b" };
-    const actionLabels = { sent: "Sent", re_sent: "Re-sent (follow-up)", bounce_retry_sent: "Bounce retry sent", skipped: "Skipped", failed: "Failed", monday_failed: "Carga al CRM falló", monday_ok: "Cargado en el CRM", crm_ok: "Cargado en el CRM", kill_switch: "Kill switch fired", cycle_no_candidates: "No candidates this cycle", cycle_heartbeat: "Heartbeat", reserved: "Reserved slot" };
+    const actionLabels = { sent: "Sent", re_sent: "Re-sent (follow-up)", bounce_retry_sent: "Bounce retry sent", skipped: "Skipped", failed: "Failed", monday_failed: "Carga a ADEQ falló", monday_ok: "Cargado en ADEQ", crm_ok: "Cargado en ADEQ", kill_switch: "Kill switch fired", cycle_no_candidates: "No candidates this cycle", cycle_heartbeat: "Heartbeat", reserved: "Reserved slot" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
       const icon = icons[r.action] || "·";
@@ -1652,7 +1652,7 @@ async function loadAdminActivity() {
   if (elAviso) {
     if (!monday.ok) {
       elAviso.style.display = "block";
-      elAviso.textContent = "⚠️ El CRM no contestó. Los envíos a mano no se pueden contar y quedan en blanco — NO son cero.";
+      elAviso.textContent = "⚠️ ADEQ no contestó. Los envíos a mano no se pueden contar y quedan en blanco — NO son cero.";
     } else elAviso.style.display = "none";
   }
 
@@ -1755,7 +1755,7 @@ async function renderAdminSourcePerformance() {
       s = (s || "").toLowerCase();
       if (s.includes("autopilot"))  return "🤖 Autopilot";
       if (s.includes("autogoogle")) return "🔎 AutoGoogle";
-      if (s.includes("monday"))     return "🔄 Reciclado del CRM";   // etiqueta histórica de la fuente
+      if (s.includes("monday"))     return "🔄 Reciclado de ADEQ";   // etiqueta histórica de la fuente
       if (s.includes("sellers"))    return "📋 sellers.json";
       if (s.includes("manual"))     return "✋ Manual";
       if (s.includes("csv"))        return "📥 CSV";
@@ -3069,7 +3069,7 @@ async function runDuplicateCheck() {
       // `autoPushReady.notDup`, o sea habilitar el push automático de un dominio que NUNCA
       // se verificó. El cuidado de buscarEnCrm (devolver `indeterminado` en vez de "libre")
       // quedaba anulado dos líneas después.
-      el.textContent = "⚠️ no pude consultar el CRM — verificá antes de escribir";
+      el.textContent = "⚠️ no pude consultar ADEQ — verificá antes de escribir";
       el.className   = "status-badge duplicate";
       checkProspectLock();
       return;
@@ -3079,11 +3079,11 @@ async function runDuplicateCheck() {
       // "descartado" pero está en los 60 días de descanso que pidió el user.
       el.textContent = result.descansando
         ? `⛔ CERRADO HACE POCO · faltan ${result.diasParaReintentar} días para reintentar`
-        : `⚠️ YA ESTÁ EN EL CRM · ${result.status}${result.board ? ` · ${result.board}` : ""} · ${result.ejecutivo || "—"}`;
+        : `⚠️ YA ESTÁ EN ADEQ · ${result.status}${result.board ? ` · ${result.board}` : ""} · ${result.ejecutivo || "—"}`;
       el.className   = "status-badge duplicate";
       state.mondayItemId = result.itemId;
       fillMondayFormFromDuplicate(result);
-      document.getElementById("btn-push-monday").textContent = "🔄 Actualizar en el CRM";
+      document.getElementById("btn-push-monday").textContent = "🔄 Actualizar en ADEQ";
 
       // Si es duplicado re-prospectable (Ciclo Finalizado / Mail No Enviado),
       // los datos en Monday pueden tener meses → forzar refresh de tráfico.
@@ -3112,7 +3112,7 @@ async function runDuplicateCheck() {
     // Detectar idioma siempre (nuevo y duplicado) para el pitch
     autoDetectPageLanguage();
   } catch {
-    el.textContent = "⚠️ el CRM no respondió";
+    el.textContent = "⚠️ ADEQ no respondió";
     el.className   = "status-badge";
   }
 }
@@ -4213,7 +4213,7 @@ function renderEmailList(emails) {
   };
 
   if (mondayEmail) {
-    html += `<div class="email-group-label">📋 Actual (CRM)</div>${chipFor(mondayEmail, "monday")}`;
+    html += `<div class="email-group-label">📋 Actual (ADEQ)</div>${chipFor(mondayEmail, "monday")}`;
   }
 
   if (suggested.length > 0) {
@@ -4902,11 +4902,11 @@ async function bindButtons() {
     const changed = Object.keys(snap).some(k => cur[k] !== snap[k]);
     if (changed) {
       btn.disabled    = false;
-      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en el CRM" : "🚀 Enviar al CRM";
+      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en ADEQ" : "🚀 Enviar a ADEQ";
       btn.classList.remove("btn-sent");
     } else {
       btn.disabled    = true;
-      btn.textContent = "✅ Ya está en el CRM";
+      btn.textContent = "✅ Ya está en ADEQ";
       btn.classList.add("btn-sent");
     }
   }
@@ -5009,7 +5009,7 @@ async function bindButtons() {
     const ids = _colaMarcados();
     const out = document.getElementById("cola-result");
     if (!ids.length) { out.textContent = "Marcá al menos uno."; out.style.color = "var(--muted)"; return; }
-    if (!confirm(`Se van a crear ${ids.length} ficha(s) en el CRM. ¿Confirmás?`)) return;
+    if (!confirm(`Se van a crear ${ids.length} ficha(s) en ADEQ. ¿Confirmás?`)) return;
     const btn = document.getElementById("btn-cola-enviar");
     btn.disabled = true;
     let ok = 0; const fallaron = [];
@@ -5067,7 +5067,7 @@ async function bindButtons() {
     // revisar los 40 a mano para encontrar los 2 que no entraron.
     out.innerHTML = fallaron.length
       ? `✅ ${ok} enviado(s) · ❌ ${fallaron.length} fallaron:<br>` + fallaron.slice(0, 6).map(x => `· ${x}`).join("<br>")
-      : `✅ Los ${ok} entraron al CRM.`;
+      : `✅ Los ${ok} entraron a ADEQ.`;
     out.style.color = fallaron.length ? "#fca5a5" : "#86efac";
     btn.disabled = false;
     await _colaRefrescarContador();
@@ -5341,7 +5341,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     }
     // Guard #1: GEO obligatorio — Monday no debe recibir items sin país
     if (!geo) {
-      res.textContent = "❌ Falta el GEO. Completalo antes de cargar en el CRM.";
+      res.textContent = "❌ Falta el GEO. Completalo antes de cargar en ADEQ.";
       res.className = "push-result error";
       document.getElementById("form-geo")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -5354,7 +5354,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       return;
     }
     // Guard #3: no dejar pushear NI updatear Monday si todavía no se mandó email
-    // en esta sesión. Aplica también a duplicados (botón "🔄 Actualizar en el CRM")
+    // en esta sesión. Aplica también a duplicados (botón "🔄 Actualizar en ADEQ")
     // para evitar que se actualice un item sin haber re-mandado el pitch.
     if (!state.emailSentInSession) {
       const action = state.duplicate?.found ? "update" : "push";
@@ -5379,7 +5379,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
         email, geo, idioma, pitch, estado, fecha, ejecutivo,
         telefono: state.contactPhone || "",
       });
-      res.textContent = nuevo ? `✅ Cargado en el CRM: ${state.domain}` : `✅ Actualizado en el CRM: ${state.domain}`;
+      res.textContent = nuevo ? `✅ Cargado en ADEQ: ${state.domain}` : `✅ Actualizado en ADEQ: ${state.domain}`;
       res.className = "push-result ok";
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
@@ -5398,7 +5398,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       }
       // Guardar snapshot — bloquea el botón hasta que algo cambie
       state.mondaySnapshot = getMondayFormValues();
-      btn.textContent      = "✅ Ya en el CRM";
+      btn.textContent      = "✅ Ya en ADEQ";
       btn.classList.add("btn-sent");
 
       // Incrementar contador de Monday pushes con contexto (nuevo/dup, +400k o no)
@@ -5422,7 +5422,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     } catch (err) {
       res.textContent = `❌ ${err.message}`; res.className = "push-result error";
       btn.disabled    = false;
-      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en el CRM" : "🚀 Enviar al CRM";
+      btn.textContent = state.duplicate?.found ? "🔄 Actualizar en ADEQ" : "🚀 Enviar a ADEQ";
     }
   });
 
@@ -5642,7 +5642,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
   document.getElementById("btn-refresh").addEventListener("click", () => window.location.reload());
 
   // ── Cascade · Import Monday collapsable ──────────────────────
-  // El card "Importar URLs del CRM" se mudó a Cascade. Lo dejo colapsado
+  // El card "Importar URLs de ADEQ" se mudó a Cascade. Lo dejo colapsado
   // por default para no robarle espacio a Keywords/Filtros que son lo más usado.
   (() => {
     const toggle = document.getElementById("cascade-monday-toggle");
@@ -5671,7 +5671,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     const minTraffic   = tMinRaw || 0;
     const maxTraffic   = tMaxRaw || 0;
 
-    btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
+    btn.disabled = true; btn.textContent = "⏳ Consultando ADEQ...";
     resultEl.textContent = ""; resultEl.className = "push-result";
     listEl.innerHTML = "";
 
@@ -5679,7 +5679,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       const candidates = await fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic });
 
       if (candidates.length === 0) {
-        resultEl.textContent = "No hay URLs con esos filtros en el CRM.";
+        resultEl.textContent = "No hay URLs con esos filtros en ADEQ.";
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "🚀 Import 15 URLs";
         return;
@@ -5728,7 +5728,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     const minTraffic   = tMinRaw || 0;
     const maxTraffic   = tMaxRaw || 0;
 
-    btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
+    btn.disabled = true; btn.textContent = "⏳ Consultando ADEQ...";
     resultEl.textContent = ""; resultEl.className = "push-result";
     listEl.innerHTML = "";
 
@@ -5736,7 +5736,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       const candidates = await fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic });
 
       if (candidates.length === 0) {
-        resultEl.textContent = "No hay URLs con esos filtros en el CRM.";
+        resultEl.textContent = "No hay URLs con esos filtros en ADEQ.";
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "📤 Send to Queue";
         return;
@@ -6597,13 +6597,13 @@ async function startCascade() {
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días).
   // Si falla (timeout/401/red), seguimos igual con índice vacío — no bloqueamos al MB.
-  statusEl.textContent = "Paso 1/2: consultando al CRM los dominios activos de otros MB...";
+  statusEl.textContent = "Paso 1/2: consultando a ADEQ los dominios activos de otros MB...";
   const boardIndex = await Promise.race([
     getMondayBoardIndex(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("el CRM no respondió en 20s")), 20000)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("ADEQ no respondió en 20s")), 20000)),
   ]).catch((e) => {
-    console.warn("[cascade] no se pudo traer la lista de bloqueados del CRM:", e.message);
-    statusEl.textContent = `⚠ el CRM no respondió (${e.message}) — sigo sin filtro de ejecutivos`;
+    console.warn("[cascade] no se pudo traer la lista de bloqueados de ADEQ:", e.message);
+    statusEl.textContent = `⚠ ADEQ no respondió (${e.message}) — sigo sin filtro de ejecutivos`;
     return new Map();
   });
   let filteredCount = 0;
@@ -7303,7 +7303,7 @@ async function initCsvQueue() {
           if (m.includes("geo_saturated")) return "⚖️ GEO saturado en pool";
           if (m.includes("not_publisher") || m.includes("publisher_signal") || m.includes("haiku_")) return "🗑 no es publisher (filtro basura)";
           if (m.includes("category-blocked")) return "🏦 categoría bloqueada";
-          if (m.includes("en monday") || m.includes("crm_activo") || m.includes("estado=")) return "📋 ya está en el CRM (ciclo activo)";
+          if (m.includes("en monday") || m.includes("crm_activo") || m.includes("estado=")) return "📋 ya está en ADEQ (ciclo activo)";
           if (m.includes("blocked:")) return "🚫 en blocklist";
           if (m.includes("unreachable") || m.includes("site_unreachable")) return "💀 sitio caído / sin emails";
           return "❓ otro: " + m.slice(0, 30);
@@ -7348,7 +7348,7 @@ async function initCsvQueue() {
     csv:          { icon: "📥", label: "CSV upload" },
     manual:       { icon: "✋", label: "Import manual" },
     sellers_json: { icon: "📋", label: "Sellers.json" },
-    monday:       { icon: "🔄", label: "Reciclado del CRM" },
+    monday:       { icon: "🔄", label: "Reciclado de ADEQ" },
   };
   let _historyRange = "today"; // "today" | "7days"
 
@@ -7713,7 +7713,7 @@ async function initCsvQueue() {
     // 'siempre los mismos 100 → all known' que ese shuffle vino a arreglar.
     const limit    = 100;
 
-    btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
+    btn.disabled = true; btn.textContent = "⏳ Consultando ADEQ...";
     resultEl.textContent = ""; resultEl.className = "push-result";
 
     try {
@@ -7759,7 +7759,7 @@ async function initCsvQueue() {
       resultEl.textContent = `❌ ${err.message}`;
       resultEl.className = "push-result error";
     } finally {
-      btn.disabled = false; btn.textContent = "🔄 Traer y encolar desde el CRM";
+      btn.disabled = false; btn.textContent = "🔄 Traer y encolar desde ADEQ";
     }
   });
 
@@ -9936,7 +9936,7 @@ function renderProspectCard(r) {
       </div>
 
       <!-- Monday fields -->
-      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Datos del CRM</div>
+      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Datos de ADEQ</div>
       <div class="form-grid">
         <label class="form-label">Owner</label>
         <select class="form-select pcard-owner">${ownerOptions}</select>
@@ -9947,7 +9947,7 @@ function renderProspectCard(r) {
         <label class="form-label">GEO</label>
         <input type="text" class="form-input pcard-geo" value="${esc(r.geo || "")}" placeholder="e.g. Mexico" style="font-size:11px;padding:4px 7px" />
         <label class="form-label">Email</label>
-        <input type="text" class="form-input pcard-email-monday" value="${esc(emails[0] || "")}" placeholder="Email al CRM" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
+        <input type="text" class="form-input pcard-email-monday" value="${esc(emails[0] || "")}" placeholder="Email a ADEQ" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
         <label class="form-label">Date</label>
         <input type="text" class="form-input pcard-date" value="${toDisplayDate(new Date().toISOString().split("T")[0])}" placeholder="DD/MM/YYYY" maxlength="10" style="font-size:11px;padding:4px 7px" title="Auto-completada con hoy — editable" />
         <label class="form-label">Traffic</label>
@@ -10066,7 +10066,7 @@ function initProspectCard(card, data) {
 
   // ── Lista de emails con autoverify + Apollo first + ver más toggle ────
   // Mismo sistema que Analysis. Apollo va primero. Click sincroniza el
-  // campo "Email" de Datos del CRM abajo.
+  // campo "Email" de Datos de ADEQ abajo.
   const renderProspectEmailList = () => {
     const listEl = card.querySelector(".pcard-email-list");
     if (!listEl || emails.length === 0) return;
@@ -10178,7 +10178,7 @@ function initProspectCard(card, data) {
       if (block) { block.style.display = "block"; e.target.style.display = "none"; }
     });
 
-    // Click chip = seleccionar + sincronizar email a Datos del CRM,
+    // Click chip = seleccionar + sincronizar email a Datos de ADEQ,
     // PERO si el user ya tipeó algo manual en el input, NO pisar.
     const mondayEmailEl = card.querySelector(".pcard-email-monday");
     const manualEmailEl = card.querySelector(".pcard-email-manual");
@@ -11047,8 +11047,8 @@ async function validateProspect(card, data, doSendEmail) {
     card.style.opacity = "0.3";
     setResult(
       mark.ok
-        ? (doSendEmail && email ? "✅ Cargado en el CRM + mail enviado" : "✅ Cargado en el CRM")
-        : (doSendEmail && email ? "✅ Email enviado (la marca se reintenta sola)" : "✅ Cargado en el CRM (la marca se reintenta sola)")
+        ? (doSendEmail && email ? "✅ Cargado en ADEQ + mail enviado" : "✅ Cargado en ADEQ")
+        : (doSendEmail && email ? "✅ Email enviado (la marca se reintenta sola)" : "✅ Cargado en ADEQ (la marca se reintenta sola)")
     );
     setTimeout(() => { card.remove(); refreshProspectsStats(); }, 200);
 
