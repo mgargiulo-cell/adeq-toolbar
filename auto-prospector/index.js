@@ -3642,6 +3642,48 @@ const MONDAY_SYNC_MAX_POR_DIA = 400;        // default; lo pisa `monday_sync_tec
 async function guardarBloqueadosDeMonday(token) {
   try {
     if (!(await _tocaCorrer(token, "monday_bloqueados", 24 * 60))) return;
+
+    // ── LA LISTA DE "NO ESCRIBIRLE" AHORA SALE DEL BOARD (Maxi 2026-09-02) ──────────────
+    // Es la última cosa que ataba la toolbar a Monday: 3.333 dominios que no hay que volver a
+    // contactar, de los cuales 1.506 SOLO existían allá. Ya están migrados al board.
+    //
+    // Se intenta el board PRIMERO y Monday queda de respaldo. Así no hay que coordinar el
+    // momento del cambio: hoy el endpoint devuelve 404 (todavía no lo deployaron) y esto sigue
+    // andando con Monday; el día que lo suban, empieza a usarlo solo, sin tocar nada acá.
+    //
+    // El board devuelve 3.381 contra los 3.333 de Monday: la diferencia son 93 CLIENTES
+    // ACTIVOS que salen del revenue real y que Monday no sabía que había que bloquear.
+    // Mandarle captación a un publisher que ya nos factura todos los meses no se deshace.
+    try {
+      const _r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/dominios-activos")}`, {
+        headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(20000),
+      });
+      if (_r.ok) {
+        const _j = await _r.json();
+        const _doms = Array.isArray(_j?.domains) ? _j.domains.filter(Boolean) : [];
+        // ⚠️ Una lista VACÍA no se guarda nunca. "No pude leer" ≠ "no hay nadie bloqueado":
+        // si el board contesta 200 con cero dominios por un problema suyo y lo guardamos, el
+        // agente sale a re-contactar a los 3.381 que están en el pipeline. El patrón que ya
+        // pagamos ocho veces en este proyecto. Ante la duda se conserva la lista anterior.
+        if (_doms.length >= 100) {
+          await setConfigValue(token, "monday_bloqueados", JSON.stringify(_doms)).catch(() => {});
+          await setConfigValue(token, "monday_bloqueados_at", new Date().toISOString()).catch(() => {});
+          await saludPing(token, "monday_bloqueados", {
+            status: "ok", cadenciaMin: 1440,
+            detalle: `${_doms.length} dominios activos (del CRM Board, incluye ${_j?.clientesActivos ?? "?"} clientes)`,
+            real: _doms.length, esperado: 1000,
+          }).catch(() => {});
+          log(`  🚫 no-recontactar: ${_doms.length} dominios desde el CRM Board (Monday ya no hace falta acá)`);
+          return;
+        }
+        log(`  ⚠️ el CRM Board devolvió solo ${_doms.length} dominios activos — se conserva la lista anterior y se usa Monday`);
+      } else if (_r.status !== 404) {
+        log(`  ⚠️ /dominios-activos HTTP ${_r.status} — se usa Monday de respaldo`);
+      }
+    } catch (e) {
+      log(`  ⚠️ /dominios-activos: ${e.message} — se usa Monday de respaldo`);
+    }
+
     const apiKey = await _getMondayApiKeyForFeeder(token);
     if (!apiKey) return;
     let cursor = null, bloqueados = [], vueltas = 0;
