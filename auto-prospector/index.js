@@ -1868,7 +1868,11 @@ async function _getRecentConversionRate(token) {
     const vals = rows.map(r => parseFloat(r.conversion_pct)).filter(v => v > 0);
     if (vals.length === 0) return null;
     return (vals.reduce((a, b) => a + b, 0) / vals.length) / 100;
-  } catch { return null; }
+  } catch (e) {
+    log(`  ⚠️ ficha: ${e.message} para ${domain} — pasa SIN verificar`);
+    _fichaFallos++;
+    return null;
+  }
 }
 
 async function _insertFeederRun(token, slotLabel, data) {
@@ -13731,6 +13735,9 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // con 200 pendientes y cero errores: todas sus salidas tempranas eran un `return 0` mudo
   // que solo dejaba una línea en los logs de Railway, a los que no siempre hay acceso.
   // Ahora cada motivo de no-arranque queda en toolbar_health, consultable desde SQL.
+  // El contador arranca en cero cada corrida: lo que interesa es si ESTA vuelta metió
+  // prospectos sin poder chequearlos contra el CRM.
+  _fichaFallos = 0;
   await saludPing(token, "csv_queue", {
     status: "ok", cadenciaMin: 30,
     detalle: `arranca · rapidapi ${rapidUsage.usedToday}/${rapidUsage.limit} día, ${rapidMonth.usedThisMonth}/${rapidMonth.limit} mes · csv ${dailyGlobal.csvCount}/${dailyGlobal.csvCap}`,
@@ -13903,6 +13910,29 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   await saveApolloUsage(token, callsRef.count, today);
   // Maxi 2026-07-15 (Cost#1): RapidAPI ya NO se flushea acá (lo persiste el RPC atómico por hit) → evita doble-conteo.
   log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}, rapidapi(session): ${_rapidGlobalCounter}`);
+
+  // ⚠️ Si algún dominio entró SIN poder verificarse contra el CRM, se avisa. El síntoma —
+  // prospectos que están en negociación recibiendo un pitch en frío — aparece días después
+  // y lejos de la causa. Acá es una línea; allá es una auditoría.
+  if (_fichaFallos > 0) {
+    log(`⚠️ ${_fichaFallos} dominios entraron SIN verificar contra el CRM (la ficha no respondió)`);
+    await saludPing(token, "csv_queue", {
+      status: "warn", cadenciaMin: 30,
+      detalle: `${processed} procesados · ⚠️ ${_fichaFallos} entraron sin verificar contra el CRM`,
+      real: processed - _fichaFallos, esperado: processed,
+    }).catch(() => {});
+    await saludAlerta(token, {
+      clave: "ficha-crm-no-responde", severidad: "error",
+      titulo: `${_fichaFallos} prospectos entraron sin chequear contra el CRM`,
+      cuerpo: `El endpoint /api/crm/ficha no respondió. Esos dominios pasaron sin saber si están en negociación o si ya son clientes, así que el agente les puede escribir. Revisar console.adeqmedia.com.`,
+    }).catch(() => {});
+  } else {
+    await saludPing(token, "csv_queue", {
+      status: "ok", cadenciaMin: 30,
+      detalle: `${processed} procesados · todos verificados contra el CRM`,
+      real: processed, esperado: processed,
+    }).catch(() => {});
+  }
   return processed;
 }
 
@@ -15722,7 +15752,7 @@ async function processManualReengagementQueue(token) {
               log(`⚠️ ${domain}: gmail OK pero Monday update FALLÓ — revisar IDs FU1/FU2`);
               reason = "sent_ok_monday_update_failed";
             } else {
-              log(`✅ ${domain}: future email enviado a ${future_email} + Monday actualizado (FU1+5, FU2+10)`);
+              log(`✅ ${domain}: future email enviado a ${future_email}${monday_api_key ? " + Monday actualizado (FU1+5, FU2+10)" : ""}`);
             }
           }
         } catch (e) {
@@ -16643,7 +16673,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
               if (mondayItemId && mondayApiKey) {
                 const boardId = cfg.monday_active_board || cfg.monday_board_id || 1420268379;
                 await updateMondayReengagementDispatch(mondayApiKey, mondayItemId, boardId, alive.email_sent_to);
-                log(`  ✅ ${domain}: Monday actualizado con email vivo ${alive.email_sent_to}`);
+                log(`  ✅ ${domain}: email vivo registrado ${alive.email_sent_to}`);
                 logAgentAction(token, mbEmail, {
                   domain, action: "auto_promoted",
                   reason: "bounce_swap_to_alive_adicional",
@@ -16683,7 +16713,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const rangeHdr = allAttemptsRes.headers.get("content-range") || "";
     const totalAttempts = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
     if (totalAttempts >= 2) {
-      log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d + clear Monday email`);
+      log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d`);
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
         method: "POST",
         headers: {
@@ -16726,29 +16756,30 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     // en Monday por dominio y armamos un "lead sintético" para el resto del flujo.
     // Así también esos bounces terminan limpiando la URL en Monday.
     if (!lead) {
-      const cfgEarly = await getConfig(token).catch(() => ({}));
-      const mondayKeyEarly = (cfgEarly[`monday_api_key_${mbEmail.toLowerCase()}`] || cfgEarly.monday_api_key || "").trim();
-      if (mondayKeyEarly) {
-        const mondayMatch = await findMondayItem(domain, mondayKeyEarly).catch(() => null);
-        if (mondayMatch?.id) {
-          log(`  🔎 ${domain}: lead no estaba en review_queue, pero existe en Monday (item ${mondayMatch.id}) — uso fallback Monday-only`);
-          lead = {
-            id: null,
-            monday_item_id: mondayMatch.id,
-            domain,
-            emails: [],           // sin candidatos: el flujo cae directo a rescate (scrape + Apollo)
-            email_sources: {},
-            category: "",
-            traffic: 0,
-            pitch: null,
-            pitch_subject: null,
-            pitch_subjects: null,
-          };
-        }
+      // ⚠️ Antes esto miraba en Monday y con el corte quedó muerto: medido, el 10% de los
+      // reintentos de rebote (60 de 594) entraban por acá — leads viejos que existían en el
+      // CRM pero nunca pasaron por review_queue. Sin reemplazo, esos rebotes se descartaban
+      // con una línea de log y CERO alerta: direcciones muertas que nadie vuelve a intentar.
+      // Ahora se pregunta a la ficha del CRM, que es donde vive ese registro hoy.
+      const ficha = await _fichaDelCrm(domain);
+      if (ficha) {
+        log(`  🔎 ${domain}: no estaba en review_queue pero sí en el CRM (${ficha.estado}) — uso lead sintético`);
+        lead = {
+          id: null,
+          monday_item_id: null,
+          domain,
+          emails: [],           // sin candidatos: el flujo cae directo a rescate (scrape + Apollo)
+          email_sources: {},
+          category: "",
+          traffic: 0,
+          pitch: null,
+          pitch_subject: null,
+          pitch_subjects: null,
+        };
       }
     }
     if (!lead) {
-      log(`  ⏭️ ${domain}: lead no encontrado en review_queue ni en Monday — skip retry`);
+      log(`  ⏭️ ${domain}: no está ni en review_queue ni en el CRM — skip retry`);
       return;
     }
 
@@ -17003,7 +17034,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         body: JSON.stringify({ domain, send_date: new Date().toISOString().split("T")[0], email: retryEmail, pitch: body.substring(0, 1000) }),
       }).catch(() => {});
 
-      log(`  ✅ ${domain}: bounce retry enviado a ${retryEmail} + Monday actualizado`);
+      log(`  ✅ ${domain}: bounce retry enviado a ${retryEmail}`);
     } else {
       log(`  ❌ ${domain}: bounce retry FAIL — ${sendErr}`);
     }
@@ -17205,7 +17236,7 @@ async function reconcileMondayBounces(token) {
           method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
           body: JSON.stringify({ status: "reconciled" }),
         }).catch(() => {});
-        log(`  ✅ ${r.domain}: Monday actualizado a ${r.retry_email}`);
+        log(`  ✅ ${r.domain}: email actualizado a ${r.retry_email}`);
       } catch (e) { log(`  ⚠️ reconcile ${r.domain}: ${e.message}`); }
     }
   } catch (e) { log(`⚠️ reconcileMondayBounces: ${e.message}`); }
@@ -20467,12 +20498,28 @@ function _crmTelefono(tel) {
  * "está libre": acá se usa sólo para BLOQUEAR, así que un null deja pasar, que es el
  * comportamiento que ya tenía cuando Monday no respondía.
  */
+// Cuántas veces no se pudo verificar un dominio contra el CRM. Lo lee el ping de salud:
+// un número distinto de cero significa que entraron prospectos sin chequear.
+let _fichaFallos = 0;
+
 async function _fichaDelCrm(domain) {
-  if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) return null;
+  if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) {
+    log(`  ⚠️ ficha: falta CRM_SYNC_SECRET — ${domain} pasa SIN verificar si está en negociación`);
+    return null;
+  }
   try {
     const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/ficha")}?domain=${encodeURIComponent(domain)}`,
       { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(15000) });
-    if (!r.ok) return null;
+    // ⚠️ Un fallo acá NO puede quedar mudo. Ésta es la única puerta que pregunta "¿este
+    // dominio está en negociación o es cliente?" en el import de CSV: si el endpoint se cae,
+    // devuelve null y TODOS los dominios pasan como libres → entran a Prospects → el agente
+    // les escribe. Antes lo cubría findMondayItem. Se loguea y se cuenta para que el
+    // vigilante lo vea, porque el síntoma (prospectos de más) aparece días después.
+    if (!r.ok) {
+      log(`  ⚠️ ficha HTTP ${r.status} para ${domain} — pasa SIN verificar`);
+      _fichaFallos++;
+      return null;
+    }
     const j = await r.json();
     if (!j?.found) return null;
     return { estado: j.estado || "", ejecutivo: j.ejecutivo || "", board: j.board || "",
@@ -23827,15 +23874,30 @@ async function vigilarLlegadaAMonday(token) {
         return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
       } catch { return null; }
     };
-    const ok = await _n("monday_ok");
+    // ⚠️ Se cuentan LOS DOS registros. Con Monday apagado el envío se anota como `crm_ok`,
+    // así que mirar sólo `monday_ok` dejaba el total en 0: `total < 5` cortaba siempre, el
+    // ping no salía nunca y el watchdog iba a gritar "monday_llegada sin correr" todos los
+    // días para siempre. Una falsa alarma permanente es peor que no tener alarma, porque
+    // enseña a ignorarlas.
+    const okMonday = await _n("monday_ok");
+    const okCrm    = await _n("crm_ok");
     const mal = await _n("monday_failed");
-    if (ok == null || mal == null) return;          // no pude medir ≠ está roto
+    if (okMonday == null || okCrm == null || mal == null) return;   // no pude medir ≠ está roto
+    const ok = okMonday + okCrm;
     const total = ok + mal;
-    if (total < 5) return;                          // sin muestra no se concluye
+    if (total < 5) {
+      // Sin muestra no se concluye, PERO se late igual: si no, el detector queda mudo y el
+      // vigilante no puede distinguir "no hubo envíos" de "esto se rompió".
+      await saludPing(token, "monday_llegada", {
+        status: "ok", cadenciaMin: 12 * 60,
+        detalle: `sólo ${total} envíos en la ventana — muestra chica, no se concluye`,
+      }).catch(() => {});
+      return;
+    }
     const pct = Math.round((mal / total) * 100);
     await saludPing(token, "monday_llegada", {
       status: pct > 20 ? "warn" : "ok", cadenciaMin: 12 * 60,
-      detalle: `${ok} entraron al CRM, ${mal} fallaron (${pct}%)`, real: ok, esperado: total,
+      detalle: `${ok} entraron al CRM (${okCrm} por el emisor nuevo), ${mal} fallaron (${pct}%)`, real: ok, esperado: total,
     });
     if (pct > 20) {
       await saludAlerta(token, {
