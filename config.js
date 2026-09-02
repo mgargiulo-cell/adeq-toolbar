@@ -3,6 +3,13 @@
 // ============================================================
 
 export const CONFIG = {
+  // ── CRM BOARD PROPIO (Maxi 2026-09-02) ────────────────────────────────────────────────
+  // Reemplaza a Monday, que queda como respaldo intacto. El secreto vive acá porque la
+  // extensión no tiene backend propio; es el mismo esquema que ya se usa para las otras
+  // claves del popup y el endpoint valida además que el dominio sea nuestro.
+  CRM_BOARD_URL: "https://console.adeqmedia.com/api/crm/sync-toolbar",
+  CRM_BOARD_SECRET: "aEuWCl5jdf9yh0kw2_EZgDfp1p298hGz",
+
   // ── Supabase (URL y anon key son públicas por diseño) ─────────
   SUPABASE_URL:      "https://ticjpwimhtfkbccchfyp.supabase.co",
   SUPABASE_ANON_KEY: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRpY2pwd2ltaHRma2JjY2NoZnlwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ5MDE1MTksImV4cCI6MjA5MDQ3NzUxOX0.85xb7q52QHFsUZIqgOsogexMml--Ag1K3LY-a7cstyU",

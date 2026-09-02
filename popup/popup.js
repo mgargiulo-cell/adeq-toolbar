@@ -4991,14 +4991,42 @@ async function bindButtons() {
       out.textContent = `Enviando ${i + 1} de ${ids.length}…`; out.style.color = "var(--muted)";
       try {
         const mp = f.monday_payload || {};
-        await pushToMonday({
-          domain: f.domain,
-          traffic: mp.traffic_text || formatTraffic(f.traffic),
-          email: (Array.isArray(f.emails) && f.emails[0]) || "",
-          geo: f.geo, idioma: mp.idioma, pitch: f.pitch || "",
-          estado: mp.estado, fecha: mp.fecha, ejecutivo: mp.ejecutivo,
-          loginEmail: state.loginEmail,
+        // ── AHORA VA AL CRM BOARD PROPIO, NO A MONDAY (Maxi 2026-09-02) ─────────────
+        // Monday queda obsoleto: sus 10.557 items ya se migraron al board (sin borrar nada
+        // de Monday, que sigue intacto como respaldo). El botón conserva el nombre porque
+        // es el que los MB conocen, pero escribe en el CRM nuevo.
+        // El board pide el idioma como ETIQUETA y el ejecutivo como EMAIL —de ahí sale de
+        // qué casilla se manda el follow-up—, así que se traduce lo que el formulario
+        // guarda como índice/nombre corto.
+        const _IDI = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
+        const _EJEC = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
+        const _hoy = new Date();
+        const _mas = (d) => new Date(_hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
+        const r = await fetch(`${CONFIG.CRM_BOARD_URL}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+          body: JSON.stringify({ prospects: [{
+            domain: f.domain,
+            email: (Array.isArray(f.emails) && f.emails[0]) || "",
+            deal_stage: "Propuesta Vigente",
+            ejecutivo_name: _EJEC[mp.ejecutivo] || state.loginEmail,
+            fecha_contacto: mp.fecha || _mas(0),
+            fecha_fu1: _mas(5),
+            fecha_fu2: _mas(10),
+            top_geo: f.geo || "",
+            pageviews: mp.traffic_text || formatTraffic(f.traffic),
+            language: _IDI[Number(mp.idioma)] || "Ingles",
+            phone: "",
+            comments: f.pitch || "",
+            source: "toolbar-cola",
+          }] }),
         });
+        const _j = await r.json().catch(() => null);
+        if (!r.ok || !_j) throw new Error(`HTTP ${r.status}`);
+        // Los avisos NO son errores pero hay que verlos: ahí aparece el idioma sin plantilla
+        // o el estado desconocido, que después se traducen en un follow-up que no sale.
+        (_j.errores || []).forEach(e => { throw new Error(e.motivo || "rechazado"); });
+        (_j.avisos || []).forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
         // Uno por uno y marcando al vuelo: si el lote se corta a la mitad, lo que ya entró
         // NO se reenvía. Un duplicado en el CRM es más caro que reintentar el resto.
         await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${f.id}`, {
