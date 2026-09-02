@@ -12644,6 +12644,9 @@ async function findMondayItem(domain, mondayApiKey) {
 }
 
 async function updateMondayItem(itemId, columnValues, mondayApiKey) {
+  // Monday apagado: no-op silencioso pero exitoso, para no marcar como fallido algo que sí pasó.
+  if (!mondayApiKey) return true;
+
   const safe = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
   const mutation = `mutation {
     change_multiple_column_values(
@@ -15337,6 +15340,9 @@ async function pickNextEmailCandidate(token, domain, excludeEmails = []) {
 
 // 4. Update Monday item email column al nuevo email B.
 async function updateMondayItemEmail(monday_api_key, itemId, boardId, newEmail) {
+  // Monday apagado: no-op silencioso pero exitoso, para no marcar como fallido algo que sí pasó.
+  if (!monday_api_key) return true;
+
   if (!itemId || !newEmail) return false;
   const cols = JSON.stringify({ [MONDAY_COL_EMAIL]: { email: newEmail, text: newEmail } });
   const query = `mutation ($board: ID!, $item: ID!, $cols: JSON!) {
@@ -15359,7 +15365,12 @@ async function updateMondayItemEmail(monday_api_key, itemId, boardId, newEmail) 
 //     - Email column ← future_email
 //     - Fecha FU1     ← today + 5 días
 //     - Fecha FU2     ← today + 10 días
+// ⚠️ Con Monday apagado esto es un NO-OP que devuelve true. Devolver false haría que los
+// llamadores tomaran el reenganche como FALLIDO —y hay uno que corta el envío por eso—,
+// cuando el mail sí salió. El registro que importa vive en el CRM y en toolbar_agent_actions.
 async function updateMondayReengagementDispatch(monday_api_key, itemId, boardId, newEmail) {
+  if (!monday_api_key || !itemId) return true;
+
   if (!itemId || !newEmail) return false;
   const today = new Date();
   const isoDate = (d) => d.toISOString().slice(0, 10); // "YYYY-MM-DD"
@@ -15610,8 +15621,11 @@ async function processManualReengagementQueue(token) {
     const enabled = String(cfg.agent_reengagement_enabled || "").toLowerCase() === "true";
     if (!enabled) return; // mismo kill switch que el agent
 
-    const monday_api_key = cfg.monday_api_key;
-    if (!monday_api_key) { log("⚠️ manualReengage: sin MONDAY_API_KEY"); return; }
+    // ⚠️ Ya NO se corta por falta de key de Monday. Este proceso MANDA MAILS de reenganche;
+    // la escritura en Monday era sólo para anotar la dirección nueva. Con Monday apagado no
+    // hay key, y cortar acá dejaría de mandar los reenganches sin que nada avise — el mismo
+    // patrón que costó el día de envíos del agente.
+    const monday_api_key = cfg.monday_api_key || "";
     const boardId = cfg.monday_active_board || cfg.monday_board_id || 1420268379;
 
     // 1. Pickear pending vencidos (limit 20 por iteración)
