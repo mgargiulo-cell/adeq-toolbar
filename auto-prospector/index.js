@@ -15802,6 +15802,83 @@ const BOUNCE_INFRA_DOMAINS = new Set([
 
 // Worker job: escanea INBOX por mailer-daemon en últimos 24h, parsea destinatario
 // que rebotó, persiste en toolbar_bounced_emails. Corre 1 vez por loop iter.
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// EL REBOTE LLEGA EN EL IDIOMA DEL SERVIDOR DEL DESTINATARIO (Maxi 2026-09-02)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Regla del user: "todos estos avisos pueden llegar en varios idiomas, tenelo en cuenta".
+// Tiene razón y era un agujero: los idiomas estaban escritos en TRES lugares distintos —la
+// búsqueda de Gmail, `isHardBounce` y la clasificación— cada uno con una lista diferente.
+// `isHardBounce` cubría 6 idiomas y el chequeo de "no existe" cubría inglés y medio español,
+// así que un rebote alemán o japonés se detectaba pero se clasificaba mal.
+//
+// Los idiomas salen de a dónde enviamos DE VERDAD (30 días): Brasil 170 · España 85 ·
+// México 44 · EE.UU. 43 · Argentina 37 · Francia 35 · Italia 34 · Alemania 32 · Japón 22.
+// Se suman los del pool que todavía no recibieron volumen (NL, PL, TR, EL, HU, RU).
+//
+// UN SOLO lugar para las tres preguntas. Si mañana aparece un idioma nuevo, se agrega acá y
+// vale para todo el circuito.
+
+// 1. LA CASILLA NO EXISTE — el rebote más definitivo.
+const REBOTE_NO_EXISTE = new RegExp([
+  // códigos SMTP: valen en cualquier idioma y son lo más confiable
+  "550[\\s-]?5\\.1\\.1", "recipnotfound", "nosuchuser",
+  // inglés
+  "does ?n[o']?t exist", "address not found", "user unknown", "unknown user", "no such user",
+  "recipient not found", "recipient unknown", "invalid recipient", "unrouteable address",
+  "was ?n[o']?t found at", "mailbox unavailable",
+  // La redacción EXACTA de Gmail, que es la que más llega y no usa ninguna de las de arriba:
+  // "your message wasn't delivered to X because the address couldn't be found".
+  "could ?n[o']?t be found", "was ?n[o']?t delivered", "unable to receive mail",
+  // español
+  "no existe", "no se ha encontrado la direcci", "direcci[oó]n.{0,12}no.{0,12}encontrada",
+  "usuario desconocido", "destinatario no encontrado", "destinatario desconocido",
+  // portugués
+  "n[aã]o existe", "endere[cç]o.{0,12}n[aã]o.{0,12}encontrado", "usu[aá]rio desconhecido",
+  "destinat[aá]rio n[aã]o encontrado",
+  // italiano
+  "non esiste", "indirizzo.{0,12}non.{0,12}trovato", "utente sconosciuto", "destinatario non trovato",
+  // francés
+  "n['’\\s]?existe pas", "adresse.{0,12}introuvable", "n['’\\s]?a pas [eé]t[eé] trouv", "utilisateur inconnu",
+  "destinataire inconnu",
+  // alemán
+  "nicht gefunden", "existiert nicht", "unbekannter empf[aä]nger", "empf[aä]nger unbekannt",
+  // neerlandés · polaco · turco · húngaro
+  "bestaat niet", "onbekende ontvanger",
+  "nie istnieje", "nieznany u[zż]ytkownik", "nie znaleziono adresu",
+  "bulunamad", "mevcut de[gğ]il", "bilinmeyen al[iı]c",
+  "nem tal[aá]lhat", "nem l[eé]tezik",
+  // griego · ruso · japonés
+  "δεν βρέθηκε", "δεν υπάρχει",
+  "не существует", "не найден",
+  "存在しません", "見つかりません",
+].join("|"), "i");
+
+// 2. NO SE PUDO ENTREGAR, sin decir por qué. El caso Postfix: igual de definitivo.
+const REBOTE_INDELIVERABLE = new RegExp([
+  "could not be delivered", "couldn['’\\s]?t be delivered", "delivery (?:has )?failed",
+  "permanent (?:fatal )?(?:error|failure)", "returned to sender", "undeliverable",
+  "delivery to the following recipient failed permanently",
+  "no se pudo entregar", "no ha podido entregarse", "no se ha entregado", "mensaje devuelto",
+  "n[aã]o foi poss[ií]vel entregar", "n[aã]o foi entregue", "mensagem devolvida",
+  "non [eè] stato possibile consegnare", "non recapitato", "consegna non riuscita",
+  "n['’\\s]?a pas pu [eê]tre remis", "non distribu", "[eé]chec de la remise",
+  "konnte nicht zugestellt werden", "unzustellbar", "nicht zugestellt",
+  "kon niet worden bezorgd", "onbestelbaar",
+  "nie mo[zż]na dostarczy", "niedostarczone",
+  "配信できませんでした", "送信できませんでした",
+].join("|"), "i");
+
+// 3. BUZÓN LLENO — lo ÚNICO transitorio. La casilla existe y la semana que viene entra,
+// así que esta dirección NO se quema. Ojo: Exchange escribe "mailbox IS full", con el verbo
+// en el medio; la regex vieja pedía "mailbox full" exacto y por eso los daba por perdidos.
+const REBOTE_BUZON_LLENO = new RegExp([
+  "mailbox (?:is )?full", "mailbox.{0,15}full", "over quota", "quota exceeded",
+  "insufficient storage", "buz[oó]n (?:est[aá] )?lleno", "cuota excedida",
+  "caixa.{0,12}cheia", "casella.{0,12}piena", "quota superata",
+  "bo[iî]te.{0,12}pleine", "quota d[eé]pass", "postfach.{0,12}voll", "kontingent",
+  "postbus vol", "skrzynka.{0,12}pe[lł]na", "容量", "いっぱい",
+].join("|"), "i");
+
 async function scanBouncesForUser(token, userEmail) {
   try {
     const accessToken = await getGmailAccessToken(userEmail);
@@ -15871,7 +15948,17 @@ async function scanBouncesForUser(token, userEmail) {
           '"não foi entregue" OR "mensagem não entregue" OR "devolvido" OR ' +
           '"non recapitato" OR "consegna non riuscita" OR ' +
           '"non distribué" OR "n\'a pas pu être remis" OR ' +
-          '"unzustellbar" OR "nicht zugestellt" OR "onbestelbaar" OR "niedostarczone"' +
+          '"unzustellbar" OR "nicht zugestellt" OR "onbestelbaar" OR "niedostarczone" OR ' +
+          // Los asuntos también llegan en el idioma del servidor del destinatario. Estos son
+          // los idiomas a los que de verdad enviamos (30 días): Brasil, España, México,
+          // EE.UU., Argentina, Francia, Italia, Alemania, Japón — más los del pool.
+          '"mensaje devuelto" OR "correo devuelto" OR "no se pudo entregar" OR ' +
+          '"mensagem devolvida" OR "falha na entrega" OR "posta non consegnata" OR ' +
+          '"[eé]chec de la remise" OR "courrier non distribu" OR ' +
+          '"nicht zustellbar" OR "postkecske" OR "kézbesíthetetlen" OR ' +
+          '"teslim edilemedi" OR "iletilemedi" OR "niet bezorgd" OR ' +
+          '"配信不能" OR "配信できませんでした" OR "送信できませんでした" OR ' +
+          '"δεν παραδόθηκε" OR "не доставлено"' +
         ')' +
       '} newer_than:7d in:anywhere'
     );
@@ -15984,19 +16071,10 @@ async function scanBouncesForUser(token, userEmail) {
         }
         // Hard vs soft bounce detection del body — el hard amerita retry inmediato
         const bodyText = extractMessageText(msg.payload || {}).toLowerCase();
-        const isHardBounce =
-          /address not found|no se ha encontrado la dirección|endereço não encontrado|indirizzo non trovato|n'a pas été trouvée|nicht gefunden/i.test(bodyText) ||
-          // Exchange no dice "address not found", dice "<local> wasn't found at <dominio>".
-          /wasn'?t found at|was not found at|recipient unknown|unknown recipient|recipient not found/i.test(bodyText) ||
-          /550[\s-]?5\.1\.1|550[\s-]?user unknown|user does not exist|no such user|mailbox unavailable|recipient does not exist/i.test(bodyText) ||
-          /permanent failure|permanent error|permanent fatal error/i.test(bodyText) ||
-          // Postfix/Sendmail genérico: rebota sin código SMTP ni motivo. Caso real que pasó
-          // el user: samantha.mitchell@wowapp.com — solo "could not be delivered" y la
-          // dirección. Es un rebote igual de definitivo aunque no diga por qué.
-          /could not be delivered to one or more recipients|couldn'?t be delivered to|delivery to the following recipient failed permanently|returned to sender/i.test(bodyText);
-        const isSoftBounce =
-          /4\d\d[\s-]?\d\.\d\.\d|mailbox (?:is )?full|over quota|temporarily|temporary failure|try again later|rate limit/i.test(bodyText) &&
-          !isHardBounce;
+        // Los tres usan el MISMO set multilingüe de arriba: antes cada uno tenía su lista y
+        // por eso un rebote alemán o japonés se detectaba pero se clasificaba mal.
+        const isHardBounce = REBOTE_NO_EXISTE.test(bodyText) || REBOTE_INDELIVERABLE.test(bodyText);
+        const isSoftBounce = (REBOTE_BUZON_LLENO.test(bodyText) || /4\d\d[\s-]?\d\.\d\.\d|temporarily|temporary failure|try again later|rate limit/i.test(bodyText)) && !isHardBounce;
         const bounceType = isHardBounce ? "hard" : (isSoftBounce ? "soft" : "unknown");
         // ── APRENDER EL PORQUÉ, NO SOLO ANOTAR EL QUÉ (Maxi 2026-08-25, pedido del user) ──
         // Ya existía el reintento a otra dirección cuando algo rebota, pero no había
@@ -16017,16 +16095,14 @@ async function scanBouncesForUser(token, userEmail) {
         // not found` terminaba etiquetado como bloqueado. Caso real:
         // rahier.raphael@sudinfo.be. Ahora el "no existe" se pregunta PRIMERO, porque el
         // 5.1.1 es la respuesta definitiva del servidor y no admite otra lectura.
-        const _noExiste = /550[\s-]?5\.1\.1|recipnotfound|user unknown|unknown user|no such user|does not exist|doesn'?t exist|address not found|wasn'?t found at|was not found at|recipient not found|no se ha encontrado la direcci|no such recipient|invalid recipient|unrouteable address/i.test(bodyText);
         const _tipoRebote =
-          /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|does not exist.{0,20}domain/i.test(bodyText) ? "dominio_inexistente"
-          : _noExiste ? "usuario_inexistente"
-          : /mailbox (?:is )?full|over quota|quota exceeded|insufficient storage|buz[oó]n (?:est[aá] )?lleno|caixa.{0,10}cheia|mailbox.{0,15}full/i.test(bodyText) ? "buzon_lleno"
-          // Exchange/M365 rechaza por REGLA de la organización, no por reputación. Son casos
-          // distintos: acá el buzón existe y funciona, simplemente no acepta correo de afuera.
-          // Sin estas frases caían en "desconocido" y el agente reintentaba contra el mismo lugar.
-          : /isn'?t set up to receive|only accepts messages from|not allowed to send to|external communication is not allowed|mail flow rule|has blocked your message|no permitido|not permitted to send/i.test(bodyText) ? "bloqueado"
-          : /blocked|blacklist|spam|reputation|policy|rejected due to|not authorized|denied|550[\s-]?5\.7\./i.test(bodyText) ? "bloqueado"
+          /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|dominio no existe|dom[ií]nio n[aã]o existe/i.test(bodyText) ? "dominio_inexistente"
+          // El "no existe" se pregunta PRIMERO: el 5.1.1 es la respuesta definitiva del
+          // servidor. Antes se preguntaba "¿bloqueado?" antes y un RECIPNOTFOUND terminaba
+          // etiquetado como bloqueado (caso real: rahier.raphael@sudinfo.be).
+          : REBOTE_NO_EXISTE.test(bodyText) ? "usuario_inexistente"
+          : REBOTE_BUZON_LLENO.test(bodyText) ? "buzon_lleno"
+          : /blocked|blacklist|spam|reputation|policy|rejected due to|not authorized|denied|550[\s-]?5\.7\.|isn'?t set up to receive|only accepts messages from|mail flow rule|acceso denegado|acesso negado|accesso negato|acc[eè]s refus|zugriff verweigert/i.test(bodyText) ? "bloqueado"
           : isHardBounce ? "usuario_inexistente"
           : isSoftBounce ? "temporal"
           : "desconocido";
