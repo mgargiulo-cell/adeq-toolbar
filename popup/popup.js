@@ -5117,7 +5117,7 @@ async function bindButtons() {
     }
     // ⚠️ NO se exige haber mandado el mail (Maxi 2026-09-02, corrección del user).
     // Lo había puesto asumiendo que el mail sale igual y solo se pospone el CRM. El pedido
-    // real es otro: "lo mismo que enviar a Monday pero dejar todo pre-grabado en hold", en UN
+    // real es otro: "lo mismo que enviar a ADEQ pero dejar todo pre-grabado en hold", en UN
     // click. Pedirle al MB que mande el mail antes de poder guardar rompe justamente lo que
     // esto viene a resolver — no frenar la prospección durante la migración.
     // Las validaciones de DATOS sí quedan (GEO, tráfico, formato del email): sin ellas el
@@ -5358,7 +5358,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // para evitar que se actualice un item sin haber re-mandado el pitch.
     if (!state.emailSentInSession) {
       const action = state.duplicate?.found ? "update" : "push";
-      const msg = `❌ Send the email first (Send via Gmail button) before ${action} in Monday.`;
+      const msg = `❌ Mandá primero el mail (botón Send via Gmail) antes de ${action === "update" ? "actualizar" : "cargar"} en ADEQ.`;
       res.textContent = msg; res.className = "push-result error";
       document.getElementById("btn-send-gmail")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -8855,9 +8855,9 @@ async function renderProspectsEmptyState(listEl) {
     `;
   }
 
-  // Case 2: CSV/Monday URL queue active with items
+  // Case 2: cola de CSV / reciclados del CRM con items
   if (csvQueueOn && (csvProcessing || csvPendingCount > 0)) {
-    const sourceLabel = csvProcessing?.source === "monday" ? "Monday URL" : "External CSV";
+    const sourceLabel = csvProcessing?.source === "monday" ? "Reciclado del CRM" : "CSV externo";
     html += `
       <div class="cascade-empty" style="background:#fef3c7;border:1px solid #f59e0b;color:#78350f;padding:12px;border-radius:8px;margin-bottom:8px;text-align:left">
         <div style="font-weight:700;margin-bottom:4px">📥 Auto Import processing · ${esc(sourceLabel)}</div>
@@ -8872,7 +8872,7 @@ async function renderProspectsEmptyState(listEl) {
   // Case 3: nothing active
   if (!html) {
     if (!autopilotOn && !csvQueueOn) {
-      html = '<div class="cascade-empty">No activity. Turn on Autopilot or upload a CSV / Monday URL to get started.</div>';
+      html = '<div class="cascade-empty">No activity. Turn on Autopilot or subí un CSV o reciclá URLs del CRM para arrancar.</div>';
     } else if (autopilotOn && !apActive) {
       // Maxi 2026-07-15 (auditoría heartbeat): cruzar con auto_heartbeat_at (liveness REAL del worker,
       // escrito cada iteración). Si el heartbeat está fresco, el worker está VIVO — el autopilot solo
@@ -8886,7 +8886,7 @@ async function renderProspectsEmptyState(listEl) {
         html = `<div class="cascade-empty">⚠️ Autopilot ON (${esc(apUser || "?")}) pero el worker no reporta actividad (heartbeat viejo). Revisá los logs de Railway si persiste.</div>`;
       }
     } else if (csvQueueOn && csvPendingCount === 0) {
-      html = '<div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:12px;border-radius:8px;text-align:left"><div style="font-weight:700;margin-bottom:4px">✅ Work finished</div><div style="font-size:11px">All imports processed. Pending prospects went through filtering. Upload a new CSV or Monday URL refresh to add more.</div></div>';
+      html = '<div class="cascade-empty" style="background:#d1fae5;border:1px solid #10b981;color:#064e3b;padding:12px;border-radius:8px;text-align:left"><div style="font-weight:700;margin-bottom:4px">✅ Work finished</div><div style="font-size:11px">All imports processed. Pending prospects went through filtering. Subí un CSV nuevo o reciclá más URLs del CRM.</div></div>';
     } else {
       html = '<div class="cascade-empty">No pending prospects.</div>';
     }
@@ -9765,7 +9765,7 @@ function renderProspectCard(r) {
               autopilot:      ["🤖", "Auto",     "#6366f1"],
               csv:            ["📥", "CSV",      "#0ea5e9"],
               manual:         ["✋", "Manual",   "#0ea5e9"],
-              monday_refresh: ["🔄", "Monday",   "#f59e0b"],
+              monday_refresh: ["🔄", "CRM",      "#f59e0b"],
               sellers_json:   ["📋", "JSON",     "#8b5cf6"],
               autogoogle:     ["🔎", "Google",   "#22c55e"],  // Maxi 2026-06-30: faltaba → caía a "Auto"
               majestic:       ["🌐", "Majestic", "#14b8a6"],  // Maxi 2026-07-16: feeder Majestic 1M (antes lumped en Auto)
