@@ -238,11 +238,13 @@ export async function getMondayBoardIndex() {
     for (const d of (j.domains || [])) index.set(cleanDomain(d), { ejecutivo: "", fecha: "", estado: "bloqueado" });
     return index;
   } catch (e) {
-    // Un Map vacío significa "no hay nadie bloqueado" y la cascada mostraría de todo. Es el
-    // mismo comportamiento que ya tenía cuando Monday fallaba, y el consumidor tiene un
-    // Promise.race con timeout que también cae acá — se conserva, pero se avisa fuerte.
-    console.warn("[getMondayBoardIndex] el CRM no contestó, la cascada NO filtra por bloqueados:", e.message);
-    return new Map();
+    // ⚠️ NO se devuelve un Map vacío: eso significa "no hay nadie bloqueado" y la cascada
+    // mostraría clientes activos y dominios en negociación como si estuvieran libres, sin
+    // un solo aviso. Se RELANZA para que el consumidor —que ya tiene un catch que pinta el
+    // cartel en pantalla— se entere. Tragarme el error acá anulaba ese cartel: la promesa
+    // resolvía "bien" con un Map vacío y el catch del popup no corría nunca.
+    console.warn("[getMondayBoardIndex] el CRM no contestó:", e.message);
+    throw e;
   }
 }
 
@@ -297,6 +299,9 @@ export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic 
   });
   return (j.items || []).map(it => ({
     domain: it.domain,
+    // `url` la usa el botón "Import N URLs" para abrir cada sitio en una pestaña. Al migrar
+    // me la comí y el botón abría N pestañas EN BLANCO (chrome.tabs.create con undefined).
+    url: `https://www.${it.domain}`,
     traffic: it.pageviews || "",
     trafficNum: it.pageviews_num || 0,
     geo: it.top_geo || "",
@@ -319,16 +324,21 @@ export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic 
 // Devuelve { ok, items: [{owner, dominio, email, geo, fecha}] }. `ok:false` significa que
 // Monday no contestó — quien llame TIENE que decirlo en pantalla en vez de mostrar cero.
 export async function fetchManualSendsFromMonday({ desde, hasta } = {}) {
-  // Los envíos cargados a mano en el rango. Antes salía de la columna de fecha de contacto
-  // del board de Monday; ahora del CRM, que separa por ORIGEN en vez de por una marca de
-  // texto que había que acordarse de escribir.
+  // ⚠️ Devuelve { ok, items }, NO un array pelado. Se lo cambié a array y el panel de
+  // Activity se rompió entero: `monday.ok` daba undefined, así que mostraba el cartel
+  // "no se pudo leer" SIEMPRE y los tres MB aparecían con "👤 ? a mano" aunque el CRM
+  // respondiera perfecto. El `ok` es lo que separa "no mandó nadie" de "no pude preguntar",
+  // y sin él el panel acusa de caído a un sistema que anda.
   try {
     const j = await crmGet("/manuales", { desde, hasta });
-    return (j.manuales || []).map(m => ({
-      dominio: m.dominio, owner: m.owner, email: m.email, geo: m.geo, fecha: m.fecha,
-    }));
+    return {
+      ok: true,
+      items: (j.manuales || []).map(m => ({
+        dominio: m.dominio, owner: m.owner, email: m.email, geo: m.geo, fecha: m.fecha,
+      })),
+    };
   } catch (e) {
     console.warn("[fetchManualSendsFromMonday] el CRM no contestó:", e.message);
-    return [];
+    return { ok: false, items: [], motivo: e.message };
   }
 }

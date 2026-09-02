@@ -1646,7 +1646,7 @@ async function loadAdminActivity() {
   if (elAviso) {
     if (!monday.ok) {
       elAviso.style.display = "block";
-      elAviso.textContent = "⚠️ Monday no contestó. Los envíos a mano no se pueden contar y quedan en blanco — NO son cero.";
+      elAviso.textContent = "⚠️ El CRM no contestó. Los envíos a mano no se pueden contar y quedan en blanco — NO son cero.";
     } else elAviso.style.display = "none";
   }
 
@@ -3056,9 +3056,15 @@ async function runDuplicateCheck() {
     state.duplicate = result;
 
     if (result.indeterminado) {
-      // No se pudo preguntar. Decirlo, en vez de dar por libre lo que no se verificó.
+      // ⚠️ No se pudo preguntar. Se corta ACÁ con `return`: sin él, el flujo seguía hasta el
+      // `else` de abajo y pisaba este aviso con "✅ Nuevo prospecto" — además de prender
+      // `autoPushReady.notDup`, o sea habilitar el push automático de un dominio que NUNCA
+      // se verificó. El cuidado de buscarEnCrm (devolver `indeterminado` en vez de "libre")
+      // quedaba anulado dos líneas después.
       el.textContent = "⚠️ no pude consultar el CRM — verificá antes de escribir";
       el.className   = "status-badge duplicate";
+      checkProspectLock();
+      return;
     }
     if (result.found) {
       // Un negocio cerrado hace poco es el caso que más importa avisar: el sitio figura
@@ -3098,7 +3104,7 @@ async function runDuplicateCheck() {
     // Detectar idioma siempre (nuevo y duplicado) para el pitch
     autoDetectPageLanguage();
   } catch {
-    el.textContent = "⚠️ Monday API error";
+    el.textContent = "⚠️ el CRM no respondió";
     el.className   = "status-badge";
   }
 }
@@ -4199,7 +4205,7 @@ function renderEmailList(emails) {
   };
 
   if (mondayEmail) {
-    html += `<div class="email-group-label">📋 Actual (Monday)</div>${chipFor(mondayEmail, "monday")}`;
+    html += `<div class="email-group-label">📋 Actual (CRM)</div>${chipFor(mondayEmail, "monday")}`;
   }
 
   if (suggested.length > 0) {
@@ -4892,7 +4898,7 @@ async function bindButtons() {
       btn.classList.remove("btn-sent");
     } else {
       btn.disabled    = true;
-      btn.textContent = "✅ Already in Monday";
+      btn.textContent = "✅ Ya está en el CRM";
       btn.classList.add("btn-sent");
     }
   }
@@ -5012,35 +5018,27 @@ async function bindButtons() {
         // El board pide el idioma como ETIQUETA y el ejecutivo como EMAIL —de ahí sale de
         // qué casilla se manda el follow-up—, así que se traduce lo que el formulario
         // guarda como índice/nombre corto.
-        const _IDI = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
-        const _EJEC = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
-        const _hoy = new Date();
-        const _mas = (d) => new Date(_hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
-        const r = await fetch(`${CONFIG.CRM_BOARD_URL}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
-          body: JSON.stringify({ prospects: [{
-            domain: f.domain,
-            email: (Array.isArray(f.emails) && f.emails[0]) || "",
-            deal_stage: "Propuesta Vigente",
-            ejecutivo_name: _EJEC[mp.ejecutivo] || state.loginEmail,
-            fecha_contacto: mp.fecha || _mas(0),
-            fecha_fu1: _mas(5),
-            fecha_fu2: _mas(10),
-            top_geo: f.geo || "",
-            pageviews: mp.traffic_text || formatTraffic(f.traffic),
-            language: _IDI[Number(mp.idioma)] || "Ingles",
-            phone: "",
-            comments: f.pitch || "",
-            source: "toolbar-cola",
-          }] }),
+        // ⚠️ Usa el MISMO emisor que el botón, no una copia. La copia que había acá diverge
+        // en tres cosas y las tres se descubrieron auditando, no usándolas:
+        //   · mandaba `deal_stage` fijo en "Propuesta Vigente" y TIRABA el estado que el MB
+        //     había elegido y que quedó guardado en monday_payload.estado;
+        //   · calculaba FU1/FU2 desde HOY en vez de desde la fecha de contacto, así que un
+        //     prospecto guardado el lunes y mandado el viernes salía con la cadencia corrida;
+        //   · mandaba el teléfono siempre vacío.
+        // El comentario de _validarProspectoMonday ya advertía que dos copias se iban a
+        // desincronizar. Se desincronizaron.
+        await enviarAlBoard({
+          domain: f.domain,
+          email: (Array.isArray(f.emails) && f.emails[0]) || "",
+          geo: f.geo || "",
+          idioma: mp.idioma,
+          estado: mp.estado,
+          fecha: mp.fecha,
+          pitch: f.pitch || "",
+          ejecutivo: mp.ejecutivo,
+          traffic: mp.traffic_text || f.traffic,
+          telefono: f.contact_phone || "",
         });
-        const _j = await r.json().catch(() => null);
-        if (!r.ok || !_j) throw new Error(`HTTP ${r.status}`);
-        // Los avisos NO son errores pero hay que verlos: ahí aparece el idioma sin plantilla
-        // o el estado desconocido, que después se traducen en un follow-up que no sale.
-        (_j.errores || []).forEach(e => { throw new Error(e.motivo || "rechazado"); });
-        (_j.avisos || []).forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
         // Uno por uno y marcando al vuelo: si el lote se corta a la mitad, lo que ya entró
         // NO se reenvía. Un duplicado en el CRM es más caro que reintentar el resto.
         await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${f.id}`, {
@@ -5058,7 +5056,7 @@ async function bindButtons() {
     // revisar los 40 a mano para encontrar los 2 que no entraron.
     out.innerHTML = fallaron.length
       ? `✅ ${ok} enviado(s) · ❌ ${fallaron.length} fallaron:<br>` + fallaron.slice(0, 6).map(x => `· ${x}`).join("<br>")
-      : `✅ Los ${ok} entraron a Monday.`;
+      : `✅ Los ${ok} entraron al CRM.`;
     out.style.color = fallaron.length ? "#fca5a5" : "#86efac";
     btn.disabled = false;
     await _colaRefrescarContador();
@@ -5132,11 +5130,24 @@ async function bindButtons() {
 // perdían los pushes cuando el id no estaba.
 const _BOARD_IDIOMA = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
 const _BOARD_EJEC   = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
-// El board pide la ETIQUETA del estado; el formulario lo guarda como ÍNDICE. Traducir acá es
-// obligatorio: mandar el índice crudo hace que el CRM no lo reconozca y le ponga su default.
-const _BOARD_ESTADO = { 0:"LIVE", 1:"En Negociacion", 2:"Descartado", 3:"Propuesta Vigente",
-                        4:"Rebotado", 5:"Ciclo Finalizado", 6:"Masivo - Diego", 7:"Avanzado",
-                        8:"Mail No Enviado", 9:"Masivo - Agus", 10:"Masivo - Max" };
+// El board pide la ETIQUETA del estado; el formulario lo guarda como ÍNDICE.
+//
+// ⚠️ La etiqueta se lee del PROPIO <select>, no de una tabla aparte. Tenerla duplicada ya
+// falló: la copié de MONDAY_STATES, que estaba desactualizada — decía que el índice 4 era
+// "Rebotado" y el 7 "Avanzado", cuando el board real dice "Propuesta Vigente (T)" y
+// "PAUSADO". Y el 4 es el valor por DEFECTO del formulario, así que todo push manual entraba
+// al CRM como un rebote: un prospecto recién contactado quedaba marcado como dirección
+// muerta y encima "Rebotado" no bloquea el re-contacto, con lo cual el agente le volvía a
+// escribir. Leyendo del select es imposible que diverjan: lo que el MB ve es lo que se manda.
+function _estadoLabel(idx) {
+  const opt = document.querySelector(`#form-estado option[value="${String(idx)}"]`);
+  const txt = opt?.textContent?.trim();
+  if (txt) return txt;
+  // Sin opción que coincida NO se inventa un estado: se manda el default seguro del board.
+  // Un estado equivocado es peor que el default, porque decide si se le vuelve a escribir.
+  console.warn("estado sin etiqueta en el formulario:", idx);
+  return "Propuesta Vigente (T)";
+}
 
 // ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
 // Devuelve la MISMA forma que devolvía aquél para no tocar a los seis lugares que la
@@ -5174,7 +5185,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
   const cuerpo = {
     domain,
     email: email || "",
-    deal_stage: _BOARD_ESTADO[Number(estado)] || "Propuesta Vigente",
+    deal_stage: _estadoLabel(estado),
     ejecutivo_name: _BOARD_EJEC[ejecutivo] || state.loginEmail,
     fecha_contacto: contacto,
     // Las fechas de seguimiento se calculan desde el contacto, no desde hoy: si el MB carga
@@ -5309,7 +5320,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     }
     // Guard #1: GEO obligatorio — Monday no debe recibir items sin país
     if (!geo) {
-      res.textContent = "❌ GEO required. Fill the GEO field before pushing to Monday.";
+      res.textContent = "❌ Falta el GEO. Completalo antes de cargar en el CRM.";
       res.className = "push-result error";
       document.getElementById("form-geo")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -5639,7 +5650,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     const minTraffic   = tMinRaw || 0;
     const maxTraffic   = tMaxRaw || 0;
 
-    btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
+    btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
     resultEl.textContent = ""; resultEl.className = "push-result";
     listEl.innerHTML = "";
 
@@ -5647,7 +5658,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       const candidates = await fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic });
 
       if (candidates.length === 0) {
-        resultEl.textContent = "No URLs found with those filters in Monday.";
+        resultEl.textContent = "No hay URLs con esos filtros en el CRM.";
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "🚀 Import 15 URLs";
         return;
@@ -5696,7 +5707,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     const minTraffic   = tMinRaw || 0;
     const maxTraffic   = tMaxRaw || 0;
 
-    btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
+    btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
     resultEl.textContent = ""; resultEl.className = "push-result";
     listEl.innerHTML = "";
 
@@ -5704,7 +5715,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       const candidates = await fetchImportCandidates({ geo, idioma, minTraffic, maxTraffic });
 
       if (candidates.length === 0) {
-        resultEl.textContent = "No URLs found with those filters in Monday.";
+        resultEl.textContent = "No hay URLs con esos filtros en el CRM.";
         resultEl.className = "push-result error";
         btn.disabled = false; btn.textContent = "📤 Send to Queue";
         return;
@@ -6403,7 +6414,7 @@ async function loadHistoryTab() {
         <div class="stat-card stat-card--monday">
           <span class="sc-num">${monthMondayNQ}</span>
           ${pct(monthMondayNQ, monthNewQual)}
-          <span class="sc-lbl">→ Monday</span>
+          <span class="sc-lbl">→ CRM</span>
         </div>
         <div class="stat-card stat-card--neutral">
           <span class="sc-num">${monthNewBelow}</span>
@@ -6424,7 +6435,7 @@ async function loadHistoryTab() {
         <div class="stat-card stat-card--monday">
           <span class="sc-num">${monthMondayDQ}</span>
           ${pct(monthMondayDQ, monthDupQual)}
-          <span class="sc-lbl">→ Monday</span>
+          <span class="sc-lbl">→ CRM</span>
         </div>
         <div class="stat-card stat-card--neutral">
           <span class="sc-num">${monthDupBelow}</span>
@@ -6440,7 +6451,7 @@ async function loadHistoryTab() {
         <div class="stat-card ${monthMondayBelow > 0 ? "stat-card--warn" : "stat-card--neutral"}">
           <span class="sc-num">${monthMondayBelow}</span>
           ${pct(monthMondayBelow, monthBelow)}
-          <span class="sc-lbl">→ Monday${monthMondayBelow > 0 ? " ⚠️" : ""}</span>
+          <span class="sc-lbl">→ CRM${monthMondayBelow > 0 ? " ⚠️" : ""}</span>
         </div>
       </div>
     </div>
@@ -6565,13 +6576,13 @@ async function startCascade() {
 
   // Cargar índice de Monday para filtrar dominios de otros ejecutivos (últimos 45 días).
   // Si falla (timeout/401/red), seguimos igual con índice vacío — no bloqueamos al MB.
-  statusEl.textContent = "Step 1/2: checking Monday for other MBs' active domains...";
+  statusEl.textContent = "Paso 1/2: consultando al CRM los dominios activos de otros MB...";
   const boardIndex = await Promise.race([
     getMondayBoardIndex(),
     new Promise((_, reject) => setTimeout(() => reject(new Error("Monday lookup timeout 20s")), 20000)),
   ]).catch((e) => {
     console.warn("[cascade] Monday board index failed:", e.message);
-    statusEl.textContent = `⚠ Monday no respondió (${e.message}) — sigo sin filtro de ejecutivos`;
+    statusEl.textContent = `⚠ el CRM no respondió (${e.message}) — sigo sin filtro de ejecutivos`;
     return new Map();
   });
   let filteredCount = 0;
@@ -7679,7 +7690,7 @@ async function initCsvQueue() {
     // Fisher-Yates del pool 1000 (modules/monday.js) garantiza variedad.
     const limit    = 100;
 
-    btn.disabled = true; btn.textContent = "⏳ Querying Monday...";
+    btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
     resultEl.textContent = ""; resultEl.className = "push-result";
 
     try {
@@ -7725,7 +7736,7 @@ async function initCsvQueue() {
       resultEl.textContent = `❌ ${err.message}`;
       resultEl.className = "push-result error";
     } finally {
-      btn.disabled = false; btn.textContent = "🔄 Fetch & queue from Monday";
+      btn.disabled = false; btn.textContent = "🔄 Traer y encolar desde el CRM";
     }
   });
 
@@ -9902,7 +9913,7 @@ function renderProspectCard(r) {
       </div>
 
       <!-- Monday fields -->
-      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Monday data</div>
+      <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin:10px 0 6px;text-transform:uppercase;letter-spacing:.5px">Datos del CRM</div>
       <div class="form-grid">
         <label class="form-label">Owner</label>
         <select class="form-select pcard-owner">${ownerOptions}</select>
@@ -9913,7 +9924,7 @@ function renderProspectCard(r) {
         <label class="form-label">GEO</label>
         <input type="text" class="form-input pcard-geo" value="${esc(r.geo || "")}" placeholder="e.g. Mexico" style="font-size:11px;padding:4px 7px" />
         <label class="form-label">Email</label>
-        <input type="text" class="form-input pcard-email-monday" value="${esc(emails[0] || "")}" placeholder="Email a Monday" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
+        <input type="text" class="form-input pcard-email-monday" value="${esc(emails[0] || "")}" placeholder="Email al CRM" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
         <label class="form-label">Date</label>
         <input type="text" class="form-input pcard-date" value="${toDisplayDate(new Date().toISOString().split("T")[0])}" placeholder="DD/MM/YYYY" maxlength="10" style="font-size:11px;padding:4px 7px" title="Auto-completada con hoy — editable" />
         <label class="form-label">Traffic</label>
@@ -10032,7 +10043,7 @@ function initProspectCard(card, data) {
 
   // ── Lista de emails con autoverify + Apollo first + ver más toggle ────
   // Mismo sistema que Analysis. Apollo va primero. Click sincroniza el
-  // campo "Email" de Monday data abajo.
+  // campo "Email" de Datos del CRM abajo.
   const renderProspectEmailList = () => {
     const listEl = card.querySelector(".pcard-email-list");
     if (!listEl || emails.length === 0) return;
@@ -10144,7 +10155,7 @@ function initProspectCard(card, data) {
       if (block) { block.style.display = "block"; e.target.style.display = "none"; }
     });
 
-    // Click chip = seleccionar + sincronizar email a Monday data,
+    // Click chip = seleccionar + sincronizar email a Datos del CRM,
     // PERO si el user ya tipeó algo manual en el input, NO pisar.
     const mondayEmailEl = card.querySelector(".pcard-email-monday");
     const manualEmailEl = card.querySelector(".pcard-email-manual");
@@ -11013,8 +11024,8 @@ async function validateProspect(card, data, doSendEmail) {
     card.style.opacity = "0.3";
     setResult(
       mark.ok
-        ? (doSendEmail && email ? "✅ Monday + Email sent!" : "✅ Pushed to Monday")
-        : (doSendEmail && email ? "✅ Email enviado (la marca se reintenta sola)" : "✅ Cargado en Monday (la marca se reintenta sola)")
+        ? (doSendEmail && email ? "✅ Cargado en el CRM + mail enviado" : "✅ Cargado en el CRM")
+        : (doSendEmail && email ? "✅ Email enviado (la marca se reintenta sola)" : "✅ Cargado en el CRM (la marca se reintenta sola)")
     );
     setTimeout(() => { card.remove(); refreshProspectsStats(); }, 200);
 

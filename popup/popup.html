@@ -526,7 +526,7 @@
 
   <!-- CARD 2: MONDAY -->
   <section class="card">
-    <div class="card-title"><span class="icon">📋</span> Monday.com</div>
+    <div class="card-title"><span class="icon">📋</span> CRM</div>
     <div id="duplicate-result" class="status-badge loading">Checking...</div>
     <div id="score-badge" class="score-badge" style="display:none"></div>
     <div id="nonpub-notice" style="display:none;margin:6px 0;padding:8px 10px;border-radius:8px;background:#fef2f2;border:1px solid #fecaca;color:#b91c1c;font-size:12px;line-height:1.4"></div>
@@ -584,7 +584,7 @@
       </div>
       <button id="btn-push-monday" class="btn btn-success btn-full" style="margin-top:9px">🚀 Enviar al CRM</button>
       <!-- Guardar para después: mismos requisitos que el botón verde, pero en vez de empujar a
-           Monday deja el prospecto en una cola. Sirve durante la migración de CRM para que los
+           el CRM deja el prospecto en una cola. Sirve durante la migración de CRM para que los
            MB no pierdan horas de prospección esperando. Se ven y se mandan desde Prospects. -->
       <div style="display:flex;justify-content:flex-end;margin-top:4px">
         <button id="btn-guardar-cola" class="btn" title="Guarda este prospecto en la cola 'Por enviar'. Después los mandás todos juntos desde Prospects."
@@ -618,7 +618,7 @@
       <!-- Maxi 2026-06-18: Adicionales (hasta 3) — salen EN PARALELO el día 0 junto con el
            original. NO se encolan.
            ⚠️ Maxi 2026-08-28 (auditoría): la promesa original decía además "si el original
-           rebota, Monday se actualiza con el primer adicional que respondió OK" — eso NUNCA
+           rebota, el CRM se actualiza con el primer adicional que respondió OK" — eso NUNCA
            se implementó: `manual_extra` se escribe en response_tracking y nadie lo lee.
            No re-prometerlo hasta que exista. -->
       <div id="email-futuro-block" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--surface-3)">
@@ -754,7 +754,7 @@
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card card-tight">
     <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" id="cascade-monday-toggle">
-      <span><span class="icon">📥</span> Import URLs from Monday</span>
+      <span><span class="icon">📥</span> Importar URLs del CRM</span>
       <span id="cascade-monday-arrow" style="font-size:11px;color:var(--text-muted)">▼</span>
     </div>
     <div id="cascade-monday-panel" style="margin-top:8px">
@@ -1141,7 +1141,7 @@
       <!-- SIEMPRE visible (Maxi 2026-09-02): lo tenía oculto hasta que hubiera algo guardado y
            el user lo fue a buscar y no lo encontró. Una función que no se ve no existe. Cuando
            la cola está vacía se muestra apagado, pero se muestra. -->
-      <button id="btn-ver-cola" type="button" title="Prospectos guardados esperando a Monday"
+      <button id="btn-ver-cola" type="button" title="Prospectos guardados esperando envío al CRM"
               style="font-size:10px;padding:2px 7px;background:#1e7d32;color:#fff;border:none;border-radius:4px;cursor:pointer;white-space:nowrap">
         📥 Por enviar (<span id="cola-count">0</span>)
       </button>
@@ -1173,7 +1173,7 @@
       <span style="font-size:10px;color:var(--text-muted);font-weight:600;margin-right:4px">FUENTE:</span>
       <button class="prospects-preset btn btn-sm" data-source="" style="font-size:10px;padding:2px 7px;background:#0ea5e9;color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">∞ All</button>
       <button class="prospects-preset btn btn-sm" data-source="sellers_json" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📋 JSON</button>
-      <button class="prospects-preset btn btn-sm" data-source="monday_refresh" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔄 Monday</button>
+      <button class="prospects-preset btn btn-sm" data-source="monday_refresh" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔄 CRM</button>
       <button class="prospects-preset btn btn-sm" data-source="csv" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">📥 CSV</button>
       <button class="prospects-preset btn btn-sm" data-source="autopilot,similar,majestic,adstxt" title="Toda la familia del descubrimiento automático: similares, grafo de ads.txt y Majestic" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🤖 Autopilot</button>
       <button class="prospects-preset btn btn-sm" data-source="autogoogle" style="font-size:10px;padding:2px 7px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:4px;cursor:pointer">🔎 AutoGoogle</button>
@@ -1211,7 +1211,7 @@
           <span id="cola-sel" style="font-size:10px;color:var(--muted);flex:1"></span>
           <button id="btn-cola-enviar" type="button"
                   style="font-size:10px;padding:3px 9px;background:#1e7d32;color:#fff;border:none;border-radius:4px;cursor:pointer">
-            🚀 Enviar a Monday
+            🚀 Enviar al CRM
           </button>
           <button id="btn-cola-borrar" type="button" title="Saca de la cola los marcados (no los borra de Prospects)"
                   style="font-size:10px;padding:3px 7px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer">
@@ -1290,11 +1290,11 @@
      ==================================================== -->
 <div id="tab-import" class="tab-content">
 
-  <!-- (Sección "Import URLs from Monday" movida al tab Cascade — esto ahora
+  <!-- (Sección "Importar URLs del CRM" movida al tab Cascade — esto ahora
        es exclusivamente AUTO-PROSPECTOR: cola en background) -->
   <!-- MONDAY CSV AUTO PROSPECTOR — upload a CSV to refresh existing data -->
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-       SECTION 2/3 — External CSV (URLs not in Monday)
+       SECTION 2/3 — CSV externo (URLs que no están en el CRM)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card" style="margin-top:14px;padding-bottom:8px">
     <div class="card-title" style="margin-bottom:6px">📤 IMPORT CSV-EXCEL</div>
@@ -1343,13 +1343,13 @@
   </section>
 
   <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-       SECCIÓN 3/3 — Monday URL Auto Prospector
-       (busca en Monday items ya existentes en Ciclo Finalizado)
+       SECCIÓN 3/3 — Auto Prospector de URLs del CRM
+       (busca en el CRM fichas ya existentes en Ciclo Finalizado)
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
   <section class="card" style="margin-top:20px">
     <div class="card-title">🔄 IMPORT MONDAY BOARD WEBSITES</div>
     <div style="display:grid; grid-template-columns:1fr 1fr 80px; gap:6px; margin-bottom:8px">
-      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Must match exact value of GEO column in Monday.">
+      <select id="refresh-geo" class="form-select" style="font-size:11px" title="Tiene que coincidir exacto con el GEO del CRM.">
         <option value="">Geo: Todos</option>
         <!-- Opciones rellenadas dinámicamente desde MONDAY_COUNTRIES -->
       </select>
@@ -1365,7 +1365,7 @@
            El cap diario sigue en 300 (acumulado de varias tiradas). -->
       <input id="refresh-limit" type="hidden" value="100" />
     </div>
-    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Search and queue from Monday (max 100)</button>
+    <button id="btn-refresh-from-monday" class="btn btn-primary btn-full" style="font-size:11px">🔄 Buscar y encolar desde el CRM (máx 100)</button>
     <div id="refresh-from-monday-result" class="push-result" style="min-height:14px; font-size:11px; margin-top:6px"></div>
   </section>
 
