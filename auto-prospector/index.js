@@ -3647,13 +3647,14 @@ async function guardarBloqueadosDeMonday(token) {
     // Es la última cosa que ataba la toolbar a Monday: 3.333 dominios que no hay que volver a
     // contactar, de los cuales 1.506 SOLO existían allá. Ya están migrados al board.
     //
-    // Se intenta el board PRIMERO y Monday queda de respaldo. Así no hay que coordinar el
-    // momento del cambio: hoy el endpoint devuelve 404 (todavía no lo deployaron) y esto sigue
-    // andando con Monday; el día que lo suban, empieza a usarlo solo, sin tocar nada acá.
+    // La lista sale SÓLO del CRM (Maxi 2026-09-02, regla del user: "ninguna lectura ya debe
+    // ir a monday"). El código de Monday quedó abajo, inalcanzable, para no perderlo.
     //
-    // El board devuelve 3.381 contra los 3.333 de Monday: la diferencia son 93 CLIENTES
-    // ACTIVOS que salen del revenue real y que Monday no sabía que había que bloquear.
-    // Mandarle captación a un publisher que ya nos factura todos los meses no se deshace.
+    // El CRM devuelve más que Monday porque sabe cosas que Monday no sabía: los CLIENTES
+    // ACTIVOS que salen del revenue real, lo que está en un tablero de negociación y los
+    // cerrados dentro de sus 60 días de descanso. Mandarle captación a un publisher que ya
+    // nos factura todos los meses no se deshace.
+    let _falla = "";
     try {
       const _r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/dominios-activos")}`, {
         headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(20000),
@@ -3676,14 +3677,29 @@ async function guardarBloqueadosDeMonday(token) {
           log(`  🚫 no-recontactar: ${_doms.length} dominios desde el CRM Board (Monday ya no hace falta acá)`);
           return;
         }
-        log(`  ⚠️ el CRM Board devolvió solo ${_doms.length} dominios activos — se conserva la lista anterior y se usa Monday`);
+        _falla = `el CRM Board devolvió solo ${_doms.length} dominios activos`;
       } else if (_r.status !== 404) {
-        log(`  ⚠️ /dominios-activos HTTP ${_r.status} — se usa Monday de respaldo`);
+        _falla = `/dominios-activos HTTP ${_r.status}`;
+      } else {
+        _falla = "/dominios-activos devolvió 404";
       }
     } catch (e) {
-      log(`  ⚠️ /dominios-activos: ${e.message} — se usa Monday de respaldo`);
+      _falla = `/dominios-activos: ${e.message}`;
     }
 
+    // ⚠️ Ya NO se cae a Monday (regla del user 2026-09-02: "ninguna lectura ya debe ir a
+    // monday"). Se conserva la lista anterior, que es lo correcto: una lista de ayer sirve,
+    // una lista vacía manda al agente a escribirle a todo el pipeline.
+    // Se avisa como FALLA para que el vigilante lo levante — si esto se rompe y queda
+    // callado, la lista se congela y nadie se entera hasta ver un pitch en frío a un cliente.
+    log(`  ⚠️ ${_falla} — se conserva la lista anterior (Monday ya no se consulta)`);
+    await saludPing(token, "monday_bloqueados", {
+      status: "fail", cadenciaMin: 1440,
+      detalle: `${_falla}. Se sigue usando la lista guardada; si esto persiste queda vieja.`,
+    }).catch(() => {});
+    return;
+
+    // eslint-disable-next-line no-unreachable
     const apiKey = await _getMondayApiKeyForFeeder(token);
     if (!apiKey) return;
     let cursor = null, bloqueados = [], vueltas = 0;
@@ -3728,6 +3744,16 @@ async function sincronizarFinalizadosDeMonday(token) {
   try {
     const cfg = await getConfig(token).catch(() => null);
     if (!cfg) return 0;
+    // Con Monday apagado esto quedó REDUNDANTE: `_feederPullMonday` ya trae los ciclos
+    // cerrados desde /api/crm/reciclables, que además descuenta clientes, negociaciones
+    // abiertas y los 60 días de descanso — cosas que el board de Monday no sabía.
+    // Se late igual con el motivo. Apagarlo en silencio dejaría al vigilante viendo un
+    // detector que dejó de reportar y no hay forma de distinguir eso de una falla.
+    if (String(cfg.monday_enabled ?? "true").toLowerCase() !== "true") {
+      await saludPing(token, "monday_sync", { status: "ok", cadenciaMin: 0,
+        detalle: "apagado: monday_enabled=false — los ciclos cerrados los trae el feeder desde /api/crm/reciclables" }).catch(() => {});
+      return 0;
+    }
     if (String(cfg.monday_sync_finalizados ?? "true") !== "true") return 0;   // ON por default
     if (!(await _tocaCorrer(token, "monday_sync_finalizados", 24 * 60))) return 0;
     const _techoDia = parseInt(cfg.monday_sync_techo_dia || "", 10) || MONDAY_SYNC_MAX_POR_DIA;
@@ -3904,29 +3930,26 @@ async function _limpiarMarcaDeEmail(token, dominios) {
 
 async function _feederPullMonday(token, targetCount, sessionKnown) {
   try {
-    const mondayApiKey = await _getMondayApiKeyForFeeder(token);
-    if (!mondayApiKey) { log(`  ⚠️ monday: no api key`); return 0; }
+    // Los ciclos cerrados salen del CRM, no de Monday (Maxi 2026-09-02, corte pedido por el
+    // user: "ninguna lectura ya debe ir a monday"). El endpoint además descuenta lo que el
+    // board de Monday no sabía: los que están en un tablero de negociación, los clientes que
+    // facturan y los que están en sus 60 días de descanso.
     const POOL_SIZE = 1000;
-    let cursor = null;
-    let items = [];
-    do {
-      const pageArgs = cursor
-        ? `cursor: "${cursor}", limit: 500`
-        : `limit: 500, query_params: { rules: [{ column_id: "deal_stage", compare_value: [5], operator: any_of }] }`;
-      const query = `{ boards(ids: [1420268379]) { items_page(${pageArgs}) { cursor items { name } } } }`;
-      const res = await fetch("https://api.monday.com/v2", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": mondayApiKey, "API-Version": "2024-01" },
-        body: JSON.stringify({ query }),
-      });
-      const data = await res.json().catch(() => null);
-      const page = data?.data?.boards?.[0]?.items_page;
-      items = [...items, ...(page?.items || [])];
-      cursor = page?.cursor || null;
-      if (items.length >= POOL_SIZE) break;
-    } while (cursor);
-    if (items.length === 0) return 0;
-    const pool = [...new Set(items.map(it => _normalizeFeederDomain(it.name || "")).filter(Boolean))];
+    if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`); return 0; }
+    let pool = [];
+    try {
+      const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/reciclables")}?limit=${POOL_SIZE}`,
+        { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(30000) });
+      if (!r.ok) { log(`  ⚠️ feeder reciclables: HTTP ${r.status} — no re-prospecto a ciegas`); return 0; }
+      const j = await r.json();
+      pool = [...new Set((j.domains || []).map(d => _normalizeFeederDomain(d)).filter(Boolean))];
+    } catch (e) {
+      // No se cae a Monday: si no se puede leer la lista buena, NO se recicla. Reciclar con
+      // una lista incompleta significa escribirle a alguien con quien se está negociando.
+      log(`  ⚠️ feeder reciclables: ${e.message} — no re-prospecto a ciegas`);
+      return 0;
+    }
+    if (pool.length === 0) return 0;
     for (let i = pool.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [pool[i], pool[j]] = [pool[j], pool[i]];
@@ -3945,10 +3968,10 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // respetar es no volver a escribirle demasiado pronto al mismo dominio.
     const _diasReprospect = parseInt((await getConfig(token).catch(() => ({})))?.monday_reprospect_days || "90", 10) || 90;
     const _recientes = await _dominiosContactadosDesde(token, _diasReprospect).catch(() => null);
-    if (_recientes === null) { log(`  ⚠️ monday: no pude leer los contactados recientes — no re-prospecto a ciegas`); return 0; }
+    if (_recientes === null) { log(`  ⚠️ reciclables: no pude leer los contactados recientes — no re-prospecto a ciegas`); return 0; }
     const _enCola = await _dominiosActivosEnCola(token, pool).catch(() => new Set());
     const fresh = pool.filter(d => !_recientes.has(d) && !_enCola.has(d) && !sessionKnown.has(d));
-    if (fresh.length === 0) { log(`  🌱 monday: ${pool.length} finalizados, ninguno re-prospectable (todos contactados en los últimos ${_diasReprospect}d o ya en cola)`); return 0; }
+    if (fresh.length === 0) { log(`  🌱 reciclables: ${pool.length} del CRM, ninguno re-prospectable (todos contactados en los últimos ${_diasReprospect}d o ya en cola)`); return 0; }
     const slice = fresh.slice(0, targetCount);
     slice.forEach(d => sessionKnown.add(d));
     // merge-duplicates: si el dominio ya tiene fila vieja en la cola, se REACTIVA a
@@ -3957,7 +3980,7 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // Y se borra la marca de "ya le busqué email": queremos buscarle uno NUEVO, que es
     // justo el sentido de volver sobre un cliente que ya cerró ciclo.
     await _limpiarMarcaDeEmail(token, slice).catch(() => {});
-    log(`  🌱 monday: ${pool.length} finalizados, ${fresh.length} re-prospectables (>${_diasReprospect}d sin contacto) → insertados=${inserted}`);
+    log(`  🌱 reciclables: ${pool.length} del CRM, ${fresh.length} re-prospectables (>${_diasReprospect}d sin contacto) → insertados=${inserted}`);
     await saludPing(token, "feeder_monday", {
       status: "ok", cadenciaMin: 24 * 60,
       detalle: `${pool.length} finalizados, ${fresh.length} re-prospectables, ${inserted} encolados`,
@@ -3965,7 +3988,7 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     });
     return inserted;
   } catch (e) {
-    log(`  ⚠️ monday feeder error: ${e.message}`);
+    log(`  ⚠️ feeder reciclables error: ${e.message}`);
     return 0;
   }
 }
@@ -5697,33 +5720,25 @@ const MONDAY_BLOCKED_STATES = new Set([
 // Helper: ¿este estado de Monday bloquea el re-prospect? (true = NO sumar)
 function _isMondayBlocked(estado) { return MONDAY_BLOCKED_STATES.has((estado || "").trim()); }
 
-async function fetchMondayDomains(apiKey) {
-  // Trae name + estado y devuelve solo dominios cuyo estado NO es re-prospectable.
-  // Esos son los que el autopilot debe excluir del pool Majestic.
-  const query = `{
-    boards(ids: [1420268379]) {
-      items_page(limit: 500) {
-        items {
-          name
-          column_values(ids: ["deal_stage"]) { text }
-        }
-      }
-    }
-  }`;
-  const res = await fetch("https://api.monday.com/v2", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": apiKey, "API-Version": "2024-01" },
-    body: JSON.stringify({ query }),
-  });
-  const data = await res.json();
-  const items = data?.data?.boards?.[0]?.items_page?.items || [];
-  return items
-    .filter(i => {
-      const estado = i.column_values?.[0]?.text || "";
-      return _isMondayBlocked(estado); // solo los ACTIVOS/con-dueño se excluyen del pool
-    })
-    .map(i => cleanDomain(i.name))
-    .filter(Boolean);
+async function fetchDominiosBloqueados() {
+  // A qué dominios NO hay que escribirles. Antes se le preguntaba a Monday leyendo los
+  // estados no re-prospectables del board; ahora sale del CRM, que además sabe lo que Monday
+  // no sabía: los clientes que facturan, los que están en un tablero de negociación y los
+  // que están en sus 60 días de descanso.
+  //
+  // ⚠️ Devuelve null —no una lista vacía— cuando no se pudo consultar. Una lista vacía
+  // significa "no hay nadie bloqueado, escribile a todos", que es el error caro; el llamador
+  // distingue los dos casos y ante la duda no arranca.
+  if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log("  ⚠️ bloqueados: falta CRM_SYNC_SECRET"); return null; }
+  try {
+    const r = await fetch(CRM_SYNC_URL.replace("/sync-toolbar", "/dominios-activos"),
+      { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(30000) });
+    if (!r.ok) { log(`  ⚠️ bloqueados: HTTP ${r.status}`); return null; }
+    const j = await r.json();
+    const doms = Array.isArray(j?.domains) ? j.domains.filter(Boolean) : [];
+    if (doms.length < 100) { log(`  ⚠️ bloqueados: sólo ${doms.length} — sospechoso, no lo uso`); return null; }
+    return doms;
+  } catch (e) { log(`  ⚠️ bloqueados: ${e.message}`); return null; }
 }
 
 // Retry helper — 3 attempts with exponential backoff for transient RapidAPI errors.
@@ -8859,8 +8874,8 @@ async function _manualesDeMonday(token, dia) {
   // Los MB ya no cargan en Monday: el botón de la toolbar escribe en el board. Si esto
   // siguiera preguntándole a Monday, el parte diario diría "0 envíos manuales" todos los
   // días sin que nada avise — un cero se lee como un dato, no como un dato que falta.
-  // Monday queda de respaldo por si el endpoint no responde; el día que se apague del todo,
-  // el respaldo simplemente devuelve vacío y el aviso lo dice.
+  // Ya no hay respaldo a Monday: si el endpoint no contesta, `ok` queda en false y el parte
+  // lo dice en vez de mostrar un cero.
   if (CRM_SYNC_URL && CRM_SYNC_SECRET) {
     try {
       const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/manuales")}?dia=${encodeURIComponent(dia)}`,
@@ -8873,12 +8888,17 @@ async function _manualesDeMonday(token, dia) {
           out.agente = Number(j.agente) || 0;
           return out;
         }
-      } else if (r.status !== 404) {
-        log(`  ⚠️ /manuales HTTP ${r.status} — se usa Monday de respaldo`);
+      } else {
+        log(`  ⚠️ /manuales HTTP ${r.status} — el parte del día va SIN los envíos manuales`);
       }
-    } catch (e) { log(`  ⚠️ /manuales: ${e.message} — se usa Monday de respaldo`); }
+    } catch (e) { log(`  ⚠️ /manuales: ${e.message} — el parte del día va SIN los envíos manuales`); }
   }
 
+  // Ya no se cae a Monday. `out.ok` queda en false y el parte diario dice que el dato no se
+  // pudo traer, en vez de mostrar un cero que se lee como "nadie mandó nada".
+  return out;
+
+  // eslint-disable-next-line no-unreachable
   try {
     const apiKey = await _getMondayApiKeyForFeeder(token);
     if (!apiKey) return out;
@@ -9490,7 +9510,7 @@ async function parteDelDia(token) {
   const cuerpo = [
     ok ? "Todo en orden." : "⚠️ Hay cosas que revisar.",
     "",
-    `1 · ENVÍOS DE HOY — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : " · a mano: Monday no contestó"}`,
+    `1 · ENVÍOS DE HOY — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : " · a mano: NO SE PUDO TRAER del CRM"}`,
     ...lineasEnvio,
     "",
     `2 · BUZÓN PROSPECTS — ALTAS DEL DÍA`,
@@ -9659,7 +9679,7 @@ async function parteDelDia(token) {
 
   <div style="font:700 12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};letter-spacing:1px;padding:2px 0 8px 2px">PARTE 1 · CÓMO ANDUVO EL AGENTE</div>
 
-  ${_card(`Envíos de hoy — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : ""}`, _htmlEnvios, ok ? _VERDE : _ROJO)}
+  ${_card(`Envíos de hoy — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : " · a mano: NO SE PUDO TRAER del CRM"}`, _htmlEnvios, ok ? _VERDE : _ROJO)}
 
   ${_card("Buzón Prospects — Altas del día", _kv([
     ["Import (sellers.json, CSV)", altaImport],
@@ -12983,21 +13003,30 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   }
   let mondayItemId = null;
 
-  if (mondayApiKey) {
-    match = await findMondayItem(domain, mondayApiKey);
-    if (match) {
-      // Existe en Monday — bloquear SOLO si está en un estado ACTIVO/con-dueño
-      // (lista negra). Ciclo Finalizado / Mail No Enviado / Descartado → se re-prospecta.
-      if (_isMondayBlocked(match.estado)) {
+  // ¿Ya está en el CRM y con quién? Antes se le preguntaba a Monday; ahora a la ficha del
+  // board, que además sabe si está en los 60 días de descanso tras cerrar un negocio.
+  match = await _fichaDelCrm(domain);
+  if (match) {
+    {
+      if (match.descansando) {
         await markCsvItem(token, item.id, "skipped", {
-          error_message: `monday_activo: estado="${match.estado || "?"}" (deal activo/con dueño — no se re-prospecta)`,
-          monday_item_id: match.id,
+          error_message: `en descanso: cerró hace poco, faltan ${match.diasParaReintentar} días para reintentar`,
         });
-        log(`  ⏭ ${domain} — Monday estado "${match.estado}" es activo/con-dueño → skip`);
+        log(`  ⏭ ${domain} — negocio cerrado hace poco, faltan ${match.diasParaReintentar}d → skip`);
         return;
       }
+      if (_isMondayBlocked(match.estado) || match.enNegociacion) {
+        await markCsvItem(token, item.id, "skipped", {
+          error_message: `crm_activo: estado="${match.estado || "?"}"${match.board ? ` en "${match.board}"` : ""} (deal activo/con dueño — no se re-prospecta)`,
+        });
+        log(`  ⏭ ${domain} — CRM estado "${match.estado}" activo/con-dueño → skip`);
+        return;
+      }
+      // Se conserva la etiqueta "monday_refresh" a propósito: es la que identifica ESTE
+      // flujo en las métricas por fuente desde hace meses. Cambiarla ahora partiría la serie
+      // histórica en dos por un tema de nombre.
       source = "monday_refresh";
-      mondayItemId = match.id;
+      mondayItemId = null;   // ya no hay item de Monday: el registro vive en el CRM
     }
   }
 
@@ -13655,7 +13684,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       pageTitle,
       // Monday refresh tagea con el MB dueño del item original (deal_owner)
       // para que el filtro USUARIO en Prospects respete quién hizo el pedido.
-      createdBy:      (source === "monday_refresh" && match?.ownerEmail) ? match.ownerEmail : (item.uploaded_by || ""),
+      createdBy:      (source === "monday_refresh" && (match?.ejecutivo || match?.ownerEmail)) ? (match.ejecutivo || match.ownerEmail) : (item.uploaded_by || ""),
       source,
       mondayItemId,
     });
@@ -13965,10 +13994,10 @@ async function runSession(token, cfg, sessionStart) {
     }
   }
 
-  // Carga en paralelo: Majestic, Monday, procesados, rechazos, uso Apollo + RapidAPI (diario + mensual)
-  const [majesticFullPool, mondayDomains, processed, rejectionPatterns, apolloUsage, rapidUsage, rapidMonth] = await Promise.all([
+  // Carga en paralelo: Majestic, bloqueados del CRM, procesados, rechazos, uso Apollo + RapidAPI
+  const [majesticFullPool, bloqueadosCrm, processed, rejectionPatterns, apolloUsage, rapidUsage, rapidMonth] = await Promise.all([
     loadDomainPool(),
-    fetchMondayDomains(monday_api_key),
+    fetchDominiosBloqueados(),
     getProcessedDomains(token),
     getRejectionPatterns(token),
     getApolloUsageToday(token),
@@ -14077,9 +14106,10 @@ async function runSession(token, cfg, sessionStart) {
         log(`  🌱 semillas desde Prospects: ${Array.isArray(filas) ? filas.length : 0} (offset ${_offsetSemillas} → ${_prox})`);
       }
     } catch {}
-    // 4) Monday activo
-    mondayDomains.slice(0, 10).forEach(d => seedDomains.add(d));
-    log(`Similar discovery seeds: ${seedDomains.size} dominios (sendtrack + validated + ${_NSEM} de Prospects rotando + Monday)`);
+    // 4) Lo que está activo en el CRM: son publishers con los que ya hablamos, o sea buenas
+    //    semillas para buscar parecidos.
+    (bloqueadosCrm || []).slice(0, 10).forEach(d => seedDomains.add(d));
+    log(`Similar discovery seeds: ${seedDomains.size} dominios (sendtrack + validated + ${_NSEM} de Prospects rotando + CRM)`);
     if (seedDomains.size === 0) {
       log("Sin seeds disponibles — fallback a Majestic global");
       pool = majesticFullPool;
@@ -14247,7 +14277,17 @@ async function runSession(token, cfg, sessionStart) {
     log(`Patrones de rechazo aprendidos — categorías: ${topRejected}`);
   }
 
-  const mondaySet  = new Set(mondayDomains);
+  // ⚠️ Sin la lista de bloqueados NO se arranca. `fetchDominiosBloqueados` devuelve null
+  // cuando no pudo consultar, y tratarlo como "no hay nadie bloqueado" haría que el autopilot
+  // prospecte justo a los que están en negociación y a los clientes que facturan. Es el
+  // mismo patrón de siempre: "no sé" no puede valer "no".
+  if (!Array.isArray(bloqueadosCrm)) {
+    log("⛔ No pude leer los dominios bloqueados del CRM — el autopilot no arranca (prospectar a ciegas es peor que no prospectar)");
+    await saludPing(token, "autopilot", { status: "fail", cadenciaMin: 60,
+      detalle: "sin lista de bloqueados del CRM: no se arranca para no escribirle a quien está en negociación" }).catch(() => {});
+    return;
+  }
+  const mondaySet  = new Set(bloqueadosCrm);
   let candidates = pool.filter(d => !mondaySet.has(d) && !processed.has(d));
 
   // Maxi 2026-06-19 (ahorro de créditos): descartar TLDs claramente Anglo
@@ -14282,7 +14322,7 @@ async function runSession(token, cfg, sessionStart) {
 
   shuffleArray(candidates);
 
-  log(`Pool: ${pool.length.toLocaleString()} | Excluidos (Monday): ${mondayDomains.length} | Ya procesados: ${processed.size} | Candidatos finales: ${candidates.length.toLocaleString()}`);
+  log(`Pool: ${pool.length.toLocaleString()} | Excluidos (CRM): ${bloqueadosCrm.length} | Ya procesados: ${processed.size} | Candidatos finales: ${candidates.length.toLocaleString()}`);
 
   if (candidates.length === 0) {
     if (pool.length === 0) {
@@ -20399,6 +20439,26 @@ function _crmTelefono(tel) {
   const digitos = t.replace(/[^\d]/g, "");
   // E.164: entre 8 y 15 dígitos contando el país. Fuera de ahí no es un teléfono.
   return (digitos.length >= 8 && digitos.length <= 15) ? t : "";
+}
+
+/**
+ * La ficha de un dominio en el CRM. Reemplaza a `findMondayItem`.
+ * Devuelve null si no está o si no se pudo consultar — el llamador NO debe leer null como
+ * "está libre": acá se usa sólo para BLOQUEAR, así que un null deja pasar, que es el
+ * comportamiento que ya tenía cuando Monday no respondía.
+ */
+async function _fichaDelCrm(domain) {
+  if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) return null;
+  try {
+    const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/ficha")}?domain=${encodeURIComponent(domain)}`,
+      { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j?.found) return null;
+    return { estado: j.estado || "", ejecutivo: j.ejecutivo || "", board: j.board || "",
+             enNegociacion: !!(j.board && j.board !== "Prospectos ADEQ"),
+             descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0 };
+  } catch { return null; }
 }
 
 async function pushToCrmPropio(token, prospectos, contexto = "envio") {
