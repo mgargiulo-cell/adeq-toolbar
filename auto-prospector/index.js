@@ -15989,9 +15989,13 @@ async function scanBouncesForUser(token, userEmail) {
           // Exchange no dice "address not found", dice "<local> wasn't found at <dominio>".
           /wasn'?t found at|was not found at|recipient unknown|unknown recipient|recipient not found/i.test(bodyText) ||
           /550[\s-]?5\.1\.1|550[\s-]?user unknown|user does not exist|no such user|mailbox unavailable|recipient does not exist/i.test(bodyText) ||
-          /permanent failure|permanent error/i.test(bodyText);
+          /permanent failure|permanent error|permanent fatal error/i.test(bodyText) ||
+          // Postfix/Sendmail genérico: rebota sin código SMTP ni motivo. Caso real que pasó
+          // el user: samantha.mitchell@wowapp.com — solo "could not be delivered" y la
+          // dirección. Es un rebote igual de definitivo aunque no diga por qué.
+          /could not be delivered to one or more recipients|couldn'?t be delivered to|delivery to the following recipient failed permanently|returned to sender/i.test(bodyText);
         const isSoftBounce =
-          /4\d\d[\s-]?\d\.\d\.\d|mailbox full|over quota|temporarily|temporary failure|try again later|rate limit/i.test(bodyText) &&
+          /4\d\d[\s-]?\d\.\d\.\d|mailbox (?:is )?full|over quota|temporarily|temporary failure|try again later|rate limit/i.test(bodyText) &&
           !isHardBounce;
         const bounceType = isHardBounce ? "hard" : (isSoftBounce ? "soft" : "unknown");
         // ── APRENDER EL PORQUÉ, NO SOLO ANOTAR EL QUÉ (Maxi 2026-08-25, pedido del user) ──
@@ -16001,9 +16005,23 @@ async function scanBouncesForUser(token, userEmail) {
         // direcciones en el mismo lugar y también rebotaron.
         // "hard/soft" no alcanza para decidir: un buzón lleno y un dominio muerto son los
         // dos "no entregado" y piden cosas opuestas. Estas cinco categorías sí deciden.
+        // ── QUÉ ES UN REBOTE, SEGÚN EL USER (2026-09-02) ──────────────────────────────
+        // Textual: "rebote = undeliverable, no hay otro tipo de rebote", y se oficializa con
+        // el aviso de Gmail que dice "Address not found / la dirección no se ha encontrado".
+        // O sea: rebote es SOLO que la casilla (o el dominio) NO EXISTE.
+        // Buzón lleno NO es rebote: la casilla existe y la semana que viene entra.
+        // Bloqueado por política tampoco: la casilla existe, la organización nos rechaza.
+        //
+        // ⚠️ EL ORDEN IMPORTA Y ESTABA AL REVÉS. "bloqueado" se evaluaba ANTES que
+        // "no existe", así que un rechazo que decía `550 5.1.1 RESOLVER.ADR.RECIPNOTFOUND;
+        // not found` terminaba etiquetado como bloqueado. Caso real:
+        // rahier.raphael@sudinfo.be. Ahora el "no existe" se pregunta PRIMERO, porque el
+        // 5.1.1 es la respuesta definitiva del servidor y no admite otra lectura.
+        const _noExiste = /550[\s-]?5\.1\.1|recipnotfound|user unknown|unknown user|no such user|does not exist|doesn'?t exist|address not found|wasn'?t found at|was not found at|recipient not found|no se ha encontrado la direcci|no such recipient|invalid recipient|unrouteable address/i.test(bodyText);
         const _tipoRebote =
           /domain not found|host unknown|no such domain|dns error|nxdomain|550[\s-]?5\.1\.2|does not exist.{0,20}domain/i.test(bodyText) ? "dominio_inexistente"
-          : /mailbox full|over quota|quota exceeded|insufficient storage|buz[oó]n lleno|caixa.{0,10}cheia/i.test(bodyText) ? "buzon_lleno"
+          : _noExiste ? "usuario_inexistente"
+          : /mailbox (?:is )?full|over quota|quota exceeded|insufficient storage|buz[oó]n (?:est[aá] )?lleno|caixa.{0,10}cheia|mailbox.{0,15}full/i.test(bodyText) ? "buzon_lleno"
           // Exchange/M365 rechaza por REGLA de la organización, no por reputación. Son casos
           // distintos: acá el buzón existe y funciona, simplemente no acepta correo de afuera.
           // Sin estas frases caían en "desconocido" y el agente reintentaba contra el mismo lugar.
@@ -16020,10 +16038,28 @@ async function scanBouncesForUser(token, userEmail) {
             // es TRANSITORIO → NO blacklistear el email para siempre (la semana que viene
             // puede entrar). Solo hard/unknown matan el contacto. El retry a un alternativo
             // igual se dispara abajo, así tenemos cobertura sin quemar el email soft.
-            if (bounceType !== "soft") {
+            // SOLO se quema la dirección cuando NO EXISTE. Antes se blacklisteaba también al
+            // bloqueado por política y a todo lo "unknown": direcciones que existen y andan,
+            // perdidas para siempre por un rechazo que no era suyo. Medido hoy: 22 bloqueados
+            // y 3 buzones llenos quemados sin motivo.
+            // ── QUÉ SE QUEMA Y QUÉ NO (Maxi 2026-09-02) ──────────────────────────────
+            // El user definió rebote = UNDELIVERABLE: el mensaje no se pudo entregar. Los
+            // ejemplos que pasó cubren tres formas distintas y ninguna comparte texto:
+            //   "Address not found / no se ha encontrado la dirección"  (Gmail, 550 5.1.1)
+            //   "User unknown" dentro de un transcript de sesión         (550-5.1.1 con guion)
+            //   "your message could not be delivered to one or more recipients" (Postfix,
+            //    SIN código SMTP y sin decir por qué — solo la dirección y el dominio)
+            // Por eso no alcanza con buscar "no existe": hay servidores que rebotan sin dar
+            // ningún diagnóstico y el rebote es igual de definitivo.
+            //
+            // La pregunta que decide no es "por qué rebotó" sino "¿tiene sentido volver a
+            // escribirle a esta dirección?". Lo ÚNICO transitorio es el buzón lleno: la
+            // semana que viene entra. Todo lo demás es permanente y se quema.
+            const _esRebote = _tipoRebote !== "buzon_lleno" && _tipoRebote !== "temporal";
+            if (_esRebote) {
               await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
             } else {
-              log(`  ↩️ soft bounce ${failed} — transitorio, NO se blacklistea (se podrá reintentar)`);
+              log(`  ↩️ ${failed}: ${_tipoRebote} — la dirección EXISTE, no es rebote → no se blacklistea`);
             }
             detected++;
             // user 2026-05-29: TODO rebote detectado (hard, soft/buzón-lleno o unknown)
