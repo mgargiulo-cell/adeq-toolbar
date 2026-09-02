@@ -22377,6 +22377,17 @@ async function runAgentCycle(token, allFlags) {
               language: lead.language,
             },
           });
+        } else if (!mondayEnabled) {
+          // ⚠️ Monday apagado. Antes caía en el `else` de abajo y se registraba como
+          // "monday_ok / actualizado_ya_existia": el log decía que se actualizó un ítem en
+          // Monday cuando ni siquiera se llamó. Una auditoría que mire estas filas concluiría
+          // que Monday sigue vivo. El registro real del envío es `crm_ok`, más el push del
+          // CRM que va justo abajo.
+          await logAgentAction(token, userEmail, {
+            domain, action: "crm_ok", reason: "monday_apagado",
+            pitch_subject: subject,
+            details: { email, source, traffic: leadTraffic, geo: leadGeo, language: lead.language },
+          });
         } else {
           await logAgentAction(token, userEmail, {
             domain, action: "monday_ok", reason: "actualizado_ya_existia",
