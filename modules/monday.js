@@ -15,7 +15,18 @@ function _mondayIndexCol(val) {
   return Number.isInteger(n) ? { index: n } : null;
 }
 
+// ⚠️ MONDAY ESTÁ APAGADO (Maxi 2026-09-02, corte pedido por el user).
+// Todo el tráfico de la extensión hacia Monday pasaba por acá, así que éste es el lugar
+// donde se corta: una sola puerta en vez de quince parches. Si alguna función quedó sin
+// migrar, revienta acá con un mensaje que dice QUÉ falta — que es justo lo que se quiere.
+// Fallar ruidoso es lo correcto: si esto devolviera vacío en silencio, una pantalla se
+// vería "sin resultados" y nadie sabría que en realidad no se consultó nada.
+const MONDAY_APAGADO = true;
+
 async function mondayRequest(query, { timeoutMs = 15000 } = {}) {
+  if (MONDAY_APAGADO) {
+    throw new Error("Monday está apagado: esta pantalla todavía no se migró al CRM. Avisá para migrarla.");
+  }
   if (!CONFIG.MONDAY_API_KEY) {
     throw new Error("Monday API key no cargada (sesión expirada o sin permisos)");
   }
@@ -42,6 +53,22 @@ async function mondayRequest(query, { timeoutMs = 15000 } = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+
+// ── El CRM, que reemplaza a Monday ──────────────────────────────────────────────────────
+// El formulario y los filtros manejan el idioma como ÍNDICE (herencia de Monday); el CRM
+// guarda la etiqueta. Un índice vacío significa "todos" y no debe filtrar nada.
+const _IDIOMA_LABEL = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
+const _idiomaLabel = (v) => (v === "" || v == null ? "" : (_IDIOMA_LABEL[Number(v)] || ""));
+
+const CRM_BASE = () => (CONFIG.CRM_BOARD_URL || "").replace("/sync-toolbar", "");
+async function crmGet(ruta, params = {}) {
+  const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null));
+  const r = await fetch(`${CRM_BASE()}${ruta}${qs.toString() ? `?${qs}` : ""}`,
+    { headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET } });
+  if (!r.ok) throw new Error(`CRM ${ruta} → HTTP ${r.status}`);
+  return r.json();
 }
 
 export async function checkDuplicate(domain) {
@@ -200,36 +227,21 @@ export const RECYCLABLE_STATES = ["Ciclo Finalizado", "Rebotado", "Descartado"];
 // ── Board index para filtrado en cascada ──────────────────────
 // Devuelve Map<domainClean, { ejecutivo, fecha }>
 export async function getMondayBoardIndex() {
-  const query = `{
-    boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
-      items_page(limit: 500) {
-        items {
-          name
-          column_values(ids: [
-            "${CONFIG.MONDAY_COLUMNS.ejecutivo}",
-            "${CONFIG.MONDAY_COLUMNS.fecha_contacto}",
-            "${CONFIG.MONDAY_COLUMNS.estado}"
-          ]) { id text }
-        }
-      }
-    }
-  }`;
-
+  // Sólo se usa para responder "¿este dominio está bloqueado?" en la cascada de similares.
+  // Eso lo contesta /api/crm/dominios-activos, que además sabe lo que Monday no sabía: los
+  // clientes que facturan, lo que está en un tablero de negociación y los cerrados dentro
+  // de sus 60 días de descanso.
+  // Se mantiene la forma Map(dominio → {estado}) para no tocar al consumidor.
   try {
-    const data  = await mondayRequest(query);
-    const items = data?.boards?.[0]?.items_page?.items || [];
+    const j = await crmGet("/dominios-activos");
     const index = new Map();
-    for (const item of items) {
-      const col = (id) => item.column_values.find(c => c.id === id)?.text || "";
-      index.set(cleanDomain(item.name), {
-        ejecutivo: col(CONFIG.MONDAY_COLUMNS.ejecutivo),
-        fecha:     col(CONFIG.MONDAY_COLUMNS.fecha_contacto),
-        estado:    col(CONFIG.MONDAY_COLUMNS.estado),
-      });
-    }
+    for (const d of (j.domains || [])) index.set(cleanDomain(d), { ejecutivo: "", fecha: "", estado: "bloqueado" });
     return index;
   } catch (e) {
-    console.warn("[getMondayBoardIndex] failed:", e.message);
+    // Un Map vacío significa "no hay nadie bloqueado" y la cascada mostraría de todo. Es el
+    // mismo comportamiento que ya tenía cuando Monday fallaba, y el consumidor tiene un
+    // Promise.race con timeout que también cae acá — se conserva, pero se avisa fuerte.
+    console.warn("[getMondayBoardIndex] el CRM no contestó, la cascada NO filtra por bloqueados:", e.message);
     return new Map();
   }
 }
@@ -270,136 +282,29 @@ export function parseTrafficText(str) {
 // Trae dominios ya en Monday con estado "Ciclo Finalizado" filtrado por geo/idioma,
 // para re-prospectarlos en batch sin necesidad de CSV
 export async function fetchMondayForRefresh({ geo = "", idioma = "", limit = 75 } = {}) {
-  const rules = [];
-  // Estado "Ciclo Finalizado" = index 5 (obligatorio)
-  rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.estado}", compare_value: [5], operator: any_of }`);
-  if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: [${parseInt(idioma)}], operator: any_of }`);
-  if (geo)           rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.geo}", compare_value: "${geo}", operator: contains_text }`);
-
-  const queryParams = `, query_params: { rules: [${rules.join(",")}] }`;
-
-  let cursor   = null;
-  let allItems = [];
-
-  // Pool máximo a traer ANTES de mezclar. Si solo trajéramos `limit`, Monday
-  // siempre devuelve los más recientes → mismos 75 → "0 added — all known".
-  // Con 1000 de pool, hay mucha más probabilidad de pegar leads viejos no
-  // procesados al hacer el shuffle.
-  const POOL_MAX = Math.max(1000, limit * 10);
-
-  try {
-    do {
-      const pageArgs = cursor
-        ? `cursor: "${cursor}", limit: 500`
-        : `limit: 500${queryParams}`;
-
-      const query = `{
-        boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
-          items_page(${pageArgs}) {
-            cursor
-            items { name }
-          }
-        }
-      }`;
-
-      const data = await mondayRequest(query);
-      const page = data?.boards?.[0]?.items_page;
-      allItems   = [...allItems, ...(page?.items || [])];
-      cursor     = page?.cursor || null;
-
-      if (allItems.length >= POOL_MAX) break;
-    } while (cursor);
-
-    // Limpia dominios + dedup en memoria
-    const pool = [...new Set(
-      allItems
-        .map(it => cleanDomain(it.name))
-        .filter(Boolean)
-    )];
-
-    // Shuffle (Fisher-Yates) → garantiza rotación entre leads viejos y nuevos.
-    // Antes la query siempre devolvía los más recientes primero y caía en el
-    // bucle "siempre los mismos 75 — todos ya conocidos".
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-
-    return pool.slice(0, limit);
-  } catch (e) {
-    console.error("[Refresh] fetchMondayForRefresh error:", e.message);
-    throw new Error(`Monday API: ${e.message}`);
-  }
+  // Los ciclos cerrados salen del CRM. `idioma` llegaba como ÍNDICE de Monday; el CRM guarda
+  // la etiqueta, así que se traduce acá y no en el llamador.
+  const j = await crmGet("/reciclables", { limit, geo, idioma: _idiomaLabel(idioma), full: 1 });
+  return (j.items || []).map(it => it.domain);
 }
 
 // ── fetchImportCandidates — para el tab Import ────────────────
 // Trae ítems del board con estado "Ciclo Finalizado" filtrados por geo/idioma
 export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic = 0, maxTraffic = 0 } = {}) {
-  const rules = [];
-  // Estado "Ciclo Finalizado" (id 5) — SIEMPRE se filtra por este estado
-  rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.estado}", compare_value: [5], operator: any_of }`);
-  // idioma: status column con ID numérico — Monday requiere número, no string
-  if (idioma !== "") rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.idioma}", compare_value: [${parseInt(idioma)}], operator: any_of }`);
-  // geo: text column, contains_text espera un string (no array)
-  if (geo)           rules.push(`{ column_id: "${CONFIG.MONDAY_COLUMNS.geo}", compare_value: "${geo}", operator: contains_text }`);
-
-  const queryParams = rules.length
-    ? `, query_params: { rules: [${rules.join(",")}] }`
-    : "";
-
-  // Collect all items using cursor pagination (Monday max 500/page)
-  let cursor   = null;
-  let allItems = [];
-
-  try {
-    do {
-      // Monday rule: query_params SOLO en la primera request; subsequent usan solo cursor
-      let pageArgs;
-      if (cursor) {
-        pageArgs = `cursor: "${cursor}", limit: 500`;
-      } else {
-        pageArgs = `limit: 500${queryParams}`;
-      }
-
-      const query = `{
-        boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
-          items_page(${pageArgs}) {
-            cursor
-            items {
-              name
-              column_values(ids: [
-                "${CONFIG.MONDAY_COLUMNS.trafico}",
-                "${CONFIG.MONDAY_COLUMNS.geo}",
-                "${CONFIG.MONDAY_COLUMNS.idioma}",
-                "${CONFIG.MONDAY_COLUMNS.estado}"
-              ]) { id text }
-            }
-          }
-        }
-      }`;
-
-      const data = await mondayRequest(query);
-      const page = data?.boards?.[0]?.items_page;
-      allItems   = [...allItems, ...(page?.items || [])];
-      cursor     = page?.cursor || null;
-    } while (cursor);
-
-    return allItems
-      .map(item => {
-        const col     = (id) => item.column_values.find(c => c.id === id)?.text || "";
-        const traffic = parseTrafficText(col(CONFIG.MONDAY_COLUMNS.trafico));
-        const domain  = cleanDomain(item.name);
-        const estado  = col(CONFIG.MONDAY_COLUMNS.estado);
-        return { domain, url: `https://www.${domain}`, traffic, geo: col(CONFIG.MONDAY_COLUMNS.geo), idioma: col(CONFIG.MONDAY_COLUMNS.idioma), estado };
-      })
-      .filter(item => item.domain)
-      .filter(item => !minTraffic || item.traffic >= minTraffic)
-      .filter(item => !maxTraffic || item.traffic <= maxTraffic);
-
-  } catch (e) {
-    console.error("[Import] fetchImportCandidates error:", e.message);
-    return [];
-  }
+  // El botón Import: mismos filtros que en Monday, contra el CRM.
+  const j = await crmGet("/reciclables", {
+    limit: 500, geo, idioma: _idiomaLabel(idioma), minTraffic, maxTraffic, full: 1,
+  });
+  return (j.items || []).map(it => ({
+    domain: it.domain,
+    traffic: it.pageviews || "",
+    trafficNum: it.pageviews_num || 0,
+    geo: it.top_geo || "",
+    idioma: it.idioma || "",
+    estado: it.estado || "",
+    ejecutivo: it.ejecutivo || "",
+    email: it.email || "",
+  }));
 }
 
 // ── LO QUE SE MANDÓ A MANO, SEGÚN EL BOARD (Maxi 2026-08-26) ────────────────────────────
@@ -414,40 +319,16 @@ export async function fetchImportCandidates({ geo = "", idioma = "", minTraffic 
 // Devuelve { ok, items: [{owner, dominio, email, geo, fecha}] }. `ok:false` significa que
 // Monday no contestó — quien llame TIENE que decirlo en pantalla en vez de mostrar cero.
 export async function fetchManualSendsFromMonday({ desde, hasta } = {}) {
-  const col = CONFIG.MONDAY_COLUMNS;
+  // Los envíos cargados a mano en el rango. Antes salía de la columna de fecha de contacto
+  // del board de Monday; ahora del CRM, que separa por ORIGEN en vez de por una marca de
+  // texto que había que acordarse de escribir.
   try {
-    // El filtro por rango va del lado de Monday para no traerse el board entero: son 10.400+
-    // deals y el panel se abre seguido.
-    const rules = [`{ column_id: "${col.fecha_contacto}", compare_value: ["${desde}", "${hasta}"], operator: between }`];
-    const query = `{
-      boards(ids: [${CONFIG.MONDAY_ACTIVE_BOARD}]) {
-        items_page(limit: 500, query_params: { rules: [${rules.join(",")}] }) {
-          items {
-            name
-            column_values(ids: ["${col.ejecutivo}", "${col.comentarios}", "${col.geo}", "${col.fecha_contacto}", "email_mm2edcd3"]) { id text }
-          }
-        }
-      }
-    }`;
-    const data = await mondayRequest(query, { timeoutMs: 25000 });
-    const items = data?.boards?.[0]?.items_page?.items;
-    if (!Array.isArray(items)) return { ok: false, items: [] };
-    const out = [];
-    for (const it of items) {
-      const cv = {};
-      for (const c of (it.column_values || [])) cv[c.id] = c.text || "";
-      // Solo lo hecho A MANO: la marca la escribe la propia toolbar en Comentarios.
-      if (!/manual/i.test(cv[col.comentarios] || "")) continue;
-      out.push({
-        owner:   cv[col.ejecutivo] || "",
-        dominio: it.name || "",
-        email:   cv["email_mm2edcd3"] || "",
-        geo:     cv[col.geo] || "",
-        fecha:   cv[col.fecha_contacto] || "",
-      });
-    }
-    return { ok: true, items: out };
-  } catch {
-    return { ok: false, items: [] };
+    const j = await crmGet("/manuales", { desde, hasta });
+    return (j.manuales || []).map(m => ({
+      dominio: m.dominio, owner: m.owner, email: m.email, geo: m.geo, fecha: m.fecha,
+    }));
+  } catch (e) {
+    console.warn("[fetchManualSendsFromMonday] el CRM no contestó:", e.message);
+    return [];
   }
 }

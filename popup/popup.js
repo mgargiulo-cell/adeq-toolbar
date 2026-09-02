@@ -2,7 +2,12 @@
 // ADEQ TOOLBAR — Popup v4
 // ============================================================
 
-import { checkDuplicate, pushToMonday, updateMonday, getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/monday.js";
+// El módulo conserva el nombre "monday.js" pero ya no habla con Monday: cada una de estas
+// funciones consulta el CRM (console.adeqmedia.com). Se dejaron los nombres para no tocar
+// los ~30 llamadores; lo que cambió es a dónde preguntan.
+// checkDuplicate / pushToMonday / updateMonday se sacaron: los reemplazan buscarEnCrm y
+// enviarAlBoard, acá en el popup.
+import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/monday.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";

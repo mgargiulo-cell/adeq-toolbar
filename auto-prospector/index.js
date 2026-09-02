@@ -20407,7 +20407,7 @@ function _crmFecha(offsetDias = 0) {
 
 // Arma el prospecto con la MISMA semántica que el push a Monday, para que las dos columnas
 // digan lo mismo mientras convivan. Si divergen acá, la comparación de la fase 5 no sirve.
-function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail }) {
+function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail, origen = "agente" }) {
   return {
     domain,
     email: email || "",
@@ -20421,7 +20421,13 @@ function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail }
     language: _crmIdioma(language),
     phone: _crmTelefono(phone),
     comments: "Agente",                    // la misma marca que se escribe en Monday
-    source: "toolbar",
+    // ⚠️ "agente", NO "toolbar" (Maxi 2026-09-02). El agente mandaba "toolbar", que es lo
+    // mismo que pone el botón manual del MB: en el CRM quedaban indistinguibles y el parte
+    // diario contaba los ~60 envíos diarios del agente como trabajo A MANO. Medido: 753
+    // "manuales" en 9 días cuando los MB no habían cargado ni cerca de esa cantidad.
+    // El origen es el ÚNICO campo que separa las dos cosas; la marca de texto "Agente" en
+    // comments no sirve porque el MB puede escribir cualquier cosa ahí.
+    source: origen,
   };
 }
 
