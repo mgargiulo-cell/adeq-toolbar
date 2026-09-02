@@ -583,6 +583,15 @@
 
       </div>
       <button id="btn-push-monday" class="btn btn-success btn-full" style="margin-top:9px">🚀 Send to Monday</button>
+      <!-- Guardar para después: mismos requisitos que el botón verde, pero en vez de empujar a
+           Monday deja el prospecto en una cola. Sirve durante la migración de CRM para que los
+           MB no pierdan horas de prospección esperando. Se ven y se mandan desde Prospects. -->
+      <div style="display:flex;justify-content:flex-end;margin-top:4px">
+        <button id="btn-guardar-cola" class="btn" title="Guarda este prospecto en la cola 'Por enviar'. Después los mandás todos juntos desde Prospects."
+                style="font-size:10px;padding:3px 9px;background:var(--border);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+          📥 Guardar para enviar después
+        </button>
+      </div>
       <div id="push-result" class="push-result"></div>
     </div>
   </section>
@@ -1127,6 +1136,12 @@
          todo el ancho. Buscar | Fecha | Tráfico | ↻. Línea única, sin wrap. -->
     <div style="display:flex;align-items:center;margin-bottom:6px;gap:4px">
       <div class="card-title" style="margin:0;flex:1;font-size:13px">📋 Review Prospects</div>
+      <!-- Cola "Por enviar": aparece SOLO si hay algo guardado, para no ensuciar la barra el
+           99% del tiempo. El contador va en el botón para que se vea sin abrir nada. -->
+      <button id="btn-ver-cola" type="button" title="Prospectos guardados esperando a Monday"
+              style="display:none;font-size:10px;padding:2px 7px;background:#1e7d32;color:#fff;border:none;border-radius:4px;cursor:pointer;white-space:nowrap">
+        📥 Por enviar (<span id="cola-count">0</span>)
+      </button>
       <input id="prospects-name-filter" type="text" placeholder="🔎" title="Buscar dominio" style="font-size:10px;padding:2px 5px;width:60px;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)" />
       <select id="prospects-date-filter" title="Filtrar por fecha" style="font-size:10px;padding:2px 4px;width:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);color:var(--text)">
         <option value="">📅 Todas</option>
@@ -1181,6 +1196,27 @@
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
         <div style="font-size:10px;color:var(--text-muted);font-weight:600">COUNTRY / REGION:</div>
         <button id="btn-prospects-country-picker" type="button" title="Pick countries" style="font-size:10px;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--bg-input);color:var(--text);cursor:pointer">🌐 Filter countries</button>
+      </div>
+      <!-- ── PANEL DE LA COLA "POR ENVIAR" ─────────────────────────────────────────────
+           Cerrado por defecto. Muestra URL + email + GEO + idioma con un tilde por fila y un
+           "seleccionar todo", que es como el user pidió trabajarlo: revisa, marca y manda. -->
+      <div id="cola-panel" style="display:none;margin:6px 0;padding:8px;border:1px solid #1e7d32;border-radius:6px;background:var(--bg-alt)">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer">
+            <input id="cola-check-all" type="checkbox" /> Seleccionar todo
+          </label>
+          <span id="cola-sel" style="font-size:10px;color:var(--muted);flex:1"></span>
+          <button id="btn-cola-enviar" type="button"
+                  style="font-size:10px;padding:3px 9px;background:#1e7d32;color:#fff;border:none;border-radius:4px;cursor:pointer">
+            🚀 Enviar a Monday
+          </button>
+          <button id="btn-cola-borrar" type="button" title="Saca de la cola los marcados (no los borra de Prospects)"
+                  style="font-size:10px;padding:3px 7px;background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:4px;cursor:pointer">
+            Quitar
+          </button>
+        </div>
+        <div id="cola-lista" style="max-height:230px;overflow-y:auto;font-size:11px"></div>
+        <div id="cola-result" style="font-size:10px;margin-top:5px"></div>
       </div>
       <div id="prospects-geo-chips" style="display:flex;gap:4px;flex-wrap:wrap;font-size:10px"></div>
       <div id="prospects-country-panel" style="display:none;margin-top:6px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg-input);max-height:220px;overflow-y:auto">
