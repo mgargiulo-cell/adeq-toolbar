@@ -19081,7 +19081,7 @@ async function pushToMondayServer(monday_api_key, payload, boardId) {
       : {}),
     // Maxi 2026-07-21 (pedido del user): marcar Comentarios="Agente" en TODO item del agente,
     // para diferenciar sus negociaciones de las que carga un MB a mano (el push manual —
-    // modules/monday.js pushToMonday— deja Comentarios en blanco). NO es el pitch: es solo la
+    // el emisor de la extensión — deja Comentarios en blanco). NO es el pitch: es solo la
     // etiqueta de origen. El MB puede editar el comentario después sin que se re-sobrescriba
     // (esto solo corre al CREAR el item).
     // ── ORIGEN DEL LEAD (Maxi 2026-08-10) ────────────────────────────────────────────────

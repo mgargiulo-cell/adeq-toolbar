@@ -7,7 +7,7 @@
 // los ~30 llamadores; lo que cambió es a dónde preguntan.
 // checkDuplicate / pushToMonday / updateMonday se sacaron: los reemplazan buscarEnCrm y
 // enviarAlBoard, acá en el popup.
-import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/monday.js";
+import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/crm.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -309,7 +309,13 @@ function resetAnalysisUI() {
     "form-geo":       "",
     "form-idioma":    "",
     "form-ejecutivo": state.mediaBuyer || "",
-    "form-estado":    "4",   // Maxi 2026-07-15 (UI#1): era "form-status" (id inexistente) → el <select> de estado Monday NO se reseteaba y arrastraba el valor del dominio anterior. Default "4" = igual que prefillMondayForm.
+    // ⚠️ "3" = Propuesta Vigente. Era "4" (Propuesta Vigente (T)) y esa opción DEJÓ DE
+    // EXISTIR cuando el CRM redujo el vocabulario de estados. Un <select> al que le asignás
+    // un value inexistente queda EN BLANCO, así que a partir del segundo sitio analizado el
+    // MB veía el campo vacío y `_estadoLabel("")` caía al fallback. Se cambió en los otros
+    // dos lugares que fijaban el default y este se pasó por alto.
+    // Tiene que coincidir con `prefillMondayForm` y `defaultStatusForOwner`, que ya usan "3".
+    "form-estado":    "3",
     "pitch-category": "",
     "pitch-tone":     "informal",
     "pitch-length":   "short",
@@ -5038,6 +5044,9 @@ async function bindButtons() {
           ejecutivo: mp.ejecutivo,
           traffic: mp.traffic_text || f.traffic,
           telefono: f.contact_phone || "",
+          // Lo que se anotó al guardar: si el MB no había mandado el mail, el CRM tiene que
+          // mandarle el inicial.
+          mailYaEnviado: mp.mail_enviado === true,
         });
         // Uno por uno y marcando al vuelo: si el lote se corta a la mitad, lo que ya entró
         // NO se reenvía. Un duplicado en el CRM es más caro que reintentar el resto.
@@ -5145,8 +5154,10 @@ function _estadoLabel(idx) {
   if (txt) return txt;
   // Sin opción que coincida NO se inventa un estado: se manda el default seguro del board.
   // Un estado equivocado es peor que el default, porque decide si se le vuelve a escribir.
+  // ⚠️ El fallback tiene que ser una etiqueta que el CRM ACEPTE. Era "Propuesta Vigente (T)",
+  // que dejó de existir: el CRM la degradaba con un aviso que nadie ve.
   console.warn("estado sin etiqueta en el formulario:", idx);
-  return "Propuesta Vigente (T)";
+  return "Propuesta Vigente";
 }
 
 // ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
@@ -5178,7 +5189,7 @@ async function buscarEnCrm(domain) {
   }
 }
 
-async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono }) {
+async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado }) {
   const hoy = new Date();
   const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
   const contacto = /^\d{4}-\d{2}-\d{2}$/.test(String(fecha || "")) ? fecha : mas(0);
@@ -5199,6 +5210,14 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     phone: telefono || "",
     comments: pitch || "",
     source: "toolbar",
+    // ⚠️ EL MAIL INICIAL YA SALIÓ DESDE ACÁ. En Analysis la toolbar OBLIGA a mandarlo por
+    // Gmail antes de dejar cargar, así que cuando el prospecto llega al CRM el primer
+    // contacto ya ocurrió. Sin avisarlo, la cadencia del board le manda un SEGUNDO mail al
+    // día siguiente — el mismo pitch, dos veces, con dos días de diferencia.
+    // La cola "Guardar para después" es la excepción: ahí a propósito NO se exige el mail,
+    // y esos SÍ tienen que recibir el inicial del CRM. Por eso el dato viaja en vez de
+    // asumirse de un lado o del otro.
+    mail_ya_enviado: mailYaEnviado === undefined ? true : !!mailYaEnviado,
   };
   const r = await fetch(CONFIG.CRM_BOARD_URL, {
     method: "POST",
@@ -7687,7 +7706,9 @@ async function initCsvQueue() {
     const idioma   = document.getElementById("refresh-idioma").value;
     // Cap fijo 100 por tirada (user 2026-05-18, antes 75). El input refresh-limit
     // está hidden con value="100" — ya no hay UI para cambiarlo. El shuffle
-    // Fisher-Yates del pool 1000 (modules/monday.js) garantiza variedad.
+    // ⚠️ Ese shuffle YA NO EXISTE: al migrar a /api/crm/reciclables se perdió el pool de
+    // 1000 con Fisher-Yates. Si el endpoint devuelve orden estable, vuelve el bucle de
+    // 'siempre los mismos 100 → all known' que ese shuffle vino a arreglar.
     const limit    = 100;
 
     btn.disabled = true; btn.textContent = "⏳ Consultando el CRM...";
