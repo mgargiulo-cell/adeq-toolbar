@@ -2904,7 +2904,7 @@ function prefillMondayForm() {
   document.getElementById("form-fecha").value     = toDisplayDate(new Date().toISOString().split("T")[0]);
   document.getElementById("form-ejecutivo").value = state.mediaBuyer;
   // Default estado: "Propuesta Vigente (T)" (id 4) para envíos/updates desde la toolbar
-  document.getElementById("form-estado").value    = "4";
+  document.getElementById("form-estado").value    = "3";   // Propuesta Vigente — el 4 ya no existe en el CRM
 }
 
 function fillMondayFormFromDuplicate(dup) {
@@ -8785,7 +8785,7 @@ function defaultOwnerForLang(lang) {
 }
 
 function defaultStatusForOwner(_owner) {
-  return "4"; // Propuesta Vigente (T) — default para envíos/updates desde la toolbar
+  return "3"; // Propuesta Vigente — el CRM sacó "Propuesta Vigente (T)" del vocabulario (02/09)
 }
 
 let _cachedProspectDrafts = []; // cache de borradores para los dropdowns de las cards

@@ -542,18 +542,18 @@
 
         <label class="form-label">Estado</label>
         <select id="form-estado" class="form-select">
-          <!-- ⚠️ Estos son los estados que el CRM ACEPTA (crm-board-schema.ts · ESTADOS).
-               El vocabulario pasó de 15 etiquetas a 6 el 02/09: ya no existen los tres
-               "Masivo - *" ni "Mail No Enviado", y seguían acá. Elegir uno de esos no daba
-               error: el CRM lo guardaba como "Propuesta Vigente" con un aviso que el MB
-               nunca ve, o sea el prospecto quedaba en un estado distinto del que se eligió.
-               "Personalizado" NO se ofrece a propósito: es un DISPARADOR — ponerlo manda el
-               mail personalizado. Eso se decide desde el tablero, no cargando un prospecto.
-               Los value siguen siendo los índices del board original; _estadoLabel lee la
-               etiqueta de acá, así que agregar o sacar una opción alcanza. -->
+          <!-- ⚠️ EXACTAMENTE las etiquetas que el CRM acepta (ESTADOS en crm-board-schema.ts).
+               El vocabulario cambió DOS VECES el 02/09: de 15 etiquetas a 6, y después se
+               sacó "Propuesta Vigente (T)" — que era el valor por DEFECTO de este formulario.
+               Si acá queda una que allá no existe, sync-toolbar la degrada a "Propuesta
+               Vigente" con un aviso que el MB NUNCA ve: el prospecto termina en un estado
+               distinto del que la persona eligió, en silencio.
+               "Personalizado" no se ofrece a propósito: es un DISPARADOR — ponerlo manda el
+               mail personalizado, y eso se decide desde el tablero, no cargando un prospecto.
+               Los `value` son los índices del board viejo, pero no se usan para nada: el
+               emisor lee la ETIQUETA de acá. Agregar o sacar una opción alcanza. -->
           <option value="1">En Negociacion</option>
           <option value="3">Propuesta Vigente</option>
-          <option value="4">Propuesta Vigente (T)</option>
           <option value="5">Ciclo Finalizado</option>
           <option value="0">LIVE</option>
         </select>
