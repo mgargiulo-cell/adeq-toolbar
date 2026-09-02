@@ -47,6 +47,7 @@ import {
   _domainLangCache,
   _scriptNoLatino,
   detectLanguageRobust,
+  puertaClaude,
 } from "./lib/idioma.js";
 import {
   AD_SALES_CONTIENE,
@@ -9733,6 +9734,91 @@ async function _hasRealAdsTxt(domain) {
 
 // Clasificador Haiku (barato) SOLO para dudosos. Cache por dominio.
 const _publisherClassCache = new Map();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LA ÚNICA PUERTA A CLAUDE  —  techo diario + quién gastó qué
+// ═══════════════════════════════════════════════════════════════════════════════
+// Hasta el 02/09 había NUEVE `fetch` al proxy escritos a mano, cada uno por su lado.
+// Consecuencia: ni techo ni idea de quién gastaba. El worker pasó de 0 llamadas/día
+// (hasta el 25/08, con el pool trabado) a 1.777 el 02/09 en cuanto se destrabó, y el
+// salto sólo se vio en la factura. Apollo tiene tope diario y mensual desde siempre;
+// Claude no tenía ninguno.
+//
+// El techo se aplica por MOTIVO, no en bloque, porque no todas las llamadas valen igual:
+// el pitch y la elección de email salen en el camino de un envío —cortarlos cuesta un
+// lead— y el resto es enriquecimiento que puede esperar a mañana sin que se pierda nada.
+const CLAUDE_MOTIVOS_ESENCIALES = new Set(["pitch", "email_pick", "idioma_envio"]);
+let _claudeGasto = { dia: "", total: 0, porMotivo: {}, sucio: 0, cargado: false };
+
+async function _cargarGastoClaude(token) {
+  if (_claudeGasto.cargado) return;
+  _claudeGasto.cargado = true;
+  // Se persiste para que un redeploy no regale el techo de nuevo: hoy hubo varios.
+  try {
+    const cfg = await getConfig(token);
+    const g = JSON.parse(cfg.claude_gasto_hoy || "{}");
+    if (g && g.dia) _claudeGasto = { ...g, sucio: 0, cargado: true };
+  } catch {}
+}
+
+async function _guardarGastoClaude(token, forzar = false) {
+  if (!forzar && _claudeGasto.sucio < 25) return;   // no escribir config en cada llamada
+  _claudeGasto.sucio = 0;
+  const { dia, total, porMotivo } = _claudeGasto;
+  await setConfigValue(token, "claude_gasto_hoy", JSON.stringify({ dia, total, porMotivo })).catch(() => {});
+}
+
+/**
+ * Única forma de hablar con Claude en el worker.
+ * @param motivo  etiqueta corta y estable — es lo que se ve en el informe de gasto
+ * @returns el JSON de la respuesta, o null si no se pudo / si el techo la frenó
+ */
+// Se le presta la puerta a lib/idioma.js, que no puede importarla sin crear un ciclo.
+puertaClaude.llamar = (...a) => llamarClaude(...a);
+
+async function llamarClaude(token, motivo, cuerpo, { timeout = 10000 } = {}) {
+  if (!token && !BACKEND_BEARER) return null;
+  await _cargarGastoClaude(token);
+
+  const hoy = new Date().toISOString().slice(0, 10);
+  if (_claudeGasto.dia !== hoy) {
+    _claudeGasto = { dia: hoy, total: 0, porMotivo: {}, sucio: 1, cargado: true };
+  }
+
+  if (!CLAUDE_MOTIVOS_ESENCIALES.has(motivo)) {
+    const cfg = await getConfig(token).catch(() => ({}));
+    const techo = Number(cfg.claude_daily_cap ?? 700) || 700;
+    if (_claudeGasto.total >= techo) {
+      // Se avisa UNA vez por día: un tope que se cruza en silencio es un tope que nadie revisa.
+      if (!_claudeGasto.avisado) {
+        _claudeGasto.avisado = true;
+        log(`💸 TECHO de Claude alcanzado (${_claudeGasto.total}/${techo}). Lo esencial sigue; el enriquecimiento espera a mañana.`);
+        await saludPing(token, "claude_techo", { status: "warn", detalle: `${_claudeGasto.total}/${techo} — ${JSON.stringify(_claudeGasto.porMotivo)}` }).catch(() => {});
+      }
+      return null;
+    }
+  }
+
+  _claudeGasto.total++;
+  _claudeGasto.porMotivo[motivo] = (_claudeGasto.porMotivo[motivo] || 0) + 1;
+  _claudeGasto.sucio++;
+  _guardarGastoClaude(token).catch(() => {});
+
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ provider: "anthropic", path: "/v1/messages", method: "POST", body: cuerpo }),
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
 async function _haikuPublisherClass(token, domain, pageContent, swCategory, trashRules = "") {
   // Cache key incluye si hay reglas (para no servir veredictos viejos cuando el MB
   // enseña reglas nuevas vía rechazos).
@@ -9773,21 +9859,12 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory, tras
     + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | bank | travel | nonprofit | service | marketplace | other.";
   let type = null;
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider: "anthropic", path: "/v1/messages", method: "POST",
-        body: {
-          model: "claude-haiku-4-5", max_tokens: 20,
-          system: sys,
-          messages: [{ role: "user", content: `Domain: ${domain}\nTitle: ${title}\nDescription: ${desc}\nSimilarWeb category: ${swCategory || "?"}` }],
-        },
-      }),
-      signal: AbortSignal.timeout(12000),
-    });
-    if (res.ok) {
-      const data = await res.json();
+    const data = await llamarClaude(token, "clasificar_sitio", {
+model: "claude-haiku-4-5", max_tokens: 20,
+system: sys,
+messages: [{ role: "user", content: `Domain: ${domain}\nTitle: ${title}\nDescription: ${desc}\nSimilarWeb category: ${swCategory || "?"}` }],
+        }, { timeout: 12000 });
+    if (data) {
       const t = (data?.content?.[0]?.text || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
       if (["publisher","corp","gov","edu","saas","ecommerce","bank","travel","nonprofit","service","marketplace","realestate","other"].includes(t)) type = t;
     }
@@ -9850,7 +9927,7 @@ async function runSuspectRejectAnalysis(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let rows = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=eq.false&select=id,domain,page_title,category&order=created_at.desc&limit=200`, { headers: auth });
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_checked_at=is.null&select=id,domain,page_title,category&order=created_at.desc&limit=200`, { headers: auth });
     if (r.ok) rows = await r.json();
   } catch {}
   if (!Array.isArray(rows) || rows.length === 0) return;
@@ -9865,12 +9942,24 @@ async function runSuspectRejectAnalysis(token) {
       let reason = "";
       const type = await _haikuPublisherClass(token, row.domain, { title: row.page_title || "", description: "" }, row.category || "", trash.rules || "");
       if (type && type !== "publisher") reason = `tipo detectado: ${type}`;
-      if (!reason) return;
+      // ⚠️ Antes esto era `if (!reason) return;` a secas: el que salía limpio no se marcaba,
+      // volvía a caer en los 200 más nuevos de la corrida siguiente y se pagaba de nuevo, para
+      // siempre. Medido el 02/09: de los 200 más nuevos, los 200 estaban limpios — o sea 200
+      // llamadas a Haiku por corrida (Lun/Mié/Vie) para producir CERO información nueva.
+      // Un dictamen "está bien" es un resultado, y hay que guardarlo igual que el otro.
+      if (!reason) {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${row.id}`, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ suspect_checked_at: new Date().toISOString() }),
+        }).catch(() => {});
+        return;
+      }
       try {
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${row.id}`, {
           method: "PATCH",
           headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ suspect_reject: true, suspect_reason: reason.slice(0, 200) }),
+          body: JSON.stringify({ suspect_reject: true, suspect_reason: reason.slice(0, 200), suspect_checked_at: new Date().toISOString() }),
         });
         flagged++;
       } catch {}
@@ -11151,36 +11240,22 @@ async function _iaJuzgaBloqueado(token, domain, { category = "", geo = "", traff
   if (!domain || !token) return null;
   if (_iaMonetizaCache.has(domain)) return _iaMonetizaCache.get(domain);
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        provider: "anthropic",
-        path: "/v1/messages",
-        method: "POST",
-        body: {
-          model: "claude-haiku-4-5",
-          max_tokens: 12,
-          system: [
-            "Sos un analista de medios digitales. Te dan un dominio que NO pudimos inspeccionar (nos bloquea el scraper).",
-            "Decidí si es un MEDIO DE CONTENIDO que monetiza con publicidad display/programática (diario, revista,",
-            "portal de noticias, deportes, entretenimiento, blog grande, sitio de recetas/tecnología con ads).",
-            "NO son medios: bancos, seguros, gobiernos, universidades, e-commerce, SaaS, casas de apuestas,",
-            "aerolíneas, marcas corporativas, plataformas de streaming, herramientas, redes sociales.",
-            "Respondé UNA sola palabra: 'publisher' si estás razonablemente seguro de que es un medio con ads,",
-            "'no' si estás razonablemente seguro de que no lo es, 'duda' si no lo conocés o no estás seguro.",
-            "Ante la duda respondé 'duda'. Sin explicación.",
-          ].join(" "),
-          messages: [{ role: "user", content: `Dominio: ${domain}\nCategoría: ${category || "?"}\nPaís: ${geo || "?"}\nPageviews: ${traffic || "?"}` }],
-        },
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await llamarClaude(token, "sitio_bloqueado", {
+model: "claude-haiku-4-5",
+max_tokens: 12,
+system: [
+  "Sos un analista de medios digitales. Te dan un dominio que NO pudimos inspeccionar (nos bloquea el scraper).",
+  "Decidí si es un MEDIO DE CONTENIDO que monetiza con publicidad display/programática (diario, revista,",
+  "portal de noticias, deportes, entretenimiento, blog grande, sitio de recetas/tecnología con ads).",
+  "NO son medios: bancos, seguros, gobiernos, universidades, e-commerce, SaaS, casas de apuestas,",
+  "aerolíneas, marcas corporativas, plataformas de streaming, herramientas, redes sociales.",
+  "Respondé UNA sola palabra: 'publisher' si estás razonablemente seguro de que es un medio con ads,",
+  "'no' si estás razonablemente seguro de que no lo es, 'duda' si no lo conocés o no estás seguro.",
+  "Ante la duda respondé 'duda'. Sin explicación.",
+].join(" "),
+messages: [{ role: "user", content: `Dominio: ${domain}\nCategoría: ${category || "?"}\nPaís: ${geo || "?"}\nPageviews: ${traffic || "?"}` }],
+        }, { timeout: 10000 });
+    if (!data) return null;
     const txt = (data?.content?.[0]?.text || "").trim().toLowerCase();
     const out = /publisher/.test(txt) ? "publisher" : /^no\b|no_publisher/.test(txt) ? "no" : "duda";
     if (_iaMonetizaCache.size > 3000) _iaMonetizaCache.clear();
@@ -11270,27 +11345,13 @@ async function classifyPublisher(token, domain, pageContent, swCategory, swData 
 async function _claudeLangByContext(token, domain, geo) {
   if (!domain) return null;
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        provider: "anthropic",
-        path: "/v1/messages",
-        method: "POST",
-        body: {
-          model: "claude-haiku-4-5",
-          max_tokens: 20,
-          system: "Guess the primary content language of a website given ONLY its domain and country code. Reply with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). If unsure, reply 'other'. No explanation.",
-          messages: [{ role: "user", content: `Domain: ${domain}\nCountry: ${geo || "unknown"}` }],
-        },
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await llamarClaude(token, "idioma_envio", {
+model: "claude-haiku-4-5",
+max_tokens: 20,
+system: "Guess the primary content language of a website given ONLY its domain and country code. Reply with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). If unsure, reply 'other'. No explanation.",
+messages: [{ role: "user", content: `Domain: ${domain}\nCountry: ${geo || "unknown"}` }],
+        }, { timeout: 8000 });
+    if (!data) return null;
     const text = (data?.content?.[0]?.text || "").trim().toLowerCase();
     const m = text.match(/^([a-z]{2})/);
     return m && SUPPORTED_AGENT_LANGS.has(m[1]) ? m[1] : null;
@@ -17068,27 +17129,13 @@ ${emails.map((e, i) => `${i + 1}. ${e}`).join("\n")}
 Devolveme JSON: { "email": "<el email exacto>", "reason": "<5 palabras>" }`;
 
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        provider: "anthropic",
-        path: "/v1/messages",
-        method: "POST",
-        body: {
-          model: "claude-haiku-4-5", // Haiku 4.5 = mucho más barato que Sonnet, suficiente para este pick
-          max_tokens: 100,
-          system: "Sos un experto en B2B AdTech sales. Elegís emails para outreach.",
-          messages: [{ role: "user", content: userMsg }],
-        },
-      }),
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await llamarClaude(token, "email_pick", {
+model: "claude-haiku-4-5", // Haiku 4.5 = mucho más barato que Sonnet, suficiente para este pick
+max_tokens: 100,
+system: "Sos un experto en B2B AdTech sales. Elegís emails para outreach.",
+messages: [{ role: "user", content: userMsg }],
+        }, { timeout: 15000 });
+    if (!data) return null;
     const text = data?.content?.[0]?.text || "";
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return null;
@@ -17166,37 +17213,25 @@ Contact: ${contactName || "(unknown)"}
 
 Write the prospecting email. Return JSON only.`;
 
-  const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-    method: "POST",
-    headers: {
-      "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      provider: "anthropic",
-      path: "/v1/messages",
-      method: "POST",
-      body: {
-        // Maxi 2026-08-07: era claude-sonnet-4-5, que NO está en la lista blanca del api-proxy
-        // (la puse el 04/08 con el blindaje). O sea que desde esa fecha CADA pitch escrito por
-        // Claude fallaba con 400 "modelo no permitido" — el 20% de los envíos que no usan
-        // template. claude-sonnet-5 es el vigente y el que el proxy permite.
-        model: "claude-sonnet-5",
-        // Sonnet 5 PIENSA por defecto, y max_tokens topea pensamiento + respuesta juntos. Con
-        // los 1024 de antes el JSON del pitch se cortaba a la mitad. effort "low" mantiene la
-        // latencia baja (esto corre en línea con el envío) y 4000 deja aire; el proxy no acepta
-        // más de 4096.
-        max_tokens: 4000,
-        thinking: { type: "adaptive" },
-        output_config: { effort: "low" },
-        system: systemMsg,
-        messages: [{ role: "user", content: userMsg }],
-      },
-    }),
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!res.ok) throw new Error(`Claude HTTP ${res.status}`);
-  const data = await res.json();
+  const data = await llamarClaude(token, "pitch", {
+// Maxi 2026-08-07: era claude-sonnet-4-5, que NO está en la lista blanca del api-proxy
+// (la puse el 04/08 con el blindaje). O sea que desde esa fecha CADA pitch escrito por
+// Claude fallaba con 400 "modelo no permitido" — el 20% de los envíos que no usan
+// template. claude-sonnet-5 es el vigente y el que el proxy permite.
+model: "claude-sonnet-5",
+// Sonnet 5 PIENSA por defecto, y max_tokens topea pensamiento + respuesta juntos. Con
+// los 1024 de antes el JSON del pitch se cortaba a la mitad. effort "low" mantiene la
+// latencia baja (esto corre en línea con el envío) y 4000 deja aire; el proxy no acepta
+// más de 4096.
+max_tokens: 4000,
+thinking: { type: "adaptive" },
+output_config: { effort: "low" },
+system: systemMsg,
+messages: [{ role: "user", content: userMsg }],
+      }, { timeout: 30000 });
+  // `res` ya no existe acá: la puerta devuelve el JSON o null. Sin este cambio el throw
+  // tiraba un ReferenceError y el llamador veía un error que no dice nada del problema real.
+  if (!data) throw new Error("Claude no respondió (o lo frenó el techo diario)");
   const text = data?.content?.[0]?.text || "";
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("Claude response no contiene JSON");
@@ -21433,21 +21468,12 @@ Devolveme SOLO JSON:
 - Basate en patrones REALES de los ejemplos, no inventes. Si no hay señal suficiente para una lista, devolvela vacía.`;
 
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider: "anthropic", path: "/v1/messages", method: "POST",
-        body: {
-          model: "claude-haiku-4-5", max_tokens: 600,
-          system: "Sos un analista de copywriting B2B. Destilás feedback en reglas accionables. Devolvés SOLO JSON válido.",
-          messages: [{ role: "user", content: userMsg }],
-        },
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) return;
-    const data = await res.json();
+    const data = await llamarClaude(token, "reglas_pitch", {
+model: "claude-haiku-4-5", max_tokens: 600,
+system: "Sos un analista de copywriting B2B. Destilás feedback en reglas accionables. Devolvés SOLO JSON válido.",
+messages: [{ role: "user", content: userMsg }],
+        }, { timeout: 20000 });
+    if (!data) return;
     const text = data?.content?.[0]?.text || "";
     const m = text.match(/\{[\s\S]*\}/);
     if (!m) return;
@@ -21511,17 +21537,8 @@ Devolveme SOLO JSON: { "rules": ["regla corta 1", "regla corta 2", ...] }
 - Máximo 8 reglas, en español, concretas y por CONTENIDO (ej: "e-commerce / tiendas de venta", "blog corporativo de una empresa de servicios", "portal de gobierno o municipio", "sitio de cursos/universidad", "directorio o agregador sin contenido propio", "landing de un producto/SaaS").
 - Basate en patrones REALES de los motivos, no inventes.`;
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider: "anthropic", path: "/v1/messages", method: "POST",
-        body: { model: "claude-haiku-4-5", max_tokens: 500, system: "Sos un analista que destila feedback en reglas de filtrado accionables por contenido. Devolvés SOLO JSON válido.", messages: [{ role: "user", content: userMsg }] },
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) return;
-    const data = await res.json();
+    const data = await llamarClaude(token, "reglas_descarte", { model: "claude-haiku-4-5", max_tokens: 500, system: "Sos un analista que destila feedback en reglas de filtrado accionables por contenido. Devolvés SOLO JSON válido.", messages: [{ role: "user", content: userMsg }] }, { timeout: 20000 });
+    if (!data) return;
     const m = (data?.content?.[0]?.text || "").match(/\{[\s\S]*\}/);
     if (!m) return;
     const parsed = JSON.parse(m[0]);
@@ -21559,17 +21576,8 @@ async function generateFreshKeywords(token) {
 - Frases cortas y naturales (2 a 5 palabras), como una búsqueda real.
 Devolveme SOLO JSON: { "keywords": ["frase 1", "frase 2", ...] }`;
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider: "anthropic", path: "/v1/messages", method: "POST",
-        body: { model: "claude-haiku-4-5", max_tokens: 1200, system: "Generás frases de búsqueda de Google para encontrar publishers de contenido. Devolvés SOLO JSON válido.", messages: [{ role: "user", content: userMsg }] },
-      }),
-      signal: AbortSignal.timeout(25000),
-    });
-    if (!res.ok) return 0;
-    const data = await res.json();
+    const data = await llamarClaude(token, "keywords", { model: "claude-haiku-4-5", max_tokens: 1200, system: "Generás frases de búsqueda de Google para encontrar publishers de contenido. Devolvés SOLO JSON válido.", messages: [{ role: "user", content: userMsg }] }, { timeout: 25000 });
+    if (!data) return 0;
     const m = (data?.content?.[0]?.text || "").match(/\{[\s\S]*\}/);
     if (!m) return 0;
     const parsed = JSON.parse(m[0]);

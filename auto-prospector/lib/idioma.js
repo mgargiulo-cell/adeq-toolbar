@@ -159,30 +159,23 @@ export const _domainLangCache = new Map();
 
 export const DOMAIN_LANG_CACHE_MAX = 1000;
 
+
+// La puerta a Claude vive en index.js (necesita getConfig/setConfigValue/log/saludPing, que
+// arrastrarían medio archivo hasta acá). Se inyecta el MÉTODO sobre este objeto exportado —
+// el mismo patrón que `_bouncedCache`: se exporta el objeto y index.js muta su contenido,
+// que es lo único que ESM le permite a un importador.
+export const puertaClaude = { llamar: null };
+
 export async function _claudeLangArbiter(token, domain, sample) {
   if (!sample || sample.length < 30) return null;
   try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        provider: "anthropic",
-        path: "/v1/messages",
-        method: "POST",
-        body: {
-          model: "claude-haiku-4-5",
-          max_tokens: 30,
-          system: "You classify the language of website text. Respond ONLY with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). No explanation.",
-          messages: [{ role: "user", content: `Domain: ${domain}\nSample (first 600 chars):\n${sample.substring(0, 600)}` }],
-        },
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    const data = await puertaClaude.llamar?.(token, "idioma_deteccion", {
+model: "claude-haiku-4-5",
+max_tokens: 30,
+system: "You classify the language of website text. Respond ONLY with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). No explanation.",
+messages: [{ role: "user", content: `Domain: ${domain}\nSample (first 600 chars):\n${sample.substring(0, 600)}` }],
+        }, { timeout: 10000 });
+    if (!data) return null;
     const text = (data?.content?.[0]?.text || "").trim().toLowerCase();
     const m = text.match(/^([a-z]{2})/);
     return m && SUPPORTED_AGENT_LANGS.has(m[1]) ? m[1] : null;
