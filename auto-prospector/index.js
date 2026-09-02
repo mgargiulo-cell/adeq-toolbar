@@ -22,6 +22,7 @@ import {
   SUPABASE_URL,
 } from "./lib/config.js";
 import { COUNTRY_CODES, GEO_BUCKETS } from "./lib/geo.js";
+import { extraerTelefonos, normalizarTelefono } from "./lib/telefono.js";
 import {
   EXCLUDE_DOMAINS,
   EXCLUDE_KEYWORD_RE,
@@ -1070,9 +1071,18 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   // exige "solo pasan los +350K, las de menos ni se analizan", sin importar la fuente (incluidos
   // imports manuales y re-imports de Monday). Si el tráfico no es número ≥ MIN, no se guarda.
   if (!Number.isFinite(trafficNum) || trafficNum < REVIEW_QUEUE_MIN_TRAFFIC) {
+
     log(`  ⛔ saveToReviewQueue ${domain} REJECTED — traffic ${trafficNum} < ${REVIEW_QUEUE_MIN_TRAFFIC} (source=${source})`);
     return "floor";
   }
+
+  // ⚠️ EL TELÉFONO SE NORMALIZA ACÁ, que es el primer lugar donde se conocen el número Y el
+  // país a la vez. El extractor corre sobre el HTML sin saber todavía el GEO, así que
+  // devuelve el candidato tal como lo escribe el sitio. Sin prefijo el CRM lo rechaza y no
+  // puede mostrar la bandera — era el motivo de que sólo 59 de 10.006 fichas tuvieran uno.
+  // Si el país no alcanza para armar un E.164 válido se guarda VACÍO: un número con el
+  // prefijo equivocado hace que el media buyer llame a otro país.
+  if (contactPhone) contactPhone = normalizarTelefono(contactPhone, geo) || "";
 
   // NOTA: el cap de 200 en review_queue se chequea EN LOS CALLERS antes de
   // llamar acá (csv worker → marca waiting_pool, autopilot → skip silent).
@@ -2884,7 +2894,7 @@ async function _serperContactSearch(domain) {
       const host = (e.split("@")[1] || "").toLowerCase();
       return host === clean || host.endsWith("." + clean) || host === base + "." + clean.split(".").slice(1).join(".") || (base.length >= 4 && host.split(".")[0] === base);
     });
-    const { phones, whatsapps } = extractPhonesFromHtml(text);
+    const { phones, whatsapps } = extractPhonesFromHtml(text, geo);
     return { urlsContacto, emails: [...new Set(emails)], phones, whatsapps };
   } catch (e) { log(`  ⚠️ Serper contact error ${clean}: ${e.message}`); return { emails: [], phones: [], whatsapps: [] }; }
 }
@@ -6959,23 +6969,17 @@ function extractEmailsFromHtml(html) {
 // (muy común en BR/otros: "fale conosco" con form + WhatsApp, ej. massa.com.br; footer con tel, ej.
 // trikalaola.gr). Prioridad ALTA precisión: wa.me y tel: son señales fuertes; el número visible es
 // más ruidoso → conservador. Devuelve { phones:[], whatsapps:[] } (WhatsApp = solo dígitos con país).
-function extractPhonesFromHtml(text) {
-  if (!text) return { phones: [], whatsapps: [] };
-  const phones = new Set(), whatsapps = new Set();
-  // WhatsApp: wa.me/<num>, api.whatsapp.com/send?phone=<num>, whatsapp://send?phone=<num>
-  for (const m of text.matchAll(/(?:wa\.me\/|(?:api\.)?whatsapp\.com\/send\/?\?phone=|whatsapp:\/\/send\?phone=)(\+?\d[\d\s\-]{6,17}\d)/gi)) {
-    const n = m[1].replace(/[^\d]/g, ""); if (n.length >= 8 && n.length <= 15) whatsapps.add(n);
-  }
-  // tel: hrefs (alta precisión)
-  for (const m of text.matchAll(/tel:(\+?\d[\d\s().\-]{6,18}\d)/gi)) {
-    const n = m[1].replace(/[^\d+]/g, ""); if (n.replace(/\D/g, "").length >= 8) phones.add(n);
-  }
-  // Números visibles con estructura de teléfono: +cc, (área) y separadores. Conservador (bajo ruido).
-  for (const m of text.matchAll(/(?:\+\d{1,3}[\s.\-]?)?\(?\d{2,4}\)?[\s.\-]\d{3,4}[\s.\-]?\d{3,4}/g)) {
-    const raw = m[0].trim(); const digits = raw.replace(/\D/g, "");
-    if (digits.length >= 8 && digits.length <= 14 && !/^\d{4}[.\-]\d{2}[.\-]\d{2}$/.test(raw)) phones.add(raw.replace(/\s+/g, " "));
-  }
-  return { phones: [...phones].slice(0, 5), whatsapps: [...whatsapps].slice(0, 3) };
+function extractPhonesFromHtml(text, geo = "") {
+  // ⚠️ Ahora delega en lib/telefono.js. El extractor que estaba acá capturaba CUALQUIER
+  // número con separadores: medido sobre los 2.497 guardados, 1 de cada 3 no era un teléfono
+  // (decimales como 226.359375, versiones como 255-255-255, ids como 2026-20007253), y casi
+  // ninguno traía código de país, así que el CRM los rechazaba todos. Resultado: 59
+  // teléfonos sobre 10.006 fichas.
+  // El nuevo exige que el número esté DECLARADO teléfono (tel:, WhatsApp, schema.org) o
+  // anunciado por una palabra ("Tel:", "Teléfono", "Llamanos"), y devuelve E.164 con el
+  // prefijo del país — que es lo que le permite al board mostrar la bandera.
+  const r = extraerTelefonos(text, geo);
+  return { phones: r.telefonos, whatsapps: r.whatsapps };
 }
 
 // Maxi 2026-06-17: Informer-only fetch. CHEAP, sin Apollo credit.
@@ -7983,7 +7987,7 @@ async function fetchPageContent(domain, _yaReintentado = false) {
       hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
       nonPublisherType,                 // tienda/banco/universidad/servicios → rechazar
       isEcommerce: nonPublisherType === "ecommerce",
-      ...extractPhonesFromHtml(html),   // Maxi 2026-07-16: phones[] + whatsapps[] del home (footer, wa.me, tel:)
+      ...extractPhonesFromHtml(html, geo),   // phones[] + whatsapps[] (tel:, WhatsApp, schema.org, anunciados)
       htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
       textSample,
     };
