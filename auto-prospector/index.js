@@ -15798,6 +15798,29 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
   }
 }
 
+// ── EL REBOTE TAMBIÉN VA AL BOARD PROPIO (Maxi 2026-09-02) ─────────────────────────────
+// El board vacía la columna Email al recibirlo —así la cadencia de follow-ups se frena sola—
+// y guarda cuál murió para no reintentarla. Si en el mismo envío llega un email nuevo, ese
+// gana: es el reemplazo.
+//
+// ⚠️ EL BUG QUE NOS AVISARON DEL OTRO LADO, Y QUE ACÁ NO SE PUEDE COMETER:
+// al decidir a quién marcar como rebotado NO se filtra por "todavía no rebotó nunca". Si un
+// prospecto ya rebotó una vez y se le cargó otra dirección, un segundo rebote no se detectaría
+// jamás porque la marca vieja sigue puesta. Por eso se manda SIEMPRE la dirección que rebotó
+// ahora, sin preguntar si el dominio ya tenía un rebote previo — el board resuelve contra la
+// que tiene cargada en ese momento.
+async function reportarReboteAlCrm(token, { email, originalDomain, tipo, detalle }) {
+  const dom = String(originalDomain || String(email || "").split("@")[1] || "").trim();
+  if (!dom || !email) return;
+  await pushToCrmPropio(token, {
+    domain: dom,
+    bounced_email: String(email).toLowerCase(),
+    // El motivo en el formato que el board espera: el código SMTP si lo tenemos, y si no
+    // nuestra clasificación. "no sé" nunca se manda como si fuera un diagnóstico.
+    bounce_reason: (String(detalle || "").match(/\b[45]\d\d[\s-]?\d\.\d\.\d\b/) || [tipo || "desconocido"])[0],
+  }, "rebote").catch(() => {});
+}
+
 // ── DEDUP POR MENSAJE DE GMAIL (Maxi 2026-07-17) ────────────────────────────────────
 // BUG que arregla: el dedup del scan era `if (!isBouncedSync(failed))`, o sea la tabla de
 // bounced_emails. Pero los SOFT bounces a propósito NO se marcan ahí (son transitorios, no
@@ -16186,6 +16209,11 @@ async function scanBouncesForUser(token, userEmail) {
             const _esRebote = _tipoRebote !== "buzon_lleno" && _tipoRebote !== "temporal";
             if (_esRebote) {
               await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
+              // Y al board propio, que vacía la columna Email para frenar la cadencia sola.
+              // Se manda SIEMPRE, sin chequear si ese dominio ya había rebotado antes: filtrar
+              // por "todavía no rebotó nunca" es justo el bug que nos avisaron del otro lado —
+              // un segundo rebote sobre una dirección de reemplazo no se detectaría jamás.
+              await reportarReboteAlCrm(token, { email: failed, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
             } else {
               log(`  ↩️ ${failed}: ${_tipoRebote} — la dirección EXISTE, no es rebote → no se blacklistea`);
             }
@@ -20284,10 +20312,26 @@ function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail }
     top_geo: normalizeMondayGeo(geo),
     pageviews: formatTrafficForMonday(traffic),
     language: _crmIdioma(language),
-    phone: phone || "",
+    phone: _crmTelefono(phone),
     comments: "Agente",                    // la misma marca que se escribe en Monday
     source: "toolbar",
   };
+}
+
+// ── EL TELÉFONO SOLO SI ES UN TELÉFONO (Maxi 2026-09-02) ───────────────────────────────
+// El board ahora valida que venga con código de país y rechaza lo que no cierre. Medido en
+// el pool: de 2.367 prospectos, **solo 68 tienen código de país**, 1.235 no lo tienen y el
+// resto está vacío. Y mirando lo guardado aparecen `255-255-255` y `226.359375` — ese último
+// es un decimal raspado de alguna parte, no un teléfono.
+// Mandar eso llenaría la respuesta de avisos por un campo opcional, y los avisos sirven
+// justamente para lo que SÍ hay que mirar. Se manda solo lo que puede ser un número
+// internacional de verdad; el resto va vacío, que es un dato honesto.
+function _crmTelefono(tel) {
+  const t = String(tel || "").trim();
+  if (!t.startsWith("+")) return "";
+  const digitos = t.replace(/[^\d]/g, "");
+  // E.164: entre 8 y 15 dígitos contando el país. Fuera de ahí no es un teléfono.
+  return (digitos.length >= 8 && digitos.length <= 15) ? t : "";
 }
 
 async function pushToCrmPropio(token, prospectos, contexto = "envio") {
@@ -20314,7 +20358,7 @@ async function pushToCrmPropio(token, prospectos, contexto = "envio") {
     try {
       const r = await fetch(CRM_SYNC_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Toolbar-Secret": CRM_SYNC_SECRET },
+        headers: { "Content-Type": "application/json", "x-toolbar-secret": CRM_SYNC_SECRET },
         body: JSON.stringify({ prospects: lote }),
       });
       const j = await r.json().catch(() => null);
