@@ -25489,7 +25489,13 @@ async function main() {
           { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
         if (_r.ok) _colaVirgen = parseInt((_r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
       } catch {}
-      const _pisoVirgen = parseInt(cfg.polish_cola_piso || "50", 10) || 50;
+      // ⚠️ `cfg` NO existe en este punto del bucle: la última definición está dentro de otra
+      // función. Al mover el bloque acá arriba lo usé igual y tiraba ReferenceError, que el
+      // try/catch del bucle se tragaba en silencio — por eso el pulido no corría y NI SIQUIERA
+      // aparecía su log. Mismo patrón de siempre: un error que no se distingue de "no pasó
+      // nada". Se lee la config como hace la línea del techo, dos más arriba.
+      const _cfgPulido = await getConfig(token).catch(() => ({}));
+      const _pisoVirgen = parseInt(_cfgPulido.polish_cola_piso || "50", 10) || 50;
       const _modoPulido = _colaVirgen >= _pisoVirgen;
       if (_modoPulido) {
         log(`🔎 Pulido primero: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen})`);
