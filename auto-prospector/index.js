@@ -11542,12 +11542,39 @@ async function getAdminBlocklistWorker(token) {
 
 // Chequeo unificado: combina hardcoded + admin blocklist.
 // Devuelve string razón si está bloqueado, null si pasa.
+
+/** Snapshot de a quién NO escribirle, guardado por `guardarBloqueadosDeMonday` una vez al día. */
+let _bloqCrmCache = { set: null, ts: 0 };
+const BLOQ_CRM_TTL = 10 * 60 * 1000;   // 10 min: la fuente se refresca cada 24 h, esto sólo evita releer la config
+async function _bloqueadosDelCrm(token) {
+  if (_bloqCrmCache.set && Date.now() - _bloqCrmCache.ts < BLOQ_CRM_TTL) return _bloqCrmCache.set;
+  try {
+    const cfg = await getConfig(token);
+    const crudo = cfg.monday_bloqueados;
+    if (!crudo) return _bloqCrmCache.set;              // sin snapshot se conserva el anterior
+    const arr = JSON.parse(crudo);
+    if (!Array.isArray(arr) || arr.length < 100) return _bloqCrmCache.set;   // vacío ≠ "no hay nadie bloqueado"
+    _bloqCrmCache = { set: new Set(arr.map(x => String(x).toLowerCase())), ts: Date.now() };
+    return _bloqCrmCache.set;
+  } catch { return _bloqCrmCache.set; }
+}
+
 async function isDomainBlockedFull(domain, token) {
   const hardcoded = isDomainBlocked(domain);
   if (hardcoded) return hardcoded;
   const d = domain.toLowerCase().replace(/^www\./, "");
   const adminList = await getAdminBlocklistWorker(token);
   if (adminList.has(d)) return "admin-blocklist";
+
+  // ⚠️ LA LISTA DEL CRM — clientes que facturan, gente en negociación, bloqueados a mano y
+  // los que están en su descanso. Se guarda una vez por día en `monday_bloqueados` y hasta
+  // hoy SÓLO se leía en `parteDelDia`, o sea para un informe: el agente mandaba sin mirarla.
+  // Costó 22 pitches en frío a clientes activos, uno el 02/09 a las 09:17 (meteored.com,
+  // desde dhorovitz@) con el dominio YA en la lista, refrescada esa misma mañana a las 07:30.
+  // Se lee del snapshot y no del endpoint a propósito: esto corre por cada dominio del pool y
+  // pegarle al CRM en cada uno lo tiraría abajo. El snapshot se refresca solo cada 24 h.
+  const _bloqCrm = await _bloqueadosDelCrm(token);
+  if (_bloqCrm && _bloqCrm.has(d)) return "crm-no-recontactar";
   // Subdominios de un dominio en blocklist
   for (const b of adminList) {
     if (d.endsWith("." + b)) return `admin-blocklist-subdomain (${b})`;
@@ -12063,13 +12090,20 @@ async function reabrirLeadsRebotados(token) {
       reabiertos++;
       if (reabiertos >= 200) break;                   // techo por vuelta
     }
-    if (reabiertos) {
+    {
       log(`  ♻️ ${reabiertos} lead(s) con TODOS sus emails rebotados → vuelven a la cola de búsqueda`);
       await saludPing(token, "reabrir_rebotados", {
         status: "ok", cadenciaMin: 6 * 60, real: reabiertos,
         detalle: `${reabiertos} lead(s) reabiertos para buscarles otro contacto`,
       }).catch(() => {});
     }
+
+    // ⚠️ El ping estaba DENTRO del `if (reabiertos)`: si el job recorría los leads y no
+    // reabría ninguno —el caso normal la mayoría de los días— se iba sin latir y el vigilante
+    // lo marcaba atrasado. Es el mismo bug que el comentario de arriba dice haber arreglado
+    // para los returns tempranos, y quedó vivo en el camino que SÍ hace trabajo.
+    // Un job que corre y no encuentra nada que hacer está SANO; que no lata es lo que lo hace
+    // indistinguible de uno roto.
   } catch (e) { log(`⚠️ reabrirLeadsRebotados: ${e.message}`); }
 }
 
@@ -12964,7 +12998,8 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // que solo dejaba una línea en los logs de Railway, a los que no siempre hay acceso.
   // Ahora cada motivo de no-arranque queda en toolbar_health, consultable desde SQL.
   // El contador arranca en cero cada corrida: lo que interesa es si ESTA vuelta metió
-  // prospectos sin poder chequearlos contra el CRM.
+  // prospectos sin poder chequearlos contra el CRM. Sin este reset, tras el primer fallo la
+  // alerta quedaba encendida para siempre y dejaba de significar algo.
   _fichaFallos = 0;
   await saludPing(token, "csv_queue", {
     status: "ok", cadenciaMin: 30,
@@ -15327,6 +15362,38 @@ const REBOTE_BUZON_LLENO = new RegExp([
   "postbus vol", "skrzynka.{0,12}pe[lł]na", "容量", "いっぱい",
 ].join("|"), "i");
 
+
+/**
+ * A QUÉ SITIO le escribimos esta dirección. Es la llave del puente de rebotes.
+ *
+ * ⚠️ Antes se usaba `email.split("@")[1]`, o sea el dominio DEL CORREO. Está mal y hace daño
+ * en las dos direcciones: el CRM hace upsert por dominio, así que un rebote de
+ * `sreleve@yahoo.fr` —el contacto de telexpresse.com— le creaba al CRM una ficha nueva de
+ * "yahoo.fr" en Propuesta Vigente, con ejecutivo y follow-up agendado (pasó de verdad el
+ * 02/09), y dejaba a telexpresse.com con la dirección muerta cargada y sin marcar.
+ *
+ * Medido: 3.048 de 9.322 fichas con email (el 33%) tienen el contacto en un dominio distinto
+ * al del sitio — cualquier gmail, yahoo o dominio corporativo del grupo. O sea que 1 de cada 3
+ * rebotes ensuciaba el CRM y perdía el aviso.
+ *
+ * Se resuelve por `toolbar_sendtrack`, que es el registro de A QUIÉN le mandamos qué.
+ * Si no se encuentra, devuelve "" y el rebote NO se reporta: mandar el dominio equivocado es
+ * peor que no avisar, porque crea un prospecto falso que después alguien va a trabajar.
+ */
+async function _sitioDeLaDireccion(token, email) {
+  const e = String(email || "").trim().toLowerCase();
+  if (!e) return "";
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?email=eq.${encodeURIComponent(e)}&select=domain&order=sent_at.desc&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } },
+    );
+    if (!r.ok) return "";
+    const filas = await r.json();
+    return (Array.isArray(filas) && filas[0]?.domain) ? String(filas[0].domain).toLowerCase() : "";
+  } catch { return ""; }
+}
+
 async function scanBouncesForUser(token, userEmail) {
   try {
     const accessToken = await getGmailAccessToken(userEmail);
@@ -15581,12 +15648,18 @@ async function scanBouncesForUser(token, userEmail) {
             // semana que viene entra. Todo lo demás es permanente y se quema.
             const _esRebote = _tipoRebote !== "buzon_lleno" && _tipoRebote !== "temporal";
             if (_esRebote) {
-              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
+              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: (await _sitioDeLaDireccion(token, failed)) || failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
               // Y al board propio, que vacía la columna Email para frenar la cadencia sola.
               // Se manda SIEMPRE, sin chequear si ese dominio ya había rebotado antes: filtrar
               // por "todavía no rebotó nunca" es justo el bug que nos avisaron del otro lado —
               // un segundo rebote sobre una dirección de reemplazo no se detectaría jamás.
-              await reportarReboteAlCrm(token, { email: failed, originalDomain: failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
+              // El dominio del SITIO, no el del correo. Ver `_sitioDeLaDireccion`.
+              const _sitio = await _sitioDeLaDireccion(token, failed);
+              if (_sitio) {
+                await reportarReboteAlCrm(token, { email: failed, originalDomain: _sitio, tipo: _tipoRebote, detalle: _detalleRebote });
+              } else {
+                log(`  ⚠️ ${failed} rebotó pero no encuentro a qué sitio se lo mandamos — NO se reporta al CRM (crearía una ficha falsa)`);
+              }
             } else {
               log(`  ↩️ ${failed}: ${_tipoRebote} — la dirección EXISTE, no es rebote → no se blacklistea`);
             }
