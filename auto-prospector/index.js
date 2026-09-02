@@ -25607,7 +25607,17 @@ async function main() {
         } catch {}
         const _pisoVirgen = parseInt(cfg.polish_cola_piso || "50", 10) || 50;
         const _modoPulido = _colaVirgen >= _pisoVirgen;
-        const _vueltaPar = _modoPulido || (_vueltaMantenimiento % 2) === 0;
+        // ⚠️ AYER ESTO DEJÓ SIN CORRER A TODO EL MANTENIMIENTO (Maxi 2026-09-02).
+        // Estaba escrito `_vueltaPar = _modoPulido || (vuelta % 2) === 0`, y la cadena de
+        // mantenimiento cuelga de `if (!_vueltaPar)`. Con el modo cola encendido, `_vueltaPar`
+        // quedaba SIEMPRE en true y la cadena entera no se ejecutaba nunca: similar_expansion,
+        // reabrir_rebotados, purga_cola y sellers_discovery llevaban entre 10 y 46 horas sin
+        // correr. Hice exactamente lo que la alternancia existía para evitar, y encima con la
+        // misma forma de error: una condición que decide DOS cosas a la vez.
+        // Ahora el modo cola le da al pulido 2 de cada 3 vueltas en vez de todas. Drena igual
+        // de rápido en la práctica y el mantenimiento conserva su tercio.
+        const _cicloTres = _vueltaMantenimiento % 3;
+        const _vueltaPar = _modoPulido ? (_cicloTres !== 0) : ((_vueltaMantenimiento % 2) === 0);
         if (_modoPulido && (_vueltaMantenimiento % 5) === 1) {
           log(`🔎 Pulido en modo cola: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen}) — se lleva todas las vueltas hasta drenar`);
         }
