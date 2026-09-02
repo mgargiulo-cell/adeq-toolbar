@@ -19,46 +19,16 @@ export const CONFIG = {
 
   // ── API keys sensibles — se cargan en runtime desde toolbar_config ──
   // No hardcodear aquí. Se populan vía fetchApiKeys() tras el login.
-  MONDAY_API_KEY:        "",
-  MONDAY_ACTIVE_BOARD:   "1420268379",
   RAPIDAPI_KEY:          "",
   RAPIDAPI_TRAFFIC_HOST: "website-insights.p.rapidapi.com",
   GEMINI_API_KEY:        "",
   APOLLO_API_KEY:        "",
 
-  // ── Monday columns (estructura, no secretos) ──────────────────
-  MONDAY_BOARDS: { prospectos: "1420268379" },
-  // Mapping: login email → Monday user ID (para columna Persona deal_owner)
-  MONDAY_USER_IDS: {
-    "mgargiulo@adeqmedia.com": 56851451, // Maximiliano
-    "sales@adeqmedia.com":     60940538, // Agustina
-    "dhorovitz@adeqmedia.com": 56938560, // Diego
-  },
-  MONDAY_COLUMNS: {
-    nombre:          "name",
-    estado:          "deal_stage",
-    ejecutivo:       "deal_owner",       // person column
-    fecha_contacto:  "deal_close_date",
-    geo:             "texto6",
-    trafico:         "texto7",
-    idioma:          "estado_12",
-    comentarios:     "texto",
-    // Columna DEDICADA para el origen (Agente/Manual). Vacía = todavía no existe y la marca
-    // sigue yendo a Comentarios. Para activarla: crear en el board una columna tipo Estado con
-    // las opciones "Agente" y "Manual", y poner su id acá (y en toolbar_config.monday_col_origen
-    // para que el worker la use también).
-    // Decisión del user (2026-08-25): NO hay columna dedicada. El estado Agente/Manual va en
-    // Comentarios y punto. Se probó una columna aparte y se descartó: no agregaba nada que
-    // Comentarios no diga ya. Dejar esto VACÍO.
-    origen:          "",
-    email:           "email_mm2edcd3",   // email column (was text_mkrwahsz)
-    telefono:        "tel_fono_1",
-    // Reengagement / Email Futuro — el agente actualiza estas dos al disparar
-    // el envío automático del email_futuro (today+5 y today+10).
-    // Verificar IDs en Monday si el push falla.
-    fecha_fu1:       "fecha2",            // Fecha FU1 (today + 5 días) — Maxi 2026-07-15: era "fecha2_8" (id inexistente en board → "This column ID doesn't exist"); id real verificado contra el board = "fecha2"
-    fecha_fu2:       "fecha_1",           // Fecha FU2 (today + 10 días)
-  },
+  // ⚠️ Toda la config de Monday se borró el 2026-09-02: MONDAY_API_KEY, MONDAY_ACTIVE_BOARD,
+  // MONDAY_BOARDS, MONDAY_USER_IDS y MONDAY_COLUMNS (ids de columnas del board).
+  // Ninguna tenía un solo lector: el módulo que las usaba se eliminó al apagar Monday.
+  // La key además se DESCARGABA al navegador en cada apertura de la toolbar, alimentando
+  // código que ya no existía — una credencial viva en memoria del cliente, sin consumidor.
 
   // ── General ────────────────────────────────────────────────────
   MEDIA_BUYER: "Max",

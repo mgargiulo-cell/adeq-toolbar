@@ -478,26 +478,14 @@ export async function createNotification(accessToken, payload) {
 // Cada key que baja al cliente es una key que vive en memoria del navegador, donde la puede
 // leer cualquier extensión instalada o cualquiera con las devtools abiertas. Las que salen
 // por el proxy no tienen ningún motivo para estar ahí — para eso existe el proxy.
-// Monday sí se queda: la extensión le pega directo al board, no hay proxy en el medio.
-export async function fetchApiKeys(accessToken, loginEmail = "") {
-  const url = CONFIG.SUPABASE_URL;
-  const key = CONFIG.SUPABASE_ANON_KEY;
-  const _propia = `monday_api_key_${String(loginEmail || "").toLowerCase().trim()}`;
-  const _pedidas = [`"${_propia}"`, '"monday_api_key"'].join(",");
-  try {
-    const res = await fetch(`${url}/rest/v1/toolbar_config?key=in.(${_pedidas})&select=key,value`, {
-      headers: {
-        "apikey":        key,
-        "Authorization": `Bearer ${accessToken}`,
-      },
-    });
-    if (!res.ok) return null;
-    const rows = await res.json();
-    if (!Array.isArray(rows)) return null;
-    const result = {};
-    rows.forEach(r => { result[r.key] = r.value; });
-    return result;
-  } catch { return null; }
+// ⚠️ YA NO BAJA NINGUNA KEY (Maxi 2026-09-02). La única que quedaba era la de Monday, y
+// Monday está apagado: se cargaba en cada apertura de la toolbar para alimentar código que
+// ya no existe. Una credencial viva en memoria del navegador, sin consumidor, es lo peor de
+// los dos mundos. El CRM se consulta con `CRM_BOARD_SECRET`, que es de la extensión y no da
+// acceso a nada más.
+// Se conserva la función porque hay llamadores; devuelve un objeto vacío.
+export async function fetchApiKeys(_accessToken, _loginEmail = "") {
+  return {};
 }
 
 // ── Autopilot toggle ──────────────────────────────────────────

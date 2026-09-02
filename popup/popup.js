@@ -1286,7 +1286,7 @@ async function _refreshAgentFeed() {
     window._lastAgentFeedRows = rows;
     const icons = { sent: "✅", re_sent: "🔁", bounce_retry_sent: "🎯", skipped: "⏭", failed: "❌", monday_failed: "⚠️", monday_ok: "🟢", kill_switch: "🚨", cycle_no_candidates: "🔍", cycle_heartbeat: "💓", reserved: "⏳" };
     const colorMap = { sent: "#34d399", re_sent: "#22d3ee", bounce_retry_sent: "#a78bfa", skipped: "#fbbf24", failed: "#f87171", monday_failed: "#fb923c", monday_ok: "#34d399", kill_switch: "#ef4444", cycle_no_candidates: "#94a3b8", cycle_heartbeat: "#64748b", reserved: "#64748b" };
-    const actionLabels = { sent: "Sent", re_sent: "Re-sent (follow-up)", bounce_retry_sent: "Bounce retry sent", skipped: "Skipped", failed: "Failed", monday_failed: "Monday push failed", monday_ok: "Monday pushed", kill_switch: "Kill switch fired", cycle_no_candidates: "No candidates this cycle", cycle_heartbeat: "Heartbeat", reserved: "Reserved slot" };
+    const actionLabels = { sent: "Sent", re_sent: "Re-sent (follow-up)", bounce_retry_sent: "Bounce retry sent", skipped: "Skipped", failed: "Failed", monday_failed: "Carga al CRM falló", monday_ok: "Cargado en el CRM", crm_ok: "Cargado en el CRM", kill_switch: "Kill switch fired", cycle_no_candidates: "No candidates this cycle", cycle_heartbeat: "Heartbeat", reserved: "Reserved slot" };
     wrap.innerHTML = rows.map(r => {
       const time = new Date(r.created_at).toLocaleString("es-AR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" });
       const icon = icons[r.action] || "·";
@@ -1755,7 +1755,7 @@ async function renderAdminSourcePerformance() {
       s = (s || "").toLowerCase();
       if (s.includes("autopilot"))  return "🤖 Autopilot";
       if (s.includes("autogoogle")) return "🔎 AutoGoogle";
-      if (s.includes("monday"))     return "🔄 Monday";
+      if (s.includes("monday"))     return "🔄 Reciclado del CRM";   // etiqueta histórica de la fuente
       if (s.includes("sellers"))    return "📋 sellers.json";
       if (s.includes("manual"))     return "✋ Manual";
       if (s.includes("csv"))        return "📥 CSV";
@@ -2570,8 +2570,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   // Monday API key por usuario (cae en la default si no hay específica)
   const loginEmail   = (auth?.user || "").toLowerCase().trim();
-  const userMondayKey = apiKeys[`monday_api_key_${loginEmail}`];
-  CONFIG.MONDAY_API_KEY = userMondayKey || apiKeys.monday_api_key || "";
+  // ⚠️ La API key de Monday YA NO se baja al navegador (02/09). Se cargaba en cada apertura
+  // de la toolbar para alimentar código que ya no existe: una credencial viva en memoria del
+  // cliente, sin consumidor. Es exactamente el hallazgo que motivó sacar rapidapi_key y
+  // apollo_api_key en agosto.
   // ── LAS KEYS QUE NO SE USAN NO SE BAJAN (Maxi 2026-08-27) ────────────────────────
   // `rapidapi_key` y `apollo_api_key` se descargaban al navegador en CADA apertura de la
   // toolbar y no las usaba nadie: SimilarWeb y Apollo salen por el proxy justamente para
@@ -5007,7 +5009,7 @@ async function bindButtons() {
     const ids = _colaMarcados();
     const out = document.getElementById("cola-result");
     if (!ids.length) { out.textContent = "Marcá al menos uno."; out.style.color = "var(--muted)"; return; }
-    if (!confirm(`Se van a crear ${ids.length} item(s) en Monday. ¿Confirmás?`)) return;
+    if (!confirm(`Se van a crear ${ids.length} ficha(s) en el CRM. ¿Confirmás?`)) return;
     const btn = document.getElementById("btn-cola-enviar");
     btn.disabled = true;
     let ok = 0; const fallaron = [];
@@ -5640,7 +5642,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
   document.getElementById("btn-refresh").addEventListener("click", () => window.location.reload());
 
   // ── Cascade · Import Monday collapsable ──────────────────────
-  // El card "Import URLs from Monday" se mudó a Cascade. Lo dejo colapsado
+  // El card "Importar URLs del CRM" se mudó a Cascade. Lo dejo colapsado
   // por default para no robarle espacio a Keywords/Filtros que son lo más usado.
   (() => {
     const toggle = document.getElementById("cascade-monday-toggle");
@@ -6598,9 +6600,9 @@ async function startCascade() {
   statusEl.textContent = "Paso 1/2: consultando al CRM los dominios activos de otros MB...";
   const boardIndex = await Promise.race([
     getMondayBoardIndex(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error("Monday lookup timeout 20s")), 20000)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("el CRM no respondió en 20s")), 20000)),
   ]).catch((e) => {
-    console.warn("[cascade] Monday board index failed:", e.message);
+    console.warn("[cascade] no se pudo traer la lista de bloqueados del CRM:", e.message);
     statusEl.textContent = `⚠ el CRM no respondió (${e.message}) — sigo sin filtro de ejecutivos`;
     return new Map();
   });
@@ -7301,7 +7303,7 @@ async function initCsvQueue() {
           if (m.includes("geo_saturated")) return "⚖️ GEO saturado en pool";
           if (m.includes("not_publisher") || m.includes("publisher_signal") || m.includes("haiku_")) return "🗑 no es publisher (filtro basura)";
           if (m.includes("category-blocked")) return "🏦 categoría bloqueada";
-          if (m.includes("en monday") || m.includes("estado=")) return "📋 ya en Monday (ciclo activo)";
+          if (m.includes("en monday") || m.includes("crm_activo") || m.includes("estado=")) return "📋 ya está en el CRM (ciclo activo)";
           if (m.includes("blocked:")) return "🚫 en blocklist";
           if (m.includes("unreachable") || m.includes("site_unreachable")) return "💀 sitio caído / sin emails";
           return "❓ otro: " + m.slice(0, 30);
@@ -7346,7 +7348,7 @@ async function initCsvQueue() {
     csv:          { icon: "📥", label: "CSV upload" },
     manual:       { icon: "✋", label: "Import manual" },
     sellers_json: { icon: "📋", label: "Sellers.json" },
-    monday:       { icon: "🔄", label: "Monday refresh" },
+    monday:       { icon: "🔄", label: "Reciclado del CRM" },
   };
   let _historyRange = "today"; // "today" | "7days"
 
