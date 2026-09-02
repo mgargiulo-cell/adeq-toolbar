@@ -10,7 +10,43 @@
 import fetch from "node-fetch";
 import { pickRandomTemplate, fillTemplate, pickPitchSource, getSenderName, getBakedTemplates } from "./templates.js";
 import { KEYWORDS as _AG_KEYWORDS } from "./keywordsData.js";  // 3490 frases (12 idiomas) para AutoGoogle
+import {
+  BACKEND_BEARER,
+  CLOUDFLARE_API_TOKEN,
+  CRM_SYNC_SECRET,
+  CRM_SYNC_URL,
+  SUPABASE_ANON_KEY,
+  SUPABASE_EMAIL,
+  SUPABASE_PASSWORD,
+  SUPABASE_SERVICE_ROLE_KEY,
+  SUPABASE_URL,
+} from "./lib/config.js";
 import { COUNTRY_CODES, GEO_BUCKETS } from "./lib/geo.js";
+import {
+  EXCLUDE_DOMAINS,
+  EXCLUDE_KEYWORD_RE,
+  MULTI_PART_TLDS,
+  _dominioLimpio,
+  _dominioValido,
+  coreDomain,
+  isDomainAllowed,
+  isUniversityDomain,
+  matchesExcludeKeyword,
+} from "./lib/dominio.js";
+import {
+  DOMAIN_LANG_CACHE_MAX,
+  GEO_TO_LANG_AGENT,
+  LANGS_ENVIABLES,
+  LANG_MARKERS,
+  SUPPORTED_AGENT_LANGS,
+  TLD_NO_LATINO,
+  TLD_TO_LANG_AGENT,
+  _claudeLangArbiter,
+  _detectLangFromText,
+  _domainLangCache,
+  _scriptNoLatino,
+  detectLanguageRobust,
+} from "./lib/idioma.js";
 import {
   AD_SALES_CONTIENE,
   AD_SALES_LOCAL,
@@ -67,7 +103,10 @@ import {
 //   cola y pool     _injectIntoCsvQueue · _parkInBacklog · _drainBacklog · processCsvItem
 //   calidad         checkAdsTxt · classifyPublisher · scoreWebsite · detectLanguageRobust
 //   bloqueos        isDomainBlockedFull · getAdminBlocklistWorker · fetchDominiosBloqueados
-//   email           → lib/email.js (extraído)
+//   email           → lib/email.js
+//   idioma          → lib/idioma.js
+//   dominios/URL    → lib/dominio.js
+//   config          → lib/config.js
 //   envío/agente    runAgentForUser · pickDbDraft · _isOutsideActiveHours
 //   rebotes         scanBouncesForUser · queueBounceRetry
 //   CRM             pushToCrmPropio · _fichaDelCrm
@@ -81,16 +120,9 @@ import {
 // el cuarto: cargar este archivo entero, porque `node --check` sólo mira sintaxis.
 
 
-const SUPABASE_URL              = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY         = process.env.SUPABASE_ANON_KEY;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY; // bypass RLS (backend worker)
-const SUPABASE_EMAIL            = process.env.SUPABASE_EMAIL;
-const SUPABASE_PASSWORD         = process.env.SUPABASE_PASSWORD;
-const CLOUDFLARE_API_TOKEN      = process.env.CLOUDFLARE_API_TOKEN || null; // optional: Radar country-indexed pool
 
 // If a service-role key is set, use it as Bearer — bypasses RLS.
 // Otherwise fall back to user JWT (won't see items uploaded by other users with RLS on).
-const BACKEND_BEARER = SUPABASE_SERVICE_ROLE_KEY || null;
 const SERPER_API_KEY = (process.env.SERPER_API_KEY || "").trim() || null;  // AutoGoogle: keyword→Google. Sin key = AutoGoogle apagado (no rompe nada).
 
 // ⚠️ 20 min NO ENTRA EN LA VIDA DEL WORKER (Maxi 2026-08-25). Railway lo reinicia cada
@@ -235,131 +267,11 @@ function classifyByUrlOnly(domain, category = "", traffic = 0) {
 const MAJESTIC_URL = "https://downloads.majesticseo.com/majestic_million.csv";
 let _majesticFalloAt = 0;   // último fallo de descarga, para el enfriamiento
 
-// Dominios de tech/redes sociales/marcas globales — no son publishers
-const EXCLUDE_DOMAINS = new Set([
-  // Search & tech
-  "google.com","google.co.uk","google.com.br","google.es","google.de","google.com.mx",
-  "google.co.jp","google.fr","google.it","google.com.ar",
-  "youtube.com","gmail.com","googletagmanager.com","googleapis.com",
-  "bing.com","duckduckgo.com","baidu.com","yandex.ru","yandex.com","naver.com","yahoo.com",
-  "msn.com","bing.com","ask.com","aol.com",
-  // Social
-  "facebook.com","instagram.com","twitter.com","x.com","threads.net",
-  "tiktok.com","snapchat.com","pinterest.com","linkedin.com","whatsapp.com",
-  "reddit.com","tumblr.com","quora.com","vk.com","ok.ru",
-  "discord.com","telegram.org","signal.org","wechat.com","line.me",
-  // Video/streaming
-  "netflix.com","spotify.com","twitch.tv","vimeo.com","dailymotion.com",
-  "hulu.com","disneyplus.com","primevideo.com","peacocktv.com","hbomax.com",
-  // E-commerce/retail
-  "amazon.com","amazon.co.uk","amazon.de","amazon.es","amazon.com.br","amazon.fr",
-  "ebay.com","ebay.co.uk","ebay.de","aliexpress.com","alibaba.com","taobao.com",
-  "mercadolibre.com","shopify.com","etsy.com","wish.com","rakuten.com",
-  "walmart.com","target.com","costco.com","bestbuy.com","homedepot.com",
-  // Finance
-  "paypal.com","stripe.com","payoneer.com","wise.com","revolut.com",
-  "chase.com","bankofamerica.com","wellsfargo.com","citibank.com","hsbc.com",
-  "visa.com","mastercard.com","americanexpress.com",
-  // Tech/software
-  "apple.com","microsoft.com","windows.com","office.com","live.com","outlook.com",
-  "zoom.us","slack.com","dropbox.com","github.com","gitlab.com","stackoverflow.com",
-  "cloudflare.com","amazonaws.com","azure.microsoft.com","cloud.google.com",
-  "oracle.com","sap.com","salesforce.com","hubspot.com","zendesk.com",
-  "adobe.com","canva.com","figma.com","notion.so","atlassian.com","jira.com",
-  // CMS/blogging (plataformas, no publishers)
-  "wp.com","wordpress.com","blogspot.com","wix.com","squarespace.com",
-  "weebly.com","medium.com","substack.com","ghost.io","blogger.com",
-  "webflow.com","jimdo.com","strikingly.com",
-  // Knowledge/encyclopedia
-  "wikipedia.org","wikimedia.org","wikihow.com","wikidata.org",
-  // Travel booking (no content puro)
-  "booking.com","airbnb.com","expedia.com","tripadvisor.com","hotels.com",
-  "kayak.com","skyscanner.net","agoda.com","hostelworld.com",
-  // Food delivery
-  "ubereats.com","doordash.com","grubhub.com","deliveroo.com","justeat.com","rappi.com",
-  // Ride/transport
-  "uber.com","lyft.com","bolt.eu","cabify.com","grab.com",
-  // Misc global brands
-  "ikea.com","zara.com","hm.com","uniqlo.com","nike.com","adidas.com",
-  "mcdonalds.com","starbucks.com","cocacola.com","pepsi.com",
-  "samsung.com","lg.com","sony.com","panasonic.com","philips.com",
-  "toyota.com","honda.com","bmw.com","mercedes-benz.com","volkswagen.com",
-]);
 
-// Detecta dominios de universidades e institutos académicos
-function isUniversityDomain(domain) {
-  if (domain.endsWith(".edu")) return true;
-  if (domain.endsWith(".ac.uk"))  return true;
-  if (domain.endsWith(".edu.au")) return true;
-  if (domain.endsWith(".edu.br")) return true;
-  if (domain.endsWith(".edu.mx")) return true;
-  if (domain.endsWith(".ac.jp"))  return true;
-  if (domain.endsWith(".edu.ar")) return true;
-  if (domain.endsWith(".edu.co")) return true;
-  if (domain.endsWith(".ac.nz"))  return true;
-  if (domain.endsWith(".ac.za"))  return true;
-  if (domain.endsWith(".sch.uk")) return true;
-  if (domain.endsWith(".edu.es")) return true;
-  if (domain.endsWith(".edu.it")) return true;
-  if (domain.endsWith(".unimi.it")) return true;
-  const kw = /\b(university|universidad|universidade|universit[aey]|uni[-.]|college|instituto[-.]tecnol|polytechnic|akademi|hochschule|facultad|school|escuela|colegio)\b/i;
-  return kw.test(domain);
-}
 
-// Patrones de palabra clave para descartar verticales que NO son publishers.
-// Aplica al nombre del dominio antes del primer punto. Más liviano que mantener
-// listas exhaustivas — si un dominio matchea alguno de estos, no es prospect ADEQ.
-const EXCLUDE_KEYWORDS = [
-  // Adulto / porno
-  "porn","xxx","sex","adult","cam","escort","fetish","hentai","onlyfans","pornhub","xvideos","xnxx","redtube",
-  "youporn","brazzers","chaturbate","stripchat","camsoda","myfreecams","livejasmin","bongacams",
-  // Gobierno / instituciones
-  "gov","gob","government","municipalidad","ayuntamiento","ministerio","ministry","parliament","congreso",
-  // Bancos grandes / fintech enterprise
-  "bank","banco","banca","banking","santander","bbva","caixabank","sabadell","unicredit","intesasanpaolo",
-  // Seguros enterprise
-  "insurance","seguros","mapfre","allianz","axa","zurich","prudential",
-  // Pharma enterprise
-  "pharma","pfizer","novartis","roche","merck","sanofi","gsk","astrazeneca",
-  // Telco enterprise
-  "telecom","telefonica","movistar","orange","vodafone","telmex","claro","mts",
-  // Energía enterprise
-  "petroleum","petrobras","exxon","chevron","totalenergies","shell","bp-",
-  // Aerolineas enterprise
-  "airlines","aerolineas","iberia","lufthansa","ryanair","emirates","qatarairways","americanairlines",
-  // Search / ad networks que se cuelan
-  "doubleclick","adservice","adsystem","adnxs","criteo","outbrain","taboola",
-  // Hosting / CDN
-  "cloudflare","cloudfront","fastly","akamai","jsdelivr","unpkg","cdn",
-  // Marketplace gigantes locales
-  "olx","craigslist","mercadolivre","gumtree","letgo","wallapop","jiji",
-  // Apuestas/gambling enterprise (legales pero gigantes)
-  "bet365","williamhill","ladbrokes","betfair","draftkings","fanduel","pokerstars",
-];
 
-const EXCLUDE_KEYWORD_RE = new RegExp(`\\b(${EXCLUDE_KEYWORDS.join("|")})\\b`, "i");
 
-function matchesExcludeKeyword(domain) {
-  // Solo chequea el nombre antes del primer punto + sufijos relevantes
-  return EXCLUDE_KEYWORD_RE.test(domain);
-}
 
-function isDomainAllowed(domain) {
-  // ⚠️ ESTO TIRABA EL PROCESO (Maxi 2026-09-02). `TypeError: domain.includes is not a
-  // function`, 14 veces sin capturar. Le llegaban OBJETOS `{title, domain}` desde el cache
-  // de similares: alguna rama guardó la respuesta cruda de la API en vez del dominio, y 117
-  // filas del cache quedaron así. Como el error salía por unhandledRejection, no lo agarraba
-  // ningún try/catch y se llevaba puesto el ciclo entero.
-  // Se acepta lo que venga y se extrae el dominio si es un objeto: una función de filtro
-  // NUNCA puede voltear el proceso por un dato mal formado.
-  if (domain && typeof domain === "object") domain = domain.domain || domain.url || domain.name || "";
-  domain = String(domain || "");
-  if (!domain || !domain.includes(".")) return false;
-  if (EXCLUDE_DOMAINS.has(domain)) return false;
-  if (isUniversityDomain(domain)) return false;
-  if (matchesExcludeKeyword(domain)) return false;
-  return true;
-}
 
 // Cap superior de tráfico — sitios con > 40M visits/mes son demasiado grandes
 // para que ADEQ pueda venderles. El SDR perdió tiempo persiguiéndolos.
@@ -2164,44 +2076,6 @@ async function _drainBacklog(token, sourceTag, room) {
   } catch (e) { log(`  ⚠️ drain pre-listado: ${e.message}`); return 0; }
 }
 
-// ── ¿ES UN DOMINIO DE VERDAD? (Maxi 2026-08-18) ──────────────────────────────────────
-// Lo que costó no tener esto: `cachalot.k` entró a la cola el 6 de julio. El ".k" no existe
-// como terminación, así que SimilarWeb devolvía HTTP 400 en cada intento. Como el 400 estaba
-// mal clasificado como error transitorio, se reintentaba sin fin y la cola nunca avanzaba:
-// 1.711 dominios detrás sin procesar y los tres motores de descubrimiento frenados por
-// saturación. Seis semanas de parálisis por un dominio mal escrito.
-// El 400 ya está arreglado, pero la lección de fondo es otra: basura que no debió entrar
-// nunca. Éste es el filtro más barato del sistema — sin red, sin API, sin costo.
-// Primero LIMPIA (protocolo, www, ruta, puerto) y después juzga. El orden importa: tirar un
-// lead bueno por venir escrito como "https://ejemplo.com/noticias" sería cambiar un problema
-// por otro. Devuelve el dominio limpio, o "" si no hay dominio posible ahí adentro.
-function _dominioLimpio(d) {
-  let s = String(d || "").trim().toLowerCase();
-  if (!s) return "";
-  s = s.replace(/^[a-z]+:\/\//, "");     // https://
-  s = s.split(/[/?#]/)[0];               // ruta, query, ancla
-  s = s.split("@").pop();                // user@host
-  s = s.split(":")[0];                   // :8080
-  s = s.replace(/^www\./, "").replace(/\.$/, "");
-  // Dominios con acentos o ñ (olé.com.ar, españa.es): existen y en un mercado hispano son
-  // leads reales. Se pasan a punycode, que es como los resuelve internet de verdad, en vez
-  // de descartarlos por "caracteres raros".
-  if (/[^\x00-\x7F]/.test(s)) {
-    try { s = new URL(`http://${s}`).hostname.replace(/^www\./, ""); } catch { return ""; }
-  }
-  return s;
-}
-function _dominioValido(d) {
-  const s = _dominioLimpio(d);
-  if (!s || s.length > 253 || s.length < 4) return false;
-  if (/[\s_\\]/.test(s)) return false;
-  if (s.startsWith(".") || s.includes("..")) return false;
-  const partes = s.split(".");
-  if (partes.length < 2) return false;                // sin punto no es un dominio
-  const tld = partes[partes.length - 1];
-  if (!/^[a-z]{2,24}$/.test(tld)) return false;       // ← acá muere "cachalot.k"
-  return partes.every(p => /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(p) && p.length <= 63);
-}
 
 async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
   // Maxi 2026-08-18: se descarta la basura ANTES de que ocupe un lugar en la cola.
@@ -5476,13 +5350,26 @@ const _GEO_SATURATION_PCT = 0.25; // >25% del pool → saturado
 async function _refreshGeoPoolCache(token) {
   if (Date.now() - _geoPoolCache.ts < _GEO_POOL_TTL && _geoPoolCache.totalPending > 0) return;
   try {
-    // Traer hasta 2000 rows con solo geo/geos_all (liviano)
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=geo,geos_all&limit=2000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return;
-    const rows = await res.json();
+    // ⚠️ SE PAGINA, y con orden. Antes era un `limit=2000` de una sola pasada sobre un pool
+    // que hoy tiene 2.401 pendientes: leía el 83% y, sin `order`, CUÁLES 2.000 cambiaba entre
+    // llamadas. Este número decide si un país "satura" el pool (>25%) y frena el feeder, así
+    // que se calculaba un porcentaje sobre una muestra parcial y movediza — el numerador y el
+    // denominador salían de poblaciones distintas.
+    const rows = [];
+    for (let desde = 0; ; desde += 1000) {
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=geo,geos_all&order=id&offset=${desde}&limit=1000`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      // Cortar sin actualizar el caché: uno viejo es mejor que uno a medias, porque a medias
+      // sub-cuenta y desfrena un GEO que sí está saturando.
+      if (!res.ok) return;
+      const pagina = await res.json();
+      if (!Array.isArray(pagina) || pagina.length === 0) break;
+      rows.push(...pagina);
+      if (pagina.length < 1000) break;
+      if (rows.length >= 20000) break;   // techo de cordura
+    }
     const byGeo = new Map();
     for (const r of rows) {
       let iso = "";
@@ -8946,10 +8833,16 @@ async function parteDelDia(token) {
   const _cacheAntes = new Set();
   try {
     const _tc = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeHoy}&select=domain&limit=40000`,
+      // ⚠️ El tope está POR ENCIMA de la tabla a propósito (hoy 33.956 filas contra 40.000) y
+      // se avisa si se acerca: si algún día lo pasa, esto devuelve una lista parcial y el
+      // informe diría que se midieron de verdad URLs que salieron de la caché.
+      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeHoy}&select=domain&order=domain&limit=40000`,
       { headers: auth }
     ).then(r => r.ok ? r.json() : []).catch(() => []);
     for (const c of (Array.isArray(_tc) ? _tc : [])) _cacheAntes.add(String(c.domain || "").toLowerCase());
+    if (Array.isArray(_tc) && _tc.length >= 39000) {
+      log(`⚠️ caché de tráfico: ${_tc.length} filas, cerca del tope de 40.000 — hay que paginar esta consulta antes de que trunque`);
+    }
   } catch {}
 
   // Los sitios que miraron (con geo). No todos terminan en un envío.
@@ -11343,146 +11236,13 @@ async function classifyPublisher(token, domain, pageContent, swCategory, swData 
   return { ok: v.ok, retry: !!v.retry, reason: v.reason, score: v.score, señales: v.señales };
 }
 
-// ── DETECCIÓN ROBUSTA DE IDIOMA — mirror del popup _detectLangFromText ──
-// Cascada: <html lang> → og:locale → texto heurístico → GEO → TLD → "en"
-// Solo retorna idiomas SOPORTADOS por templates: es/en/it/pt/ar.
-// Crítico: el agente debe acertar idioma SIEMPRE — un mail en idioma equivocado
-// quema el dominio para siempre.
-const SUPPORTED_AGENT_LANGS = new Set(["es", "en", "it", "pt", "ar"]);
-
-const TLD_TO_LANG_AGENT = {
-  ar:"es", mx:"es", co:"es", cl:"es", pe:"es", uy:"es", py:"es", bo:"es",
-  ec:"es", ve:"es", do:"es", cr:"es", pa:"es", gt:"es", hn:"es", sv:"es",
-  ni:"es", cu:"es", pr:"es", es:"es",
-  br:"pt", pt:"pt",
-  it:"it",
-  ae:"ar", sa:"ar", eg:"ar", ma:"ar",
-  com:"en", net:"en", org:"en", io:"en", uk:"en", us:"en", au:"en", nz:"en",
-};
-
-const GEO_TO_LANG_AGENT = {
-  Argentina:"es", Mexico:"es", Colombia:"es", Chile:"es", Peru:"es", Uruguay:"es",
-  Paraguay:"es", Bolivia:"es", Ecuador:"es", Venezuela:"es", "Dominican Republic":"es",
-  "Costa Rica":"es", Panama:"es", Guatemala:"es", Honduras:"es", "El Salvador":"es",
-  Nicaragua:"es", Cuba:"es", "Puerto Rico":"es", Spain:"es",
-  Brazil:"pt", Portugal:"pt",
-  Italy:"it", Switzerland:"it",
-  "United Arab Emirates":"ar", "Saudi Arabia":"ar", Egypt:"ar", Morocco:"ar",
-  AR:"es", MX:"es", CO:"es", CL:"es", PE:"es", UY:"es", PY:"es", BO:"es",
-  EC:"es", VE:"es", DO:"es", CR:"es", PA:"es", GT:"es", HN:"es", SV:"es",
-  NI:"es", CU:"es", PR:"es", ES:"es",
-  BR:"pt", PT:"pt",
-  IT:"it", CH:"it",
-  AE:"ar", SA:"ar", EG:"ar", MA:"ar",
-};
 
 
-// ── ALFABETO DEL SITIO (Maxi 2026-07-28) ──────────────────────────────────────────────────
-// Caso real reportado por el user: wanfangdata.com.cn (título 万方数据知识服务平台…, GEO China)
-// quedó guardado con idioma "pt". El sistema de votos está pensado para idiomas de alfabeto
-// LATINO: ante un sitio en chino ninguna señal aplica, y basta un voto suelto (bonus de acento
-// por mojibake, un geo/tld mal mapeado, el árbitro adivinando) para que gane con 1-2 puntos.
-// La regla del user es determinista y no depende de adivinar: si el sitio NO está en alfabeto
-// latino y no es árabe (el único no-latino con template), el mail sale en INGLÉS.
-// Cubre: chino, japonés, coreano, cirílico, griego, hebreo, tailandés, devanagari (hindi),
-// bengalí, tamil, armenio, georgiano.
-function _scriptNoLatino(text) {
-  const t = String(text || "");
-  if (!t) return null;
-  if (/[\u0600-\u06FF\u0750-\u077F]/.test(t)) return "ar";       // árabe → SÍ soportado
-  if (/[\u4E00-\u9FFF\u3400-\u4DBF]/.test(t)) return "zh";
-  if (/[\u3040-\u309F\u30A0-\u30FF]/.test(t)) return "ja";
-  if (/[\uAC00-\uD7AF\u1100-\u11FF]/.test(t)) return "ko";
-  if (/[\u0400-\u04FF]/.test(t))                 return "cyrillic";
-  if (/[\u0370-\u03FF\u1F00-\u1FFF]/.test(t))  return "el";
-  if (/[\u0590-\u05FF]/.test(t))                 return "he";
-  if (/[\u0E00-\u0E7F]/.test(t))                 return "th";
-  if (/[\u0900-\u097F]/.test(t))                 return "hi";
-  if (/[\u0980-\u09FF]/.test(t))                 return "bn";
-  if (/[\u0B80-\u0BFF]/.test(t))                 return "ta";
-  if (/[\u0530-\u058F]/.test(t))                 return "hy";
-  if (/[\u10A0-\u10FF]/.test(t))                 return "ka";
-  return null;
-}
-// TLDs de países cuyo idioma NO usa alfabeto latino y NO tenemos template → inglés directo.
-// Sirve cuando no pudimos bajar la página y no hay texto que analizar.
-const TLD_NO_LATINO = new Set(["cn","jp","kr","tw","hk","th","ru","ua","by","kz","gr","il","in","bd","lk","np","mm","kh","la","ge","am","rs","bg","mk"]);
 
-// ── DETECTOR DE IDIOMA POR TEXTO (reescrito 2026-07-28, planteo del user) ─────────────────
-// El user: "no hay nada más fácil que coger 200 palabras del texto de una web y detectar el
-// idioma". Tiene razón, y el diseño anterior lo hacía al revés: el texto era UN voto (peso 10)
-// entre ocho señales, compitiendo con el TLD (peso 2) y el GEO (peso 3). Un sitio rumano con
-// GEO mal leído terminaba con pitch en portugués.
-// AHORA: el texto MANDA. Y para que pueda mandar, tiene que saber reconocer los idiomas que NO
-// soportamos — antes solo conocía es/pt/it/en/fr/de, así que ante un sitio polaco o rumano
-// encontraba 2 stopwords sueltas y devolvía cualquier cosa. Ahora reconoce 20 idiomas: los 5
-// que enviamos y 15 más que sirven para decir "no es ninguno de los nuestros → inglés".
-const LANG_MARKERS = {
-  // ── Los 5 que SÍ enviamos ──
-  es: /\b(que|los|las|para|por|con|una|del|este|esta|pero|cuando|donde|como|porque|sobre|también|nuestra|nuestro|hola|gracias|hace|noticias|últimas|más|años|días|nuevo|nueva|desde|entre|hasta|muy|todo|puede)\b/gi,
-  pt: /\b(que|não|para|com|uma|por|esse|essa|mas|quando|onde|como|porque|sobre|nossa|nosso|você|notícias|últimas|mais|anos|dias|nova|desde|entre|até|muito|tudo|pode|são|está|fazer)\b/gi,
-  it: /\b(che|non|per|con|una|del|della|sono|questo|questa|quando|dove|come|perché|grazie|nostra|nostro|notizie|ultim|anni|giorni|nuovo|nuova|più|molto|tutto|essere|anche|dopo)\b/gi,
-  en: /\b(the|and|that|for|with|this|from|have|been|will|would|could|should|about|which|their|there|where|when|because|news|latest|more|years|days|new|very|all|can|has|not|are)\b/gi,
-  ar: /[\u0600-\u06FF]{3,}/g,
-  // ── Los que NO enviamos: reconocerlos es lo que evita el falso es/pt/it ──
-  fr: /\b(que|les|des|pour|avec|une|sur|cette|mais|quand|où|comme|parce|notre|votre|bonjour|merci|nouvelles|plus|ans|jours|nouveau|très|tout|être|dans|sont|aussi)\b/gi,
-  de: /\b(der|die|das|und|für|mit|ein|eine|nicht|auch|aber|wenn|wie|weil|über|unsere|unser|nachrichten|mehr|jahre|tage|neue|sehr|alle|sind|haben|wird|noch|nach)\b/gi,
-  nl: /\b(de|het|een|van|voor|met|niet|maar|ook|wanneer|waar|hoe|omdat|onze|nieuws|meer|jaar|dagen|nieuwe|zeer|alle|zijn|hebben|wordt|naar|door|over)\b/gi,
-  pl: /\b(nie|się|jest|dla|przez|jako|który|która|ale|kiedy|gdzie|jak|ponieważ|nasze|nasza|wiadomości|więcej|lata|dni|nowe|bardzo|wszystko|są|mają|oraz|tylko)\b/gi,
-  ro: /\b(nu|este|pentru|prin|care|dar|când|unde|cum|pentru că|nostru|noastră|știri|mai|ani|zile|nou|nouă|foarte|toate|sunt|au|și|din|cu|despre)\b/gi,
-  tr: /\b(bir|bu|için|ile|ve|değil|ama|zaman|nerede|nasıl|çünkü|bizim|haber|daha|yıl|gün|yeni|çok|tüm|var|olan|olarak|sonra|kadar)\b/gi,
-  cs: /\b(není|je|pro|přes|který|ale|když|kde|jak|protože|naše|náš|zprávy|více|roky|dny|nové|velmi|všechno|jsou|mají|nebo|také|což)\b/gi,
-  sv: /\b(inte|är|för|med|som|men|när|var|hur|eftersom|vår|våra|nyheter|mer|år|dagar|nya|mycket|alla|har|kan|och|det|att|den)\b/gi,
-  da: /\b(ikke|er|for|med|som|men|når|hvor|hvordan|fordi|vores|nyheder|mere|år|dage|nye|meget|alle|har|kan|og|det|at|den)\b/gi,
-  no: /\b(ikke|er|for|med|som|men|når|hvor|hvordan|fordi|vår|våre|nyheter|mer|år|dager|nye|mye|alle|har|kan|og|det|som)\b/gi,
-  fi: /\b(ei|on|että|kuin|mutta|kun|missä|miten|koska|meidän|uutiset|lisää|vuotta|päivää|uusi|hyvin|kaikki|ovat|voi|ja|se|tämä)\b/gi,
-  hu: /\b(nem|van|hogy|mint|de|amikor|hol|hogyan|mert|mi|hírek|több|év|nap|új|nagyon|minden|vannak|lehet|és|ez|az|egy)\b/gi,
-  id: /\b(tidak|adalah|untuk|dengan|yang|tetapi|ketika|di mana|bagaimana|karena|kami|berita|lebih|tahun|hari|baru|sangat|semua|dan|ini|itu)\b/gi,
-  vi: /\b(không|là|cho|với|mà|nhưng|khi|ở đâu|thế nào|bởi vì|chúng tôi|tin tức|hơn|năm|ngày|mới|rất|tất cả|và|này|đó)\b/gi,
-  ca: /\b(que|els|les|per|amb|una|del|aquest|aquesta|però|quan|on|com|perquè|nostra|nostre|notícies|més|anys|dies|nou|molt|tot|són)\b/gi,
-};
-const LANGS_ENVIABLES = new Set(["es", "pt", "it", "en", "ar"]);
 
-function _detectLangFromText(text) {
-  const raw = String(text || "");
-  // El alfabeto se chequea PRIMERO, antes del mínimo de longitud: en chino/japonés/coreano 30
-  // caracteres ya son un párrafo entero, y el umbral pensado para texto latino los descartaba
-  // como "muy corto" (caso wanfangdata.com.cn, título de 35 chars).
-  const script = _scriptNoLatino(raw);
-  if (script === "ar") return { lang: "ar", confidence: "high", scores: { ar: 999 } };
-  if (script)          return { lang: script, confidence: "high", scores: {}, noLatino: true };
-  if (raw.length < 40) return { lang: null, confidence: "none", scores: {} };
 
-  // Muestra amplia: ~200 palabras es más que suficiente y evita decidir sobre un menú de 5 items.
-  const t = raw.slice(0, 4000).toLowerCase();
-  const palabras = (t.match(/[\p{L}]+/gu) || []).length;
-  if (palabras < 8) return { lang: null, confidence: "low", scores: {} };
 
-  const scores = {};
-  for (const [lang, re] of Object.entries(LANG_MARKERS)) {
-    scores[lang] = (t.match(re) || []).length;
-  }
-  // Caracteres muy distintivos: sólo desempatan, no crean un ganador de la nada.
-  if (/[ñ¿¡]/.test(raw) && scores.es > 0) scores.es += 5;
-  if (/[ãõ]/.test(raw)  && scores.pt > 0) scores.pt += 5;
-  if (/[ăâîșț]/.test(raw) && scores.ro > 0) scores.ro += 5;
-  if (/[ąćęłńóśźż]/.test(raw) && scores.pl > 0) scores.pl += 5;
-  if (/[ğışçö]/.test(raw) && scores.tr > 0) scores.tr += 5;
-  if (/ß/.test(raw) && scores.de > 0) scores.de += 5;
 
-  const orden = Object.entries(scores).sort((a, b) => b[1] - a[1]);
-  const [top, segundo] = [orden[0], orden[1] || ["", 0]];
-  // Densidad: cuántas de las palabras del texto son stopwords del ganador.
-  const densidad = top[1] / Math.max(palabras, 1);
-  if (top[1] < 4 || densidad < 0.01) return { lang: null, confidence: "low", scores };
-  const margen = top[1] - segundo[1];
-  const confidence = margen >= 6 ? "high" : margen >= 3 ? "medium" : "low";
-  return { lang: top[0], confidence, scores, gap: margen, densidad };
-}
-
-// Cache de detección por dominio — evita re-pagar Claude/re-fetchear HTML
-const _domainLangCache = new Map();
-const DOMAIN_LANG_CACHE_MAX = 1000;
 
 // Árbitro Claude Haiku — clasificación final cuando heurística es ambigua.
 // Cost: ~$0.0005 por call. Cached por dominio.
@@ -11519,214 +11279,7 @@ async function _claudeLangByContext(token, domain, geo) {
   } catch { return null; }
 }
 
-async function _claudeLangArbiter(token, domain, sample) {
-  if (!sample || sample.length < 30) return null;
-  try {
-    const res = await fetch(`${SUPABASE_URL}/functions/v1/api-proxy`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        provider: "anthropic",
-        path: "/v1/messages",
-        method: "POST",
-        body: {
-          model: "claude-haiku-4-5",
-          max_tokens: 30,
-          system: "You classify the language of website text. Respond ONLY with a 2-letter ISO code (es/en/pt/it/ar/fr/de/other). No explanation.",
-          messages: [{ role: "user", content: `Domain: ${domain}\nSample (first 600 chars):\n${sample.substring(0, 600)}` }],
-        },
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const text = (data?.content?.[0]?.text || "").trim().toLowerCase();
-    const m = text.match(/^([a-z]{2})/);
-    return m && SUPPORTED_AGENT_LANGS.has(m[1]) ? m[1] : null;
-  } catch { return null; }
-}
 
-// Sistema de VOTACIÓN — recolecta todos los signals, weighta, decide.
-// El text heuristic es la fuente más confiable (lo que el publisher REALMENTE escribió),
-// aunque html lang diga otra cosa (sitios mal-declarados son comunes).
-// Si la votación es ambigua y tenemos token, llamamos a Claude Haiku como árbitro.
-async function detectLanguageRobust({ htmlLang, ogLocale, hreflang, jsonLdLang, pathLang, textSample, geo, domain }, opts = {}) {
-  const { token = null, allowClaudeArbiter = true } = opts;
-  const cleanDomain = (domain || "").replace(/^www\./, "").toLowerCase();
-
-  // Cache hit SOLO si tenemos textSample (= invocación con datos completos).
-  // Si solo tenemos geo/domain (hint cheap), no cache para no envenenar.
-  const hasFullData = !!textSample;
-  if (cleanDomain && hasFullData && _domainLangCache.has(cleanDomain)) {
-    return _domainLangCache.get(cleanDomain);
-  }
-
-  // Maxi 2026-07-08: cierre unificado — aplica la REGLA DURA (lang SIEMPRE en
-  // SUPPORTED_AGENT_LANGS, ante cualquier duda → en), cachea y devuelve. Evita duplicar
-  // el cacheo en los múltiples early-returns (incl. el fallback de idioma no soportado).
-  const finish = (result) => {
-    if (!result.lang || !SUPPORTED_AGENT_LANGS.has(result.lang)) {
-      result = { ...result, lang: "en", source: (result.source || "") + "→en_hardrule" };
-    }
-    if (cleanDomain && hasFullData) {
-      if (_domainLangCache.size >= DOMAIN_LANG_CACHE_MAX) {
-        const firstKey = _domainLangCache.keys().next().value;
-        _domainLangCache.delete(firstKey);
-      }
-      _domainLangCache.set(cleanDomain, result);
-    }
-    return result;
-  };
-
-  // Recolectar votos: cada signal aporta peso al lang detectado.
-  const votes = {}; // lang → puntaje
-  const reasons = [];
-  const addVote = (lang, weight, source) => {
-    if (!lang || !SUPPORTED_AGENT_LANGS.has(lang)) return;
-    votes[lang] = (votes[lang] || 0) + weight;
-    reasons.push(`${source}:${lang}+${weight}`);
-  };
-
-  // ── REGLA DURA DEL ALFABETO (Maxi 2026-07-28) — va ANTES de cualquier voto ──
-  // Si el sitio está escrito en un alfabeto que no es latino, ningún voto de stopwords/acentos
-  // tiene sentido. Árabe es la única excepción (tenemos template); todo el resto → INGLÉS.
-  // Esto cierra de raíz el caso wanfangdata.com.cn → "pt".
-  const _script = _scriptNoLatino(textSample || "");
-  if (_script === "ar") {
-    return finish({ lang: "ar", source: "script_arabe", confidence: "high", reasons: ["alfabeto árabe"] });
-  }
-  if (_script) {
-    return finish({ lang: "en", source: `script_${_script}_→en`, confidence: "high",
-                    reasons: [`alfabeto ${_script} sin template → inglés (regla del user)`] });
-  }
-  // Sin texto para analizar: el TLD del país ya nos dice que no es un idioma que manejemos.
-  if (!textSample && TLD_NO_LATINO.has((cleanDomain.split(".").pop() || ""))) {
-    return finish({ lang: "en", source: "tld_no_latino_→en", confidence: "medium",
-                    reasons: [`TLD .${cleanDomain.split(".").pop()} sin template → inglés`] });
-  }
-
-  // ── EL TEXTO DECIDE (Maxi 2026-07-28, planteo del user) ───────────────────────────────
-  // Antes el texto era UN voto entre ocho, y el TLD/GEO podían darlo vuelta. Ahora, si tenemos
-  // texto y el detector está seguro, ESE es el idioma y no se vota nada más. Es la única señal
-  // que mira lo que el publisher realmente escribió.
-  //   · detecta uno de los 5 que enviamos  → ese
-  //   · detecta otro idioma (pl, ro, tr, nl, de, fr…) → INGLÉS (regla del user: fuera de
-  //     {es,en,it,pt,ar} se manda en inglés)
-  // Solo si el texto NO alcanza para decidir se cae al sistema de votos de abajo.
-  // REGLA DEL USER (2026-07-28), textual:
-  //   web hispanohablante → español · italiana → italiano · Portugal/Brasil → portugués
-  //   árabe → árabe · cualquier otra cosa → INGLÉS
-  // Y: "no te bases siempre en SimilarWeb que puede fallar; toma el idioma del TEXTO +
-  // SimilarWeb y compará ambos".
-  const _txt = _detectLangFromText(textSample || "");
-  const _geoLang = GEO_TO_LANG_AGENT[geo] || GEO_TO_LANG_AGENT[(geo || "").trim()] || null;
-  const _tldLang = TLD_TO_LANG_AGENT[cleanDomain.split(".").pop() || ""] || null;
-
-  if (_txt.lang && (_txt.confidence === "high" || _txt.confidence === "medium")) {
-    const _final = LANGS_ENVIABLES.has(_txt.lang) ? _txt.lang : "en";
-    // CRUCE explícito texto ⨯ GEO. El texto manda siempre (es lo que el publisher realmente
-    // escribió; el GEO de SimilarWeb viene mal seguido: windguru.cz figuraba como Argentina).
-    // Pero cuando discrepan lo dejamos asentado en el log, que es como se detectan los casos
-    // raros sin tener que salir a buscarlos.
-    const _cruce = !_geoLang ? "geo sin dato"
-                 : _geoLang === _final ? `geo coincide (${geo})`
-                 : `⚠️ geo dice ${_geoLang} (${geo}) y el texto dice ${_txt.lang} → mando ${_final} (manda el texto)`;
-    return finish({
-      lang: _final,
-      source: LANGS_ENVIABLES.has(_txt.lang) ? `texto(${_txt.confidence})` : `texto_${_txt.lang}_→en`,
-      confidence: _txt.confidence,
-      reasons: [`texto→${_txt.lang}`, _cruce],
-    });
-  }
-
-  // El texto NO alcanzó para decidir (poca cantidad, o empate). Ahí SÍ usamos GEO y TLD, que
-  // es exactamente para lo que sirven: desempatar cuando no hay contenido que leer.
-  if (_geoLang && _tldLang && _geoLang === _tldLang) {
-    return finish({ lang: _geoLang, source: "geo+tld_coinciden", confidence: "medium",
-                    reasons: [`sin texto útil; geo(${geo}) y tld coinciden en ${_geoLang}`] });
-  }
-
-  // 1) Texto heurístico (más confiable — lo que el publisher escribió)
-  const textRes = _detectLangFromText(textSample || "");
-  // Maxi 2026-07-08: si el TEXTO detecta CLARAMENTE un idioma NO soportado (de/fr/otro)
-  // con confianza media/alta, es señal de que el sitio NO está en uno de nuestros 5 idiomas
-  // → EN directo. Antes: un textRes.lang no soportado lo rechazaba addVote() y el resultado
-  // caía a señales débiles (geo/tld) o al voto de acento equivocado → es/pt/it falso. Regla
-  // del dueño: todo lo que no sea {en,es,pt,ar,it} se manda en INGLÉS.
-  if (textRes.lang && !SUPPORTED_AGENT_LANGS.has(textRes.lang) &&
-      (textRes.confidence === "high" || textRes.confidence === "medium")) {
-    return finish({ lang: "en", source: "unsupported_fallback", confidence: "high",
-                    reasons: [`text_unsupported:${textRes.lang}(${textRes.confidence})`] });
-  }
-  if (textRes.lang) {
-    const weight = textRes.confidence === "high" ? 10 : textRes.confidence === "medium" ? 6 : 3;
-    addVote(textRes.lang, weight, `text(${textRes.confidence})`);
-  }
-
-  // 2) hreflang del primer link alternate (alta confianza si existe)
-  const hl = (hreflang || "").toLowerCase().split("-")[0];
-  if (SUPPORTED_AGENT_LANGS.has(hl)) addVote(hl, 8, "hreflang");
-
-  // 3) JSON-LD inLanguage (alta confianza si presente)
-  const jl = (jsonLdLang || "").toLowerCase().split("-")[0];
-  if (SUPPORTED_AGENT_LANGS.has(jl)) addVote(jl, 8, "jsonld");
-
-  // 4) URL path /es/ /pt-BR/ (cuando aparece, muy confiable)
-  const pl = (pathLang || "").toLowerCase().split(/[-_]/)[0];
-  if (SUPPORTED_AGENT_LANGS.has(pl)) addVote(pl, 7, "url");
-
-  // 5) <html lang> — peso medio (sitios mal-declarados son comunes)
-  const hl2 = (htmlLang || "").toLowerCase().split("-")[0];
-  if (SUPPORTED_AGENT_LANGS.has(hl2)) addVote(hl2, 5, "html_lang");
-
-  // 6) og:locale — peso medio
-  const og = (ogLocale || "").toLowerCase().split(/[-_]/)[0];
-  if (SUPPORTED_AGENT_LANGS.has(og)) addVote(og, 5, "og");
-
-  // 7) GEO → idioma — peso bajo (RapidAPI a veces devuelve geo wrong)
-  const geoLang = GEO_TO_LANG_AGENT[geo] || GEO_TO_LANG_AGENT[(geo || "").trim()];
-  if (geoLang && SUPPORTED_AGENT_LANGS.has(geoLang)) addVote(geoLang, 3, "geo");
-
-  // 8) TLD — peso bajo (.com domina, poco discriminativo)
-  const tld = cleanDomain.split(".").pop() || "";
-  const tldLang = TLD_TO_LANG_AGENT[tld];
-  if (tldLang && SUPPORTED_AGENT_LANGS.has(tldLang)) addVote(tldLang, 2, "tld");
-
-  // ── Decisión ────────────────────────────────────────────────
-  const sorted = Object.entries(votes).sort((a, b) => b[1] - a[1]);
-  let result;
-  if (sorted.length === 0) {
-    result = { lang: "en", source: "default", confidence: "low", reasons: ["no_signals"] };
-  } else {
-    const winner = sorted[0];
-    const runnerUp = sorted[1] || ["", 0];
-    const margin = winner[1] - runnerUp[1];
-    // Confianza: si winner score >= 10 Y margen >= 5 → high. Si margen < 3 → low (ambiguo).
-    const confidence = winner[1] >= 10 && margin >= 5 ? "high" : margin >= 3 ? "medium" : "low";
-
-    // Si confianza baja Y tenemos token + sample → Claude Haiku decide
-    if (confidence === "low" && allowClaudeArbiter && token && textSample) {
-      const claudeAns = await _claudeLangArbiter(token, cleanDomain, textSample);
-      if (claudeAns) {
-        result = { lang: claudeAns, source: "claude_arbiter", confidence: "high", reasons: [...reasons, `claude:${claudeAns}`] };
-      } else {
-        // Maxi 2026-07-08: el árbitro devolvió null (Claude dijo un idioma NO soportado —
-        // de/fr/other — o hubo error). En baja confianza NO caemos al winner dudoso (voto de
-        // acento/geo equivocado): el fallback CORRECTO es EN. Antes esto mandaba pt/es/it falso.
-        result = { lang: "en", source: "arbiter_null_fallback", confidence: "low",
-                   reasons: [...reasons, "claude_null→en"] };
-      }
-    } else {
-      result = { lang: winner[0], source: "voting", confidence, reasons };
-    }
-  }
-
-  // Maxi 2026-07-08: cierre unificado (regla dura SUPPORTED-only + cache) vía finish().
-  return finish(result);
-}
 
 // ── Blocklist para autopilot — evita dominios que no son targets válidos ───
 
@@ -11888,59 +11441,6 @@ const TLD_BY_REGION = {
   Asia:   [".in",".jp",".kr",".cn",".tw",".hk",".sg",".my",".id",".ph",".th",".vn",".pk",".bd"],
 };
 
-// Returns the "organization root" of a domain — collapses regional TLD variants
-// so clarin.com / clarin.com.ar / clarin.com.br dedupe to the same org key.
-// Heuristic — strips known multi-part TLDs first, then last TLD label, leaving
-// the brand part. Not perfect, but cuts >80% of obvious cross-region duplicates.
-const MULTI_PART_TLDS = new Set([
-  // commercial
-  "com.ar","com.br","com.mx","com.co","com.pe","com.uy","com.ec","com.ve","com.bo",
-  "com.es","com.au","com.cn","com.tw","com.hk","com.sg","com.my","com.tr","com.eg",
-  "com.sa","com.ng","com.za","com.ph","com.vn","com.pk","com.gt","com.do","com.pa",
-  "com.gh","com.ke","com.uy","com.bd","com.np","com.lk","com.kh","com.kw","com.qa",
-  "com.lb","com.jo","com.om","com.ye","com.ly","com.tn","com.dz",
-  "co.uk","co.za","co.in","co.kr","co.jp","co.il","co.nz","co.id","co.cr","co.ve",
-  "co.th","co.ke","co.tz","co.ug","co.zw","co.ma","co.ao",
-  // organization
-  "org.uk","org.ar","org.br","org.mx","org.au","org.za","org.es","org.in","org.pl",
-  "org.cn","org.tw","org.kr","org.jp","org.tr","org.sg","org.my","org.ph","org.vn",
-  "org.pk","org.bd","org.np","org.lk","org.eg","org.sa","org.ae","org.il",
-  // government — todos los .gov.X conocidos
-  "gov.ar","gov.br","gov.mx","gov.co","gov.pe","gov.cl","gov.uy","gov.ec","gov.ve",
-  "gov.bo","gov.au","gov.in","gov.uk","gov.za","gov.eg","gov.sa","gov.ng",
-  "gov.cn","gov.tw","gov.kr","gov.jp","gov.sg","gov.my","gov.ph","gov.vn","gov.pk",
-  "gov.bd","gov.np","gov.lk","gov.tr","gov.ae","gov.il","gov.tn","gov.ma",
-  // academic
-  "ac.uk","ac.in","ac.za","ac.jp","ac.kr","ac.nz","ac.th","ac.id","ac.cn","ac.tw",
-  "ac.ir","ac.ae","ac.il","ac.bd","ac.lk","ac.np","ac.tz","ac.ke",
-  "edu.ar","edu.br","edu.mx","edu.co","edu.pe","edu.uy","edu.au","edu.in","edu.eg",
-  "edu.cn","edu.tw","edu.hk","edu.sg","edu.my","edu.ph","edu.vn","edu.pk","edu.bd",
-  "edu.np","edu.lk","edu.tr","edu.sa","edu.ae","edu.jo","edu.lb",
-  // network/info per country
-  "net.ar","net.br","net.mx","net.au","net.in","net.cn","net.tw","net.kr","net.jp",
-  "net.sg","net.my","net.ph","net.vn","net.pk","net.bd","net.np","net.lk","net.eg",
-  "net.sa","net.ae","net.tr",
-  // .jp specific second-level (not just co.jp)
-  "or.jp","ne.jp","ad.jp","ed.jp","gr.jp","lg.jp","go.jp",
-  // .kr specific
-  "or.kr","ne.kr","go.kr","re.kr","pe.kr","es.kr","sc.kr","hs.kr","ms.kr",
-  // .cn specific
-  "ah.cn","bj.cn","cq.cn","fj.cn","gd.cn","gs.cn","gz.cn","gx.cn","ha.cn","hb.cn",
-  "he.cn","hi.cn","hk.cn","hl.cn","hn.cn","jl.cn","js.cn","jx.cn","ln.cn","mo.cn",
-  "nm.cn","nx.cn","qh.cn","sc.cn","sd.cn","sh.cn","sn.cn","sx.cn","tj.cn","tw.cn",
-  "xj.cn","xz.cn","yn.cn","zj.cn",
-]);
-function coreDomain(domain) {
-  if (!domain) return "";
-  const parts = domain.toLowerCase().replace(/^www\./, "").split(".");
-  if (parts.length <= 2) return parts[0]; // foo.com → "foo"
-  // Last 2 labels — check if it's a multi-part TLD (e.g. "com.ar", "gov.co")
-  const last2 = parts.slice(-2).join(".");
-  if (MULTI_PART_TLDS.has(last2) && parts.length >= 3) {
-    return parts[parts.length - 3]; // x.gov.co → "x", brand.com.ar → "brand"
-  }
-  return parts[parts.length - 2]; // sub.foo.com → "foo"
-}
 
 // Maxi 2026-07-08: marcas/plataformas por LABEL de 2do nivel — matchea en CUALQUIER TLD o
 // subdominio (news.google.at → "google", rakuten.tv → "rakuten", fr.wix.com → "wix"). El user
@@ -19374,8 +18874,6 @@ async function _recentGeoSendCounts(token, userEmail, days = 7) {
 //
 // NUNCA puede romper un envío. El mail ya salió cuando esto corre; que el CRM esté caído no
 // puede costar un lead. Todo va en try/catch y el error se registra, no se propaga.
-const CRM_SYNC_URL = process.env.CRM_SYNC_URL || "https://console.adeqmedia.com/api/crm/sync-toolbar";
-const CRM_SYNC_SECRET = process.env.CRM_SYNC_SECRET || "";
 
 // El idioma del CRM es el del PITCH, no el del sitio. La toolbar detecta 20+ idiomas pero el
 // pitch se escribe en 5, y todo lo que no es uno de esos cinco sale en inglés (`?? 0` en el

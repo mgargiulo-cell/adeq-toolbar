@@ -16,14 +16,24 @@ Son **dos Supabase distintas a propósito**: la del pool (toolbar) y la del CRM 
 ## Worker — `auto-prospector/`
 
 ```
-index.js        el ciclo y todo lo que toca estado o red
-lib/email.js    A QUIÉN se le escribe   ← extraído 2026-09-02
-lib/geo.js      país por TLD y prioridad geográfica
-templates.js    los pitches por idioma
-discovery.js    fuentes de descubrimiento
-keywordsData.js 3.490 frases para AutoGoogle
-tests/          20 tests, corren con `npm test`
+index.js          el ciclo y todo lo que toca estado o red   (24.684 L)
+lib/config.js     credenciales y URLs — la BASE, no depende de nada  (21 L)
+lib/dominio.js    normalizar una URL a algo comparable       (233 L)
+lib/email.js      A QUIÉN se le escribe                    (1.199 L)
+lib/geo.js        país por TLD y prioridad geográfica         (66 L)
+lib/idioma.js     en qué idioma está el sitio                (369 L)
+templates.js      los pitches por idioma
+discovery.js      fuentes de descubrimiento
+keywordsData.js   3.490 frases para AutoGoogle
+tests/            20 tests · `npm test`
 ```
+
+El orden de dependencias es en un solo sentido, sin ciclos:
+
+    config ← idioma
+    geo    ← email
+    (dominio y geo no dependen de nadie)
+    index.js importa de todos
 
 ### Las áreas dentro de `index.js`
 
@@ -35,7 +45,9 @@ Están **entremezcladas**, no en bloques: por eso conviene buscar por nombre de 
 | Cola y pool | qué se analiza y en qué orden | `_injectIntoCsvQueue`, `_parkInBacklog`, `_drainBacklog`, `processCsvItem` |
 | Calidad del sitio | ¿es un publisher que nos sirve? | `checkAdsTxt`, `classifyPublisher`, `scoreWebsite`, `detectLanguageRobust` |
 | Bloqueos | a quién NO tocar | `isDomainBlockedFull`, `getAdminBlocklistWorker`, `guardarBloqueadosDeMonday` |
-| **Email** | **a quién escribirle** | **todo en `lib/email.js`** |
+| **Email** | **a quién escribirle** | **`lib/email.js`** |
+| Idioma | en qué idioma sale el pitch | **`lib/idioma.js`** |
+| Dominio | normalizar URLs | **`lib/dominio.js`** |
 | Envío / agente | cuándo y desde qué casilla | `runAgentForUser`, `pickDbDraft`, `_isOutsideActiveHours` |
 | Rebotes | quién no existe y qué se reintenta | `scanBouncesForUser`, `queueBounceRetry`, `reconcileMondayBounces` |
 | CRM | el puente con el dashboard | `pushToCrmPropio`, `_fichaDelCrm`, `fetchDominiosBloqueados` |
@@ -49,7 +61,8 @@ duplicado significa **un tope de gasto que deja de funcionar sin avisar**. Se ex
 de a una, verificando cada paso.
 
 **Criterio para extraer:** una función se puede mover si no toca estado mutable de módulo ni
-hace red. Hoy **155 de 381 funciones (4.775 líneas) cumplen** eso.
+hace red. Al 2026-09-02 se extrajeron **1.888 líneas** en 5 módulos. Quedan candidatas medidas:
+calidad del sitio (~460 L), ads.txt (~172 L), fechas y turnos (~248 L).
 
 **Cómo verificar una extracción** (los cuatro pasos, en orden):
 1. `node --check` en los dos archivos

@@ -16,6 +16,7 @@
 
 import { COUNTRY_CODES } from "./geo.js";
 
+
 // ── MEMORIA DE REBOTE POR DOMINIO (auditoría 2026-08-04) ───────────────────────────────────
 // La lista de rebotados bloquea el EMAIL exacto, pero el rebote casi nunca es de la casilla:
 // es del dominio (servidor decomisionado, empresa cerrada, MX roto). Si ventas@x.com rebotó,
