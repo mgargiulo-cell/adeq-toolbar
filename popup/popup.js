@@ -5204,8 +5204,10 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // Las fechas de seguimiento se calculan desde el contacto, no desde hoy: si el MB carga
     // un prospecto contactado la semana pasada, los follow-ups tienen que salir cuando le
     // corresponden y no cinco días después de haberlo cargado.
-    fecha_fu1: new Date(Date.parse(contacto) + 5 * 86400000).toISOString().slice(0, 10),
-    fecha_fu2: new Date(Date.parse(contacto) + 10 * 86400000).toISOString().slice(0, 10),
+    // ⚠️ Las fechas de follow-up NO se mandan: las calcula el CRM desde `fecha_contacto`,
+    // con los offsets configurables de `crm_board_cadence_steps`. Acá estaban clavadas en
+    // +5 y +10, que hoy coinciden por casualidad; el día que se cambie la cadencia, todo lo
+    // que cargue el MB seguiría con las viejas. El MB elige el estado, no la cadencia.
     top_geo: geo || "",
     pageviews: typeof traffic === "number" ? formatTraffic(traffic) : (traffic || ""),
     language: _BOARD_IDIOMA[Number(idioma)] || "Ingles",

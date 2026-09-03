@@ -15205,8 +15205,13 @@ async function runReengagementCycle(token) {
 async function processManualReengagementQueue(token) {
   try {
     const cfg = await getConfig(token);
-    const enabled = String(cfg.agent_reengagement_enabled || "").toLowerCase() === "true";
-    if (!enabled) return; // mismo kill switch que el agent
+    // ⚠️ Interruptor PROPIO, encendido por defecto. Antes compartía el del re-engagement
+    // automático, y eso mezcla dos cosas que no se parecen: la cadencia automática la maneja
+    // el CRM (por eso `agent_reengagement_enabled` está en false desde el 03/09), pero esto es
+    // la cola de "Email Futuro" que dispara el MB A MANO. Apagar la cadencia no puede apagarle
+    // un botón a una persona; al hacerlo, sus mails se quedaban en la cola sin que nadie avise.
+    const enabled = String(cfg.manual_future_email_enabled ?? "true").toLowerCase() !== "false";
+    if (!enabled) return;
 
     // ⚠️ Ya NO se corta por falta de key de Monday. Este proceso MANDA MAILS de reenganche;
     // la escritura en Monday era sólo para anotar la dirección nueva. Con Monday apagado no
@@ -19299,8 +19304,12 @@ function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail, 
     // Encima mandaba "Propuesta Vigente (T)", que el CRM ya no acepta y traducía en silencio.
     ejecutivo_name: userEmail || "",
     fecha_contacto: _crmFecha(0),
-    fecha_fu1: _crmFecha(5),               // mismos offsets que MONDAY_COL_FU1
-    fecha_fu2: _crmFecha(10),              // y MONDAY_COL_FU2
+    // ⚠️ NO se mandan `fecha_fu1`/`fecha_fu2`. La cadencia es del CRM: sus offsets viven en
+    // `crm_board_cadence_steps` y son DIEZ pasos (seg1 +3, fu1 +5, seg2 +6, seg3 +9, fu2 +10,
+    // seg4 +12, fu3 +17, fu4 +40). Acá se mandaban dos, hardcodeados y copiados de Monday, y
+    // sync-toolbar dice "las que manda la toolbar mandan": o sea que el día que se cambie la
+    // cadencia en el CRM, los ~60 prospectos diarios del agente la ignorarían en silencio.
+    // Sin estas dos, el CRM las calcula solo desde `fecha_contacto`. Un solo dueño.
     top_geo: normalizeMondayGeo(geo),
     pageviews: formatTrafficForMonday(traffic),
     language: _crmIdioma(language),
