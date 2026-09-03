@@ -9774,12 +9774,106 @@ async function _guardarGastoClaude(token, forzar = false) {
  * @returns el JSON de la respuesta, o null si no se pudo / si el techo la frenó
  */
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  VIGILANTE DEL GASTO DE CLAUDE  —  ¿esto es normal o pasó algo?
+// ═══════════════════════════════════════════════════════════════════════════════
+// El 26/08 el gasto pasó de 0 a 1.777 llamadas/día y nos enteramos por la factura, seis días
+// después. Este job existe para que la próxima vez avise el mismo día y diga POR QUÉ.
+//
+// Dos preguntas distintas, y las dos importan:
+//   1. ¿Entiendo TODO lo que se gastó?  (cruce contra el contador del proxy)
+//   2. ¿Lo que se gastó es lo de siempre? (cada motivo contra su propia historia)
+//
+// El umbral sale de la historia de CADA motivo, no de un número fijo: un tope fijo con motivos
+// que hacen 10 llamadas y otros que hacen 1.500 es una bomba de tiempo — o no salta nunca o
+// salta siempre. Y el número que alarma es EL MISMO que se muestra en el detalle.
+async function vigilarGastoClaude(token) {
+  const { hour } = _madridNowParts();
+  if (hour < 9) return;                                   // con el día anterior ya cerrado
+  const dia = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 10);
+  if (_ultimoVigilanteGasto === dia) return;
+  _ultimoVigilanteGasto = dia;
+
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const traer = async (u) => { try { const r = await fetch(u, { headers: auth }); return r.ok ? await r.json() : null; } catch { return null; } };
+
+  // ── 1. ¿Hay llamadas que no sé explicar? ──────────────────────────────────
+  const cruce = await traer(`${SUPABASE_URL}/rest/v1/toolbar_gasto_claude_cruce?dia=eq.${dia}`);
+  if (cruce === null) {
+    // No se pudo consultar ≠ está todo bien. Se avisa, porque un vigilante mudo es peor que
+    // no tenerlo: da la sensación de que alguien está mirando.
+    await saludPing(token, "vigilante_gasto_claude", { status: "warn", cadenciaMin: 1440, detalle: "no pude leer el cruce" }).catch(() => {});
+    return;
+  }
+  const c = cruce[0];
+  if (c && c.proxy > 0 && Number(c.pct_sin_explicar) > 5) {
+    await saludAlerta(token, {
+      clave: `gasto_claude_sin_explicar_${dia}`,
+      titulo: `${c.sin_explicar} llamadas a Claude que no sé de dónde salieron (${c.pct_sin_explicar}%)`,
+      severidad: "warning",
+      cuerpo: `El ${dia} el proxy contó ${c.proxy} llamadas y sólo ${c.con_motivo} traen motivo.\n`
+            + `La diferencia es código que le pega a la key sin pasar por las dos puertas conocidas,\n`
+            + `o una puerta que dejó de anotar. Hasta que cierre, el desglose por motivo está incompleto\n`
+            + `y cualquier conclusión sobre en qué se gasta va a ser parcial.`,
+    }).catch(() => {});
+  }
+
+  // ── 2. ¿Algún motivo se disparó contra su propia historia? ────────────────
+  const hist = await traer(`${SUPABASE_URL}/rest/v1/toolbar_gasto_claude_vista?dia=gte.${new Date(Date.now() - 15 * 86400000).toISOString().slice(0, 10)}&select=dia,motivo,fuente,llamadas,usd_aprox&order=dia`);
+  const filas = Array.isArray(hist) ? hist : [];
+  const porMotivo = new Map();
+  for (const f of filas) {
+    const k = `${f.motivo}|${f.fuente}`;
+    if (!porMotivo.has(k)) porMotivo.set(k, []);
+    porMotivo.get(k).push(f);
+  }
+
+  const picos = [];
+  let diasDeBase = new Set(filas.filter(f => f.dia !== dia).map(f => f.dia)).size;
+  for (const [k, arr] of porMotivo) {
+    const hoy = arr.find(f => f.dia === dia);
+    const antes = arr.filter(f => f.dia !== dia).map(f => Number(f.llamadas)).sort((a, b) => a - b);
+    if (!hoy || antes.length < 3) continue;               // sin base no se dictamina
+    const mediana = antes[Math.floor(antes.length / 2)];
+    const n = Number(hoy.llamadas);
+    // 3x la mediana Y al menos 50 llamadas de diferencia: sin el piso, un motivo que hace 2
+    // llamadas y hace 6 dispararía una alerta por algo que no mueve la aguja.
+    if (mediana > 0 && n >= mediana * 3 && n - mediana >= 50) {
+      picos.push(`${k.split("|")[0]} (${k.split("|")[1]}): ${n} llamadas, viene de ${mediana} · US$${Number(hoy.usd_aprox).toFixed(2)}`);
+    }
+  }
+
+  if (picos.length) {
+    await saludAlerta(token, {
+      clave: `gasto_claude_pico_${dia}`,
+      titulo: `El ${dia} se disparó el gasto de Claude en ${picos.length} motivo(s)`,
+      severidad: "warning",
+      cuerpo: `Cada línea compara contra la mediana de los días anteriores del mismo motivo:\n\n`
+            + picos.map(p => `  · ${p}`).join("\n")
+            + `\n\nPuede ser trabajo legítimo (el 26/08 lo fue: el pool se destrabó). Lo que hay que\n`
+            + `mirar es si el motivo que subió corresponde a algo que efectivamente se empezó a hacer.`,
+    }).catch(() => {});
+  }
+
+  const total = filas.filter(f => f.dia === dia).reduce((a, x) => a + Number(x.usd_aprox || 0), 0);
+  await saludPing(token, "vigilante_gasto_claude", {
+    status: "ok", cadenciaMin: 1440,
+    // Se pinguea SIEMPRE, con picos o sin ellos: un día tranquilo es un resultado. Y se dice
+    // cuántos días de base hay, porque "0 anomalías" con 1 día de historia no significa nada.
+    detalle: diasDeBase < 3
+      ? `US$${total.toFixed(2)} el ${dia} · todavía sin base para comparar (${diasDeBase} día(s) de historia)`
+      : `US$${total.toFixed(2)} el ${dia} · ${picos.length} pico(s) sobre ${diasDeBase} días de base · ${c?.pct_sin_explicar ?? "?"}% sin explicar`,
+  }).catch(() => {});
+}
+
 // ── Registro de gasto: llamadas Y TOKENS ──────────────────────────────────────
 // Contar llamadas no alcanza: lo que se factura son tokens, y una llamada con 700 tokens de
 // system cuesta 200 veces una de 3. Se acumula en memoria y se vuelca cada tanto, para no
 // escribir en la base en cada llamada.
 const _gastoBuffer = new Map();   // "motivo|modelo" → {llamadas, in, out, cache}
 let _gastoUltimoVolcado = 0;
+let _ultimoVigilanteGasto = "";
 
 function _anotarGasto(motivo, modelo, usage) {
   const k = `${motivo}|${modelo}`;
@@ -24567,6 +24661,9 @@ async function main() {
       // que vigila y nunca avisa de nada. Tiene su propio guard de 15 min, así que
       // llamarlo en cada vuelta sale en microsegundos.
       await saludWatchdog(token).catch(e => log(`⚠️ saludWatchdog: ${e.message}`));
+      // Junto al resto de los vigilantes: mira el gasto de Claude del día anterior y avisa si
+      // hay llamadas sin explicar o un motivo que se disparó contra su propia historia.
+      await vigilarGastoClaude(token).catch(e => log(`⚠️ vigilante de gasto: ${e.message}`));
       // UN solo mail cada 72h con todo junto (lo curado + lo que necesita una mano).
       await enviarResumenSalud(token).catch(e => log(`⚠️ resumenSalud: ${e.message}`));
       // Snapshot diario de las 4 métricas, al cierre de la jornada.
