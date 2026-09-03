@@ -15560,6 +15560,12 @@ async function reportarReboteAlCrm(token, { email, originalDomain, tipo, detalle
     // El motivo en el formato que el board espera: el código SMTP si lo tenemos, y si no
     // nuestra clasificación. "no sé" nunca se manda como si fuera un diagnóstico.
     bounce_reason: (String(detalle || "").match(/\b[45]\d\d[\s-]?\d\.\d\.\d\b/) || [tipo || "desconocido"])[0],
+    // ⚠️ `source` va SIEMPRE, aunque este push sólo hable del rebote. El endpoint hace
+    // `origen = whitelist.has(p.source) ? p.source : 'toolbar'` y escribe la columna en cada
+    // upsert: sin este campo, reportar un rebote RE-ETIQUETA el envío del agente como trabajo
+    // a mano. Es la misma métrica que se arregló el 02/09 —753 falsos "manuales" en 9 días—
+    // corrompiéndose otra vez por una puerta distinta. Un push parcial igual pisa la columna.
+    source: "agente",
   }, "rebote").catch(() => {});
 }
 

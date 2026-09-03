@@ -5210,7 +5210,11 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // que cargue el MB seguiría con las viejas. El MB elige el estado, no la cadencia.
     top_geo: geo || "",
     pageviews: typeof traffic === "number" ? formatTraffic(traffic) : (traffic || ""),
-    language: _BOARD_IDIOMA[Number(idioma)] || "Ingles",
+    // ⚠️ El `<select>` ofrece "Language?" (valor 5) para cuando el MB NO sabe el idioma, y el
+    // fallback lo convertía en "Ingles": la respuesta honesta terminaba siendo una afirmación
+    // falsa, y el CRM le mandaba la plantilla en inglés a un sitio francés. Ahora se manda
+    // vacío y el CRM decide — "no sé" no se puede seguir tratando como "no". Caso nº9.
+    language: _BOARD_IDIOMA[Number(idioma)] || "",
     phone: telefono || "",
     comments: pitch || "",
     source: "toolbar",
@@ -9720,10 +9724,21 @@ function renderProspectCard(r) {
   const ownerOptions = ["Agus", "Diego", "Max"].map(o =>
     `<option value="${o}" ${o === owner ? "selected" : ""}>${o}</option>`).join("");
 
-  const statusOptions = [
-    ["1","En Negociacion"],["9","Masivo - Agus"],["6","Masivo - Diego"],["10","Masivo - Max"],
-    ["8","Mail No Enviado"],["3","Propuesta Vigente"],["4","Propuesta Vigente (T)"],["5","Ciclo Finalizado"]
-  ].map(([v,l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`).join("");
+  // ⚠️ Se leen del MISMO `#form-estado` que usa el emisor, no de una lista paralela.
+  // Acá había una copia con el vocabulario viejo de Monday —"Masivo - Agus", "Mail No Enviado",
+  // "Propuesta Vigente (T)"— con índices 9, 6, 10, 8 y 4 que ya no existen. `_estadoLabel`
+  // resuelve la etiqueta contra `#form-estado`, así que esas 5 caían al fallback "Propuesta
+  // Vigente" con nada más que un console.warn: el MB elegía "Mail No Enviado" y el prospecto
+  // entraba a la cadencia de follow-ups diciendo lo contrario de lo que él marcó.
+  // Una lista paralela a un desplegable SIEMPRE termina divergiendo. Ésta es la tercera vez.
+  const _opcionesEstado = Array.from(document.querySelectorAll("#form-estado option"))
+    .map(o => [o.value, o.textContent]);
+  // Si el canónico no estuviera en el DOM, mejor las 4 conocidas que un desplegable vacío.
+  const _estados = _opcionesEstado.length ? _opcionesEstado
+    : [["1", "En Negociacion"], ["3", "Propuesta Vigente"], ["5", "Ciclo Finalizado"], ["0", "Live"]];
+  const statusOptions = _estados
+    .map(([v, l]) => `<option value="${v}" ${v === status ? "selected" : ""}>${l}</option>`)
+    .join("");
 
   const langOptions = [
     ["0","English"],["1","Spanish"],["2","Italian"],["3","Portuguese"],["6","Arabic"]
@@ -10952,10 +10967,14 @@ async function validateProspect(card, data, doSendEmail) {
       fecha:     fechaISO,
       loginEmail: state.loginEmail,
     };
-    await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "" });
-    // Bump counter para Activity admin panel. Antes solo se hacía desde Analysis,
-    // las cargas desde Prospects (validate + push/send) no se contaban.
-    incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
+    // ⚠️ La carga al CRM va DESPUÉS del envío, no antes (Maxi 2026-09-03).
+    // Estaba al revés: se creaba la ficha —marcada como contactada, y sembrando el log del
+    // mail inicial— y recién después se intentaba mandar. Si Gmail fallaba, el `throw` de abajo
+    // sólo pintaba el error en la card: NO revertía la ficha. Resultado: un prospecto que el
+    // CRM da por contactado y al que no le escribió nadie, y al que nadie le va a escribir,
+    // porque `mail_ya_enviado` sale true por defecto y frena el inicial del CRM.
+    // El botón de Analysis ya lo hacía bien (se niega a cargar si no salió el mail); ésta era
+    // la única de las tres puertas con el orden invertido.
 
     // 2. Send email (if requested and email available)
     if (doSendEmail && email) {
@@ -10971,6 +10990,10 @@ async function validateProspect(card, data, doSendEmail) {
       const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
       if (!result.ok) throw new Error(result.error || "Gmail error");
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
+
+      // El mail salió: recién ahora la ficha puede decir que este prospecto fue contactado.
+      await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "" });
+      incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
       // Maxi 2026-06-18: contactos adicionales se envían EN PARALELO día 0
       // (no se encolan). Si el original rebota/OOO, bounce handler en worker
