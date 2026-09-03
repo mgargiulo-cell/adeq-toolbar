@@ -18421,6 +18421,71 @@ async function _nombreDeRemitente(userEmail) {
 
 
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LA MESA COMPARTIDA DE ENVÍOS  —  casilla_envios
+// ═══════════════════════════════════════════════════════════════════════════════
+// El worker y el CRM mandan desde LAS MISMAS TRES CASILLAS y hasta hoy contaban por
+// separado. Gmail mide la reputación por buzón: no le importa cuál de los dos apretó el
+// botón, le importa la ráfaga que ve salir. Con dos contadores el techo real era el doble.
+//
+// La tabla vive en la base del CRM, y el worker sólo tiene la puerta de `sync-toolbar`
+// (ver lib/config.js: no hay credenciales de esa base, a propósito). Así que esto se
+// apoya en un endpoint del CRM. Mientras no exista, avisa UNA vez y sigue.
+//
+// ⚠️ Por qué NO frena el envío si no puede consultar: el agente manda 20 por día por
+// casilla repartidos en 5 turnos, o sea 4 por hora — un octavo del tope de 25. Mi mitad
+// no puede ser la que queme la reputación, y cortar la prospección entera porque un
+// endpoint tuvo un hipo sería un daño mayor que el que evita.
+// ESTO DEJA DE SER CIERTO si el volumen del worker sube: si algún día manda más de ~15
+// por hora por casilla, hay que darlo vuelta y fallar cerrado.
+const CUPO_CASILLA_HORA = 25;
+let _avisoCasillaEnvios = false;
+
+function _urlCrm(ruta) {
+  return CRM_SYNC_URL.replace(/\/sync-toolbar\/?$/, ruta);
+}
+
+/** Anota en la mesa compartida que salió un mail. Nunca hace fallar el envío. */
+async function registrarEnvioCasilla(casilla, destino, ref) {
+  if (!CRM_SYNC_SECRET) return;
+  try {
+    const r = await fetch(_urlCrm("/casilla-envios"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-toolbar-secret": CRM_SYNC_SECRET },
+      // `origen` es el literal exacto que filtra el cron del CRM para sembrar su cupo, y
+      // `casilla` va en minúsculas porque del otro lado se compara con un toLowerCase().
+      body: JSON.stringify({ casilla: String(casilla || "").toLowerCase(), destino, origen: "toolbar", ref: ref ? String(ref) : null }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok && !_avisoCasillaEnvios) {
+      _avisoCasillaEnvios = true;
+      log(`  ⚠️ casilla_envios: el CRM devolvió ${r.status} — el cupo compartido no se está registrando`);
+    }
+  } catch (e) {
+    if (!_avisoCasillaEnvios) {
+      _avisoCasillaEnvios = true;
+      log(`  ⚠️ casilla_envios: no pude registrar el envío (${e.message}) — el cupo compartido queda ciego`);
+    }
+  }
+}
+
+/** Cuántos mails salieron de esa casilla en la última hora, contando LOS DOS sistemas. */
+async function cupoDisponibleCasilla(casilla) {
+  if (!CRM_SYNC_SECRET) return { hay: true, usados: null };
+  try {
+    const r = await fetch(`${_urlCrm("/casilla-envios")}?casilla=${encodeURIComponent(String(casilla || "").toLowerCase())}`, {
+      headers: { "x-toolbar-secret": CRM_SYNC_SECRET },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!r.ok) return { hay: true, usados: null };          // ver la nota de arriba
+    const j = await r.json();
+    const usados = Number(j?.ultima_hora ?? j?.count ?? NaN);
+    if (!Number.isFinite(usados)) return { hay: true, usados: null };
+    return { hay: usados < CUPO_CASILLA_HORA, usados };
+  } catch { return { hay: true, usados: null }; }
+}
+
 async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null, esProspeccion = true, htmlPropio = "" }) {
   // Sanitización final del destinatario: aunque venga del review_queue, de un
   // reintento o de un email viejo/manual, acá lo limpiamos (saca %, control chars,
@@ -18598,7 +18663,15 @@ async function sendGmailServer(_token, userEmail, { to, subject, body, agentActi
     const errText = await sendRes.text();
     throw new Error(`gmail_send_failed: ${sendRes.status} ${errText.slice(0,200)}`);
   }
-  return await sendRes.json();
+  const _envio = await sendRes.json();
+
+  // Se anota DESPUÉS de que salió, y sólo la prospección: los informes y las alertas
+  // internas van a nuestras propias casillas y no gastan reputación con nadie.
+  // Va acá adentro y no en los 8 llamadores a propósito: es el único punto por el que
+  // pasan todos, así que un envío nuevo no se puede olvidar de anotarse.
+  if (esProspeccion) registrarEnvioCasilla(userEmail, to, _envio?.id).catch(() => {});
+
+  return _envio;
 }
 
 // ── Push to Monday (server-side) ──
@@ -20922,6 +20995,16 @@ async function runAgentCycle(token, allFlags) {
         const _subjs = (pitch.subjects || []).filter(Boolean);
         const _hashDom = [...domain].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
         const subject = _subjs.length ? _subjs[_hashDom % _subjs.length] : `Sobre ${domain}`;
+
+        // ── CUPO COMPARTIDO DE LA CASILLA ─────────────────────────────────────────
+        // Cuenta lo que salió de este buzón en la última hora, del worker Y del CRM.
+        // Es un `break` y no un `continue`: si la casilla llegó al tope, no sirve probar
+        // con el lead siguiente — el límite es del buzón, no del destinatario.
+        const _cupo = await cupoDisponibleCasilla(userEmail);
+        if (!_cupo.hay) {
+          log(`  ⏸️ ${userEmail}: ${_cupo.usados}/${CUPO_CASILLA_HORA} mails en la última hora (worker + CRM) — corto el turno`);
+          break;
+        }
 
         // ── ÚLTIMA PUERTA ANTES DE ALGO IRREVERSIBLE ──────────────────────────────
         // El snapshot de bloqueados se refresca 1×/día, y el CRM mueve a "En Negociacion"
