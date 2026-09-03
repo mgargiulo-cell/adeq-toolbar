@@ -190,12 +190,19 @@ Grazie`,
  * Selecciona un template random para el idioma dado.
  * Si no hay templates para ese idioma, usa inglés como fallback.
  * @param {string} language - código ISO (es/en/pt/it/ar)
- * @returns {{ body: string, subjects: string[] }}
+ * @returns {{ body: string, subjects: string[], variant: number, idioma: string, ref: string }}
  */
 export function pickRandomTemplate(language) {
   const lang = (language || "en").toLowerCase();
   const list = TEMPLATES[lang] || TEMPLATES.en;
-  return list[Math.floor(Math.random() * list.length)];
+  const idx = Math.floor(Math.random() * list.length);
+  // ⚠️ El IDIOMA que se devuelve es el REALMENTE usado, no el pedido: si no hay plantillas
+  // para ese idioma se cae a inglés, y registrar el idioma pedido diría que le mandamos en
+  // vietnamita un texto que salió en inglés. El registro tiene que decir lo que pasó.
+  // `variant` es 1-based porque así lo espera el CRM (su columna arranca en 1).
+  // `ref` es la identidad de la plantilla baked: es lo que separa nuestro catálogo del suyo,
+  // y el bandit del CRM excluye por ese campo para no elegir su variante mirando nuestro texto.
+  return { ...list[idx], variant: idx + 1, idioma: lang in TEMPLATES ? lang : "en", ref: `baked_${lang in TEMPLATES ? lang : "en"}_${idx}` };
 }
 
 /**

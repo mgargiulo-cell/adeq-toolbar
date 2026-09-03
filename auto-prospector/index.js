@@ -19548,7 +19548,32 @@ function _crmFecha(offsetDias = 0) {
 
 // Arma el prospecto con la MISMA semántica que el push a Monday, para que las dos columnas
 // digan lo mismo mientras convivan. Si divergen acá, la comparación de la fase 5 no sirve.
-function _crmPayload({ domain, email, emailSecundario, geo, traffic, language, phone, userEmail, origen = "agente" }) {
+/**
+ * Traduce el identificador interno de una plantilla a lo que el CRM guarda del envío.
+ *
+ * ⚠️ El `template_id` del CRM es un uuid con FK a SU catálogo (crm_board_templates, 705
+ * filas). Nuestras plantillas son otra cosa: las baked de templates.js (`baked_es_2`) y los
+ * borradores de toolbar_pitch_drafts. No hay uuid que mandar ni join posible, así que va
+ * `template_ref` —la identidad nuestra— y el CRM deja su template_id en null.
+ *
+ * Y es lo que evita un daño fino: su `crm_board_template_stats` es el bandit con el que ELIGE
+ * qué variante mandar, y agrupa por (step_key, idioma, variant). Sin distinguir el catálogo,
+ * sus 'inicial' habrían elegido variante propia mirando el rendimiento de un texto nuestro.
+ * La vista excluye lo que tenga `template_ref`; por eso mandarlo no es opcional.
+ */
+function _plantillaParaElCrm(templateId, idiomaUsado) {
+  const ref = String(templateId || "");
+  // `baked_es_2` → variante 3 (el CRM las cuenta desde 1). Cualquier otra cosa —un borrador
+  // de toolbar_pitch_drafts, o el fallback— es variante 1: no tiene un orden que preservar.
+  const m = ref.match(/^baked_([a-z]{2})_(\d+)$/);
+  return {
+    template_ref: ref || null,
+    plantilla_variant: m ? Number(m[2]) + 1 : 1,
+    plantilla_idioma: m ? m[1] : String(idiomaUsado || "en").toLowerCase().slice(0, 2),
+  };
+}
+
+function _crmPayload({ domain, email, emailSecundario, plantilla, geo, traffic, language, phone, userEmail, origen = "agente" }) {
   return {
     domain,
     email: email || "",
@@ -19556,6 +19581,10 @@ function _crmPayload({ domain, email, emailSecundario, geo, traffic, language, p
     // moría en memoria. Desde el 03/09 el board MUESTRA esta columna, y es a quién escribirle
     // si la primera rebota, así que tirarlas era perder el reemplazo antes de necesitarlo.
     ...(emailSecundario ? { email_secondary: emailSecundario } : {}),
+    // El registro del mail INICIAL. Sin esto el panel del CRM contaba 0 en 'inicial' y el
+    // embudo arrancaba en el primer follow-up: todo el volumen de captación —que es el
+    // trabajo del agente— era invisible para el negocio.
+    ...(plantilla ? { ...plantilla, enviado_at: new Date().toISOString() } : {}),
     // ⚠️ NO se manda `deal_stage`. El estado es del CRM (acordado con la sesión del dashboard,
     // 03/09): él detecta las respuestas y mueve a "En Negociacion" en 3 minutos, y la lista de
     // bloqueados que mira el agente puede tener hasta 24 h. Si el agente estampa un estado en
@@ -21557,6 +21586,9 @@ async function runAgentCycle(token, allFlags) {
 
         await pushToCrmPropio(token, _crmPayload({
           domain, email, emailSecundario: _emailSecundario,
+          // `pitch._templateId` lo dejan puestos los dos caminos de selección (el ponderado
+          // por respuestas y el fallback baked), así que sirve para los dos.
+          plantilla: _plantillaParaElCrm(pitch?._templateId, lead.language),
           geo: leadGeo, traffic: leadTraffic,
           language: lead.language, phone: lead.contact_phone, userEmail,
         }), "envio").catch(() => {});
