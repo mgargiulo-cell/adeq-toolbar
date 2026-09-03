@@ -20923,6 +20923,27 @@ async function runAgentCycle(token, allFlags) {
         const _hashDom = [...domain].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
         const subject = _subjs.length ? _subjs[_hashDom % _subjs.length] : `Sobre ${domain}`;
 
+        // ── ÚLTIMA PUERTA ANTES DE ALGO IRREVERSIBLE ──────────────────────────────
+        // El snapshot de bloqueados se refresca 1×/día, y el CRM mueve a "En Negociacion"
+        // TRES MINUTOS después de que alguien contesta. Con sólo el snapshot, quien contestó
+        // a las 10 podía recibir un pitch en frío a las 13. Así salieron los 22 pitches a
+        // clientes que nos facturan.
+        //
+        // Regla: el snapshot filtra barato sobre miles de dominios del pool; la ficha FRESCA
+        // decide justo antes de mandar. Son ~60-100 consultas por día —una por mail que sale—
+        // y es el único momento en que el costo de equivocarse no se puede deshacer.
+        const _fichaAhora = await _fichaDelCrm(domain);
+        if (_fichaAhora?.enNegociacion) {
+          log(`  ⊘ ${domain}: ABORT send — el CRM lo tiene en negociación (${_fichaAhora.board})`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:en_negociacion" });
+          continue;
+        }
+        if (_fichaAhora?.descansando) {
+          log(`  ⊘ ${domain}: ABORT send — descansando, faltan ${_fichaAhora.diasParaReintentar} días`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:descansando" });
+          continue;
+        }
+
         // BLOCKLIST GUARD (defense-in-depth) — admin pudo agregar el dominio
         // entre intake y send. Recheck antes de mandar.
         const _blockGuard = await isDomainBlockedFull(domain, token).catch(() => null);
