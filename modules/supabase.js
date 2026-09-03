@@ -369,7 +369,7 @@ export async function isEmailBounced(accessToken, email) {
   if (!clean.includes("@")) return { bounced: false };
   try {
     const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?email=eq.${encodeURIComponent(clean)}&select=email,reason,created_at&limit=1`,
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?email=eq.${encodeURIComponent(clean)}&evidencia=in.(rebote_smtp,verificador,sin_clasificar)&select=email,reason,created_at&limit=1`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` } }
     );
     if (!res.ok) return { bounced: false };

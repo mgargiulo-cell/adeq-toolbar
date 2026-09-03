@@ -9876,7 +9876,11 @@ let _gastoUltimoVolcado = 0;
 let _ultimoVigilanteGasto = "";
 
 function _anotarGasto(motivo, modelo, usage) {
-  const k = `${motivo}|${modelo}`;
+  // El DÍA va en la clave, no se calcula al volcar. El worker duerme de noche sin morirse, así
+  // que el buffer de la última tanda de la tarde se volcaba recién con la primera llamada de la
+  // mañana siguiente y caía en el día equivocado — todos los días. Eso solo garantizaba que
+  // `sin_explicar` nunca llegara a 0 y que el vigilante alertara sobre su propio desfase.
+  const k = `${new Date().toISOString().slice(0, 10)}|${motivo}|${modelo}`;
   const a = _gastoBuffer.get(k) || { llamadas: 0, in: 0, out: 0, cache: 0 };
   a.llamadas++;
   a.in    += usage?.input_tokens || 0;
@@ -9889,11 +9893,10 @@ async function volcarGastoClaude(token, forzar = false) {
   if (!_gastoBuffer.size) return;
   if (!forzar && Date.now() - _gastoUltimoVolcado < 5 * 60 * 1000) return;
   _gastoUltimoVolcado = Date.now();
-  const dia = new Date().toISOString().slice(0, 10);
   const pend = [..._gastoBuffer.entries()];
-  _gastoBuffer.clear();                                  // se vacía YA: si falla el POST se
-  for (const [k, a] of pend) {                           // pierde un tramo, no se duplica
-    const [motivo, modelo] = k.split("|");
+  _gastoBuffer.clear();
+  for (const [k, a] of pend) {
+    const [dia, motivo, modelo] = k.split("|");
     // Suma sobre lo que ya haya del día. No hay upsert-con-suma en PostgREST, así que se lee
     // y se escribe; el worker es el único que escribe estas filas, no hay carrera.
     try {
@@ -9916,7 +9919,18 @@ async function volcarGastoClaude(token, forzar = false) {
           actualizado: new Date().toISOString(),
         }),
       });
-    } catch {}
+    } catch {
+      // ⚠️ El buffer ya se vació. Si el POST falla, el tramo se devuelve en vez de perderse:
+      // antes desaparecía en silencio y encima alimentaba la falsa alarma de "llamadas que no
+      // sé de dónde salieron". Perder el dato y después alarmarse por haberlo perdido es el
+      // peor de los dos mundos.
+      const prevBuf = _gastoBuffer.get(k) || { llamadas: 0, in: 0, out: 0, cache: 0 };
+      _gastoBuffer.set(k, {
+        llamadas: prevBuf.llamadas + a.llamadas, in: prevBuf.in + a.in,
+        out: prevBuf.out + a.out, cache: prevBuf.cache + a.cache,
+      });
+      log(`  ⚠️ no pude guardar el gasto de ${motivo}: queda en cola para el próximo volcado`);
+    }
   }
 }
 
@@ -9934,7 +9948,13 @@ async function llamarClaude(token, motivo, cuerpo, { timeout = 10000 } = {}) {
 
   if (!CLAUDE_MOTIVOS_ESENCIALES.has(motivo)) {
     const cfg = await getConfig(token).catch(() => ({}));
-    const techo = Number(cfg.claude_daily_cap ?? 700) || 700;
+    // ⚠️ Era `Number(...) || 700`, y eso convertía el 0 en 700: el único valor que uno
+    // escribiría para FRENAR el gasto era justo el que no funcionaba.
+    // Vacío NO es cero: `Number("")` da 0, y un campo que alguien borró apagaría el
+    // enriquecimiento sin que nadie lo haya pedido. El 0 hay que escribirlo.
+    const _crudo = String(cfg.claude_daily_cap ?? "").trim();
+    const _t = _crudo === "" ? NaN : Number(_crudo);
+    const techo = Number.isFinite(_t) && _t >= 0 ? _t : 700;
     if (_claudeGasto.total >= techo) {
       // Se avisa UNA vez por día: un tope que se cruza en silencio es un tope que nadie revisa.
       if (!_claudeGasto.avisado) {
@@ -9994,19 +10014,23 @@ async function _haikuPublisherClassLote(token, filas, trashRules = "") {
     if (!f.title && !f.description) { out.set(f.domain, null); continue; }   // nada que clasificar
     pendientes.push(f);
   }
+
+  // El texto viene del sitio ajeno: un salto de línea o un `|` deja meter una línea falsa en
+  // la lista y hacer que el modelo hable de un sitio que no existe. Un publisher puede elegir
+  // su propio <title>; no puede elegir el formato de nuestro prompt.
+  const _limpio = (t) => String(t || "").replace(/[\r\n|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+
   const LOTE = 20;
   for (let i = 0; i < pendientes.length; i += LOTE) {
     const grupo = pendientes.slice(i, i + LOTE);
-    const lista = grupo.map((f, n) =>
-      `${n + 1}. ${f.domain} | ${(f.title || "").slice(0, 120)} | ${(f.description || "").slice(0, 120)} | cat:${f.category || "?"}`
-    ).join("\n");
+    const lista = grupo.map(f => `${f.domain} | ${_limpio(f.title)} | ${_limpio(f.description)} | cat:${_limpio(f.category) || "?"}`).join("\n");
     const data = await llamarClaude(token, "clasificar_sitio_lote", {
       model: "claude-haiku-4-5",
-      max_tokens: 40 + grupo.length * 18,
+      max_tokens: 60 + grupo.length * 22,
       system: _SYS_CLASIFICA_SITIO(trashRules)
-        + "\n\nTe paso VARIOS sitios numerados. Devolvé SOLO un JSON: "
-        + '{"1":"publisher","2":"ecommerce",...} usando el número de cada línea como clave. '
-        + "Una entrada por sitio, sin texto alrededor.",
+        + "\n\nTe paso VARIOS sitios, uno por línea. Devolvé SOLO un JSON que use el DOMINIO "
+        + 'exacto como clave: {"ejemplo.com":"publisher","otro.com":"ecommerce"}. '
+        + "Una entrada por sitio, con el dominio tal cual te lo pasé, sin texto alrededor.",
       messages: [{ role: "user", content: lista }],
     }, { timeout: 30000 });
 
@@ -10014,17 +10038,33 @@ async function _haikuPublisherClassLote(token, filas, trashRules = "") {
     const m = txt.match(/\{[\s\S]*\}/);
     let parsed = null;
     try { parsed = m ? JSON.parse(m[0]) : null; } catch {}
-    grupo.forEach((f, n) => {
-      const bruto = String(parsed?.[String(n + 1)] || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
-      const tipo = _TIPOS_SITIO.includes(bruto) ? bruto : null;
-      // Si el lote no volvió o vino incompleto, el sitio queda SIN veredicto y se reintenta
-      // otro día. No se cachea un null de un lote fallado: sería dar por revisado algo que no lo fue.
+
+    // ⚠️ La clave es el DOMINIO, no el número de línea (Maxi 2026-09-03).
+    // Con claves numéricas, si el modelo se saltea una línea RENUMERA todo lo que sigue y cada
+    // sitio se lleva el veredicto del siguiente. Medido: entre 1 y 15 errores sobre 20, según
+    // la corrida — intermitente, o sea indetectable. Y como `runSuspectRejectAnalysis` sella
+    // `suspect_checked_at`, el veredicto equivocado es PERMANENTE: publishers reales marcados
+    // para descarte y tiendas entrando al pool, sin que nadie lo vuelva a mirar.
+    // Con el dominio como clave el corrimiento deja de existir: o coincide o no se usa.
+    const porDominio = new Map();
+    for (const [k, v] of Object.entries(parsed || {})) {
+      const dom = String(k).trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "");
+      const bruto = String(v || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
+      if (_TIPOS_SITIO.includes(bruto)) porDominio.set(dom, bruto);
+    }
+
+    let _faltan = 0;
+    for (const f of grupo) {
+      const tipo = porDominio.get(String(f.domain).toLowerCase()) || null;
+      // Un dominio que el modelo no devolvió queda SIN veredicto y se reintenta otro día.
+      // Nunca se le adjudica el de otro, ni se cachea un null de una respuesta incompleta.
       if (tipo) {
         if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
         _publisherClassCache.set(`${f.domain}|${rk}`, tipo);
-      }
+      } else { _faltan++; }
       out.set(f.domain, tipo);
-    });
+    }
+    if (_faltan) log(`  ⚠️ clasificación por lote: ${_faltan}/${grupo.length} sin veredicto — quedan para otra corrida`);
   }
   return out;
 }
@@ -12342,7 +12382,7 @@ async function reabrirLeadsRebotados(token) {
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
     const rebotados = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=5000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=5000`,
       { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
     if (!Array.isArray(rebotados) || !rebotados.length) {
       await saludPing(token, "reabrir_rebotados", { status: "ok", cadenciaMin: 360, detalle: "no hay rebotes registrados" }).catch(() => {});
@@ -15410,7 +15450,7 @@ async function loadBouncedEmails(token) {
       //                     caído. Había 5 direcciones sanas bloqueadas de por vida por eso.
       // Se filtra por COLUMNA y no por regex sobre el texto del motivo: un `reason` nuevo que
       // nadie previó volvía a colarse como rebote sin que se notara.
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&evidencia=in.(rebote_smtp,verificador,sin_clasificar)&limit=10000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=10000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (res.ok) {
@@ -15440,7 +15480,7 @@ async function _cargarDominiosQueRechazan(token) {
   if (Date.now() - _dominiosRechazoAt < 30 * 60 * 1000) return;   // refresco cada 30 min
   try {
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo&limit=5000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo&${EVIDENCIA_BLOQUEA}&limit=5000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
     if (!r.ok) return;                      // no pude leer ≠ nadie rechaza
     const filas = await r.json();
@@ -15491,11 +15531,26 @@ async function _fuenteDelEmail(token, email) {
 // para no volver a escribirle NUNCA a esa dirección, y así estaban entrando.
 // ⚠️ `\bsoft\b` NO sirve: en "smtp_bounce_soft" el guion bajo es carácter de palabra y no hay
 // borde antes de "soft". El negativo por la derecha evita comerse "software".
-const _REBOTE_TEMPORAL = /soft(?![a-z])|\b4\d\d[\s-]\d\.\d\.\d\b|^\s*4\d\d\b/i;
+
+// Las clases de prueba que JUSTIFICAN no volver a escribirle a una dirección. Va en UN solo
+// lugar porque hay cuatro lectores que deciden bloqueos y tres leían la tabla entera: una
+// autorespuesta contaba como dirección muerta y llegó a vaciarle los emails a un lead.
+const EVIDENCIA_BLOQUEA = "evidencia=in.(rebote_smtp,verificador,sin_clasificar)";
+
+
+// ⚠️ El lookahead solo por la derecha protegía "software" pero NO "microsoft": un
+// "550 5.1.1 ... sent by Microsoft Exchange Server" quedaba como temporal y le seguíamos
+// escribiendo a una dirección muerta. Hace falta el lookbehind también.
+const _REBOTE_TEMPORAL = /(?<![a-z])soft(?![a-z])|\b4\d\d[\s-]\d\.\d\.\d\b|^\s*4\d\d\b/i;
 
 /** Qué CLASE de prueba tenemos de que una dirección no sirve. Sólo dos clases bloquean. */
-function _claseDeRebote(reason, detalle) {
+function _claseDeRebote(reason, detalle, tipo) {
   const r = String(reason || ""), d = String(detalle || "");
+  // ⚠️ Si el gate de arriba ya dictaminó que la dirección no existe o que nos bloquean, eso
+  // MANDA sobre el texto. Había una fila real de hoy con tipo="bloqueado" (el escritor dijo
+  // "quemala") y evidencia="rebote_temporal" (el filtro dijo "no la bloquees"), sólo porque el
+  // cuerpo traía un 454. Dos decisiones opuestas sobre el mismo hecho, y ganaba la del string.
+  if (tipo === "usuario_inexistente" || tipo === "dominio_inexistente" || tipo === "bloqueado") return "rebote_smtp";
   if (/^mv_|millionverifier/i.test(r)) return "verificador";     // nunca salió: envío evitado
   if (/auto_reply/i.test(r))           return "autorespuesta";   // prueba que está VIVO
   if (_REBOTE_TEMPORAL.test(`${r} ${d}`) || _REBOTE_TEMPORAL.test(d)) return "rebote_temporal";
@@ -15528,7 +15583,7 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
           // sale del pool esa información desaparece. Sin saber QUIÉN produjo la dirección
           // que rebotó, no se puede aprender nada.
           tipo:    tipo || null,
-          evidencia: evidencia || _claseDeRebote(reason, detalle),
+          evidencia: evidencia || _claseDeRebote(reason, detalle, tipo),
           detalle: (detalle || "").substring(0, 200) || null,
           fuente:  _fuenteCongelada,
       }),
@@ -15725,10 +15780,18 @@ async function _sitioDeLaDireccion(token, email) {
   if (!e) return "";
   try {
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?email=eq.${encodeURIComponent(e)}&select=domain&order=sent_at.desc&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?email=eq.${encodeURIComponent(e)}&select=domain&order=send_date.desc&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } },
     );
-    if (!r.ok) return "";
+    if (!r.ok) {
+      // ⚠️ Devolver "" acá hacía que el llamador dijera "no encuentro a qué sitio se lo
+      // mandamos" —o sea "faltan datos"— cuando la causa era un 400 por mi propio error:
+      // la columna se llama `send_date`, no `sent_at`, y la query fallaba SIEMPRE. El puente
+      // de rebotes al CRM estuvo apagado el 100% del tiempo y el log decía otra cosa.
+      // Un fallo de consulta y una falta de datos NO se pueden ver iguales desde afuera.
+      log(`  ⚠️ _sitioDeLaDireccion(${e}): HTTP ${r.status} — no es que falten datos, la consulta falló`);
+      return "";
+    }
     const filas = await r.json();
     return (Array.isArray(filas) && filas[0]?.domain) ? String(filas[0].domain).toLowerCase() : "";
   } catch { return ""; }
@@ -19850,7 +19913,7 @@ async function runAgentCycle(token, allFlags) {
             `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${_desde7}&select=email_to&limit=3000`,
             { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
           const _rb = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=5000`,
+            `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=5000`,
             { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
           if (!_rs.ok || !_rb.ok) throw new Error("no pude medir");
           const _dest = (await _rs.json()).map(x => String(x.email_to || "").toLowerCase()).filter(Boolean);
