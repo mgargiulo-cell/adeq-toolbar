@@ -9819,19 +9819,75 @@ async function llamarClaude(token, motivo, cuerpo, { timeout = 10000 } = {}) {
   } catch { return null; }
 }
 
-async function _haikuPublisherClass(token, domain, pageContent, swCategory, trashRules = "") {
-  // Cache key incluye si hay reglas (para no servir veredictos viejos cuando el MB
-  // enseña reglas nuevas vía rechazos).
-  const ckey = `${domain}|${trashRules ? "r1" : "r0"}`;
-  if (_publisherClassCache.has(ckey)) return _publisherClassCache.get(ckey);
-  const title = pageContent?.title || ""; const desc = pageContent?.description || "";
-  if (!title && !desc) return null; // sin nada que clasificar
-  // Maxi 2026-07-08: taxonomía DESTILADA de los rechazos manuales del MB (los ejemplos que fue
-  // pasando: leroymerlin/defacto/beyoung=tienda, n26/bbva=banco, ipsos=market research,
-  // carwow/holidayautos=alquiler, andalusiaegypt/urlaubsguru=hotel/viajes, tommys.org=ONG,
-  // ouedkniss=marketplace, universidades). Un publisher SOLO es medio de CONTENIDO monetizado
-  // con display/programmatic. Todo lo que VENDE/RESERVA/GESTIONA no va.
-  const sys = "Clasificás sitios web para un ad-network. Un 'publisher' (ÚNICO target válido) es un "
+
+/**
+ * Igual que `_haikuPublisherClass` pero de a MUCHOS sitios en una sola llamada.
+ *
+ * Por qué existe: el system prompt de la clasificación son ~700 tokens y la respuesta son 3.
+ * Preguntando de a uno se paga esa instrucción entera CADA VEZ — el 97% de lo que se gasta es
+ * la misma explicación repetida. `runSuspectRejectAnalysis` la repetía 200 veces por corrida.
+ * De a 20 se paga una vez y se reparte: ~11x menos tokens de entrada y 20x menos llamadas.
+ *
+ * (Prompt caching de Anthropic no servía acá: el mínimo cacheable son 2048 tokens y este
+ * prompt no llega. Agrupar además ELIMINA la repetición en vez de abaratarla.)
+ *
+ * @returns Map dominio → tipo. El que no vuelva en la respuesta queda sin veredicto (null),
+ *          nunca se asume "publisher" ni se lo da por descartado.
+ */
+async function _haikuPublisherClassLote(token, filas, trashRules = "") {
+  const out = new Map();
+  const rk = trashRules ? "r1" : "r0";
+  const pendientes = [];
+  for (const f of filas) {
+    const ckey = `${f.domain}|${rk}`;
+    if (_publisherClassCache.has(ckey)) { out.set(f.domain, _publisherClassCache.get(ckey)); continue; }
+    if (!f.title && !f.description) { out.set(f.domain, null); continue; }   // nada que clasificar
+    pendientes.push(f);
+  }
+  const LOTE = 20;
+  for (let i = 0; i < pendientes.length; i += LOTE) {
+    const grupo = pendientes.slice(i, i + LOTE);
+    const lista = grupo.map((f, n) =>
+      `${n + 1}. ${f.domain} | ${(f.title || "").slice(0, 120)} | ${(f.description || "").slice(0, 120)} | cat:${f.category || "?"}`
+    ).join("\n");
+    const data = await llamarClaude(token, "clasificar_sitio_lote", {
+      model: "claude-haiku-4-5",
+      max_tokens: 40 + grupo.length * 18,
+      system: _SYS_CLASIFICA_SITIO(trashRules)
+        + "\n\nTe paso VARIOS sitios numerados. Devolvé SOLO un JSON: "
+        + '{"1":"publisher","2":"ecommerce",...} usando el número de cada línea como clave. '
+        + "Una entrada por sitio, sin texto alrededor.",
+      messages: [{ role: "user", content: lista }],
+    }, { timeout: 30000 });
+
+    const txt = data?.content?.[0]?.text || "";
+    const m = txt.match(/\{[\s\S]*\}/);
+    let parsed = null;
+    try { parsed = m ? JSON.parse(m[0]) : null; } catch {}
+    grupo.forEach((f, n) => {
+      const bruto = String(parsed?.[String(n + 1)] || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
+      const tipo = _TIPOS_SITIO.includes(bruto) ? bruto : null;
+      // Si el lote no volvió o vino incompleto, el sitio queda SIN veredicto y se reintenta
+      // otro día. No se cachea un null de un lote fallado: sería dar por revisado algo que no lo fue.
+      if (tipo) {
+        if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
+        _publisherClassCache.set(`${f.domain}|${rk}`, tipo);
+      }
+      out.set(f.domain, tipo);
+    });
+  }
+  return out;
+}
+
+
+// Los tipos que el clasificador puede devolver. Uno solo, en un solo lugar: la versión
+// individual y la de lote tienen que dictaminar EXACTAMENTE igual, y dos listas paralelas
+// terminan divergiendo siempre.
+const _TIPOS_SITIO = ["publisher","corp","gov","edu","saas","ecommerce","bank","travel","nonprofit","service","marketplace","realestate","other"];
+
+/** El criterio de qué es un publisher. Compartido por la clasificación de a uno y por lote. */
+function _SYS_CLASIFICA_SITIO(trashRules = "") {
+  return "Clasificás sitios web para un ad-network. Un 'publisher' (ÚNICO target válido) es un "
     + "medio/blog/revista/portal de CONTENIDO editorial que vive de publicidad display/programmatic: "
     + "noticias, deportes, entretenimiento, farándula, estilo de vida, tecnología, gaming, recetas, etc. "
     + "El sitio muestra ARTÍCULOS/NOTAS y coloca avisos alrededor.\n\n"
@@ -9856,7 +9912,21 @@ async function _haikuPublisherClass(token, domain, pageContent, swCategory, tras
     + "(preferimos dejar pasar y que un humano lo descarte; perder un publisher real es lo peor). "
     + "Solo respondé un tipo comercial cuando sea EVIDENTE."
     + (trashRules ? `\n\nEl media buyer YA rechazó sitios por estos motivos adicionales — si encaja, NO es publisher:\n${trashRules}` : "")
-    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | bank | travel | nonprofit | service | marketplace | other.";
+    + "\n\nRespondé SOLO una palabra: publisher | corp | gov | edu | saas | ecommerce | bank | travel | nonprofit | service | marketplace | other.";}
+
+async function _haikuPublisherClass(token, domain, pageContent, swCategory, trashRules = "") {
+  // Cache key incluye si hay reglas (para no servir veredictos viejos cuando el MB
+  // enseña reglas nuevas vía rechazos).
+  const ckey = `${domain}|${trashRules ? "r1" : "r0"}`;
+  if (_publisherClassCache.has(ckey)) return _publisherClassCache.get(ckey);
+  const title = pageContent?.title || ""; const desc = pageContent?.description || "";
+  if (!title && !desc) return null; // sin nada que clasificar
+  // Maxi 2026-07-08: taxonomía DESTILADA de los rechazos manuales del MB (los ejemplos que fue
+  // pasando: leroymerlin/defacto/beyoung=tienda, n26/bbva=banco, ipsos=market research,
+  // carwow/holidayautos=alquiler, andalusiaegypt/urlaubsguru=hotel/viajes, tommys.org=ONG,
+  // ouedkniss=marketplace, universidades). Un publisher SOLO es medio de CONTENIDO monetizado
+  // con display/programmatic. Todo lo que VENDE/RESERVA/GESTIONA no va.
+  const sys = _SYS_CLASIFICA_SITIO(trashRules);
   let type = null;
   try {
     const data = await llamarClaude(token, "clasificar_sitio", {
@@ -9866,7 +9936,7 @@ messages: [{ role: "user", content: `Domain: ${domain}\nTitle: ${title}\nDescrip
         }, { timeout: 12000 });
     if (data) {
       const t = (data?.content?.[0]?.text || "").trim().toLowerCase().match(/[a-z]+/)?.[0] || "";
-      if (["publisher","corp","gov","edu","saas","ecommerce","bank","travel","nonprofit","service","marketplace","realestate","other"].includes(t)) type = t;
+      if (_TIPOS_SITIO.includes(t)) type = t;
     }
   } catch {}
   if (_publisherClassCache.size > 3000) _publisherClassCache.clear();
@@ -9933,15 +10003,28 @@ async function runSuspectRejectAnalysis(token) {
   if (!Array.isArray(rows) || rows.length === 0) return;
   log(`🔎 suspect-analysis (${dateISO}): analizando ${rows.length} prospects contra reglas de rechazo`);
   let flagged = 0;
-  const CONC = 4;
+
+  // Se pregunta de a 20 en una sola llamada. Antes era una llamada por sitio: 200 por corrida,
+  // re-mandando los ~700 tokens del criterio cada vez para recibir 3 de vuelta.
+  const veredictos = await _haikuPublisherClassLote(
+    token,
+    rows.map(r => ({ domain: r.domain, title: r.page_title || "", description: "", category: r.category || "" })),
+    trash.rules || "",
+  );
+
+  const CONC = 8;   // ya no hay llamada a la IA acá adentro: esto sólo escribe en la base
   for (let i = 0; i < rows.length; i += CONC) {
     await Promise.all(rows.slice(i, i + CONC).map(async (row) => {
       // Maxi 2026-07-01: SOLO por TIPO/contenido (Haiku + reglas destiladas de comentarios de
       // rechazo). Se sacó el flag por `dislikedCats` (temática) — el user prohíbe descartar por
       // categoría o geo. La ⚠️ aprende del CONTENIDO del sitio, no de su país ni su temática.
       let reason = "";
-      const type = await _haikuPublisherClass(token, row.domain, { title: row.page_title || "", description: "" }, row.category || "", trash.rules || "");
-      if (type && type !== "publisher") reason = `tipo detectado: ${type}`;
+      const type = veredictos.get(row.domain);
+      // `undefined`/`null` = el lote no dictaminó (respuesta incompleta o techo alcanzado).
+      // En ese caso NO se marca nada: se deja para la próxima corrida en vez de darlo por
+      // revisado. Dar por bueno lo que no se miró es exactamente el bug que se acaba de tapar.
+      if (type === null || type === undefined) return;
+      if (type !== "publisher") reason = `tipo detectado: ${type}`;
       // ⚠️ Antes esto era `if (!reason) return;` a secas: el que salía limpio no se marcaba,
       // volvía a caer en los 200 más nuevos de la corrida siguiente y se pagaba de nuevo, para
       // siempre. Medido el 02/09: de los 200 más nuevos, los 200 estaban limpios — o sea 200
