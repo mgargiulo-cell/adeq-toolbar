@@ -289,6 +289,7 @@ Write the prospecting email. Return a JSON object with "body" (string) and "subj
   ];
 
   const result = await callClaude({
+    motivo: "pitch_a_pedido",
     model:     CLAUDE_SONNET,
     maxTokens: length === "long" ? 4000 : 3000,
     system:    systemBlocks,
@@ -342,6 +343,7 @@ Respond in Spanish. Be direct and use numbers.`;
 
   try {
     const result = await callClaude({
+      motivo: "analisis_revenue",
       model:     CLAUDE_SONNET,
       // Maxi 2026-08-07: eran 200. En Sonnet 5 el max_tokens topea pensamiento + respuesta
       // juntos, y con thinking adaptativo prendido 200 no alcanzan ni para pensar: la

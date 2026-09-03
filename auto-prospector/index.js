@@ -9773,6 +9773,59 @@ async function _guardarGastoClaude(token, forzar = false) {
  * @param motivo  etiqueta corta y estable — es lo que se ve en el informe de gasto
  * @returns el JSON de la respuesta, o null si no se pudo / si el techo la frenó
  */
+
+// ── Registro de gasto: llamadas Y TOKENS ──────────────────────────────────────
+// Contar llamadas no alcanza: lo que se factura son tokens, y una llamada con 700 tokens de
+// system cuesta 200 veces una de 3. Se acumula en memoria y se vuelca cada tanto, para no
+// escribir en la base en cada llamada.
+const _gastoBuffer = new Map();   // "motivo|modelo" → {llamadas, in, out, cache}
+let _gastoUltimoVolcado = 0;
+
+function _anotarGasto(motivo, modelo, usage) {
+  const k = `${motivo}|${modelo}`;
+  const a = _gastoBuffer.get(k) || { llamadas: 0, in: 0, out: 0, cache: 0 };
+  a.llamadas++;
+  a.in    += usage?.input_tokens || 0;
+  a.out   += usage?.output_tokens || 0;
+  a.cache += (usage?.cache_read_input_tokens || 0) + (usage?.cache_creation_input_tokens || 0);
+  _gastoBuffer.set(k, a);
+}
+
+async function volcarGastoClaude(token, forzar = false) {
+  if (!_gastoBuffer.size) return;
+  if (!forzar && Date.now() - _gastoUltimoVolcado < 5 * 60 * 1000) return;
+  _gastoUltimoVolcado = Date.now();
+  const dia = new Date().toISOString().slice(0, 10);
+  const pend = [..._gastoBuffer.entries()];
+  _gastoBuffer.clear();                                  // se vacía YA: si falla el POST se
+  for (const [k, a] of pend) {                           // pierde un tramo, no se duplica
+    const [motivo, modelo] = k.split("|");
+    // Suma sobre lo que ya haya del día. No hay upsert-con-suma en PostgREST, así que se lee
+    // y se escribe; el worker es el único que escribe estas filas, no hay carrera.
+    try {
+      const q = `dia=eq.${dia}&fuente=eq.worker&motivo=eq.${encodeURIComponent(motivo)}&modelo=eq.${encodeURIComponent(modelo)}&usuario=eq.`;
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_claude_gasto?${q}&select=llamadas,tokens_in,tokens_out,cache_in`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+      const prev = r.ok ? (await r.json())[0] : null;
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_claude_gasto`, {
+        method: "POST",
+        headers: {
+          "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+          "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates",
+        },
+        body: JSON.stringify({
+          dia, fuente: "worker", motivo, modelo, usuario: "",
+          llamadas:   (prev?.llamadas   || 0) + a.llamadas,
+          tokens_in:  (prev?.tokens_in  || 0) + a.in,
+          tokens_out: (prev?.tokens_out || 0) + a.out,
+          cache_in:   (prev?.cache_in   || 0) + a.cache,
+          actualizado: new Date().toISOString(),
+        }),
+      });
+    } catch {}
+  }
+}
+
 // Se le presta la puerta a lib/idioma.js, que no puede importarla sin crear un ciclo.
 puertaClaude.llamar = (...a) => llamarClaude(...a);
 
@@ -9815,7 +9868,10 @@ async function llamarClaude(token, motivo, cuerpo, { timeout = 10000 } = {}) {
       signal: AbortSignal.timeout(timeout),
     });
     if (!res.ok) return null;
-    return await res.json();
+    const json = await res.json();
+    _anotarGasto(motivo, cuerpo?.model || "?", json?.usage);
+    volcarGastoClaude(token).catch(() => {});
+    return json;
   } catch { return null; }
 }
 
@@ -22961,6 +23017,27 @@ async function _boletinPorSeccion(token) {
     if (_esDiaDeLento) _nota("APIS", "ℹ️", [
       `SimilarWeb ${_rapid}/${_rLim} este ciclo · Apollo ${_apo}/2250 (el pacing apunta a gastarlo entero).`,
     ]);
+
+    // ── EN QUÉ SE GASTA LA KEY DE ANTHROPIC ─────────────────────────────────
+    // El 26/08 el gasto del worker pasó de 0 a 1.777 llamadas/día de un salto y sólo se vio
+    // en la factura. No había cómo saber QUIÉN gastaba: eran nueve fetch sueltos sin contador.
+    // Esto es para que un mes caro se pueda explicar, no sólo pagar.
+    try {
+      const _ayer = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 10);
+      const _g = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_gasto_claude_vista?dia=eq.${_ayer}&order=usd_aprox.desc&limit=20`);
+      if (_g.length) {
+        const _usd = _g.reduce((a, x) => a + Number(x.usd_aprox || 0), 0);
+        const _lin = _g.slice(0, 8).map(x =>
+          `${String(x.motivo).padEnd(22)} ${String(x.fuente).padEnd(9)} ${String(x.llamadas).padStart(5)} llam · `
+          + `${(Number(x.entrada) / 1000).toFixed(0)}k in / ${(Number(x.salida) / 1000).toFixed(0)}k out · US$${Number(x.usd_aprox).toFixed(3)}`);
+        // El titular es el motivo más CARO, no el más frecuente: para optimizar hay que mirar
+        // dónde se va la plata, y no siempre coincide con lo que más se llama.
+        _nota(`GASTO DE CLAUDE (${_ayer})`, _usd >= 5 ? "🟡" : "ℹ️", [
+          `US$${_usd.toFixed(2)} aprox · lo más caro: ${_g[0].motivo} (US$${Number(_g[0].usd_aprox).toFixed(3)})`,
+          ..._lin,
+        ]);
+      }
+    } catch {}
   } catch (e) {
     out.push(`(el boletín por sección falló: ${e.message})`);
   }

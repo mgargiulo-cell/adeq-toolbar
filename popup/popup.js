@@ -10699,7 +10699,7 @@ function initProspectCard(card, data) {
     try {
       const { callClaude, CLAUDE_HAIKU } = await import("../modules/claude.js");
       const r = await callClaude({
-        model: CLAUDE_HAIKU, maxTokens: 40,
+        model: CLAUDE_HAIKU, maxTokens: 40, motivo: "tipo_de_web",
         system: "Clasificás sitios web para un equipo de monetización publicitaria. Devolvé en 2-6 palabras el TIPO de web a evitar según su CALIDAD y NATURALEZA de CONTENIDO (ej: 'sitio MFA/spam', 'contenido autogenerado', 'agregador sin valor', 'foro muerto', 'blog bajo tráfico', 'directorio', 'web corporativa sin inventario'). REGLA DURA: NO clasifiques por país/idioma ni por temática general (deportes, noticias, autos, etc. son válidos) — solo por la CALIDAD/TIPO del contenido. SOLO el tipo, sin explicación.",
         messages: [{ role: "user", content: `Dominio: ${data.domain}\nTítulo guardado: ${data.page_title || ""}\n${siteSnippet || "(no se pudo leer el sitio en vivo)"}\nMotivo del rechazo del MB: ${reason || "(sin comentario)"}` }],
       });

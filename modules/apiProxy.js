@@ -18,6 +18,10 @@ let _sbUserEmail = null;
 // haber UN SOLO dueño del refresh, porque el refresh_token de Supabase es de un solo uso y dos
 // renovaciones en paralelo se invalidan entre sí.
 let _refresher = null;
+/** Quién está autenticado ahora. El dueño del token es este módulo —que lo renueva ante un
+ *  401—, así que nadie más debe guardarse una copia: sería la que queda vieja. */
+export function quienEstaAutenticado() { return { token: _sbAuthToken, email: _sbUserEmail }; }
+
 export function setProxyAuth(accessToken, email, refresher) {
   _sbAuthToken = accessToken || null;
   if (email) _sbUserEmail = email.toLowerCase();
