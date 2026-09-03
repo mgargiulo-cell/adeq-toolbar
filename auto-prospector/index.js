@@ -16524,6 +16524,19 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       // con una línea de log y CERO alerta: direcciones muertas que nadie vuelve a intentar.
       // Ahora se pregunta a la ficha del CRM, que es donde vive ese registro hoy.
       const ficha = await _fichaDelCrm(domain);
+      // ⚠️ Acá se le pedía la ficha FRESCA al CRM y se tiraba su veredicto: sólo se usaba para
+      // armar un lead sintético y seguir mandando. El único freno era el snapshot de hasta 24 h.
+      // Y el CRM mueve a "En Negociacion" a los 3 minutos de que alguien contesta: alguien que
+      // contestó a la mañana podía recibir un reintento a la tarde. Pedir la respuesta y no
+      // mirarla es peor que no preguntar — cuesta lo mismo y da falsa tranquilidad.
+      if (ficha?.enNegociacion) {
+        log(`  ⛔ ${domain}: el CRM lo tiene en negociación (${ficha.board}) — no reintento`);
+        return;
+      }
+      if (ficha?.descansando) {
+        log(`  ⛔ ${domain}: está descansando, faltan ${ficha.diasParaReintentar} días — no reintento`);
+        return;
+      }
       if (ficha) {
         log(`  🔎 ${domain}: no estaba en review_queue pero sí en el CRM (${ficha.estado}) — uso lead sintético`);
         lead = {
