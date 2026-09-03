@@ -15394,7 +15394,18 @@ async function loadBouncedEmails(token) {
   if (Date.now() - _bouncedCache.ts < BOUNCED_CACHE_TTL) return _bouncedCache.set;
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&limit=10000`,
+      // ⚠️ Sólo lo que JUSTIFICA no volver a escribir nunca más:
+      //   rebote_smtp  = el correo volvió, la dirección no existe o nos bloquea
+      //   verificador  = MillionVerifier la dio por no entregable antes de mandar
+      // Quedan FUERA a propósito:
+      //   autorespuesta   = un "estoy de vacaciones" PRUEBA que el buzón está vivo. Bloquearlo
+      //                     es tirar un lead bueno. Había 2, y una era sales@adeqmedia.com:
+      //                     nuestra propia casilla en la lista negra.
+      //   rebote_temporal = un 4xx es "ahora no", no "nunca". Greylisting, buzón lleno, servidor
+      //                     caído. Había 5 direcciones sanas bloqueadas de por vida por eso.
+      // Se filtra por COLUMNA y no por regex sobre el texto del motivo: un `reason` nuevo que
+      // nadie previó volvía a colarse como rebote sin que se notara.
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&evidencia=in.(rebote_smtp,verificador,sin_clasificar)&limit=10000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (res.ok) {
@@ -15470,7 +15481,30 @@ async function _fuenteDelEmail(token, email) {
   } catch { return null; }
 }
 
-async function markEmailBounced(token, { email, reason, originalActionId, originalDomain, tipo, detalle, fuente }) {
+
+// 4xx = "ahora no", 5xx = "nunca". Un greylisting (454) o un buzón lleno (452) no son motivo
+// para no volver a escribirle NUNCA a esa dirección, y así estaban entrando.
+// ⚠️ `\bsoft\b` NO sirve: en "smtp_bounce_soft" el guion bajo es carácter de palabra y no hay
+// borde antes de "soft". El negativo por la derecha evita comerse "software".
+const _REBOTE_TEMPORAL = /soft(?![a-z])|\b4\d\d[\s-]\d\.\d\.\d\b|^\s*4\d\d\b/i;
+
+/** Qué CLASE de prueba tenemos de que una dirección no sirve. Sólo dos clases bloquean. */
+function _claseDeRebote(reason, detalle) {
+  const r = String(reason || ""), d = String(detalle || "");
+  if (/^mv_|millionverifier/i.test(r)) return "verificador";     // nunca salió: envío evitado
+  if (/auto_reply/i.test(r))           return "autorespuesta";   // prueba que está VIVO
+  if (_REBOTE_TEMPORAL.test(`${r} ${d}`) || _REBOTE_TEMPORAL.test(d)) return "rebote_temporal";
+  return "rebote_smtp";
+}
+
+/**
+ * @param evidencia  QUÉ CLASE de prueba tenemos: "rebote_smtp" (el correo volvió),
+ *   "verificador" (MillionVerifier lo dio por muerto antes de mandar), "rebote_temporal"
+ *   (un 4xx: ahora no, no nunca) o "autorespuesta" (que en realidad prueba que está VIVO).
+ *   Sólo las dos primeras bloquean. Si no se pasa, se deduce del `reason`, pero pasarla
+ *   explícita es mejor: deducir de un texto libre es lo que había que arreglar.
+ */
+async function markEmailBounced(token, { email, reason, originalActionId, originalDomain, tipo, detalle, fuente, evidencia }) {
   try {
     const _fuenteCongelada = fuente || (await _fuenteDelEmail(token, email).catch(() => null));
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails`, {
@@ -15489,6 +15523,7 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
           // sale del pool esa información desaparece. Sin saber QUIÉN produjo la dirección
           // que rebotó, no se puede aprender nada.
           tipo:    tipo || null,
+          evidencia: evidencia || _claseDeRebote(reason, detalle),
           detalle: (detalle || "").substring(0, 200) || null,
           fuente:  _fuenteCongelada,
       }),
@@ -20822,7 +20857,7 @@ async function runAgentCycle(token, allFlags) {
               if (_mv === "no") {
                 // No entregable → marcar para que no se re-elija y seguir con el siguiente
                 markEmailBounced(token, {
-                  email: cand.email, reason: "mv_undeliverable",
+                  email: cand.email, reason: "mv_undeliverable", evidencia: "verificador",
                   originalDomain: cand.email.split("@")[1] || "",
                 }).catch(() => {});
                 descartados++;
@@ -21001,7 +21036,7 @@ async function runAgentCycle(token, allFlags) {
           // `riesgoRebotePorDominio`. Se saltea este envío y se le busca otra dirección; si
           // más adelante no aparece ninguna mejor, sigue disponible.
           if (_mvEstado === "no") {
-            markEmailBounced(token, { email, reason: "mv_undeliverable", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+            markEmailBounced(token, { email, reason: "mv_undeliverable", evidencia: "verificador", originalDomain: email.split("@")[1] || "" }).catch(() => {});
           }
           continue; // próximo lead — el re-enrich le buscará otro email
         }
@@ -22349,12 +22384,16 @@ async function vigilarReputacion(token) {
     // volvieron.
     let rebotados = new Set();
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle&limit=3000`, { headers: auth });
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle,evidencia&limit=3000`, { headers: auth });
       if (!r.ok) return;
       const f = await r.json();
       if (Array.isArray(f)) {
         rebotados = new Set(f
           .filter(x => {
+            // Desde el 03/09 la clase de prueba es una COLUMNA. El regex quedó de respaldo para
+            // las filas viejas sin clasificar: una condición que depende de que nadie invente
+            // un texto nuevo no es una condición, es una apuesta.
+            if (x.evidencia) return x.evidencia === "rebote_smtp";
             const _m = `${x.reason || ""} ${x.detalle || ""}`.toLowerCase();
             return !/mv_undeliverable|millionverifier|pre_send|no_enviado/.test(_m);
           })
