@@ -16612,6 +16612,23 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     }
 
     if (sendOk) {
+      // ── AVISARLE AL CRM LA DIRECCIÓN NUEVA ────────────────────────────────────────
+      // Cuando se reporta el rebote, el CRM VACÍA la columna Email para frenar la cadencia.
+      // Si acá mandamos a otra dirección y no se la contamos, queda el peor de los dos mundos:
+      // el CRM con la ficha sin email —o sea sin follow-ups— mientras el worker se escribe con
+      // alguien que el CRM no conoce. Y si esa persona contesta, la detección de respuestas
+      // matchea por dirección: no la reconocería. El envío existiría y sería invisible.
+      // Va DESPUÉS del envío y sólo si salió: avisar de un contacto que no ocurrió es peor.
+      // `fecha_contacto` es hoy a propósito — para el CRM esto es un primer contacto nuevo, y
+      // su cadencia tiene que contar desde acá, no desde el mail que rebotó.
+      await pushToCrmPropio(token, {
+        domain,
+        email: retryEmail,
+        fecha_contacto: _crmFecha(0),
+        mail_ya_enviado: true,          // el mail ya salió de acá: que el CRM no mande otro
+        source: "agente",
+      }, "retry_rebote").catch(() => {});
+
       // Log agent action
       try {
         const resAct = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions`, {
