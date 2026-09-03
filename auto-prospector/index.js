@@ -11897,15 +11897,47 @@ let _bloqCrmCache = { set: null, ts: 0 };
 const BLOQ_CRM_TTL = 10 * 60 * 1000;   // 10 min: la fuente se refresca cada 24 h, esto sólo evita releer la config
 async function _bloqueadosDelCrm(token) {
   if (_bloqCrmCache.set && Date.now() - _bloqCrmCache.ts < BLOQ_CRM_TTL) return _bloqCrmCache.set;
+  // ⚠️ Las tres ramas de fallo devolvían el caché anterior, que en el PRIMER arranque es null.
+  // Y `isDomainBlockedFull` lee null como "no está bloqueado": ante la duda, escribirle.
+  // Es exactamente el escenario que costó 22 pitches en frío a clientes que nos pagan.
+  // Ahora un fallo se distingue de un "no hay nadie bloqueado", y se dice.
+  let motivo = "";
   try {
     const cfg = await getConfig(token);
     const crudo = cfg.monday_bloqueados;
-    if (!crudo) return _bloqCrmCache.set;              // sin snapshot se conserva el anterior
-    const arr = JSON.parse(crudo);
-    if (!Array.isArray(arr) || arr.length < 100) return _bloqCrmCache.set;   // vacío ≠ "no hay nadie bloqueado"
-    _bloqCrmCache = { set: new Set(arr.map(x => String(x).toLowerCase())), ts: Date.now() };
-    return _bloqCrmCache.set;
-  } catch { return _bloqCrmCache.set; }
+    if (!crudo) motivo = "el snapshot no existe";
+    else {
+      const arr = JSON.parse(crudo);
+      if (!Array.isArray(arr)) motivo = "el snapshot no es una lista";
+      else if (arr.length < 100) motivo = `el snapshot tiene ${arr.length} dominios (piso: 100)`;
+      else {
+        // Un snapshot viejo es peor que uno ausente: se ve sano y miente. Lo escribe un job
+        // diario, así que más de 48 h significa que ese job dejó de correr.
+        const sello = Date.parse(cfg.monday_bloqueados_at || "") || 0;
+        const horas = sello ? (Date.now() - sello) / 3600000 : Infinity;
+        // Un snapshot viejo SE USA IGUAL: 3.333 dominios de anteayer protegen muchísimo más que
+        // no tener lista. Lo que no puede pasar es que se use en silencio, así que se carga y
+        // se avisa. Devolver null acá —"ante la duda, nada"— dejaría pasar TODO el pipeline,
+        // que es justo el daño que esta lista existe para evitar.
+        _bloqCrmCache = { set: new Set(arr.map(x => String(x).toLowerCase())), ts: Date.now() };
+        if (horas > 48) motivo = `el snapshot tiene ${Math.round(horas)} h y lo escribe un job diario — se usa igual, pero está quedando viejo`;
+        else return _bloqCrmCache.set;
+      }
+    }
+  } catch (e) { motivo = `no se pudo leer: ${e.message}`; }
+
+  log(`  🔴 lista de no-recontactar: ${motivo}`);
+  await saludPing(token, "lista_no_recontactar", { status: "fail", cadenciaMin: 60, detalle: motivo }).catch(() => {});
+  if (!_bloqCrmCache.set) {   // sólo cuando no hay NINGUNA lista: eso sí es "no sé a quién no escribirle"
+    await saludAlerta(token, {
+      clave: `sin_lista_bloqueados_${new Date().toISOString().slice(0, 10)}`,
+      titulo: "El agente no sabe a quién NO escribirle",
+      severidad: "critical",
+      cuerpo: `Motivo: ${motivo}\n\nSin esta lista, un pitch en frío puede salirle a un cliente que\n`
+            + `nos factura o a alguien en plena negociación. Ya pasó: 22 casos.`,
+    }).catch(() => {});
+  }
+  return _bloqCrmCache.set;    // el caché viejo si existe; null si nunca hubo, y eso ahora se grita
 }
 
 async function isDomainBlockedFull(domain, token) {
@@ -15582,7 +15614,7 @@ function _claseDeRebote(reason, detalle, tipo) {
 async function markEmailBounced(token, { email, reason, originalActionId, originalDomain, tipo, detalle, fuente, evidencia }) {
   try {
     const _fuenteCongelada = fuente || (await _fuenteDelEmail(token, email).catch(() => null));
-    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails`, {
+    const _resBounce = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails`, {
       method: "POST",
       headers: {
         "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
@@ -15604,7 +15636,15 @@ async function markEmailBounced(token, { email, reason, originalActionId, origin
       }),
     });
     _bouncedCache.set.add((email || "").toLowerCase());
-    log(`  🚫 BOUNCED: ${email} (${reason || "unknown"}) — agregado al blocklist`);
+    // ⚠️ Antes se logueaba "agregado al blocklist" pase lo que pase, sin mirar `res.ok`. Si el
+    // INSERT fallaba (columna nueva ausente, RLS, red), el bloqueo vivía sólo en la caché de
+    // memoria: duraba hasta el próximo restart, y el log afirmaba que estaba guardado.
+    if (!_resBounce.ok) {
+      log(`  🔴 ${email} rebotó pero NO se pudo guardar (HTTP ${_resBounce.status}) — el bloqueo se pierde al reiniciar`);
+      await saludPing(token, "guardar_rebote", { status: "fail", cadenciaMin: 60, detalle: `HTTP ${_resBounce.status} guardando ${email}` }).catch(() => {});
+    } else {
+      log(`  🚫 BOUNCED: ${email} (${reason || "unknown"}) — agregado al blocklist`);
+    }
   } catch (e) {
     log(`⚠️ markEmailBounced failed: ${e.message}`);
   }
@@ -16316,8 +16356,17 @@ async function scanRealResponsesForUser(token, userEmail) {
 
 async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
   try {
-    const domain = (bouncedEmail.split("@")[1] || "").toLowerCase();
+    // ⚠️ El dominio es el del SITIO al que le escribimos, no el de la dirección que rebotó.
+    // Salían de `bouncedEmail.split("@")[1]`, que sólo coincide cuando el contacto está en el
+    // mismo dominio del sitio. Con un gmail/free.fr de por medio, todo el reintento —el lookup
+    // del lead, el chequeo de bloqueo, el freeze y el push al CRM— apuntaba al dominio del
+    // PROVEEDOR DE CORREO. Es el bug que creó la ficha falsa de yahoo.fr, acá adentro.
+    // `_sitioDeLaDireccion` lo resuelve desde toolbar_sendtrack; si no lo encuentra se
+    // conserva el comportamiento viejo, pero queda dicho en el log.
+    const _sitioReal = await _sitioDeLaDireccion(token, bouncedEmail);
+    const domain = _sitioReal || (bouncedEmail.split("@")[1] || "").toLowerCase();
     if (!domain) return;
+    if (!_sitioReal) log(`  ⚠️ bounceRetry ${bouncedEmail}: no sé a qué sitio se le escribió — uso el dominio del correo`);
     log(`🔄 bounceRetry: procesando bounce ${bouncedEmail} (${bounceType}) para ${domain}`);
 
     // 0. Maxi 2026-06-17 (audit #3): si el DOMINIO está en blocklist global
