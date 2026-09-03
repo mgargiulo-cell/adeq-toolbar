@@ -9364,9 +9364,24 @@ async function parteDelDia(token) {
       esProspeccion: false,
     });
     await setConfigValue(token, "parte_diario_ultimo", hoy).catch(() => {});
+    // Late también cuando sale bien: un job que sólo avisa al fallar es indistinguible de uno
+    // que dejó de correr, que es exactamente lo que pasó durante 9 días.
+    await saludPing(token, "parte_diario", { status: "ok", cadenciaMin: 1440, detalle: "parte enviado" }).catch(() => {});
     log(`📬 parte del día enviado a ${dest} — ${totalEnviado}/${objetivoTotal} envíos`);
   } catch (e) {
     log(`🔴 no se pudo enviar el parte del día: ${e.message}`);
+    // ⚠️ Esto era SÓLO un log. El parte estuvo 9 días sin salir (última marca: 25/08) y nadie
+    // se enteró, porque en sus 800 líneas no había un solo `saludPing`: el vigilante mira 34
+    // jobs y éste no era uno. Es el único informe que dice si el día se cumplió.
+    // El aviso de que algo falló no puede depender de que ese algo funcione.
+    await saludPing(token, "parte_diario", { status: "fail", cadenciaMin: 1440, detalle: e.message?.slice(0, 200) || "error sin mensaje" }).catch(() => {});
+    await saludAlerta(token, {
+      clave: `parte_diario_fallo_${new Date().toISOString().slice(0, 10)}`,
+      titulo: "El parte del día no salió",
+      severidad: "warning",
+      cuerpo: `Falló con: ${e.message}\n\nEs el informe que dice si el día se cumplió: mientras no salga,\n`
+            + `nadie está mirando los envíos, el pool ni los rebotes.`,
+    }).catch(() => {});
   }
 }
 
@@ -25018,15 +25033,24 @@ async function main() {
         // Notification scanners — cada uno tiene su guard de frecuencia interno
         await runNotificationScanners(token).catch(e => log(`⚠️ notif scanners: ${e.message}`));
 
-        // Boot-time guarantee: agent_enabled_users siempre con mgargiulo si vacío.
-        // Reemplaza al self-activator viejo (sin chequear horario ni manual_off).
-        // Maxi 2026-07-03 perf: era un read dedicado a config cada iteración.
-        // agent_enabled_users es una key del config → sale de getConfig (cacheado).
+        // Boot-time guarantee: agent_enabled_users siempre con mgargiulo si quedó vacío.
+        //
+        // ⚠️ AHORA RESPETA EL BOTÓN DE APAGADO (Maxi 2026-09-03). El comentario viejo decía
+        // "sin chequear horario ni manual_off" como si fuera una simplificación, y era un bug
+        // grave: el panel apaga el agente VACIANDO esta misma lista y dejando
+        // `agent_manual_off=true` (popup.js:1384). O sea que esta línea deshacía el apagado en
+        // la vuelta siguiente, y nadie leía el flag en todo el repo — el botón OFF no apagaba.
+        // La garantía existe para que un vaciado ACCIDENTAL no deje al agente mudo; un apagado
+        // deliberado no es un accidente.
+        const _cfgBoot = await getConfig(token).catch(() => ({}));
         let agentUsers = [];
-        try { agentUsers = JSON.parse((await getConfig(token)).agent_enabled_users || "[]"); } catch {}
-        if (agentUsers.length === 0) {
+        try { agentUsers = JSON.parse(_cfgBoot.agent_enabled_users || "[]"); } catch {}
+        const _apagadoAMano = String(_cfgBoot.agent_manual_off ?? "").toLowerCase() === "true";
+        if (agentUsers.length === 0 && !_apagadoAMano) {
           await setConfigValue(token, "agent_enabled_users", JSON.stringify(["mgargiulo@adeqmedia.com"]));
           log(`🔛 boot guarantee: agent_enabled_users=[mgargiulo@adeqmedia.com]`);
+        } else if (agentUsers.length === 0) {
+          log(`⏸️ agente apagado a mano (agent_manual_off=true) — no repueblo la lista`);
         }
       } catch (e) { log(`⚠️ band maintainer: ${e.message}`); }
 
