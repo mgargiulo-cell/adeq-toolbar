@@ -22,7 +22,11 @@ import { CONFIG } from "../config.js";
 const _IDIOMA_LABEL = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
 const _idiomaLabel = (v) => (v === "" || v == null ? "" : (_IDIOMA_LABEL[Number(v)] || ""));
 
-const CRM_BASE = () => (CONFIG.CRM_BOARD_URL || "").replace("/sync-toolbar", "");
+// La base del CRM, en un solo lugar y EXPORTADA: popup.js armaba su propia URL con otro
+// replace, así que había dos formas de llegar al mismo servidor y sólo una se mantenía.
+// El replace va anclado al final (`$`): sin ancla matchea en cualquier parte de la URL.
+export const crmUrl = (ruta = "") => `${(CONFIG.CRM_BOARD_URL || "").replace(/\/sync-toolbar\/?$/, "")}${ruta}`;
+const CRM_BASE = () => crmUrl();
 async function crmGet(ruta, params = {}) {
   const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null));
   const r = await fetch(`${CRM_BASE()}${ruta}${qs.toString() ? `?${qs}` : ""}`,

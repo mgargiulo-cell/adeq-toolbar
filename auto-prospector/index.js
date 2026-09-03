@@ -3595,7 +3595,7 @@ async function guardarBloqueadosDeMonday(token) {
     // nos factura todos los meses no se deshace.
     let _falla = "";
     try {
-      const _r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/dominios-activos")}`, {
+      const _r = await fetch(_urlCrm("/dominios-activos"), {
         headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(20000),
       });
       if (_r.ok) {
@@ -3877,7 +3877,7 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`); return 0; }
     let pool = [];
     try {
-      const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/reciclables")}?limit=${POOL_SIZE}`,
+      const r = await fetch(`${_urlCrm("/reciclables")}?limit=${POOL_SIZE}`,
         { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(30000) });
       if (!r.ok) { log(`  ⚠️ feeder reciclables: HTTP ${r.status} — no re-prospecto a ciegas`); return 0; }
       const j = await r.json();
@@ -4619,6 +4619,14 @@ async function maybeStartAutopilotSlot(token) {
 // El sistema ya viene de una racha de rebotes; espaciarlos protege la reputación sin sacar
 // nada de la ventana. Los cinco turnos caen dentro del horario laboral de las dos regiones.
 // Si preferís uno solo, es cambiar esta línea por [13].
+// La base del CRM, una sola vez. Antes cinco lugares hacían
+// `CRM_SYNC_URL.replace("/sync-toolbar", "/loquesea")`: si el path cambiaba se rompían los
+// cinco a la vez, en silencio y cada uno con su propio 404. Y un replace no anclado matchea
+// en cualquier parte de la URL, así que un dominio que contuviera el texto lo habría partido.
+const CRM_BASE_URL = CRM_SYNC_URL.replace(/\/sync-toolbar\/?$/, "");
+/** Arma la URL de un endpoint del CRM. `ruta` va con la barra: "/ficha". */
+function _urlCrm(ruta) { return `${CRM_BASE_URL}${ruta}`; }
+
 const AGENT_SLOTS = [13, 14, 15, 16, 17];
 let _agentLastSlot = "";
 
@@ -5704,7 +5712,7 @@ async function fetchDominiosBloqueados() {
   // distingue los dos casos y ante la duda no arranca.
   if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log("  ⚠️ bloqueados: falta CRM_SYNC_SECRET"); return null; }
   try {
-    const r = await fetch(CRM_SYNC_URL.replace("/sync-toolbar", "/dominios-activos"),
+    const r = await fetch(_urlCrm("/dominios-activos"),
       { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(30000) });
     if (!r.ok) { log(`  ⚠️ bloqueados: HTTP ${r.status}`); return null; }
     const j = await r.json();
@@ -8498,7 +8506,7 @@ async function _manualesDeMonday(token, dia) {
   // lo dice en vez de mostrar un cero.
   if (CRM_SYNC_URL && CRM_SYNC_SECRET) {
     try {
-      const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/manuales")}?dia=${encodeURIComponent(dia)}`,
+      const r = await fetch(`${_urlCrm("/manuales")}?dia=${encodeURIComponent(dia)}`,
         { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(20000) });
       if (r.ok) {
         const j = await r.json();
@@ -12656,6 +12664,12 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // ¿Ya está en el CRM y con quién? Antes se le preguntaba a Monday; ahora a la ficha del
   // board, que además sabe si está en los 60 días de descanso tras cerrar un negocio.
   match = await _fichaDelCrm(domain);
+  // El sentinel de "no pude consultar" NO es una ficha: no tiene estado ni board, así que
+  // dejarlo entrar acá lo leería como una ficha vacía y lo daría por libre.
+  if (match?.indeterminado) {
+    log(`  ⏭️ ${domain}: no pude consultar el CRM — no lo importo ahora`);
+    return;   // como los otros 27 returns de esta función: no devuelve valor
+  }
   if (match) {
     {
       if (match.descansando) {
@@ -16524,6 +16538,10 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       // con una línea de log y CERO alerta: direcciones muertas que nadie vuelve a intentar.
       // Ahora se pregunta a la ficha del CRM, que es donde vive ese registro hoy.
       const ficha = await _fichaDelCrm(domain);
+      if (ficha?.indeterminado) {
+        log(`  ⏭️ ${domain}: no pude consultar el CRM — no reintento ahora`);
+        return;
+      }
       // ⚠️ Acá se le pedía la ficha FRESCA al CRM y se tiraba su veredicto: sólo se usaba para
       // armar un lead sintético y seguir mandando. El único freno era el snapshot de hasta 24 h.
       // Y el CRM mueve a "En Negociacion" a los 3 minutos de que alguien contesta: alguien que
@@ -16651,6 +16669,14 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
             status: "skipped_no_alt", reason: "no_alternative_emails_after_rescue",
           }),
         }).catch(() => {});
+
+      // ⚠️ AVISARLE AL CRM QUE ACÁ NO HAY CONTACTO.
+      // El CRM deriva `contacto_formulario` de "no hay email", y eso mezcla dos cosas muy
+      // distintas: "todavía no busqué" y "busqué TODAS las alternativas y no hay ninguna".
+      // Con la primera vale la pena reintentar; con la segunda hay que ir por el formulario
+      // web. Sin este aviso, 666 fichas suyas dicen lo mismo sin distinguir cuál es cuál, y
+      // este dato -que sólo lo tengo yo, porque el rescate corre acá- se moría en mi log.
+      await pushToCrmPropio(token, { domain, contacto_agotado: true }, "sin_contacto").catch(() => {});
         // Freeze 30d (no 60d) para darle chance que el sitio actualice contactos
         await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
           method: "POST",
@@ -18442,10 +18468,6 @@ async function _nombreDeRemitente(userEmail) {
 const CUPO_CASILLA_HORA = 25;
 let _avisoCasillaEnvios = false;
 
-function _urlCrm(ruta) {
-  return CRM_SYNC_URL.replace(/\/sync-toolbar\/?$/, ruta);
-}
-
 /** Anota en la mesa compartida que salió un mail. Nunca hace fallar el envío. */
 async function registrarEnvioCasilla(casilla, destino, ref) {
   if (!CRM_SYNC_SECRET) return;
@@ -19526,10 +19548,14 @@ function _crmFecha(offsetDias = 0) {
 
 // Arma el prospecto con la MISMA semántica que el push a Monday, para que las dos columnas
 // digan lo mismo mientras convivan. Si divergen acá, la comparación de la fase 5 no sirve.
-function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail, origen = "agente" }) {
+function _crmPayload({ domain, email, emailSecundario, geo, traffic, language, phone, userEmail, origen = "agente" }) {
   return {
     domain,
     email: email || "",
+    // Las direcciones de más que encontró el descubrimiento. Antes se elegía una y el resto
+    // moría en memoria. Desde el 03/09 el board MUESTRA esta columna, y es a quién escribirle
+    // si la primera rebota, así que tirarlas era perder el reemplazo antes de necesitarlo.
+    ...(emailSecundario ? { email_secondary: emailSecundario } : {}),
     // ⚠️ NO se manda `deal_stage`. El estado es del CRM (acordado con la sesión del dashboard,
     // 03/09): él detecta las respuestas y mueve a "En Negociacion" en 3 minutos, y la lista de
     // bloqueados que mira el agente puede tener hasta 24 h. Si el agente estampa un estado en
@@ -19550,7 +19576,15 @@ function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail, 
     pageviews: formatTrafficForMonday(traffic),
     language: _crmIdioma(language),
     phone: _crmTelefono(phone),
-    comments: "Agente",                    // la misma marca que se escribe en Monday
+    // ⚠️ `comments` NO se manda (Maxi 2026-09-03). Es la nota corta del media buyer
+    // ("who is - Mica", "NO TIENE CLEVER") y así se ve en el tablero; escribir "Agente" ahí
+    // era redundante con `source`, que dice exactamente eso y que una persona no puede pisar.
+    // El propio comentario de abajo ya lo decía: la marca de texto no sirve.
+    // ⚠️ `mail_ya_enviado` va EXPLÍCITO: el agente manda el inicial él mismo. Antes dependía
+    // del default del endpoint (`!== false`), y si ese default cambiara los ~60 pushes
+    // diarios del agente recibirían un segundo inicial. Un contrato apoyado en el default
+    // del otro lado es un contrato a medias.
+    mail_ya_enviado: true,
     // ⚠️ "agente", NO "toolbar" (Maxi 2026-09-02). El agente mandaba "toolbar", que es lo
     // mismo que pone el botón manual del MB: en el CRM quedaban indistinguibles y el parte
     // diario contaba los ~60 envíos diarios del agente como trabajo A MANO. Medido: 753
@@ -19587,30 +19621,39 @@ function _crmTelefono(tel) {
 // un número distinto de cero significa que entraron prospectos sin chequear.
 let _fichaFallos = 0;
 
+/**
+ * La ficha del dominio en el CRM.
+ * @returns `null` = NO está en el CRM (o sea, libre) · un objeto con datos = está
+ *          · `{ indeterminado: true }` = NO SE PUDO CONSULTAR, que NO es lo mismo que libre.
+ *
+ * ⚠️ Antes las tres cosas devolvían `null` y el llamador leía cualquiera de ellas como
+ * "libre". Sumado a que la lista de bloqueados se cachea 24 h, un prospecto que pasó a
+ * En Negociacion a las 10:00 podía recibir un pitch en frío esa misma tarde si el endpoint
+ * tenía un hipo. "No sé" tratado como "no" es el patrón que más caro salió en este proyecto.
+ */
 async function _fichaDelCrm(domain) {
   if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) {
-    log(`  ⚠️ ficha: falta CRM_SYNC_SECRET — ${domain} pasa SIN verificar si está en negociación`);
-    return null;
+    log(`  ⚠️ ficha: falta CRM_SYNC_SECRET — no puedo verificar ${domain}`);
+    return { indeterminado: true };
   }
   try {
-    const r = await fetch(`${CRM_SYNC_URL.replace("/sync-toolbar", "/ficha")}?domain=${encodeURIComponent(domain)}`,
+    const r = await fetch(`${_urlCrm("/ficha")}?domain=${encodeURIComponent(domain)}`,
       { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(15000) });
-    // ⚠️ Un fallo acá NO puede quedar mudo. Ésta es la única puerta que pregunta "¿este
-    // dominio está en negociación o es cliente?" en el import de CSV: si el endpoint se cae,
-    // devuelve null y TODOS los dominios pasan como libres → entran a Prospects → el agente
-    // les escribe. Antes lo cubría findMondayItem. Se loguea y se cuenta para que el
-    // vigilante lo vea, porque el síntoma (prospectos de más) aparece días después.
     if (!r.ok) {
-      log(`  ⚠️ ficha HTTP ${r.status} para ${domain} — pasa SIN verificar`);
+      log(`  ⚠️ ficha HTTP ${r.status} para ${domain} — NO se puede dar por libre`);
       _fichaFallos++;
-      return null;
+      return { indeterminado: true };
     }
     const j = await r.json();
-    if (!j?.found) return null;
+    if (!j?.found) return null;                     // consultado y no está: libre de verdad
     return { estado: j.estado || "", ejecutivo: j.ejecutivo || "", board: j.board || "",
              enNegociacion: !!(j.board && j.board !== "Prospectos ADEQ"),
              descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0 };
-  } catch { return null; }
+  } catch (e) {
+    log(`  ⚠️ ficha ${domain}: ${e.message} — NO se puede dar por libre`);
+    _fichaFallos++;
+    return { indeterminado: true };
+  }
 }
 
 async function pushToCrmPropio(token, prospectos, contexto = "envio") {
@@ -21016,6 +21059,14 @@ async function runAgentCycle(token, allFlags) {
         // decide justo antes de mandar. Son ~60-100 consultas por día —una por mail que sale—
         // y es el único momento en que el costo de equivocarse no se puede deshacer.
         const _fichaAhora = await _fichaDelCrm(domain);
+        // Ante la duda, NO. Si el CRM no contesta, este dominio queda para el turno
+        // siguiente: no se rechaza el lead ni se lo marca, sólo no sale hoy. Es el mismo
+        // criterio con el que el CRM devuelve 503 en vez de una lista incompleta.
+        if (_fichaAhora?.indeterminado) {
+          log(`  ⏭️ ${domain}: no pude consultar el CRM — lo dejo para el turno siguiente`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:no_verificable" });
+          continue;
+        }
         if (_fichaAhora?.enNegociacion) {
           log(`  ⊘ ${domain}: ABORT send — el CRM lo tiene en negociación (${_fichaAhora.board})`);
           await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:en_negociacion" });
@@ -21495,8 +21546,18 @@ async function runAgentCycle(token, allFlags) {
         // fuera de su try/catch a propósito: si Monday falla, el prospecto igual tiene que
         // llegar al CRM — son dos destinos independientes y hoy uno solo caído nos deja el
         // lead sin rastro. Apagado hasta que `crm_propio_enabled` sea "true".
+        // La segunda mejor dirección del descubrimiento. Se manda aunque NO se le haya
+        // escrito: es a quién recurrir si la primera rebota, y hasta ahora se descartaba en
+        // memoria. Mismo piso de calidad que para enviar (score ≥ 40): guardar basura en el
+        // board es peor que dejar la celda vacía, porque alguien la va a usar.
+        const _emailSecundario = (ranked || []).find(r =>
+          r.email && r.email.toLowerCase() !== String(email).toLowerCase() &&
+          r.score >= 40 && !isBouncedSync(r.email)
+        )?.email || "";
+
         await pushToCrmPropio(token, _crmPayload({
-          domain, email, geo: leadGeo, traffic: leadTraffic,
+          domain, email, emailSecundario: _emailSecundario,
+          geo: leadGeo, traffic: leadTraffic,
           language: lead.language, phone: lead.contact_phone, userEmail,
         }), "envio").catch(() => {});
 

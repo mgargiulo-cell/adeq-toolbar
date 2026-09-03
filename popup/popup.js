@@ -7,7 +7,7 @@
 // los ~30 llamadores; lo que cambió es a dónde preguntan.
 // checkDuplicate / pushToMonday / updateMonday se sacaron: los reemplazan buscarEnCrm y
 // enviarAlBoard, acá en el popup.
-import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday } from "../modules/crm.js";
+import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday, crmUrl } from "../modules/crm.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -5169,7 +5169,7 @@ function _estadoLabel(idx) {
 async function buscarEnCrm(domain) {
   try {
     const r = await fetch(
-      `${CONFIG.CRM_BOARD_URL.replace("/sync-toolbar", "/ficha")}?domain=${encodeURIComponent(domain)}`,
+      `${crmUrl("/ficha")}?domain=${encodeURIComponent(domain)}`,
       { headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET } },
     );
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -5216,7 +5216,11 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // vacío y el CRM decide — "no sé" no se puede seguir tratando como "no". Caso nº9.
     language: _BOARD_IDIOMA[Number(idioma)] || "",
     phone: telefono || "",
-    comments: pitch || "",
+    // ⚠️ `comments` NO lleva el pitch (Maxi 2026-09-03). Del otro lado esa celda es la NOTA
+    // CORTA del media buyer ("who is - Mica", "NO TIENE CLEVER") y `sync-toolbar` la PISA en
+    // cada push: mandar el pitch acá no era sólo ruido, borraba la nota de la persona.
+    // Medido: 77 de 199 filas tenían el pitch en vez de una nota, la más larga de 826 chars.
+    // El pitch no se pierde: queda en `toolbar_sendtrack.pitch` (4.169 de 4.169 lo tienen).
     source: "toolbar",
     // ⚠️ EL MAIL INICIAL YA SALIÓ DESDE ACÁ. En Analysis la toolbar OBLIGA a mandarlo por
     // Gmail antes de dejar cargar, así que cuando el prospecto llega al CRM el primer
