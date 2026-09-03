@@ -12,3 +12,4 @@ supabase/.branches/
 # Credenciales del Chrome Web Store — nunca al repo (viven en ~/.adeq-cws.json)
 .adeq-cws.json
 *cws*credentials*
+__pycache__/
