@@ -19289,7 +19289,14 @@ function _crmPayload({ domain, email, geo, traffic, language, phone, userEmail, 
   return {
     domain,
     email: email || "",
-    deal_stage: "Propuesta Vigente (T)",   // idéntico al estado_idx 3 de Monday
+    // ⚠️ NO se manda `deal_stage`. El estado es del CRM (acordado con la sesión del dashboard,
+    // 03/09): él detecta las respuestas y mueve a "En Negociacion" en 3 minutos, y la lista de
+    // bloqueados que mira el agente puede tener hasta 24 h. Si el agente estampa un estado en
+    // cada push, alguien que contestó a las 10:00 vuelve a "Propuesta Vigente" a la tarde y se
+    // le reinicia la cadencia. `sync-toolbar` escribe el estado sin mirar si la fila ya existe.
+    // La ficha nueva no queda sin estado: la columna tiene default 'Propuesta Vigente' NOT NULL.
+    // (El botón manual del MB SÍ manda estado, y está bien: ahí una persona lo eligió.)
+    // Encima mandaba "Propuesta Vigente (T)", que el CRM ya no acepta y traducía en silencio.
     ejecutivo_name: userEmail || "",
     fecha_contacto: _crmFecha(0),
     fecha_fu1: _crmFecha(5),               // mismos offsets que MONDAY_COL_FU1
