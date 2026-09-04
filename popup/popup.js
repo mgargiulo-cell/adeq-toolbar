@@ -8,6 +8,7 @@
 // checkDuplicate / pushToMonday / updateMonday se sacaron: los reemplazan buscarEnCrm y
 // enviarAlBoard, acá en el popup.
 import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday, crmUrl, getPlantillasIniciales } from "../modules/crm.js";
+import { traducirAlCastellano } from "../modules/traducir.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -2407,6 +2408,13 @@ function isValidEmail(email) {
 // MB no podía cargar el prospecto. Una URL se reconoce por el esquema o por un www. con ruta;
 // NO se le manda mail (Gmail lo frena con un aviso claro) y el push al CRM no exige haber
 // mandado uno: el contacto fue por el formulario del sitio.
+//
+// ⚠️ ESTA DEFINICIÓN ESTÁ DUPLICADA A PROPÓSITO EN EL OTRO REPO: `app/lib/crm-formulario.ts`
+// del dashboard tiene EXACTAMENTE estos dos regex, porque el CRM necesita reconocer lo mismo
+// para prender `contacto_formulario` y para que la cadencia no le mande follow-ups.
+// **Si se amplía acá, hay que ampliarlo allá en el mismo momento** (acordado con su equipo el
+// 04/09). Si un lado acepta algo que el otro no, la ficha queda marcada como formulario y en
+// cadencia a la vez: le mandaríamos mails a una URL, que es justo lo que esto vino a evitar.
 function _esFormularioUrl(v) {
   const s = String(v || "").trim();
   if (!s || s.includes("@")) return false;
@@ -8275,6 +8283,52 @@ function _mostrarPistaBloqueo() {
   _pista("🔒 Es la plantilla del CRM. Para escribir la tuya, apretá 🗑️ Limpiar.");
 }
 
+// ── LA TRADUCCIÓN AL CASTELLANO, EN HOVER (2026-09-04, pedido del user) ──────────────────
+// "Que todos los mails tengan la traducción de Google gratuita para que el media buyer
+// entienda lo que se está enviando… puede ser que al pasar el cursor por encima te muestre
+// la traducción, para no cambiar lo que ves en el recuadro."
+//
+// El diseño es exactamente eso, y la parte importante es lo que NO hace: **el textarea nunca
+// se toca**. La traducción vive en un panel superpuesto con `pointer-events:none`, así que
+// ni siquiera roba el click. Es imposible que salga la traducción en el mail, que sería el
+// error más caro posible acá (un castellano perfecto a un publisher polaco).
+//
+// Cero Claude y cero API paga: `modules/traducir.js` usa los endpoints gratuitos de Google
+// (el mismo de la extensión de Chrome) con caché de 30 días.
+function _idiomaDelPitchActual() {
+  const t = state.pitchTemplate;
+  if (t?.lang) return t.lang;
+  return _draftsState.currentLang || _resolvePitchLang() || "";
+}
+
+function _conectarTraduccionHover(areaEl, panelEl, bodyEl, getTexto, getLang) {
+  if (!areaEl || !panelEl || !bodyEl) return;
+  let ultimo = "";
+  const ocultar = () => { panelEl.hidden = true; };
+  const mostrar = async () => {
+    const texto = String(getTexto() || "").trim();
+    const lang  = String(getLang() || "");
+    // Nada que mostrar, o ya está en castellano: el panel no aparece. Taparle el texto al MB
+    // para decirle lo mismo que ya está leyendo sería sólo estorbo.
+    if (!texto || String(lang).toLowerCase().startsWith("es")) return;
+    panelEl.hidden = false;
+    if (ultimo !== texto) {
+      bodyEl.className = "pitch-es-body cargando";
+      bodyEl.textContent = "Traduciendo…";
+    }
+    const r = await traducirAlCastellano(texto, lang);
+    // El mouse pudo haberse ido mientras Google contestaba.
+    if (panelEl.hidden) return;
+    ultimo = texto;
+    if (r.ok) { bodyEl.className = "pitch-es-body"; bodyEl.textContent = r.texto; }
+    else      { bodyEl.className = "pitch-es-body falla"; bodyEl.textContent = `No se pudo traducir (${r.motivo}). El texto de arriba es el que sale.`; }
+  };
+  areaEl.addEventListener("mouseenter", mostrar);
+  areaEl.addEventListener("mouseleave", ocultar);
+  // Con el foco puesto el MB está leyendo o escribiendo: el panel estorba.
+  areaEl.addEventListener("focus", ocultar);
+}
+
 function applyCrmTemplate(t, lang) {
   if (!t) return;
   const domain = state.domain || "example.com";
@@ -8517,6 +8571,14 @@ function initPitchInlineControls() {
     _draftsState.flagIdxByLang.set(_draftsState.currentLang, 0);
     autofillDraftOnLoad().catch(() => updatePitchFlagButton());
   });
+  // La traducción en hover — sobre el texto que HAY, sea plantilla o escrito por el MB.
+  _conectarTraduccionHover(
+    pitchEl,
+    document.getElementById("pitch-es"),
+    document.getElementById("pitch-es-body"),
+    () => pitchEl?.value,
+    () => _idiomaDelPitchActual(),
+  );
 }
 
 // ── Pitch Drafts modal ────────────────────────────────────────
@@ -10136,7 +10198,13 @@ function renderProspectCard(r) {
             <button type="button" class="pcard-clear-btn pitch-tool-btn pitch-tool-clear" title="Limpiar pitch">🗑️ Limpiar</button>
           </div>
         </div>
-        <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Language draft auto-loads here...">${esc(r.pitch || "")}</textarea>
+        <div class="pitch-wrap">
+          <textarea class="pitch-textarea pcard-pitch" rows="5" placeholder="Language draft auto-loads here...">${esc(r.pitch || "")}</textarea>
+          <div class="pitch-es pcard-es" hidden>
+            <div class="pitch-es-cab">🇪🇸 Traducción al castellano <span class="pitch-es-nota">— muestra: lo que sale es el texto de arriba</span></div>
+            <div class="pitch-es-body pcard-es-body"></div>
+          </div>
+        </div>
 
         <div class="pitch-actions" style="margin-top:6px">
           <button class="btn btn-primary btn-sm pcard-generate-btn" type="button">${r.pitch ? "✨ Regenerate Pitch" : "✨ Generate Pitch"}</button>
@@ -10674,6 +10742,15 @@ function initProspectCard(card, data) {
     _applyCardDraft(drafts[cardFlag.idx]);
     _updateCardUI();
   });
+
+  // La traducción al castellano en hover, igual que en Analysis: el textarea no se toca.
+  _conectarTraduccionHover(
+    card.querySelector(".pcard-pitch"),
+    card.querySelector(".pcard-es"),
+    card.querySelector(".pcard-es-body"),
+    () => card.querySelector(".pcard-pitch")?.value,
+    () => cardFlag.lang,
+  );
 
   // Trash = limpiar Y desbloquear: el único camino para escribir un mensaje propio.
   card.querySelector(".pcard-clear-btn")?.addEventListener("click", () => {

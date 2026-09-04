@@ -905,6 +905,34 @@ input.form-pv-display { font-weight: 700; }
 .pitch-tool-flag.pitch-tpl-crm { border-color: #0ea5e9; background: #f0f9ff; }
 .pitch-tool-flag.pitch-tpl-crm .pitch-tool-name { color: #0369a1; }
 
+/* Traducción al castellano en hover — 2026-09-04.
+   Se superpone al textarea SIN tocarlo: lo que se envía es siempre el de abajo. */
+.pitch-wrap { position: relative; }
+.pitch-es {
+  position: absolute; inset: 0; z-index: 5;
+  display: flex; flex-direction: column;
+  background: #fffdf5;
+  border: 1px solid #fcd34d;
+  border-radius: var(--r-md);
+  box-shadow: 0 4px 14px rgba(0,0,0,.10);
+  overflow: hidden;
+  pointer-events: none;   /* el mouse sigue siendo del textarea: no roba el click */
+}
+.pitch-es-cab {
+  flex-shrink: 0;
+  font-size: 10px; font-weight: 800; letter-spacing: .3px;
+  color: #92400e; background: #fef3c7;
+  padding: 4px 8px; border-bottom: 1px solid #fcd34d;
+}
+.pitch-es-nota { font-weight: 500; opacity: .85; }
+.pitch-es-body {
+  flex: 1; overflow-y: auto;
+  padding: 8px 10px;
+  font-size: var(--fs-base); line-height: 1.5;
+  color: #1f2937; white-space: pre-wrap;
+}
+.pitch-es-body.cargando, .pitch-es-body.falla { color: #92400e; font-style: italic; }
+
 /* Pitch toolbar */
 .pitch-toolbar {
   display: flex; justify-content: space-between; align-items: center;

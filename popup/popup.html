@@ -747,7 +747,16 @@
           <button id="btn-pitch-clear" type="button" class="pitch-tool-btn pitch-tool-clear" title="Limpiar y desbloquear para escribir">🗑️ Limpiar</button>
         </div>
       </div>
-      <textarea id="pitch-text" class="pitch-textarea" placeholder="Language draft auto-loads here..."></textarea>
+      <!-- El recuadro muestra SIEMPRE el original (es lo que sale). La traducción al
+           castellano aparece en un panel al pasar el cursor por encima, para que el media
+           buyer entienda qué está mandando sin que el texto real cambie nunca. -->
+      <div class="pitch-wrap">
+        <textarea id="pitch-text" class="pitch-textarea" placeholder="Language draft auto-loads here..."></textarea>
+        <div id="pitch-es" class="pitch-es" hidden>
+          <div class="pitch-es-cab">🇪🇸 Traducción al castellano <span class="pitch-es-nota">— muestra: lo que sale es el texto de arriba</span></div>
+          <div id="pitch-es-body" class="pitch-es-body"></div>
+        </div>
+      </div>
       <div id="pitch-lock-hint" class="pitch-lock-hint" hidden></div>
       <div id="pitch-subjects" class="pitch-subjects" style="display:none"></div>
       <div class="pitch-actions">

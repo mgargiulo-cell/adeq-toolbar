@@ -41,9 +41,15 @@ async function crmGet(ruta, params = {}) {
 // (`crm_board_templates`, step_key='inicial'). Se leen por HTTP con el mismo secreto que la
 // ficha: la extensión no tiene —ni debe tener— credenciales de la base del CRM.
 //
-// Contrato pedido al CRM: GET /api/crm/plantillas?step=inicial → { ok, plantillas: [{ id,
-// idioma, variant, nombre, subject, body, ejecutivo, activa }] }. Hasta que exista, la
-// llamada devuelve ok:false y el popup cae a los borradores propios del MB, avisando.
+// Contrato, ya vivo y verificado contra producción el 04/09 (69 plantillas, 23 idiomas,
+// 3 variantes cada uno, y 401 sin el secreto):
+//   GET /api/crm/plantillas?step=inicial   header x-toolbar-secret
+//   → { ok, plantillas: [{ id, idioma, variant, nombre, subject, body, ejecutivo, activa }] }
+// `idioma` viene con la etiqueta del CRM ("Aleman", no "de"); la traduce `IDIOMA_CRM` del popup.
+//
+// El fallback al borrador propio se mantiene aunque el endpoint ande: si algún día devuelve
+// 500 o se cae el deploy, el media buyer sigue teniendo con qué escribir y ve POR QUÉ no está
+// la plantilla del CRM. Quedarse mudo mostrando otra cosa sería peor que no mostrar nada.
 //
 // Caché de 6 horas en chrome.storage: las plantillas cambian poco y el popup se abre cientos
 // de veces por día. `force` la saltea (el botón de recargar).
