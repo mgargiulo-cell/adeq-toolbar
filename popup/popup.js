@@ -9,6 +9,13 @@
 // enviarAlBoard, acá en el popup.
 import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday, crmUrl, getPlantillasIniciales } from "../modules/crm.js";
 import { traducirAlCastellano } from "../modules/traducir.js";
+// ── UNA SOLA IMPLEMENTACIÓN DEL RANKING (Fase 5, 2026-09-04) ─────────────────────────────
+// El popup tenía copias propias del criterio de "a quién se le escribe" (regex comercial,
+// lista de genéricos, tiers) y ya habían discrepado dos veces del worker. Medido el 04/09:
+// `prensa@` valía 115 en el worker y era genérico acá; `dpo@`/`privacy@` eran "persona" acá y
+// basura allá; y los nueve cambios de la Fase 1 no llegaban al media buyer. Desde ahora el
+// popup importa el MISMO archivo que el worker. El zip lo incluye (scripts/empaquetar.sh).
+import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL } from "../auto-prospector/lib/email.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -3701,22 +3708,23 @@ function inferCountryFromPageSignals() {
 // MENSUAL restante (más reveals al inicio del ciclo 6-a-6, menos al final). Se
 // auto-calibra solo y SIEMPRE respeta el tope: si no queda cupo, no revela.
 // Cada reveal consume 1 crédito Apollo (/v1/people/match).
+// Las tres funciones de abajo ya no tienen regex propias: delegan en `lib/email.js`, el mismo
+// archivo que decide en el worker. Lo único que sigue siendo del popup es el TIER POR FUENTE
+// (apollo/manual > comercial > persona > informer > genérico), porque `rankEmail` no sabe de
+// dónde salió cada dirección. Dentro de cada tier manda el puntaje de rankEmail: así el orden
+// que ve el MB es el mismo con el que manda el agente.
 function _isGenericEmailLocal(email) {
-  const local = String(email || "").split("@")[0].toLowerCase().replace(/[._-]/g, "");
-  // Paridad con el worker (2026-09-04): `press@`/`prensa@` salen de la bolsa de genéricos —
-  // el worker les da 115 (rol editorial, atendido por una persona que reenvía) y acá contaban
-  // como info@. `media@`/`team@` también son buzones atendidos. Se quedan los que de verdad
-  // son la mesa de entrada.
-  return /^(info|contact|hello|hi|admin|support|office|general|contacto|hola|ayuda|soporte|webmaster|enquiries|hr|jobs|careers|noreply|donotreply|geral|kontakt|contato)$/.test(local);
+  return _isGenericLocalPart(String(email || ""));
 }
-// Maxi 2026-07-09: rol de VENTA DE PAUTA/PUBLICIDAD = "mejor opción" para ADEQ (elección user Q4).
-// Regex acotado (no matchea admin/advisor). Paridad con el worker (AD_SALES_LOCAL).
-const _AD_SALES_LOCAL_RE = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor)/i;
-// Tier de SELECCIÓN del email (paridad worker _pickTier): apollo/informer nominal (4) >
-// publicidad@/comercial@/ventas@ scrapeado (3) > persona scrapeada (2) > genérico info@/contacto@ (0).
+const _AD_SALES_LOCAL_RE = AD_SALES_LOCAL;
+function _rankClient(email) {
+  try { return rankEmail(String(email || ""), state.domain || "", state.category || ""); } catch { return 0; }
+}
 function _emailPickTierClient(email) {
   const src = (state.emailSources.get(email) || "").toLowerCase();
   const local = String(email || "").toLowerCase().split("@")[0];
+  // Basura según el ranking compartido (dpo@, privacy@, dmarc@, rebotados…): último de todo.
+  if (_rankClient(email) < 0) return -1;
   // Maxi 2026-07-15 (D1 sync worker _pickTier): informer (WHOIS/registrar) NO es top-tier — baja a 1
   // (o 3 si el local es rol comercial). Antes estaba en 4 junto a apollo → el popup mostraba como
   // "mejor contacto" un domainmanagement@ que el worker rankea ÚLTIMO. Ahora coincide con el envío real.
@@ -3726,10 +3734,14 @@ function _emailPickTierClient(email) {
   if (!_isGenericEmailLocal(email)) return 2;                // persona / rol no-genérico
   return 0;                                                   // genérico
 }
+// Orden: tier de fuente primero, y dentro del tier el puntaje del ranking compartido.
+function _ordenarEmailsClient(list) {
+  return [...list].sort((a, b) => (_emailPickTierClient(b) - _emailPickTierClient(a)) || (_rankClient(b) - _rankClient(a)));
+}
 function _bestEmailByTier(emails) {
   const list = (emails || []).filter(Boolean);
   if (!list.length) return "";
-  return [...list].sort((a, b) => _emailPickTierClient(b) - _emailPickTierClient(a))[0];
+  return _ordenarEmailsClient(list)[0];
 }
 async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
   try {
@@ -4184,7 +4196,7 @@ function renderEmailList(emails) {
   // 2. ORDEN (Maxi 2026-07-09): tiering comercial (paridad worker). apollo/informer nominal >
   //    publicidad@/comercial@/ventas@ > persona scrapeada > genérico. Sort estable (Chrome) →
   //    dentro de cada tier conserva el orden de inserción. Antes solo era "Apollo primero".
-  const suggested = [...cleaned].sort((a, b) => _emailPickTierClient(b) - _emailPickTierClient(a));
+  const suggested = _ordenarEmailsClient(cleaned);
 
   // Maxi 2026-06-17 v3: si NO hay emails ni socials, mensaje fallback simple.
   const _socials = Array.isArray(state.pageSocialLinks) ? state.pageSocialLinks : [];

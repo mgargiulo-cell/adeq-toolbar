@@ -1225,7 +1225,9 @@ export function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, e
   if (_estricto && urls.length > 3) bloqueantes.push(`demasiados_links_${urls.length}`);
 
   if (mime) {
-    if (mime.split("\r\n").some(l => Buffer.byteLength(l, "utf-8") > 990)) bloqueantes.push("linea_mime_mayor_a_990");
+    // TextEncoder y no Buffer: este módulo también lo importa la EXTENSIÓN (Fase 5, 2026-09-04)
+    // y en el navegador Buffer no existe. Probado equivalente byte a byte con ñ, kanji y emoji.
+    if (mime.split("\r\n").some(l => new TextEncoder().encode(l).length > 990)) bloqueantes.push("linea_mime_mayor_a_990");
     if (_estricto && /Content-Disposition:\s*attachment/i.test(mime)) bloqueantes.push("adjunto_en_prospeccion");
     if ((mime.match(/=\?UTF-8\?B\?[^?]+\?=/g) || []).some(w => w.length > 75)) bloqueantes.push("encoded_word_mayor_a_75");
   }

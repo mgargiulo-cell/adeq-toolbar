@@ -61,18 +61,25 @@ function log(msg) {
 // Seeds se guardan en toolbar_config con key = "discovery_seeds"
 // Valor: JSON array de dominios, ej: ["marca.com","deportes.mx"]
 async function getSeeds(token) {
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` };
+  let manuales = [];
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.discovery_seeds&select=value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${token}` } }
-    );
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_config?key=eq.discovery_seeds&select=value`, { headers });
     const rows = await res.json();
-    const raw  = rows?.[0]?.value || "[]";
-    const seeds = JSON.parse(raw);
-    return Array.isArray(seeds) ? seeds.map(cleanDomain).filter(Boolean) : [];
-  } catch {
-    return [];
-  }
+    const seeds = JSON.parse(rows?.[0]?.value || "[]");
+    manuales = Array.isArray(seeds) ? seeds.map(cleanDomain).filter(Boolean) : [];
+  } catch {}
+  // ── LOS QUE RESPONDIERON SON LA MEJOR SEMILLA (Fase 4, 2026-09-04, medido) ──────────────
+  // La lista manual la carga alguien a mano y envejece. Los dominios con respuesta REAL de una
+  // persona (79 al 04/09) son la definición viva de "publisher que nos compra": lo que se
+  // parece a ellos es lo que buscamos. Van adelante de los manuales; si la consulta falla, la
+  // lista manual sigue funcionando sola, como siempre.
+  let respondieron = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?response_type=eq.real&select=domain&order=sent_at.desc&limit=80`, { headers });
+    if (r.ok) respondieron = (await r.json()).map(x => cleanDomain(x.domain)).filter(Boolean);
+  } catch {}
+  return [...new Set([...respondieron, ...manuales])];
 }
 
 // ── Supabase: dominios ya procesados ─────────────────────────

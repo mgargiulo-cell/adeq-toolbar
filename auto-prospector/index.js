@@ -2532,8 +2532,22 @@ async function _construirBusquedasPorSspRegional(token, cuantas) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let semillas = [];
   try {
+    // ── SEMBRAR DESDE LOS QUE RESPONDIERON (Fase 4, 2026-09-04, medido) ───────────────────
+    // Similar-sites y Majestic responden bien (9-11%) pero validan mal (9-12%): la semilla era
+    // "los últimos 12 validados", que es lo que el filtro dejó pasar, no lo que el negocio
+    // confirmó. Hay 79 dominios con respuesta REAL de una persona: son la mejor definición de
+    // "un publisher que nos compra" que existe en la base. Van primero; los validados recientes
+    // quedan de relleno para los días sin respuestas nuevas.
+    const rr = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?response_type=eq.real&select=domain,geo&order=sent_at.desc&limit=40`, { headers: auth });
+    if (rr.ok) semillas = (await rr.json()).filter(x => x.domain);
     const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.validated&select=domain,geo&order=validated_at.desc&limit=12`, { headers: auth });
-    if (r.ok) semillas = (await r.json()).filter(x => x.domain);
+    if (r.ok) semillas.push(...(await r.json()).filter(x => x.domain));
+    // Un dominio que respondió puede estar dos veces (respondió y está validado). Y el orden
+    // se mezcla dentro de los respondedores para no pegarle siempre a los mismos 4.
+    const vistos = new Set();
+    semillas = semillas.filter(s => { const d = String(s.domain).toLowerCase(); if (vistos.has(d)) return false; vistos.add(d); return true; });
+    const nResp = Math.min(semillas.length, 40);
+    for (let i = nResp - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [semillas[i], semillas[j]] = [semillas[j], semillas[i]]; }
   } catch {}
   if (!semillas.length) return [];
   const out = [];
@@ -7880,6 +7894,24 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     const PUBLISHER_ADS_RE = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|div-gpt-ad|data-ad-slot|googletag\.cmd|amazon-adsystem|aps\.amazon|pubmatic|rubiconproject|magnite|openx\.net|prebid\.js|prebidjs|adnxs\.com|appnexus|33across|sovrn\.com|indexexchange|casalemedia|smartadserver|yieldmo|sharethrough|gumgum|fundingchoicesmessages)/i;
     const hasPublisherAds = PUBLISHER_ADS_RE.test(html) || adNetworks.length > 0;
 
+    // ── ¿HAY ALGO EDITORIAL EN LA HOME? (Fase 3, 2026-09-04, medido) ─────────────────────
+    // Seis señales baratas, sobre el HTML que ya está bajado: artículos, secciones de noticias,
+    // fechas, RSS declarado, schema de medio y firma de autor. Medido sobre 582 publishers
+    // reales de marzo: el 86% tiene al menos una. El 14% que no (calendarios, códigos postales,
+    // recetas, juegos) son publishers igual — por eso esto NO rechaza: sólo manda el sitio a la
+    // segunda opinión de Haiku cuando además no tiene marcado que lo delate. En la muestra del
+    // pool, 13 de los 25 no-publishers etiquetados (directorios, corporativos, apps: firmy.cz,
+    // houzz.es, sony.co.jp, inmobi.com) sólo se distinguen por esto.
+    const _low = html.toLowerCase();
+    const _senalEditorial =
+         (html.match(/<article\b/gi) || []).length >= 3
+      || (_low.match(/href="[^"]*\/(politica|economia|deportes|sociedad|cultura|internacional|noticias|news|sport|economy|politics|opinion|tecnologia|espectaculos|local|region|actualidad|mundo|nacional|salud|ciencia|esportes|esporte|cotidiano|sports|business|entertainment|lifestyle|health|ultimas)\b/g) || []).length >= 4
+      || (html.match(/\b20(2[0-9])[-\/.](0[1-9]|1[0-2])[-\/.](0[1-9]|[12][0-9]|3[01])\b/g) || []).length >= 5
+      || /type=["']application\/(rss|atom)\+xml["']/i.test(html)
+      || /"@type"\s*:\s*"(NewsMediaOrganization|Newspaper|NewsArticle|ReportageNewsArticle|Article|BlogPosting)"/i.test(html)
+      || /rel=["']author["']|class=["'][^"']*author|\/author\/|by-?line/i.test(html);
+    const sinSenalEditorial = !_senalEditorial;
+
     // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
     // Adult/Streaming PRIMERO porque scoreWebsite los usa como gates duros (descarte total).
     const textForCategory = `${title} ${desc} ${domain}`.toLowerCase();
@@ -8107,6 +8139,7 @@ async function fetchPageContent(domain, _yaReintentado = false) {
       adNetworks, category,
       hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
       nonPublisherType,                 // tienda/banco/universidad/servicios → rechazar
+      sinSenalEditorial,                // sin artículos/secciones/fechas/RSS/autor → Haiku decide
       isEcommerce: nonPublisherType === "ecommerce",
       ...extractPhonesFromHtml(html, geo),   // phones[] + whatsapps[] (tel:, WhatsApp, schema.org, anunciados)
       htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
@@ -11775,7 +11808,12 @@ async function classifyPublisher(token, domain, pageContent, swCategory, swData 
   const catOk = PUBLISHER_CATEGORIES.has(pageContent?.category || "")
              || /news|media|sport|entertain|magazine|gossip|lifestyle|gaming|music|tv|film|movie/.test((swCategory || "").toLowerCase());
   let haikuType = null;
-  if (!(catOk && adsTxt.state === "yes" && adsTxt.lines >= 20)) {
+  // El atajo "categoría de medio + ads.txt gordo → sin Haiku" dejaba pasar justo a los que no
+  // se distinguen por marcado: un directorio o un corporativo con 40 líneas de ads.txt y
+  // categoría "news" en SimilarWeb (firmy.cz, houzz.es, sony.co.jp). Si la home no tiene UNA
+  // sola señal editorial, Haiku mira igual — y su prompt ya dice "ante la duda, publisher",
+  // así que un calendario o un sitio de recetas sin artículos no se pierde. (Fase 3, 04/09)
+  if (!(catOk && adsTxt.state === "yes" && adsTxt.lines >= 20) || pageContent?.sinSenalEditorial) {
     const trash = await _loadProspectTrashContext(token).catch(() => ({ rules: "" }));
     haikuType = await _haikuPublisherClass(token, domain, pageContent, swCategory, trash.rules || "").catch(() => null);
   }
