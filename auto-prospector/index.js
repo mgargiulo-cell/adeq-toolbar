@@ -7880,6 +7880,19 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     // Maxi 2026-07-15 (user "corregilo"): corporate-brochure y personal/portfolio por schema.
     const corpSchema    = /"@type"\s*:\s*"Corporation"/i;                    // Corporation (NO Organization, que usan publishers)
     const personalSchema = /"@type"\s*:\s*"(ProfilePage|ResumeAction)"/i;
+    // ── TIENDA POR SCHEMA y TURNOS MÉDICOS (Maxi 2026-09-04, medido) ─────────────────────
+    // Muestra de 75 dominios del pool bajados en vivo: 25–30% no eran publishers, y los que se
+    // colaban tenían justo lo que este detector no miraba: botland.com.pl se declara
+    // `ElectronicsStore`, rinascente.it "Shop Online" en el título, topdoctors.it y ekshef.com
+    // (Egipto) piden turno ("Prenota una visita", "احجز ميعاد"). Ninguna de las tres señales aparece
+    // en los 624 publishers reales de referencia (0 falsos negativos medidos); el schema de tienda
+    // va con el candado `!hasPublisherAds` como todo lo demás: un medio con merch y AdSense sigue
+    // pasando. NO se agrega "sin señal editorial": rompería al 4,8% de los publishers reales
+    // (calendarios, códigos postales, recetas), así que eso queda para la segunda opinión.
+    // Sin `Product`: un medio que RESEÑA productos lo embebe (musio.net.br, sarangburung.net —
+    // dos publishers reales que se perdían). Sólo el tipo que dice "yo SOY una tienda".
+    const storeSchema   = /"@type"\s*:\s*"(Store|ElectronicsStore|ClothingStore|FurnitureStore|GroceryStore|HardwareStore|JewelryStore|ShoeStore|SportingGoodsStore|ToyStore|BookStore|PetStore|GardenStore|HomeGoodsStore|DepartmentStore|OutletStore|WholesaleStore|OnlineStore)"/i;
+    const bookingKw     = /\b(book (an |your )?appointment|pedir (cita|turno|hora)|reservar (turno|cita|hora)|agendar (cita|consulta|hora)|solicitar turno|sacar turno|prenota (una |la )?visita|prendre rendez-vous|termin (buchen|vereinbaren)|marcar consulta|agende sua consulta|umów wizytę)\b|احجز (ميعاد|موعد)/i;
     // Piratería / brand-unsafe: se excluye AUNQUE tenga ads (decisión de brand-safety, no de monetización).
     // Señales fuertes y específicas para no pegar un artículo que MENCIONE el tema.
     const piracyRe = /magnet:\?xt=urn:btih|\.torrent["'\s>]|\b(putlocker|123movies|fmovies|solarmovie|thepiratebay|1337x|rarbg|nyaa\.si)\b|read\s+manga\s+online\s+free/i;
@@ -7927,7 +7940,13 @@ async function fetchPageContent(domain, _yaReintentado = false) {
       [/\b(crypto|cripto)[\s·|-]{0,3}(exchange|wallet|broker)\b|\bexchange de (cripto|bitcoin)|casa de cambio (de )?cripto|\b(compra|comprar|buy) y (vende|vender|sell) (bitcoin|cripto)/i, "crypto"],
       [/\b(mobile|game|gaming|app|hyper[- ]?casual)[\s·|-]{0,3}(publisher|studio|developer|dev)\b|\bgame studio\b|\bestudio de (juegos|videojuegos)\b/i, "app"],
       [/\b(software|it|tech|digital|web|cloud)[\s·|-]{0,3}(company|agency|agencia|consult\w+|services|solutions)\b|\bsoluciones (digitales|tecnol[oó]gicas|de software)\b|\bdesarrollo de software\b|\bstaff augmentation\b/i, "service"],
-      [/\b(tienda (online|oficial|virtual)|loja (oficial|online)|online (shop|store)|comprar online|e-?commerce oficial)\b/i, "ecommerce"],
+      // Ampliado 2026-09-04 con lo que decían los títulos de las tiendas que se colaron:
+      // "Shop Online" (rinascente.it), "Sklep Elektroniczny" (botland.com.pl), "Versandhaus"
+      // (bader.de), "STORE" pegado a la marca (GreenSnapSTORE), "Tienda en Línea" (pacifiko.com).
+      // Sin "tienda/loja OFICIAL": un club o un medio con merch lo dice en su descripción
+      // (flamengo.com.br, publisher real, caía por "Loja Oficial"). Sólo lo que un medio nunca
+      // pone de sí mismo: "shop online", "sklep internetowy", "Versandhaus", "tienda en línea".
+      [/\b(tienda (online|en l[ií]nea)|loja (online|virtual)|online (shop|store)|shop online|e-?shop|onlineshop|web ?shop|comprar online|sklep (internetowy|online|elektroniczny)|negozio online|boutique en ligne|versandhaus)\b|[a-z]store\b(?=[^a-z]|$)/i, "ecommerce"],
     ];
     let _tipoPorTitulo = null;
     for (const [re, tipo] of TITULO_DELATOR) { if (re.test(_tituloYSitio)) { _tipoPorTitulo = tipo; break; } }
@@ -7956,6 +7975,8 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     else if (!hasPublisherAds && saasSchema.test(html)) nonPublisherType = "saas";
     else if (!hasPublisherAds && corpSchema.test(html)) nonPublisherType = "corporate";
     else if (!hasPublisherAds && personalSchema.test(html)) nonPublisherType = "personal";
+    else if (!hasPublisherAds && storeSchema.test(html)) nonPublisherType = "ecommerce";     // 2026-09-04: botland.com.pl (ElectronicsStore)
+    else if (!hasPublisherAds && bookingKw.test(html)) nonPublisherType = "health";          // 2026-09-04: topdoctors.it, ekshef.com (turnos)
     // El título se lee DESPUÉS del schema (más específico) y ANTES de los keywords (más laxos).
     else if (!hasPublisherAds && _tipoPorTitulo) nonPublisherType = _tipoPorTitulo;
     // TODO lo demás (schema Y keywords) SOLO cuenta si el sitio NO muestra ads display (programmatic
@@ -10539,6 +10560,49 @@ function _sembrarTopeSerperContacto(cfg, dia) {
 // compensa. Tradeoff: el agente se pacea un poco (polishPool corre antes en el loop) pero sigue enviando.
 const POLISH_COOLDOWN_MS = 8 * 1000;   // 20→8s: corre casi cada loop
 const POLISH_BATCH = 120;              // 60→120: más dominios por corrida (commit incremental por wave lo hace seguro)
+
+// ── EL ROL ADIVINADO, COMO HACE EL MEDIA BUYER (Maxi 2026-09-04, medido) ─────────────────────
+// De los 4.014 emails que los media buyers cargaron a mano en el CRM, el 32% es una dirección de
+// rol estándar EN el propio dominio (info@ 490, contact@ 121, redazione@ 89, contato@ 69,
+// kontakt@ 48…), y en los 406 dominios donde el worker no tenía NADA, el humano resolvió el 28%
+// exactamente así: no encontró el buzón publicado y probó el estándar del idioma. Los 48 sitios
+// que fui a ver en vivo lo confirman: en 28 no hay un solo email en 33 rutas, y el humano usó
+// `redazione@`, `contacto@`, `info@`. El sitio no lo publica, pero existe.
+// Es el ÚLTIMO recurso y sólo para leads con cero emails: primero corre todo el crawl y las vías
+// externas. El candidato entra sólo si el dominio tiene MX (sin MX no hay nadie del otro lado),
+// con fuente `rol_mx` para medirle el rebote aparte, y MillionVerifier lo verifica antes de que
+// el agente lo mande, como a cualquier otro. Tope diario para que una mala racha no queme una
+// casilla. Flag: polish_rol_mx (default true).
+// El orden por idioma sale de lo que eligieron los humanos, no de una opinión.
+const _ROLES_POR_IDIOMA = {
+  es: ["contacto", "info", "redaccion"],
+  it: ["redazione", "info", "marketing"],
+  pt: ["contato", "comercial", "redacao"],
+  pl: ["kontakt", "redakcja", "reklama"],
+  de: ["info", "kontakt", "redaktion"],
+  fr: ["contact", "info", "redaction"],
+  el: ["info", "contact"],
+  ar: ["info", "contact"],
+  tr: ["info", "iletisim", "reklam"],
+  nl: ["info", "redactie"],
+  ro: ["contact", "redactia", "office"],
+  hu: ["info", "szerkesztoseg"],
+  cs: ["info", "redakce"],
+  vi: ["info", "lienhe", "quangcao"],
+  id: ["info", "redaksi", "iklan"],
+  ja: ["info"],
+  ko: ["info"],
+  en: ["info", "contact", "editor"],
+};
+const _TLD_A_IDIOMA = { it: "it", es: "es", ar: "es", mx: "es", cl: "es", co: "es", pe: "es", uy: "es", ve: "es", ec: "es", bo: "es", py: "es", cr: "es", gt: "es", do: "es", pa: "es", hn: "es", sv: "es", ni: "es", br: "pt", pt: "pt", pl: "pl", de: "de", at: "de", ch: "de", fr: "fr", be: "fr", gr: "el", tr: "tr", nl: "nl", ro: "ro", hu: "hu", cz: "cs", vn: "vi", id: "id", jp: "ja", kr: "ko" };
+function _rolesAdivinables(domain, language) {
+  const d = String(domain || "").toLowerCase().replace(/^www\./, "");
+  let idioma = String(language || "").toLowerCase().slice(0, 2);
+  if (!_ROLES_POR_IDIOMA[idioma]) idioma = _TLD_A_IDIOMA[d.split(".").pop()] || "";
+  const base = _ROLES_POR_IDIOMA[idioma] || ["info", "contact"];
+  return [...new Set([...base, "info"])].slice(0, 3).map(l => `${l}@${d}`);
+}
+let _rolMxHoy = { dia: "", n: 0 };
 const POLISH_CONC = 12;                // 8→12: más dominios en paralelo por wave
 // ── TECHO DE TIEMPO POR CICLO (Maxi 2026-08-04) ────────────────────────────────────────────
 // polishPool corre ANTES de maybeRunAgentSlot en la misma vuelta del loop. Con el presupuesto
@@ -10856,7 +10920,7 @@ async function polishPool(token) {
   let leads = null;
   try {
     const _sel = (cols) => `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}${sinEmailClause}&select=${cols}&order=created_at.asc&limit=${POLISH_BATCH}`;
-    const _base = "id,domain,emails,email_sources,contact_name,contact_phone,category,traffic,created_at";
+    const _base = "id,domain,emails,email_sources,contact_name,contact_phone,category,traffic,created_at,language";
     let r = await fetch(_sel(`${_base},email_intentos`), { headers: auth });
     // Igual que en el pool del agente: `email_intentos` la crea la migración del 11/08.
     // Si el código va antes que el SQL, se sigue trabajando sin esa columna en vez de
@@ -10989,7 +11053,21 @@ async function polishPool(token) {
         let _diagEmail = null;      // qué se encontró y qué se descartó, para el motivo real
         const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
         const _crawlStats = { ok: 0, fail: 0, timeouts: 0, waf: false };
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats }).catch(() => []);
+        const _urlPorEmail = new Map();   // dónde se encontró cada dirección
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats, urlByEmail: _urlPorEmail }).catch(() => []);
+        // ── LO QUE EL SITIO IMPRIME ES SU CONTACTO, VALGA EL DOMINIO QUE VALGA (2026-09-04) ──
+        // `lamoto@motorpress.com.ar` está en todas las páginas de lamoto.com.ar y el ranking le
+        // daba -50 por "otra empresa": el lead quedaba en cero teniendo el contacto a la vista.
+        // _cleanScrapedEmails ya lo perdona (vieneDelPropioSitio), pero rankEmail no sabía de
+        // dónde salió. Si una dirección corporativa se leyó EN el propio sitio, su dominio es
+        // la casa editora de facto: se declara y el ranking le da +20 en vez de -50.
+        const _domLead = String(domain).toLowerCase().replace(/^www\./, "");
+        for (const [_e, _u] of _urlPorEmail) {
+          const _dEmail = (String(_e).split("@")[1] || "").toLowerCase();
+          if (!_dEmail || _dEmail === _domLead || _dEmail.endsWith("." + _domLead) || WEBMAIL_RE.test(_dEmail)) continue;
+          let _host = ""; try { _host = new URL(String(_u).startsWith("http") ? _u : `https://${_u}`).hostname.replace(/^www\./, "").toLowerCase(); } catch {}
+          if (_host === _domLead || _host.endsWith("." + _domLead)) _casasOut.add(_dEmail);
+        }
         if (Array.isArray(scraped) && scraped.length) {
           // ── QUÉ SE ENCONTRÓ Y POR QUÉ SE DESCARTÓ (Maxi 2026-08-27, pedido del user) ────
           // El motivo que se guardaba era siempre "no_encontrado", que junta dos cosas muy
@@ -11056,14 +11134,39 @@ async function polishPool(token) {
             }
           }
         }
+        // 6) ÚLTIMO RECURSO: el rol estándar del idioma, si el dominio tiene MX (ver _ROLES_POR_IDIOMA).
+        //    Sólo con CERO emails, después de todas las vías. Fuente `rol_mx`, con tope diario.
+        let _extraRol = [];
+        if (!foundEmail && curEmails.length === 0 && String(cfg.polish_rol_mx ?? "true") !== "false") {
+          const _mDay = _madridNowParts().dateISO;
+          if (_rolMxHoy.dia !== _mDay) _rolMxHoy = { dia: _mDay, n: 0 };
+          const _capRol = parseInt(cfg.polish_rol_mx_daily_cap || "60", 10) || 60;
+          if (_rolMxHoy.n < _capRol) {
+            try {
+              const mx = await _doh(domain.replace(/^www\./, ""), "MX");
+              if (mx.length) {
+                const cands = _rolesAdivinables(domain, lead.language)
+                  .map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) }))
+                  .filter(c => c.score > 0);            // el dominio quemado o la dirección rebotada ya dan -1
+                if (cands.length) {
+                  _rolMxHoy.n++;
+                  foundEmail = cands[0].email; foundSource = "rol_mx";
+                  _extraRol = cands.slice(1).map(c => c.email);   // el segundo va de reserva en la lista
+                  log(`  🎯 ${domain}: sin email publicado → rol estándar del idioma con MX: ${cands.map(c => c.email.split("@")[0]).join(", ")} (rol_mx ${_rolMxHoy.n}/${_capRol} hoy)`);
+                }
+              }
+            } catch {}
+          }
+        }
         // Guardar email (si hay) y/o teléfono (si es nuevo) en UN solo PATCH.
         if (foundEmail || (foundPhone && !_curPhone)) {
           const _patch = {};
           if (foundEmail) {
-            const merged = [foundEmail, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
+            const merged = [foundEmail, ..._extraRol, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
             _patch.emails = await validateEmailsBatch(merged);
             const newSources = { ...(lead.email_sources || {}) };
             newSources[foundEmail.toLowerCase()] = foundSource;
+            for (const _e of _extraRol) newSources[_e.toLowerCase()] = foundSource;
             _patch.email_sources = newSources;
             _patch.contact_name = foundName || lead.contact_name || "";
           }

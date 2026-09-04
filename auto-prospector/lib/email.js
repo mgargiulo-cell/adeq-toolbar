@@ -245,7 +245,9 @@ export function _rootDomain(d) {
 // scraper saca de la página de contacto— y las vías nuevas de descubrimiento (MX, DMARC,
 // Certificate Transparency, YouTube). Al no estar, se las trataba como origen desconocido
 // y hostil, que es exactamente lo contrario de lo que son.
-export const _FUENTES_DEL_PROPIO_SITIO = /^(scrape|mailto|jsonld|json_ld|sitemap|rss|wordpress|wp|contact_form|social|ads_txt|adstxt|google_contact|play|wayback|apollo|generic|mx|dmarc|ct|cert_transparency|youtube|instagram|facebook|twitter|linkedin)/i;
+// `rol_mx` (2026-09-04): el rol estándar del idioma en el propio dominio, con MX verificado. Es
+// del dominio por construcción (ver _ROLES_POR_IDIOMA en index.js).
+export const _FUENTES_DEL_PROPIO_SITIO = /^(scrape|mailto|jsonld|json_ld|sitemap|rss|wordpress|wp|contact_form|social|ads_txt|adstxt|google_contact|play|wayback|apollo|generic|mx|dmarc|ct|cert_transparency|youtube|instagram|facebook|twitter|linkedin|rol_mx)/i;
 
 export function _brandMatches(email, leadDomain, fuente = "") {
   const recipientDom = (String(email || "").split("@")[1] || "").toLowerCase();
