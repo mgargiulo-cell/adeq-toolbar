@@ -35,6 +35,47 @@ async function crmGet(ruta, params = {}) {
   return r.json();
 }
 
+// ── LAS PLANTILLAS DEL MAIL INICIAL, LAS MISMAS QUE USA EL CRM (2026-09-04, pedido del user) ──
+// "En la toolbar tienen que aparecer, en el espacio de los emails a enviar, los mismos mails
+// que están en el CRM como mail inicial." El CRM tiene 3 variantes por idioma en 23 idiomas
+// (`crm_board_templates`, step_key='inicial'). Se leen por HTTP con el mismo secreto que la
+// ficha: la extensión no tiene —ni debe tener— credenciales de la base del CRM.
+//
+// Contrato pedido al CRM: GET /api/crm/plantillas?step=inicial → { ok, plantillas: [{ id,
+// idioma, variant, nombre, subject, body, ejecutivo, activa }] }. Hasta que exista, la
+// llamada devuelve ok:false y el popup cae a los borradores propios del MB, avisando.
+//
+// Caché de 6 horas en chrome.storage: las plantillas cambian poco y el popup se abre cientos
+// de veces por día. `force` la saltea (el botón de recargar).
+const _PLANTILLAS_CACHE_KEY = "crm_plantillas_inicial_v1";
+const _PLANTILLAS_TTL_MS    = 6 * 60 * 60 * 1000;
+export async function getPlantillasIniciales({ force = false } = {}) {
+  try {
+    if (!force && chrome?.storage?.local) {
+      const { [_PLANTILLAS_CACHE_KEY]: c } = await chrome.storage.local.get(_PLANTILLAS_CACHE_KEY);
+      if (c && Array.isArray(c.plantillas) && Date.now() - (c.ts || 0) < _PLANTILLAS_TTL_MS) {
+        return { ok: true, plantillas: c.plantillas, cache: true };
+      }
+    }
+  } catch {}
+  try {
+    const j = await crmGet("/plantillas", { step: "inicial" });
+    const plantillas = (j.plantillas || [])
+      .filter(t => t && t.body && t.activa !== false)
+      .map(t => ({
+        id: String(t.id || ""), idioma: String(t.idioma || ""), variant: Number(t.variant) || 1,
+        nombre: String(t.nombre || ""), subject: String(t.subject || ""), body: String(t.body || ""),
+        ejecutivo: String(t.ejecutivo || ""),
+      }));
+    try { await chrome.storage.local.set({ [_PLANTILLAS_CACHE_KEY]: { ts: Date.now(), plantillas } }); } catch {}
+    return { ok: true, plantillas };
+  } catch (e) {
+    // ⚠️ No se devuelve una lista vacía como si fuera "no hay plantillas": el popup tiene que
+    // saber que NO PUDO preguntar para avisarlo y caer al borrador propio.
+    return { ok: false, plantillas: [], motivo: e.message };
+  }
+}
+
 // ── Board index para filtrado en cascada ──────────────────────
 // Devuelve Map<domainClean, { ejecutivo, fecha }>
 export async function getMondayBoardIndex() {

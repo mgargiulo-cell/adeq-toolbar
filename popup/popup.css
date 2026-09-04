@@ -880,6 +880,31 @@ input.form-pv-display { font-weight: 700; }
 .pitch-lang-flag.disabled { opacity: 0.35; cursor: not-allowed; }
 .pitch-toolbar-right { display: flex; align-items: center; gap: var(--sp-2); }
 
+/* País → borrador propio (desplegable con filtro nativo: <input list>) — 2026-09-04 */
+.pitch-country {
+  width: 150px; height: 26px; padding: 0 8px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-2); font-size: var(--fs-xs); font-family: inherit;
+  color: var(--text-secondary);
+}
+.pitch-country:focus { outline: none; border-color: var(--brand-blue); background: #fff; }
+.pitch-country::placeholder { color: var(--text-muted); }
+
+/* El pitch con la plantilla del CRM puesta: se ve, no se toca. Limpiar desbloquea. */
+.pitch-textarea.pitch-locked {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+  color: #334155;
+  cursor: not-allowed;
+}
+.pitch-lock-hint {
+  font-size: var(--fs-xs); color: #92400e; background: #fffbeb;
+  border: 1px solid #fde68a; border-radius: var(--r-sm);
+  padding: 4px 8px; margin-top: 4px;
+}
+.pitch-tool-flag.pitch-tpl-crm { border-color: #0ea5e9; background: #f0f9ff; }
+.pitch-tool-flag.pitch-tpl-crm .pitch-tool-name { color: #0369a1; }
+
 /* Pitch toolbar */
 .pitch-toolbar {
   display: flex; justify-content: space-between; align-items: center;

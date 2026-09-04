@@ -7,7 +7,7 @@
 // los ~30 llamadores; lo que cambió es a dónde preguntan.
 // checkDuplicate / pushToMonday / updateMonday se sacaron: los reemplazan buscarEnCrm y
 // enviarAlBoard, acá en el popup.
-import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday, crmUrl } from "../modules/crm.js";
+import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday, crmUrl, getPlantillasIniciales } from "../modules/crm.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -2400,6 +2400,19 @@ function isValidEmail(email) {
     /^[^\s@]{1,64}@[^\s@]{1,253}\.[^\s@]{2,}$/.test(email.trim());
 }
 
+// ── EL FORMULARIO DE CONTACTO VA EN EL CAMPO EMAIL, TAL CUAL (2026-09-04, pedido del user) ──
+// "Si se agrega en el campo email una URL que es de contacto/formulario (suelen terminar en
+// /contacto), debe insertarse tal cual en la columna email del CRM; el sistema después le
+// pone la palabra formulario." Antes el formato se rechazaba con "Invalid email format" y el
+// MB no podía cargar el prospecto. Una URL se reconoce por el esquema o por un www. con ruta;
+// NO se le manda mail (Gmail lo frena con un aviso claro) y el push al CRM no exige haber
+// mandado uno: el contacto fue por el formulario del sitio.
+function _esFormularioUrl(v) {
+  const s = String(v || "").trim();
+  if (!s || s.includes("@")) return false;
+  return /^https?:\/\/\S+/i.test(s) || /^www\.[^\s/]+\/\S*/i.test(s);
+}
+
 function sanitizeDomain(domain) {
   return (domain || "")
     .toLowerCase()
@@ -4741,6 +4754,9 @@ async function bindButtons() {
     const dislikeBtn = document.getElementById("btn-pitch-dislike");
     const likeStatus = document.getElementById("pitch-like-status");
     const ta         = document.getElementById("pitch-text");
+    // Con la plantilla del CRM puesta el pitch está bloqueado: generar uno pisaría lo que el
+    // CRM manda. Primero Limpiar, después lo que quiera.
+    if (ta?.readOnly) { _mostrarPistaBloqueo(); return; }
     btn.disabled = true; btn.textContent = "⏳ Generating..."; ta.value = "";
     likeBtn.style.display = "none"; dislikeBtn.style.display = "none";
     likeStatus.textContent = "";
@@ -5105,7 +5121,7 @@ async function bindButtons() {
   // prospectos que Monday después rechaza, y el MB se entera recién al mandar el lote.
   function _validarProspectoMonday(res) {
     const v = getMondayFormValues();
-    if (v.email && !isValidEmail(v.email)) {
+    if (v.email && !isValidEmail(v.email) && !_esFormularioUrl(v.email)) {
       res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return null;
     }
     if (!v.geo) {
@@ -5143,7 +5159,15 @@ async function bindButtons() {
 // 2 filas, no 3). Por eso NO hay rama "crear vs actualizar" como en Monday: el mismo POST
 // sirve para las dos cosas y desaparece toda la lógica de mondayItemId, que era donde se
 // perdían los pushes cuando el id no estaba.
-const _BOARD_IDIOMA = { 0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe" };
+// Los cinco índices de Monday siguen valiendo; el resto del <select> va con código ISO
+// (2026-09-04). Las etiquetas son EXACTAMENTE las de `crm_board_templates.idioma`.
+const _BOARD_IDIOMA = {
+  0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe",
+  en: "Ingles", es: "Español", it: "Italiano", pt: "Portugues", ar: "Arabe",
+  de: "Aleman", fr: "Frances", pl: "Polaco", ja: "Japones", ko: "Coreano", nl: "Holandes",
+  tr: "Turco", el: "Griego", cs: "Checo", hu: "Hungaro", ro: "Rumano", sv: "Sueco",
+  hr: "Croata", uk: "Ucraniano", id: "Indonesio", vi: "Vietnamita", th: "Tailandes", zh: "Chino",
+};
 const _BOARD_EJEC   = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
 // El board pide la ETIQUETA del estado; el formulario lo guarda como ÍNDICE.
 //
@@ -5195,7 +5219,16 @@ async function buscarEnCrm(domain) {
   }
 }
 
-async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado }) {
+// Qué plantilla del CRM salió en el mail, si fue una sin tocar. Con el pitch bloqueado es
+// igual por construcción; si el MB apretó Limpiar y escribió lo suyo, no hay plantilla.
+function _plantillaEnviadaAlCrm(pitchEnviado) {
+  const t = state.pitchTemplate;
+  if (!t || t.origen !== "crm") return null;
+  if (String(pitchEnviado || "").trim() !== String(t.body || "").trim()) return null;
+  return { ref: `crm:${t.id}`, variant: t.variant, idioma: t.lang, enviado_at: new Date().toISOString() };
+}
+
+async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado, plantilla = null }) {
   const hoy = new Date();
   const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
   const contacto = /^\d{4}-\d{2}-\d{2}$/.test(String(fecha || "")) ? fecha : mas(0);
@@ -5218,8 +5251,16 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // fallback lo convertía en "Ingles": la respuesta honesta terminaba siendo una afirmación
     // falsa, y el CRM le mandaba la plantilla en inglés a un sitio francés. Ahora se manda
     // vacío y el CRM decide — "no sé" no se puede seguir tratando como "no". Caso nº9.
-    language: _BOARD_IDIOMA[Number(idioma)] || "",
+    language: _BOARD_IDIOMA[String(idioma)] || "",
     phone: telefono || "",
+    // La plantilla del CRM con la que salió el inicial, si salió con una sin tocar. Mismo
+    // contrato que usa el agente (acordado 03/09): el CRM siembra la fila en
+    // crm_board_template_sends y su panel cuenta el inicial. `template_ref` lleva su propio
+    // id ("crm:<uuid>") para que pueda enlazarlo con la plantilla exacta.
+    ...(plantilla ? {
+      template_ref: plantilla.ref, plantilla_variant: plantilla.variant,
+      plantilla_idioma: plantilla.idioma, enviado_at: plantilla.enviado_at,
+    } : {}),
     // ⚠️ `comments` NO lleva el pitch (Maxi 2026-09-03). Del otro lado esa celda es la NOTA
     // CORTA del media buyer ("who is - Mica", "NO TIENE CLEVER") y `sync-toolbar` la PISA en
     // cada push: mandar el pitch acá no era sólo ruido, borraba la nota de la persona.
@@ -5349,8 +5390,9 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     if (!_rateLimiter.check()) {
       res.textContent = "⚠️ Too many requests — please wait a moment"; res.className = "push-result error"; return;
     }
-    // Validate email if provided
-    if (email && !isValidEmail(email)) {
+    // Validate email if provided. Una URL de formulario de contacto pasa tal cual (ver _esFormularioUrl).
+    const esFormulario = _esFormularioUrl(email);
+    if (email && !isValidEmail(email) && !esFormulario) {
       res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return;
     }
     // Guard #1: GEO obligatorio — Monday no debe recibir items sin país
@@ -5370,7 +5412,8 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // Guard #3: no dejar pushear NI updatear Monday si todavía no se mandó email
     // en esta sesión. Aplica también a duplicados (botón "🔄 Actualizar en ADEQ")
     // para evitar que se actualice un item sin haber re-mandado el pitch.
-    if (!state.emailSentInSession) {
+    // Con un formulario en vez de email no hay mail que mandar: el contacto fue por el sitio.
+    if (!state.emailSentInSession && !esFormulario) {
       const action = state.duplicate?.found ? "update" : "push";
       const msg = `❌ Mandá primero el mail (botón Send via Gmail) antes de ${action === "update" ? "actualizar" : "cargar"} en ADEQ.`;
       res.textContent = msg; res.className = "push-result error";
@@ -5392,8 +5435,11 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
         domain: state.domain, traffic: state.traffic,
         email, geo, idioma, pitch, estado, fecha, ejecutivo,
         telefono: state.contactPhone || "",
+        // Si el mail salió con la plantilla del CRM sin tocar, el CRM registra qué variante
+        // fue: así el inicial manual se mide igual que el del agente.
+        plantilla: _plantillaEnviadaAlCrm(pitch),
       });
-      res.textContent = nuevo ? `✅ Cargado en ADEQ: ${state.domain}` : `✅ Actualizado en ADEQ: ${state.domain}`;
+      res.textContent = nuevo ? `✅ Cargado en ADEQ: ${state.domain}${esFormulario ? " (contacto por formulario)" : ""}` : `✅ Actualizado en ADEQ: ${state.domain}`;
       res.className = "push-result ok";
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
@@ -5449,6 +5495,10 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     const pitch   = document.getElementById("pitch-text").value || state.pitch;
     const subjectRaw = document.getElementById("form-subject").value.trim();
 
+    if (_esFormularioUrl(email)) {
+      res.textContent = "📋 Es un formulario de contacto, no un email: completalo en el sitio y cargá directo en ADEQ (no hace falta mandar mail).";
+      res.className = "push-result error"; return;
+    }
     if (!isValidEmail(email)) {
       res.textContent = "❌ Enter a valid email first"; res.className = "push-result error"; return;
     }
@@ -8093,25 +8143,43 @@ const _draftsState = {
   currentLang: "",
 };
 
-// Solo soportamos 5 idiomas en drafts: ES / EN / IT / PT / AR
-const LANG_FLAG = { es:"🇪🇸", en:"🇬🇧", it:"🇮🇹", pt:"🇵🇹", ar:"🇸🇦" };
-// GEO (alpha-2) → idioma del template. Países sin idioma soportado caen a EN.
-const GEO_TO_LANG = {
-  // Spanish-speaking
-  AR:"es", MX:"es", CO:"es", CL:"es", PE:"es", UY:"es", PY:"es", BO:"es",
-  EC:"es", VE:"es", DO:"es", CR:"es", PA:"es", GT:"es", HN:"es", SV:"es",
-  NI:"es", CU:"es", PR:"es", ES:"es",
-  // English-speaking
-  US:"en", GB:"en", CA:"en", AU:"en", NZ:"en", IE:"en", IN:"en", ZA:"en", SG:"en",
-  // Portuguese
-  BR:"pt", PT:"pt",
-  // Italian
-  IT:"it", CH:"it",
-  // Arabic
-  AE:"ar", SA:"ar", EG:"ar", MA:"ar",
-  // Otros países sin idioma propio en nuestro stack → EN como default razonable
-  FR:"en", BE:"en", LU:"en", DE:"en", AT:"en", NL:"en", PL:"en", TR:"en",
+// ── LOS 23 IDIOMAS DEL CRM (2026-09-04) ─────────────────────────────────────────────────
+// Antes eran 5 (es/en/it/pt/ar) y todo lo demás caía a inglés: un sitio alemán recibía el
+// borrador en inglés y se cargaba sin idioma. Ahora el idioma se resuelve en los 23 en los
+// que el CRM tiene plantilla de mail inicial, y la etiqueta que se le manda al CRM es la suya.
+const LANG_FLAG = {
+  es:"🇪🇸", en:"🇬🇧", it:"🇮🇹", pt:"🇵🇹", ar:"🇸🇦", de:"🇩🇪", fr:"🇫🇷", pl:"🇵🇱", ja:"🇯🇵", ko:"🇰🇷",
+  nl:"🇳🇱", tr:"🇹🇷", el:"🇬🇷", cs:"🇨🇿", hu:"🇭🇺", ro:"🇷🇴", sv:"🇸🇪", hr:"🇭🇷", uk:"🇺🇦", id:"🇮🇩",
+  vi:"🇻🇳", th:"🇹🇭", zh:"🇹🇼",
 };
+const LANG_NOMBRE = {
+  es:"Español", en:"Inglés", it:"Italiano", pt:"Portugués", ar:"Árabe", de:"Alemán", fr:"Francés",
+  pl:"Polaco", ja:"Japonés", ko:"Coreano", nl:"Holandés", tr:"Turco", el:"Griego", cs:"Checo",
+  hu:"Húngaro", ro:"Rumano", sv:"Sueco", hr:"Croata", uk:"Ucraniano", id:"Indonesio", vi:"Vietnamita",
+  th:"Tailandés", zh:"Chino",
+};
+// ISO de la toolbar → etiqueta EXACTA de `crm_board_templates.idioma`.
+const IDIOMA_CRM = {
+  es:"Español", en:"Ingles", it:"Italiano", pt:"Portugues", ar:"Arabe", de:"Aleman", fr:"Frances",
+  pl:"Polaco", ja:"Japones", ko:"Coreano", nl:"Holandes", tr:"Turco", el:"Griego", cs:"Checo",
+  hu:"Hungaro", ro:"Rumano", sv:"Sueco", hr:"Croata", uk:"Ucraniano", id:"Indonesio", vi:"Vietnamita",
+  th:"Tailandes", zh:"Chino",
+};
+// GEO (alpha-2) → idioma. Se arma desde listas por idioma para que agregar un país sea una
+// línea. Lo que no está acá cae a inglés.
+const _PAISES_DEL_IDIOMA = {
+  es: "AR MX CO CL PE UY PY BO EC VE DO CR PA GT HN SV NI CU PR ES",
+  en: "US GB CA AU NZ IE IN ZA SG PH NG KE GH PK BD LK MY",
+  pt: "BR PT AO MZ",  it: "IT SM",  ar: "AE SA EG MA DZ TN JO IQ KW QA OM BH LB SY YE LY PS",
+  de: "DE AT CH LI",  fr: "FR BE LU MC SN CI CM",  pl: "PL",  ja: "JP",  ko: "KR KP",
+  nl: "NL",  tr: "TR",  el: "GR CY",  cs: "CZ SK",  hu: "HU",  ro: "RO MD",  sv: "SE NO DK FI",
+  hr: "HR BA RS SI ME MK",  uk: "UA",  id: "ID",  vi: "VN",  th: "TH",  zh: "CN TW HK",
+};
+const GEO_TO_LANG = {};
+for (const [lang, paises] of Object.entries(_PAISES_DEL_IDIOMA)) for (const p of paises.split(" ")) GEO_TO_LANG[p] = lang;
+// La bandera de cualquier país sale de su código: no hace falta una tabla.
+const _banderaDe = (alpha2) => String(alpha2 || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 2)
+  .split("").map(c => String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65)).join("") || "🌐";
 
 function _rebuildDraftsByLang() {
   _draftsState.byLang.clear();
@@ -8146,9 +8214,80 @@ function applyDraftToPitch(d, { silent = false } = {}) {
   const body    = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
   const pitchEl   = document.getElementById("pitch-text");
   const subjectEl = document.getElementById("form-subject");
+  // Un borrador PROPIO del MB: editable, y no es la plantilla del CRM. Si resulta que es
+  // idéntico al del CRM, se avisa: editar para mandar lo mismo no tiene sentido.
+  _desbloquearPitch();
+  state.pitchTemplate = { origen: "draft", id: d.id, lang: d.language || "", body };
   if (pitchEl)   pitchEl.value   = body;
   if (subjectEl && subject) subjectEl.value = subject;
+  const igual = _crmTpl.byLang.get(d.language || "")?.some(t => _mismoTexto(t.body, d.body));
+  _pista(igual ? `⚠️ Este borrador es IGUAL a una plantilla del CRM: no tiene sentido usarlo para variar el mensaje.` : "");
   if (!silent) pitchEl?.dispatchEvent(new Event("input"));
+}
+
+// ── LA PLANTILLA DEL CRM COMO PUNTO DE PARTIDA (2026-09-04, pedido del user) ─────────────
+// "En la toolbar tienen que aparecer, en el espacio de los emails a enviar, los mismos
+// mails que están en el CRM como mail inicial, según el idioma del geo, rotando. El MB
+// puede editar, pero antes tiene que hacer click en Limpiar."
+const _crmTpl = { loaded: false, ok: false, motivo: "", byLang: new Map(), idxByLang: new Map() };
+const _mismoTexto = (a, b) => String(a || "").replace(/\s+/g, " ").trim().toLowerCase() === String(b || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+async function loadCrmTemplates(force = false) {
+  if (_crmTpl.loaded && !force) return;
+  const r = await getPlantillasIniciales({ force });
+  _crmTpl.loaded = true; _crmTpl.ok = r.ok; _crmTpl.motivo = r.motivo || "";
+  _crmTpl.byLang.clear();
+  const etiquetaAIso = Object.fromEntries(Object.entries(IDIOMA_CRM).map(([iso, et]) => [et.toLowerCase(), iso]));
+  for (const t of (r.plantillas || [])) {
+    const iso = etiquetaAIso[String(t.idioma || "").toLowerCase()];
+    if (!iso) continue;
+    if (!_crmTpl.byLang.has(iso)) _crmTpl.byLang.set(iso, []);
+    _crmTpl.byLang.get(iso).push(t);
+  }
+  for (const arr of _crmTpl.byLang.values()) arr.sort((a, b) => a.variant - b.variant);
+}
+
+// "A veces uno, a veces otros": el punto de partida depende del dominio y del día, así el
+// mismo sitio abierto dos veces muestra la misma variante, y sitios distintos van rotando.
+function _semillaRotacion(n) {
+  const s = `${state.domain || ""}|${new Date().toISOString().slice(0, 10)}`;
+  let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return n ? h % n : 0;
+}
+
+function _bloquearPitch() {
+  const el = document.getElementById("pitch-text");
+  if (!el) return;
+  el.readOnly = true; el.classList.add("pitch-locked");
+}
+function _desbloquearPitch() {
+  const el = document.getElementById("pitch-text");
+  if (!el) return;
+  el.readOnly = false; el.classList.remove("pitch-locked");
+  _pista("");
+}
+function _pista(msg) {
+  const el = document.getElementById("pitch-lock-hint");
+  if (!el) return;
+  el.textContent = msg; el.hidden = !msg;
+}
+function _mostrarPistaBloqueo() {
+  _pista("🔒 Es la plantilla del CRM. Para escribir la tuya, apretá 🗑️ Limpiar.");
+}
+
+function applyCrmTemplate(t, lang) {
+  if (!t) return;
+  const domain = state.domain || "example.com";
+  const body    = String(t.body || "").replace(/\{\{\s*(domain|dominio|site|url|web)\s*\}\}/gi, domain);
+  const subject = String(t.subject || "").replace(/\{\{\s*(domain|dominio|site|url|web)\s*\}\}/gi, domain);
+  const pitchEl   = document.getElementById("pitch-text");
+  const subjectEl = document.getElementById("form-subject");
+  if (pitchEl)   pitchEl.value = body;
+  if (subjectEl && subject) subjectEl.value = subject;
+  state.pitchTemplate = { origen: "crm", id: t.id, lang, variant: t.variant, nombre: t.nombre, body };
+  _bloquearPitch();
+  _pista("");
+  pitchEl?.dispatchEvent(new Event("input"));
 }
 
 // ── Detección robusta del idioma del pitch ───────────────────
@@ -8199,7 +8338,7 @@ function _detectLangFromText(text) {
   return null;
 }
 
-const SUPPORTED_LANGS = new Set(["es", "en", "it", "pt", "ar"]);
+const SUPPORTED_LANGS = new Set(Object.keys(IDIOMA_CRM));
 
 function _resolvePitchLang() {
   // 1. siteLanguage del <html lang> — el más confiable cuando existe
@@ -8242,67 +8381,103 @@ function updatePitchFlagButton() {
   const flagEmoji = document.getElementById("pitch-flag-emoji");
   const nameEl    = document.getElementById("pitch-flag-name");
   if (!flagBtn || !flagEmoji || !nameEl) return;
-  const lang   = _draftsState.currentLang || _resolvePitchLang();
-  const drafts = _draftsState.byLang.get(lang) || [];
+  const lang = _draftsState.currentLang || _resolvePitchLang();
+  const t    = state.pitchTemplate;
   flagEmoji.textContent = LANG_FLAG[lang] || "🌐";
-  if (drafts.length === 0) {
-    nameEl.textContent = LANG_FLAG[lang] ? `Sin templates en ${lang.toUpperCase()}` : "Idioma desconocido";
-    flagBtn.title = `No hay drafts. Abrí 📝 (header) para crear uno.`;
+  flagBtn.classList.toggle("pitch-tpl-crm", t?.origen === "crm");
+  if (t?.origen === "crm") {
+    const lista = _crmTpl.byLang.get(t.lang) || [];
+    const pos   = Math.max(0, lista.findIndex(x => x.id === t.id));
+    nameEl.textContent = `CRM · ${LANG_NOMBRE[t.lang] || t.lang} · ${t.nombre || "inicial"} (${pos + 1}/${lista.length || 1})`;
+    flagBtn.title = "Plantilla del mail inicial del CRM. Click para rotar entre sus variantes.";
   } else {
-    const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
-    const current = drafts[idx];
-    const cleanName = (current?.name || `Template ${idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
-    nameEl.textContent = `${cleanName} (${idx + 1}/${drafts.length})`;
-    flagBtn.title = `Click para rotar templates del mismo idioma`;
+    const drafts = _draftsState.byLang.get(lang) || [];
+    if (drafts.length === 0) {
+      nameEl.textContent = _crmTpl.ok ? `Sin borrador propio en ${LANG_NOMBRE[lang] || lang}` : (_crmTpl.motivo ? "CRM sin responder · sin borrador" : "Sin borrador");
+      flagBtn.title = `No hay borradores propios en este idioma. Abrí 📝 (header) para crear uno.`;
+    } else {
+      const idx     = _draftsState.flagIdxByLang.get(lang) ?? 0;
+      const current = drafts[idx];
+      const cleanName = (current?.name || `Borrador ${idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
+      nameEl.textContent = `Propio · ${cleanName} (${idx + 1}/${drafts.length})`;
+      flagBtn.title = `Borrador propio. Click para rotar los del mismo idioma.`;
+    }
   }
-  // Chips de idioma — solo los que tienen al menos 1 draft
-  const flagsContainer = document.getElementById("pitch-lang-flags");
-  if (flagsContainer) {
-    const order = ["es", "en", "it", "pt", "ar"];
-    flagsContainer.innerHTML = order.map(l => {
-      const flag    = LANG_FLAG[l];
-      const has     = (_draftsState.byLang.get(l) || []).length > 0;
-      const cls     = `pitch-lang-flag${l === lang ? " active" : ""}${has ? "" : " disabled"}`;
-      return `<button type="button" class="${cls}" data-lang="${l}" title="${has ? "Cambiar a " + l.toUpperCase() : "Sin templates en " + l.toUpperCase()}">${flag}</button>`;
-    }).join("");
-    flagsContainer.querySelectorAll(".pitch-lang-flag").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const l = btn.dataset.lang;
-        const list = _draftsState.byLang.get(l) || [];
-        if (list.length === 0) return;
-        _draftsState.currentLang = l;
-        _draftsState.flagIdxByLang.set(l, 0);
-        // Aplicar prio-1 del nuevo idioma
-        const d = list[0];
-        const domain = state.domain || "example.com";
-        const ptEl   = document.getElementById("pitch-text");
-        const subjEl = document.getElementById("form-subject");
-        if (ptEl)   ptEl.value   = (d.body    || "").replace(/\{\{domain\}\}/g, domain);
-        if (subjEl) subjEl.value = (d.subject || "").replace(/\{\{domain\}\}/g, domain);
-        ptEl?.dispatchEvent(new Event("input"));
+  // El desplegable de país: todos los países con su idioma, con filtro nativo al escribir.
+  // Elegir uno carga el borrador PROPIO del MB para ese idioma (no el del CRM).
+  const cont = document.getElementById("pitch-lang-flags");
+  if (cont && !cont.querySelector("#pitch-country")) {
+    const opciones = Object.entries(GEO_LABEL)
+      .map(([cc, nombre]) => ({ cc, nombre, lang: GEO_TO_LANG[cc] || "en" }))
+      .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+    cont.innerHTML = `<input id="pitch-country" class="pitch-country" list="pitch-country-list" placeholder="🌐 País → borrador propio" autocomplete="off" />`
+      + `<datalist id="pitch-country-list">${opciones.map(o => `<option value="${_banderaDe(o.cc)} ${esc(o.nombre)} · ${LANG_NOMBRE[o.lang] || o.lang}"></option>`).join("")}</datalist>`;
+    const input = cont.querySelector("#pitch-country");
+    input.addEventListener("change", () => {
+      const v = input.value.trim();
+      const o = opciones.find(x => v.includes(x.nombre));
+      if (!o) return;
+      const l = o.lang;
+      _draftsState.currentLang = l;
+      _draftsState.flagIdxByLang.set(l, 0);
+      const list = _draftsState.byLang.get(l) || [];
+      if (list.length === 0) {
+        _pista(`Sin borrador propio en ${LANG_NOMBRE[l] || l}. Creá uno en 📝 (arriba) — tiene que ser distinto al del CRM.`);
         updatePitchFlagButton();
-      });
+        return;
+      }
+      applyDraftToPitch(list[0]);
+      updatePitchFlagButton();
     });
   }
 }
 
 // Auto-carga el draft de prioridad 1 (o el primero ordenado) en el pitch al cargar la web.
 // Se invoca después de runAutoFill para tener la GEO ya seteada.
+// Al abrir el sitio: PRIMERO la plantilla del mail inicial del CRM para el idioma resuelto,
+// en la variante que toca por dominio y día (bloqueada). Si el CRM no responde o no tiene
+// ese idioma, el borrador propio del MB, como antes, y se dice por qué.
 async function autofillDraftOnLoad() {
-  await loadDraftsCache();
-  const lang   = _resolvePitchLang();
+  await Promise.all([loadDraftsCache(), loadCrmTemplates().catch(() => {})]);
+  const lang = _resolvePitchLang();
   _draftsState.currentLang = lang;
+  const crm = _crmTpl.byLang.get(lang) || [];
+  if (crm.length) {
+    const idx = _semillaRotacion(crm.length);
+    _crmTpl.idxByLang.set(lang, idx);
+    applyCrmTemplate(crm[idx], lang);
+    updatePitchFlagButton();
+    return;
+  }
   const drafts = _draftsState.byLang.get(lang) || [];
   if (drafts.length === 0) {
+    state.pitchTemplate = null;
+    _desbloquearPitch();
+    if (!_crmTpl.ok) _pista(`⚠️ No pude leer las plantillas del CRM (${_crmTpl.motivo || "sin respuesta"}). Escribí el pitch o usá 📝.`);
+    else _pista(`El CRM no tiene plantilla inicial en ${LANG_NOMBRE[lang] || lang} y no hay borrador propio.`);
     updatePitchFlagButton();
     return;
   }
   _draftsState.flagIdxByLang.set(lang, 0);
   applyDraftToPitch(drafts[0], { silent: true });
+  if (!_crmTpl.ok) _pista(`⚠️ No pude leer las plantillas del CRM (${_crmTpl.motivo || "sin respuesta"}): va tu borrador propio.`);
   updatePitchFlagButton();
 }
 
+// La bandera rota dentro de la fuente que está puesta: variantes del CRM si hay plantilla
+// del CRM, borradores propios si no.
 function rotatePitchTemplate() {
+  const t = state.pitchTemplate;
+  if (t?.origen === "crm") {
+    const lista = _crmTpl.byLang.get(t.lang) || [];
+    if (lista.length < 2) return;
+    const cur  = Math.max(0, lista.findIndex(x => x.id === t.id));
+    const next = (cur + 1) % lista.length;
+    _crmTpl.idxByLang.set(t.lang, next);
+    applyCrmTemplate(lista[next], t.lang);
+    updatePitchFlagButton();
+    return;
+  }
   const lang   = _draftsState.currentLang || _resolvePitchLang();
   const drafts = _draftsState.byLang.get(lang) || [];
   if (drafts.length === 0) return;
@@ -8318,17 +8493,29 @@ function initPitchInlineControls() {
   const clearBtn = document.getElementById("btn-pitch-clear");
   const pitchEl  = document.getElementById("pitch-text");
   flagBtn?.addEventListener("click", rotatePitchTemplate);
+  // Limpiar = vaciar Y desbloquear. Es el único camino para escribir un mensaje propio.
   clearBtn?.addEventListener("click", () => {
     if (!pitchEl) return;
+    state.pitchTemplate = null;
+    _desbloquearPitch();
     pitchEl.value = "";
     pitchEl.dispatchEvent(new Event("input"));
     pitchEl.focus();
+    updatePitchFlagButton();
   });
-  // Si cambia la GEO manualmente, recalcular idioma + actualizar bandera
+  // Intentar escribir sobre la plantilla bloqueada: se explica en vez de ignorar la tecla.
+  pitchEl?.addEventListener("keydown", () => { if (pitchEl.readOnly) _mostrarPistaBloqueo(); });
+  pitchEl?.addEventListener("click",   () => { if (pitchEl.readOnly) _mostrarPistaBloqueo(); });
+  // Si el MB edita un borrador propio, deja de ser "el borrador": es su mensaje.
+  pitchEl?.addEventListener("input", () => {
+    const t = state.pitchTemplate;
+    if (t && t.origen !== "crm" && !_mismoTexto(pitchEl.value, t.body)) state.pitchTemplate = null;
+  });
+  // Si cambia la GEO manualmente, recalcular idioma y volver a la plantilla del CRM de ese idioma.
   document.getElementById("form-geo")?.addEventListener("change", () => {
     _draftsState.currentLang = _resolvePitchLang();
     _draftsState.flagIdxByLang.set(_draftsState.currentLang, 0);
-    updatePitchFlagButton();
+    autofillDraftOnLoad().catch(() => updatePitchFlagButton());
   });
 }
 
@@ -9682,11 +9869,9 @@ function renderProspectCard(r) {
     // 6) default
     return "en";
   })();
-  // Pre-render de los 5 chips de banderas — visibles desde el primer paint
-  const _langFlagsHTML = ["es", "en", "it", "pt", "ar"].map(l => {
-    const isActive = l === _initLang;
-    return `<button type="button" class="pitch-lang-flag${isActive ? " active" : ""}" data-lang="${l}" title="${l.toUpperCase()}">${LANG_FLAG[l]}</button>`;
-  }).join("");
+  // El desplegable de país se rellena en `_updateCardUI` (son 100+ países y hace falta el
+  // datalist). Hasta entonces, un placeholder para que el primer paint no salte.
+  const _langFlagsHTML = "";
   // Filtrar garbage (whois, abuse, postmaster, etc.) y dedupe.
   // Backend ya guarda Apollo primero (apolloEmails antes que scraperEmails),
   // así que el orden del array preserva la prioridad Apollo.
@@ -10366,90 +10551,123 @@ function initProspectCard(card, data) {
   };
   const cardLang = _resolveCardLang();
   // Estado local del rotator de esta card
-  const cardFlag = { lang: cardLang, idx: 0 };
+  const cardFlag = { lang: cardLang, idx: 0, origen: null, crmId: null };
 
-  const _applyCardDraft = (d) => {
-    if (!d) return;
-    const replaceVars = (s) => (s || "").replace(/\{\{domain\}\}/g, data.domain || "");
+  // La tarjeta es el OTRO espacio de "emails a enviar", así que sigue la misma regla que
+  // Analysis (2026-09-04): arranca con la plantilla del mail inicial del CRM para el idioma,
+  // bloqueada, y el 🗑️ la desbloquea. `cardFlag.origen` dice qué hay puesto.
+  const _replaceVarsCard = (s) => String(s || "").replace(/\{\{\s*(domain|dominio|site|url|web)\s*\}\}/gi, data.domain || "");
+  const _setCardPitch = (body, subject, { bloqueado = false } = {}) => {
     const pitchEl   = card.querySelector(".pcard-pitch");
     const subjectEl = card.querySelector(".pcard-subject");
-    if (pitchEl)   pitchEl.value   = replaceVars(d.body);
-    if (subjectEl) subjectEl.value = replaceVars(d.subject || "");
+    if (pitchEl) {
+      pitchEl.value = _replaceVarsCard(body);
+      pitchEl.readOnly = bloqueado;
+      pitchEl.classList.toggle("pitch-locked", bloqueado);
+      pitchEl.title = bloqueado ? "Plantilla del CRM — apretá 🗑️ para escribir la tuya" : "";
+    }
+    if (subjectEl && subject) subjectEl.value = _replaceVarsCard(subject);
+  };
+  const _applyCardDraft = (d) => {
+    if (!d) return;
+    cardFlag.origen = "draft";
+    _setCardPitch(d.body, d.subject || "");
+  };
+  const _applyCardCrm = (t) => {
+    if (!t) return;
+    cardFlag.origen = "crm"; cardFlag.crmId = t.id;
+    _setCardPitch(t.body, t.subject || "", { bloqueado: true });
   };
 
   const _cardDraftsForLang = () => (_draftsState.byLang.get(cardFlag.lang) || []);
+  const _cardCrmForLang    = () => (_crmTpl.byLang.get(cardFlag.lang) || []);
 
   const _updateCardUI = () => {
-    // Bandera + nombre del template
+    // Bandera + nombre de la plantilla puesta
     const flagEmoji = card.querySelector(".pcard-flag-emoji");
     const nameEl    = card.querySelector(".pcard-flag-name");
     const flagBtn   = card.querySelector(".pcard-flag-btn");
-    const drafts    = _cardDraftsForLang();
     if (flagEmoji && nameEl && flagBtn) {
-      const flag = LANG_FLAG[cardFlag.lang];
-      flagEmoji.textContent = flag || "🌐";
-      if (drafts.length === 0) {
-        nameEl.textContent = flag ? `Sin templates en ${cardFlag.lang.toUpperCase()}` : "Idioma desconocido";
-        flagBtn.title = `No hay drafts en este idioma`;
+      flagEmoji.textContent = LANG_FLAG[cardFlag.lang] || "🌐";
+      flagBtn.classList.toggle("pitch-tpl-crm", cardFlag.origen === "crm");
+      const crm = _cardCrmForLang();
+      if (cardFlag.origen === "crm" && crm.length) {
+        const pos = Math.max(0, crm.findIndex(x => x.id === cardFlag.crmId));
+        nameEl.textContent = `CRM · ${crm[pos]?.nombre || "inicial"} (${pos + 1}/${crm.length})`;
+        flagBtn.title = "Plantilla del mail inicial del CRM. Click para rotar variantes.";
       } else {
-        const cur = drafts[cardFlag.idx];
-        const cleanName = (cur?.name || `Template ${cardFlag.idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
-        nameEl.textContent = `${cleanName} (${cardFlag.idx + 1}/${drafts.length})`;
-        flagBtn.title = `Click para rotar`;
+        const drafts = _cardDraftsForLang();
+        if (drafts.length === 0) {
+          nameEl.textContent = `Sin borrador en ${LANG_NOMBRE[cardFlag.lang] || cardFlag.lang}`;
+          flagBtn.title = `No hay borradores propios en este idioma`;
+        } else {
+          const cur = drafts[cardFlag.idx];
+          const cleanName = (cur?.name || `Borrador ${cardFlag.idx + 1}`).replace(/^[A-Z]{2}\s*·\s*/, "");
+          nameEl.textContent = `Propio · ${cleanName} (${cardFlag.idx + 1}/${drafts.length})`;
+          flagBtn.title = `Click para rotar`;
+        }
       }
     }
-    // Chips de idiomas
+    // País → borrador propio, igual que en Analysis: desplegable con filtro, no 5 banderas.
     const flagsEl = card.querySelector(".pcard-lang-flags");
-    if (flagsEl) {
-      const order = ["es", "en", "it", "pt", "ar"];
-      flagsEl.innerHTML = order.map(l => {
-        const flag    = LANG_FLAG[l];
-        const has     = (_draftsState.byLang.get(l) || []).length > 0;
-        const cls     = `pitch-lang-flag${l === cardFlag.lang ? " active" : ""}${has ? "" : " disabled"}`;
-        return `<button type="button" class="${cls}" data-lang="${l}" title="${has ? "Cambiar a " + l.toUpperCase() : "Sin templates"}">${flag}</button>`;
-      }).join("");
-      flagsEl.querySelectorAll(".pitch-lang-flag").forEach(btn => {
-        btn.addEventListener("click", () => {
-          const l = btn.dataset.lang;
-          const list = _draftsState.byLang.get(l) || [];
-          if (list.length === 0) return;
-          cardFlag.lang = l;
-          cardFlag.idx  = 0;
-          _applyCardDraft(list[0]);
-          _updateCardUI();
-        });
+    if (flagsEl && !flagsEl.querySelector("input")) {
+      const opciones = Object.entries(GEO_LABEL)
+        .map(([cc, nombre]) => ({ cc, nombre, lang: GEO_TO_LANG[cc] || "en" }))
+        .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+      const listId = `pcard-country-list-${Math.random().toString(36).slice(2, 8)}`;
+      flagsEl.innerHTML = `<input class="pitch-country pcard-country" list="${listId}" placeholder="🌐 País → borrador propio" autocomplete="off" />`
+        + `<datalist id="${listId}">${opciones.map(o => `<option value="${_banderaDe(o.cc)} ${esc(o.nombre)} · ${LANG_NOMBRE[o.lang] || o.lang}"></option>`).join("")}</datalist>`;
+      flagsEl.querySelector("input").addEventListener("change", (e) => {
+        const o = opciones.find(x => e.target.value.includes(x.nombre));
+        if (!o) return;
+        cardFlag.lang = o.lang; cardFlag.idx = 0;
+        const list = _draftsState.byLang.get(o.lang) || [];
+        if (list.length === 0) { _updateCardUI(); return; }
+        _applyCardDraft(list[0]);
+        _updateCardUI();
       });
     }
   };
 
   (async () => {
-    if (!_draftsState.loaded) {
-      try { await loadDraftsCache(); } catch {}
-    }
-    // Si el prospect no trae pitch, autocargar el draft del idioma detectado.
-    // BUGFIX: antes usaba `r` (undefined en este scope) → throw silencioso →
-    // el draft jamás se aplicaba. Ahora usa `data` que sí está definido.
+    if (!_draftsState.loaded) { try { await loadDraftsCache(); } catch {} }
+    if (!_crmTpl.loaded)      { try { await loadCrmTemplates(); } catch {} }
+    // Si el prospect no trae pitch: primero la plantilla del CRM del idioma, si existe.
+    // BUGFIX histórico: antes usaba `r` (undefined en este scope) → throw silencioso.
     if (!data.pitch || !data.pitch.trim()) {
-      const drafts = _cardDraftsForLang();
-      if (drafts.length > 0) {
-        cardFlag.idx = 0;
-        _applyCardDraft(drafts[0]);
+      const crm = _cardCrmForLang();
+      if (crm.length) {
+        // Rotación estable por dominio+día, igual que en Analysis: cada prospecto de la
+        // lista arranca en una variante distinta en vez de mandar todos la misma.
+        let h = 0; const s = `${data.domain || ""}|${new Date().toISOString().slice(0, 10)}`;
+        for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+        _applyCardCrm(crm[h % crm.length]);
       } else {
-        // Fallback: prio-1 de cualquier idioma
-        const sorted = (_draftsState.all || []).slice().sort((a,b) => (a.priority??3)-(b.priority??3));
-        const fb = sorted[0];
-        if (fb) {
-          cardFlag.lang = fb.language;
-          cardFlag.idx  = 0;
-          _applyCardDraft(fb);
+        const drafts = _cardDraftsForLang();
+        if (drafts.length > 0) {
+          cardFlag.idx = 0;
+          _applyCardDraft(drafts[0]);
+        } else {
+          // Fallback: prio-1 de cualquier idioma
+          const sorted = (_draftsState.all || []).slice().sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3));
+          const fb = sorted[0];
+          if (fb) { cardFlag.lang = fb.language; cardFlag.idx = 0; _applyCardDraft(fb); }
         }
       }
     }
     _updateCardUI();
   })();
 
-  // Bandera = rotar template del mismo idioma
+  // Bandera = rotar dentro de la fuente puesta (variantes del CRM, o borradores propios)
   card.querySelector(".pcard-flag-btn")?.addEventListener("click", () => {
+    if (cardFlag.origen === "crm") {
+      const crm = _cardCrmForLang();
+      if (crm.length < 2) return;
+      const cur = Math.max(0, crm.findIndex(x => x.id === cardFlag.crmId));
+      _applyCardCrm(crm[(cur + 1) % crm.length]);
+      _updateCardUI();
+      return;
+    }
     const drafts = _cardDraftsForLang();
     if (drafts.length === 0) return;
     cardFlag.idx = (cardFlag.idx + 1) % drafts.length;
@@ -10457,10 +10675,17 @@ function initProspectCard(card, data) {
     _updateCardUI();
   });
 
-  // Trash = limpiar pitch
+  // Trash = limpiar Y desbloquear: el único camino para escribir un mensaje propio.
   card.querySelector(".pcard-clear-btn")?.addEventListener("click", () => {
     const pitchEl = card.querySelector(".pcard-pitch");
-    if (pitchEl) { pitchEl.value = ""; pitchEl.focus(); }
+    cardFlag.origen = null; cardFlag.crmId = null;
+    if (pitchEl) {
+      pitchEl.readOnly = false;
+      pitchEl.classList.remove("pitch-locked");
+      pitchEl.title = "";
+      pitchEl.value = ""; pitchEl.focus();
+    }
+    _updateCardUI();
   });
 
   // Subject chips — click selects subject into input
