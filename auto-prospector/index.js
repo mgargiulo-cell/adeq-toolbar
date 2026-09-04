@@ -10574,7 +10574,11 @@ const POLISH_MAX_MS = 120 * 1000;
 //   4. si no sobrevive ninguno, lo deja SIN email a propósito: así polishPool
 //      lo agarra y le busca uno nuevo. Es mejor saber que no tenemos contacto
 //      que creer que tenemos uno que no sirve.
-const AUDITORIA_EMAILS_LOTE = 250;      // ~4 días para recorrer el pool entero
+// El lote subió de 250 a 750 junto con el estado (abajo): el conjunto a recorrer pasó de
+// 2.705 filas a 5.781, y con 250 cada 84 h una vuelta completa tardaba once semanas. Un
+// email muerto que tarda once semanas en salir del pool es, para el media buyer, un email
+// muerto que no sale nunca.
+const AUDITORIA_EMAILS_LOTE = 750;      // ~4 semanas para recorrer el pool entero
 const AUDITORIA_EMAILS_CORTE_SEGURIDAD = 0.30;   // si vaciaría más del 30%, NO aplica y avisa
 async function auditarEmailsDelPool(token) {
   try {
@@ -10604,7 +10608,16 @@ async function auditarEmailsDelPool(token) {
     let leads = null;
     try {
       const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D${clausula}&select=id,domain,emails,email_sources,category,created_at&order=created_at.asc&limit=${AUDITORIA_EMAILS_LOTE}`,
+        // ⚠️ ESTO MIRABA SÓLO `pending` Y ERA CIEGO AL 99% DEL PROBLEMA (Maxi 2026-09-04).
+        // Medido: de los 173 leads del pool que tenían como email principal una dirección ya
+        // rebotada, **172 estaban en `validated` y 1 en `pending`**. O sea que la auditoría
+        // corría en verde, informaba "0 rebotados fuera" y no era mentira: en su recorte no
+        // había ninguno. Y `validated` es justamente el estado de los que YA se empujaron al
+        // CRM — los únicos que el media buyer ve. Borraba la dirección en el board, volvía a
+        // abrir el sitio, el formulario se la autocompletaba desde el pool y volvía a entrar.
+        // `por_enviar` va también y es lo más urgente de los tres: ahí un email muerto no
+        // ensucia una ficha, se manda.
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=in.(pending,validated,por_enviar)&emails=neq.%5B%5D${clausula}&select=id,domain,emails,email_sources,category,created_at&order=created_at.asc&limit=${AUDITORIA_EMAILS_LOTE}`,
         { headers: auth });
       if (r.ok) { const j = await r.json(); if (Array.isArray(j)) leads = j; }
     } catch {}
