@@ -2312,6 +2312,54 @@ const _HUELLAS_FR = [
   `"tarifs publicitaires" OR "régie publicitaire" journal en ligne {tld}`,
   `"notre rédaction" OR "qui sommes-nous" actualités {tld}`,
 ];
+// ── LA HUELLA COMERCIAL EN LOS IDIOMAS QUE FALTABAN (Maxi 2026-09-04, medido) ─────────────
+// Las huellas existían sólo en es/pt/it/fr. Los 377 sitios de marzo que ninguna fuente vio
+// jamás son en su mayoría polacos, japoneses, coreanos, alemanes y turcos: tenían plantilla
+// "medio + ciudad" desde el 27/08 pero ninguna búsqueda por HUELLA (ads.txt indexado, tarifario,
+// "anuncie con nosotros"), que es el segundo patrón que mejor rinde. Mismas cuatro ideas en
+// cada idioma: el ads.txt en Google, el kit de medios, la invitación a anunciar, la redacción.
+const _HUELLAS_DE = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"Mediadaten" OR "Anzeigenpreise" Nachrichtenportal {tld}`,
+  `"Werben Sie bei uns" OR "Anzeige schalten" Zeitung online {tld}`,
+  `"unsere Redaktion" OR "über uns" Nachrichten lokal {tld}`,
+];
+const _HUELLAS_PL = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"cennik reklam" OR "oferta reklamowa" portal informacyjny {tld}`,
+  `"reklama" OR "współpraca reklamowa" lokalny portal {tld}`,
+  `"nasza redakcja" OR "o nas" wiadomości {tld}`,
+];
+const _HUELLAS_JA = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"広告掲載" OR "媒体資料" ニュースサイト {tld}`,
+  `"広告のお問い合わせ" 地域 情報サイト {tld}`,
+];
+const _HUELLAS_KO = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"광고문의" OR "광고안내" 뉴스 {tld}`,
+  `"매체소개" OR "광고제휴" 언론사 {tld}`,
+];
+const _HUELLAS_TR = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"reklam" OR "medya kiti" haber sitesi {tld}`,
+  `"reklam fiyatları" OR "reklam verin" yerel haber {tld}`,
+];
+const _HUELLAS_EL = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"διαφήμιση" OR "διαφημιστείτε" ειδησεογραφικό site {tld}`,
+  `"τιμοκατάλογος διαφήμισης" ενημερωτικό portal {tld}`,
+];
+const _HUELLAS_NL = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"adverteren" OR "mediakit" nieuwssite {tld}`,
+  `"tarieven" adverteren regionale krant {tld}`,
+];
+const _HUELLAS_CS = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"ceník inzerce" OR "inzerce" zpravodajský web {tld}`,
+  `"reklama" OR "spolupráce" regionální zpravodajství {tld}`,
+];
 
 // ── CIUDADES SECUNDARIAS: el antídoto contra los cuatro gigantes ─────────────
 // Buscar "noticias Argentina" devuelve Clarín, La Nación, Infobae y Página 12 — que
@@ -2325,7 +2373,17 @@ const _CIUDADES = {
   cl: ["Valparaíso", "Concepción", "Antofagasta", "Temuco", "La Serena", "Iquique", "Puerto Montt", "Rancagua"],
   pe: ["Arequipa", "Trujillo", "Chiclayo", "Piura", "Cusco", "Huancayo", "Iquitos", "Tacna"],
   es: ["Sevilla", "Valencia", "Zaragoza", "Málaga", "Murcia", "Valladolid", "Vigo", "Granada", "Alicante", "Bilbao"],
-  br: ["Belo Horizonte", "Curitiba", "Porto Alegre", "Recife", "Salvador", "Fortaleza", "Goiânia", "Manaus", "Belém"],
+  // ── LAS CIUDADES DONDE VIVEN LOS MEDIOS QUE NUNCA VIMOS (Maxi 2026-09-04, medido) ──────
+  // De los 699 sitios que los media buyers prospectaron a mano en marzo, 377 no fueron vistos
+  // jamás por ninguna fuente, y se concentran en Brasil (85), Polonia (86), Japón (30) y Corea
+  // (15). No son chicos —mediana 1M de pageviews— y son REGIONALES: blogbraga, clicrdc,
+  // folhadosulonline, sudoestesp, omunicipiojoinville. Con 9 ciudades para Brasil y 6 para
+  // Polonia el sorteo casi nunca caía donde están. Se amplían a las ciudades medias, que es
+  // exactamente donde un diario regional monetiza y todavía no tiene agencia.
+  br: ["Belo Horizonte", "Curitiba", "Porto Alegre", "Recife", "Salvador", "Fortaleza", "Goiânia", "Manaus", "Belém",
+       "Campinas", "São Luís", "Maceió", "Natal", "Teresina", "João Pessoa", "Cuiabá", "Campo Grande", "Florianópolis",
+       "Vitória", "Londrina", "Ribeirão Preto", "Uberlândia", "Sorocaba", "Joinville", "Juiz de Fora", "Feira de Santana",
+       "Caxias do Sul", "Aracaju", "Blumenau", "Chapecó", "Marília", "Bauru", "Piracicaba", "Petrolina", "Imperatriz"],
   ec: ["Guayaquil", "Cuenca", "Manta", "Ambato", "Loja"],
   bo: ["Santa Cruz", "Cochabamba", "El Alto", "Sucre"],
   uy: ["Salto", "Maldonado", "Paysandú"],
@@ -2348,7 +2406,9 @@ const _CIUDADES = {
   ch: ["Zürich", "Basel", "Lausanne", "Bern"],
   nl: ["Rotterdam", "Utrecht", "Eindhoven", "Groningen", "Tilburg"],
   be: ["Antwerpen", "Gent", "Charleroi", "Liège"],
-  pl: ["Kraków", "Wrocław", "Poznań", "Gdańsk", "Łódź", "Katowice"],
+  pl: ["Kraków", "Wrocław", "Poznań", "Gdańsk", "Łódź", "Katowice",
+       "Szczecin", "Bydgoszcz", "Lublin", "Białystok", "Rzeszów", "Toruń", "Kielce", "Olsztyn", "Opole",
+       "Zielona Góra", "Gorzów", "Radom", "Częstochowa", "Tarnów", "Nowy Sącz", "Płock", "Koszalin", "Legnica", "Kalisz"],
   tr: ["İzmir", "Bursa", "Antalya", "Adana", "Konya", "Gaziantep"],
   gr: ["Θεσσαλονίκη", "Πάτρα", "Ηράκλειο", "Λάρισα", "Βόλος"],
   ro: ["Cluj-Napoca", "Timișoara", "Iași", "Constanța", "Brașov"],
@@ -2361,9 +2421,9 @@ const _CIUDADES = {
   vn: ["Đà Nẵng", "Hải Phòng", "Cần Thơ", "Huế", "Nha Trang"],
   th: ["เชียงใหม่", "ขอนแก่น", "ภูเก็ต", "หาดใหญ่"],
   my: ["Johor Bahru", "Penang", "Ipoh", "Kuching", "Kota Kinabalu"],
-  kr: ["부산", "인천", "대구", "광주", "대전"],
+  kr: ["부산", "인천", "대구", "광주", "대전", "울산", "수원", "창원", "전주", "청주", "천안", "포항", "제주", "강릉", "춘천", "여수"],
   tw: ["高雄", "台中", "台南", "新竹"],
-  jp: ["大阪", "名古屋", "福岡", "札幌", "仙台", "広島"],
+  jp: ["大阪", "名古屋", "福岡", "札幌", "仙台", "広島", "神戸", "京都", "熊本", "岡山", "新潟", "静岡", "金沢", "長野", "松山", "鹿児島", "那覇", "高松", "宇都宮", "富山"],
   ma: ["Casablanca", "Marrakech", "Fès", "Tanger"],
   eg: ["الإسكندرية", "الجيزة", "المنصورة", "أسيوط"],
 };
@@ -2427,11 +2487,14 @@ function _construirBusquedasPorCiudad(esHispano, cuantas) {
   const paises = esHispano
     ? Object.keys(_CIUDADES).filter(p => (_IDIOMA_DE_PAIS[p] || "es") === "es")
     : Object.keys(_CIUDADES);
+  // Se sortea entre TODAS las ciudades y no entre países (Maxi 2026-09-04): con el sorteo por
+  // país, Brasil —35 ciudades y 85 de los sitios de marzo que nunca vimos— pesaba lo mismo que
+  // Bulgaria con 4. Así el peso de cada país sigue al tamaño de su lista, que es el del mercado.
+  const pares = paises.flatMap(p => (_CIUDADES[p] || []).map(c => [p, c]));
   const out = [];
-  for (let i = 0; i < cuantas; i++) {
-    const pais = paises[Math.floor(Math.random() * paises.length)];
+  for (let i = 0; i < cuantas && pares.length; i++) {
+    const [pais, ciudad] = pares[Math.floor(Math.random() * pares.length)];
     const lang = _IDIOMA_DE_PAIS[pais] || "es";
-    const ciudad = _CIUDADES[pais][Math.floor(Math.random() * _CIUDADES[pais].length)];
     const plt = _PLANTILLAS_CIUDAD[lang];
     const q = plt[Math.floor(Math.random() * plt.length)].replace("{ciudad}", ciudad);
     out.push(q);
@@ -2496,6 +2559,15 @@ const _TLDS_POR_IDIOMA = {
   // Sin .ca: Norteamérica queda fuera por regla del user. Con Magreb y África
   // occidental francófona, que sí entran en el foco.
   fr: [".fr", ".be", ".ch", ".ma", ".sn", ".dz", ".tn", ".ci"],
+  // Los idiomas que se sumaron a la huella comercial el 04/09 (ver _HUELLAS_DE y compañía).
+  de: [".de", ".at", ".ch"],
+  pl: [".pl"],
+  ja: [".jp", ".co.jp"],
+  ko: [".kr", ".co.kr"],
+  tr: [".com.tr", ".tr"],
+  el: [".gr"],
+  nl: [".nl", ".be"],
+  cs: [".cz"],
 };
 
 // ── APAREAR IDIOMA, PAÍS E INTERFAZ (Maxi 2026-08-11) ────────────────────────
@@ -2726,9 +2798,12 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
   const _rotacionDelDia = _dayIndex(_madridDateStr()) % 7;
   // En el turno hispano, todo en español. En el otro, español mayoritario y el
   // resto repartido entre portugués, italiano y francés. Inglés nunca.
+  // Español mayoritario (regla del user), y el resto repartido entre TODOS los idiomas con
+  // huella. La mezcla rota con el día para que con 8-10 búsquedas por slot se alcancen todos a
+  // lo largo de la semana; antes eran 5 idiomas y los otros 8 no se buscaban nunca por huella.
   const mezcla = esHispano
     ? ["es", "es", "es", "es"]
-    : ["es", "es", "pt", "it", "fr"];
+    : ["es", "es", "es", "pt", "it", "fr", "de", "pl", "ja", "ko", "tr", "el", "nl", "cs"];
   // Los PDF entran en el mismo pool de huellas: un tarifario publicado es la prueba
   // más fuerte de que hay equipo comercial, y el archivo suele traer el contacto.
   const porIdioma = {
@@ -2736,10 +2811,12 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
     pt: [..._HUELLAS_PT, ..._HUELLAS_PDF.pt],
     it: [..._HUELLAS_IT, ..._HUELLAS_PDF.it],
     fr: [..._HUELLAS_FR, ..._HUELLAS_PDF.fr],
+    de: _HUELLAS_DE, pl: _HUELLAS_PL, ja: _HUELLAS_JA, ko: _HUELLAS_KO,
+    tr: _HUELLAS_TR, el: _HUELLAS_EL, nl: _HUELLAS_NL, cs: _HUELLAS_CS,
   };
   const out = [];
   for (let i = 0; i < cuantas; i++) {
-    const lang = mezcla[i % mezcla.length];
+    const lang = mezcla[(i + _rotacionDelDia) % mezcla.length];
     const plantillas = porIdioma[lang];
     const tlds = _TLDS_POR_IDIOMA[lang];
     // ⚠️ ESTO DIVIDÍA POR EL LARGO DE LA MEZCLA DE IDIOMAS (Maxi 2026-08-24).
