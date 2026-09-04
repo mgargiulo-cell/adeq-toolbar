@@ -3534,6 +3534,120 @@ async function _getMondayApiKeyForFeeder(token) {
 }
 
 // FUENTE 1: sellers.json (rotación, insiste hasta llegar al target)
+// ════════════════════════════════════════════════════════════════
+// EL sellers.json DE GOOGLE, POR VENTANAS (Fase 4 del plan, 2026-09-04, medido)
+// ════════════════════════════════════════════════════════════════
+// Es el archivo más grande que existe de publishers que monetizan (AdSense + Ad Manager):
+// 108 MB, ~1,2 millones de vendedores, y NO estaba en la lista fija de redes. No se podía:
+// el feeder de sellers corta cada archivo a 8 MB y un JSON truncado no parsea → habría dado
+// cero, en silencio. Google acepta `Range`, así que se lee de a 1 MB con un cursor de bytes
+// persistido (`sellers_google_cursor`), igual que Majestic recorre su millón.
+//
+// Medido el 04/09 sobre una ventana al azar de 6 MB: 7.531 dominios únicos, 20% con TLD de
+// nuestros países. De 80 de esos, el 95% era desconocido para el sistema, y el 13% tenía un
+// ads.txt de ≥10 líneas (protv.ro, macg.co, bobaedream.co.kr, infonu.nl, vipsg.fr, tech4u.it).
+// El otro 87% son blogs con AdSense y poco más. Por eso el pre-filtro por ads.txt va ANTES de
+// encolar: es HTTP gratis, y cada dominio encolado después cuesta un crédito de tráfico.
+//
+// Sólo ccTLD de los países objetivo por ahora (los .com son el 74% del archivo y ahí la
+// proporción de blogs es peor); `sellers_google_incluir_gtld=true` lo abre. Sudáfrica (.za)
+// queda afuera hasta la decisión 4. Flag: `sellers_google_enabled` ("false" apaga).
+const _TLDS_OBJETIVO_GOOGLE = new Set([
+  ...HISPANIC_TLDS, ".br", ".pt", ".it", ".fr", ".be", ".ch", ".de", ".at", ".pl", ".jp", ".kr", ".tr", ".gr", ".nl", ".cz",
+  ".hu", ".ro", ".se", ".hr", ".ua", ".rs", ".bg", ".sk", ".id", ".vn", ".th", ".my", ".ph", ".in", ".ng", ".ke", ".ma", ".dz", ".tn", ".sn", ".ci",
+]);
+const _GOOGLE_SELLERS_URL = "https://realtimebidding.google.com/sellers.json";
+async function _feederPullSellersGoogle(token, targetCount, sessionKnown) {
+  const cfg = await getConfig(token).catch(() => ({}));
+  if (String(cfg.sellers_google_enabled ?? "true") === "false") {
+    await saludApagado(token, "sellers_google", "sellers_google_enabled=false").catch(() => {});
+    return 0;
+  }
+  const t0 = Date.now();
+  const VENTANA = 1024 * 1024;
+  let cursor = parseInt(cfg.sellers_google_cursor || "0", 10) || 0;
+  let pendientes = [];
+  try { pendientes = JSON.parse(cfg.sellers_google_pendientes || "[]"); } catch {}
+  if (!Array.isArray(pendientes)) pendientes = [];
+  const incluirGtld = String(cfg.sellers_google_incluir_gtld || "false") === "true";
+  const ccDe = d => (d.match(/\.([a-z]{2})$/) || [])[1];
+  let leidos = 0, objetivo = 0, frescos = 0, total = 0;
+
+  // 1) Si la lista de espera se acorta, leer UNA ventana más del archivo.
+  if (pendientes.length < 60) {
+    try {
+      // La URL redirige a storage.googleapis.com; se resuelve una vez y el Range va al destino.
+      let url = _GOOGLE_SELLERS_URL;
+      const r0 = await fetchExternoSeguro(url, { redirect: "manual", signal: AbortSignal.timeout(15000) });
+      const loc = r0.headers.get("location");
+      if (r0.status >= 300 && r0.status < 400 && loc) url = new URL(loc, url).toString();
+      const res = await fetchExternoSeguro(url, { headers: { Range: `bytes=${cursor}-${cursor + VENTANA - 1}` }, signal: AbortSignal.timeout(30000) });
+      if (res.status !== 206 && res.status !== 200) throw new Error(`HTTP ${res.status}`);
+      total = parseInt((res.headers.get("content-range") || "").split("/")[1] || "0", 10) || 0;
+      const txt = (await res.text()).slice(0, VENTANA + 1024);
+      leidos = txt.length;
+      const fin = txt.lastIndexOf("}");
+      const objs = txt.match(/\{[^{}]*\}/g) || [];
+      const cands = new Set();
+      for (const o of objs) {
+        if (!/"seller_type"\s*:\s*"PUBLISHER"/.test(o)) continue;
+        const m = o.match(/"domain"\s*:\s*"([^"]+)"/); if (!m) continue;
+        const d = _normalizeFeederDomain(m[1]); if (!d || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) continue;
+        const cc = ccDe(d);
+        if (!incluirGtld && !(cc && _TLDS_OBJETIVO_GOOGLE.has(`.${cc}`))) continue;
+        if (DEPRIO_TLD_RE.test(d) || _MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || BRAND_BLOCKLIST.has(d)) continue;
+        cands.add(d);
+      }
+      objetivo = cands.size;
+      const known = cands.size ? await _findKnownDomainsWorker(token, [...cands]) : new Set();
+      const nuevos = [...cands].filter(d => !known.has(d) && !sessionKnown.has(d) && !pendientes.includes(d));
+      frescos = nuevos.length;
+      pendientes.push(...nuevos);
+      // El cursor avanza hasta el último objeto COMPLETO de la ventana: el que quedó cortado
+      // se lee entero en la próxima. Al final del archivo, vuelve al principio.
+      cursor = (fin > 0) ? cursor + fin + 1 : cursor + VENTANA;
+      if (total && cursor >= total) { cursor = 0; log("  📗 sellers google: vuelta completa al archivo, arranca de nuevo"); }
+    } catch (e) {
+      await saludPing(token, "sellers_google", { status: "warn", cadenciaMin: 1440, detalle: `no pude leer la ventana en ${cursor}: ${e.message} — se conserva el cursor` }).catch(() => {});
+      if (!pendientes.length) return 0;
+    }
+  }
+
+  // 2) Pre-filtro gratis: ads.txt con ≥10 líneas. Hasta 60 chequeos por corrida, 6 a la vez.
+  const MIN_LINEAS = parseInt(cfg.sellers_google_min_adstxt || "10", 10) || 10;
+  const aChequear = pendientes.splice(0, 60);
+  const conAds = [];
+  let chequeados = 0, sinAds = 0, dudosos = 0;
+  for (let i = 0; i < aChequear.length; i += 6) {
+    if (Date.now() - t0 > 90_000) { pendientes.unshift(...aChequear.slice(i)); break; }   // techo de tiempo: lo no mirado vuelve a la espera
+    await Promise.all(aChequear.slice(i, i + 6).map(async d => {
+      const a = await checkAdsTxt(d).catch(() => ({ state: "unknown", lines: 0 }));
+      chequeados++;
+      if (a.state === "yes" && a.lines >= MIN_LINEAS) conAds.push(d);
+      else if (a.state === "unknown") { dudosos++; }          // no se pudo leer ≠ no tiene: se descarta igual, hay de sobra
+      else sinAds++;
+    }));
+  }
+
+  // 3) Encolar con la misma etiqueta que el resto de sellers (comparte carril y cupo).
+  let inserted = 0;
+  if (conAds.length) {
+    const slice = conAds.slice(0, targetCount);
+    slice.forEach(d => sessionKnown.add(d));
+    inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_sellers");
+    // Lo que no entró por cupo no se pierde: vuelve al frente de la espera.
+    pendientes.unshift(...conAds.slice(inserted));
+  }
+  await setConfigValue(token, "sellers_google_cursor", String(cursor)).catch(() => {});
+  await setConfigValue(token, "sellers_google_pendientes", JSON.stringify(pendientes.slice(0, 400))).catch(() => {});
+  const detalle = `ventana ${Math.round(leidos / 1024)} KB → ${objetivo} con TLD objetivo → ${frescos} nuevos · ads.txt: ${chequeados} chequeados, ${conAds.length} con ≥${MIN_LINEAS} líneas, ${sinAds} sin, ${dudosos} ilegibles → ${inserted} encolados · espera ${pendientes.length} · cursor ${Math.round(100 * cursor / Math.max(1, total || 108688283))}%`;
+  // "Chequeé 60 y ninguno tiene ads.txt" no es normal (medido 13%): o la red falla o cambió el archivo.
+  const status = (chequeados >= 40 && conAds.length === 0) ? "warn" : "ok";
+  await saludPing(token, "sellers_google", { status, cadenciaMin: 1440, real: inserted, esperado: conAds.length, detalle }).catch(() => {});
+  log(`  📗 sellers google: ${detalle} · ${Math.round((Date.now() - t0) / 1000)} s`);
+  return inserted;
+}
+
 async function _feederPullSellers(token, targetCount, sessionKnown) {
   let inserted = 0;
   // ⚠️ EL CIRCUITO ESTABA CORTADO EN EL ÚLTIMO PASO (Maxi 2026-08-19)
@@ -3592,6 +3706,11 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
     log(`⏸️ sellers: carril lleno (${_usadoCarril}/${_cupoCarril}) — no bajo ningún sellers.json, sería trabajo tirado`);
     return 0;
   }
+
+  // Google primero, con un tercio del cupo: es la única fuente que trae dominios que ninguna
+  // otra red conoce (95% desconocidos en la medición). Las redes fijas completan el resto.
+  inserted += await _feederPullSellersGoogle(token, Math.max(3, Math.ceil(targetCount / 3)), sessionKnown)
+    .catch(e => { log(`  ⚠️ sellers google error: ${e.message}`); return 0; });
 
   for (const url of sourcesToTry) {
     if (inserted >= targetCount) break;
@@ -7840,6 +7959,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 
 // ── Page intelligence ─────────────────────────────────────────
 
+// Errores INTERNOS de fetchPageContent (ReferenceError/TypeError: un bug nuestro, no la red).
+// Se cuentan y se avisan UNA vez por mensaje por arranque. Existe porque entre el 02/09 y el
+// 04/09 un ReferenceError se disfrazó de "no pude bajar la página" en todos los sitios.
+const _fetchPageErrInternos = { n: 0, avisados: new Set() };
 async function fetchPageContent(domain, _yaReintentado = false) {
   try {
     const res = await fetch(`https://${domain}`, {
@@ -8061,6 +8184,12 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     for (const [re, tipo] of TITULO_DELATOR) { if (re.test(_tituloYSitio)) { _tipoPorTitulo = tipo; break; } }
 
     let nonPublisherType = null;
+    // "Fuerte" = lo dijo el marcado del propio sitio (schema de tienda/banco/hospital, plataforma
+    // de carrito, turnos, título) y no un conteo de palabras. Se distingue porque el user lo
+    // pidió textual el 04/09: "tiene ads.txt y tampoco es prospectable porque es la web de un
+    // hospital, la web de un ecommerce" — a estos la puerta grande de ads.txt + tráfico NO los
+    // perdona (ver scoreProspectable). A los de keywords sí, como hasta hoy.
+    let nonPublisherFuerte = false;
     // Maxi 2026-07-15: isStore ya NO es "aunque tenga ads" — si el sitio corre ad-tech de PUBLISHER
     // (AdSense/GPT/SSP/Taboola) es un medio con tienda de merch (allhiphop.com), NO una tienda. Veto.
     if (isStore && !hasPublisherAds) nonPublisherType = "ecommerce";
@@ -8094,6 +8223,13 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     // se rechaza (regla de oro: no perder un publisher). Un banco/hotel/universidad/inmobiliaria/
     // tienda-sin-plataforma en su PROPIO sitio no vende inventario → no corre display → se caza.
     // Esto además arregla: nonprofit-journalism con ads (pasa) vs charity sin ads (se caza).
+    // Todo lo de arriba es marcado del sitio, no keywords — con UNA excepción medida: "ecommerce"
+    // por plataforma/carrito (isStore) no cuenta como fuerte. Replay del 04/09 con el código
+    // exacto sobre 687 publishers reales de marzo: el único falso negativo fue flamengo.com.br,
+    // un club con la tienda en VTEX en el dominio raíz (324 menciones de vtex, cero schema de
+    // tienda). Con schema de tienda o título de tienda sí es fuerte: 0 FN en los mismos 687,
+    // y caza 4 tiendas + 2 de turnos entre los 27 negativos etiquetados.
+    if (nonPublisherType) nonPublisherFuerte = !(nonPublisherType === "ecommerce" && isStore && !storeSchema.test(html) && !_tipoPorTitulo);
     else if (!hasDisplayAds) {
       if (travelSchema.test(html)) nonPublisherType = "travel";
       else if (npoSchema.test(html)) nonPublisherType = "nonprofit";
@@ -8139,9 +8275,16 @@ async function fetchPageContent(domain, _yaReintentado = false) {
       adNetworks, category,
       hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
       nonPublisherType,                 // tienda/banco/universidad/servicios → rechazar
+      nonPublisherFuerte,               // true si lo dijo el marcado (schema/plataforma/título), no las keywords
       sinSenalEditorial,                // sin artículos/secciones/fechas/RSS/autor → Haiku decide
       isEcommerce: nonPublisherType === "ecommerce",
-      ...extractPhonesFromHtml(html, geo),   // phones[] + whatsapps[] (tel:, WhatsApp, schema.org, anunciados)
+      // ⚠️ Acá decía `extractPhonesFromHtml(html, geo)` y `geo` NO EXISTE en esta función
+      // (30c0daec, 02/09). ReferenceError → catch → null: durante dos días el clasificador no
+      // vio NINGUNA página (ni tienda, ni turnos, ni Haiku con contenido) y nadie se enteró
+      // porque el catch lo trataba como "no pude bajar". Encontrado el 04/09 al correr el
+      // replay con el código exacto: 687 sitios, 687 null. El teléfono sin país es como
+      // estaba antes del 02/09; el GEO del lead no llega hasta acá.
+      ...extractPhonesFromHtml(html, ""),    // phones[] + whatsapps[] (tel:, WhatsApp, schema.org, anunciados)
       htmlLang, ogLocale, hreflang, jsonLdLang, pathLang,
       textSample,
     };
@@ -8150,6 +8293,21 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     // ENOTFOUND/EAI_AGAIN = el dominio no existe/no resuelve → dead:true para skipear downstream.
     // Timeout/403/reset = puede estar VIVO pero bloqueando → null (no lo matamos).
     const code = String(e?.cause?.code || e?.code || e?.message || "");
+    // ── UN BUG NUESTRO NO ES UN SITIO CAÍDO (2026-09-04) ─────────────────────────────
+    // Si lo que tiró es un error de programación, el sitio respondió y el que falló fue este
+    // código. Se avisa fuerte (log + ping de salud en rojo) en vez de devolver null como si
+    // fuera la red. Con esto, "geo is not defined" habría aparecido en el panel a los 7 min
+    // de deployarse, no dos días después.
+    if (e instanceof ReferenceError || e instanceof TypeError || e instanceof SyntaxError || e instanceof RangeError) {
+      _fetchPageErrInternos.n++;
+      const msg = `${e.name}: ${String(e.message).slice(0, 120)}`;
+      log(`🚨 fetchPageContent(${domain}) — ERROR INTERNO #${_fetchPageErrInternos.n}: ${msg} — es un bug del código, no del sitio`);
+      if (!_fetchPageErrInternos.avisados.has(msg)) {
+        _fetchPageErrInternos.avisados.add(msg);
+        await saludPing(null, "fetch_page_content", { status: "fail", detalle: `error interno en ${domain}: ${msg}` }).catch(() => {});
+      }
+      return null;
+    }
     // Maxi 2026-07-16: DOMINIO MUERTO/INSERVIBLE = DNS no resuelve, conexión rechazada, o error DURO de
     // TLS/SSL/certificado. El user pasó ejemplos: zd.blog.jp (privacy error), gamepress.gg (can't be
     // reached), eiga.com (ERR_SSL_VERSION_OR_CIPHER_MISMATCH). Esos NO se pueden servir → dead:true → se
@@ -10397,6 +10555,103 @@ async function runSuspectRejectAnalysis(token) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// BARRIDO DEL POOL CON EL CLASIFICADOR DE HOY (Fase 3 del plan, 2026-09-04)
+// ════════════════════════════════════════════════════════════════
+// El pool tiene 2.889 pendientes que entraron con las reglas de su día. Medido el 04/09 sobre
+// una muestra bajada y clasificada a mano: el 25–30% no es un medio (tiendas, turnos médicos,
+// directorios, corporativos) — entraron con ads.txt por todas las fuentes. El agente les
+// escribe igual, y cada uno de esos mails es un envío tirado y un poco de reputación menos.
+//
+// Qué hace: pasa por cada pendiente UNA vez (cursor por created_at, persistido), baja la home
+// y le aplica EXACTAMENTE el mismo classifyPublisher que juzga a los que entran hoy. Al que no
+// pasa le pone la marca ⚠️ que ya existe (`suspect_reject` + motivo "barrido: …"): el agente
+// deja de escribirle, el MB lo ve en el filtro Alert y con un clic lo aprueba y enseña el
+// contraejemplo. NO se borra nada, NO cambia el status: es exactamente "marcar, no borrar".
+//
+// Lo que NO marca, a propósito:
+//   · sin ads.txt — es la decisión 1 del plan (8% de publishers reales no lo tienen) y está
+//     esperando al user; hasta entonces el barrido no la toca;
+//   · sitio caído / sin HTML — "no pude mirar" no es "no es un medio" (regla de oro);
+//   · "reintentar" del clasificador — mismo motivo.
+//
+// Techo: `barrido_np_daily_cap` revisados por día (300) — el clasificador puede pedirle a Haiku
+// y comparte el techo diario de Claude con la entrada; sin este tope, el barrido podría
+// dejar sin IA a los candidatos nuevos. Flag: `barrido_no_publisher` ("false" apaga).
+// Cuando el cursor alcanza el final, cada vuelta siguiente mira sólo lo que entró después.
+// Auditar y revertir: suspect_reason LIKE 'barrido:%'.
+const _BARRIDO_NO_MARCAR = /^(sin_ads_txt|unreachable)/;
+async function barridoNoPublisher(token) {
+  const cfg = await getConfig(token).catch(() => ({}));
+  if (String(cfg.barrido_no_publisher ?? "true") === "false") {
+    await saludApagado(token, "barrido_no_publisher", "barrido_no_publisher=false").catch(() => {});
+    return;
+  }
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const hoy = new Date().toISOString().slice(0, 10);
+  // El contador vive en la config y no en memoria: el worker se reinicia cada pocos minutos y
+  // un contador en memoria volvería a cero en cada arranque (= sin tope).
+  const [_dia, _n] = String(cfg.barrido_np_hoy || "").split(":");
+  let revisadosHoy = _dia === hoy ? (parseInt(_n, 10) || 0) : 0;
+  const cap = parseInt(cfg.barrido_np_daily_cap || "300", 10) || 300;
+  if (revisadosHoy >= cap) {
+    await saludPing(token, "barrido_no_publisher", { status: "ok", cadenciaMin: 240, detalle: `tope diario ${revisadosHoy}/${cap} — sigue mañana` }).catch(() => {});
+    return;
+  }
+  let cursor = String(cfg.barrido_np_cursor || "1970-01-01T00:00:00Z");
+  const LOTE = Math.min(25, cap - revisadosHoy);
+  let rows = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&created_at=gt.${encodeURIComponent(cursor)}&select=id,domain,category,traffic,geo,created_at&order=created_at.asc&limit=${LOTE}`, { headers: auth });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    rows = await r.json();
+  } catch (e) {
+    await saludPing(token, "barrido_no_publisher", { status: "fail", cadenciaMin: 240, detalle: `no pude leer el pool: ${e.message} — se conserva el cursor` }).catch(() => {});
+    return;
+  }
+  if (!Array.isArray(rows) || rows.length === 0) {
+    await saludPing(token, "barrido_no_publisher", { status: "ok", cadenciaMin: 240, real: 0, esperado: 0, detalle: `al día: nada pendiente después de ${cursor.slice(0, 16)}` }).catch(() => {});
+    return;
+  }
+  const t0 = Date.now();
+  const TECHO_MS = 75_000;   // comparte la ventana de mantenimiento con el pulido y el auditor
+  let revisados = 0, marcados = 0, sinHtml = 0, pasan = 0;
+  const motivos = {};
+  for (const row of rows) {
+    if (Date.now() - t0 > TECHO_MS) break;
+    cursor = row.created_at;   // avanza también sobre los que se saltean: se miran UNA vez
+    const domain = String(row.domain || "").toLowerCase().replace(/^www\./, "");
+    if (!domain) continue;
+    const pc = await fetchPageContent(domain).catch(() => null);
+    if (!pc || pc.dead) { sinHtml++; continue; }
+    revisados++;
+    const v = await classifyPublisher(token, domain, pc, row.category || "", { traffic: Number(row.traffic || 0), geo: row.geo || "" }).catch(() => null);
+    if (!v) continue;
+    if (v.ok || v.retry) { pasan++; continue; }
+    const motivo = String(v.reason || "");
+    if (_BARRIDO_NO_MARCAR.test(motivo)) { pasan++; continue; }
+    try {
+      const p = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${row.id}`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify({ suspect_reject: true, suspect_reason: `barrido: ${motivo}`.slice(0, 200), suspect_checked_at: new Date().toISOString() }),
+      });
+      if (p.ok) { marcados++; const k = motivo.split(":")[0].slice(0, 30); motivos[k] = (motivos[k] || 0) + 1; log(`  🧹 barrido: ${domain} ⚠️ ${motivo}`); }
+    } catch {}
+  }
+  revisadosHoy += revisados;
+  await setConfigValue(token, "barrido_np_cursor", cursor).catch(() => {});
+  await setConfigValue(token, "barrido_np_hoy", `${hoy}:${revisadosHoy}`).catch(() => {});
+  const _top = Object.entries(motivos).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} ${n}`).join(", ");
+  // "Miré 25 y no pude ver ninguno" no es "todo bien": es la red o el fetch, y hay que avisarlo.
+  const status = (revisados === 0 && sinHtml >= 5) ? "warn" : "ok";
+  await saludPing(token, "barrido_no_publisher", {
+    status, cadenciaMin: 240, real: marcados, esperado: revisados,
+    detalle: `lote ${rows.length}: revisados ${revisados} · marcados ⚠️ ${marcados}${_top ? ` (${_top})` : ""} · pasan ${pasan} · sin html ${sinHtml} · hoy ${revisadosHoy}/${cap} · cursor ${String(cursor).slice(0, 16)}`,
+  }).catch(() => {});
+  log(`🧹 barrido no-publisher: ${revisados} revisados, ${marcados} marcados ⚠️${_top ? ` (${_top})` : ""}, ${sinHtml} sin html · ${Math.round((Date.now() - t0) / 1000)} s · hoy ${revisadosHoy}/${cap}`);
+}
+
+// ════════════════════════════════════════════════════════════════
 // BARRIDO DE PROSPECTS (Maxi 2026-07-13) — el pool VIEJO (pending) entró antes de que
 // endureciera los filtros y NO se re-evalúa solo → cientos de no-publishers conocidos
 // (pinterest/esselunga/bancos/retailers) siguen ahí. Este job los PURGA de a batches usando
@@ -11608,8 +11863,17 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   if (pageContent?.dead) {
     return { ok: false, score: -999, reason: `unreachable:${pageContent.deadReason || "dead"}`, señales: ["sitio caído"] };
   }
-  if (pageContent?.nonPublisherType && !_pasaPuertaGrande) {
-    return { ok: false, score: -999, reason: `nonpub_${pageContent.nonPublisherType}`, señales: [`estructural: ${pageContent.nonPublisherType}`] };
+  // ── LA PUERTA GRANDE NO PERDONA AL MARCADO FUERTE (2026-09-04, pedido textual) ────────
+  // "Tiene ads.txt y tampoco es prospectable porque es la web de un hospital, la web de un
+  // ecommerce." La regla del 11/08 perdonaba TODO tipo no-publisher con ads.txt + tráfico,
+  // pensada para el RUBRO (loterías, finanzas); acá la extendía a una tienda con schema de
+  // Store o a una clínica con turnos, que no venden inventario aunque tengan ads.txt. Lo
+  // fuerte (schema de entidad, título de tienda, turnos) veta siempre; lo que sale de contar
+  // palabras o de detectar un carrito sigue perdonado, como hasta hoy. Medido: 0 falsos
+  // negativos sobre 687 publishers reales con el código exacto (ver nonPublisherFuerte).
+  if (pageContent?.nonPublisherType && (!_pasaPuertaGrande || pageContent.nonPublisherFuerte)) {
+    const _perdonable = _pasaPuertaGrande ? " (ads.txt y tráfico no lo salvan: es marcado del propio sitio)" : "";
+    return { ok: false, score: -999, reason: `nonpub_${pageContent.nonPublisherType}`, señales: [`estructural: ${pageContent.nonPublisherType}${_perdonable}`] };
   }
   if (haikuType && haikuType !== "publisher" && haikuType !== "other" && !_pasaPuertaGrande) {
     return { ok: false, score: -999, reason: `haiku_${haikuType}`, señales: [`IA: ${haikuType}`] };
@@ -25369,6 +25633,7 @@ async function main() {
         log(`🔎 Pulido primero: ${_colaVirgen} leads sin un solo intento (piso ${_pisoVirgen})`);
         if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
         if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
+        if (_hayTiempo()) await barridoNoPublisher(token).catch(e => log(`⚠️ barrido no-publisher: ${e.message}`));
       }
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
@@ -25488,6 +25753,8 @@ async function main() {
       // Va después del pulido a propósito: el pulido AGREGA emails y el auditor los JUZGA.
       // Al revés, el auditor no vería lo que acaba de entrar.
       if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
+      // Y después de los dos, el barrido: saca del alcance del agente lo que no es un medio.
+      if (_hayTiempo()) await barridoNoPublisher(token).catch(e => log(`⚠️ barrido no-publisher: ${e.message}`));
         }
         // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
         //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.
