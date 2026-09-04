@@ -88,7 +88,12 @@ const _GARBAGE_DOMAIN_KEYWORDS = [
 // vía rankEmail score bajo, no descarte total.
 const _GL_LOCAL_PARTS = [
   // Sysadmin / mail infra (sin lectura humana real)
-  "abuse","admin","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
+  // ⚠️ `admin` SALIÓ de acá (Maxi 2026-09-04). En un medio chico `admin@` es el dueño —el
+  // WordPress lo crea así y nadie lo cambia—. Medido: los media buyers lo usaron y funcionó
+  // (multipasko.pl, bangla-kobita.com, forebet.com), y el crawler lo veía y lo tiraba con -1.
+  // Queda como "de última" (ver el castigo en rankEmail), no como basura: pierde contra
+  // cualquier persona o rol, pero no deja al lead sin ningún email.
+  "abuse","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
   // Roles que no responden / no son decision-makers (cazados 2026-05-14)
   "feedback","feedbacks","reclamo","reclamos","reclamacao","reclamacoes","quejas","sugerencias","sugestoes",
   "circulation","subscriptions","subs","newsletter","alerts","alerta","alertas",
@@ -122,6 +127,10 @@ const _GL_LOCAL_PARTS = [
   "legal","copyright","dmca","takedown","trademark",
   // Privacy / GDPR (proxies de WHOIS)
   "gdpr","gdpr-?mask","gdpr-?masking","gdpr-?desk","dpo","data-?protection","privacy","masked","masking","anonymous","anon","undisclosed",
+  // Las mismas oficinas en los idiomas del pool (Maxi 2026-09-04). `datenschutz@` puntuaba 65 y
+  // `rgpd@` 40 —o sea "sirve"— porque el castigo de -30 de abajo no compensaba el +40 del dominio
+  // propio y el +55 de "parece persona". Un delegado de protección de datos no compra pauta.
+  "rgpd","lopd","datenschutz","datenschutzbeauftragter","proteccion-?de-?datos","protecao-?de-?dados","privacidade","privacidad","ochrona-?danych",
   // Billing / finance (no compran ads)
   "billing","invoice","invoices","invoicing","accounting","finance","payable","payables","treasury",
   // Hosting / CDN (infraestructura)
@@ -468,7 +477,7 @@ export function _cleanScrapedEmails(list, leadDomain, opts = {}) {
 // verdad. Antes _isGenericLocalPart, processCsvItem y autopilot usaban regex
 // DIFERENTES → un email podía ser "no-genérico" para Informer pero "genérico"
 // para rankEmail. Ahora todos consultan esta constante.
-export const GENERIC_LOCAL_RE = /^(info|contact|contacto|contato|contatto|contattare|kontakt|kontakte|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|e-mail|inbox|news|press|prensa|imprensa|stampa|presse|sales|ventas|comercial|marketing|publicidade|publicidad|publicite|pubblicita|werbung|admin|general|generale|reception|recepcion|recepcao|webmaster|noreply|no-reply|no_reply|donotreply|do-not-reply|abuse|hostmaster|postmaster|spam|legal|dmca|copyright|takedown|privacy|gdpr|dpo|jobs|career|hr|recruit|talents)$/i;
+export const GENERIC_LOCAL_RE = /^(info|geral|contact|contacto|contato|contatto|contattare|kontakt|kontakte|hello|hi|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|e-mail|inbox|news|press|prensa|imprensa|stampa|presse|sales|ventas|comercial|marketing|publicidade|publicidad|publicite|pubblicita|werbung|admin|general|generale|reception|recepcion|recepcao|webmaster|noreply|no-reply|no_reply|donotreply|do-not-reply|abuse|hostmaster|postmaster|spam|legal|dmca|copyright|takedown|privacy|gdpr|dpo|jobs|career|hr|recruit|talents)$/i;
 
 export function _isGenericLocalPart(email) {
   const local = (email || "").split("@")[0].toLowerCase();
@@ -847,13 +856,31 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // (no el "director/manager" genérico, que queda en COMMERCIAL).
   // Regex hoisteado a módulo (AD_SALES_LOCAL) — misma fuente de verdad que _pickTier.
   const AD_SALES   = AD_SALES_LOCAL;
+  // El buzón comercial con el departamento adelante (Maxi 2026-09-04). AD_SALES está anclado
+  // al principio del local, así que `departamentocomercial@grupocronica.com.ar` —el contacto
+  // que el media buyer usó para baenegocios.com— no matcheaba nada, caía en "parece persona"
+  // y, por ser de otro dominio, terminaba en -50. Es el mismo buzón de venta de pauta con
+  // una palabra adelante.
+  // Y con la palabra ATRÁS también: `mcobian.comercial@elespanol.com` es la persona del área
+  // comercial del grupo editor de redaccionmedica.com. Se mira cada trozo del local por
+  // separado (partiendo por . _ -), así "comercial" cuenta adelante, atrás o en el medio, pero
+  // "comerciales" o "noticiascomerciales" no.
+  const _SEG_COMERCIAL = /^(?:comercial|commercial|publicidad|publicidade|pubblicita|publicite|ventas|vendas|sales|adsales|marketing|advertising|anuncios|anunciantes|reklama|werbung|pauta)$/i;
+  const AD_SALES_DEPTO = {
+    test: (l) => /^(?:departamento|depto|dpto|dept|area|setor|sector|equipo|equipe|team|servicio|service|oficina|gerencia|direccion|diretoria)[._-]?(?:comercial|commercial|publicidad|publicidade|publicit|pubblicit|ventas|vendas|sales|marketing|advertis|anunci|reklam|werbung)/i.test(l)
+             || (l.includes(".") || l.includes("_") || l.includes("-")) && l.split(/[._-]+/).some(seg => _SEG_COMERCIAL.test(seg)),
+  };
   const COMMERCIAL = /^(?:(?:business|partnership|partner|propaganda|director|gerente|manager|jefe|brand|media)|(?:bd|head)\b)/i;
   // Maxi 2026-08-31: faltaban los idiomas europeos. `redazione` (it) ya estaba pero moría en la
   // lista negra; `redaktion` (de), `redaction` (fr), `redactie` (nl), `redakcja` (pl), `redakce`
   // (cz), `szerkesztoseg` (hu) y `syntaxi` (gr) no figuraban en ningún lado. Y `editorial` no
   // entraba por el `\b`: después de "editor" viene una "i", que es carácter de palabra, así que
   // la alternativa fallaba y caía en PERSON_LIKELY (+55) en vez de EDITORIAL (+75).
-  const EDITORIAL  = /^(editor|editorial|editor-in-chief|chief-editor|redacao|redaccion|redazione|redaktion|redaction|redactie|redakcja|redakce|redaktsiya|szerkesztoseg|syntaxi|writer|periodista|journalist|prensa|press|reporter|news-?desk)\b/;
+  // `presse` (fr), `imprensa` (pt), `stampa` (it), `basin` (tr), `sajto` (hu), `tisk` (cz): la
+  // casilla de prensa en los idiomas del pool. Estaban en la lista de GENÉRICOS y no acá, así
+  // que `press@` valía 115 y `presse@` 55 — la misma palabra, dos puntajes, según el idioma.
+  // Es el mismo error que se arregló con `redazione` el 31/08. (Maxi 2026-09-04)
+  const EDITORIAL  = /^(editor|editorial|editor-in-chief|chief-editor|redacao|redaccion|redazione|redaktion|redaction|redactie|redakcja|redakce|redaktsiya|szerkesztoseg|syntaxi|toimitus|newsroom|writer|periodista|journalist|prensa|press|presse|imprensa|stampa|basin|sajto|tisk|reporter|news-?desk)\b/;
   const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
 
   // ORDEN: chequear generics PRIMERO (antes que "single name"), sino palabras
@@ -862,7 +889,7 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   const IS_GENERIC = GENERIC_LOCAL_RE;
 
   let matchedRole = "";
-  if (AD_SALES.test(local))        { score += 95; matchedRole = "AD_SALES"; }    // publicidad@/comercial@/ads@ = target ideal ADEQ
+  if (AD_SALES.test(local) || AD_SALES_DEPTO.test(local)) { score += 95; matchedRole = "AD_SALES"; }    // publicidad@/comercial@/ads@ = target ideal ADEQ
   else if (EXEC.test(local))       { score += 90; matchedRole = "EXEC"; }       // CEO/founder = jackpot
   else if (COMMERCIAL.test(local)) { score += 80; matchedRole = "COMMERCIAL"; }
   // ── ORDEN DEL MEDIA BUYER (Maxi 2026-08-25, textual) ────────────────────────────────
@@ -876,6 +903,11 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // `info@`. (Hoy no hay ninguno en el pool, así que esto no cambia nada de inmediato: es
   // para que cuando aparezca uno, se lo trate como lo que es.)
   else if (EDITORIAL.test(local))  { score += 75; matchedRole = "EDITORIAL"; }
+  // Redacción/prensa con un prefijo de región o idioma: `lat.press@motorsport.com`,
+  // `fr.press@`, `es.redaccion@`. La regla de arriba está anclada al principio y estos caían
+  // como "persona" (lat + press) hasta que se dejó de aceptar un genérico como apellido; sin
+  // esto quedaban sin rol, en 35. Mismo criterio que el comercial por segmento. (2026-09-04)
+  else if (/[._-]/.test(local) && local.split(/[._-]+/).some(seg => seg.length >= 4 && EDITORIAL.test(seg))) { score += 75; matchedRole = "EDITORIAL"; }
   else if (/^webmaster([._-]|$)/i.test(local)) { score += 72; matchedRole = "WEBMASTER"; }
   // Maxi 2026-07-24 (auditoría respuestas 22-24): direcciones de DEPARTAMENTO / atención al
   // cliente que NO son contacto de venta de pauta y ni rebotan ni responden a un pitch de
@@ -893,7 +925,9 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // Escribirle al buzón de reclamos no solo no vende: mete un pitch en la cola de
   // atención al cliente del publisher, que es la peor primera impresión posible.
   // Score NEGATIVO = rankEmail lo descarta. Preferimos no mandar antes que mandar acá.
-  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|ajuda|apoyo|denuncias?|reclamos?|reclama[cç][õo]es|abonnements?|suscripciones|assinaturas|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|helpdesk|help|servicios?|servico|service|tickets?|customer[a-z]*|cliente[a-z]*|servicedesk)([._-]|$)/i.test(local)) { score -= 20; matchedRole = "MESA_DE_AYUDA"; }
+  // `ouvidoria` (la defensoría del lector en Brasil), `ombudsman` y `complaints` son la mesa de
+  // reclamos con otro nombre (Maxi 2026-09-04): `ouvidoria@` puntuaba 95 por parecer un nombre.
+  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|ajuda|apoyo|denuncias?|reclamos?|reclama[cç][õo]es|ouvidoria|ombudsman|complaints?|abonnements?|suscripciones|assinaturas|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|helpdesk|help|servicios?|servico|service|tickets?|customer[a-z]*|cliente[a-z]*|servicedesk)([._-]|$)/i.test(local)) { score -= 20; matchedRole = "MESA_DE_AYUDA"; }
   // Otros departamentos que no son mesa de ayuda: no venden pauta, pero tampoco
   // ensucian una cola de soporte. Siguen sendables como último recurso (North Star: ≥1 email).
   // ── ÁREAS QUE LOS MB DESCARTAN SIEMPRE (Maxi 2026-08-25) ────────────────────────────
@@ -918,8 +952,16 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // como último recurso (North Star: ≥1 email), pero pierden contra todo lo demás.
   // Va ANTES del patrón nombre.apellido, igual que DEPARTMENT.
   else if (local.split(/[._-]+/).some(seg => IT_INFRA_SEGMENT.has(seg))) { score += 5; matchedRole = "IT_INFRA"; }
-  // Pattern firstname.lastname (juan.perez@x.com) = persona real
-  else if (/^[a-z]{2,}[._-][a-z]{2,}$/.test(local)) { score += 70; matchedRole = "PERSON"; }
+  // Un genérico con sufijo o prefijo de región (`info.lat@`, `contacto.mx@`, `gq.contacto@`)
+  // es un genérico, no una persona llamada "info lat". Va antes del patrón nombre.apellido.
+  else if (/[._-]/.test(local) && local.split(/[._-]+/).some(seg => IS_GENERIC.test(seg))) score += 15;
+  // Pattern firstname.lastname (juan.perez@x.com) = persona real.
+  // También inicial.apellido (j.perez@, m.rossi@): es el formato corporativo más común en
+  // Italia, Francia y Alemania, y el patrón exigía dos letras antes del punto, así que
+  // `f.puglisi@iltempo.it` —el contacto que usó el media buyer— valía 40 y `fpuglisi@` 95.
+  // La misma persona, dos puntajes. Se excluye que el segundo trozo sea un genérico
+  // (`e.mail`, `i.info`) para no fabricar personas de artefactos. (Maxi 2026-09-04)
+  else if (/^[a-z]+[._-][a-z]{2,}$/.test(local) && !IS_GENERIC.test(local.split(/[._-]/)[1])) { score += 70; matchedRole = "PERSON"; }
   // Pattern firstinitial+lastname (jperez@x.com, mgarcia@x.com) = común corp
   else if (/^[a-z][a-z]{4,14}$/.test(local) && local.length >= 5 && /[aeiou]/.test(local) && !IS_GENERIC.test(local)) { score += 55; matchedRole = "PERSON_LIKELY"; }
   // Generics — OK pero baja conversión. Cobertura multi-idioma (PT/IT/FR/DE/ES).
@@ -962,13 +1004,45 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
     matchedRole = "INICIALES_SOSPECHOSAS";
   }
 
-  if (matchedRole && (matchedRole === "AD_SALES" || matchedRole === "EXEC" || matchedRole === "COMMERCIAL" || matchedRole === "EDITORIAL" || matchedRole === "PERSON")) {
-    if (isFreeWebmail && cleanSite && dom !== cleanSite) {
-      score += 15; // cancela el -15 inicial
+  // ── EL DUEÑO CON UN GMAIL RESPONDE EL DOBLE (Maxi 2026-09-04, medido) ──────────────────
+  // Sobre 2.597 envíos con resultado: las direcciones de webmail (gmail/hotmail/yahoo)
+  // tuvieron 7,7% de respuesta real y 1,8% de rebote; todo lo demás, 3,5% y 7,3%. Es la regla
+  // textual de Diego —"si no hay, prefiero los de gmail"— validada con datos. Y en el hueco
+  // contra el CRM, el ranking había tirado `rsmaxit@gmail.com`, `adrianofrazao@gmail.com`,
+  // `vietnamplus2008@gmail.com`, `agazeta.jornal@gmail.com`: exactamente las direcciones que
+  // el media buyer terminó usando.
+  // Antes: persona@gmail = 55 − 15 (cross) − 20 (webmail) = 20, debajo de info@ (55). Ahora una
+  // PERSONA o un rol con webmail cancela el -15 y suma 10: queda por encima del genérico y
+  // por debajo de la misma persona en el dominio propio (95). El orden del MB, medido en sus
+  // elecciones: comercial > persona@webmail > info@.
+  const _esPersonaORol = ["AD_SALES", "EXEC", "COMMERCIAL", "EDITORIAL", "PERSON", "PERSON_LIKELY", "SINGLE_NAME"].includes(matchedRole);
+  // El nombre del MEDIO dentro del local de un webmail (`agazeta.jornal@gmail.com`,
+  // `diarioexample@gmail.com`) es el buzón del propio sitio alojado en gmail: en LATAM y en
+  // Europa del Este es la norma para un medio chico. Se trata como contacto del sitio.
+  const _brandSitio = _brandStripTld(cleanSite).replace(/[^a-z0-9]/g, "");
+  const _marcaEnLocal = _brandSitio.length >= 4 && local.replace(/[^a-z0-9]/g, "").includes(_brandSitio);
+  const _webmailDelSitio = isFreeWebmail && _marcaEnLocal;
+  // Y el mismo caso en el dominio del GRUPO editor: `contacto.topgear@henneomagazines.com` es
+  // el buzón de topgear.es alojado en su casa matriz. Llevaba -50 por "otra empresa" y quedaba
+  // rechazado; con la marca del sitio en el local no es otra empresa, es su propio buzón.
+  if (isCrossDomainCorporate && _marcaEnLocal) {
+    score += 60;   // cancela el -50 y suma 10
+    isCrossDomainCorporate = false;
+    if (!matchedRole) matchedRole = "BUZON_DEL_SITIO_EN_GRUPO";
+  }
+  if (isFreeWebmail && cleanSite && dom !== cleanSite && (_esPersonaORol || _webmailDelSitio)) {
+    if (_webmailDelSitio && !_esPersonaORol) {
+      // Sin rol reconocible (`diario-ejemplo.contacto@gmail.com`, `kultivi01@gmail.com`): es el
+      // info@ del sitio con otro hosting. Vale lo mismo que info@ en el dominio propio (55):
+      // -15 del cross + 70 = 55.
+      score += 70;
+      matchedRole = "WEBMAIL_DEL_SITIO";
+    } else {
+      score += 25;   // cancela el -15 inicial y suma 10
     }
-    if (isCrossDomainCorporate && matchedRole === "EXEC") {
-      score += 25; // revierte la mitad del -50
-    }
+  }
+  if (isCrossDomainCorporate && matchedRole === "EXEC") {
+    score += 25; // revierte la mitad del -50
   }
 
   // ── CATEGORY-ROLE MATCH (peso 0-25) ──
@@ -986,14 +1060,17 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   if (/^(datenschutz|legal|privacy|privacidad|gdpr|dpo|dsb|dmca|copyright|compliance|abuse|recht)/.test(local)) score -= 30;
   // Maxi 2026-07-13 (auditoría): departamentos que NO compran pauta (seguridad/casting/quejas/
   // reclamos/RRHH/soporte). No se descartan del todo (por si es el único contacto), pero van bien abajo.
-  if (/^(seguridad|seguranca|security|sicherheit|casting|complaints?|reclam|quejas|reclamacoes|helpdesk|helpline|support.?tech|soporte.?tecnico|suporte.?tecnico)/.test(local)) score -= 45;
+  if (/^(seguridad|seguranca|security|sicherheit|casting|complaints?|ouvidoria|ombudsman|reclam|quejas|reclamacoes|helpdesk|helpline|support.?tech|soporte.?tecnico|suporte.?tecnico)/.test(local)) score -= 45;
   // Roles TÉCNICOS/IT/operaciones/red — rara vez compran pauta, pero en un medio chico pueden ser el
   // ÚNICO contacto (feedback user 2026-07-13: "sistemas.diariodovale@ no lo veo mal") → penalty fuerte,
   // NO hard-reject: pierden contra cualquier otro candidato pero sobreviven como último recurso.
   if (/^(sys|sysadmin|systems?|sistemas?|edv|betrieb|technik|teknik|informatica|infra|infraestructura|infrastructure|netmanage|net-manage)([._-]|$)/.test(local)
       || /^it[._-](einkauf|support|admin|team|abteilung|dept|helpdesk|service)/.test(local)) score -= 55;
   // Placeholders de CMS (user01, user02, usuario3, guest) — no son personas.
-  if (/^(user|usuario|guest|nobody|admin)\d*$/.test(local)) score -= 60;
+  if (/^(user|usuario|guest|nobody)\d*$/.test(local) || /^admin\d+$/.test(local)) score -= 60;
+  // `admin@` a secas: de última. En un medio chico es el dueño (ver la nota en la lista de
+  // basura), pero pierde contra info@ (55) y contra cualquier persona. (Maxi 2026-09-04)
+  if (/^admin$/.test(local)) score -= 20;
   // Maxi 2026-06-17 (audit #10): penalty solo si dígitos están AL INICIO
   // (ej. "1234email@", "0001foo@") o si parecen un hash sin vocales (ya
   // descartado arriba con /^[a-z0-9]{8,}$/). NO penalizar mid-string
@@ -1004,10 +1081,15 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   if (local.length > 30) score -= 25;
   // Soft penalty para palabras con flavor spam (real estate, sales, etc).
   // No descarta — baja prioridad para que ganen otros candidatos si los hay.
-  if (/property|sale|offer|click|freemium|promo|bonus/.test(local)) score -= 15;
+  // ⚠️ "sale" está dentro de "sales" (Maxi 2026-09-04): el castigo anti-spam le pegaba a
+  // `sales@`, `adsales@`, `de.adsales@` —el buzón que más buscamos— y por eso valían 120
+  // mientras `ventas@` y `comercial@` valían 135. Si ya es AD_SALES, no es spam.
+  if (matchedRole !== "AD_SALES" && /property|sale|offer|click|freemium|promo|bonus/.test(local)) score -= 15;
   // Free webmail = penalizar pero NO descartar (un MB humano puede mandar)
   if (_rd.penalidad) score += _rd.penalidad;   // 1 rebote previo en el dominio → -40
-  if (isFreeWebmail) score -= 20; // antes -35, ahora -20 para que webmail con persona real sobreviva
+  // El castigo al webmail se queda SOLO para lo que no es ni persona ni rol ni el buzón del
+  // sitio (un `xyz123@gmail.com` sin forma). A los demás ya se los trató arriba con datos.
+  if (isFreeWebmail && !_esPersonaORol && !_webmailDelSitio) score -= 20;
 
   // ── LANGUAGE MATCH bonus ──
   // Si el sitio es .br y el email tiene palabras pt (vendas, comercial) → +5

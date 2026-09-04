@@ -21470,7 +21470,12 @@ async function runAgentCycle(token, allFlags) {
             mb_email:        userEmail.toLowerCase(),
             domain,
             email_sent_to:   email,
-            source:          pickedSource || "unknown",
+            // ⚠️ `pickedSource` puede ser el OBJETO {url, source} de email_sources, no el string
+            // (Maxi 2026-09-04). Se guardaba entero como texto: 379 de 2.597 filas tenían
+            // `{"url":"https://…","source":"scrape"}` en esta columna, y el análisis por fuente
+            // —source_performance, el parte diario, el reajuste semanal de tiers— contaba cada
+            // una de esas filas como una fuente distinta. Se normaliza igual que en el ranking.
+            source:          _normSrc(pickedSource) || "unknown",
             geo:             leadGeo || "",
             category:        lead.category || "",
             sent_at:         new Date().toISOString(),
