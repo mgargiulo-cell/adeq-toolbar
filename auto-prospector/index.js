@@ -2318,6 +2318,14 @@ const _HUELLAS_FR = [
 // "medio + ciudad" desde el 27/08 pero ninguna búsqueda por HUELLA (ads.txt indexado, tarifario,
 // "anuncie con nosotros"), que es el segundo patrón que mejor rinde. Mismas cuatro ideas en
 // cada idioma: el ads.txt en Google, el kit de medios, la invitación a anunciar, la redacción.
+// Inglés = Sudáfrica y nada más (decisión 4, 04/09). Las frases imitan lo que publica un medio
+// sudafricano que vende display: "advertise with us", "rate card", "media kit".
+const _HUELLAS_EN = [
+  `inurl:ads.txt "google.com, pub-" {tld}`,
+  `"advertise with us" OR "media kit" news {tld}`,
+  `"rate card" OR "advertising rates" newspaper online {tld}`,
+  `"our newsroom" OR "about us" local news {tld}`,
+];
 const _HUELLAS_DE = [
   `inurl:ads.txt "google.com, pub-" {tld}`,
   `"Mediadaten" OR "Anzeigenpreise" Nachrichtenportal {tld}`,
@@ -2406,6 +2414,7 @@ const _CIUDADES = {
   ch: ["Zürich", "Basel", "Lausanne", "Bern"],
   nl: ["Rotterdam", "Utrecht", "Eindhoven", "Groningen", "Tilburg"],
   be: ["Antwerpen", "Gent", "Charleroi", "Liège"],
+  za: ["Johannesburg", "Cape Town", "Durban", "Pretoria", "Gqeberha", "Bloemfontein", "East London", "Polokwane", "Mbombela", "Pietermaritzburg"],   // decisión 4 (04/09)
   pl: ["Kraków", "Wrocław", "Poznań", "Gdańsk", "Łódź", "Katowice",
        "Szczecin", "Bydgoszcz", "Lublin", "Białystok", "Rzeszów", "Toruń", "Kielce", "Olsztyn", "Opole",
        "Zielona Góra", "Gorzów", "Radom", "Częstochowa", "Tarnów", "Nowy Sącz", "Płock", "Koszalin", "Legnica", "Kalisz"],
@@ -2447,6 +2456,7 @@ const _PLANTILLAS_CIUDAD = {
   de: [`nachrichten {ciudad} heute`, `lokalzeitung {ciudad} online`, `"mediadaten" zeitung {ciudad}`],
   nl: [`nieuws {ciudad} vandaag`, `regionale krant {ciudad}`, `"adverteren" nieuwssite {ciudad}`],
   pl: [`wiadomości {ciudad} dzisiaj`, `lokalna gazeta {ciudad}`, `"reklama" portal {ciudad}`],
+  en: [`{ciudad} news today`, `local newspaper {ciudad} online`, `"advertise with us" news {ciudad}`],   // Sudáfrica (decisión 4)
   tr: [`{ciudad} haberleri bugün`, `yerel gazete {ciudad}`, `"reklam" haber sitesi {ciudad}`],
   ar: [`أخبار {ciudad} اليوم`, `صحيفة {ciudad} الإلكترونية`, `"إعلانات" موقع أخبار {ciudad}`],
   id: [`berita {ciudad} hari ini`, `portal berita {ciudad}`, `"pasang iklan" berita {ciudad}`],
@@ -2582,6 +2592,7 @@ const _TLDS_POR_IDIOMA = {
   el: [".gr"],
   nl: [".nl", ".be"],
   cs: [".cz"],
+  en: [".co.za", ".za"],   // decisión 4 (04/09): inglés SÓLO para Sudáfrica
 };
 
 // ── APAREAR IDIOMA, PAÍS E INTERFAZ (Maxi 2026-08-11) ────────────────────────
@@ -2623,6 +2634,12 @@ const _PAISES_POR_IDIOMA = {
   ko: ["kr"],
   zh: ["tw", "hk", "sg"],      // sin `cn`: Google no opera ahí
   ms: ["my", "sg", "bn"],
+  // ── SUDÁFRICA (decisión 4 del user, 04/09) ─────────────────────────────────────────
+  // 35 de los 699 sitios que los MB prospectaron con éxito en marzo eran sudafricanos, y el
+  // sistema no los buscaba nunca: no por una exclusión, sino porque el inglés no existía como
+  // idioma de búsqueda. Entra SÓLO con gl=za; el cinturón anti-anglo de abajo sigue vetando
+  // us/ca/gb/au/nz aunque alguien los agregue acá.
+  en: ["za"],
 };
 // ── EL FOCO GEOGRÁFICO, DICHO POR EL USER (2026-08-26) ─────────────────────────────────
 // "Focalizar en países de América Central, Sur, Europa y Asia. Oceanía, USA, Canadá, UK y
@@ -2817,7 +2834,7 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
   // lo largo de la semana; antes eran 5 idiomas y los otros 8 no se buscaban nunca por huella.
   const mezcla = esHispano
     ? ["es", "es", "es", "es"]
-    : ["es", "es", "es", "pt", "it", "fr", "de", "pl", "ja", "ko", "tr", "el", "nl", "cs"];
+    : ["es", "es", "es", "pt", "it", "fr", "de", "pl", "ja", "ko", "tr", "el", "nl", "cs", "en"];   // "en" = sólo gl=za (decisión 4)
   // Los PDF entran en el mismo pool de huellas: un tarifario publicado es la prueba
   // más fuerte de que hay equipo comercial, y el archivo suele traer el contacto.
   const porIdioma = {
@@ -2827,6 +2844,7 @@ function _construirBusquedasDeHuella(esHispano, cuantas) {
     fr: [..._HUELLAS_FR, ..._HUELLAS_PDF.fr],
     de: _HUELLAS_DE, pl: _HUELLAS_PL, ja: _HUELLAS_JA, ko: _HUELLAS_KO,
     tr: _HUELLAS_TR, el: _HUELLAS_EL, nl: _HUELLAS_NL, cs: _HUELLAS_CS,
+    en: _HUELLAS_EN,
   };
   const out = [];
   for (let i = 0; i < cuantas; i++) {
@@ -2989,6 +3007,41 @@ async function _serperContactSearch(domain) {
     const { phones, whatsapps } = extractPhonesFromHtml(text, geo);
     return { urlsContacto, emails: [...new Set(emails)], phones, whatsapps };
   } catch (e) { log(`  ⚠️ Serper contact error ${clean}: ${e.message}`); return { emails: [], phones: [], whatsapps: [] }; }
+}
+
+// ── LA PERSONA POR FUERA DEL SITIO (decisión 3 del user, 04/09) ────────────────────────
+// `_serperContactSearch` busca DENTRO del sitio (site:dominio contacto). Esto es lo otro que
+// hace un media buyer cuando el sitio no publica a nadie: googlear "@dominio.com" con
+// publicidad/comercial. Google indexa emails del dominio en media kits, PDFs de tarifas,
+// directorios de prensa y perfiles que el propio sitio no muestra. Medido en el hueco: en el
+// 58% de los sitios donde el humano tenía el email y nosotros no, no había ningún email
+// publicado en el sitio. Sólo emails del MISMO dominio; la segunda consulta va sólo si la
+// primera vino vacía. Cupo aparte (serper_personas_daily_cap, 60/día).
+async function _serperPersonaSearch(domain) {
+  const vacio = { emails: [], consultas: 0 };
+  if (!SERPER_API_KEY) return vacio;
+  const clean = String(domain || "").replace(/^www\./, "").toLowerCase();
+  const base = clean.split(".")[0];
+  const mismoDominio = e => {
+    const host = (e.split("@")[1] || "").toLowerCase();
+    return host === clean || host.endsWith("." + clean) || (base.length >= 4 && host.split(".")[0] === base);
+  };
+  const consultas = [
+    `"@${clean}" (publicidad OR comercial OR advertising OR marketing OR ventas OR publicidade OR pubblicità OR werbung OR reklama OR "media kit")`,
+    `"${clean}" email (publicidad OR advertising OR comercial OR director OR responsable OR "media kit") -site:${clean}`,
+  ];
+  const emails = new Set();
+  let n = 0;
+  for (const q of consultas) {
+    const r = await _serperSearch(q, 10);
+    n++;
+    if (!r.ok) continue;
+    let text = "";
+    for (const x of r.resultados) text += ` ${x.title} ${x.snippet}`;
+    for (const e of extractEmailsFromHtml(text)) if (mismoDominio(e)) emails.add(e.toLowerCase());
+    if (emails.size) break;
+  }
+  return { emails: [...emails], consultas: n };
 }
 
 async function maybeRunAutoGoogleSlot(token) {
@@ -3551,9 +3604,9 @@ async function _getMondayApiKeyForFeeder(token) {
 //
 // Sólo ccTLD de los países objetivo por ahora (los .com son el 74% del archivo y ahí la
 // proporción de blogs es peor); `sellers_google_incluir_gtld=true` lo abre. Sudáfrica (.za)
-// queda afuera hasta la decisión 4. Flag: `sellers_google_enabled` ("false" apaga).
+// entra desde la decisión 4 del user (04/09). Flag: `sellers_google_enabled` ("false" apaga).
 const _TLDS_OBJETIVO_GOOGLE = new Set([
-  ...HISPANIC_TLDS, ".br", ".pt", ".it", ".fr", ".be", ".ch", ".de", ".at", ".pl", ".jp", ".kr", ".tr", ".gr", ".nl", ".cz",
+  ...HISPANIC_TLDS, ".br", ".pt", ".it", ".fr", ".be", ".ch", ".de", ".at", ".pl", ".jp", ".kr", ".tr", ".gr", ".nl", ".cz", ".za",
   ".hu", ".ro", ".se", ".hr", ".ua", ".rs", ".bg", ".sk", ".id", ".vn", ".th", ".my", ".ph", ".in", ".ng", ".ke", ".ma", ".dz", ".tn", ".sn", ".ci",
 ]);
 const _GOOGLE_SELLERS_URL = "https://realtimebidding.google.com/sellers.json";
@@ -5453,7 +5506,11 @@ async function getUserLimits(token, userEmail) {
 // era ~4%: cap fijo 2400) → corta en 2,250 y deja 250 de colchón real.
 // Si llega → fallback a scraping/page-emails (no rompe flujos, solo no usa Apollo).
 const APOLLO_PLAN_CREDITS  = 2500;
-const APOLLO_SAFETY_MARGIN = 0.10;
+// Decisión 2 del user (04/09): "usar sí o sí el 100% de las requests, quemarlas sí o sí antes
+// de terminar el mes". El margen del 10% del 17/07 se va: el plan se paga entero y los créditos
+// no se acumulan. Medido el 04/09: 12 usados con el 77% del ciclo corrido — el freno nunca fue
+// el tope, fue la falta de demanda; por eso además existe apolloQuemarCiclo.
+const APOLLO_SAFETY_MARGIN = 0;
 const APOLLO_MONTHLY_HARD_CAP = Math.floor(APOLLO_PLAN_CREDITS * (1 - APOLLO_SAFETY_MARGIN)); // 2250
 
 // Techo de seguridad por día (protege contra rate-limit de Apollo y errores).
@@ -6626,8 +6683,12 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
         // de 2.250 con el 42% del ciclo corrido, en un plan que se paga entero.
         // Ahora se le piden los cargos que de verdad valen: comercial y publicidad
         // primero, dirección después. Es la misma lista que premia `_score`.
-        person_titles: ["head of advertising","advertising director","ad sales","ad operations","programmatic","monetization","revenue director","commercial director","director comercial","gerente comercial","publicidad","publicidade","sales director","marketing director","business development","CEO","founder","co-founder","owner","publisher"],
-        per_page: 5, page: 1,
+        // Decisión 2 (04/09), "revisar la elección": vuelven los jefes de redacción. En un medio
+        // regional el director/editor jefe ES quien decide la pauta (el CRM lo muestra: redacción
+        // vale 115 en el ranking porque el humano le escribe y le contesta). Lo que se saca es
+        // el tech: un developer o un webmaster no compra publicidad, y se estaba pagando por él.
+        person_titles: ["head of advertising","advertising director","ad sales","ad operations","programmatic","monetization","revenue director","commercial director","director comercial","gerente comercial","publicidad","publicidade","sales director","marketing director","business development","CEO","founder","co-founder","owner","publisher","editor in chief","chief editor","director de redacción","managing director"],
+        per_page: 8, page: 1,
       }),
       signal: AbortSignal.timeout(12000),
     });
@@ -6703,9 +6764,14 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
   // TECH/DECISIÓN — NUNCA periodistas, editores, fotógrafos ni ops (ahí se quemaba el crédito
   // en gente sin email ni relevancia). Filtramos ANTES de pagar el reveal.
   const _CONTENT_OPS_RE = /\b(reporter|report[eé]r|journalist|periodist|redactor|redacc|correspondent|columnist|writer|editor|photograph|fot[oó]graf|graphic|designer|copy|clerk|cashier|mechanic|warehouse|driver|pressroom|circulation|imaging|literacy|custodian|delivery)\b/i;
-  const _RELEVANT_RE = /\b(ceo|founder|co-?founder|owner|president|chief|cmo|cro|cto|publisher|propietari|due[ñn]|director|vp|vice president|head of|general manager|managing|marketing|advertis|publicidad|comercial|commercial|sales|ventas|revenue|monetiz|ad ?ops|ad ?operations|programmatic|program[aá]tic|media buy|inventory|yield|partnership|business development|bizdev|growth|digital|developer|engineer|programador|desarrollador|webmaster|\btech\b)\b/i;
+  // Decisión 2 (04/09): fuera dev/engineer/webmaster/digital/tech — no compran pauta y se
+  // gastaba crédito en ellos. Y el JEFE de redacción sí cuenta como decisión (antes el
+  // "editor" genérico lo vetaba junto con los periodistas).
+  const _RELEVANT_RE = /\b(ceo|founder|co-?founder|owner|president|chief|cmo|cro|publisher|propietari|due[ñn]|director|vp|vice president|head of|general manager|managing|marketing|advertis|publicidad|comercial|commercial|sales|ventas|revenue|monetiz|ad ?ops|ad ?operations|programmatic|program[aá]tic|media buy|inventory|yield|partnership|business development|bizdev|growth)\b/i;
+  const _JEFE_REDACCION_RE = /\b(editor[- ]in[- ]chief|chief editor|editor[- ]jefe|editora? chefe|direct(or|ora|eur|rice) (de|of|da|de la) (redacci[oó]n|redação|contenidos?|content|la r[ée]daction)|chefredakteur(in)?|direttore responsabile|redaktor naczeln[ya]|hoofdredacteur)\b/i;
   const _score = (t) => {
     const s = (t || "").toLowerCase();
+    if (_JEFE_REDACCION_RE.test(s)) return 2;  // quien dirige el medio decide la pauta
     if (_CONTENT_OPS_RE.test(s)) return -1;   // periodista/editor/ops → NUNCA revelar
     if (!_RELEVANT_RE.test(s))   return -1;   // fuera de interés → NUNCA revelar
     if (/\b(advertis|publicidad|marketing|programmatic|program[aá]tic|monetiz|ad ?ops|comercial|commercial|revenue)\b/.test(s)) return 3; // core: publi/marketing/programmatic
@@ -6739,6 +6805,7 @@ async function findBestApolloEmail(domain, apolloKey, token, { traffic = 0, allo
         phone,
         source: "unlocked",
         source_url: sourceUrl,
+        title: String(target.title || "").slice(0, 80),   // para medir qué cargos contestan (decisión 2)
       };
       if (token) saveApolloCacheServer(token, domain, { emails: [result.email], contact_name: result.contact_name, phone, source_url: sourceUrl, source: "worker_unlocked", title: target.title || "" }).catch(() => {});
       return result;
@@ -8016,6 +8083,10 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     // NO cuenta acá. Un publisher con tienda de merch (allhiphop) SÍ tiene publisher-ads → vetea isStore.
     const PUBLISHER_ADS_RE = /(pagead2\.googlesyndication|adsbygoogle|googletagservices|securepubads|div-gpt-ad|data-ad-slot|googletag\.cmd|amazon-adsystem|aps\.amazon|pubmatic|rubiconproject|magnite|openx\.net|prebid\.js|prebidjs|adnxs\.com|appnexus|33across|sovrn\.com|indexexchange|casalemedia|smartadserver|yieldmo|sharethrough|gumgum|fundingchoicesmessages)/i;
     const hasPublisherAds = PUBLISHER_ADS_RE.test(html) || adNetworks.length > 0;
+    // AdSense ACTIVO en la home: el script de adsbygoogle o un slot con ca-pub. Es la única
+    // excepción a "sin ads.txt no entra" (decisión 1 del user, 04/09): "si no tiene ads.txt y
+    // tiene tags de AdSense activos puede entrar, la única regla".
+    const hasAdSense = /adsbygoogle\.js|pagead2\.googlesyndication\.com|data-ad-client=["']?ca-pub-\d|\bca-pub-\d{10,}/i.test(html);
 
     // ── ¿HAY ALGO EDITORIAL EN LA HOME? (Fase 3, 2026-09-04, medido) ─────────────────────
     // Seis señales baratas, sobre el HTML que ya está bajado: artículos, secciones de noticias,
@@ -8276,6 +8347,7 @@ async function fetchPageContent(domain, _yaReintentado = false) {
       hasDisplayAds, hasProgrammatic,   // B2: señales de monetización real
       nonPublisherType,                 // tienda/banco/universidad/servicios → rechazar
       nonPublisherFuerte,               // true si lo dijo el marcado (schema/plataforma/título), no las keywords
+      hasAdSense,                       // única excepción a "sin ads.txt no entra" (decisión 1, 04/09)
       sinSenalEditorial,                // sin artículos/secciones/fechas/RSS/autor → Haiku decide
       isEcommerce: nonPublisherType === "ecommerce",
       // ⚠️ Acá decía `extractPhonesFromHtml(html, geo)` y `geo` NO EXISTE en esta función
@@ -10657,6 +10729,107 @@ async function barridoNoPublisher(token) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// QUEMAR EL CICLO DE APOLLO (decisión 2 del user, 2026-09-04)
+// ════════════════════════════════════════════════════════════════
+// "Usar sí o sí el 100% de las requests, quemarlas sí o sí antes de terminar el mes."
+// Medido el 04/09: 12 créditos usados con el 77% del ciclo corrido. El tope nunca fue el
+// problema: la demanda no llegaba, porque Apollo sólo se consulta cuando un lead pasa por el
+// pulido o la entrada y encima cumple el umbral de tráfico. Este job crea la demanda que falta:
+// si el gasto va por detrás del calendario (o quedan ≤5 días), toma los pendientes con más
+// tráfico que no tienen persona (sin email o sólo genéricos), sin intento reciente de Apollo, y
+// pide la persona con forceUnlock. Lo que trae se guarda como en el pulido (fuente `apollo`).
+// El presupuesto por vuelta es lo que el ritmo diario deja (`getApolloUsageToday().limit`,
+// que crece solo a medida que se acerca el fin del ciclo), con un techo de 30 por vuelta.
+async function apolloQuemarCiclo(token) {
+  const cfg = await getConfig(token).catch(() => ({}));
+  if (String(cfg.apollo_quemar_ciclo ?? "true") === "false") {
+    await saludApagado(token, "apollo_quemar_ciclo", "apollo_quemar_ciclo=false").catch(() => {});
+    return;
+  }
+  const key = cfg.apollo_api_key;
+  if (!key) { await saludPing(token, "apollo_quemar_ciclo", { status: "warn", cadenciaMin: 240, detalle: "sin apollo_api_key en la config" }).catch(() => {}); return; }
+  const usage = await getApolloUsageToday(token).catch(() => null);
+  if (!usage) { await saludPing(token, "apollo_quemar_ciclo", { status: "fail", cadenciaMin: 240, detalle: "no pude leer el uso de Apollo" }).catch(() => {}); return; }
+  const cap = usage.monthLimit || APOLLO_MONTHLY_HARD_CAP;
+  const used = usage.usedThisMonth || 0;
+  const ritmo = _cycleElapsedRatio(_apolloCyclePeriod());
+  const diasQuedan = _daysLeftInApolloCycle();
+  const atrasado = (used / cap) < (ritmo - 0.10);
+  const final = diasQuedan <= 5;
+  const estado = `${used}/${cap} con el ${Math.round(ritmo * 100)}% del ciclo, quedan ${diasQuedan} días`;
+  if (!atrasado && !final) {
+    await saludPing(token, "apollo_quemar_ciclo", { status: "ok", cadenciaMin: 240, real: 0, esperado: 0, detalle: `al ritmo: ${estado}` }).catch(() => {});
+    return;
+  }
+  const presupuesto = Math.min(30, Math.max(0, (usage.limit || 0) - (usage.usedToday || 0)));
+  if (presupuesto <= 0) {
+    await saludPing(token, "apollo_quemar_ciclo", { status: "ok", cadenciaMin: 240, real: 0, esperado: 0, detalle: `tope diario cubierto (${usage.usedToday}/${usage.limit}) · ${estado}` }).catch(() => {});
+    return;
+  }
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  let rows = [];
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&or=(email_ultimo_motivo.is.null,email_ultimo_motivo.neq.apollo_sin_contacto)&select=id,domain,traffic,emails,email_sources,contact_name&order=traffic.desc.nullslast&limit=120`, { headers: auth });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    rows = await r.json();
+  } catch (e) {
+    await saludPing(token, "apollo_quemar_ciclo", { status: "fail", cadenciaMin: 240, detalle: `no pude leer el pool: ${e.message}` }).catch(() => {});
+    return;
+  }
+  // Sin persona = sin email o sólo genéricos; y sin intento previo de Apollo en la lista.
+  const sinPersona = (Array.isArray(rows) ? rows : []).filter(l => {
+    const ems = Array.isArray(l.emails) ? l.emails : [];
+    const srcs = Object.values(l.email_sources || {}).map(v => _normSrc(v).toLowerCase());
+    if (srcs.includes("apollo")) return false;
+    return ems.length === 0 || ems.every(e => _isGenericLocalPart(String(e)));
+  });
+  // Apollo tiene cache de 7 días: lo consultado hace poco no se vuelve a pagar (lo filtra el
+  // propio findBestApolloEmail), pero tampoco se cuenta acá para no gastar el presupuesto en nada.
+  let recientes = new Set();
+  try {
+    const desde = new Date(Date.now() - 7 * 86_400_000).toISOString();
+    const doms = sinPersona.map(l => String(l.domain).toLowerCase().replace(/^www\./, ""));
+    if (doms.length) {
+      const rc = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_apollo_cache?domain=in.(${doms.map(encodeURIComponent).join(",")})&fetched_at=gte.${desde}&select=domain`, { headers: auth });
+      if (rc.ok) recientes = new Set((await rc.json()).map(x => String(x.domain).toLowerCase()));
+    }
+  } catch {}
+  const candidatos = sinPersona.filter(l => !recientes.has(String(l.domain).toLowerCase().replace(/^www\./, ""))).slice(0, presupuesto);
+  const t0 = Date.now();
+  let intentos = 0, conEmail = 0, sinContacto = 0;
+  for (const lead of candidatos) {
+    if (Date.now() - t0 > 90_000) break;
+    const domain = String(lead.domain).toLowerCase().replace(/^www\./, "");
+    intentos++;
+    let ap = null;
+    try { ap = await findBestApolloEmail(domain, key, token, { traffic: Number(lead.traffic || 0), allowUnlock: true, forceUnlock: true }); } catch (e) { log(`  ⚠️ apollo quemar ${domain}: ${e.message}`); continue; }
+    const patch = {};
+    if (ap?.email) {
+      const cur = (Array.isArray(lead.emails) ? lead.emails : []).map(String);
+      const merged = [ap.email, ...cur.filter(e => e.toLowerCase() !== ap.email.toLowerCase())];
+      patch.emails = await validateEmailsBatch(merged);
+      patch.email_sources = { ...(lead.email_sources || {}), [ap.email.toLowerCase()]: "apollo" };
+      if (!lead.contact_name && ap.contact_name) patch.contact_name = ap.contact_name;
+      patch.email_found_at = new Date().toISOString();
+      conEmail++;
+      log(`  💎 apollo quemar: ${domain} → ${ap.email}${ap.title ? ` (${ap.title})` : ""}`);
+    } else {
+      patch.email_ultimo_motivo = "apollo_sin_contacto";
+      sinContacto++;
+    }
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+      method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" }, body: JSON.stringify(patch),
+    }).catch(() => {});
+  }
+  // "Estoy atrasado y no encontré a quién pedirle" también hay que verlo: el pool se quedó sin
+  // candidatos, no el presupuesto.
+  const status = (candidatos.length === 0) ? "warn" : "ok";
+  const detalle = `${atrasado ? "ATRASADO" : "fin de ciclo"} · ${estado} · candidatos ${sinPersona.length} (${recientes.size} recientes) · intentos ${intentos} → ${conEmail} con email, ${sinContacto} sin contacto · presupuesto ${presupuesto}`;
+  await saludPing(token, "apollo_quemar_ciclo", { status, cadenciaMin: 240, real: conEmail, esperado: intentos, detalle }).catch(() => {});
+  log(`💎 apollo quemar ciclo: ${detalle} · ${Math.round((Date.now() - t0) / 1000)} s`);
+}
+
+// ════════════════════════════════════════════════════════════════
 // BARRIDO DE PROSPECTS (Maxi 2026-07-13) — el pool VIEJO (pending) entró antes de que
 // endureciera los filtros y NO se re-evalúa solo → cientos de no-publishers conocidos
 // (pinterest/esselunga/bancos/retailers) siguen ahí. Este job los PURGA de a batches usando
@@ -11385,7 +11558,9 @@ async function polishPool(token) {
         // La regla del user es que sin ads.txt no entra, y este es el job que hoy recorre el
         // pool entero, así que la puerta tiene que estar acá. checkAdsTxt cachea por proceso.
         const _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown" }));
-        if (_ads.state === "no") { await _softRejectLead(auth, lead.id, "sin_ads_txt"); blocked++; return; }
+        // Única excepción (decisión 1, 04/09): AdSense activo en la home ya bajada.
+        if (_ads.state === "no" && _pcUtil?.hasAdSense) log(`  📄✳️ ${domain}: sin ads.txt pero AdSense activo → se queda (excepción del user)`);
+        else if (_ads.state === "no") { await _softRejectLead(auth, lead.id, "sin_ads_txt"); blocked++; return; }
         // "unknown" no es "no": puede ser Cloudflare tapándonos. Pero si ADEMÁS no pudimos leer
         // la home, no tenemos UNA sola señal de que monetice — y gastar scrape ahí es tirar
         // tiempo. Vuelve como no-verificable, que es reversible cuando el re-chequeo lo resuelva.
@@ -11501,6 +11676,36 @@ async function polishPool(token) {
                 if (g.whatsapps.length) foundPhone = "wa:" + g.whatsapps[0];
                 else if (g.phones.length) foundPhone = g.phones[0];
               }
+            }
+          }
+        }
+        // 5b) LA PERSONA POR FUERA DEL SITIO (decisión 3 del user, 04/09): Google con "@dominio".
+        //     Sólo cuando no hay nada o sólo hay genéricos (el hueco real). 60 consultas por día,
+        //     contador y dominios ya buscados persistidos en config (el worker reinicia seguido).
+        if (!foundEmail && (curEmails.length === 0 || curEmails.every(e => _isGenericLocalPart(e))) && String(cfg.polish_serper_personas ?? "true") !== "false") {
+          const _mDay = _madridNowParts().dateISO;
+          const [_pd, _pn] = String(cfg.serper_personas_hoy || "").split(":");
+          let _usadasHoy = _pd === _mDay ? (parseInt(_pn, 10) || 0) : 0;
+          const _capP = parseInt(cfg.serper_personas_daily_cap || "60", 10) || 60;
+          let _hechos = []; try { _hechos = JSON.parse(cfg.serper_personas_hechos || "[]"); } catch {}
+          if (!Array.isArray(_hechos)) _hechos = [];
+          if (_usadasHoy < _capP && !_hechos.includes(domain)) {
+            const r = await _serperPersonaSearch(domain).catch(() => ({ emails: [], consultas: 1 }));
+            _usadasHoy += r.consultas || 1;
+            _hechos.push(domain); if (_hechos.length > 600) _hechos = _hechos.slice(-600);
+            cfg.serper_personas_hoy = `${_mDay}:${_usadasHoy}`;
+            cfg.serper_personas_hechos = JSON.stringify(_hechos);
+            await setConfigValue(token, "serper_personas_hoy", cfg.serper_personas_hoy).catch(() => {});
+            await setConfigValue(token, "serper_personas_hechos", cfg.serper_personas_hechos).catch(() => {});
+            const cands = r.emails
+              .map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) }))
+              .filter(c => c.score > 0)
+              .sort((a, b) => b.score - a.score);
+            if (cands.length) {
+              foundEmail = cands[0].email; foundSource = "serper_persona";
+              log(`  🔎👤 ${domain}: Google trajo ${cands.map(c => c.email).join(", ")} → ${foundEmail} (serper_persona ${_usadasHoy}/${_capP})`);
+            } else {
+              log(`  🔎👤 ${domain}: Google no tiene ningún email del dominio (${r.consultas} consultas, ${_usadasHoy}/${_capP})`);
             }
           }
         }
@@ -11865,6 +12070,7 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   if (adsTxt?.state === "no") {
     return { ok: false, score: -999, reason: "sin_ads_txt", señales: ["sin ads.txt = no puede monetizar"] };
   }
+  if (adsTxt?.state === "adsense") señales.push("sin ads.txt: entra por AdSense activo (única excepción, decisión del user 04/09)");
   if (pageContent?.dead) {
     return { ok: false, score: -999, reason: `unreachable:${pageContent.deadReason || "dead"}`, señales: ["sitio caído"] };
   }
@@ -12066,8 +12272,12 @@ async function classifyPublisher(token, domain, pageContent, swCategory, swData 
   if (!urlVerdict.ok) return { ok: false, reason: urlVerdict.reason, score: -999 };
 
   // 2. ads.txt — la regla dura del user. Una request, sin API paga.
-  const adsTxt = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
-  if (adsTxt.state === "no") return { ok: false, reason: "sin_ads_txt", score: -999 };
+  let adsTxt = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
+  if (adsTxt.state === "no") {
+    // Única excepción (decisión 1 del user, 04/09): AdSense activo en la home. Ver puerta 0.
+    if (pageContent?.hasAdSense) adsTxt = { ...adsTxt, state: "adsense", excepcion: "adsense" };
+    else return { ok: false, reason: "sin_ads_txt", score: -999 };
+  }
 
   // 3. Señales de la página (ya viene bajada por el caller; si no, no gastamos otra request)
   if (pageContent?.dead) return { ok: false, reason: `unreachable:${pageContent.deadReason || "dead"}`, score: -999 };
@@ -13221,6 +13431,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // que hoy nos costó 2.011 leads congelados.
   {
     _ads = await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }));
+    // ── LA ÚNICA EXCEPCIÓN (decisión 1 del user, 04/09) ────────────────────────────────
+    // "Si no tiene ads.txt y tiene tags de AdSense activos puede entrar, la única regla. El
+    // resto no entra." Medido: el 8% de los sitios que los MB prospectaron con éxito en marzo
+    // no publica ads.txt. Cuesta un fetch de la home SÓLO en los que no tienen archivo — que
+    // hasta hoy se descartaban sin mirar nada. Lo demás sigue igual: entra con marca visible
+    // en la ficha ("sin ads.txt · AdSense activo") y sin la puerta grande (no se le perdona
+    // el rubro). "puede entrar" no es "entra": el resto de las puertas se aplica igual.
+    if (_ads.state === "no") {
+      const _pc0 = await fetchPageContent(domain).catch(() => null);
+      if (_pc0?.hasAdSense) {
+        _ads = { state: "adsense", lines: 0, excepcion: "adsense", checked: domain };
+        log(`  📄✳️ ${domain} — sin ads.txt pero con AdSense activo → entra por la excepción del user, con marca`);
+      }
+    }
     if (_ads.state === "no") {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: sin_ads_txt` });
       registrarDiagDescarte(token, {
@@ -13613,7 +13837,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     }
   }
   const category = pageContent?.category || swCategory || "";
-  const adNetworks = pageContent?.adNetworks || [];
+  // La marca visible que pidió el user para la excepción de AdSense: va en ad_networks, que la
+  // ficha ya muestra, así el MB sabe que ese sitio entró sin ads.txt.
+  const adNetworks = [...(pageContent?.adNetworks || []), ...(_ads?.state === "adsense" ? ["⚠️ sin ads.txt · AdSense activo"] : [])];
   const pageTitle = pageContent?.title || "";
 
   // Maxi 2026-06-19: filtro de DESCUBRIMIENTO configurable por el admin
@@ -25639,6 +25865,7 @@ async function main() {
         if (_hayTiempo()) await polishPool(token).catch(e => log(`⚠️ polish pool: ${e.message}`));
         if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
         if (_hayTiempo()) await barridoNoPublisher(token).catch(e => log(`⚠️ barrido no-publisher: ${e.message}`));
+        if (_hayTiempo()) await apolloQuemarCiclo(token).catch(e => log(`⚠️ apollo quemar ciclo: ${e.message}`));
       }
       await vigilarReputacion(token).catch(e => log(`⚠️ reputación: ${e.message}`));
       // Y el chequeo diario de nuestro propio SPF/DKIM/DMARC.
@@ -25760,6 +25987,7 @@ async function main() {
       if (_hayTiempo()) await auditarEmailsDelPool(token).catch(e => log(`⚠️ auditoría de emails: ${e.message}`));
       // Y después de los dos, el barrido: saca del alcance del agente lo que no es un medio.
       if (_hayTiempo()) await barridoNoPublisher(token).catch(e => log(`⚠️ barrido no-publisher: ${e.message}`));
+        if (_hayTiempo()) await apolloQuemarCiclo(token).catch(e => log(`⚠️ apollo quemar ciclo: ${e.message}`));
         }
         // 3. Mantenimiento. Reintenta los ads.txt que no se pudieron leer (Cloudflare/timeout);
         //    los que ahora sí tienen vuelven solos a la cola. Techo: 1 min por vuelta.

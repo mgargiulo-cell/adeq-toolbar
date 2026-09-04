@@ -1278,7 +1278,17 @@ export const _TIER_ORDEN_DEFAULT = ["apollo", "rol", "persona", "generico"];
 export function _tipoDeEmailParaRanking(email, source) {
   const src = String(source || "").toLowerCase();
   const local = String(email || "").toLowerCase().split("@")[0];
-  if (src === "apollo" || src === "manual") return "apollo";
+  // El que eligió una persona a mano sigue arriba de todo.
+  if (src === "manual") return "apollo";
+  // ── APOLLO COMPITE POR RESULTADO (decisión 2 del user, 04/09) ───────────────────────
+  // Medido en 90 días: 169 envíos a emails de Apollo → 3 respuestas reales (1,8%), contra
+  // 6,6% de los que el MB agregó a mano y 3,1% del scrape. Ser de Apollo ya no vale por sí
+  // solo: una persona de Apollo es una persona, un rol comercial es un rol, y un info@ que
+  // Apollo devolvió es un genérico — y se ordena con los de su clase.
+  if (src === "apollo") {
+    if (AD_SALES_LOCAL.test(local)) return "rol";
+    return _isGenericLocalPart(email) ? "generico" : "persona";
+  }
   if (AD_SALES_LOCAL.test(local)) return "rol";
   if (_sourceHardTier(source) === 1) return "persona";
   return "generico";

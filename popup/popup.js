@@ -3729,7 +3729,10 @@ function _emailPickTierClient(email) {
   // (o 3 si el local es rol comercial). Antes estaba en 4 junto a apollo → el popup mostraba como
   // "mejor contacto" un domainmanagement@ que el worker rankea ÚLTIMO. Ahora coincide con el envío real.
   if (src === "informer") return _AD_SALES_LOCAL_RE.test(local) ? 3 : 1;
-  if (src === "apollo" || src === "manual") return 4;        // decision-maker verificado
+  if (src === "manual") return 4;                            // lo eligió el MB a mano
+  // Apollo compite por resultado (decisión del user, 04/09; paridad con _tipoDeEmailParaRanking
+  // del worker): su email vale lo que es — rol comercial, persona o genérico — no por venir de Apollo.
+  if (src === "apollo") return _AD_SALES_LOCAL_RE.test(local) ? 3 : (_isGenericEmailLocal(email) ? 0 : 2);
   if (_AD_SALES_LOCAL_RE.test(local)) return 3;              // rol comercial/publicidad
   if (!_isGenericEmailLocal(email)) return 2;                // persona / rol no-genérico
   return 0;                                                   // genérico
