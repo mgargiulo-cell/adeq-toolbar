@@ -3682,7 +3682,11 @@ function inferCountryFromPageSignals() {
 // Cada reveal consume 1 crédito Apollo (/v1/people/match).
 function _isGenericEmailLocal(email) {
   const local = String(email || "").split("@")[0].toLowerCase().replace(/[._-]/g, "");
-  return /^(info|contact|hello|hi|admin|support|sales|team|press|media|marketing|office|general|ventas|contacto|hola|ayuda|soporte|prensa|comercial|webmaster|enquiries|hr|jobs|careers|noreply|donotreply)$/.test(local);
+  // Paridad con el worker (2026-09-04): `press@`/`prensa@` salen de la bolsa de genéricos —
+  // el worker les da 115 (rol editorial, atendido por una persona que reenvía) y acá contaban
+  // como info@. `media@`/`team@` también son buzones atendidos. Se quedan los que de verdad
+  // son la mesa de entrada.
+  return /^(info|contact|hello|hi|admin|support|office|general|contacto|hola|ayuda|soporte|webmaster|enquiries|hr|jobs|careers|noreply|donotreply|geral|kontakt|contato)$/.test(local);
 }
 // Maxi 2026-07-09: rol de VENTA DE PAUTA/PUBLICIDAD = "mejor opción" para ADEQ (elección user Q4).
 // Regex acotado (no matchea admin/advisor). Paridad con el worker (AD_SALES_LOCAL).

@@ -102,6 +102,10 @@ const GARBAGE_LOCAL_PREFIXES = [
   "registrar","registrarcontact","registrar-contact",
   "whois","whoisprivacy","whoisguard","whoisrequest",
   "takedown","dmca","copyright-claim","copyrightclaim","legal-notices","legalnotices",
+  // Protección de datos / legal (paridad con el worker, 2026-09-04): dpo@, privacy@,
+  // datenschutz@ y rgpd@ aparecían en la UI como "persona" candidata. Un delegado de
+  // protección de datos no compra pauta; el worker los rechaza con -1 desde siempre.
+  "dpo","privacy","privacidad","privacidade","datenschutz","datenschutzbeauftragter","gdpr","rgpd","lopd","legal","compliance","protecciondedatos","protecao-de-dados",
   "domainabuse","domain-abuse","abusereport",
   // Manejo de dominios / DNS / hosting — caso real domains@latinregistrar.com.br
   "domains","domain","domainmaster","domain-admin","domainadmin",
