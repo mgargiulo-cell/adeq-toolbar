@@ -10579,7 +10579,12 @@ async function runSuspectRejectAnalysis(token) {
 // dejar sin IA a los candidatos nuevos. Flag: `barrido_no_publisher` ("false" apaga).
 // Cuando el cursor alcanza el final, cada vuelta siguiente mira sólo lo que entró después.
 // Auditar y revertir: suspect_reason LIKE 'barrido:%'.
-const _BARRIDO_NO_MARCAR = /^(sin_ads_txt|unreachable)/;
+// Tampoco marca por la IA sola (`haiku_*`, `ia_*`): en la tercera vuelta marcó moneyweb.co.za
+// —diario financiero sudafricano, 6,8M de tráfico— como "bank". Es la debilidad conocida de
+// Haiku (noticias de finanzas vs. banco, ver ccn.com más abajo) y a la entrada la perdona la
+// puerta grande; en el barrido el ads.txt puede no leerse ese día y la IA quedaba sola. Para
+// un lead que YA pasó la entrada, sólo cuenta lo que dice su propia página.
+const _BARRIDO_NO_MARCAR = /^(sin_ads_txt|unreachable|haiku_|ia_)/;
 async function barridoNoPublisher(token) {
   const cfg = await getConfig(token).catch(() => ({}));
   if (String(cfg.barrido_no_publisher ?? "true") === "false") {
