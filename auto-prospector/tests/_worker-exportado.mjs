@@ -11,7 +11,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-export async function cargarWorker(funciones) {
+// `fetchFalso: true` reemplaza el `fetch` de node-fetch por `globalThis.__fetchFalso`, para que
+// un test pueda contestar las consultas a la base y a Gmail con datos inventados y así correr
+// funciones enteras del worker (el parte del día, el boletín) sin red ni credenciales.
+export async function cargarWorker(funciones, { fetchFalso = false } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "adeq-worker-"));
   for (const f of ["node_modules", "lib", "discovery.js", "templates.js", "keywordsData.js", "package.json"]) {
     fs.symlinkSync(path.join(REPO, f), path.join(tmp, f));
@@ -20,6 +23,10 @@ export async function cargarWorker(funciones) {
   const n = (s.match(/main\(\)\.catch\(/g) || []).length;
   if (n !== 1) throw new Error(`esperaba 1 main().catch( en index.js, hay ${n}`);
   s = s.replace("main().catch(", "false && main().catch(");
+  if (fetchFalso) {
+    if (!/^import fetch from "node-fetch";/m.test(s)) throw new Error("no encontré el import de node-fetch para reemplazarlo");
+    s = s.replace(/^import fetch from "node-fetch";/m, 'const fetch = (...a) => globalThis.__fetchFalso(...a);');
+  }
   s += `\nexport { ${funciones.join(", ")} };\n`;
   fs.writeFileSync(path.join(tmp, "index.js"), s);
   return import(pathToFileURL(path.join(tmp, "index.js")).href);

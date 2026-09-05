@@ -8919,12 +8919,39 @@ async function _manualesDeMonday(token, dia) {
   return out;
 }
 
-async function parteDelDia(token) {
+// ── TRAER TODO, DE A PÁGINAS (2026-09-04) ──────────────────────────────────────────────
+// PostgREST devuelve como máximo 1.000 filas por pedido, pida lo que pida el `limit=`. El
+// worker tenía 44 consultas con límites de 2.000 a 50.000 que creían traer todo y traían las
+// primeras 1.000: el resumen de salud decía "drenó 1000" con 1.876 procesados, "next_day
+// 1000" con 1.365, y la suma por fuente daba exactamente 1.000. Esto pagina con Range hasta
+// `max` o hasta que una página venga corta. Si una página falla devuelve null — nunca una
+// lista parcial que parezca entera, que es justo el error que arregla.
+async function _traerTodo(url, headers, { max = 20000, pagina = 1000 } = {}) {
+  const limpia = String(url).replace(/[&?]limit=\d+/g, "");
+  const out = [];
+  for (let desde = 0; desde < max; desde += pagina) {
+    let r;
+    try { r = await fetch(limpia, { headers: { ...headers, "Range-Unit": "items", "Range": `${desde}-${desde + pagina - 1}` } }); }
+    catch { return null; }
+    if (r.status === 416) break;                       // más allá del final
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    if (!Array.isArray(j)) return null;
+    out.push(...j);
+    if (j.length < pagina) break;
+  }
+  return out;
+}
+
+async function parteDelDia(token, opts = {}) {
   const cfg = await getConfig(token);
   if (String(cfg.parte_diario_enabled ?? "true") === "false") return;
   const hoy = _madridDateStr();
-  if ((cfg.parte_diario_ultimo || "") === hoy) return;          // uno por día
-  if (_spainHour() < 21) return;                                        // al cierre de la jornada
+  // `parte_forzar_ahora=true` en la config (o opts.forzar desde un test) lo manda YA, sin
+  // esperar las 21 ni respetar el "uno por día". Sirve para pedirlo a mano y para probarlo.
+  const forzar = !!opts.forzar || String(cfg.parte_forzar_ahora || "") === "true";
+  if (!forzar && (cfg.parte_diario_ultimo || "") === hoy) return;          // uno por día
+  if (!forzar && _spainHour() < 21) return;                                 // al cierre de la jornada
   // ⚠️ LA MARCA SE PONE AL FINAL, NO ACÁ (Maxi 2026-08-25). Se marcaba el día como
   // "parte enviado" ANTES de armarlo: si algo fallaba en el medio —una consulta, el mail—
   // ese día simplemente no había parte y nadie se enteraba, porque el guard de arriba ya
@@ -9220,18 +9247,32 @@ async function parteDelDia(token) {
   // es anterior a hoy, cuando el MB la abrió le respondió la caché.
   const _cacheAntes = new Set();
   try {
-    const _tc = await fetch(
-      // ⚠️ El tope está POR ENCIMA de la tabla a propósito (hoy 33.956 filas contra 40.000) y
-      // se avisa si se acerca: si algún día lo pasa, esto devuelve una lista parcial y el
-      // informe diría que se midieron de verdad URLs que salieron de la caché.
-      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeHoy}&select=domain&order=domain&limit=40000`,
-      { headers: auth }
-    ).then(r => r.ok ? r.json() : []).catch(() => []);
-    for (const c of (Array.isArray(_tc) ? _tc : [])) _cacheAntes.add(String(c.domain || "").toLowerCase());
-    if (Array.isArray(_tc) && _tc.length >= 39000) {
-      log(`⚠️ caché de tráfico: ${_tc.length} filas, cerca del tope de 40.000 — hay que paginar esta consulta antes de que trunque`);
-    }
+    // ⚠️ El `limit=40000` de antes nunca trajo más de 1.000 filas (tope de PostgREST): con
+    // 36.086 dominios en caché, el parte contaba como "medidas hoy" a casi todas las URLs que
+    // en realidad salieron de la caché. Ahora se pagina.
+    const _tc = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeHoy}&select=domain&order=domain`,
+      auth, { max: 80000 }
+    )) || [];
+    for (const c of _tc) _cacheAntes.add(String(c.domain || "").toLowerCase());
+    if (_tc.length >= 78000) log(`⚠️ caché de tráfico: ${_tc.length} filas, cerca del tope de 80.000 de _traerTodo — subir el max`);
   } catch {}
+
+  // ⚠️ ESTAS CONSTANTES VAN ANTES DEL RECORRIDO, NO DESPUÉS (2026-09-04) ──────────────────
+  // Estaban declaradas 80 líneas más abajo, y `_ANGLO_PARTE` se usaba adentro del bucle del
+  // historial. Con `const`, usar antes de declarar tira ReferenceError; el catch del loop lo
+  // convertía en una línea de log y nada más. Resultado: el parte del día NO SALIÓ NI UNA VEZ
+  // desde el 25/08 (el día en que se agregó el bloque), sin ping, sin alerta, sin nadie que lo
+  // notara — `parte_diario_ultimo` quedó clavado en 2026-08-25. Descubierto al certificar el
+  // mail diario; hay un test que carga el worker entero y lo manda con datos falsos.
+  const _HUECO_MIN = parseInt(cfg.parte_hueco_minutos || "30", 10) || 30;
+  const _JORNADA_H = parseFloat(cfg.parte_jornada_horas || "9") || 9;   // 09:00 a 18:00 AR
+  const _JORNADA_MIN = Math.round(_JORNADA_H * 60);
+  // Geos fuera del foco: anglosajón y Norteamérica. Acepta el código y el nombre, porque el
+  // historial guarda a veces uno y a veces otro.
+  const _ANGLO_PARTE = /^(US|CA|GB|UK|AU|NZ|IE|United States|Canada|United Kingdom|Australia|New Zealand|Ireland)$/i;
+  const _horaAr = (t) => new Date(t).toLocaleTimeString("es-AR", {
+    timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit", hour12: false });
 
   // Los sitios que miraron (con geo). No todos terminan en un envío.
   const _hist = await fetch(
@@ -9318,17 +9359,9 @@ async function parteDelDia(token) {
   // ⚠️ EN HORA DE BUENOS AIRES a propósito, no Madrid. El resto del parte usa Madrid porque
   // es la ventana horaria del AGENTE; esto es sobre personas que están en Argentina, y
   // mostrarles su propio día en otro huso sería inútil.
-  const _HUECO_MIN = parseInt(cfg.parte_hueco_minutos || "30", 10) || 30;
-  // La jornada de referencia, en horas. Sirve para que "poca inactividad" no se confunda con
-  // "trabajó bien": lo que importa es cuánto de la jornada tuvo actividad, no si los ratos
-  // sueltos estaban pegados entre sí.
-  const _JORNADA_H = parseFloat(cfg.parte_jornada_horas || "9") || 9;   // 09:00 a 18:00 AR
-  const _JORNADA_MIN = Math.round(_JORNADA_H * 60);
-  // Geos fuera del foco: anglosajón y Norteamérica. Acepta el código y el nombre, porque el
-  // historial guarda a veces uno y a veces otro.
-  const _ANGLO_PARTE = /^(US|CA|GB|UK|AU|NZ|IE|United States|Canada|United Kingdom|Australia|New Zealand|Ireland)$/i;
-  const _horaAr = (t) => new Date(t).toLocaleTimeString("es-AR", {
-    timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit", hour12: false });
+  // La jornada de referencia (`_JORNADA_MIN`) sirve para que "poca inactividad" no se confunda
+  // con "trabajó bien": lo que importa es cuánto de la jornada tuvo actividad, no si los ratos
+  // sueltos estaban pegados entre sí. Las constantes están declaradas arriba del historial.
   for (const [, d] of _porPersona) {
     const ms = (d.momentos || []).sort((a, b) => a - b);
     d.huecos = [];
@@ -9361,10 +9394,10 @@ async function parteDelDia(token) {
   const _contactadosAlguna = new Set();
   try {
     const _c30 = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
-    const _st = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain,send_date&limit=50000`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    for (const f of (Array.isArray(_st) ? _st : [])) {
+    // Mismo tope de 1.000 que arriba: con 4.192 filas en sendtrack, "ya contactados" miraba
+    // sólo un cuarto. Paginado.
+    const _st = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain,send_date`, auth, { max: 60000 })) || [];
+    for (const f of _st) {
       const d = String(f.domain || "").toLowerCase();
       if (!d) continue;
       _contactadosAlguna.add(d);
@@ -9733,6 +9766,7 @@ async function parteDelDia(token) {
       esProspeccion: false,
     });
     await setConfigValue(token, "parte_diario_ultimo", hoy).catch(() => {});
+    if (String(cfg.parte_forzar_ahora || "") === "true") await setConfigValue(token, "parte_forzar_ahora", "false").catch(() => {});
     // Late también cuando sale bien: un job que sólo avisa al fallar es indistinguible de uno
     // que dejó de correr, que es exactamente lo que pasó durante 9 días.
     await saludPing(token, "parte_diario", { status: "ok", cadenciaMin: 1440, detalle: "parte enviado" }).catch(() => {});
@@ -23539,11 +23573,14 @@ async function vigilarReputacion(token) {
     if (_pisoDominio > REBOTE_TECHO_DOMINIO && !_yaPausado) {
       await saludAlerta(token, {
         clave: "reputacion-dominio", severidad: "error",
-        titulo: `🔥 Rebote del ${(tasaDominio * 100).toFixed(1)}% — envío PAUSADO 12h`,
-        cuerpo: `${totReb} rebotes sobre ${totEnv} envíos en 7 días (piso estadístico ${(_pisoDominio * 100).toFixed(1)}%, techo ${REBOTE_TECHO_DOMINIO * 100}%).\nLa reputación en Gmail es por DOMINIO: esto arrastra a los tres buzones y también al correo con clientes.\nRevisá la verificación de direcciones antes de reanudar.`,
+        // El título decía "envío PAUSADO 12h" y llevaba 3 días en el mail como crónico, cuando
+        // desde el 02/09 el rebote NO frena nada. Un aviso que anuncia una pausa que no existe
+        // hace buscar una causa que no está.
+        titulo: `🔥 Rebote del ${(tasaDominio * 100).toFixed(1)}% en 7 días — sólo aviso, el envío NO se frena`,
+        cuerpo: `${totReb} rebotes sobre ${totEnv} envíos en 7 días (piso estadístico ${(_pisoDominio * 100).toFixed(1)}%, techo ${REBOTE_TECHO_DOMINIO * 100}%).\nLa reputación en Gmail es por DOMINIO: esto arrastra a los tres buzones y también al correo con clientes.\nPor regla del 02/09 no se pausa; lo que baja el rebote es la verificación de direcciones antes de enviar.`,
         metadata: { tasa: +tasaDominio.toFixed(4), envios: totEnv, rebotes: totReb },
       });
-      log(`🔥 REPUTACIÓN: rebote ${(tasaDominio * 100).toFixed(1)}% → agente pausado 12h`);
+      log(`🔥 REPUTACIÓN: rebote ${(tasaDominio * 100).toFixed(1)}% en 7 días — se avisa, no se frena`);
     } else {
       // ── Un buzón puntual pasado de rosca ───────────────────────────────────
       for (const [mb, d] of Object.entries(porBuzon)) {
@@ -24071,53 +24108,85 @@ async function _boletinPorSeccion(token) {
   try {
     const cfg = await getConfig(token).catch(() => ({}));
 
-    // ── ENVÍO ─────────────────────────────────────────────────────────────
-    const _envios = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${_hoyMadrid}&select=user_email&limit=500`);
+    // ── ENVÍO: AYER ENTERO, Y HOY HASTA AHORA (2026-09-04, certificación del mail) ────────
+    // El resumen sale a la mañana (10:17 Madrid el 04/09) y "ENVÍO (hoy)" contaba desde la
+    // medianoche: a esa hora es "0 de 40 (nadie)" SIEMPRE, porque los slots del agente son de
+    // 13 a 17. Un rojo estructural que no dice nada. El día que se juzga es AYER, completo;
+    // lo de hoy se muestra aparte, con la hora hasta la que llega.
+    const _ayerMadrid = new Date(Date.parse(_hoyMadrid) - 86_400_000).toISOString();
+    const _envAyer = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${_ayerMadrid}&created_at=lt.${_hoyMadrid}&select=user_email`, auth)) || [];
+    const _envHoy  = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${_hoyMadrid}&select=user_email`, auth)) || [];
     const _porMb = {};
-    for (const e of _envios) { const u = String(e.user_email || "?").split("@")[0]; _porMb[u] = (_porMb[u] || 0) + 1; }
+    for (const e of _envAyer) { const u = String(e.user_email || "?").split("@")[0]; _porMb[u] = (_porMb[u] || 0) + 1; }
     const _cupo = parseInt(cfg.agent_max_per_day || "20", 10) || 20;
     // El objetivo sale de cuántos buzones tiene el agente HOY, no de un 3 fijo: si no, el
     // boletín pide 60 con dos buzones y marca 🔴 un día perfecto.
     let _nBuzones = 0;
     try { _nBuzones = (JSON.parse(cfg.agent_enabled_users || "[]") || []).length; } catch {}
     if (_nBuzones < 1) _nBuzones = 1;
-    const _tot = _envios.length, _obj = _cupo * _nBuzones;
-    _nota("ENVÍO (hoy)", _tot >= _obj * 0.9 ? "✅" : _tot >= _obj * 0.6 ? "🟡" : "🔴", [
-      `${_tot} de ${_obj} (${Object.entries(_porMb).map(([u, n]) => `${u} ${n}`).join(" · ") || "nadie"})`,
-      ...(_tot < _obj * 0.9 ? ["Qué mirar: los skips en ERRORES CONCRETOS de abajo dicen qué lo frenó."] : []),
+    const _tot = _envAyer.length, _obj = _cupo * _nBuzones;
+    const _ayerFinde = ["Sat", "Sun"].includes(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", weekday: "short" }).format(new Date(Date.now() - 86_400_000)));
+    const _hhmm = new Date().toLocaleTimeString("es-ES", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit" });
+    _nota("ENVÍO (ayer, día completo)", _ayerFinde ? "ℹ️" : _tot >= _obj * 0.9 ? "✅" : _tot >= _obj * 0.6 ? "🟡" : "🔴", [
+      _ayerFinde
+        ? `Ayer fue fin de semana: el agente no manda. Hoy hasta las ${_hhmm} (Madrid): ${_envHoy.length}.`
+        : `${_tot} de ${_obj} (${Object.entries(_porMb).map(([u, n]) => `${u} ${n}`).join(" · ") || "nadie"}) · hoy hasta las ${_hhmm} (Madrid): ${_envHoy.length}`,
+      ...(!_ayerFinde && _tot < _obj * 0.9 ? ["Qué mirar: ENVÍOS SALTEADOS, abajo, dice qué lo frenó (con el motivo más frecuente primero)."] : []),
     ]);
 
     // ── DESCUBRIMIENTO (feeders) ──────────────────────────────────────────
-    const _proc = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=source,status&limit=5000`);
+    // Dos números que antes se mostraban como si fueran el mismo: las ALTAS en Prospects (por
+    // fuente, de toolbar_review_queue) y el EMBUDO de la cola (procesados→pasaron, de
+    // toolbar_csv_queue). El 04/09 decía "275 altas" y la suma por fuente daba 195 — y encima
+    // esa suma era exactamente 1.000 procesados: el tope de PostgREST. Ahora cada uno con su
+    // nombre, y sin tope.
+    const _proc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=source,status`, auth)) || [];
     const _porSrc = {};
     for (const f of _proc) {
       const k = String(f.source || "?").replace(/^auto_feeder_/, "");
       (_porSrc[k] = _porSrc[k] || { n: 0, ok: 0 }).n++;
       if (f.status === "done") _porSrc[k].ok++;
     }
-    const _altas = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=id`);
+    const _altasFilas = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=source`, auth)) || [];
+    const _altas = _altasFilas.length;
+    const _altasPor = {};
+    for (const a of _altasFilas) { const k = String(a.source || "?"); _altasPor[k] = (_altasPor[k] || 0) + 1; }
     const _fuentes = Object.entries(_porSrc).sort((a, b) => b[1].n - a[1].n);
-    _nota("DESCUBRIMIENTO", (_altas ?? 0) >= 15 ? "✅" : (_altas ?? 0) >= 5 ? "🟡" : "🔴", [
-      `${_altas ?? "?"} alta(s) nuevas en Prospects en 24h.`,
-      `Por fuente (procesados→pasaron): ${_fuentes.map(([k, v]) => `${k} ${v.n}→${v.ok}`).join(" · ") || "nada procesado"}`,
-      ...((_altas ?? 0) < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en toolbar_diag_descartes."] : []),
+    _nota("DESCUBRIMIENTO (24h)", _altas >= 15 ? "✅" : _altas >= 5 ? "🟡" : "🔴", [
+      `${_altas} alta(s) en Prospects: ${Object.entries(_altasPor).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(" · ") || "ninguna"}`,
+      `La cola procesó ${_proc.length} (→ pasaron): ${_fuentes.map(([k, v]) => `${k} ${v.n}→${v.ok}`).join(" · ") || "nada procesado"}`,
+      ...(_altas < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en DESCARTES DEL DESCUBRIMIENTO, abajo."] : []),
     ]);
 
     // ── BÚSQUEDA DE EMAILS ────────────────────────────────────────────────
     const _mudos = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
     const _rescatados = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desde24}&select=id`);
-    const _diag24 = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${desde24}&select=motivo&limit=500`);
+    const _diag24 = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${desde24}&select=motivo`, auth)) || [];
     const _porMot = {};
     for (const d of _diag24) _porMot[d.motivo] = (_porMot[d.motivo] || 0) + 1;
-    _nota("BÚSQUEDA DE EMAILS", (_rescatados ?? 0) > 0 || (_mudos ?? 1) < 100 ? "✅" : "🟡", [
-      `${_rescatados ?? "?"} email(s) encontrados hoy a leads que no tenían · quedan ${_mudos ?? "?"} sin email.`,
-      ...(Object.keys(_porMot).length ? [`Por qué fallan: ${Object.entries(_porMot).map(([m, n]) => `${m} ${n}`).join(" · ")}`] : []),
+    // Por FUENTE: es lo que dice si las vías nuevas (Google fuera del sitio, rol con MX, Apollo
+    // quemando el ciclo) traen algo o no. Sale de email_sources de los rescatados en 24h.
+    const _resc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desde24}&select=email_sources`, auth)) || [];
+    const _porFuenteResc = {};
+    for (const r of _resc) {
+      const vals = Object.values(r.email_sources || {}).map(v => _normSrc(v).toLowerCase()).filter(Boolean);
+      const f = vals[vals.length - 1] || "?";     // la última fuente escrita es la del rescate
+      _porFuenteResc[f] = (_porFuenteResc[f] || 0) + 1;
+    }
+    _nota("BÚSQUEDA DE EMAILS (24h)", (_rescatados ?? 0) > 0 || (_mudos ?? 1) < 100 ? "✅" : "🟡", [
+      `${_rescatados ?? "?"} email(s) encontrados a leads que no tenían · quedan ${_mudos ?? "?"} sin email.`,
+      ...(Object.keys(_porFuenteResc).length ? [`Quién los encontró: ${Object.entries(_porFuenteResc).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(" · ")}`] : []),
+      ...(Object.keys(_porMot).length ? [`Por qué fallan (${_diag24.length} intentos): ${Object.entries(_porMot).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(" · ")}`] : []),
     ]);
 
     // ── COLA ──────────────────────────────────────────────────────────────
-    const _cola = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool,next_day,error)&select=status&limit=10000`);
+    // Conteos exactos por estado (un count por estado): traer las filas se cortaba en 1.000
+    // y el mail decía "next_day 1000" con 1.365 reales.
     const _porSt = {};
-    for (const c of _cola) _porSt[c.status] = (_porSt[c.status] || 0) + 1;
+    for (const st of ["pending", "processing", "waiting_pool", "next_day", "error"]) {
+      const n = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.${st}&select=id`);
+      if (n) _porSt[st] = n;
+    }
     const _drenado = _proc.length;
     _nota("COLA", _drenado >= 100 ? "✅" : _drenado >= 30 ? "🟡" : "🔴", [
       `Drenó ${_drenado} en 24h. Ahora: ${Object.entries(_porSt).map(([k, v]) => `${k} ${v}`).join(" · ") || "vacía"}.`,
@@ -24129,10 +24198,18 @@ async function _boletinPorSeccion(token) {
     let _mSync = null;
     try { _mSync = JSON.parse(cfg.monday_sync_ultimo || "null"); } catch {}
     if (_mSync) {
+      // ── EL RECICLADO NO ES UN PROBLEMA CUANDO CUMPLE SU TECHO (2026-09-04) ────────────
+      // Marcaba 🔴 con 4.564 esperando "objetivo: cero", pero el barrido tiene un techo diario
+      // a propósito (700) y cumplirlo es lo esperado: un rojo por diseño se deja de leer. Rojo
+      // sólo si el dato es viejo (el barrido no corrió) o si entró mucho menos que el techo.
+      // Y el nombre: los ciclos cerrados ya no vienen de Monday, vienen del CRM.
       const _resta = Math.max(0, (_mSync.reprospectables || 0) - (_mSync.encolados || 0));
-      _nota("MONDAY → PROSPECTS", _resta === 0 ? "✅" : _resta < 1000 ? "🟡" : "🔴", [
-        `Barrido ${_mSync.fecha}: ${_mSync.encolados} entraron, ${_resta} siguen esperando (objetivo: cero).`,
-        ...(_resta > 0 ? [`A ${_mSync.encolados || 1}/día se vacía en ~${Math.ceil(_resta / Math.max(1, _mSync.encolados || 1))} día(s).`] : []),
+      const _edad = Math.floor((Date.now() - Date.parse(`${_mSync.fecha}T12:00:00Z`)) / 86_400_000);
+      const _techo = Number(_mSync.techo || 0);
+      const _cumplio = _resta === 0 || (_techo && (_mSync.encolados || 0) >= _techo * 0.9) || (_resta > 0 && (_mSync.encolados || 0) >= Math.min(_resta, _techo || Infinity) * 0.9);
+      _nota("CICLOS FINALIZADOS → PROSPECTS (CRM)", _edad >= 2 ? "🔴" : _cumplio ? "✅" : "🟡", [
+        `Barrido del ${_mSync.fecha}${_edad >= 2 ? ` — ⚠️ hace ${_edad} días que no corre` : _edad === 1 ? " (ayer)" : ""}: ${_mSync.encolados} entraron (techo ${_techo || "?"}/día), ${_resta} elegibles siguen esperando su turno.`,
+        ...(_resta > 0 ? [`A este ritmo, ~${Math.ceil(_resta / Math.max(1, _mSync.encolados || 1))} día(s) para vaciar la espera. Es el techo diario, no una falla.`] : []),
       ]);
     }
 
@@ -24153,15 +24230,15 @@ async function _boletinPorSeccion(token) {
     // sobre 30 días — con menos ventana el % baila demasiado para decidir nada.
     try {
       const _d30 = new Date(Date.now() - 30 * 86400_000).toISOString();
-      const _rt = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${_d30}&select=email_sent_to,source,responded_at,response_type&limit=5000`);
+      const _rt = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${_d30}&select=email_sent_to,source,responded_at,response_type`, auth)) || [];
       if (Array.isArray(_rt) && _rt.length >= 30) {
+        // El MISMO clasificador que usa el envío para ordenar (lib/email.js), no una copia con
+        // otra regex: acá `redaccion@` contaba como genérico y en el ranking vale 115.
+        const _NOMBRE_TIPO = { apollo: "manual (elegido a mano)", rol: "rol comercial", persona: "persona con nombre", generico: "genérico (info@)" };
         const _tipoDe = (r) => {
-          const e = String(r.email_sent_to || "").toLowerCase();
           if (r.source === "manual_extra") return "manual (adicional)";
-          if (r.source === "apollo") return "apollo (persona)";
-          if (/^(publicidad|pub|ads|adsales|sales|ventas|comercial|marketing|anuncie|reklam|werbung)@/.test(e)) return "rol comercial";
-          if (/^(info|contact|contacto|contato|hello|hola|mail|admin|general|redaccion|redacao|prensa|press)@/.test(e)) return "genérico (info@)";
-          return "persona con nombre";
+          const t = _tipoDeEmailParaRanking(String(r.email_sent_to || ""), _normSrc(r.source));
+          return (r.source === "apollo" ? "apollo · " : "") + (_NOMBRE_TIPO[t] || t);
         };
         const _agg = {};
         for (const r of _rt) {
@@ -24215,8 +24292,9 @@ async function _boletinPorSeccion(token) {
     // buzón rebotaba seis veces más que otro y el mail diario no lo decía en ningún lado.
     // Va POR BUZÓN a propósito: el promedio de los tres escondía justamente ese caso.
     try {
-      const _envs = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to&limit=5000`);
-      const _reb  = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email&limit=3000`);
+      // Sólo envíos del AGENTE (regla del user: estas métricas son del agente); sin tope de filas.
+      const _envs = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to`, auth)) || [];
+      const _reb  = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email`, auth)) || [];
       const _setReb = new Set((_reb || []).map(x => String(x.email || "").toLowerCase()));
       const _porMb = {};
       for (const e of (_envs || [])) {
@@ -24229,10 +24307,36 @@ async function _boletinPorSeccion(token) {
         .sort((a, b) => b.pct - a.pct);
       if (_filas.length) {
         const _peor = _filas[0].pct;
-        _nota("REBOTES (7d)", _peor >= 5 ? "🔴" : _peor >= 3 ? "🟡" : "✅",
+        _nota("REBOTES (7d, envíos del agente)", _peor >= 5 ? "🔴" : _peor >= 3 ? "🟡" : "✅",
           [_filas.map(f => `${f.u} ${f.pct.toFixed(1)}% (${f.r}/${f.n})`).join(" · "),
-           _peor >= 3 ? "Un buzón muy por encima del resto suele ser la fuente de sus leads, no el buzón." : "Todos por debajo del 3%."]);
+           _peor >= 3 ? "Un buzón muy por encima del resto suele ser la fuente de sus leads, no el buzón. El rebote NO frena el envío (regla del 02/09): sólo se informa." : "Todos por debajo del 3%."]);
       }
+    } catch {}
+
+    // ── EL PLAN, DÍA A DÍA (2026-09-04) ────────────────────────────────────────────────
+    // Lo que se cambió el 04/09 tiene cada uno su medida, y esta es la sección donde se ve
+    // si mueven algo: Apollo quemando el ciclo, la persona por Google, el rol con MX, el
+    // barrido del pool, el sellers.json de Google, la excepción de AdSense y Sudáfrica.
+    // Sale del mismo lugar que el resto: toolbar_health (el último ping de cada job) y
+    // conteos de 24h en Prospects. Cuando alguno lleve 30 días en cero, se saca.
+    try {
+      const _jobsPlan = ["apollo_quemar_ciclo", "barrido_no_publisher", "sellers_google", "fetch_page_content"];
+      const _hp = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_health?job=in.(${_jobsPlan.join(",")})&select=job,last_status,last_detail,last_run_at`);
+      const _porJob = {}; for (const h of (_hp || [])) _porJob[h.job] = h;
+      const _lp = [];
+      const _hace = (iso) => { const m = Math.round((Date.now() - Date.parse(iso || "")) / 60000); return Number.isFinite(m) ? (m < 90 ? `hace ${m} min` : `hace ${Math.round(m / 60)} h`) : "sin ping"; };
+      const _linea = (job, nombre) => { const h = _porJob[job]; _lp.push(h ? `${h.last_status === "fail" ? "🔴" : h.last_status === "warn" ? "🟡" : "·"} ${nombre}: ${String(h.last_detail || "").slice(0, 150)} (${_hace(h.last_run_at)})` : `· ${nombre}: todavía no corrió`); };
+      _linea("apollo_quemar_ciclo", "Apollo quemando el ciclo");
+      _linea("barrido_no_publisher", "Barrido del pool");
+      _linea("sellers_google", "Google sellers.json");
+      const _adsense = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&ad_networks=cs.${encodeURIComponent('["⚠️ sin ads.txt · AdSense activo"]')}&select=id`);
+      const _za = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&domain=like.*.za&select=id`);
+      const _barridoMarcas = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?suspect_reason=like.barrido:*&suspect_checked_at=gte.${desde24}&select=id`);
+      _lp.push(`· Entraron sin ads.txt por AdSense activo: ${_adsense ?? "?"} · sitios .za nuevos: ${_za ?? "?"} · marcados ⚠️ por el barrido: ${_barridoMarcas ?? "?"} (24h)`);
+      _lp.push(`· Emails nuevos por vía (24h): ${["apollo", "serper_persona", "rol_mx", "google_contact", "scrape"].map(f => `${f} ${_porFuenteResc[f] || 0}`).join(" · ")}`);
+      if (_porJob.fetch_page_content && _porJob.fetch_page_content.last_status === "fail") _lp.unshift(`🔴 fetchPageContent con error interno: ${String(_porJob.fetch_page_content.last_detail || "").slice(0, 140)}`);
+      const _algunFail = _jobsPlan.some(j => _porJob[j] && _porJob[j].last_status === "fail");
+      _nota("EL PLAN DEL 04/09, DÍA A DÍA", _algunFail ? "🔴" : "ℹ️", _lp);
     } catch {}
 
     // ── CRM PROPIO ──────────────────────────────────────────────────────────────────────
@@ -24265,15 +24369,24 @@ async function _boletinPorSeccion(token) {
     try {
       const _ayer = new Date(Date.now() - 24 * 3600_000).toISOString().slice(0, 10);
       const _g = await _rows(`${SUPABASE_URL}/rest/v1/toolbar_gasto_claude_vista?dia=eq.${_ayer}&order=usd_aprox.desc&limit=20`);
-      if (_g.length) {
+      // El total que vale es el del PROXY (lo que se factura); el desglose por motivo es lo
+      // que el worker anotó. El 03/09 el mail decía "US$0,01 · 27 llamadas" mientras el proxy
+      // había contado 35, y la alerta de al lado hablaba de 1.777 sin explicar del 02/09: dos
+      // números del mismo gasto sin decir cuál era cuál.
+      const _cru = (await _rows(`${SUPABASE_URL}/rest/v1/toolbar_gasto_claude_cruce?dia=eq.${_ayer}`))[0] || null;
+      if (_g.length || (_cru && _cru.proxy > 0)) {
         const _usd = _g.reduce((a, x) => a + Number(x.usd_aprox || 0), 0);
         const _lin = _g.slice(0, 8).map(x =>
           `${String(x.motivo).padEnd(22)} ${String(x.fuente).padEnd(9)} ${String(x.llamadas).padStart(5)} llam · `
           + `${(Number(x.entrada) / 1000).toFixed(0)}k in / ${(Number(x.salida) / 1000).toFixed(0)}k out · US$${Number(x.usd_aprox).toFixed(3)}`);
+        const _cab = _cru
+          ? `Proxy: ${_cru.proxy} llamadas · con motivo anotado ${_cru.con_motivo} (${Math.max(0, 100 - Number(_cru.pct_sin_explicar || 0)).toFixed(0)}% explicado)`
+          : "Proxy: sin dato del cruce";
         // El titular es el motivo más CARO, no el más frecuente: para optimizar hay que mirar
         // dónde se va la plata, y no siempre coincide con lo que más se llama.
-        _nota(`GASTO DE CLAUDE (${_ayer})`, _usd >= 5 ? "🟡" : "ℹ️", [
-          `US$${_usd.toFixed(2)} aprox · lo más caro: ${_g[0].motivo} (US$${Number(_g[0].usd_aprox).toFixed(3)})`,
+        _nota(`GASTO DE CLAUDE (${_ayer})`, _usd >= 5 || (_cru && Number(_cru.pct_sin_explicar) > 25) ? "🟡" : "ℹ️", [
+          _cab,
+          _g.length ? `US$${_usd.toFixed(2)} aprox de lo anotado · lo más caro: ${_g[0].motivo} (US$${Number(_g[0].usd_aprox).toFixed(3)})` : "Sin desglose por motivo ese día (el contador por motivo existe desde el 03/09).",
           ..._lin,
         ]);
       }
@@ -24430,32 +24543,36 @@ async function enviarResumenSalud(token) {
       const _desdeResumenISO = new Date(Date.now() - RESUMEN_SALUD_CADA_HORAS * 3600_000).toISOString();
 
       // 1) Por qué los leads se quedan sin email — el motivo REAL, agrupado.
-      const _sinMail = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&email_ultimo_motivo=not.is.null&select=domain,email_ultimo_motivo&limit=400`,
-        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      // Esto es el STOCK de pendientes sin email, agrupado por el último motivo — no es de
+      // 24h. El mail lo mostraba sin decirlo, al lado de dos conteos de 24h del mismo
+      // concepto con otros números (154/139/78 · 167/165/67 · 82/86/32), y encima cortado en
+      // 400 filas (167+165+67+1 = 400). Ahora dice lo que es y cuenta todo.
+      const _sinMail = (await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&email_ultimo_motivo=not.is.null&select=domain,email_ultimo_motivo`,
+        _auth)) || [];
       if (Array.isArray(_sinMail) && _sinMail.length) {
         const _porMotivo = {};
         for (const l of _sinMail) {
           // Los motivos con detalle traen el ejemplo pegado; se agrupa por el prefijo.
           const _k = String(l.email_ultimo_motivo || "").split(":")[0];
-          (_porMotivo[_k] = _porMotivo[_k] || { n: 0, ej: [] }).n++;
-          if (_porMotivo[_k].ej.length < 2) _porMotivo[_k].ej.push(l.domain);
+          (_porMotivo[_k] = _porMotivo[_k] || { n: 0, ej: new Set() }).n++;
+          if (_porMotivo[_k].ej.size < 2) _porMotivo[_k].ej.add(l.domain);
         }
         const _top = Object.entries(_porMotivo).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
-        _errs.push("SIN EMAIL — por qué:");
-        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n} caso(s). Ej: ${v.ej.join(", ")}`);
+        _errs.push(`SIN EMAIL — el stock de ${_sinMail.length} pendientes sin email, por su último motivo (no es de hoy: es lo acumulado):`);
+        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}. Ej: ${[...v.ej].join(", ")}`);
       }
 
       // 1b) El comentario REAL de un caso concreto, para poder verificarlo a mano.
       // Un porcentaje no se puede comprobar; un dominio con su explicación sí.
-      const _diagSE = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${_desdeResumenISO}&select=domain,motivo,comentario&order=created_at.desc&limit=200`,
-        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      const _diagSE = (await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${_desdeResumenISO}&select=domain,motivo,comentario&order=created_at.desc`,
+        _auth)) || [];
       if (Array.isArray(_diagSE) && _diagSE.length) {
         const _porMot = {};
         for (const d of _diagSE) (_porMot[d.motivo] = _porMot[d.motivo] || []).push(d);
-        _errs.push("", "SIN EMAIL — un caso de cada tipo, para verificar:");
-        for (const [mot, arr] of Object.entries(_porMot).slice(0, 4)) {
+        _errs.push("", `SIN EMAIL — los ${_diagSE.length} intentos de las últimas 24h, un caso de cada tipo para verificar:`);
+        for (const [mot, arr] of Object.entries(_porMot).sort((a, b) => b[1].length - a[1].length).slice(0, 4)) {
           const ej = arr[0];
           _errs.push(`   · ${mot} (${arr.length} casos) — ej. ${ej.domain}`);
           if (ej.comentario) _errs.push(`     ${ej.comentario}`);
@@ -24463,33 +24580,37 @@ async function enviarResumenSalud(token) {
       }
 
       // 1c) Descartes del descubrimiento, con el motivo explicado.
-      const _diagDesc = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_diag_descartes?created_at=gte.${_desdeResumenISO}&select=domain,etapa,motivo,comentario&order=created_at.desc&limit=300`,
-        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      const _diagDesc = (await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_diag_descartes?created_at=gte.${_desdeResumenISO}&select=domain,etapa,motivo,comentario&order=created_at.desc`,
+        _auth)) || [];
       if (Array.isArray(_diagDesc) && _diagDesc.length) {
-        const _porEtapa = {};
-        for (const d of _diagDesc) (_porEtapa[d.etapa] = _porEtapa[d.etapa] || []).push(d);
-        _errs.push("", `DESCARTES DEL DESCUBRIMIENTO (${_diagDesc.length}) — por qué:`);
-        for (const [et, arr] of Object.entries(_porEtapa).sort((a, b) => b[1].length - a[1].length).slice(0, 4)) {
-          _errs.push(`   · ${et} → ${arr.length}. Ej: ${arr.slice(0, 2).map(x => x.domain).join(", ")}`);
-          if (arr[0].comentario) _errs.push(`     ${arr[0].comentario}`);
+        // Por MOTIVO y no por etapa: "geo_bloqueada 54" mezclaba Estados Unidos, Reino Unido y
+        // Rusia, y "tipo_de_negocio 18" mezclaba streaming con e-commerce. El motivo trae el
+        // detalle después de los dos puntos, y es lo que se necesita para decidir algo.
+        const _porMotivo = {};
+        for (const d of _diagDesc) (_porMotivo[d.motivo || d.etapa] = _porMotivo[d.motivo || d.etapa] || []).push(d);
+        _errs.push("", `DESCARTES DEL DESCUBRIMIENTO (${_diagDesc.length} en 24h) — por qué:`);
+        for (const [mot, arr] of Object.entries(_porMotivo).sort((a, b) => b[1].length - a[1].length).slice(0, 6)) {
+          _errs.push(`   · ${mot} → ${arr.length}. Ej: ${[...new Set(arr.map(x => x.domain))].slice(0, 2).join(", ")}`);
         }
+        const _ej = _diagDesc.find(x => x.comentario);
+        if (_ej) _errs.push(`     (por ejemplo, ${_ej.domain}: ${String(_ej.comentario).slice(0, 220)})`);
       }
 
       // 2) Por qué el agente saltea envíos.
-      const _skips = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&created_at=gte.${_desdeResumenISO}&select=reason,domain&limit=800`,
-        { headers: _auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+      const _skips = (await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&created_at=gte.${_desdeResumenISO}&select=reason,domain`,
+        _auth)) || [];
       if (Array.isArray(_skips) && _skips.length) {
         const _porRazon = {};
         for (const a of _skips) {
           const _k = String(a.reason || "(sin motivo)").split(":").slice(0, 2).join(":");
-          (_porRazon[_k] = _porRazon[_k] || { n: 0, ej: [] }).n++;
-          if (_porRazon[_k].ej.length < 2 && a.domain) _porRazon[_k].ej.push(a.domain);
+          (_porRazon[_k] = _porRazon[_k] || { n: 0, ej: new Set() }).n++;
+          if (_porRazon[_k].ej.size < 2 && a.domain) _porRazon[_k].ej.add(a.domain);
         }
         const _top = Object.entries(_porRazon).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
-        _errs.push("", "ENVÍOS SALTEADOS — por qué:");
-        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}${v.ej.length ? `. Ej: ${v.ej.join(", ")}` : ""}`);
+        _errs.push("", `ENVÍOS SALTEADOS (${_skips.length} en 24h) — por qué:`);
+        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}${v.ej.size ? `. Ej: ${[...v.ej].join(", ")}` : ""}`);
       }
 
       // 3) Lo que la cola no pudo procesar, con el error textual.
@@ -24701,14 +24822,16 @@ async function saludWatchdog(token) {
     if (atrasados.length) {
       await saludAlerta(token, {
         clave: "jobs-atrasados", severidad: "error",
-        titulo: `⏰ ${atrasados.length} trabajo(s) sin correr`,
+        // Con nombres: "1 trabajo(s) sin correr — desde hace 6 días" no dice cuál, y en la
+        // lista de crónicos sólo se ve el título.
+        titulo: `⏰ ${atrasados.length} trabajo(s) sin correr: ${atrasados.slice(0, 3).map(t => String(t).split(/[\s(:—]/)[0]).join(", ")}${atrasados.length > 3 ? "…" : ""}`,
         cuerpo: atrasados.join("\n"), metadata: { jobs: atrasados },
       });
     }
     if (fallando.length) {
       await saludAlerta(token, {
         clave: "jobs-fallando", severidad: "error",
-        titulo: `💥 ${fallando.length} trabajo(s) fallando`,
+        titulo: `💥 ${fallando.length} trabajo(s) fallando: ${fallando.slice(0, 3).map(t => String(t).split(/[\s(:—]/)[0]).join(", ")}${fallando.length > 3 ? "…" : ""}`,
         cuerpo: fallando.join("\n"), metadata: { jobs: fallando },
       });
     }
@@ -24718,7 +24841,7 @@ async function saludWatchdog(token) {
         // nada, con la señal correcta escrita en toolbar_health, y nadie se enteró
         // porque el aviso no salía del panel. Un motor que deja de producir es grave.
         clave: "jobs-rinden-poco", severidad: "error",
-        titulo: `📉 ${rindenPoco.length} trabajo(s) rindiendo por debajo`,
+        titulo: `📉 ${rindenPoco.length} trabajo(s) rindiendo por debajo: ${rindenPoco.slice(0, 3).map(t => String(t).split(/[\s(:—]/)[0]).join(", ")}${rindenPoco.length > 3 ? "…" : ""}`,
         cuerpo: rindenPoco.join("\n"), metadata: { jobs: rindenPoco },
       });
     }
