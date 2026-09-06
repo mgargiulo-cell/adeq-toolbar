@@ -25678,6 +25678,13 @@ async function main() {
     // (tiene su propio gate interno Domingo 20-21, así que no molesta el resto de la semana).
     try { await runFrozenWeeklyReport(token); } catch (e) { log(`⚠️ frozenReport: ${e.message}`); }
 
+    // ── EL RESUMEN DE SALUD SALE TODOS LOS DÍAS, FIN DE SEMANA INCLUIDO (2026-09-06) ────────
+    // Estaba después del portón de fin de semana: el sábado a la mañana el loop hacía `continue`
+    // antes de llegar, así que el resumen del viernes no salía nunca y el del lunes cubría el
+    // domingo. El user lo notó: "no me llegó el sábado el del viernes". Va acá arriba, antes de
+    // cualquier portón, a partir de las 8 de Madrid; su propio guard de 24h evita repetirlo.
+    if (_spainHour() >= 8) await enviarResumenSalud(token).catch(e => log(`⚠️ resumenSalud: ${e.message}`));
+
     // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
     // backfill, refresh, unfreezer.
