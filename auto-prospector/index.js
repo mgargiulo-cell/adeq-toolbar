@@ -9047,15 +9047,20 @@ async function parteDelDia(token, opts = {}) {
         const j = r.ok ? await r.json() : null;
         const dia = Number(j?.ultimas_24h ?? j?.hoy ?? NaN);
         const po = j?.por_origen && typeof j.por_origen === "object" ? j.por_origen : null;
-        _volumenBuzon.push({ casilla: c, dia: Number.isFinite(dia) ? dia : null, hora: Number(j?.ultima_hora ?? j?.count ?? NaN), porOrigen: po });
-      } catch { _volumenBuzon.push({ casilla: c, dia: null, hora: NaN, porOrigen: null }); }
+        // Los umbrales del cortacircuitos los manda el CRM (`corte_dia`, `corte_hora`): son los
+        // que aplica de verdad, así nadie inventa un umbral propio. 1.000/300 sólo si no vienen.
+        const corteDia = Number.isFinite(Number(j?.corte_dia)) && Number(j.corte_dia) > 0 ? Number(j.corte_dia) : 1000;
+        const corteHora = Number.isFinite(Number(j?.corte_hora)) && Number(j.corte_hora) > 0 ? Number(j.corte_hora) : 300;
+        _volumenBuzon.push({ casilla: c, dia: Number.isFinite(dia) ? dia : null, hora: Number(j?.ultima_hora ?? j?.count ?? NaN), porOrigen: po, corteDia, corteHora });
+      } catch { _volumenBuzon.push({ casilla: c, dia: null, hora: NaN, porOrigen: null, corteDia: 1000, corteHora: 300 }); }
     }
   }
+  const _fmtMil = (n) => Number(n).toLocaleString("es-ES");
   const _lineasVolumen = _volumenBuzon.map(v => {
     const _po = v.porOrigen ? ` (${Object.entries(v.porOrigen).map(([k, n]) => `${k} ${n}`).join(" · ")})` : "";
     return v.dia == null
       ? `   ${v.casilla.split("@")[0].padEnd(10)} 24h: sin dato del CRM${Number.isFinite(v.hora) ? ` · última hora ${v.hora}` : ""}`
-      : `   ${v.dia >= 1000 ? "🛑" : v.dia >= 500 ? "⚠️" : "✅"} ${v.casilla.split("@")[0].padEnd(10)} ${String(v.dia).padStart(4)} / 1.000 en 24h${_po}`;
+      : `   ${v.dia >= v.corteDia ? "🛑" : v.dia >= v.corteDia / 2 ? "⚠️" : "✅"} ${v.casilla.split("@")[0].padEnd(10)} ${String(v.dia).padStart(4)} / ${_fmtMil(v.corteDia)} en 24h${_po}`;
   });
 
   // 2. Prospects: lo que importa no es el total, es cuántos se pueden contactar.
@@ -9804,9 +9809,9 @@ async function parteDelDia(token, opts = {}) {
     v.casilla.split("@")[0],
     v.dia == null
       ? `sin dato del CRM${Number.isFinite(v.hora) ? ` · última hora ${v.hora}` : ""}`
-      : `${v.dia} / 1.000 en 24h${v.porOrigen ? ` (${Object.entries(v.porOrigen).map(([k, n]) => `${k} ${n}`).join(" · ")})` : ""}`,
-    v.dia == null ? _GRIS : v.dia >= 1000 ? _ROJO : v.dia >= 500 ? "#b26a00" : _VERDE,
-  ])) + `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">El cortacircuitos del CRM frena a 300/h y 1.000/24h por casilla; Workspace bloquea el buzón 24 h a las 2.000.</div>`) : ""}
+      : `${v.dia} / ${_fmtMil(v.corteDia)} en 24h${v.porOrigen ? ` (${Object.entries(v.porOrigen).map(([k, n]) => `${k} ${n}`).join(" · ")})` : ""}`,
+    v.dia == null ? _GRIS : v.dia >= v.corteDia ? _ROJO : v.dia >= v.corteDia / 2 ? "#b26a00" : _VERDE,
+  ])) + `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">El cortacircuitos del CRM frena a ${_fmtMil(_volumenBuzon[0].corteHora)}/h y ${_fmtMil(_volumenBuzon[0].corteDia)}/24h por casilla (umbrales que informa el CRM); Workspace bloquea el buzón 24 h a las 2.000.</div>`) : ""}
 
   ${_card("Buzón Prospects — Altas del día", _kv([
     ["Import (sellers.json, CSV)", altaImport],
