@@ -268,6 +268,11 @@ function resetAnalysisUI() {
   // 1) Resetear estado interno (state.X)
   state.duplicate     = null;
   state.mondayItemId  = null;
+  // El veredicto es de la web ANTERIOR: dejarlo puesto significaba que el recuadro seguía
+  // diciendo "prospectable" sobre un dominio que todavía no se consultó, y que el chequeo
+  // temprano se creyera ya pintado y no volviera a preguntar.
+  state.crmVeredicto  = null;
+  _crmVuelo           = null;
   // Los adicionales encolados son de la web anterior: si no se limpian, el push de la
   // siguiente le manda al CRM contactos que no son suyos. (El objeto igual lleva el dominio
   // adentro y se compara, pero limpiarlo acá es la barrera que corresponde.)
@@ -298,6 +303,14 @@ function resetAnalysisUI() {
   state.pitch              = "";
   state.generatedPitches   = [];
   state.decisionMakerName  = "";
+  // ── AL CAMBIAR DE URL EL BORRADOR SE DESBLOQUEA (2026-09-07, pedido del user) ──────────
+  // *"Al cambiar de url el borrador queda bloqueado, no autogenera el nuevo borrador en el
+  // idioma que corresponde."* `state.pitchTemplate` seguía apuntando a la plantilla del sitio
+  // anterior y el textarea seguía `readOnly` de cuando se aplicó: quedaba vacío Y trabado, sin
+  // nada que lo destrabara salvo apretar 🗑️ Limpiar a mano.
+  state.pitchTemplate      = null;
+  try { _desbloquearPitch(); } catch {}
+  try { _tradPitch?.invalidar?.(); } catch {}   // la traducción también era del mail anterior
 
   // 2) Limpiar TODOS los elementos de UI (display + inputs + selects)
   const textIds = [
@@ -361,7 +374,16 @@ function resetAnalysisUI() {
 
   // 7) Reset botón push-monday a "Send" (no "Update")
   const pushBtn = document.getElementById("btn-push-monday");
-  if (pushBtn) pushBtn.textContent = "🚀 Enviar a ADEQ";
+  if (pushBtn) {
+    pushBtn.textContent = "🚀 Enviar a ADEQ";
+    // Y sacarle el bloqueo de la web anterior: sin esto el botón arrancaba en rojo sobre un
+    // dominio todavía sin veredicto, y `dataset.textoPrevio` guardaba "⛔ No prospectable",
+    // que es lo que se restauraba después.
+    pushBtn.classList.remove("btn-bloqueado-crm");
+    delete pushBtn.dataset.textoPrevio;
+    pushBtn.title = "";
+  }
+  document.getElementById("btn-send-gmail")?.classList.remove("btn-bloqueado-crm");
 
   // 8) Esconder pulgares/status del pitch (solo se muestran después de generar)
   ["btn-pitch-like", "btn-pitch-dislike"].forEach(id => {
@@ -443,6 +465,15 @@ function runAnalysisPipeline() {
   _pipelineRunning = true;
   const startedDomain = state.domain;
 
+  // ── EL BORRADOR NO ESPERA AL ANÁLISIS (2026-09-07, pedido del user) ────────────────────
+  // *"Apenas cambio de url todo se tiene que actualizar lo más rápido posible técnicamente."*
+  // El idioma de la plantilla se resuelve con el TLD y el contexto de la página, y las 69
+  // plantillas del CRM ya están en memoria desde la primera carga: no hay ninguna razón para
+  // que el recuadro del mail espere a SimilarWeb, al scraper de emails y a los banners.
+  // Se llena YA con lo que se sabe, y se vuelve a resolver al final por si el análisis
+  // corrigió la GEO.
+  autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill temprano]", e?.message || e));
+
   const tasks = [
     runDuplicateCheck().catch(() => {}),
     runTrafficCheck().catch(() => {}),
@@ -454,6 +485,16 @@ function runAnalysisPipeline() {
 
   Promise.all(tasks).finally(() => {
     _pipelineRunning = false;
+    // ⚠️ Esto FALTABA: al cambiar de URL se re-corrían los seis chequeos y después no se
+    // llenaba nada. El formulario del CRM quedaba con los datos que el MB tuviera de antes y
+    // el borrador, en lo que hubiera puesto el primer intento. Al abrir la toolbar sí se hacía
+    // (está en el DOMContentLoaded); navegar a otra web era el camino que nadie completó.
+    if (state.domain === startedDomain) {
+      try { runAutoFill(); } catch (e) { console.warn("[AutoFill]", e?.message || e); }
+      // Segunda pasada del borrador: recién ahora se sabe la GEO y el idioma reales. Sólo si
+      // el MB no escribió lo suyo mientras tanto — pisarle el texto sería peor que no refrescar.
+      if (_pitchIntacto()) autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill]", e?.message || e));
+    }
     // Si durante el pipeline cambió el domain, re-correr el nuevo
     if (_pipelinePendingDomain && _pipelinePendingDomain !== startedDomain) {
       _pipelinePendingDomain = null;
@@ -3092,7 +3133,8 @@ function initTabs() {
 // ANÁLISIS CORE
 // ============================================================
 async function runDuplicateCheck() {
-  const el = document.getElementById("duplicate-result");
+  _pintarEsperaCrm();
+  _armarWatchdogCrm();
   try {
     // Usar caché de sesión solo si ya confirmamos que ES duplicado.
     // Si el caché dice "no encontrado", siempre se re-consulta el CRM porque
@@ -3102,13 +3144,16 @@ async function runDuplicateCheck() {
     if (sess?.duplicate?.found === true) {
       result = sess.duplicate;
     } else {
-      result = await buscarEnCrm(state.domain);
+      // `_crmConsultar` y no `buscarEnCrm`: comparte el pedido con el chequeo temprano en vez
+      // de hacer el mismo GET dos veces al abrir la toolbar.
+      result = await _crmConsultar(state.domain);
     }
     state.duplicate = result;
 
     // El veredicto, antes que cualquier otra cosa: es lo primero que el MB tiene que leer.
     // Sale de la columna `estado` de la ficha del CRM y de nada más (regla del user, 07/09).
     const veredicto = _veredictoCrm(result);
+    clearTimeout(_crmWatchdog);
     state.crmVeredicto = veredicto;
     _pintarVeredictoCrm(veredicto, result);
     // ⚠️ El bloqueo se aplica al FINAL, no acá: la rama de duplicado que viene abajo le pone
@@ -3159,6 +3204,7 @@ async function runDuplicateCheck() {
     console.warn("runDuplicateCheck:", e?.message || e);
     const v = { ok: false, duda: true, titulo: "No pude consultar el CRM",
                 detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
+    clearTimeout(_crmWatchdog);
     state.crmVeredicto = v;
     _pintarVeredictoCrm(v, null);
     _aplicarBloqueoCrm(v);
@@ -5285,6 +5331,17 @@ function _veredictoCrm(dup) {
            detalle: `Estado "${estado || "sin estado"}": no lo reconozco, no puedo decir si se puede escribir.`, clase: "crm-duda" };
 }
 
+// Mientras se pregunta. El "Checking..." del HTML no distinguía "estoy preguntando" de
+// "me colgué antes de preguntar": con este cartel, si el recuadro no cambia, ya se sabe que
+// la consulta arrancó.
+function _pintarEsperaCrm() {
+  const el = document.getElementById("duplicate-result");
+  if (!el) return;
+  if (state.crmVeredicto && !state.crmVeredicto.provisional) return;  // ya hay una respuesta real
+  el.className = "status-badge loading";
+  el.textContent = "⏳ Consultando ADEQ…";
+}
+
 function _pintarVeredictoCrm(v, dup) {
   const el = document.getElementById("duplicate-result");
   if (!el) return;
@@ -5295,11 +5352,33 @@ function _pintarVeredictoCrm(v, dup) {
     if (dup.fecha)     ctx.push(`último contacto ${esc(dup.fecha)}`);
     if (dup.board)     ctx.push(esc(dup.board));
   }
+  // Cuánto tardó. Es la prueba en pantalla de lo que el user pidió medir ("máximo 2-3
+  // segundos"): si algún día vuelve a arrastrarse, se ve en el recuadro y no hay que abrir
+  // la consola para enterarse.
+  if (typeof dup?.ms === "number") ctx.push(`ADEQ en ${(dup.ms / 1000).toFixed(1)}s`);
   el.className = `crm-veredicto ${v.clase}`;
   el.innerHTML =
     `<div class="crm-veredicto-t">${v.ok ? "✅" : v.duda ? "⚠️" : "⛔"} ${esc(v.titulo)}</div>` +
     `<div class="crm-veredicto-d">${esc(v.detalle)}</div>` +
-    (ctx.length ? `<div class="crm-veredicto-ctx">${ctx.join(" · ")}</div>` : "");
+    (ctx.length ? `<div class="crm-veredicto-ctx">${ctx.join(" · ")}</div>` : "") +
+    // Si no se pudo preguntar, el MB tiene que poder reintentar sin cerrar y abrir la toolbar.
+    (v.duda && !dup?.found ? `<button type="button" id="btn-crm-reintentar" class="crm-reintentar">🔄 Reintentar</button>` : "");
+  document.getElementById("btn-crm-reintentar")?.addEventListener("click", () => { _reintentarVeredictoCrm(); });
+}
+
+// Vuelve a preguntar, salteando la consulta que ya falló.
+async function _reintentarVeredictoCrm() {
+  const dom = state.domain;
+  if (!dom) return;
+  state.crmVeredicto = null;
+  _pintarEsperaCrm();
+  const r = await _crmConsultar(dom, { forzar: true });
+  if (state.domain !== dom) return;
+  state.duplicate = r;
+  const v = _veredictoCrm(r);
+  state.crmVeredicto = v;
+  _pintarVeredictoCrm(v, r);
+  _aplicarBloqueoCrm(v);
 }
 
 // El mensaje único cuando algo se niega a seguir porque el CRM dice que no.
@@ -5313,30 +5392,117 @@ function _motivoBloqueoCrm() {
 // Devuelve la MISMA forma que devolvía aquél para no tocar a los seis lugares que la
 // consumen — lo único nuevo es `descansando`, que Monday no sabía: un negocio cerrado hace
 // menos de 60 días existe pero NO hay que escribirle todavía.
+// ── LA CONSULTA TIENE RELOJ (2026-09-07, pedido del user) ────────────────────────────────
+// *"Nunca arroja resultado… máximo 2-3 segundos. Tiene que filtrar directo la url en prospects
+// ADEQ y ver la columna estado, nada más."* Del lado del servidor eso ya es lo que pasa: un
+// `.eq('domain', …)` con índice sobre `crm_board_prospects`, medido en 0,5-0,75 s. El agujero
+// estaba acá: `fetch` **sin timeout**. Un pedido que se cuelga (wifi que se cae, service worker
+// dormido, Vercel frío) no rechaza NUNCA, así que la promesa no se resolvía y el recuadro se
+// quedaba con el "Checking..." del HTML para siempre — sin error, sin aviso, sin manera de
+// reintentar. Es el mismo patrón de "no sé tratado como no": acá era "no sé" tratado como
+// "seguí esperando".
+// Ahora: 2,5 s por intento, dos intentos, y a los ~5 s como mucho hay un veredicto en pantalla
+// (aunque sea "no pude preguntar"). Se devuelve `ms` para poder mostrar cuánto tardó.
+const _CRM_FICHA_TIMEOUT_MS = 2500;
+
 async function buscarEnCrm(domain) {
-  try {
-    const r = await fetch(
-      `${crmUrl("/ficha")}?domain=${encodeURIComponent(domain)}`,
-      { headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET } },
-    );
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = await r.json();
-    if (!j.found) return { found: false };
-    return {
-      found: true, itemId: null,
-      status: j.estado || "", ejecutivo: j.ejecutivo || "", trafico: j.pageviews || "",
-      email: j.email || "", geo: j.top_geo || "", fecha: j.fecha_contacto || "",
-      idioma: j.idioma || "", board: j.board || "",
-      descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0,
-    };
-  } catch (e) {
-    // ⚠️ NO se devuelve `{found:false}` ante un error: eso le diría al MB "está libre,
-    // dale" justo cuando no pudimos verificar, que es el error caro. Se marca `indeterminado`
-    // y el cartel lo dice.
-    console.warn("buscarEnCrm:", e.message);
-    return { found: false, indeterminado: true, motivo: e.message };
+  const t0 = Date.now();
+  let ultimo = "";
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      const r = await fetch(
+        `${crmUrl("/ficha")}?domain=${encodeURIComponent(domain)}`,
+        {
+          headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+          cache: "no-store",
+          signal: AbortSignal.timeout(_CRM_FICHA_TIMEOUT_MS),
+        },
+      );
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      const ms = Date.now() - t0;
+      if (!j.found) return { found: false, ms };
+      return {
+        found: true, itemId: null, ms,
+        status: j.estado || "", ejecutivo: j.ejecutivo || "", trafico: j.pageviews || "",
+        email: j.email || "", geo: j.top_geo || "", fecha: j.fecha_contacto || "",
+        idioma: j.idioma || "", board: j.board || "",
+        descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0,
+      };
+    } catch (e) {
+      // `AbortSignal.timeout` tira TimeoutError; se traduce para que el cartel diga algo que
+      // el MB entienda en vez de un nombre de excepción.
+      ultimo = e?.name === "TimeoutError" ? `no contestó en ${_CRM_FICHA_TIMEOUT_MS / 1000}s` : (e?.message || String(e));
+      console.warn(`buscarEnCrm (intento ${intento}):`, ultimo);
+    }
   }
+  // ⚠️ NO se devuelve `{found:false}` ante un error: eso le diría al MB "está libre,
+  // dale" justo cuando no pudimos verificar, que es el error caro. Se marca `indeterminado`
+  // y el cartel lo dice.
+  return { found: false, indeterminado: true, motivo: ultimo, ms: Date.now() - t0 };
 }
+
+// Una sola consulta por dominio, compartida por el chequeo temprano y por la pipeline: sin
+// esto el veredicto se pediría dos veces al abrir la toolbar.
+let _crmVuelo = null;   // { domain, promesa }
+function _crmConsultar(domain, { forzar = false } = {}) {
+  if (!forzar && _crmVuelo && _crmVuelo.domain === domain) return _crmVuelo.promesa;
+  const promesa = buscarEnCrm(domain);
+  _crmVuelo = { domain, promesa };
+  return promesa;
+}
+
+// ── EL VEREDICTO ARRANCA PRIMERO Y POR SU CUENTA (2026-09-07) ────────────────────────────
+// Va en un listener PROPIO de DOMContentLoaded, no adentro del grande. Dos razones:
+//  1. La ficha no necesita el JWT —se autentica con el `x-toolbar-secret` bakeado—, así que
+//     no tiene por qué hacer cola detrás del refresh de token, las keys y el resto del arranque.
+//  2. Si el handler grande se cae en cualquier línea previa a la pipeline, ese `throw` se lleva
+//     puesto TODO lo que venía después, incluido el chequeo del CRM, y el recuadro se queda con
+//     el "Checking..." del HTML sin que nadie se entere. Dos listeners son independientes: uno
+//     no puede matar al otro.
+// La consulta se comparte con `runDuplicateCheck` por `_crmConsultar`, así que sigue siendo
+// UN pedido.
+let _crmWatchdog = null;
+function _armarWatchdogCrm() {
+  clearTimeout(_crmWatchdog);
+  // Techo duro: 2 intentos × 2,5 s + margen. Si a los 6 s no hay veredicto, algo se colgó en
+  // un lugar que no previmos y el MB tiene que enterarse, no seguir mirando un reloj.
+  _crmWatchdog = setTimeout(() => {
+    if (state.crmVeredicto) return;
+    const v = { ok: false, duda: true, provisional: true, titulo: "No pude consultar el CRM",
+                detalle: "La consulta no volvió en 6 segundos. Verificá a mano en ADEQ o reintentá.",
+                clase: "crm-duda" };
+    state.crmVeredicto = v;
+    _pintarVeredictoCrm(v, null);
+    _aplicarBloqueoCrm(v);
+  }, 6000);
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  try {
+    const { auth } = await chrome.storage.local.get("auth");
+    if (!auth?.loggedIn) return;               // con el login en pantalla la tarjeta ni se ve
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.url || !/^https?:/i.test(tab.url)) return;
+    const dom = extractDomain(tab.url);
+    if (!dom) return;
+    _pintarEsperaCrm();
+    _armarWatchdogCrm();
+    const r = await _crmConsultar(dom);
+    // Si el MB ya navegó a otra web, o la pipeline pintó antes, este resultado no manda.
+    // El cartel del watchdog sí se pisa: es un "todavía no sé", no una respuesta.
+    if (state.domain && state.domain !== dom) return;
+    if (state.crmVeredicto && !state.crmVeredicto.provisional) return;
+    clearTimeout(_crmWatchdog);
+    state.duplicate = r;
+    const v = _veredictoCrm(r);
+    state.crmVeredicto = v;
+    _pintarVeredictoCrm(v, r);
+    _aplicarBloqueoCrm(v);
+  } catch (e) {
+    console.warn("[CRM temprano]", e?.message || e);
+  }
+});
 
 // Qué plantilla del CRM salió en el mail, si fue una sin tocar. Con el pitch bloqueado es
 // igual por construcción; si el MB apretó Limpiar y escribió lo suyo, no hay plantilla.
@@ -8462,6 +8628,17 @@ function applyDraftToPitch(d, { silent = false } = {}) {
 const _crmTpl = { loaded: false, ok: false, motivo: "", byLang: new Map(), idxByLang: new Map() };
 const _mismoTexto = (a, b) => String(a || "").replace(/\s+/g, " ").trim().toLowerCase() === String(b || "").replace(/\s+/g, " ").trim().toLowerCase();
 
+// ¿El recuadro del mail sigue teniendo lo que pusimos nosotros? Sirve para decidir si se puede
+// refrescar el borrador sin pisarle el texto al media buyer: vacío o igual a la plantilla que
+// cargamos, se puede; cualquier otra cosa la escribió él y no se toca.
+function _pitchIntacto() {
+  const el = document.getElementById("pitch-text");
+  if (!el) return true;
+  if (!el.value.trim()) return true;
+  const t = state.pitchTemplate;
+  return !!t && _mismoTexto(el.value, t.body);
+}
+
 async function loadCrmTemplates(force = false) {
   if (_crmTpl.loaded && !force) return;
   const r = await getPlantillasIniciales({ force });
@@ -8502,7 +8679,7 @@ function _pista(msg) {
   el.textContent = msg; el.hidden = !msg;
 }
 function _mostrarPistaBloqueo() {
-  _pista("🔒 Es la plantilla del CRM. Para escribir la tuya, apretá 🗑️ Limpiar.");
+  _pista("🔒 Es la plantilla del CRM y no se cambia a mano. Para mandar otra cosa: 🗑️ Limpiar y escribís el mail, o elegís un país y usás tu borrador propio (1-3).");
 }
 
 // ── LA TRADUCCIÓN AL CASTELLANO, EN HOVER (2026-09-04, pedido del user) ──────────────────
@@ -8628,7 +8805,12 @@ function applyCrmTemplate(t, lang) {
   const subjectEl = document.getElementById("form-subject");
   if (pitchEl)   pitchEl.value = body;
   if (subjectEl && subject) subjectEl.value = subject;
-  state.pitchTemplate = { origen: "crm", id: t.id, lang, variant: t.variant, nombre: t.nombre, body };
+  // `body` es el texto YA resuelto (con el dominio adentro) porque es lo que se compara contra
+  // lo que se envía. `bodyRaw` es el original con `{{domain}}`: sin él, comparar la plantilla
+  // guardada contra la que devuelve el CRM daba SIEMPRE distinto —un texto sustituido nunca es
+  // igual a uno con el placeholder— y el botón anunciaba "se actualizó" en cada click sin que
+  // hubiera cambiado nada. Es lo que el user vio: el cartel decía que sí y el texto no se movía.
+  state.pitchTemplate = { origen: "crm", id: t.id, lang, variant: t.variant, nombre: t.nombre, body, bodyRaw: String(t.body || "") };
   _bloquearPitch();
   _pista("");
   // El panel de traducción muestra la traducción del texto ANTERIOR hasta que alguien avisa:
@@ -8840,18 +9022,26 @@ function rotatePitchTemplate() {
     // al CRM salteando la caché de 6 h. Sin esto no había ninguna forma de traer una plantilla
     // recién editada —el `force` existía en el código y no lo llamaba nadie— y el MB tenía que
     // esperar seis horas sin saber por qué. (2026-09-07.)
-    _pista("Ésta es la plantilla que manda el CRM y la variante la elige el sistema. Para escribir otra cosa: 🗑️ Limpiar, o elegí un país. Buscando cambios en el CRM…");
+    // El mensaje tiene que decir QUÉ HACER, no sólo qué no se puede (pedido del user, 07/09):
+    // *"debería decirme que la plantilla del CRM no se puede cambiar, que si desea enviar otra
+    // elija país y template propio al apretar limpiar, o redacte el email"*.
+    const _REGLA = "🔒 La plantilla del CRM no se cambia a mano: la variante la elige el sistema. "
+                 + "¿Querés mandar otra cosa? 🗑️ Limpiar y escribís el mail, o elegís un país y usás tu borrador propio (1-3).";
+    _pista(`${_REGLA} Buscando cambios en el CRM…`);
     loadCrmTemplates(true).then(() => {
       const lista = _crmTpl.byLang.get(t.lang) || [];
       if (!lista.length) { _pista("El CRM no tiene plantilla inicial en este idioma."); return; }
       const idx = _semillaRotacion(lista.length);
       _crmTpl.idxByLang.set(t.lang, idx);
       const nueva = lista[idx];
-      const cambio = !_mismoTexto(nueva.body, t.body);
+      // Crudo contra crudo: `t.body` ya tiene el dominio sustituido y nunca coincidiría.
+      const cambio = !_mismoTexto(nueva.body, t.bodyRaw ?? t.body);
       applyCrmTemplate(nueva, t.lang);
       updatePitchFlagButton();
-      _pista(cambio ? "✅ Se actualizó: la plantilla del CRM había cambiado." : "Al día: es la misma plantilla que tiene el CRM ahora.");
-    }).catch(e => _pista(`No pude consultar el CRM (${e.message}). Sigue la que estaba.`));
+      _pista(cambio
+        ? `✅ El CRM había editado la plantilla: se actualizó el texto. ${_REGLA}`
+        : `${_REGLA} (Ya estaba al día: es la misma que tiene el CRM ahora.)`);
+    }).catch(e => _pista(`No pude consultar el CRM (${e.message}). Sigue la que estaba. ${_REGLA}`));
     return;
   }
   const lang   = _draftsState.currentLang || _resolvePitchLang();
