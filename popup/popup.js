@@ -5594,6 +5594,27 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
           emails:        state.emails,
         });
       }
+      // ── CERRAR LA COPIA QUE QUEDA EN PROSPECTS (2026-09-07, hallazgo del user) ──────────
+      // El user: *"en Prospects no deberían haber clientes que ya están en el CRM; si sucede,
+      // es que se filtraron"*. Tenía razón y el mecanismo era éste: el MB trabaja un dominio
+      // desde Analysis, la ficha del CRM pasa a Propuesta Vigente… y la fila del MISMO dominio
+      // que estaba esperando en Prospects se queda en `pending`, porque este push nunca la
+      // tocó. Queda ofrecida para que la vuelvan a trabajar.
+      // Medido hoy: 2 casos vivos (opopular.com.br y umdoisesportes.com.br, los dos contactados
+      // el 04/09 desde Analysis y todavía pendientes en el pool). Son pocos porque el agente ya
+      // se protege con /dominios-activos — pero el MB que abría Prospects los veía igual.
+      // Se marca `validated`, que es lo que significa: este dominio ya se trabajó.
+      try {
+        const _r = await fetch(
+          `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(state.domain)}&status=eq.pending`,
+          { method: "PATCH",
+            headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                       "Content-Type": "application/json", "Prefer": "return=representation" },
+            body: JSON.stringify({ status: "validated", validated_at: new Date().toISOString(), validated_by: state.loginEmail }) });
+        const _cerradas = _r.ok ? ((await _r.json().catch(() => [])) || []).length : 0;
+        if (_cerradas) res.textContent += " · también se cerró en Prospects";
+      } catch { /* que no se caiga el push por esto: la ficha del CRM ya se creó */ }
+
       // Guardar snapshot — bloquea el botón hasta que algo cambie
       state.mondaySnapshot = getMondayFormValues();
       btn.textContent      = "✅ Ya en ADEQ";
