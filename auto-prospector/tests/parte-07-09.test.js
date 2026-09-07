@@ -86,6 +86,9 @@ function enrutador(registro) {
       { source: "auto_feeder_monday", status: "done" },
     ]);
     if (u.includes("toolbar_health?job=in.")) return resp([]);
+    // La mesa común del CRM: sales@ ya informa el acumulado del día; dhorovitz@ todavía no.
+    if (u.includes("casilla-envios?casilla=sales")) return resp({ ok: true, ultima_hora: 3, ultimas_24h: 312, por_origen: { crm: 280, toolbar: 32 }, sin_tope: true });
+    if (u.includes("casilla-envios?casilla=")) return resp({ ok: true, ultima_hora: 2, sin_tope: true });
     if (u.includes("googleapis.com/oauth2") || u.includes("oauth2.googleapis.com")) return resp({ access_token: "falso" });
     if (u.includes("gmail.googleapis.com")) return resp({ id: "msg-falso" });
     return resp([]);
@@ -145,6 +148,12 @@ test("las congeladas se cuentan aparte y no como 'gasta créditos para nada'", (
 test("el corte de turno por casilla llena se dice con todas las letras", () => {
   ok(/casilla ya tenía el tope de mails de la última hora/.test(html), "el mail tiene que explicar que el turno se cortó por el cupo del buzón");
   ok(!/no llegó a intentarlo/.test(html), "ya no puede decir que el agente no lo intentó: lo intentó y cortó");
+});
+
+test("el volumen de cada buzón sale de la mesa del CRM, y si falta el dato lo dice", () => {
+  const s = despuesDe("Volumen de cada buzón", 900);
+  ok(/sales\s+312 \/ 1\.000 en 24h \(crm 280 · toolbar 32\)/.test(s), `sales tiene que mostrar 312/1.000 con el desglose, vino: ${s.slice(0, 160)}`);
+  ok(/dhorovitz\s+sin dato del CRM · última hora 2/.test(s), `sin ultimas_24h no se inventa un 0, vino: ${s.slice(0, 200)}`);
 });
 
 test("Monday ya no aparece en el mail", () => {

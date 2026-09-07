@@ -9030,6 +9030,34 @@ async function parteDelDia(token, opts = {}) {
   }
   const objetivoTotal = mbs.length * OBJETIVO_POR_MB;
 
+  // ── VOLUMEN REAL DE CADA BUZÓN (pedido del user, 07/09) ─────────────────────────────
+  // Desde que el CRM sacó sus cupos, el único freno de reputación es un cortacircuitos a
+  // 300/h y 1.000/24h por casilla (Workspace bloquea el buzón 24 h a las 2.000). La mesa
+  // común `casilla_envios` (base del CRM) es la única foto completa —cadencia + agente + a
+  // mano desde la v695—, y este parte es donde el user la tiene que ver sin entrar al board.
+  // Se lee por su GET; si todavía no informa el acumulado (`ultimas_24h`), se DICE que falta,
+  // no se muestra un 0. Las tres casillas salen de `agent_whitelist`.
+  const _casillas = String(cfg.agent_whitelist || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const _volumenBuzon = [];
+  if (CRM_SYNC_SECRET) {
+    for (const c of (_casillas.length ? _casillas : mbs)) {
+      try {
+        const r = await fetch(`${_urlCrm("/casilla-envios")}?casilla=${encodeURIComponent(c)}`,
+          { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(8000) });
+        const j = r.ok ? await r.json() : null;
+        const dia = Number(j?.ultimas_24h ?? j?.hoy ?? NaN);
+        const po = j?.por_origen && typeof j.por_origen === "object" ? j.por_origen : null;
+        _volumenBuzon.push({ casilla: c, dia: Number.isFinite(dia) ? dia : null, hora: Number(j?.ultima_hora ?? j?.count ?? NaN), porOrigen: po });
+      } catch { _volumenBuzon.push({ casilla: c, dia: null, hora: NaN, porOrigen: null }); }
+    }
+  }
+  const _lineasVolumen = _volumenBuzon.map(v => {
+    const _po = v.porOrigen ? ` (${Object.entries(v.porOrigen).map(([k, n]) => `${k} ${n}`).join(" · ")})` : "";
+    return v.dia == null
+      ? `   ${v.casilla.split("@")[0].padEnd(10)} 24h: sin dato del CRM${Number.isFinite(v.hora) ? ` · última hora ${v.hora}` : ""}`
+      : `   ${v.dia >= 1000 ? "🛑" : v.dia >= 500 ? "⚠️" : "✅"} ${v.casilla.split("@")[0].padEnd(10)} ${String(v.dia).padStart(4)} / 1.000 en 24h${_po}`;
+  });
+
   // 2. Prospects: lo que importa no es el total, es cuántos se pueden contactar.
   const conEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`);
   const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
@@ -9599,6 +9627,7 @@ async function parteDelDia(token, opts = {}) {
     "",
     `1 · ENVÍOS DE HOY — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : " · a mano: NO SE PUDO TRAER del CRM"}`,
     ...lineasEnvio,
+    ...(_lineasVolumen.length ? ["", "   VOLUMEN DE CADA BUZÓN (CRM + agente + a mano; corte a 1.000/24h)", ..._lineasVolumen] : []),
     "",
     `2 · BUZÓN PROSPECTS — ALTAS DEL DÍA`,
     `    Import (sellers.json, CSV)                     ${altaImport}`,
@@ -9770,6 +9799,14 @@ async function parteDelDia(token, opts = {}) {
   <div style="font:700 12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};letter-spacing:1px;padding:2px 0 8px 2px">PARTE 1 · CÓMO ANDUVO EL AGENTE</div>
 
   ${_card(`Envíos de hoy — agente ${totalEnviado}/${objetivoTotal}${_monday.ok ? ` · a mano ${totalManual}` : " · a mano: NO SE PUDO TRAER del CRM"}`, _htmlEnvios, ok ? _VERDE : _ROJO)}
+
+  ${_volumenBuzon.length ? _card("Volumen de cada buzón (CRM + agente + a mano)", _kv(_volumenBuzon.map(v => [
+    v.casilla.split("@")[0],
+    v.dia == null
+      ? `sin dato del CRM${Number.isFinite(v.hora) ? ` · última hora ${v.hora}` : ""}`
+      : `${v.dia} / 1.000 en 24h${v.porOrigen ? ` (${Object.entries(v.porOrigen).map(([k, n]) => `${k} ${n}`).join(" · ")})` : ""}`,
+    v.dia == null ? _GRIS : v.dia >= 1000 ? _ROJO : v.dia >= 500 ? "#b26a00" : _VERDE,
+  ])) + `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">El cortacircuitos del CRM frena a 300/h y 1.000/24h por casilla; Workspace bloquea el buzón 24 h a las 2.000.</div>`) : ""}
 
   ${_card("Buzón Prospects — Altas del día", _kv([
     ["Import (sellers.json, CSV)", altaImport],
