@@ -929,6 +929,13 @@ input.form-pv-display { font-weight: 700; }
 /* Traducción al castellano en hover — 2026-09-04.
    Se superpone al textarea SIN tocarlo: lo que se envía es siempre el de abajo. */
 .pitch-wrap { position: relative; }
+/* ⚠️ SIN ESTO EL PANEL NO SE OCULTA NUNCA (2026-09-07, reporte del user: "el cajón siempre se
+   ve traducido por más que yo no pase el cursor"). El atributo `hidden` del HTML oculta por la
+   hoja de estilos del navegador, que pierde contra CUALQUIER `display` declarado acá: la regla
+   de abajo pone `display:flex` y ganaba siempre, así que `panelEl.hidden = true` no hacía nada
+   y el panel tapaba el borrador de forma permanente. Vale para el de Analysis y el de la card
+   de Prospects, que comparte la clase. */
+.pitch-es[hidden] { display: none !important; }
 .pitch-es {
   position: absolute; inset: 0; z-index: 5;
   display: flex; flex-direction: column;

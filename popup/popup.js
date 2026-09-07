@@ -8496,16 +8496,33 @@ function _conectarTraduccionHover(areaEl, panelEl, bodyEl, getTexto, getLang) {
     if (!texto || String(lang).toLowerCase().startsWith("es")) return;
     ponerCabecera(lang);
     panelEl.hidden = false;
+    // ── EL PANEL NUNCA SE VE VACÍO (2026-09-07, pedido del user) ────────────────────────
+    // *"Si la traducción no carga y el sistema se da cuenta, mostrar la original sin importar
+    // el idioma, porque si no parece que se envía en blanco."* El panel es opaco y tapa el
+    // textarea: mientras decía "Traduciendo…" —o si Google fallaba— el MB veía un recuadro sin
+    // el mail y podía creer que el mensaje estaba vacío. Ahora el texto ORIGINAL se pinta
+    // primero y la traducción lo reemplaza recién cuando llega. Si no llega, queda el original
+    // con el aviso arriba: siempre se ve lo que se está por mandar.
     if (ultimo !== texto) {
       bodyEl.className = "pitch-es-body cargando";
-      bodyEl.textContent = "Traduciendo…";
+      bodyEl.textContent = texto;
+      if (cabEl) cabEl.textContent = "🇪🇸 Traduciendo al castellano… (abajo, el original que se envía)";
     }
     const r = await traducirAlCastellano(texto, lang);
     // El mouse pudo haberse ido mientras Google contestaba.
     if (panelEl.hidden) return;
     ultimo = texto;
-    if (r.ok) { bodyEl.className = "pitch-es-body"; bodyEl.textContent = r.texto; }
-    else      { bodyEl.className = "pitch-es-body falla"; bodyEl.textContent = `No se pudo traducir (${r.motivo}). El texto de arriba es el que sale.`; }
+    if (r.ok) {
+      ponerCabecera(lang);
+      bodyEl.className = "pitch-es-body";
+      bodyEl.textContent = r.texto;
+    } else {
+      // Falla: se deja el ORIGINAL a la vista y el aviso va en el encabezado, que es donde no
+      // estorba. Poner el motivo en el cuerpo dejaba el panel sin una línea del mail.
+      if (cabEl) cabEl.textContent = `⚠️ No se pudo traducir (${r.motivo}). Abajo está el original, que es lo que se envía.`;
+      bodyEl.className = "pitch-es-body falla";
+      bodyEl.textContent = texto;
+    }
   };
   // ⚠️ El hover va en el CONTENEDOR, no en el textarea. Con el listener en el textarea y el
   // panel encima, entrar al panel para scrollearlo disparaba `mouseleave` y lo cerraba —
