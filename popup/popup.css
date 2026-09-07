@@ -552,6 +552,10 @@ a:hover { text-decoration: underline; }
   background: transparent; color: inherit; opacity: .85;
 }
 .crm-reintentar:hover { opacity: 1; }
+/* Web que el CRM no deja prospectar: los campos se ven, pero no se tocan. */
+.campo-bloqueado-crm {
+  opacity: .55; cursor: not-allowed; background: var(--surface-3, #f1f5f9) !important;
+}
 .crm-veredicto.crm-si   { background: #ecfdf5; border-color: #a7f3d0; border-left-color: #059669; color: #065f46; }
 .crm-veredicto.crm-no   { background: #fef2f2; border-color: #fecaca; border-left-color: #dc2626; color: #991b1b; }
 .crm-veredicto.crm-duda { background: #fffbeb; border-color: #fde68a; border-left-color: #d97706; color: #92400e; }

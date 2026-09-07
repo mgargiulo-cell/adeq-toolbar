@@ -309,6 +309,9 @@ function resetAnalysisUI() {
   // anterior y el textarea seguía `readOnly` de cuando se aplicó: quedaba vacío Y trabado, sin
   // nada que lo destrabara salvo apretar 🗑️ Limpiar a mano.
   state.pitchTemplate      = null;
+  // El país elegido era para la web anterior: en la nueva se arranca otra vez con lo que
+  // manda el CRM, que es la regla.
+  try { _draftsState.paisElegido = false; } catch {}
   try { _desbloquearPitch(); } catch {}
   try { _tradPitch?.invalidar?.(); } catch {}   // la traducción también era del mail anterior
 
@@ -2928,6 +2931,9 @@ async function _fetchPageMetaForProspect(domain) {
 }
 
 function runAutoFill() {
+  // Si el CRM ya dijo que no, no se completa nada: los datos que están son los suyos y quedan
+  // congelados. Autocompletar acá volvía a llenar GEO y email encima del bloqueo.
+  if (_crmBloquea()) return;
   const dup    = state.duplicate;
   const isNew  = !dup?.found;
 
@@ -3230,6 +3236,40 @@ function _aplicarBloqueoCrm(v) {
     if (bloquea) { push.dataset.textoPrevio = push.dataset.textoPrevio || push.textContent; push.textContent = "⛔ No prospectable"; }
     else if (push.dataset.textoPrevio) { push.textContent = push.dataset.textoPrevio; delete push.dataset.textoPrevio; }
   }
+  _bloquearFormularioCrm(!!bloquea);
+}
+
+// ── SI NO SE PUEDE PROSPECTAR, NO SE PREPARA NADA (2026-09-07, regla del user) ───────────
+// Textual: *"Si es un Live o alguien que no es prospectable, el borrador ni se debe cargar,
+// esos campos deben estar bloqueados."* Apagar sólo los dos botones no alcanzaba: el MB veía
+// un mail redactado, un email elegido y el formulario lleno, todo listo para mandarle a un
+// cliente activo. Un formulario que se puede completar es una invitación a completarlo.
+const _CAMPOS_CRM = [
+  "form-ejecutivo", "form-estado", "form-idioma", "form-geo", "form-pv-display",
+  "form-email-search", "form-fecha", "form-telefono", "form-subject", "pitch-text",
+  "form-email-futuro", "form-email-futuro-2", "form-email-futuro-3",
+  "btn-pitch-flag", "btn-pitch-clear", "btn-generate-pitch", "pitch-country",
+];
+function _bloquearFormularioCrm(bloquear) {
+  for (const id of _CAMPOS_CRM) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.disabled = bloquear;
+    el.classList.toggle("campo-bloqueado-crm", bloquear);
+  }
+  // Los radios de la lista de emails también: elegir destinatario es el primer paso del envío.
+  document.querySelectorAll("#email-result input").forEach(r => { r.disabled = bloquear; });
+  if (!bloquear) return;
+  // Y se vacía lo que ya se hubiera preparado. El borrador se llena apenas se abre la web
+  // (antes de que llegue el veredicto, a propósito, para que sea rápido), así que cuando el
+  // CRM contesta "no" hay que deshacerlo — no basta con no volver a llenarlo.
+  const pitchEl = document.getElementById("pitch-text");
+  const subjEl  = document.getElementById("form-subject");
+  if (pitchEl) pitchEl.value = "";
+  if (subjEl)  subjEl.value  = "";
+  state.pitchTemplate = null;
+  try { _tradPitch?.invalidar?.(); } catch {}
+  try { _pista(_motivoBloqueoCrm() + " No se carga borrador."); } catch {}
 }
 
 async function autoDetectPageLanguage() {
@@ -5379,6 +5419,12 @@ async function _reintentarVeredictoCrm() {
   state.crmVeredicto = v;
   _pintarVeredictoCrm(v, r);
   _aplicarBloqueoCrm(v);
+}
+
+// ¿El CRM ya dijo que no? (Un veredicto con duda NO bloquea: avisa.)
+function _crmBloquea() {
+  const v = state.crmVeredicto;
+  return !!v && !v.ok && !v.duda;
 }
 
 // El mensaje único cuando algo se niega a seguir porque el CRM dice que no.
@@ -8536,6 +8582,14 @@ const _draftsState = {
   flagIdxByLang: new Map(), // language -> índice actual del rotator
   loaded: false,
   currentLang: "",
+  // ── LA ÚNICA LLAVE QUE ABRE LOS BORRADORES PROPIOS ES EL PAÍS (2026-09-07, regla del user) ──
+  // Textual: *"no debo poder cambiar el mail del CRM, ese siempre va el que el sistema da. Por
+  // más que ponga limpiar debe estar bloqueada esa área al darle click a 1 de 3, 2 de 3, etc.
+  // Sólo se habilitan los templates cuando elijo país para cambiar entre el 1 de 3, 2 de 3, pero
+  // de templates, que no es lo mismo."*
+  // O sea: 🗑️ Limpiar sirve para ESCRIBIR el mail a mano, no para desbloquear el rotador. El
+  // botón de la bandera sólo rota borradores propios después de elegir un país a propósito.
+  paisElegido: false,
 };
 
 // ── LOS 23 IDIOMAS DEL CRM (2026-09-04) ─────────────────────────────────────────────────
@@ -8920,6 +8974,11 @@ function updatePitchFlagButton() {
     const pos   = Math.max(0, lista.findIndex(x => x.id === t.id));
     nameEl.textContent = `CRM · ${LANG_NOMBRE[t.lang] || t.lang} · ${t.nombre || "inicial"} (${pos + 1}/${lista.length || 1})`;
     flagBtn.title = "Es la plantilla que manda el CRM y la variante la elige el sistema (por dominio y día). Para escribir otra cosa: 🗑️ Limpiar, o elegí un país para usar tu borrador.";
+  } else if (!_draftsState.paisElegido) {
+    // Recuadro limpio pero sin país: el botón no rota nada y tiene que decirlo, en vez de
+    // parecer un botón muerto.
+    nameEl.textContent = "Elegí un país para tus borradores";
+    flagBtn.title = "El mail del CRM lo elige el sistema y no se cambia acá. Elegí un país 🏳️ para pasar entre tus borradores propios (1/3, 2/3, 3/3), o escribí el tuyo después de 🗑️ Limpiar.";
   } else {
     const drafts = _draftsState.byLang.get(lang) || [];
     if (drafts.length === 0) {
@@ -8961,6 +9020,9 @@ function updatePitchFlagButton() {
       input.value = "";
       const l = o.lang;
       _draftsState.currentLang = l;
+      // Elegir un país es EL acto que habilita rotar entre los borradores propios (1/3, 2/3,
+      // 3/3). Es lo único que lo habilita: ni Limpiar ni abrir la web lo hacen.
+      _draftsState.paisElegido = true;
       _draftsState.flagIdxByLang.set(l, 0);
       const list = _draftsState.byLang.get(l) || [];
       if (list.length === 0) {
@@ -8980,7 +9042,11 @@ function updatePitchFlagButton() {
 // en la variante que toca por dominio y día (bloqueada). Si el CRM no responde o no tiene
 // ese idioma, el borrador propio del MB, como antes, y se dice por qué.
 async function autofillDraftOnLoad() {
+  // A un cliente activo no se le prepara un mail. Regla del user: si no es prospectable, el
+  // borrador ni se carga.
+  if (_crmBloquea()) { _pista(_motivoBloqueoCrm() + " No se carga borrador."); return; }
   await Promise.all([loadDraftsCache(), loadCrmTemplates().catch(() => {})]);
+  if (_crmBloquea()) return;   // el veredicto pudo llegar mientras se leían las plantillas
   const lang = _resolvePitchLang();
   _draftsState.currentLang = lang;
   const crm = _crmTpl.byLang.get(lang) || [];
@@ -9042,6 +9108,12 @@ function rotatePitchTemplate() {
         ? `✅ El CRM había editado la plantilla: se actualizó el texto. ${_REGLA}`
         : `${_REGLA} (Ya estaba al día: es la misma que tiene el CRM ahora.)`);
     }).catch(e => _pista(`No pude consultar el CRM (${e.message}). Sigue la que estaba. ${_REGLA}`));
+    return;
+  }
+  // Sin país elegido no hay rotador. Limpiar deja el recuadro en blanco para ESCRIBIR, no para
+  // ponerse a pasar borradores: el mail que sale por default es el que decide el sistema.
+  if (!_draftsState.paisElegido) {
+    _pista("El mail del CRM lo elige el sistema y no se cambia con este botón. Para usar tus borradores (1/3, 2/3, 3/3), elegí un país 🏳️ acá al lado. Para escribir el tuyo, 🗑️ Limpiar.");
     return;
   }
   const lang   = _draftsState.currentLang || _resolvePitchLang();

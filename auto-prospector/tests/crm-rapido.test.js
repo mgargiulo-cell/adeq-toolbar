@@ -147,6 +147,42 @@ test("la plantilla del CRM se compara CRUDA, no con el dominio ya sustituido", (
      "applyCrmTemplate tiene que guardar el body crudo además del resuelto");
 });
 
+// ── Si el CRM dice que no, no se prepara nada ───────────────────────────────────────────
+test("una web no prospectable deja el formulario bloqueado y sin borrador", () => {
+  const bloqueo = extraer(popup, "function _aplicarBloqueoCrm(v) {");
+  ok(/_bloquearFormularioCrm\(/.test(bloqueo),
+     "apagar los dos botones no alcanza: el MB veía el mail redactado y el formulario lleno para un cliente activo");
+  const campos = extraer(popup, "function _bloquearFormularioCrm(bloquear) {");
+  for (const id of ["form-ejecutivo", "form-estado", "form-geo", "form-email-search", "pitch-text", "form-subject"]) {
+    ok(popup.includes(`"${id}"`), `${id} tiene que estar en la lista de campos que se bloquean`);
+  }
+  ok(/el\.disabled = bloquear/.test(campos), "los campos se deshabilitan de verdad, no sólo se pintan");
+  ok(/pitchEl\.value = ""/.test(campos), "el borrador que ya se había cargado hay que borrarlo");
+});
+
+test("el borrador no se carga para una web que el CRM frena", () => {
+  const cuerpo = extraer(popup, "async function autofillDraftOnLoad() {");
+  ok(/_crmBloquea\(\)/.test(cuerpo),
+     "autofillDraftOnLoad tiene que cortar si el veredicto dice que no");
+  const auto = extraer(popup, "function runAutoFill() {");
+  ok(/_crmBloquea\(\)/.test(auto),
+     "runAutoFill volvía a llenar GEO y email por encima del bloqueo");
+  const cb = extraer(popup, "function _crmBloquea() {");
+  ok(/!v\.ok && !v\.duda/.test(cb), "una duda avisa pero NO bloquea: sólo bloquea un 'no' del CRM");
+});
+
+// ── El rotador de borradores sólo lo abre el país ───────────────────────────────────────
+test("sin país elegido el botón no rota nada: el mail del CRM lo decide el sistema", () => {
+  const cuerpo = extraer(popup, "function rotatePitchTemplate() {");
+  ok(/!_draftsState\.paisElegido/.test(cuerpo),
+     "regla del user: ni Limpiar habilita pasar entre 1/3, 2/3 — sólo elegir un país");
+  ok(/paisElegido: false/.test(popup), "_draftsState tiene que arrancar sin país elegido");
+  ok(/_draftsState\.paisElegido = true/.test(popup),
+     "elegir un país es lo único que habilita el rotador");
+  const reset = extraer(popup, "function resetAnalysisUI() {");
+  ok(/paisElegido = false/.test(reset), "al cambiar de web se vuelve a lo que manda el CRM");
+});
+
 test("el mensaje del botón dice qué hacer, no sólo que no se puede", () => {
   const cuerpo = extraer(popup, "function rotatePitchTemplate() {");
   ok(/no se cambia a mano/.test(cuerpo), "tiene que decir que la plantilla del CRM no se cambia");
