@@ -324,7 +324,6 @@ function resetAnalysisUI() {
     // dos lugares que fijaban el default y este se pasó por alto.
     // Tiene que coincidir con `prefillMondayForm` y `defaultStatusForOwner`, que ya usan "3".
     "form-estado":    "3",
-    "pitch-category": "",
     "pitch-tone":     "informal",
     "pitch-length":   "short",
     "pitch-focus":    "analysis",
@@ -3228,9 +3227,7 @@ async function autoDetectPageLanguage() {
 
   state.siteLanguage = lang;
 
-  // Sincronizar selector de idioma del pitch
-  const pitchLangSel = document.getElementById("pitch-language");
-  if (pitchLangSel) pitchLangSel.value = lang;
+  // (El selector de idioma del pitch se sacó el 07/09: lo resuelve `_resolvePitchLang()`.)
 
   // Auto-select in Monday language selector (supported langs only)
   const MAP = { en:"0", es:"1", it:"2", pt:"3", ar:"6" };
@@ -3310,12 +3307,7 @@ async function runTrafficCheck(opts = {}) {
     state.trafficData   = enrichTrafficWithPageSignals(data);
     state.category      = data.category || "";
 
-    // Auto-set categoría en el selector de pitch
-    if (data.category) {
-      const mapped = mapCategory(data.category);
-      const catSel = document.getElementById("pitch-category");
-      if (catSel && mapped) catSel.value = mapped;
-    }
+    // (El selector de categoría del pitch se sacó el 07/09: se usa `state.category` directo.)
 
     const cacheStr = data.fromCache ? ` <span class="cache-badge">⚡ Cache · ${data.cachedDaysAgo}d ago</span>` : "";
 
@@ -3455,10 +3447,17 @@ async function runAuditCheck() {
     state.revenueGap = audit.revenueGap;
     state.partners   = audit.allPartners;
 
+    // ── SÓLO LOS QUE ESTÁN (2026-09-07, pedido del user) ────────────────────────────────
+    // *"Sólo debe mostrar en verde los que detecta; los otros, ocultar los nombres directamente
+    // para hacer más simple la vista."* Antes se listaban los ~19 partners siempre, con los no
+    // encontrados en gris: veinte nombres para leer tres. El total se dice en una línea, que es
+    // lo único que aportaba el resto (saber contra cuántos se comparó).
     partnersEl.className = "partners-result";
-    partnersEl.innerHTML = audit.allPartners.map(p =>
-      `<span class="partner-chip ${p.found ? "partner-found" : "partner-miss"}">${p.found ? "✓ " : ""}${esc(p.name)}</span>`
-    ).join("");
+    const _hallados = audit.allPartners.filter(p => p.found);
+    partnersEl.innerHTML = _hallados.length
+      ? _hallados.map(p => `<span class="partner-chip partner-found">✓ ${esc(p.name)}</span>`).join("")
+        + `<span class="partner-nota">de ${audit.allPartners.length} socios ADEQ</span>`
+      : `<span class="partner-nota">Ninguno de los ${audit.allPartners.length} socios de ADEQ está en este sitio.</span>`;
 
     updateScore();
 
@@ -4812,8 +4811,14 @@ async function bindButtons() {
     const chipsEl = document.getElementById("pitch-subjects");
     if (chipsEl) chipsEl.style.display = "none";
     try {
-      const category    = document.getElementById("pitch-category")?.value || state.category;
-      const siteLanguage = document.getElementById("pitch-language")?.value || state.siteLanguage || "en";
+      // ── SIN SELECTORES: EL IDIOMA SALE DE LA GEO, LA CATEGORÍA DEL SITIO (2026-09-07) ──
+      // Pedido del user: *"ese botón de idiomas y categoría quitarlo; Claude debe generar el
+      // borrador en el idioma que está seleccionada la geo"*. Se usa `_resolvePitchLang()`, el
+      // MISMO resolutor que elige la plantilla del CRM (idioma del HTML → og:locale → texto de
+      // la página → GEO del formulario → inglés). Así el pitch de Claude y el del CRM nunca
+      // salen en idiomas distintos para el mismo sitio, que es lo que permitían los selectores.
+      const category     = state.category;
+      const siteLanguage = _resolvePitchLang();
       const cfg         = getPitchConfig();
       const [favLocal, dislLocal, rag] = await Promise.all([
         loadFavPitches(cfg),
@@ -4903,7 +4908,7 @@ async function bindButtons() {
     btn.disabled  = true; btn.textContent = "⏳ Preparando...";
 
     try {
-      const category    = document.getElementById("pitch-category")?.value || state.category;
+      const category    = state.category;   // el selector se sacó el 07/09: manda la del sitio
       const cfg         = getPitchConfig();
       const [favLocal, dislLocal, rag] = await Promise.all([
         loadFavPitches(cfg),
@@ -10403,28 +10408,6 @@ function renderProspectCard(r) {
       <div class="sub-section" style="padding:0;margin-top:10px">
         <div class="sub-title-row">
           <span class="sub-title">🤖 Pitch with Claude</span>
-          <select class="category-select pcard-pitch-language" title="Email language" style="font-size:11px;padding:2px 4px">
-            <option value="en" ${_initLang === "en" ? "selected" : ""}>English</option>
-            <option value="es" ${_initLang === "es" ? "selected" : ""}>Spanish</option>
-            <option value="it" ${_initLang === "it" ? "selected" : ""}>Italian</option>
-            <option value="pt" ${_initLang === "pt" ? "selected" : ""}>Portuguese</option>
-            <option value="ar" ${_initLang === "ar" ? "selected" : ""}>Arabic</option>
-          </select>
-          <select class="category-select pcard-pitch-category" title="Site category" style="font-size:11px;padding:2px 4px">
-            <option value="">Auto category</option>
-            <option value="sports">Sports</option>
-            <option value="news">News &amp; Media</option>
-            <option value="finance">Finance</option>
-            <option value="technology">Technology</option>
-            <option value="entertainment">Entertainment</option>
-            <option value="health">Health</option>
-            <option value="travel">Travel</option>
-            <option value="gambling">Gambling</option>
-            <option value="automotive">Automotive</option>
-            <option value="food">Food &amp; Drink</option>
-            <option value="realestate">Real Estate</option>
-            <option value="business">Business / B2B</option>
-          </select>
         </div>
 
         <!-- Style compacto: pills ciclan al click (1 fila) -->
@@ -10847,20 +10830,8 @@ function initProspectCard(card, data) {
       });
     });
 
-    const langSel = card.querySelector(".pcard-pitch-language");
-    const langVal = (data.language || "").split("-")[0];
-    if (langSel && langVal) {
-      const opt = [...langSel.options].find(o => o.value === langVal);
-      if (opt) langSel.value = langVal;
-    }
-    const catSel = card.querySelector(".pcard-pitch-category");
-    if (catSel && data.category) {
-      try {
-        const mapped = mapCategory(data.category);
-        const opt = mapped ? [...catSel.options].find(o => o.value === mapped) : null;
-        if (opt) catSel.value = mapped;
-      } catch {}
-    }
+    // (Los selectores de idioma y categoría del pitch se sacaron el 07/09: el idioma sale del
+    //  de la ficha —el mismo que elige la plantilla— y la categoría, del sitio.)
   } catch (e) {
     console.warn("[ProspectCard] pills init failed:", e);
   }
@@ -11067,8 +11038,10 @@ function initProspectCard(card, data) {
         };
         return localCfg;
       })();
-      const cardLanguage = card.querySelector(".pcard-pitch-language")?.value || data.language || "en";
-      const cardCategory = card.querySelector(".pcard-pitch-category")?.value || data.category || "";
+      // Sin selectores (07/09): el idioma es el de la ficha —el mismo con el que se eligió la
+      // plantilla, `cardFlag.lang`— y la categoría, la que trae el lead.
+      const cardLanguage = cardFlag?.lang || (data.language || "").split("-")[0] || "en";
+      const cardCategory = data.category || "";
 
       // Solo RAG (Voyage) — loadFavPitches/getPitchConfig viven en otro
       // closure y no son accesibles desde acá, pero el RAG es suficiente.

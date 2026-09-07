@@ -827,7 +827,11 @@ input.form-pv-display { font-weight: 700; }
   white-space: nowrap;
 }
 .partner-found { background: #d1fae5; color: #065f46; border: 1px solid #6ee7b7; }
+/* `.partner-miss` ya no se usa (07/09: sólo se muestran los detectados). Se deja la regla por
+   si algún día se quiere volver a listar los que faltan. */
 .partner-miss  { background: var(--surface-3); color: var(--text-faint); border: 1px solid var(--border); }
+/* El contador de contra cuántos se comparó: es contexto, no un chip más. */
+.partner-nota  { font-size: 11px; color: var(--text-faint); align-self: center; margin-left: 4px; }
 
 /* ---- PITCH ---- */
 .pitch-style-row {
