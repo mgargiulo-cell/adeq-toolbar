@@ -937,7 +937,11 @@ input.form-pv-display { font-weight: 700; }
   border-radius: var(--r-md);
   box-shadow: 0 4px 14px rgba(0,0,0,.10);
   overflow: hidden;
-  pointer-events: none;   /* el mouse sigue siendo del textarea: no roba el click */
+  /* ⚠️ NO va `pointer-events:none` (2026-09-07). Estaba para que el click cayera en el
+     textarea, pero de paso hacía que la rueda del mouse no llegara nunca al panel: un mail
+     largo no se podía scrollear para leerlo entero. El hover ahora vive en `.pitch-wrap`,
+     así que entrar al panel es seguir dentro de la zona y no lo cierra. */
+  pointer-events: auto;
 }
 .pitch-es-cab {
   flex-shrink: 0;

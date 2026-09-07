@@ -8387,6 +8387,7 @@ function applyDraftToPitch(d, { silent = false } = {}) {
   if (subjectEl && subject) subjectEl.value = subject;
   const igual = _crmTpl.byLang.get(d.language || "")?.some(t => _mismoTexto(t.body, d.body));
   _pista(igual ? `⚠️ Este borrador es IGUAL a una plantilla del CRM: no tiene sentido usarlo para variar el mensaje.` : "");
+  _tradPitch?.invalidar?.();   // el panel de traducción está encima: si no, muestra el texto anterior
   if (!silent) pitchEl?.dispatchEvent(new Event("input"));
 }
 
@@ -8458,16 +8459,42 @@ function _idiomaDelPitchActual() {
   return _draftsState.currentLang || _resolvePitchLang() || "";
 }
 
+// El panel de traducción de Analysis. Lo guarda `initPitchInlineControls` para que Limpiar y
+// los cambios de plantilla puedan invalidarlo.
+let _tradPitch = null;
+
+// Devuelve `{ ocultar, invalidar }`: el que cambia el texto de abajo TIENE que avisar, porque
+// el panel se superpone y si no queda mostrando la traducción del mensaje anterior. Eso hacía
+// parecer que "Limpiar no limpia" y que rotar la variante "no cambia el preview": abajo sí
+// cambiaba, arriba no. (2026-09-07, reporte del user.)
 function _conectarTraduccionHover(areaEl, panelEl, bodyEl, getTexto, getLang) {
-  if (!areaEl || !panelEl || !bodyEl) return;
+  if (!areaEl || !panelEl || !bodyEl) return { ocultar() {}, invalidar() {} };
   let ultimo = "";
   const ocultar = () => { panelEl.hidden = true; };
+  // Si el panel está a la vista cuando cambia el texto de abajo, se vuelve a traducir en el
+  // acto; si no, se marca como vencido para que la próxima vez no muestre lo anterior.
+  const invalidar = () => {
+    ultimo = "";
+    if (!panelEl.hidden) { mostrar(); return; }
+    bodyEl.textContent = "";
+  };
+  // El encabezado lo dice en una frase, con el idioma adentro: "Traducción al castellano. El
+  // email original será este mismo en idioma Inglés." Antes decía "muestra: lo que sale es el
+  // texto de arriba", que obligaba a deducirlo. (2026-09-07, redacción del user.)
+  const cabEl = panelEl.querySelector(".pitch-es-cab, .pcard-es-cab");
+  const ponerCabecera = (lang) => {
+    if (!cabEl) return;
+    const iso = String(lang || "").toLowerCase().slice(0, 2);
+    const nombre = LANG_NOMBRE[iso] || String(lang || "").trim() || "el idioma del sitio";
+    cabEl.textContent = `🇪🇸 Traducción al castellano. El email original será este mismo en idioma ${nombre}.`;
+  };
   const mostrar = async () => {
     const texto = String(getTexto() || "").trim();
     const lang  = String(getLang() || "");
     // Nada que mostrar, o ya está en castellano: el panel no aparece. Taparle el texto al MB
     // para decirle lo mismo que ya está leyendo sería sólo estorbo.
     if (!texto || String(lang).toLowerCase().startsWith("es")) return;
+    ponerCabecera(lang);
     panelEl.hidden = false;
     if (ultimo !== texto) {
       bodyEl.className = "pitch-es-body cargando";
@@ -8480,10 +8507,16 @@ function _conectarTraduccionHover(areaEl, panelEl, bodyEl, getTexto, getLang) {
     if (r.ok) { bodyEl.className = "pitch-es-body"; bodyEl.textContent = r.texto; }
     else      { bodyEl.className = "pitch-es-body falla"; bodyEl.textContent = `No se pudo traducir (${r.motivo}). El texto de arriba es el que sale.`; }
   };
-  areaEl.addEventListener("mouseenter", mostrar);
-  areaEl.addEventListener("mouseleave", ocultar);
+  // ⚠️ El hover va en el CONTENEDOR, no en el textarea. Con el listener en el textarea y el
+  // panel encima, entrar al panel para scrollearlo disparaba `mouseleave` y lo cerraba —
+  // y con `pointer-events:none` la rueda del mouse ni siquiera llegaba al panel: no se podía
+  // leer un mail largo. En el contenedor, moverse del textarea al panel es seguir adentro.
+  const zona = areaEl.closest(".pitch-wrap") || areaEl.parentElement || areaEl;
+  zona.addEventListener("mouseenter", mostrar);
+  zona.addEventListener("mouseleave", ocultar);
   // Con el foco puesto el MB está leyendo o escribiendo: el panel estorba.
   areaEl.addEventListener("focus", ocultar);
+  return { ocultar, invalidar };
 }
 
 function applyCrmTemplate(t, lang) {
@@ -8498,6 +8531,10 @@ function applyCrmTemplate(t, lang) {
   state.pitchTemplate = { origen: "crm", id: t.id, lang, variant: t.variant, nombre: t.nombre, body };
   _bloquearPitch();
   _pista("");
+  // El panel de traducción muestra la traducción del texto ANTERIOR hasta que alguien avisa:
+  // sin esto, rotar la variante cambiaba el textarea y el panel seguía igual — que es lo que
+  // el user leyó como "si le doy click no cambia el preview".
+  _tradPitch?.invalidar?.();
   pitchEl?.dispatchEvent(new Event("input"));
 }
 
@@ -8624,10 +8661,22 @@ function updatePitchFlagButton() {
     cont.innerHTML = `<input id="pitch-country" class="pitch-country" list="pitch-country-list" placeholder="🌐 País → borrador propio" autocomplete="off" />`
       + `<datalist id="pitch-country-list">${opciones.map(o => `<option value="${_banderaDe(o.cc)} ${esc(o.nombre)} · ${LANG_NOMBRE[o.lang] || o.lang}"></option>`).join("")}</datalist>`;
     const input = cont.querySelector("#pitch-country");
+    // ⚠️ EL DESPLEGABLE SE COLGABA DESPUÉS DE ELEGIR (2026-09-07, reporte del user).
+    // Un `<input list>` nativo filtra la lista por lo que tiene escrito. Al elegir un país, el
+    // valor queda en "🇦🇷 Argentina · Español", y la próxima vez que se abre sólo matchea
+    // consigo mismo: la lista sale vacía y parece que se colgó. Se limpia al enfocar (así
+    // siempre se ve la lista entera) y después de aplicar (para que no quede un valor que
+    // filtra). El país elegido se ve en el botón de la izquierda, no acá.
+    const porEtiqueta = new Map(opciones.map(o => [`${_banderaDe(o.cc)} ${o.nombre} · ${LANG_NOMBRE[o.lang] || o.lang}`, o]));
+    input.addEventListener("focus", () => { input.value = ""; });
     input.addEventListener("change", () => {
       const v = input.value.trim();
-      const o = opciones.find(x => v.includes(x.nombre));
-      if (!o) return;
+      // Primero la etiqueta exacta (lo que devuelve el datalist); el `includes` es sólo el
+      // respaldo para cuando el MB escribe el país a mano y no elige de la lista. Buscar por
+      // substring primero elegía mal entre nombres que se contienen ("Guinea" / "Guinea Ecuatorial").
+      const o = porEtiqueta.get(v) || opciones.find(x => v.toLowerCase().includes(x.nombre.toLowerCase()));
+      if (!o) { input.value = ""; return; }
+      input.value = "";
       const l = o.lang;
       _draftsState.currentLang = l;
       _draftsState.flagIdxByLang.set(l, 0);
@@ -8710,6 +8759,13 @@ function initPitchInlineControls() {
     state.pitchTemplate = null;
     _desbloquearPitch();
     pitchEl.value = "";
+    // El asunto también: si queda el de la plantilla, el mail sale con un asunto que no es
+    // del texto que el MB acaba de escribir.
+    const subjEl = document.getElementById("form-subject");
+    if (subjEl) subjEl.value = "";
+    // Y el panel de traducción, que está ENCIMA: sin esto el MB ve la traducción del mensaje
+    // que acaba de borrar y concluye —con razón— que Limpiar no limpió nada.
+    _tradPitch?.invalidar?.();
     pitchEl.dispatchEvent(new Event("input"));
     pitchEl.focus();
     updatePitchFlagButton();
@@ -8729,7 +8785,8 @@ function initPitchInlineControls() {
     autofillDraftOnLoad().catch(() => updatePitchFlagButton());
   });
   // La traducción en hover — sobre el texto que HAY, sea plantilla o escrito por el MB.
-  _conectarTraduccionHover(
+  // Se guarda el handle: Limpiar y cada cambio de plantilla tienen que invalidar el panel.
+  _tradPitch = _conectarTraduccionHover(
     pitchEl,
     document.getElementById("pitch-es"),
     document.getElementById("pitch-es-body"),
