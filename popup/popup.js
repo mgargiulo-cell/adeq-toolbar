@@ -9,6 +9,18 @@
 // enviarAlBoard, acá en el popup.
 import { getMondayBoardIndex, fetchImportCandidates, fetchMondayForRefresh, parseTrafficText, fetchManualSendsFromMonday, crmUrl, getPlantillasIniciales } from "../modules/crm.js";
 import { traducirAlCastellano } from "../modules/traducir.js";
+
+// ── EL TONO LO DECIDE EL SISTEMA (2026-09-07, pedido del user) ───────────────────────────
+// *"Que ajuste directamente el pitch al idioma local y que determine el tono."* Había cuatro
+// pills (tono / largo / enfoque / apertura) que el MB podía ciclar, y las cuatro venían con
+// estos mismos valores marcados: nadie las movía y sólo ocupaban una fila.
+// Se fijan acá, y estos cuatro no son una preferencia mía: son el ESTILO ADEQ que ya manda en
+// el prompt maestro (ver `modules/diegoVoicePrompt.js`) — mail corto de 60-130 palabras, sin
+// bullets ni negritas, apertura directa y cierre con una pregunta concreta.
+// ⚠️ No se eligieron midiendo, porque no hay con qué: `toolbar_pitch_feedback` tiene 4 filas
+// (la última del 27/05) y ni siquiera guarda el tono. El día que se quiera optimizar esto,
+// primero hay que registrar el estilo junto al envío y su respuesta.
+const ESTILO_PITCH = Object.freeze({ tone: "informal", length: "short", focus: "analysis", opening: "direct" });
 // ── UNA SOLA IMPLEMENTACIÓN DEL RANKING (Fase 5, 2026-09-04) ─────────────────────────────
 // El popup tenía copias propias del criterio de "a quién se le escribe" (regex comercial,
 // lista de genéricos, tiers) y ya habían discrepado dos veces del worker. Medido el 04/09:
@@ -4705,41 +4717,9 @@ async function bindButtons() {
     btn.disabled = false; btn.textContent = "↻ Actualizar";
   });
 
-  // Generar Pitch
-  // ── Pitch style: pills CICLAN al click — solo el active es visible ─
-  // Cada grupo tiene N pills (.active visible, resto hidden). Click en el
-  // visible avanza al siguiente del array. Compatible con getPitchConfig.
-  const cycleGroup = (group) => {
-    const pills  = [...group.querySelectorAll(".pitch-pill")];
-    const curIdx = pills.findIndex(p => p.classList.contains("active"));
-    const nextIdx = (curIdx + 1) % pills.length;
-    pills.forEach((p, i) => {
-      p.classList.toggle("active", i === nextIdx);
-      p.hidden = i !== nextIdx;
-    });
-  };
-  document.querySelectorAll(".pitch-cycle-pills").forEach(group => {
-    group.addEventListener("click", () => cycleGroup(group));
-  });
-  // Compat: viejo .pitch-pills (no-cycle) sigue funcionando
-  document.querySelectorAll(".pitch-pills:not(.pitch-cycle-pills)").forEach(group => {
-    group.querySelectorAll(".pitch-pill").forEach(pill => {
-      pill.addEventListener("click", () => {
-        group.querySelectorAll(".pitch-pill").forEach(p => p.classList.remove("active"));
-        pill.classList.add("active");
-      });
-    });
-  });
-
+  // Generar Pitch. (Las pills de estilo se sacaron el 07/09: ver ESTILO_PITCH.)
   function getPitchConfig() {
-    // Soporta tanto .pitch-cycle-pills como .pitch-pills (legacy)
-    const val = (group) => document.querySelector(`[data-group="${group}"] .pitch-pill.active`)?.dataset.val || "";
-    return {
-      tone:    val("tone")    || "informal",
-      length:  val("length")  || "short",
-      focus:   val("focus")   || "analysis",
-      opening: val("opening") || "direct",
-    };
+    return { ...ESTILO_PITCH };
   }
 
   function pitchConfigKey(cfg) {
@@ -8468,6 +8448,7 @@ function _idiomaDelPitchActual() {
 // los cambios de plantilla puedan invalidarlo.
 let _tradPitch = null;
 
+
 // Devuelve `{ ocultar, invalidar }`: el que cambia el texto de abajo TIENE que avisar, porque
 // el panel se superpone y si no queda mostrando la traducción del mensaje anterior. Eso hacía
 // parecer que "Limpiar no limpia" y que rotar la variante "no cambia el preview": abajo sí
@@ -10410,27 +10391,6 @@ function renderProspectCard(r) {
           <span class="sub-title">🤖 Pitch with Claude</span>
         </div>
 
-        <!-- Style compacto: pills ciclan al click (1 fila) -->
-        <div class="pitch-style-row">
-          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="tone">
-            <button class="pitch-pill active" data-val="informal" type="button">💬 Informal</button>
-            <button class="pitch-pill" data-val="formal" type="button" hidden>💬 Formal</button>
-          </div>
-          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="length">
-            <button class="pitch-pill active" data-val="short" type="button">📏 Short</button>
-            <button class="pitch-pill" data-val="long" type="button" hidden>📏 Long</button>
-          </div>
-          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="focus">
-            <button class="pitch-pill active" data-val="analysis" type="button">📊 Analysis</button>
-            <button class="pitch-pill" data-val="nodataanalysis" type="button" hidden>📊 No analysis</button>
-          </div>
-          <div class="pitch-cycle-pills pcard-pitch-pills" data-group="opening">
-            <button class="pitch-pill active" data-val="direct" type="button">🚀 Direct</button>
-            <button class="pitch-pill" data-val="problem" type="button" hidden>🚀 Problem</button>
-            <button class="pitch-pill" data-val="praise" type="button" hidden>🚀 Praise</button>
-          </div>
-        </div>
-
         <!-- Asunto separado visualmente (igual que Analysis) -->
         <div class="pitch-subject-row">
           <label class="pitch-subject-label">📨 Asunto</label>
@@ -10816,20 +10776,8 @@ function initProspectCard(card, data) {
   };
   renderProspectEmailList();
 
-  // ── Pitch style pills CICLAN al click (compacto, 1 fila) ──────
+  // (Las pills de estilo se sacaron el 07/09: el tono lo fija `ESTILO_PITCH`.)
   try {
-    card.querySelectorAll(".pcard-pitch-pills").forEach(group => {
-      group.addEventListener("click", () => {
-        const pills  = [...group.querySelectorAll(".pitch-pill")];
-        const cur    = pills.findIndex(p => p.classList.contains("active"));
-        const next   = (cur + 1) % pills.length;
-        pills.forEach((p, i) => {
-          p.classList.toggle("active", i === next);
-          p.hidden = i !== next;
-        });
-      });
-    });
-
     // (Los selectores de idioma y categoría del pitch se sacaron el 07/09: el idioma sale del
     //  de la ficha —el mismo que elige la plantilla— y la categoría, del sitio.)
   } catch (e) {
@@ -11026,18 +10974,7 @@ function initProspectCard(card, data) {
     errEl.textContent = "";
 
     try {
-      // Config local de la card (los pills/selectores propios). Si no existen
-      // (caso tabs viejas), cae al getPitchConfig global del Analysis.
-      const _localPillVal = (group) => card.querySelector(`.pcard-pitch-pills[data-group="${group}"] .pitch-pill.active`)?.dataset.val || "";
-      const cfg = (() => {
-        const localCfg = {
-          tone:    _localPillVal("tone")    || "informal",
-          length:  _localPillVal("length")  || "short",
-          focus:   _localPillVal("focus")   || "analysis",
-          opening: _localPillVal("opening") || "direct",
-        };
-        return localCfg;
-      })();
+      const cfg = { ...ESTILO_PITCH };   // el mismo estilo fijo que en Analysis
       // Sin selectores (07/09): el idioma es el de la ficha —el mismo con el que se eligió la
       // plantilla, `cardFlag.lang`— y la categoría, la que trae el lead.
       const cardLanguage = cardFlag?.lang || (data.language || "").split("-")[0] || "en";
