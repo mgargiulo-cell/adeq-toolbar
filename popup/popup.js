@@ -268,6 +268,10 @@ function resetAnalysisUI() {
   // 1) Resetear estado interno (state.X)
   state.duplicate     = null;
   state.mondayItemId  = null;
+  // Los adicionales encolados son de la web anterior: si no se limpian, el push de la
+  // siguiente le manda al CRM contactos que no son suyos. (El objeto igual lleva el dominio
+  // adentro y se compara, pero limpiarlo acá es la barrera que corresponde.)
+  state.adicionalesEncolados = null;
   state.traffic       = 0;
   state.visits        = 0;
   state.pagesPerVisit = null;
@@ -5349,11 +5353,16 @@ function _plantillaEnviadaAlCrm(pitchEnviado) {
 // por dirección, y como los adicionales no estaban en la ficha, **sus respuestas quedaban
 // huérfanas** — justo los que mejor responden (6,6% real sobre 499 envíos en 90 días, la mejor
 // de todas las fuentes).
-// Se manda la dirección y el orden, y NO `enviado_at`: en el momento del push el mail todavía
-// no salió (queda encolado a +1/+2/+3 minutos), así que afirmar que ya se envió sería mentir.
-// La hora real la informa el worker cuando lo despacha, y el endpoint es idempotente y no pisa
-// lo guardado con nulos. El principal va en `email` como siempre.
+// Van TODOS en el push, con su hora — regla del user: *"que al momento del push se encolen
+// todos, a pesar de que nuestro envío tarde 3 minutos, para evitar errores"*. Si esto dependiera
+// de que el worker informe cada uno al despacharlo, un worker caído dejaría al CRM sin enterarse
+// nunca. `enviado_at` es la hora PROGRAMADA (+1/+2/+3 min): está a minutos de la real, y el CRM
+// la necesita para el caso del rebote —reenganchar la cadencia desde que esa persona recibió el
+// inicial y no desde hoy—. El worker igual confirma la hora exacta cuando lo manda; el endpoint
+// es idempotente. Si el mail todavía no se envió, se mandan sin hora: no se afirma lo que no pasó.
 function _contactosAdicionales() {
+  const enc = state.adicionalesEncolados;
+  if (enc && enc.domain === state.domain && enc.lista?.length) return enc.lista;
   const ids = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
   const vistos = new Set();
   const out = [];
@@ -5847,6 +5856,14 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
         });
         sentMsgs.push(`⏱️ ${futureEmail} en ${_colaAdicionales.length} min`);
       }
+      // Se guardan para que el push al CRM los mande TODOS de una, con su hora programada.
+      // Regla del user (07/09): *"que al momento del push se encolen todos, a pesar de que
+      // nuestro envío tarde 3 minutos, para evitar errores"*. Depender de que el worker los
+      // informe uno por uno significa que, si el worker está caído, el CRM no se entera nunca.
+      state.adicionalesEncolados = {
+        domain: state.domain,
+        lista: _colaAdicionales.map((c, i) => ({ email: c.future_email, tipo: "adicional", orden: i + 1, enviado_at: c.scheduled_for })),
+      };
       if (_colaAdicionales.length) {
         // Si la cola falla hay que DECIRLO: el MB tiene que saber que esos mails no van a salir.
         // Un adicional que no se manda y nadie avisa es el mismo "fallo silencioso" de siempre.
