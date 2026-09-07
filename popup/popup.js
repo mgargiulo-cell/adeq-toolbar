@@ -5343,7 +5343,30 @@ function _plantillaEnviadaAlCrm(pitchEnviado) {
   return { ref: `crm:${t.id}`, variant: t.variant, idioma: t.lang, enviado_at: new Date().toISOString() };
 }
 
-async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado, plantilla = null }) {
+// ── LOS CONTACTOS ADICIONALES VIAJAN CON EL PROSPECTO (2026-09-07) ──────────────────────
+// El CRM tiene desde hoy `crm_board_contactos` (commit 775c9dd de su lado) y acepta la lista
+// en el mismo push. Es lo que arregla el agujero más caro que teníamos: `scan-replies` matchea
+// por dirección, y como los adicionales no estaban en la ficha, **sus respuestas quedaban
+// huérfanas** — justo los que mejor responden (6,6% real sobre 499 envíos en 90 días, la mejor
+// de todas las fuentes).
+// Se manda la dirección y el orden, y NO `enviado_at`: en el momento del push el mail todavía
+// no salió (queda encolado a +1/+2/+3 minutos), así que afirmar que ya se envió sería mentir.
+// La hora real la informa el worker cuando lo despacha, y el endpoint es idempotente y no pisa
+// lo guardado con nulos. El principal va en `email` como siempre.
+function _contactosAdicionales() {
+  const ids = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
+  const vistos = new Set();
+  const out = [];
+  for (const id of ids) {
+    const v = (document.getElementById(id)?.value || "").trim().toLowerCase();
+    if (!v || !v.includes("@") || vistos.has(v)) continue;
+    vistos.add(v);
+    out.push({ email: v, tipo: "adicional", orden: out.length + 1 });
+  }
+  return out;
+}
+
+async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado, plantilla = null, contactos = null }) {
   const hoy = new Date();
   const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
   const contacto = /^\d{4}-\d{2}-\d{2}$/.test(String(fecha || "")) ? fecha : mas(0);
@@ -5391,6 +5414,8 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     // asumirse de un lado o del otro.
     mail_ya_enviado: mailYaEnviado === undefined ? true : !!mailYaEnviado,
   };
+  const _cts = contactos || _contactosAdicionales();
+  if (_cts.length) cuerpo.contactos = _cts;
   const r = await fetch(CONFIG.CRM_BOARD_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
@@ -5401,9 +5426,18 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
   // Un `errores` con contenido es un rechazo REAL aunque el HTTP sea 200. Tratarlo como
   // éxito dejaría al MB creyendo que cargó un prospecto que no existe.
   if (Array.isArray(j.errores) && j.errores.length) throw new Error(j.errores[0].motivo || "rechazado por el CRM");
-  // Los avisos no frenan pero se ven: ahí aparece el idioma sin plantilla o el estado
-  // desconocido, que después se traducen en un follow-up que no sale.
-  (j.avisos || []).forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
+  // ── LOS AVISOS DEL CRM SE VEN EN PANTALLA (2026-09-07) ────────────────────────────────
+  // Acá aparece el idioma que el CRM no reconoce (y entonces la cadencia no encuentra
+  // plantilla y el follow-up no sale), el GEO que no parece un país, una fecha ignorada o un
+  // contacto adicional que no pudo guardar. El comentario viejo decía "no frenan pero se ven"
+  // y no se veían: iban a `console.warn`, que ningún media buyer abre. El push decía
+  // "✅ Cargado" y el dato quedaba mal en silencio — el fallo silencioso que la regla de oro
+  // prohíbe. Se devuelven para que quien llama los muestre junto al resultado.
+  const _av = (j.avisos || []).filter(a => !a?.domain || String(a.domain).toLowerCase() === String(domain).toLowerCase());
+  if (_av.length) {
+    _av.forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
+    j._avisoTexto = _av.map(a => a.motivo).join(" · ");
+  }
   return j;
 }
 
@@ -5554,7 +5588,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       // "update si tengo itemId", que en Monday era donde se perdían los pushes cuando el id
       // no estaba a mano.
       const nuevo = !state.duplicate?.found;
-      await enviarAlBoard({
+      const _boardRes = await enviarAlBoard({
         domain: state.domain, traffic: state.traffic,
         email, geo, idioma, pitch, estado, fecha, ejecutivo,
         telefono: state.contactPhone || "",
@@ -5562,8 +5596,16 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
         // fue: así el inicial manual se mide igual que el del agente.
         plantilla: _plantillaEnviadaAlCrm(pitch),
       });
-      res.textContent = nuevo ? `✅ Cargado en ADEQ: ${state.domain}${esFormulario ? " (contacto por formulario)" : ""}` : `✅ Actualizado en ADEQ: ${state.domain}`;
+      const _cts = _contactosAdicionales();
+      const _extra = _cts.length ? ` · ${_cts.length} contacto(s) adicional(es)` : "";
+      res.textContent = nuevo ? `✅ Cargado en ADEQ: ${state.domain}${esFormulario ? " (contacto por formulario)" : ""}${_extra}` : `✅ Actualizado en ADEQ: ${state.domain}${_extra}`;
       res.className = "push-result ok";
+      // Si el CRM avisó algo (idioma sin plantilla, GEO raro, un contacto que no entró), va
+      // pegado al resultado: es la diferencia entre "cargó" y "cargó bien".
+      if (_boardRes?._avisoTexto) {
+        res.textContent += ` — ⚠️ ${_boardRes._avisoTexto}`;
+        res.className = "push-result warn";
+      }
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
 
       if (nuevo) {

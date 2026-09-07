@@ -16175,6 +16175,19 @@ async function processManualReengagementQueue(token) {
             // envíos en 90 días con **6,6% de respuesta real, la mejor de todas las fuentes**,
             // y sin esta fila el mail diario diría que los adicionales dejaron de existir.
             // Mismo nombre de fuente a propósito: para que los 90 días sigan comparándose.
+            // ── AVISARLE AL CRM QUE ESTE CONTACTO YA RECIBIÓ EL MAIL (2026-09-07) ────────
+            // El CRM guarda los adicionales en `crm_board_contactos` y usa `enviado_at` para
+            // dos cosas: mostrar el estado en la ficha y, si el principal rebota, reengancharle
+            // la cadencia a ESTA persona desde el día en que recibió el inicial (no desde hoy).
+            // El popup manda las direcciones en el push, pero en ese momento el mail todavía no
+            // salió —está encolado a +1/+2/+3 min—, así que mandar un `enviado_at` ahí sería
+            // afirmar algo que no pasó. La hora real la sabe este bloque, y recién acá se
+            // informa. El endpoint es idempotente y no pisa datos con nulos.
+            await pushToCrmPropio(token, [{
+              domain,
+              contactos: [{ email: future_email, tipo: "adicional", enviado_at: new Date().toISOString() }],
+            }], "adicional_enviado").catch(e => log(`  ⚠️ ${domain}: adicional enviado pero el CRM no lo registró (${e.message})`));
+
             if (reason_row === "adicional_manual") {
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
                 method: "POST",
