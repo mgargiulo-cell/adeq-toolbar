@@ -8486,7 +8486,7 @@ function _conectarTraduccionHover(areaEl, panelEl, bodyEl, getTexto, getLang) {
     if (!cabEl) return;
     const iso = String(lang || "").toLowerCase().slice(0, 2);
     const nombre = LANG_NOMBRE[iso] || String(lang || "").trim() || "el idioma del sitio";
-    cabEl.textContent = `🇪🇸 Traducción al castellano. El email original será este mismo en idioma ${nombre}.`;
+    cabEl.textContent = `🇪🇸 Ésta es la traducción al castellano del email en ${nombre}. Se envía el original, no esto.`;
   };
   const mostrar = async () => {
     const texto = String(getTexto() || "").trim();
@@ -8529,11 +8529,29 @@ function _conectarTraduccionHover(areaEl, panelEl, bodyEl, getTexto, getLang) {
   // y con `pointer-events:none` la rueda del mouse ni siquiera llegaba al panel: no se podía
   // leer un mail largo. En el contenedor, moverse del textarea al panel es seguir adentro.
   const zona = areaEl.closest(".pitch-wrap") || areaEl.parentElement || areaEl;
-  zona.addEventListener("mouseenter", mostrar);
-  zona.addEventListener("mouseleave", ocultar);
+
+  // ── SE ABRE RECIÉN A LOS 2 SEGUNDOS QUIETO (2026-09-07, pedido del user) ───────────────
+  // *"Sólo si el usuario deja el cursor en el texto del borrador más de 2 segundos quieto, ahí
+  // se abre."* Antes bastaba con pasar por encima, así que el panel saltaba al mover el mouse
+  // hacia otro botón y tapaba el borrador sin que nadie lo pidiera. Con la espera, el MB decide
+  // cuándo verlo — y de paso no se traduce un mail que nadie va a leer.
+  // "Quieto" es literal: cada `mousemove` reinicia la cuenta. Una vez abierto no se reprograma,
+  // así que moverse DENTRO del panel para scrollearlo no lo cierra ni lo reabre.
+  const DEMORA_MS = 2000;
+  let reloj = null;
+  const cancelar = () => { if (reloj) { clearTimeout(reloj); reloj = null; } };
+  const programar = () => {
+    if (!panelEl.hidden) return;
+    cancelar();
+    reloj = setTimeout(() => { reloj = null; mostrar(); }, DEMORA_MS);
+  };
+  const salir = () => { cancelar(); ocultar(); };
+  zona.addEventListener("mouseenter", programar);
+  zona.addEventListener("mousemove",  programar);
+  zona.addEventListener("mouseleave", salir);
   // Con el foco puesto el MB está leyendo o escribiendo: el panel estorba.
-  areaEl.addEventListener("focus", ocultar);
-  return { ocultar, invalidar };
+  areaEl.addEventListener("focus", salir);
+  return { ocultar: salir, invalidar };
 }
 
 function applyCrmTemplate(t, lang) {
