@@ -736,7 +736,9 @@
            apretar Limpiar. El desplegable de país carga el borrador PROPIO del MB para ese
            idioma (que no tiene que ser el mismo que el del CRM). (2026-09-04, pedido del user) -->
       <div class="pitch-toolbar">
-        <button id="btn-pitch-flag" type="button" class="pitch-tool-btn pitch-tool-flag" title="Click para rotar variantes del mismo idioma">
+        <!-- El título real lo pone updatePitchFlagButton() según de dónde venga el texto; éste
+             es sólo el del primer instante, antes de que carguen las plantillas. -->
+        <button id="btn-pitch-flag" type="button" class="pitch-tool-flag pitch-tool-btn" title="Plantilla del mail. La del CRM la elige el sistema; tus borradores se rotan con click.">
           <span id="pitch-flag-emoji">🌐</span>
           <span id="pitch-flag-name" class="pitch-tool-name">—</span>
         </button>
