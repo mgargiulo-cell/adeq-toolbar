@@ -5288,13 +5288,6 @@ function _veredictoCrm(dup) {
     return { ok: true, titulo: "Web prospectable", detalle: "Cliente Antiguo Pausado.", clase: "crm-si" };
   }
   if (_CRM_CERRADO_RE.test(estado)) {
-    // `descansando` NO es una conclusión de la toolbar: lo calcula el CRM y lo devuelve en la
-    // misma ficha, y sólo lo sella la transición "En Negociacion → Ciclo Finalizado" (un
-    // negocio que se habló y se cayó). Por eso se respeta.
-    if (dup.descansando) {
-      return { ok: false, titulo: "No prospectable todavía",
-               detalle: `Se cerró hace poco — faltan ${dup.diasParaReintentar} día(s) de descanso.`, clase: "crm-no" };
-    }
     return { ok: true, titulo: "Web prospectable", detalle: "Ya tiene ciclo finalizado.", clase: "crm-si" };
   }
   // Un estado que no conocemos no se declara prospectable: el vocabulario del CRM ya cambió

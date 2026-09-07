@@ -69,10 +69,13 @@ test("Live NO se prospecta: es un cliente activo", () => {
   match(v.detalle, /cliente activo/i);
 });
 
-test("el descanso de 40 días del CRM se respeta", () => {
+test("Ciclo Finalizado es prospectable siempre: decide la columna, no otra cosa", () => {
+  // El user, textual: "la toolbar lee del CRM la columna estado y dependiendo lo que diga la
+  // columna, aplica el cartel prospectable o no prospectable". Ni el descanso de 40 días ni
+  // ninguna otra señal cambian el veredicto.
   const v = veredicto({ found: true, status: "Ciclo Finalizado", descansando: true, diasParaReintentar: 12 });
-  strictEqual(v.ok, false);
-  match(v.detalle, /12 día/);
+  strictEqual(v.ok, true);
+  match(v.detalle, /ciclo finalizado/i);
 });
 
 test("el veredicto sale de `estado` y de nada más", () => {
