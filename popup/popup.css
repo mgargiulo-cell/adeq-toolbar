@@ -531,6 +531,27 @@ a:hover { text-decoration: underline; }
   font-weight: 700;
   letter-spacing: 0.3px;
 }
+/* ── EL VEREDICTO DEL CRM (2026-09-07) ─────────────────────────────────────────
+   Es la primera línea del recuadro y tiene que leerse sin buscarla: dice si esta
+   web se puede prospectar y por qué. Reemplaza al chip chico "YA ESTÁ EN ADEQ",
+   que obligaba a saberse de memoria cuáles de los cinco estados dejan escribir. */
+.crm-veredicto {
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 0 0 10px 0;
+  border: 1px solid transparent;
+  border-left-width: 4px;
+}
+.crm-veredicto-t   { font-size: 15px; font-weight: 700; line-height: 1.25; }
+.crm-veredicto-d   { font-size: 13px; margin-top: 2px; line-height: 1.4; }
+.crm-veredicto-ctx { font-size: 11px; margin-top: 5px; opacity: .75; line-height: 1.4; }
+.crm-veredicto.crm-si   { background: #ecfdf5; border-color: #a7f3d0; border-left-color: #059669; color: #065f46; }
+.crm-veredicto.crm-no   { background: #fef2f2; border-color: #fecaca; border-left-color: #dc2626; color: #991b1b; }
+.crm-veredicto.crm-duda { background: #fffbeb; border-color: #fde68a; border-left-color: #d97706; color: #92400e; }
+/* Un botón que el CRM no deja usar se ve apagado, pero sigue clickeable a propósito:
+   el click contesta POR QUÉ está bloqueado en vez de no hacer nada. */
+.btn-bloqueado-crm { opacity: .5; filter: grayscale(.6); }
+
 .status-badge.new       { background: #dbeafe; color: #1d4ed8; }
 .status-badge.duplicate { background: #fee2e2; color: #b91c1c; }
 .status-badge.loading   { background: var(--surface-3); color: var(--text-muted); font-style: italic; font-weight: 500; }

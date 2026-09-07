@@ -3091,34 +3091,44 @@ async function runDuplicateCheck() {
     }
     state.duplicate = result;
 
+    // El veredicto, antes que cualquier otra cosa: es lo primero que el MB tiene que leer.
+    // La lista de bloqueados del CRM sólo se consulta cuando el estado NO alcanza para
+    // decidir (no está en el CRM, o está cerrado/pausado): con "Live" o "En Negociacion" ya
+    // está dicho y no hace falta esperar 2 segundos.
+    let _bloq = false;
+    const _estadoDecide = result.found && (_CRM_LIVE_RE.test(result.status || "") || _CRM_EN_CURSO_RE.test(result.status || ""));
+    if (!result.indeterminado && !_estadoDecide && !_CRM_PAUSADO_RE.test(result.status || "")) {
+      const set = await _dominiosBloqueadosCrm();
+      if (set) _bloq = set.has(String(state.domain || "").replace(/^www\./, "").toLowerCase());
+    }
+    const veredicto = _veredictoCrm(result, { bloqueadoPorCrm: _bloq });
+    state.crmVeredicto = veredicto;
+    _pintarVeredictoCrm(veredicto, result);
+    // ⚠️ El bloqueo se aplica al FINAL, no acá: la rama de duplicado que viene abajo le pone
+    // "🔄 Actualizar en ADEQ" al botón y le pisaba el "⛔ No prospectable". Un botón que dice
+    // "Actualizar" sobre una web bloqueada invita justo a lo que estamos frenando.
+
     if (result.indeterminado) {
       // ⚠️ No se pudo preguntar. Se corta ACÁ con `return`: sin él, el flujo seguía hasta el
-      // `else` de abajo y pisaba este aviso con "✅ Nuevo prospecto" — además de prender
-      // `autoPushReady.notDup`, o sea habilitar el push automático de un dominio que NUNCA
-      // se verificó. El cuidado de buscarEnCrm (devolver `indeterminado` en vez de "libre")
-      // quedaba anulado dos líneas después.
-      el.textContent = "⚠️ no pude consultar ADEQ — verificá antes de escribir";
-      el.className   = "status-badge duplicate";
+      // `else` de abajo y prendía `autoPushReady.notDup`, o sea habilitaba el push automático
+      // de un dominio que NUNCA se verificó. El cuidado de buscarEnCrm (devolver
+      // `indeterminado` en vez de "libre") quedaba anulado dos líneas después.
+      _aplicarBloqueoCrm(veredicto);
       checkProspectLock();
       return;
     }
     if (result.found) {
-      // Un negocio cerrado hace poco es el caso que más importa avisar: el sitio figura
-      // "descartado" pero está en los 60 días de descanso que pidió el user.
-      el.textContent = result.descansando
-        ? `⛔ CERRADO HACE POCO · faltan ${result.diasParaReintentar} días para reintentar`
-        : `⚠️ YA ESTÁ EN ADEQ · ${result.status}${result.board ? ` · ${result.board}` : ""} · ${result.ejecutivo || "—"}`;
-      el.className   = "status-badge duplicate";
       state.mondayItemId = result.itemId;
       fillMondayFormFromDuplicate(result);
       document.getElementById("btn-push-monday").textContent = "🔄 Actualizar en ADEQ";
 
-      // Si es duplicado re-prospectable (Ciclo Finalizado / Mail No Enviado),
-      // los datos en Monday pueden tener meses → forzar refresh de tráfico.
-      // Esto sobreescribe el cache 90d y trae fresh de RapidAPI.
-      // Solo forzamos refresh si: (a) status reprospectable Y (b) el cache está viejo
-      // (>30d). Si el cache es reciente, lo respetamos para no quemar RapidAPI.
-      const reprospectable = /ciclo\s*finalizado|mail\s*no\s*enviado/i.test(result.status || "");
+      // Si se le puede volver a escribir (ciclo finalizado o pausado), los datos del CRM
+      // pueden tener meses → forzar refresh de tráfico. Esto sobreescribe el cache 90d y trae
+      // fresh de RapidAPI. Solo si: (a) es re-prospectable Y (b) el cache está viejo (>30d).
+      // ⚠️ Antes la lista era `/ciclo finalizado|mail no enviado/`, y "Mail No Enviado" dejó
+      // de existir cuando el CRM pasó a cinco estados. Ahora sale del MISMO veredicto que ve
+      // el MB en pantalla: una sola definición de "se puede volver a escribir".
+      const reprospectable = veredicto.ok;
       if (reprospectable) {
         // Esperar a runTrafficCheck para ver si los datos vinieron de cache reciente.
         // Si cache > 30d, re-fetch con forceRefresh.
@@ -3129,19 +3139,43 @@ async function runDuplicateCheck() {
           }
         }, 1500);
       }
-    } else {
-      el.textContent = "✅ Nuevo prospecto";
-      el.className   = "status-badge new";
+    } else if (veredicto.ok) {
       autoPushReady.notDup = true;
       checkAutoPush();
     }
-    // Lock check: si OTRO MB ya está trabajando este dominio, mostrar warning
-    checkProspectLock();
-    // Detectar idioma siempre (nuevo y duplicado) para el pitch
-    autoDetectPageLanguage();
-  } catch {
-    el.textContent = "⚠️ ADEQ no respondió";
-    el.className   = "status-badge";
+    _aplicarBloqueoCrm(veredicto);
+  } catch (e) {
+    // Sólo llega acá si falló la consulta en sí. Lo de después (lock, idioma) va afuera del
+    // try a propósito: estaba adentro, y cualquier excepción suya pintaba "⚠️ ADEQ no
+    // respondió" sobre un veredicto correcto — el CRM había contestado perfecto. Es el cartel
+    // que el user vio en claude.ai el 07/09.
+    console.warn("runDuplicateCheck:", e?.message || e);
+    const v = { ok: false, duda: true, titulo: "No pude consultar el CRM",
+                detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
+    state.crmVeredicto = v;
+    _pintarVeredictoCrm(v, null);
+    _aplicarBloqueoCrm(v);
+  }
+  // Lock check: si OTRO MB ya está trabajando este dominio, mostrar warning
+  checkProspectLock();
+  // Detectar idioma siempre (nuevo y duplicado) para el pitch
+  autoDetectPageLanguage();
+}
+
+// Deja el formulario en claro: si el CRM dice que no, el botón de cargar lo dice y no se
+// puede apretar. Avisar sin frenar no alcanzó nunca — el user pidió que "no deje prospectar".
+function _aplicarBloqueoCrm(v) {
+  const push = document.getElementById("btn-push-monday");
+  const gmail = document.getElementById("btn-send-gmail");
+  const bloquea = v && !v.ok && !v.duda;
+  for (const b of [push, gmail]) {
+    if (!b) continue;
+    b.classList.toggle("btn-bloqueado-crm", !!bloquea);
+    b.title = bloquea ? `${v.titulo}: ${v.detalle}` : "";
+  }
+  if (push) {
+    if (bloquea) { push.dataset.textoPrevio = push.dataset.textoPrevio || push.textContent; push.textContent = "⛔ No prospectable"; }
+    else if (push.dataset.textoPrevio) { push.textContent = push.dataset.textoPrevio; delete push.dataset.textoPrevio; }
   }
 }
 
@@ -5213,6 +5247,115 @@ function _estadoLabel(idx) {
   return "Propuesta Vigente";
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// ¿SE PUEDE PROSPECTAR ESTA WEB? — el veredicto, dicho con todas las letras
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Regla del user (2026-09-07), textual:
+//   · no está en el CRM            → "Web prospectable. Nunca fue contactada."
+//   · Ciclo Finalizado             → "Web prospectable. Ya tiene ciclo finalizado."
+//   · Pausado                      → "Web prospectable. Cliente Antiguo Pausado."
+//   · Propuesta Vigente / En Negociacion / Personalizado → NO deja prospectar. "Propuesta en curso."
+//   · Live                         → NO deja prospectar. "Cliente activo."
+//
+// Antes esto no se decía en ningún lado: el recuadro mostraba "⚠️ YA ESTÁ EN ADEQ · <estado>"
+// y el MB tenía que saberse de memoria cuáles de los cinco estados permiten volver a escribir.
+// El veredicto ahora es la primera línea del recuadro y, cuando dice que no, el botón de
+// cargar y el de mandar el mail se niegan (no alcanza con avisar: el que apura, apura).
+//
+// ⚠️ DATO QUE EL USER TIENE QUE SABER (medido el 07/09): los 62 dominios en `Pausado` están
+// TODOS en `crm_board_clientes_activos` (facturaron en los últimos 90 días) y el CRM los
+// bloquea en `/dominios-activos`. Con esta regla, la toolbar los deja prospectar igual —
+// es la decisión del user y acá se respeta— pero por eso el detalle lo dice en pantalla.
+const _CRM_LIVE_RE    = /^\s*live\s*$/i;
+const _CRM_EN_CURSO_RE = /propuesta\s*vigente|en\s*negociaci|personalizado/i;
+const _CRM_PAUSADO_RE = /pausad/i;
+const _CRM_CERRADO_RE = /ciclo\s*finalizado/i;
+
+// La lista de bloqueados del propio CRM (`/dominios-activos`) sabe cosas que el estado de la
+// ficha no dice: cliente que factura sin estar en `Live`, dominio en un tablero de negociación,
+// bloqueado a mano por un MB. Se usa SÓLO para tapar el hueco "el estado parece libre pero el
+// CRM igual lo bloquea"; nunca para pisar la regla de arriba. Cacheada 1 h: son 3.100 dominios
+// y 2,4 s de espera, y la lista la regenera el CRM una vez por día.
+const _BLOQ_CACHE_KEY = "crm_bloqueados_v1";
+const _BLOQ_TTL_MS = 60 * 60 * 1000;
+async function _dominiosBloqueadosCrm() {
+  try {
+    const { [_BLOQ_CACHE_KEY]: c } = await chrome.storage.local.get(_BLOQ_CACHE_KEY);
+    if (c && Array.isArray(c.domains) && Date.now() - (c.ts || 0) < _BLOQ_TTL_MS) return new Set(c.domains);
+  } catch {}
+  try {
+    const idx = await getMondayBoardIndex();          // devuelve Map(dominio → {estado})
+    const domains = [...idx.keys()];
+    try { await chrome.storage.local.set({ [_BLOQ_CACHE_KEY]: { ts: Date.now(), domains } }); } catch {}
+    return new Set(domains);
+  } catch {
+    return null;                                       // no pudimos preguntar ≠ no hay nadie bloqueado
+  }
+}
+
+function _veredictoCrm(dup, { bloqueadoPorCrm = false } = {}) {
+  // "No pude preguntar" NUNCA es "está libre": es el error caro, y ya nos costó una vez.
+  if (!dup || dup.indeterminado) {
+    return { ok: false, duda: true, titulo: "No pude consultar el CRM",
+             detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
+  }
+  if (!dup.found) {
+    return bloqueadoPorCrm
+      ? { ok: false, titulo: "No prospectable", detalle: "El CRM lo tiene bloqueado (cliente que factura, en un tablero de negociación o bloqueado a mano).", clase: "crm-no" }
+      : { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
+  }
+  const estado = String(dup.status || "").trim();
+  if (_CRM_LIVE_RE.test(estado)) {
+    return { ok: false, titulo: "No prospectable", detalle: "Cliente activo.", clase: "crm-no" };
+  }
+  if (_CRM_EN_CURSO_RE.test(estado)) {
+    return { ok: false, titulo: "No prospectable", detalle: `Propuesta en curso (${estado}).`, clase: "crm-no" };
+  }
+  if (_CRM_PAUSADO_RE.test(estado)) {
+    return { ok: true, titulo: "Web prospectable", detalle: "Cliente Antiguo Pausado.", clase: "crm-si" };
+  }
+  if (_CRM_CERRADO_RE.test(estado)) {
+    // El descanso de 40 días del CRM se respeta: sólo lo sella la transición
+    // "En Negociacion → Ciclo Finalizado", o sea un negocio que se habló y se cayó.
+    if (dup.descansando) {
+      return { ok: false, titulo: "No prospectable todavía",
+               detalle: `Se cerró hace poco — faltan ${dup.diasParaReintentar} día(s) de descanso.`, clase: "crm-no" };
+    }
+    return { ok: true, titulo: "Web prospectable", detalle: "Ya tiene ciclo finalizado.", clase: "crm-si" };
+  }
+  if (bloqueadoPorCrm) {
+    return { ok: false, titulo: "No prospectable", detalle: `El CRM lo tiene bloqueado${estado ? ` (${estado})` : ""}.`, clase: "crm-no" };
+  }
+  // Un estado que no conocemos no se declara prospectable: el vocabulario del CRM ya cambió
+  // tres veces en un día y afirmar de más acá significa un mail a un cliente.
+  return { ok: false, duda: true, titulo: "Revisalo a mano",
+           detalle: `Estado "${estado || "sin estado"}": no lo reconozco, no puedo decir si se puede escribir.`, clase: "crm-duda" };
+}
+
+function _pintarVeredictoCrm(v, dup) {
+  const el = document.getElementById("duplicate-result");
+  if (!el) return;
+  const ctx = [];
+  if (dup?.found) {
+    if (dup.ejecutivo) ctx.push(esc(dup.ejecutivo.split("@")[0]));
+    if (dup.status)    ctx.push(esc(dup.status));
+    if (dup.fecha)     ctx.push(`último contacto ${esc(dup.fecha)}`);
+    if (dup.board)     ctx.push(esc(dup.board));
+  }
+  el.className = `crm-veredicto ${v.clase}`;
+  el.innerHTML =
+    `<div class="crm-veredicto-t">${v.ok ? "✅" : v.duda ? "⚠️" : "⛔"} ${esc(v.titulo)}</div>` +
+    `<div class="crm-veredicto-d">${esc(v.detalle)}</div>` +
+    (ctx.length ? `<div class="crm-veredicto-ctx">${ctx.join(" · ")}</div>` : "");
+}
+
+// El mensaje único cuando algo se niega a seguir porque el CRM dice que no.
+function _motivoBloqueoCrm() {
+  const v = state.crmVeredicto;
+  if (!v || v.ok) return "";
+  return `⛔ ${v.titulo}: ${v.detalle}${v.duda ? "" : " No se le escribe ni se carga."}`;
+}
+
 // ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
 // Devuelve la MISMA forma que devolvía aquél para no tocar a los seis lugares que la
 // consumen — lo único nuevo es `descansando`, que Monday no sabía: un negocio cerrado hace
@@ -5413,6 +5556,14 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     if (!_rateLimiter.check()) {
       res.textContent = "⚠️ Too many requests — please wait a moment"; res.className = "push-result error"; return;
     }
+    // Guard #0: el CRM dice que esta web NO se prospecta (cliente activo, propuesta en curso,
+    // o cerrada dentro de su descanso). Va PRIMERO: es el único guard que protege al negocio
+    // de afuera —escribirle a un cliente vivo— y no a nuestros datos.
+    if (state.crmVeredicto && !state.crmVeredicto.ok && !state.crmVeredicto.duda) {
+      res.textContent = _motivoBloqueoCrm(); res.className = "push-result error";
+      document.getElementById("duplicate-result")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
     // Validate email if provided. Una URL de formulario de contacto pasa tal cual (ver _esFormularioUrl).
     const esFormulario = _esFormularioUrl(email);
     if (email && !isValidEmail(email) && !esFormulario) {
@@ -5518,6 +5669,14 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     const pitch   = document.getElementById("pitch-text").value || state.pitch;
     const subjectRaw = document.getElementById("form-subject").value.trim();
 
+    // El mail es lo que de verdad llega al publisher: si el CRM dice que esta web no se
+    // prospecta (cliente activo, propuesta en curso, o cerrada dentro de su descanso), acá se
+    // corta antes que en ningún otro lado.
+    if (state.crmVeredicto && !state.crmVeredicto.ok && !state.crmVeredicto.duda) {
+      res.textContent = _motivoBloqueoCrm(); res.className = "push-result error";
+      document.getElementById("duplicate-result")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
     if (_esFormularioUrl(email)) {
       res.textContent = "📋 Es un formulario de contacto, no un email: completalo en el sitio y cargá directo en ADEQ (no hace falta mandar mail).";
       res.className = "push-result error"; return;
@@ -6695,18 +6854,16 @@ async function startCascade() {
   });
   let filteredCount = 0;
 
-  // Bloqueado SI: está en Monday Y tiene estado distinto a "Ciclo Finalizado".
-  // Razón: si está en ciclo activo (LIVE / Propuesta / En Negociación / Rebotado /
-  // Descartado / etc.) no se debe re-prospectar. Solo los "Ciclo Finalizado" son
-  // recyclables y aparecen en cascade aunque ya estén cargados en Monday.
-  const isBlockedByExec = (domain) => {
-    const clean = domain.replace(/^www\./, "").toLowerCase();
-    const info  = boardIndex.get(clean);
-    if (!info) return false;                         // no está en Monday → libre
-    const estado = (info.estado || "").trim();
-    if (!estado) return false;                       // sin estado → no bloquear
-    return estado.toLowerCase() !== "ciclo finalizado"; // bloquea todo lo demás
-  };
+  // Bloqueado SI el CRM lo tiene en su lista de "no escribir" (`/api/crm/dominios-activos`).
+  // Esa lista YA aplica las reglas del negocio —propuesta vigente, en negociación, Live,
+  // cliente que factura, tablero de negociación, bloqueado a mano, y el descanso de 40 días—
+  // así que acá no se re-interpreta el estado: si el CRM lo bloquea, no se sugiere.
+  // ⚠️ El código viejo comparaba `estado !== "ciclo finalizado"` contra un campo que
+  // `getMondayBoardIndex` rellena con la constante "bloqueado" desde que se apagó Monday:
+  // la comparación era siempre verdadera y el nombre mentía sobre lo que hacía.
+  // La cascada es a propósito MÁS conservadora que Analysis: acá no hay un MB mirando la
+  // ficha, son sugerencias automáticas, y una de más se le manda a un cliente.
+  const isBlockedByExec = (domain) => boardIndex.has(domain.replace(/^www\./, "").toLowerCase());
 
   const passesFilters = (site) => {
     if (CASCADE_BLOCKLIST.has(site.domain.replace(/^www\./, ""))) return false;
@@ -11168,6 +11325,22 @@ async function validateProspect(card, data, doSendEmail) {
   const setResult = (msg, ok = true) => {
     if (resultEl) { resultEl.textContent = msg; resultEl.style.color = ok ? "#16a34a" : "#e53e3e"; }
   };
+
+  // ── LA MISMA REGLA QUE EN ANALYSIS (2026-09-07, pedido del user) ─────────────────────
+  // Esta puerta mandaba el mail y creaba la ficha SIN preguntarle al CRM en qué estado está
+  // el dominio. Un prospecto entró al pool cuando estaba libre, pero entre eso y hoy pudo
+  // haberse vuelto cliente (`Live`) o haber arrancado una negociación: escribirle un primer
+  // contacto a esa altura es el peor mail que podemos mandar. El agente ya se protege con
+  // `/dominios-activos`; el envío a mano desde Prospects era la única de las tres puertas sin
+  // el chequeo. Se pregunta por la ficha, que es lo barato y lo exacto (0,6 s).
+  const _dupPool = await buscarEnCrm(data.domain);
+  const _vPool = _veredictoCrm(_dupPool);
+  if (!_vPool.ok && !_vPool.duda) {
+    setResult(`⛔ ${_vPool.titulo}: ${_vPool.detalle}`, false);
+    card.querySelectorAll("button").forEach(b => { b.disabled = false; });
+    return;
+  }
+  if (_vPool.duda) setResult(`⚠️ ${_vPool.titulo} — ${_vPool.detalle}`, false);
 
   // Daily limit check
   const dailyCount = await getDailyValidationCount(state.accessToken, state.loginEmail);
