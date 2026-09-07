@@ -5767,6 +5767,7 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
       const sentMsgs  = [];
       const failMsgs  = [];
       const _yaEnviados = new Set([email.toLowerCase()]);   // dedupe: principal + entre slots
+      const _colaAdicionales = [];                          // se encolan y los manda el worker, 1 por minuto
       for (const slotId of futureSlots) {
         const futureEmail = document.getElementById(slotId)?.value?.trim()?.toLowerCase();
         if (!futureEmail || !futureEmail.includes("@")) continue;
@@ -5777,32 +5778,51 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
         _yaEnviados.add(futureEmail);
         const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }));
         if (bFut.bounced) { failMsgs.push(`🚫 ${futureEmail} bounced`); continue; }
-        // Mandar EL MISMO subject + body al adicional
-        const altRes = await sendEmail({ to: futureEmail, subject, body: bodyToSend, expectedFrom: state.loginEmail });
-        if (altRes.ok) {
-          sentMsgs.push(`✅ ${futureEmail}`);
-          incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
-          // Registrar también en response_tracking (source = "manual_extra")
-          fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+        // ── UNO POR MINUTO, NO LOS CUATRO JUNTOS (2026-09-07, pedido del user) ────────────
+        // Salían los cuatro (principal + 3) en el mismo minuto, con el mismo asunto y el mismo
+        // cuerpo, desde el mismo remitente. Si los adicionales son del mismo dominio, el
+        // servidor del publisher ve cuatro copias idénticas a la vez: es la firma de una
+        // difusión, y el rebote lo pagan los tres buzones porque la reputación en Gmail es por
+        // dominio. Ahora se encolan a +1, +2 y +3 minutos y los despacha el worker, que ya sabe
+        // mandar desde la casilla del MB (delegación por buzón).
+        // Se usa `toolbar_reengagement_queue`, que YA existía para esto —era el viejo +11/+22/+33
+        // días— con toda la maquinaria hecha: snapshot del asunto y del cuerpo, dedupe, y el
+        // despacho en `processManualReengagementQueue`. `tracking_action_id: null` a propósito:
+        // con él, el worker saltea el envío si el original ya se abrió, y acá los queremos todos.
+        _colaAdicionales.push({
+          domain:           state.domain,
+          mb_email:         state.loginEmail.toLowerCase(),
+          original_email:   email.toLowerCase(),
+          future_email:     futureEmail,
+          original_subject: subject,
+          original_body:    bodyToSend,
+          original_sent_at: new Date().toISOString(),
+          scheduled_for:    new Date(Date.now() + (_colaAdicionales.length + 1) * 60_000).toISOString(),
+          status:           "pending",
+          reason:           "adicional_manual",
+          sequence:         _colaAdicionales.length + 1,
+          tracking_action_id: null,
+        });
+        sentMsgs.push(`⏱️ ${futureEmail} en ${_colaAdicionales.length} min`);
+      }
+      if (_colaAdicionales.length) {
+        // Si la cola falla hay que DECIRLO: el MB tiene que saber que esos mails no van a salir.
+        // Un adicional que no se manda y nadie avisa es el mismo "fallo silencioso" de siempre.
+        try {
+          const _r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_reengagement_queue`, {
             method: "POST",
             headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({
-              mb_email:      state.loginEmail.toLowerCase(),
-              domain:        state.domain,
-              email_sent_to: futureEmail,
-              source:        "manual_extra",
-              geo:           document.getElementById("form-geo")?.value || "",
-              category:      state.category || "",
-              sent_at:       new Date().toISOString(),
-            }),
-          }).catch(() => {});
-        } else {
-          failMsgs.push(`❌ ${futureEmail}: ${altRes.error || "send fail"}`);
+            body: JSON.stringify(_colaAdicionales),
+          });
+          if (!_r.ok) throw new Error(`HTTP ${_r.status}`);
+        } catch (e) {
+          sentMsgs.length = 0;
+          failMsgs.push(`❌ no se pudieron programar los adicionales (${e.message}) — mandalos a mano`);
         }
       }
       if (futStatusEl && (sentMsgs.length || failMsgs.length)) {
         const parts = [];
-        if (sentMsgs.length) parts.push(`Adicionales enviados día 0: ${sentMsgs.join(" · ")}`);
+        if (sentMsgs.length) parts.push(`Adicionales programados (1 por minuto, para no parecer una difusión): ${sentMsgs.join(" · ")}`);
         if (failMsgs.length) parts.push(`Problemas: ${failMsgs.join(" · ")}`);
         futStatusEl.textContent = parts.join(" | ");
         futStatusEl.style.color = failMsgs.length && !sentMsgs.length ? "#dc2626" : sentMsgs.length ? "#16a34a" : "#d97706";

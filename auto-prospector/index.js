@@ -16083,7 +16083,7 @@ async function processManualReengagementQueue(token) {
 
     // 1. Pickear pending vencidos (limit 20 por iteración)
     const nowIso = new Date().toISOString();
-    const url = `${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?status=eq.pending&scheduled_for=lte.${encodeURIComponent(nowIso)}&select=id,domain,monday_item_id,mb_email,future_email,original_subject,original_body,tracking_action_id,original_email&order=scheduled_for.asc&limit=20`; // Maxi 2026-07-03 perf: select=* → solo columnas destructuradas
+    const url = `${SUPABASE_URL}/rest/v1/toolbar_reengagement_queue?status=eq.pending&scheduled_for=lte.${encodeURIComponent(nowIso)}&select=id,domain,monday_item_id,mb_email,future_email,original_subject,original_body,tracking_action_id,original_email,reason&order=scheduled_for.asc&limit=20`; // Maxi 2026-07-03 perf: select=* → solo columnas destructuradas
     const res = await fetch(url, {
       headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
     });
@@ -16095,7 +16095,7 @@ async function processManualReengagementQueue(token) {
 
     for (const row of rows) {
       const { id, domain, monday_item_id, mb_email, original_email, future_email,
-              original_subject, original_body, tracking_action_id } = row;
+              original_subject, original_body, tracking_action_id, reason: reason_row } = row;
       let newStatus = "sent";
       let reason = null;
 
@@ -16167,6 +16167,27 @@ async function processManualReengagementQueue(token) {
                 original_action_id:    tracking_action_id || null,
               },
             });
+
+            // ── LA MEDICIÓN NO SE PUEDE PERDER EN LA MUDANZA (2026-09-07) ─────────────────
+            // Hasta hoy los adicionales los mandaba el popup y él escribía la fila en
+            // `toolbar_response_tracking` con `source='manual_extra'`. Ahora los manda el
+            // worker, así que la fila la tiene que escribir acá o la serie se corta: son 499
+            // envíos en 90 días con **6,6% de respuesta real, la mejor de todas las fuentes**,
+            // y sin esta fila el mail diario diría que los adicionales dejaron de existir.
+            // Mismo nombre de fuente a propósito: para que los 90 días sigan comparándose.
+            if (reason_row === "adicional_manual") {
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+                method: "POST",
+                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+                body: JSON.stringify({
+                  mb_email: String(mb_email || "").toLowerCase(),
+                  domain,
+                  email_sent_to: future_email,
+                  source: "manual_extra",
+                  sent_at: new Date().toISOString(),
+                }),
+              }).catch(e => log(`  ⚠️ ${domain}: adicional enviado pero no se pudo registrar (${e.message})`));
+            }
 
             // 4. Update Monday: email + FU1 (today+5) + FU2 (today+10)
             const upd = await updateMondayReengagementDispatch(monday_api_key, monday_item_id, boardId, future_email);
@@ -25685,6 +25706,16 @@ async function main() {
     // cualquier portón, a partir de las 8 de Madrid; su propio guard de 24h evita repetirlo.
     if (_spainHour() >= 8) await enviarResumenSalud(token).catch(e => log(`⚠️ resumenSalud: ${e.message}`));
 
+    // ── LOS ADICIONALES DEL MB, A SU HORA (2026-09-07) ──────────────────────────────────
+    // Desde hoy la extensión no manda los contactos adicionales de golpe: los encola a +1, +2 y
+    // +3 minutos para no disparar cuatro mails idénticos al mismo dominio en el mismo instante.
+    // Para que ese "+1 minuto" sea de verdad, el despacho tiene que correr seguido y sin portón:
+    // estaba detrás de un throttle de 25 MINUTOS y del horario 9-23 de Madrid, así que un mail
+    // programado a las 22:59 salía a las 9 de la mañana siguiente. Acá arriba corre en cada
+    // vuelta del loop (~20 s) y también fuera de hora: son envíos que una persona ya disparó,
+    // no trabajo del agente. La consulta es un SELECT indexado que casi siempre vuelve vacío.
+    await processManualReengagementQueue(token).catch(e => log(`⚠️ manualReengage: ${e.message}`));
+
     // ── REGLA DE ORO: lun-vie 9-20 Madrid. Fin de semana o fuera de hora → NADA corre ──
     // Aplica a TODOS los users y TODOS los flows: agent, csv queue, autopilot,
     // backfill, refresh, unfreezer.
@@ -25731,9 +25762,8 @@ async function main() {
     // Sin esto la función early-returns sin tocar nada.
     if (await _tocaCorrer(token, "reengagement", 25)) {
       runReengagementCycle(token).catch(e => log(`⚠️ reengagement: ${e.message}`));
-      // Cola MANUAL de Email Futuro (toolbar_reengagement_queue) — se procesa
-      // siempre que esté el flag general activo (mismo gate que el otro).
-      processManualReengagementQueue(token).catch(e => log(`⚠️ manualReengage: ${e.message}`));
+      // (La cola manual de adicionales se movió arriba del portón horario: ver el comentario
+      //  en el bloque de `processManualReengagementQueue`, cerca del parte diario.)
       // Re-enrich de leads malos del review_queue (flag agent_reenrich_bad_leads).
       // Sin esto, los 240 leads viejos sin Apollo nunca se actualizan.
       runReenrichBadLeads(token).catch(e => log(`⚠️ reenrich: ${e.message}`));
