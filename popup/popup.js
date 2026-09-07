@@ -8637,7 +8637,7 @@ function updatePitchFlagButton() {
     const lista = _crmTpl.byLang.get(t.lang) || [];
     const pos   = Math.max(0, lista.findIndex(x => x.id === t.id));
     nameEl.textContent = `CRM · ${LANG_NOMBRE[t.lang] || t.lang} · ${t.nombre || "inicial"} (${pos + 1}/${lista.length || 1})`;
-    flagBtn.title = "Plantilla del mail inicial del CRM. Click para rotar entre sus variantes.";
+    flagBtn.title = "Es la plantilla que manda el CRM y la variante la elige el sistema (por dominio y día). Para escribir otra cosa: 🗑️ Limpiar, o elegí un país para usar tu borrador.";
   } else {
     const drafts = _draftsState.byLang.get(lang) || [];
     if (drafts.length === 0) {
@@ -8728,14 +8728,15 @@ async function autofillDraftOnLoad() {
 // del CRM, borradores propios si no.
 function rotatePitchTemplate() {
   const t = state.pitchTemplate;
+  // ── LA PLANTILLA DEL CRM NO SE ELIGE A MANO (regla del user, 2026-09-07) ───────────────
+  // Textual: *"si el botón de la izquierda muestra lo que envía el CRM, no debe dar la
+  // posibilidad de cambiarlo, porque dijimos que acá en la toolbar a veces sea el 1, a veces
+  // el 2 y otras el 3. Sólo el media buyer lo debe limpiar si quiere redactar algo"*.
+  // La variante la decide `_semillaRotacion` (hash de dominio + día): así el mismo sitio
+  // siempre recibe la misma y el reparto entre las tres queda parejo solo. Si el MB pudiera
+  // rotarla, elegiría siempre la que más le gusta y no habría con qué comparar cuál rinde.
   if (t?.origen === "crm") {
-    const lista = _crmTpl.byLang.get(t.lang) || [];
-    if (lista.length < 2) return;
-    const cur  = Math.max(0, lista.findIndex(x => x.id === t.id));
-    const next = (cur + 1) % lista.length;
-    _crmTpl.idxByLang.set(t.lang, next);
-    applyCrmTemplate(lista[next], t.lang);
-    updatePitchFlagButton();
+    _pista("Ésta es la plantilla que manda el CRM y la elige el sistema. Para escribir otra cosa: 🗑️ Limpiar, o elegí un país para usar tu borrador.");
     return;
   }
   const lang   = _draftsState.currentLang || _resolvePitchLang();
@@ -10876,7 +10877,7 @@ function initProspectCard(card, data) {
       if (cardFlag.origen === "crm" && crm.length) {
         const pos = Math.max(0, crm.findIndex(x => x.id === cardFlag.crmId));
         nameEl.textContent = `CRM · ${crm[pos]?.nombre || "inicial"} (${pos + 1}/${crm.length})`;
-        flagBtn.title = "Plantilla del mail inicial del CRM. Click para rotar variantes.";
+        flagBtn.title = "Es la plantilla que manda el CRM: la variante la elige el sistema. Para escribir otra cosa, limpiá.";
       } else {
         const drafts = _cardDraftsForLang();
         if (drafts.length === 0) {
@@ -10942,14 +10943,9 @@ function initProspectCard(card, data) {
 
   // Bandera = rotar dentro de la fuente puesta (variantes del CRM, o borradores propios)
   card.querySelector(".pcard-flag-btn")?.addEventListener("click", () => {
-    if (cardFlag.origen === "crm") {
-      const crm = _cardCrmForLang();
-      if (crm.length < 2) return;
-      const cur = Math.max(0, crm.findIndex(x => x.id === cardFlag.crmId));
-      _applyCardCrm(crm[(cur + 1) % crm.length]);
-      _updateCardUI();
-      return;
-    }
+    // Igual que en Analysis: la variante del CRM la elige el sistema, no el MB (regla del
+    // user, 07/09). Para mandar otra cosa está el trash (limpiar) o el borrador propio.
+    if (cardFlag.origen === "crm") return;
     const drafts = _cardDraftsForLang();
     if (drafts.length === 0) return;
     cardFlag.idx = (cardFlag.idx + 1) % drafts.length;
@@ -11221,36 +11217,19 @@ function initProspectCard(card, data) {
       } catch { return "ilegible_red"; }
     })();
 
-    let siteSnippet = "";
-    try {
-      const resp = await fetch(`https://${data.domain}`, { signal: AbortSignal.timeout(5000) });
-      if (resp.ok) {
-        const html = await resp.text();
-        const pick = (re) => { const m = html.match(re); return m ? m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160) : ""; };
-        const title = pick(/<title[^>]*>([\s\S]*?)<\/title>/i);
-        const desc  = pick(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i)
-                   || pick(/<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i);
-        const heads = [...html.matchAll(/<h[12][^>]*>([\s\S]*?)<\/h[12]>/gi)].slice(0, 4)
-          .map(m => m[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()).filter(Boolean).join(" | ").slice(0, 240);
-        siteSnippet = [title && `Título real: ${title}`, desc && `Descripción: ${desc}`, heads && `Titulares: ${heads}`].filter(Boolean).join("\n");
-      }
-    } catch { /* sitio caído/CORS → uso solo los campos guardados */ }
-    // Claude deduce el TIPO de web por CONTENIDO (ignora país y temática general).
-    let webType = "";
-    try {
-      const { callClaude, CLAUDE_HAIKU } = await import("../modules/claude.js");
-      const r = await callClaude({
-        model: CLAUDE_HAIKU, maxTokens: 40, motivo: "tipo_de_web",
-        system: "Clasificás sitios web para un equipo de monetización publicitaria. Devolvé en 2-6 palabras el TIPO de web a evitar según su CALIDAD y NATURALEZA de CONTENIDO (ej: 'sitio MFA/spam', 'contenido autogenerado', 'agregador sin valor', 'foro muerto', 'blog bajo tráfico', 'directorio', 'web corporativa sin inventario'). REGLA DURA: NO clasifiques por país/idioma ni por temática general (deportes, noticias, autos, etc. son válidos) — solo por la CALIDAD/TIPO del contenido. SOLO el tipo, sin explicación.",
-        messages: [{ role: "user", content: `Dominio: ${data.domain}\nTítulo guardado: ${data.page_title || ""}\n${siteSnippet || "(no se pudo leer el sitio en vivo)"}\nMotivo del rechazo del MB: ${reason || "(sin comentario)"}` }],
-      });
-      webType = (r?.text || "").trim().replace(/^["']|["']$/g, "").slice(0, 60);
-    } catch (e) { console.warn("[reject] Claude type err", e?.message); }
+    // ── ACÁ NO SE GASTA CLAUDE (regla del user, 2026-09-07) ─────────────────────────────
+    // Textual: *"lo único que tiene que gastar crédito de Claude en la toolbar es el generador
+    // de borradores pitch, que casi nunca se utiliza"*. Acá se bajaba la home del sitio y se le
+    // preguntaba a Haiku el TIPO de web para enriquecer el motivo del rechazo. Se saca entero:
+    // el motivo queda con lo que escribió el MB y el estado del ads.txt, que es dato duro y
+    // gratis. El worker ya clasifica el tipo de sitio con su propio detector, así que la
+    // información no se pierde donde importa (`classifyPublisher` + el destilador de rechazos).
+    // Medido antes de sacarlo: 0 llamadas registradas en 30 días — no aportaba nada.
     adsTxtEstado = await _adsTxtPromesa.catch(() => "?");
     // El motivo queda con el estado del ads.txt pegado: "no tiene ads.txt [ads.txt: no]" se puede
     // auditar después sin volver a salir a la red, y distingue "el filtro falló" de "el sitio
     // cambió desde entonces".
-    const _motivoCompleto = [reason, webType ? `[tipo: ${webType}]` : "", `[ads.txt: ${adsTxtEstado}]`]
+    const _motivoCompleto = [reason, `[ads.txt: ${adsTxtEstado}]`]
       .filter(Boolean).join(" ");
     await Promise.all([
       rejectReviewItem(state.accessToken, id, data.domain, _motivoCompleto),
@@ -11260,7 +11239,7 @@ function initProspectCard(card, data) {
         reason: _motivoCompleto || undefined,
       }),
     ]);
-    if (typeof showToast === "function") showToast(webType ? `🧠 Aprendido — evitar tipo: ${webType}` : "❌ Rechazado", "info", 3500);
+    if (typeof showToast === "function") showToast("❌ Rechazado", "info", 3000);
     card.remove();
     refreshProspectsStats();
   });
