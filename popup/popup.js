@@ -8736,14 +8736,32 @@ function rotatePitchTemplate() {
   // siempre recibe la misma y el reparto entre las tres queda parejo solo. Si el MB pudiera
   // rotarla, elegiría siempre la que más le gusta y no habría con qué comparar cuál rinde.
   if (t?.origen === "crm") {
-    _pista("Ésta es la plantilla que manda el CRM y la elige el sistema. Para escribir otra cosa: 🗑️ Limpiar, o elegí un país para usar tu borrador.");
+    // El click no cambia la variante, pero SÍ sirve para algo: vuelve a pedirle las plantillas
+    // al CRM salteando la caché de 6 h. Sin esto no había ninguna forma de traer una plantilla
+    // recién editada —el `force` existía en el código y no lo llamaba nadie— y el MB tenía que
+    // esperar seis horas sin saber por qué. (2026-09-07.)
+    _pista("Ésta es la plantilla que manda el CRM y la variante la elige el sistema. Para escribir otra cosa: 🗑️ Limpiar, o elegí un país. Buscando cambios en el CRM…");
+    loadCrmTemplates(true).then(() => {
+      const lista = _crmTpl.byLang.get(t.lang) || [];
+      if (!lista.length) { _pista("El CRM no tiene plantilla inicial en este idioma."); return; }
+      const idx = _semillaRotacion(lista.length);
+      _crmTpl.idxByLang.set(t.lang, idx);
+      const nueva = lista[idx];
+      const cambio = !_mismoTexto(nueva.body, t.body);
+      applyCrmTemplate(nueva, t.lang);
+      updatePitchFlagButton();
+      _pista(cambio ? "✅ Se actualizó: la plantilla del CRM había cambiado." : "Al día: es la misma plantilla que tiene el CRM ahora.");
+    }).catch(e => _pista(`No pude consultar el CRM (${e.message}). Sigue la que estaba.`));
     return;
   }
   const lang   = _draftsState.currentLang || _resolvePitchLang();
   const drafts = _draftsState.byLang.get(lang) || [];
   if (drafts.length === 0) return;
-  const cur  = _draftsState.flagIdxByLang.get(lang) ?? 0;
-  const next = (cur + 1) % drafts.length;
+  const cur = _draftsState.flagIdxByLang.get(lang) ?? 0;
+  // Con el recuadro vacío (recién limpiado) el primer click carga el borrador 1, no el 2:
+  // antes saltaba al siguiente índice y el MB nunca veía el primero sin dar tres vueltas.
+  const hay  = !!state.pitchTemplate;
+  const next = hay ? (cur + 1) % drafts.length : cur;
   _draftsState.flagIdxByLang.set(lang, next);
   applyDraftToPitch(drafts[next], { silent: true });
   updatePitchFlagButton();
