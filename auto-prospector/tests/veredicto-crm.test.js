@@ -12,10 +12,16 @@
 // test es también el detector: si mañana aparece un estado nuevo, el veredicto tiene que decir
 // "no lo reconozco" y NO dejar escribir — nunca inventar que se puede.
 //
+// Manda la columna `estado` y NADA MÁS (regla del user: "matchear por la columna estado, no
+// sacar conclusiones"). Los datos le dan la razón: los 45 `Live` facturan los 45, y de los 62
+// `Pausado` NO factura ninguno. El CRM ya es consistente; cruzarlo con otras vistas sólo
+// agregaba ruido mío.
+//
 // `_veredictoCrm` vive en popup/popup.js, que no se puede importar (arranca el DOM entero):
 // se extrae el bloque por texto, igual que hace tests/paridad-popup.test.js.
 //
 // Run: npm test
+/* eslint-disable no-new-func */
 import { test } from "node:test";
 import { strictEqual, ok, match } from "node:assert";
 import fs from "node:fs";
@@ -27,9 +33,7 @@ const src = fs.readFileSync(POPUP, "utf8");
 const ini = src.indexOf("const _CRM_LIVE_RE");
 const fin = src.indexOf("function _pintarVeredictoCrm");
 ok(ini > 0 && fin > ini, "no encontré _veredictoCrm en popup.js — ¿lo renombraron?");
-// Se saca `_dominiosBloqueadosCrm`, que usa chrome.storage y no hace falta para la regla.
-const cuerpo = src.slice(ini, fin).replace(/const _BLOQ_CACHE_KEY[\s\S]*?^}/m, "");
-const veredicto = new Function(cuerpo + "; return _veredictoCrm;")();
+const veredicto = new Function(src.slice(ini, fin) + "; return _veredictoCrm;")();
 
 test("una web que nunca fue contactada se puede prospectar", () => {
   const v = veredicto({ found: false });
@@ -71,10 +75,13 @@ test("el descanso de 40 días del CRM se respeta", () => {
   match(v.detalle, /12 día/);
 });
 
-test("si el CRM lo bloquea por otra razón (cliente que factura, bloqueado a mano), tampoco", () => {
-  const v = veredicto({ found: false }, { bloqueadoPorCrm: true });
-  strictEqual(v.ok, false);
-  match(v.detalle, /bloqueado/i);
+test("el veredicto sale de `estado` y de nada más", () => {
+  // Regla del user: "matchear con el CRM por la columna estado, no sacar conclusiones".
+  // Si alguien vuelve a cruzar `/dominios-activos` o la vista de clientes para inventar
+  // bloqueos, este test lo dice: la función toma UN argumento.
+  strictEqual(veredicto.length, 1, "_veredictoCrm no puede recibir más señales que la ficha");
+  ok(!/dominios-activos|clientes_activos|bloqueadoPorCrm/.test(src.slice(ini, fin)),
+     "el veredicto volvió a cruzar otra fuente además de `estado`");
 });
 
 test("no haber podido preguntar NUNCA es 'está libre'", () => {

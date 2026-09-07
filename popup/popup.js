@@ -3092,16 +3092,8 @@ async function runDuplicateCheck() {
     state.duplicate = result;
 
     // El veredicto, antes que cualquier otra cosa: es lo primero que el MB tiene que leer.
-    // La lista de bloqueados del CRM sólo se consulta cuando el estado NO alcanza para
-    // decidir (no está en el CRM, o está cerrado/pausado): con "Live" o "En Negociacion" ya
-    // está dicho y no hace falta esperar 2 segundos.
-    let _bloq = false;
-    const _estadoDecide = result.found && (_CRM_LIVE_RE.test(result.status || "") || _CRM_EN_CURSO_RE.test(result.status || ""));
-    if (!result.indeterminado && !_estadoDecide && !_CRM_PAUSADO_RE.test(result.status || "")) {
-      const set = await _dominiosBloqueadosCrm();
-      if (set) _bloq = set.has(String(state.domain || "").replace(/^www\./, "").toLowerCase());
-    }
-    const veredicto = _veredictoCrm(result, { bloqueadoPorCrm: _bloq });
+    // Sale de la columna `estado` de la ficha del CRM y de nada más (regla del user, 07/09).
+    const veredicto = _veredictoCrm(result);
     state.crmVeredicto = veredicto;
     _pintarVeredictoCrm(veredicto, result);
     // ⚠️ El bloqueo se aplica al FINAL, no acá: la rama de duplicado que viene abajo le pone
@@ -5262,47 +5254,28 @@ function _estadoLabel(idx) {
 // El veredicto ahora es la primera línea del recuadro y, cuando dice que no, el botón de
 // cargar y el de mandar el mail se niegan (no alcanza con avisar: el que apura, apura).
 //
-// ⚠️ DATO QUE EL USER TIENE QUE SABER (medido el 07/09): los 62 dominios en `Pausado` están
-// TODOS en `crm_board_clientes_activos` (facturaron en los últimos 90 días) y el CRM los
-// bloquea en `/dominios-activos`. Con esta regla, la toolbar los deja prospectar igual —
-// es la decisión del user y acá se respeta— pero por eso el detalle lo dice en pantalla.
+// ⚠️ MANDA LA COLUMNA `estado` DEL CRM, Y NADA MÁS (regla del user, 07/09: *"vos tenés que
+// matchear con el CRM por la columna estado, no sacar conclusiones"*). La primera versión
+// cruzaba además la lista `/dominios-activos` para "tapar huecos", y de ahí salió una
+// advertencia MÍA que era falsa: dije que los 62 `Pausado` facturaban porque están en
+// `crm_board_clientes_activos`, sin mirar POR QUÉ están. Medido después: de esos 62, **0
+// facturan** (54 "ex cliente: en la base y sin revenue", 8 marcados activos pero sin revenue
+// en 90 días), y los 45 `Live` facturan los 45. O sea: el CRM ya dice todo lo que hace falta
+// en una sola columna, y el que sacaba conclusiones era yo. Sin el cruce, además, el recuadro
+// contesta al instante en vez de esperar 2,4 s.
 const _CRM_LIVE_RE    = /^\s*live\s*$/i;
 const _CRM_EN_CURSO_RE = /propuesta\s*vigente|en\s*negociaci|personalizado/i;
 const _CRM_PAUSADO_RE = /pausad/i;
 const _CRM_CERRADO_RE = /ciclo\s*finalizado/i;
 
-// La lista de bloqueados del propio CRM (`/dominios-activos`) sabe cosas que el estado de la
-// ficha no dice: cliente que factura sin estar en `Live`, dominio en un tablero de negociación,
-// bloqueado a mano por un MB. Se usa SÓLO para tapar el hueco "el estado parece libre pero el
-// CRM igual lo bloquea"; nunca para pisar la regla de arriba. Cacheada 1 h: son 3.100 dominios
-// y 2,4 s de espera, y la lista la regenera el CRM una vez por día.
-const _BLOQ_CACHE_KEY = "crm_bloqueados_v1";
-const _BLOQ_TTL_MS = 60 * 60 * 1000;
-async function _dominiosBloqueadosCrm() {
-  try {
-    const { [_BLOQ_CACHE_KEY]: c } = await chrome.storage.local.get(_BLOQ_CACHE_KEY);
-    if (c && Array.isArray(c.domains) && Date.now() - (c.ts || 0) < _BLOQ_TTL_MS) return new Set(c.domains);
-  } catch {}
-  try {
-    const idx = await getMondayBoardIndex();          // devuelve Map(dominio → {estado})
-    const domains = [...idx.keys()];
-    try { await chrome.storage.local.set({ [_BLOQ_CACHE_KEY]: { ts: Date.now(), domains } }); } catch {}
-    return new Set(domains);
-  } catch {
-    return null;                                       // no pudimos preguntar ≠ no hay nadie bloqueado
-  }
-}
-
-function _veredictoCrm(dup, { bloqueadoPorCrm = false } = {}) {
+function _veredictoCrm(dup) {
   // "No pude preguntar" NUNCA es "está libre": es el error caro, y ya nos costó una vez.
   if (!dup || dup.indeterminado) {
     return { ok: false, duda: true, titulo: "No pude consultar el CRM",
              detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
   }
   if (!dup.found) {
-    return bloqueadoPorCrm
-      ? { ok: false, titulo: "No prospectable", detalle: "El CRM lo tiene bloqueado (cliente que factura, en un tablero de negociación o bloqueado a mano).", clase: "crm-no" }
-      : { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
+    return { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
   }
   const estado = String(dup.status || "").trim();
   if (_CRM_LIVE_RE.test(estado)) {
@@ -5315,16 +5288,14 @@ function _veredictoCrm(dup, { bloqueadoPorCrm = false } = {}) {
     return { ok: true, titulo: "Web prospectable", detalle: "Cliente Antiguo Pausado.", clase: "crm-si" };
   }
   if (_CRM_CERRADO_RE.test(estado)) {
-    // El descanso de 40 días del CRM se respeta: sólo lo sella la transición
-    // "En Negociacion → Ciclo Finalizado", o sea un negocio que se habló y se cayó.
+    // `descansando` NO es una conclusión de la toolbar: lo calcula el CRM y lo devuelve en la
+    // misma ficha, y sólo lo sella la transición "En Negociacion → Ciclo Finalizado" (un
+    // negocio que se habló y se cayó). Por eso se respeta.
     if (dup.descansando) {
       return { ok: false, titulo: "No prospectable todavía",
                detalle: `Se cerró hace poco — faltan ${dup.diasParaReintentar} día(s) de descanso.`, clase: "crm-no" };
     }
     return { ok: true, titulo: "Web prospectable", detalle: "Ya tiene ciclo finalizado.", clase: "crm-si" };
-  }
-  if (bloqueadoPorCrm) {
-    return { ok: false, titulo: "No prospectable", detalle: `El CRM lo tiene bloqueado${estado ? ` (${estado})` : ""}.`, clase: "crm-no" };
   }
   // Un estado que no conocemos no se declara prospectable: el vocabulario del CRM ya cambió
   // tres veces en un día y afirmar de más acá significa un mail a un cliente.
