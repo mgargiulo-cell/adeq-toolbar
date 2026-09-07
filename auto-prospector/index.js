@@ -19393,6 +19393,12 @@ async function cupoDisponibleCasilla(casilla) {
     const j = await r.json();
     const usados = Number(j?.ultima_hora ?? j?.count ?? NaN);
     if (!Number.isFinite(usados)) return { hay: true, usados: propios, tope: CUPO_CASILLA_HORA, propios, motivo: "crm_sin_numero" };
+    // ── EL CRM SACÓ SUS TOPES (07/09, segunda versión de c54cbad) ─────────────────────────
+    // Ya no hay red compartida: mandan `sin_tope: true` (y un `tope` inalcanzable a propósito,
+    // para que un fallback a 25 no nos frene). Queda UN solo freno de nuestro lado: el propio
+    // de arriba (25/h entre agente y a mano) + el cap de 20/día. El `count` de la mesa pasa a
+    // ser sólo la medida del volumen real por casilla, que vamos a mirar juntos.
+    if (j?.sin_tope === true) return { hay: true, usados, tope: null, restantes: null, propios, tope_crm: null, motivo: "sin_tope_crm" };
     // `tope`/`restantes` los manda el CRM desde c54cbad; antes de eso, el 25 de siempre.
     const tope = Number.isFinite(Number(j?.tope)) && Number(j.tope) > 0 ? Number(j.tope) : CUPO_CASILLA_HORA;
     const restantes = Number.isFinite(Number(j?.restantes)) ? Number(j.restantes) : (tope - usados);

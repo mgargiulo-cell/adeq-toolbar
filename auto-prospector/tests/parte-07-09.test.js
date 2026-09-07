@@ -218,6 +218,14 @@ test("red compartida agotada: no sale aunque lo nuestro sea poco", async () => {
   const c = await cupoDisponibleCasilla("sales@adeqmedia.com");
   strictEqual(c.hay, false); strictEqual(c.motivo, "red_compartida");
 });
+test("CRM sin topes (`sin_tope: true`): la mesa no frena, y lo nuestro sigue frenando", async () => {
+  mesa({ propios: 4, crm: { ultima_hora: 180, tope: 999999, restantes: 999819, sin_tope: true } });
+  const c = await cupoDisponibleCasilla("sales@adeqmedia.com");
+  strictEqual(c.hay, true); strictEqual(c.motivo, "sin_tope_crm");
+  mesa({ propios: 25, crm: { ultima_hora: 180, tope: 999999, restantes: 999819, sin_tope: true } });
+  strictEqual((await cupoDisponibleCasilla("sales@adeqmedia.com")).hay, false, "sin tope del CRM, nuestros 25/h siguen valiendo");
+});
+
 test("los envíos manuales del popup también se anotan en la mesa común", () => {
   const gmail = fs.readFileSync(path.join(aqui, "..", "..", "modules", "gmail.js"), "utf8");
   ok(/_registrarEnMesaComun\(expectedFrom, to\)/.test(gmail), "el 07/09 Agustina mandó 27 a mano y la mesa decía 1");
