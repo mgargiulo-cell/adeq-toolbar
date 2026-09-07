@@ -3311,22 +3311,33 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // frases buenas y no encasillarse). Sube la calidad de URLs sin gastar más búsquedas.
   let _topPhrases = [];
   const _yieldPorFrase = new Map();   // frase → cuántas veces se buscó (para paginar)
+  // ── LAS FRASES MUERTAS SE RETIRAN (parte del 07/09) ────────────────────────────────────
+  // "Las mejores 600 por qualified" incluía a las que tenían qualified=0: hay 220 frases que
+  // alguna vez calificaron un lead, así que las otras 380 del "top" eran ceros ordenados por
+  // frescura, y encima seguían entrando por el 35% de exploración. Medido: 93 frases con ≥10
+  // búsquedas y CERO leads —"dropshipping guía", "congreso noticias", "salud mental consejos":
+  // temas, no medios— se habían llevado 1.538 búsquedas de Serper. Ahora el top exige haber
+  // calificado alguna vez, y una frase con 10 búsquedas y ningún lead no vuelve a salir.
+  const _muertas = new Set();
   try {
-    const _yr = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&order=qualified.desc,fresh.desc&select=phrase,searches&limit=600`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
+    const _hdr = { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } };
+    const [_yr, _mr] = await Promise.all([
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&qualified=gt.0&order=qualified.desc,fresh.desc&select=phrase,searches&limit=600`, _hdr),
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.10&or=(qualified.is.null,qualified.eq.0)&select=phrase&limit=2000`, _hdr),
+    ]);
     if (_yr.ok) {
       const _filas = await _yr.json();
       _topPhrases = _filas.map(r => r.phrase).filter(p => typeof p === "string");
       _filas.forEach(r => { if (r.phrase) _yieldPorFrase.set(r.phrase, r.searches || 0); });
     }
+    if (_mr.ok) for (const r of await _mr.json()) if (r?.phrase) _muertas.add(r.phrase);
   } catch {}
+  if (_muertas.size) log(`  🪦 AutoGoogle: ${_muertas.size} frase(s) retiradas por no calificar nunca en ≥10 búsquedas`);
   const _poolSet = new Set(pool);
   const _topInPool = _topPhrases.filter(p => _poolSet.has(p));
   const _pickTop = [..._topInPool].sort(() => Math.random() - 0.5).slice(0, Math.round(N * 0.65));
   const _pickTopSet = new Set(_pickTop);
-  const _explore = pool.filter(p => !_pickTopSet.has(p)).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
+  const _explore = pool.filter(p => !_pickTopSet.has(p) && !_muertas.has(p)).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
   // ── HUELLA DE PUBLISHER, no tema (Maxi 2026-08-11) ────────────────────────
   // Las keywords del pool buscan TEMAS ("breaking news today", "recetas faciles").
   // Google responde a eso con la CNN y la BBC: sitios enormes, anglo y que ya
@@ -9051,7 +9062,13 @@ async function parteDelDia(token, opts = {}) {
   for (const a of (Array.isArray(_altas) ? _altas : [])) {
     const s = String(a.source || "").toLowerCase();
     const _por = String(a.created_by || "").toLowerCase();
-    if (!_por || /worker@|autofeeder|@backend/.test(_por)) altaAgente++;
+    // ⚠️ EL RECICLADO NO LO CARGA NADIE A MANO (parte del 07/09). Las filas `monday_refresh`
+    // —ciclos finalizados del CRM que vuelven al pool— llevan en `created_by` al EJECUTIVO
+    // de la ficha (línea `createdBy:` del feeder), no a quien las cargó. El parte las contaba
+    // como "las dio un MB a mano: sales 105 · dhorovitz 42 · mgargiulo 13" un día en que
+    // Maxi no cargó ni una. Las 160 eran del reciclador. La fuente manda sobre la firma.
+    const _esReciclado = /monday|crm_recicl/.test(s);
+    if (_esReciclado || !_por || /worker@|autofeeder|@backend/.test(_por)) altaAgente++;
     else altaManualPorMb.set(_por, (altaManualPorMb.get(_por) || 0) + 1);
     if (Array.isArray(a.emails) && a.emails.length) altasConEmail++; else altasSinEmail++;
     if (/autogoogle/.test(s)) altaAutogoogle++;
@@ -9085,18 +9102,28 @@ async function parteDelDia(token, opts = {}) {
       { headers: auth }
     ).then(r => r.ok ? r.json() : []).catch(() => []);
     for (const f of (Array.isArray(filas) ? filas : [])) {
-      const s = String(f.source || "?").replace(/^auto_feeder_/, "");
-      _porFuente[s] = _porFuente[s] || { trajo: 0, paso: 0 };
+      // `monday` es el reciclado de ciclos finalizados del CRM (Monday está apagado desde el
+      // 02/09); se nombra por lo que es. `sellers`/`sellers_json` son la misma fuente.
+      const s = String(f.source || "?").replace(/^auto_feeder_/, "")
+        .replace(/^monday(_refresh)?$/, "crm_reciclado").replace(/^sellers_json$/, "sellers");
+      _porFuente[s] = _porFuente[s] || { trajo: 0, paso: 0, congelados: 0 };
       _porFuente[s].trajo++;
       if (f.status === "done") _porFuente[s].paso++;
+      // ⚠️ CONGELADO NO ES PROCESADO (parte del 07/09). El barrido del 02-04/09 congeló 1.368
+      // filas viejas de `autopilot` (subidas en julio-agosto) con 15 días de backoff, y cada
+      // una tocó `processed_at`: el parte las contaba como "trajo 1.411 · pasaron 0 (0%)" y
+      // sentenciaba "esa fuente gasta créditos para nada". No gastó nada (RapidAPI: 9-49
+      // llamadas por día esa semana) y la fuente ni siquiera existe ya. Se cuentan aparte.
+      else if (f.status === "frozen") _porFuente[s].congelados++;
     }
   } catch {}
   const lineasFuente = Object.entries(_porFuente)
     .sort((a, b) => b[1].trajo - a[1].trajo)
     .map(([s, v]) => {
-      const pct = v.trajo ? Math.round((v.paso / v.trajo) * 100) : 0;
-      const señal = pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
-      return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)`;
+      const _evaluados = v.trajo - v.congelados;
+      const pct = _evaluados ? Math.round((v.paso / _evaluados) * 100) : 0;
+      const señal = !_evaluados ? "🧊" : pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
+      return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)${v.congelados ? ` · ${v.congelados} congelados` : ""}`;
     });
 
   // 4. LIMPIEZA: URLs que YA ESTABAN en Prospects y se sacaron hoy por no cumplir.
@@ -9146,31 +9173,43 @@ async function parteDelDia(token, opts = {}) {
   let _agStats = null;
   try { _agStats = JSON.parse(cfg.autogoogle_stats || "null"); } catch {}
 
-  // 5. EMAILS RECUPERADOS: leads que no tenían email y hoy sí. Contador que lleva polishPool.
-  const _pe = String(cfg.polish_enriquecidos_hoy || "").split(":");
-  const emailsHallados = _pe[0] === hoy ? (parseInt(_pe[1], 10) || 0) : 0;
+  // 5. EMAILS RECUPERADOS: leads que no tenían email y hoy sí.
+  // ⚠️ Se lee de la COLUMNA, no del contador (parte del 07/09). `polish_enriquecidos_hoy`
+  // suma `enriched++` cada vez que polish encuentra una dirección, tenga o no el lead otra
+  // ya cargada; `email_found_at` se marca SOLO cuando no tenía ninguna (línea ~11790). Ese
+  // día el contador decía 574 y la columna 14: el renglón "no tenían" estaba inflado 40×
+  // con direcciones extra sobre leads que ya eran contactables. Lo que el user pidió medir
+  // es el rescate, y el rescate es la columna.
+  const emailsHallados = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desdeHoy}&select=id`);
 
   // 4. Lo que se rompió hoy, si algo se rompió.
   const problemas = [];
   if (totalEnviado < objetivoTotal) {
+    // También los cortes de TURNO (`cycle_*`), no sólo los descartes por lead: un turno que
+    // encontró la casilla llena o el pool vacío no descarta a nadie y antes quedaba invisible.
     const motivos = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&created_at=gte.${desdeHoy}&select=reason`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(skipped,cycle_no_candidates,cycle_gates,cycle_cupo_casilla)&created_at=gte.${desdeHoy}&select=action,reason`,
       { headers: auth }
     ).then(r => r.ok ? r.json() : []).catch(() => []);
     const top = {};
+    let _cortesCasilla = 0;
     for (const m of (Array.isArray(motivos) ? motivos : [])) {
-      const k = String(m.reason || "?").split(":")[0];
+      if (m.action === "cycle_cupo_casilla") { _cortesCasilla++; continue; }
+      const k = m.action === "skipped" ? String(m.reason || "?").split(":")[0] : m.action;
       top[k] = (top[k] || 0) + 1;
     }
     const orden = Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 3);
-    if (orden.length) problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos. Los descartes de hoy: ${orden.map(([k, v]) => `${k} (${v})`).join(", ")}.`);
-    else problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos y NO hay descartes registrados — el agente no llegó a intentarlo. Revisar si el worker corrió.`);
+    // El corte por casilla llena se dice con todas las letras: es el otro sistema (la cadencia
+    // del CRM) ocupando el cupo compartido del buzón, y no se arregla mirando al agente.
+    if (_cortesCasilla) problemas.push(`El agente cortó ${_cortesCasilla} turno(s) porque la casilla ya tenía ${CUPO_CASILLA_HORA}/${CUPO_CASILLA_HORA} mails en la última hora (cupo compartido con la cadencia del CRM). Faltaron ${objetivoTotal - totalEnviado} envíos: el cupo del buzón lo usó el CRM.`);
+    else if (orden.length) problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos. Los descartes de hoy: ${orden.map(([k, v]) => `${k} (${v})`).join(", ")}.`);
+    else problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos y NO hay descartes ni cortes registrados — el agente no llegó a intentarlo. Revisar si el worker corrió.`);
   }
   if (altasHoy === 0) problemas.push("No entró ni una URL nueva a Prospects. El descubrimiento está parado.");
   // Un motor en cero mientras otros traen es la señal que se perdió tres semanas: el total
   // disimulaba que Autopilot y AutoGoogle estaban muertos porque Monday seguía dando algo.
   else {
-    const _mudos = [["Autopilot", altaAutopilot], ["AutoGoogle", altaAutogoogle], ["los imports", altaImport], ["el reciclado de Monday", altaMonday]]
+    const _mudos = [["Autopilot", altaAutopilot], ["AutoGoogle", altaAutogoogle], ["los imports", altaImport], ["el reciclado del CRM", altaMonday]]
       .filter(([, n]) => n === 0).map(([m]) => m);
     if (_mudos.length) problemas.push(`Hoy no trajo nada: ${_mudos.join(", ")}. Los demás sí, así que no es una caída general.`);
   }
@@ -9282,7 +9321,15 @@ async function parteDelDia(token, opts = {}) {
     `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo,is_new,page_views,created_at&limit=2000`,
     { headers: auth }
   ).then(r => r.ok ? r.json() : []).catch(() => []);
+  // ── LO QUE NO ES UNA WEB NO CUENTA COMO "URL ABIERTA" (parte del 07/09) ─────────────
+  // La toolbar analiza sola cada pestaña a la que se llega con el panel abierto: Gmail,
+  // YouTube, claude.ai, la consola del CRM. Diego figuraba con 60 "URLs abiertas" y 26 "sin
+  // dato de tráfico" —una de cada dos era mail.google.com o gemini.google.com— y el 85% "fuera
+  // del foco" salía de que todas ésas se guardan con GEO=US por defecto. Es navegación, no
+  // prospección, y contarla acusa al MB de trabajar mal donde no trabajó.
+  const _NO_ES_WEB_PARTE = /(^|\.)(google\.com|googleapis\.com|youtube\.com|youtu\.be|claude\.ai|anthropic\.com|adeqmedia\.com|monday\.com|supabase\.co|railway\.app|github\.com|chatgpt\.com|openai\.com|localhost)$/i;
   for (const h of (Array.isArray(_hist) ? _hist : [])) {
+    if (_NO_ES_WEB_PARTE.test(String(h.domain || ""))) continue;
     const f = _fila(_quien(h.media_buyer));
     f.mirados++;
     if (h.is_new) f.nuevas++; else f.conocidas++;
@@ -9400,6 +9447,11 @@ async function parteDelDia(token, opts = {}) {
     for (const f of _st) {
       const d = String(f.domain || "").toLowerCase();
       if (!d) continue;
+      // ⚠️ Lo de HOY no cuenta como "ya contactado" (parte del 07/09). El MB abre la web, le
+      // escribe, y esa misma fila de sendtrack la convertía en "ya contactado en 30 días — bien
+      // no escribirle": a Agustina le figuraban 20 de sus 27 envíos del día como sitios que
+      // hizo bien en NO contactar. Lo de hoy ya está en "le escribió a".
+      if (String(f.send_date || "") >= hoy) continue;
       _contactadosAlguna.add(d);
       if (String(f.send_date || "") >= _c30) _contactados30.add(d);
     }
@@ -9456,7 +9508,7 @@ async function parteDelDia(token, opts = {}) {
   // Si el conteo no vino de Monday, el número es una fracción y hay que DECIRLO. El 25/08
   // este mismo bloque informó 2 envíos de Agustina cuando en el board había 18.
   if (!_manualesDesdeMonday) {
-    _lineasManual.push("   ⚠️ Monday no contestó: los envíos a mano salen del registro interno,");
+    _lineasManual.push("   ⚠️ El CRM no contestó: los envíos a mano salen del registro interno,");
     _lineasManual.push("      que viene incompleto. Tomá estos números como un piso, no como el total.");
     _lineasManual.push("");
   }
@@ -9502,12 +9554,12 @@ async function parteDelDia(token, opts = {}) {
         // sync recorre el board pero solo persiste un resumen—. Así que el parte informa el
         // hecho y NO afirma lo que no puede verificar.
         if (d.retomables) _lineasManual.push(d.mondaySabido
-          ? `         (+ ${d.retomables} se pueden RETOMAR: pasó el mes y no tienen deal vivo en Monday)`
-          : `         (+ ${d.retomables} contactados hace más de 30 días — revisar en Monday, todavía no tengo el estado del board)`);
-        if (d.conDealVivo) _lineasManual.push(`         (${d.conDealVivo} tienen deal VIVO en Monday — no se tocan)`);
+          ? `         (+ ${d.retomables} se pueden RETOMAR: pasó el mes y no tienen deal vivo en el CRM)`
+          : `         (+ ${d.retomables} contactados hace más de 30 días — revisar en el CRM, no tengo el estado de la ficha)`);
+        if (d.conDealVivo) _lineasManual.push(`         (${d.conDealVivo} tienen deal VIVO en el CRM — no se tocan)`);
         if (d.yaContactados) _lineasManual.push(`         (${d.yaContactados} ya contactados en los últimos 30 días — bien no escribirles)`);
         if (d.anglo) _lineasManual.push(`      🌎 Fuera del foco geográfico: ${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%) son anglo/Norteamérica`);
-        if (d.sesiones) _lineasManual.push(`      Toolbar abierta: ~${_min} min en ${d.sesiones} sesiones${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden — el total es un piso)` : ""}`);
+        if (d.sesiones) _lineasManual.push(`      Panel en primer plano (piso): ~${_min} min en ${d.sesiones} ratos${d.sesionesMedidas < d.sesiones ? ` (${d.sesiones - d.sesionesMedidas} de menos de 1 min no se miden)` : ""}`);
         if (d.desde) {
           const _hm = (m) => `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}min`;
           // El titular es la COBERTURA de la jornada, no los huecos. Un día de 20 minutos sin
@@ -9545,7 +9597,7 @@ async function parteDelDia(token, opts = {}) {
     `    Import (sellers.json, CSV)                     ${altaImport}`,
     `    Autopilot (similares, Majestic)                ${altaAutopilot}`,
     `    AutoGoogle                                     ${altaAutogoogle}`,
-    `    Monday finalizados reciclados                  ${altaMonday}`,
+    `    CRM: ciclos finalizados reciclados             ${altaMonday}`,
     ...(altaOtros > 0 ? [`    (otras fuentes: ${altaOtros})`] : []),
     `    Total de altas del día: ${altasHoy}`,
     `    Las dio el AGENTE: ${altaAgente}${altaManualPorMb.size
@@ -9554,7 +9606,7 @@ async function parteDelDia(token, opts = {}) {
     `    De esas, CON email: ${altasConEmail} · sin email: ${altasSinEmail}${altasHoy ? ` (${Math.round(100 * altasConEmail / altasHoy)}% contactable de entrada)` : ""}`,
     "",
     `6 · SACADAS DE PROSPECTS por no cumplir            ${_num(purgadas)}`,
-    `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${emailsHallados}`,
+    `7 · EMAILS ENCONTRADOS (no tenían y ahora sí)      ${_num(emailsHallados)}`,
     "",
     `PUBLISHERS DISPONIBLES — PROSPECTS  ${_num(conEmail)} contactables (~${diasDeStock} días de envíos) · ${_num(sinEmail)} sin email · ${_num(backlog)} en cola`,
     ...(conEmail != null && objetivoTotal > 0 && (conEmail / objetivoTotal) < 10
@@ -9679,12 +9731,15 @@ async function parteDelDia(token, opts = {}) {
                ...(d.retomables ? [[d.mondaySabido ? "Se pueden retomar" : "Contactados hace +30 días",
                    d.mondaySabido ? `${d.retomables}` : `${d.retomables} — falta el estado del board`,
                    d.mondaySabido ? "#b26a00" : _GRIS]] : []),
-               ...(d.conDealVivo ? [["Con deal vivo en Monday", `${d.conDealVivo} — no se tocan`, _GRIS]] : []),
+               ...(d.conDealVivo ? [["Con deal vivo en el CRM", `${d.conDealVivo} — no se tocan`, _GRIS]] : []),
                ...(d.yaContactados ? [["Ya contactados (30 días)", `${d.yaContactados}`, _GRIS]] : []),
                ...(d.anglo ? [["Fuera del foco (anglo)", `${d.anglo} de ${d.mirados} (${Math.round(100 * d.anglo / d.mirados)}%)`,
                    (d.anglo / d.mirados) > 0.3 ? _ROJO : _GRIS]] : []),
                ...(_promedios.get(nombre) ? [["Su promedio (14 días)", `${_promedios.get(nombre)} URLs/día`]] : []),
-               ...(d.sesiones ? [["Toolbar abierta", `~${Math.round((d.segundos || 0) / 60)} min · ${d.sesiones} sesiones`]] : []),
+               // Se llamaba "Toolbar abierta": ~15 min para 27 mails enviados en 4 horas no es
+               // tiempo de uso, es la suma de ratos en que el panel estuvo en primer plano (cada
+               // cambio de pestaña cierra la sesión). El tiempo de trabajo real es "Cobertura".
+               ...(d.sesiones ? [["Panel en primer plano (piso)", `~${Math.round((d.segundos || 0) / 60)} min en ${d.sesiones} ratos`, _GRIS]] : []),
                ...(d.desde ? [["Actividad (hora AR)", `${_horaAr(d.desde)} — ${_horaAr(d.hasta)}`]] : []),
                ...(d.desde ? [["Cobertura de la jornada",
                    `${Math.floor(d.activoMin / 60)}h ${String(d.activoMin % 60).padStart(2, "0")}min de ${Math.round(_JORNADA_MIN / 60)}h (${d.coberturaPct}%)`,
@@ -9713,7 +9768,7 @@ async function parteDelDia(token, opts = {}) {
     ["Import (sellers.json, CSV)", altaImport],
     ["Autopilot (similares, Majestic)", altaAutopilot],
     ["AutoGoogle", altaAutogoogle],
-    ["Monday finalizados reciclados", altaMonday],
+    ["CRM: ciclos finalizados reciclados", altaMonday],
     ...(altaOtros > 0 ? [["Otras fuentes", altaOtros]] : []),
     ["Total de altas del día", altasHoy],
     ["Las dio el agente", altaAgente],
@@ -9731,7 +9786,7 @@ async function parteDelDia(token, opts = {}) {
     ["Sin email todavía", _num(sinEmail)],
     ["En cola esperando", _num(backlog)],
     ["Sacadas de Prospects por no cumplir", _num(purgadas)],
-    ["Emails encontrados hoy (no tenían)", emailsHallados],
+    ["Emails encontrados hoy (no tenían)", _num(emailsHallados)],
   ]))}
 
   ${lineasFuente.length ? _card("Rendimiento por fuente (7 días)",
@@ -21210,6 +21265,7 @@ async function runAgentCycle(token, allFlags) {
     }
     if (scored.length === 0) {
       log(`🤖 Agent ${userEmail}: todos los candidatos descartados por gates`);
+      await logAgentAction(token, userEmail, { domain: "_cycle_", action: "cycle_gates", reason: `gates:${candidatesRaw.length}_candidatos_0_pasaron` }).catch(() => {});
       continue;
     }
     // Maxi 2026-06-18: DIVERSIDAD POR GEO obligatoria.
@@ -21331,6 +21387,8 @@ async function runAgentCycle(token, allFlags) {
       const _blockReason = await isDomainBlockedFull(domain, token);
       if (_blockReason) {
         log(`  ⛔ ${domain}: blocklist (${_blockReason}) — no se envía`);
+        // Con registro: un `continue` mudo deja al parte diciendo "no llegó a intentarlo".
+        await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `blocklist:${_blockReason}` }).catch(() => {});
         continue;
       }
       let emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
@@ -21869,6 +21927,17 @@ async function runAgentCycle(token, allFlags) {
         const _cupo = await cupoDisponibleCasilla(userEmail);
         if (!_cupo.hay) {
           log(`  ⏸️ ${userEmail}: ${_cupo.usados}/${CUPO_CASILLA_HORA} mails en la última hora (worker + CRM) — corto el turno`);
+          // ⚠️ SE ANOTA (parte del 07/09). Este `break` era mudo: el 07/09 el CRM mandó 25/h por
+          // buzón de 13 a 17 —exactamente el techo— en las mismas horas que los cinco turnos del
+          // agente, y cada turno cortó acá con "0 de 8" sin dejar rastro. El parte concluyó "no
+          // hay descartes registrados — el agente no llegó a intentarlo. Revisar si el worker
+          // corrió", que es lo contrario de lo que pasó: corrió cinco veces y cinco veces
+          // encontró la casilla llena por el otro sistema.
+          await logAgentAction(token, userEmail, {
+            domain: "_cycle_", action: "cycle_cupo_casilla",
+            reason: `casilla_llena:${_cupo.usados}/${CUPO_CASILLA_HORA}`,
+            details: { usados: _cupo.usados, tope: CUPO_CASILLA_HORA, hora_es: _spainHour() },
+          }).catch(() => {});
           break;
         }
 
@@ -21934,6 +22003,7 @@ async function runAgentCycle(token, allFlags) {
           // el lead sigue en el pool y se reintenta en el próximo ciclo, no se pierde nada.
           if (!stRes.ok) {
             log(`  ⏸️ ${domain}: no pude verificar si ya lo contactamos (HTTP ${stRes.status}) — NO se manda, se reintenta`);
+            await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `sendtrack_guard_error:HTTP ${stRes.status}` }).catch(() => {});
             continue;
           }
           const sentRows = await stRes.json();
@@ -21947,6 +22017,7 @@ async function runAgentCycle(token, allFlags) {
           }
         } catch (e) {
           log(`  ⏸️ sendtrack guard ${domain}: ${e.message} — NO se manda, se reintenta`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `sendtrack_guard_error:${String(e.message || e).slice(0, 80)}` }).catch(() => {});
           continue;
         }
 
@@ -23899,18 +23970,29 @@ async function vigilarAgenteFrenado(token) {
     const _global = Date.parse(cfg.agent_paused_until || "") > Date.now();
 
     const _mudos = _porMb.filter(x => x.n === 0).map(x => x.u.split("@")[0]);
-    const _grave = _total === 0 && _contactables > 0;
+    const _esperado = mbs.length * OBJETIVO_POR_MB;
+    // ⚠️ "Cero" era el único umbral (parte del 07/09): ese día salió 1 de 40 y el vigilante
+    // dijo "ok" porque 1 no es 0. Un cuarto del objetivo a esta hora ya es una caída.
+    const _grave = _contactables > 0 && _total < Math.ceil(_esperado * 0.25);
+    // El cupo compartido del buzón, por casilla: es la explicación que el 07/09 nadie tenía a
+    // mano (el CRM había llenado los 25/h de cada buzón en las horas del agente).
+    const _cupos = [];
+    for (const u of mbs) {
+      const c = await cupoDisponibleCasilla(u).catch(() => null);
+      if (c && c.usados != null) _cupos.push(`${u.split("@")[0]}: ${c.usados}/${CUPO_CASILLA_HORA} en la última hora${c.hay ? "" : " ← LLENA, el agente corta el turno"}`);
+    }
     await saludPing(token, "agente_frenado", {
       status: _grave ? "warn" : "ok", cadenciaMin: 2 * 60,
-      detalle: `${_total} envíos hoy · ${_contactables} contactables`,
-      real: _total, esperado: mbs.length * OBJETIVO_POR_MB,
+      detalle: `${_total} envíos hoy · ${_contactables} contactables${_cupos.length ? ` · cupo: ${_cupos.join(" | ")}` : ""}`,
+      real: _total, esperado: _esperado,
     });
     if (_grave) {
       await saludAlerta(token, {
         clave: "agente-sin-enviar", severidad: "error",
-        titulo: `🛑 El agente no mandó NINGÚN mail hoy y hay ${_contactables} para contactar`,
+        titulo: `🛑 El agente mandó ${_total} de ${_esperado} y hay ${_contactables} para contactar`,
         cuerpo: [
-          `Son las ${_spainHour()}h y los ${mbs.length} buzones van en cero.`,
+          `Son las ${_spainHour()}h y los ${mbs.length} buzones van ${_total} de ${_esperado}.`,
+          _cupos.length ? `Cupo del buzón (worker + CRM): ${_cupos.join(" · ")}` : "",
           _pausados.length ? `Pausados por el kill switch: ${_pausados.join(", ")}` : "Ningún buzón figura pausado por el kill switch.",
           _global ? "⚠️ La pausa GLOBAL (agent_paused_until) está activa — la pone el freno por rebotes." : "",
           "",

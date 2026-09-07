@@ -7404,10 +7404,23 @@ function countryFlag(code) {
   return [...code.toUpperCase()].map(c => String.fromCodePoint(c.charCodeAt(0) + 127397)).join("");
 }
 
+// ── EL GEO DEL HISTORIAL SALE DEL TRÁFICO, NO DEL TLD (parte del 07/09) ─────────────────
+// Esto devolvía "US" para todo lo que no estuviera en un mapa de 15 TLDs: wielerrevue.nl,
+// cyclingpro.net y ciclismointernacional.com (Colombia) quedaban como Estados Unidos, y el
+// parte diario acusaba a los tres MB de pasar el 68-85% del día "fuera del foco (anglo)" un
+// día en que escribieron a Argentina, Italia, Países Bajos y Marruecos. Primero manda el país
+// principal que midió SimilarWeb; el TLD sólo si no hay dato; y si no hay nada, VACÍO — un
+// "no sé" no se escribe como "Estados Unidos".
+const _TLD_GEO = { es:"ES",mx:"MX",ar:"AR",co:"CO",cl:"CL",pe:"PE",ec:"EC",ve:"VE",uy:"UY",py:"PY",bo:"BO",
+  br:"BR",pt:"PT",fr:"FR",be:"BE",nl:"NL",de:"DE",at:"AT",ch:"CH",it:"IT",hu:"HU",ro:"RO",pl:"PL",cz:"CZ",gr:"GR",
+  tr:"TR",ma:"MA",dz:"DZ",tn:"TN",eg:"EG",za:"ZA",ng:"NG",ke:"KE",vn:"VN",id:"ID",th:"TH",ph:"PH",my:"MY",
+  jp:"JP",kr:"KR",tw:"TW",in:"IN",pk:"PK",bd:"BD",ua:"UA",ru:"RU",se:"SE",no:"NO",dk:"DK",fi:"FI",ie:"IE",
+  uk:"GB",au:"AU",nz:"NZ",ca:"CA",us:"US" };
 function detectGeo() {
-  const tld = state.domain.split(".").pop()?.toLowerCase();
-  const map = { es:"ES",mx:"MX",ar:"AR",co:"CO",cl:"CL",br:"BR",pt:"PT",fr:"FR",de:"DE",it:"IT",hu:"HU",vn:"VN",uk:"UK",au:"AU",ca:"CA" };
-  return map[tld] || "US";
+  const medido = state.trafficData?.topCountries?.[0]?.code;
+  if (medido && /^[A-Za-z]{2}$/.test(medido)) return medido.toUpperCase();
+  const tld = (state.domain || "").split(".").pop()?.toLowerCase();
+  return _TLD_GEO[tld] || "";
 }
 
 function simplifyCategory(raw) {
