@@ -27,6 +27,9 @@ const aqui   = path.dirname(fileURLToPath(import.meta.url));
 const indexJs = fs.readFileSync(path.join(aqui, "..", "index.js"), "utf8");
 const popupJs = fs.readFileSync(path.join(aqui, "..", "..", "popup", "popup.js"), "utf8");
 
+// Sin secreto el worker ni le pregunta al CRM por el cupo (camino `sin_crm`): se pone uno falso
+// ANTES de cargar el módulo, que lo lee del entorno al arrancar.
+process.env.CRM_SYNC_SECRET = process.env.CRM_SYNC_SECRET || "secreto-de-prueba";
 const { parteDelDia } = await cargarWorker(["parteDelDia"], { fetchFalso: true });
 
 const hoy = new Date().toISOString().slice(0, 10);
@@ -140,7 +143,7 @@ test("las congeladas se cuentan aparte y no como 'gasta créditos para nada'", (
 });
 
 test("el corte de turno por casilla llena se dice con todas las letras", () => {
-  ok(/casilla ya tenía 25\/25/.test(html), "el mail tiene que explicar que el cupo del buzón lo usó el CRM");
+  ok(/casilla ya tenía el tope de mails de la última hora/.test(html), "el mail tiene que explicar que el turno se cortó por el cupo del buzón");
   ok(!/no llegó a intentarlo/.test(html), "ya no puede decir que el agente no lo intentó: lo intentó y cortó");
 });
 
@@ -182,6 +185,43 @@ test("AutoGoogle retira las frases muertas y el top exige haber calificado", () 
   ok(/toolbar_keyword_yield\?searches=gte\.2&qualified=gt\.0&order=qualified\.desc/.test(indexJs), "el top de frases tiene que exigir qualified>0");
   ok(/searches=gte\.10&or=\(qualified\.is\.null,qualified\.eq\.0\)/.test(indexJs), "tiene que traer las muertas (≥10 búsquedas, 0 leads)");
   ok(/!_muertas\.has\(p\)/.test(indexJs), "la exploración tiene que saltear las muertas");
+});
+
+// ── El cupo del buzón: dos frenos (acuerdo con el CRM, 07/09) ──────────────────────────
+const { cupoDisponibleCasilla } = await cargarWorker(["cupoDisponibleCasilla"], { fetchFalso: true });
+/** Simula la base (nuestros envíos de la última hora) y la mesa común del CRM. */
+function mesa({ propios, crm }) {
+  globalThis.__fetchFalso = async (url) => {
+    const u = String(url);
+    if (u.includes("toolbar_agent_actions")) return resp(Array.from({ length: propios }, (_, i) => ({ id: i })));
+    if (u.includes("casilla-envios")) return crm === null ? resp({}, { status: 503 }) : resp(crm);
+    return resp([]);
+  };
+}
+test("freno propio: con 25 nuestros en la hora no sale uno más, diga lo que diga la red", async () => {
+  mesa({ propios: 25, crm: { ultima_hora: 30, tope: 100, restantes: 70 } });
+  const c = await cupoDisponibleCasilla("sales@adeqmedia.com");
+  strictEqual(c.hay, false); strictEqual(c.motivo, "freno_propio");
+});
+test("la red del CRM manda cuando hay lugar: tope y restantes se leen de la respuesta", async () => {
+  mesa({ propios: 3, crm: { ultima_hora: 29, tope: 100, restantes: 71, tope_crm: 25 } });
+  const c = await cupoDisponibleCasilla("sales@adeqmedia.com");
+  strictEqual(c.hay, true); strictEqual(c.tope, 100); strictEqual(c.restantes, 71);
+});
+test("sin `tope` en la respuesta (CRM viejo) vale el 25 de siempre: 25 usados = llena", async () => {
+  mesa({ propios: 1, crm: { ultima_hora: 25 } });
+  const c = await cupoDisponibleCasilla("sales@adeqmedia.com");
+  strictEqual(c.hay, false); strictEqual(c.tope, 25);
+});
+test("red compartida agotada: no sale aunque lo nuestro sea poco", async () => {
+  mesa({ propios: 2, crm: { ultima_hora: 100, tope: 100, restantes: 0 } });
+  const c = await cupoDisponibleCasilla("sales@adeqmedia.com");
+  strictEqual(c.hay, false); strictEqual(c.motivo, "red_compartida");
+});
+test("los envíos manuales del popup también se anotan en la mesa común", () => {
+  const gmail = fs.readFileSync(path.join(aqui, "..", "..", "modules", "gmail.js"), "utf8");
+  ok(/_registrarEnMesaComun\(expectedFrom, to\)/.test(gmail), "el 07/09 Agustina mandó 27 a mano y la mesa decía 1");
+  ok(/origen: "toolbar"/.test(gmail), "el origen tiene que ser el literal que filtra el CRM");
 });
 
 test("el vigilante del agente alarma con un cuarto del objetivo, no sólo con cero", () => {

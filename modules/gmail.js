@@ -9,6 +9,27 @@
 // token is removed and a fresh one is requested.
 // ============================================================
 
+import { CONFIG } from "../config.js";
+import { crmUrl } from "./crm.js";
+
+// ── LA MESA COMÚN TAMBIÉN CUENTA LO MANUAL (2026-09-07) ─────────────────────────────────
+// `casilla_envios` (base del CRM) es el contador compartido de cuánto salió de cada buzón en
+// la última hora: lo lee la cadencia del CRM para frenarse y lo lee el agente antes de cada
+// turno. El worker registraba lo suyo; el popup, NO. Medido el 07/09: Agustina mandó 27 a mano
+// desde sales@ y en la mesa figuraba 1. Los otros dos sistemas frenaban sobre un número que
+// no incluía a la persona que más manda. Es fire-and-forget: nunca frena ni demora el envío.
+function _registrarEnMesaComun(casilla, destino) {
+  try {
+    if (!casilla || !CONFIG.CRM_BOARD_SECRET) return;
+    fetch(crmUrl("/casilla-envios"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+      body: JSON.stringify({ casilla: String(casilla).toLowerCase().trim(), destino: String(destino || ""), origen: "toolbar", ref: null }),
+      signal: AbortSignal.timeout(8000),
+    }).catch(() => {});
+  } catch {}
+}
+
 const GMAIL_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
   "https://www.googleapis.com/auth/gmail.settings.basic",
@@ -208,6 +229,7 @@ export async function sendEmail({ to, subject, body, expectedFrom }) {
       throw new Error(err?.error?.message || `Gmail error ${res.status}`);
     }
 
+    _registrarEnMesaComun(expectedFrom, to);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };

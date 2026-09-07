@@ -9192,16 +9192,23 @@ async function parteDelDia(token, opts = {}) {
       { headers: auth }
     ).then(r => r.ok ? r.json() : []).catch(() => []);
     const top = {};
-    let _cortesCasilla = 0;
+    let _cortesCasilla = 0, _motivoCasilla = "";
     for (const m of (Array.isArray(motivos) ? motivos : [])) {
-      if (m.action === "cycle_cupo_casilla") { _cortesCasilla++; continue; }
+      if (m.action === "cycle_cupo_casilla") {
+        _cortesCasilla++;
+        // "casilla_llena:usados/tope:motivo" — el motivo dice de quién es el freno.
+        const _mo = String(m.reason || "").split(":")[2] || "";
+        if (_mo === "freno_propio") _motivoCasilla = "freno propio de la toolbar: ya salieron 25 de ese buzón en la hora, entre agente y a mano";
+        else if (!_motivoCasilla) _motivoCasilla = "red compartida: el CRM y la toolbar juntos llegaron al techo del buzón";
+        continue;
+      }
       const k = m.action === "skipped" ? String(m.reason || "?").split(":")[0] : m.action;
       top[k] = (top[k] || 0) + 1;
     }
     const orden = Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 3);
     // El corte por casilla llena se dice con todas las letras: es el otro sistema (la cadencia
     // del CRM) ocupando el cupo compartido del buzón, y no se arregla mirando al agente.
-    if (_cortesCasilla) problemas.push(`El agente cortó ${_cortesCasilla} turno(s) porque la casilla ya tenía ${CUPO_CASILLA_HORA}/${CUPO_CASILLA_HORA} mails en la última hora (cupo compartido con la cadencia del CRM). Faltaron ${objetivoTotal - totalEnviado} envíos: el cupo del buzón lo usó el CRM.`);
+    if (_cortesCasilla) problemas.push(`El agente cortó ${_cortesCasilla} turno(s) porque la casilla ya tenía el tope de mails de la última hora (${_motivoCasilla || "cupo compartido con la cadencia del CRM"}). Faltaron ${objetivoTotal - totalEnviado} envíos por el cupo del buzón.`);
     else if (orden.length) problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos. Los descartes de hoy: ${orden.map(([k, v]) => `${k} (${v})`).join(", ")}.`);
     else problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos y NO hay descartes ni cortes registrados — el agente no llegó a intentarlo. Revisar si el worker corrió.`);
   }
@@ -19314,6 +19321,10 @@ async function _nombreDeRemitente(userEmail) {
 // endpoint tuvo un hipo sería un daño mayor que el que evita.
 // ESTO DEJA DE SER CIERTO si el volumen del worker sube: si algún día manda más de ~15
 // por hora por casilla, hay que darlo vuelta y fallar cerrado.
+//
+// Desde el 07/09 (acuerdo con el CRM, su commit c54cbad) este 25 es el FRENO PROPIO de la
+// toolbar —lo que salió de la casilla por nosotros, agente y a mano, en la última hora— y el
+// techo de la mesa común lo informa el CRM (`tope`, 100/h de red). Ver cupoDisponibleCasilla.
 const CUPO_CASILLA_HORA = 25;
 let _avisoCasillaEnvios = false;
 
@@ -19341,20 +19352,52 @@ async function registrarEnvioCasilla(casilla, destino, ref) {
   }
 }
 
-/** Cuántos mails salieron de esa casilla en la última hora, contando LOS DOS sistemas. */
+/**
+ * ¿Puede salir un mail más de esa casilla? Dos frenos, y los dos tienen que decir que sí.
+ *
+ * ── DOS FRENOS, NO UNO (acordado con el equipo del CRM el 07/09, su commit c54cbad) ────────
+ * Hasta hoy los dos sistemas frenaban contra EL MISMO número (25/h): el CRM llenaba los 25
+ * con su cadencia de 13 a 17 y el agente encontraba la casilla llena en cada turno (1 de 40
+ * el 07/09). La mesa común (`casilla_envios`) pasa a informar un techo de red de 100/h con
+ * `tope` y `restantes`; cada lado mantiene su freno propio: el CRM sus 25, nosotros los
+ * nuestros. Advertencia textual de ellos, que es correcta: *"El 100 es una red, no un cupo a
+ * gastar. Si el worker deja caer su ritmo y se guía sólo por `restantes`, el 100 no protege
+ * nada."* Por eso `CUPO_CASILLA_HORA` sigue en 25 y se mide sobre LO NUESTRO
+ * (`toolbar_agent_actions` sent de la última hora, agente + manual), no sobre la mesa.
+ *
+ * 1. Freno propio: lo que salió de esta casilla por la toolbar en los últimos 60 min < 25.
+ * 2. Red compartida: `restantes` > 0 según el CRM. Si la respuesta todavía no trae `tope`
+ *    (su versión vieja), se asume el 25 de antes: nada cambia hasta que deployen.
+ */
 async function cupoDisponibleCasilla(casilla) {
-  if (!CRM_SYNC_SECRET) return { hay: true, usados: null };
+  const _c = String(casilla || "").toLowerCase();
+  let propios = null;
   try {
-    const r = await fetch(`${_urlCrm("/casilla-envios")}?casilla=${encodeURIComponent(String(casilla || "").toLowerCase())}`, {
+    const desde = new Date(Date.now() - 3600_000).toISOString();
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(_c)}&action=eq.sent&created_at=gte.${encodeURIComponent(desde)}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || _workerToken}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(8000) },
+    );
+    if (r.ok) propios = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
+  } catch {}
+  if (propios != null && propios >= CUPO_CASILLA_HORA) {
+    return { hay: false, usados: propios, tope: CUPO_CASILLA_HORA, propios, motivo: "freno_propio" };
+  }
+  if (!CRM_SYNC_SECRET) return { hay: true, usados: propios, tope: CUPO_CASILLA_HORA, propios, motivo: "sin_crm" };
+  try {
+    const r = await fetch(`${_urlCrm("/casilla-envios")}?casilla=${encodeURIComponent(_c)}`, {
       headers: { "x-toolbar-secret": CRM_SYNC_SECRET },
       signal: AbortSignal.timeout(8000),
     });
-    if (!r.ok) return { hay: true, usados: null };          // ver la nota de arriba
+    if (!r.ok) return { hay: true, usados: propios, tope: CUPO_CASILLA_HORA, propios, motivo: "crm_sin_respuesta" };   // ver la nota de arriba
     const j = await r.json();
     const usados = Number(j?.ultima_hora ?? j?.count ?? NaN);
-    if (!Number.isFinite(usados)) return { hay: true, usados: null };
-    return { hay: usados < CUPO_CASILLA_HORA, usados };
-  } catch { return { hay: true, usados: null }; }
+    if (!Number.isFinite(usados)) return { hay: true, usados: propios, tope: CUPO_CASILLA_HORA, propios, motivo: "crm_sin_numero" };
+    // `tope`/`restantes` los manda el CRM desde c54cbad; antes de eso, el 25 de siempre.
+    const tope = Number.isFinite(Number(j?.tope)) && Number(j.tope) > 0 ? Number(j.tope) : CUPO_CASILLA_HORA;
+    const restantes = Number.isFinite(Number(j?.restantes)) ? Number(j.restantes) : (tope - usados);
+    return { hay: restantes > 0, usados, tope, restantes, propios, tope_crm: j?.tope_crm ?? null, motivo: restantes > 0 ? "ok" : "red_compartida" };
+  } catch { return { hay: true, usados: propios, tope: CUPO_CASILLA_HORA, propios, motivo: "crm_error" }; }
 }
 
 async function sendGmailServer(_token, userEmail, { to, subject, body, agentActionId = null, esProspeccion = true, htmlPropio = "" }) {
@@ -21926,7 +21969,7 @@ async function runAgentCycle(token, allFlags) {
         // con el lead siguiente — el límite es del buzón, no del destinatario.
         const _cupo = await cupoDisponibleCasilla(userEmail);
         if (!_cupo.hay) {
-          log(`  ⏸️ ${userEmail}: ${_cupo.usados}/${CUPO_CASILLA_HORA} mails en la última hora (worker + CRM) — corto el turno`);
+          log(`  ⏸️ ${userEmail}: ${_cupo.usados}/${_cupo.tope} mails en la última hora (${_cupo.motivo === "freno_propio" ? "freno propio de la toolbar" : "red compartida con el CRM"}) — corto el turno`);
           // ⚠️ SE ANOTA (parte del 07/09). Este `break` era mudo: el 07/09 el CRM mandó 25/h por
           // buzón de 13 a 17 —exactamente el techo— en las mismas horas que los cinco turnos del
           // agente, y cada turno cortó acá con "0 de 8" sin dejar rastro. El parte concluyó "no
@@ -21935,8 +21978,8 @@ async function runAgentCycle(token, allFlags) {
           // encontró la casilla llena por el otro sistema.
           await logAgentAction(token, userEmail, {
             domain: "_cycle_", action: "cycle_cupo_casilla",
-            reason: `casilla_llena:${_cupo.usados}/${CUPO_CASILLA_HORA}`,
-            details: { usados: _cupo.usados, tope: CUPO_CASILLA_HORA, hora_es: _spainHour() },
+            reason: `casilla_llena:${_cupo.usados}/${_cupo.tope}:${_cupo.motivo}`,
+            details: { usados: _cupo.usados, tope: _cupo.tope, propios: _cupo.propios, motivo: _cupo.motivo, hora_es: _spainHour() },
           }).catch(() => {});
           break;
         }
@@ -23979,7 +24022,7 @@ async function vigilarAgenteFrenado(token) {
     const _cupos = [];
     for (const u of mbs) {
       const c = await cupoDisponibleCasilla(u).catch(() => null);
-      if (c && c.usados != null) _cupos.push(`${u.split("@")[0]}: ${c.usados}/${CUPO_CASILLA_HORA} en la última hora${c.hay ? "" : " ← LLENA, el agente corta el turno"}`);
+      if (c && c.usados != null) _cupos.push(`${u.split("@")[0]}: ${c.usados}/${c.tope} en la última hora (nuestros: ${c.propios ?? "?"}/${CUPO_CASILLA_HORA})${c.hay ? "" : ` ← LLENA (${c.motivo}), el agente corta el turno`}`);
     }
     await saludPing(token, "agente_frenado", {
       status: _grave ? "warn" : "ok", cadenciaMin: 2 * 60,
