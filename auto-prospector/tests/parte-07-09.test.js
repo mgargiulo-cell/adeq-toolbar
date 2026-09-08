@@ -32,7 +32,11 @@ const popupJs = fs.readFileSync(path.join(aqui, "..", "..", "popup", "popup.js")
 process.env.CRM_SYNC_SECRET = process.env.CRM_SYNC_SECRET || "secreto-de-prueba";
 const { parteDelDia } = await cargarWorker(["parteDelDia"], { fetchFalso: true });
 
-const hoy = new Date().toISOString().slice(0, 10);
+// ⚠️ "Hoy" es el de MADRID, como en el worker (`_madridNowParts`), no el UTC. Con `toISOString`
+// el test fallaba entre las 22:00 y las 24:00 UTC: en Madrid ya era mañana, el envío "de hoy" del
+// fixture quedaba de ayer y aparecía como "Ya contactados (30 días)". Reproducido el 08/09 a las
+// 22:10 UTC — no era un bug del parte, era el reloj del test.
+const hoy = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 const ahora = new Date().toISOString();
 const resp = (body, { status = 200 } = {}) => ({
   ok: status >= 200 && status < 300, status,

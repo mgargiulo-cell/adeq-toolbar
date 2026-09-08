@@ -1873,6 +1873,8 @@ const PER_SOURCE_ACTIVE_CAP = {
   auto_feeder_sellers:  150,
   auto_feeder_majestic: 150,   // autopilot (majestic/similar)
   auto_feeder_adstxt:   120,   // autopilot (ads.txt-graph)
+  auto_feeder_crux:     120,   // 2026-09-08: fuente GEO — top de Chrome por país
+  auto_feeder_wikidata: 120,   // 2026-09-08: fuente GEO — medios de Wikidata por país
   // Maxi 2026-08-11: 120 → 400. Los finalizados de Monday dejaron de ser una porción
   // del reparto del feeder y pasaron a ser un barrido DIARIO del 100% del board
   // (sincronizarFinalizadosDeMonday). Es la mejor fuente que tenemos —gente que ya
@@ -2415,6 +2417,14 @@ const _CIUDADES = {
   nl: ["Rotterdam", "Utrecht", "Eindhoven", "Groningen", "Tilburg"],
   be: ["Antwerpen", "Gent", "Charleroi", "Liège"],
   za: ["Johannesburg", "Cape Town", "Durban", "Pretoria", "Gqeberha", "Bloemfontein", "East London", "Polokwane", "Mbombela", "Pietermaritzburg"],   // decisión 4 (04/09)
+  // ── ÁFRICA ANGLÓFONA (2026-09-08, del parte del día) ─────────────────────────────────
+  // Diego trabaja Kenia, Nigeria y Sudán a mano (sudantribune, allafrica, kenyamoja, arise.tv):
+  // medios africanos EN INGLÉS. AutoGoogle tenía el inglés apagado porque con `gl` global
+  // devuelve la CNN; con `gl` de estos países y una ciudad en la frase ("Nairobi newspaper")
+  // devuelve el medio local, que es justo el mercado. Mismo criterio que Sudáfrica (decisión 4).
+  ke: ["Nairobi", "Mombasa", "Kisumu", "Nakuru", "Eldoret", "Nyeri"],
+  ng: ["Lagos", "Abuja", "Port Harcourt", "Kano", "Ibadan", "Enugu", "Benin City", "Kaduna"],
+  gh: ["Accra", "Kumasi", "Takoradi", "Tamale", "Cape Coast"],
   pl: ["Kraków", "Wrocław", "Poznań", "Gdańsk", "Łódź", "Katowice",
        "Szczecin", "Bydgoszcz", "Lublin", "Białystok", "Rzeszów", "Toruń", "Kielce", "Olsztyn", "Opole",
        "Zielona Góra", "Gorzów", "Radom", "Częstochowa", "Tarnów", "Nowy Sącz", "Płock", "Koszalin", "Legnica", "Kalisz"],
@@ -2486,6 +2496,11 @@ const _IDIOMA_DE_PAIS = {
   gr: "el", ro: "ro", hu: "hu", cz: "cs", bg: "bg", rs: "sr",
   id: "id", vn: "vi", th: "th", my: "ms",
   kr: "ko", tw: "zh", jp: "ja",
+  // ⚠️ `za` FALTABA acá (2026-09-08). La decisión 4 del 04/09 cargó las ciudades sudafricanas y
+  // las plantillas en inglés, pero no este mapeo: `_construirBusquedasPorCiudad` hace
+  // `_IDIOMA_DE_PAIS[pais] || "es"`, así que "Johannesburg" se buscaba con las plantillas EN
+  // ESPAÑOL ("diario digital Johannesburg") durante cinco días. Cero medios sudafricanos.
+  za: "en", ke: "en", ng: "en", gh: "en",   // África anglófona: inglés con `gl` local
   eg: "ar",
 };
 
@@ -2592,7 +2607,7 @@ const _TLDS_POR_IDIOMA = {
   el: [".gr"],
   nl: [".nl", ".be"],
   cs: [".cz"],
-  en: [".co.za", ".za"],   // decisión 4 (04/09): inglés SÓLO para Sudáfrica
+  en: [".co.za", ".za", ".co.ke", ".ke", ".ng", ".com.ng", ".gh", ".com.gh"],   // Sudáfrica (decisión 4) + Kenia/Nigeria/Ghana (2026-09-08)
 };
 
 // ── APAREAR IDIOMA, PAÍS E INTERFAZ (Maxi 2026-08-11) ────────────────────────
@@ -2639,7 +2654,7 @@ const _PAISES_POR_IDIOMA = {
   // sistema no los buscaba nunca: no por una exclusión, sino porque el inglés no existía como
   // idioma de búsqueda. Entra SÓLO con gl=za; el cinturón anti-anglo de abajo sigue vetando
   // us/ca/gb/au/nz aunque alguien los agregue acá.
-  en: ["za"],
+  en: ["za", "ke", "ng", "gh"],   // Sudáfrica (decisión 4) + África anglófona (2026-09-08, del parte: Kenia/Nigeria a mano)
 };
 // ── EL FOCO GEOGRÁFICO, DICHO POR EL USER (2026-08-26) ─────────────────────────────────
 // "Focalizar en países de América Central, Sur, Europa y Asia. Oceanía, USA, Canadá, UK y
@@ -4522,6 +4537,146 @@ async function _feederPullAdsTxtGraph(token, maxInject, sessionKnown) {
   return inserted;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// FUENTE GEO — CrUX por país + Wikidata (2026-09-08, pedido del user)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// *"El feeder descubre mucho USA, que es un país con el que ADEQ no trabaja. Debería poder
+// descubrir webs de geos al azar que uno ponga, omitiendo USA, Canadá, UK y Oceanía."*
+//
+// Las fuentes del feeder (sellers.json, similares, Majestic) son globales por naturaleza: van
+// a traer USA siempre, y el filtro anglo es blando a propósito (regla del user: sesgo, no
+// rechazo). La respuesta no es filtrar más: es sumar fuentes que NACEN filtradas por país.
+// Dos, gratis y medidas en vivo el 08/09:
+//
+//  · CrUX por país — los sitios más visitados según Chrome, por país, mensual, en
+//    github.com/InternetHealthReport/crux-top-lists-country (CSV `origin,rank`, cubos
+//    1K/5K/10K/50K/100K/500K/1M). Colombia: 261.811 orígenes. Cloudflare Radar, que ya usamos,
+//    da 100 por país. Se filtra por rank ≤ 100K y por TLD del país, porque la lista trae también
+//    lo global que se visita desde ahí (healthline, fandom). De una muestra del top-100K
+//    colombiano, el 15% tenía ads.txt real: la puerta 0 de _injectIntoCsvQueue hace el resto.
+//  · Wikidata — diarios, diarios online, radios, TV y revistas CON sitio oficial (P856) por país
+//    (P17), vía SPARQL. Colombia 389 · Perú 163 · Polonia 1.395 · Nigeria 237 · Indonesia 272 ·
+//    Argentina 563. Es medio por definición: no hay que adivinar el rubro.
+//
+// Los países salen de `feeder_geo_paises` (toolbar_config, lista ISO-2 separada por comas);
+// USA/CA/UK/AU/NZ/IE no están en el default y aunque alguien los ponga, el GEO deprio del
+// worker sigue actuando después. Se rota un país por slot (`feeder_geo_cursor`) para que todos
+// reciban su turno. Cada fuente inyecta con SU etiqueta (`auto_feeder_crux` /
+// `auto_feeder_wikidata`) para que el parte diga cuánto pasó de cada una — si una no rinde,
+// se ve en "Rendimiento por fuente" y se baja.
+// Va ENCIMA del reparto de las 3 clásicas, como el grafo de ads.txt: supply extra, no compite
+// por el yield hasta que tenga historia.
+const _GEO_FEEDER_PAISES_DEFAULT = "co,pe,ar,cl,mx,ec,uy,py,bo,cr,gt,do,pa,br,pt,es,it,fr,de,at,nl,be,pl,ro,hu,cz,gr,tr,ma,eg,ng,ke,gh,za,id,my,ph,vn,th";
+const _GEO_FEEDER_RANK_MAX = 100_000;
+const _GEO_FEEDER_ANGLO = new Set(["us", "ca", "gb", "uk", "au", "nz", "ie"]);   // nunca, ni por config
+const _cruxCache = new Map();   // cc → { mes, dominios[] } (vive lo que vive el proceso; el worker reinicia cada ~7 min)
+
+// ¿Este host es "del país"? Por TLD: `.co`, `.com.co`, `.gov.co`… todos terminan en `.co`.
+// Es la única señal barata que separa a los medios locales de lo global que se visita desde ahí.
+function _hostEsDelPais(host, cc) {
+  const h = String(host || "").toLowerCase();
+  if (!h || !cc) return false;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return false;
+  return h.endsWith("." + cc) || (cc === "gb" && h.endsWith(".uk"));
+}
+
+async function _cruxDominiosDelPais(cc) {
+  const mes = new Date().toISOString().slice(0, 7);
+  const hit = _cruxCache.get(cc);
+  if (hit && hit.mes === mes) return hit.dominios;
+  const ua = { "User-Agent": "ADEQ-Toolbar-feeder/1.0 (+https://www.adeqmedia.com)" };
+  // El listado del directorio dice qué meses hay; se toma el más nuevo. Una llamada por país por
+  // proceso: la API de GitHub sin token da 60/hora y el feeder corre 5 slots por día.
+  const lst = await fetch(`https://api.github.com/repos/InternetHealthReport/crux-top-lists-country/contents/data/country/${cc}`,
+    { headers: ua, signal: AbortSignal.timeout(20_000) });
+  if (!lst.ok) throw new Error(`CrUX ${cc}: listado HTTP ${lst.status}`);
+  const archivos = (await lst.json()).filter(f => /^\d{6}\.csv\.gz$/.test(f?.name || "")).sort((a, b) => a.name.localeCompare(b.name));
+  const ultimo = archivos.at(-1);
+  if (!ultimo?.download_url) throw new Error(`CrUX ${cc}: sin archivos`);
+  const r = await fetch(ultimo.download_url, { headers: ua, signal: AbortSignal.timeout(90_000) });
+  if (!r.ok) throw new Error(`CrUX ${cc}: descarga HTTP ${r.status}`);
+  const { gunzipSync } = await import("node:zlib");
+  const csv = gunzipSync(Buffer.from(await r.arrayBuffer())).toString("utf8");
+  const dominios = [];
+  for (const linea of csv.split("\n")) {
+    const [origin, rank] = linea.split(",");
+    if (!origin || !/^https?:\/\//.test(origin)) continue;
+    if (!(parseInt(rank, 10) <= _GEO_FEEDER_RANK_MAX)) continue;
+    let host; try { host = new URL(origin).hostname.replace(/^www\./, ""); } catch { continue; }
+    if (origin.includes(":") && /:\d+$/.test(new URL(origin).host)) continue;   // puertos raros (sicse.policia.gov.co:8443)
+    if (!_hostEsDelPais(host, cc)) continue;
+    if (/\.(gov|gob|edu|mil|ac)\./.test("." + host) || /^(mail|webmail|login|api|cdn|static)\./.test(host)) continue;
+    dominios.push(host);
+  }
+  const unicos = [...new Set(dominios)];
+  _cruxCache.set(cc, { mes, dominios: unicos });
+  log(`  🌍 CrUX ${cc.toUpperCase()} (${ultimo.name}): ${unicos.length} dominios del país con rank ≤ ${_GEO_FEEDER_RANK_MAX.toLocaleString()}`);
+  return unicos;
+}
+
+async function _wikidataMediosDelPais(cc) {
+  // P297 = código ISO-2 del país; P31/P279* = es instancia de (o subclase de) los tipos de medio;
+  // P856 = sitio oficial. Un solo request, sin clave.
+  const sparql = `SELECT DISTINCT ?url WHERE {
+    ?pais wdt:P297 "${cc.toUpperCase()}" .
+    VALUES ?tipo { wd:Q11032 wd:Q1153191 wd:Q14350 wd:Q1616075 wd:Q41298 wd:Q17232649 }
+    ?item wdt:P31/wdt:P279* ?tipo . ?item wdt:P17 ?pais . ?item wdt:P856 ?url .
+  } LIMIT 4000`;
+  const r = await fetch(`https://query.wikidata.org/sparql?query=${encodeURIComponent(sparql)}`, {
+    headers: { "Accept": "application/sparql-results+json", "User-Agent": "ADEQ-Toolbar-feeder/1.0 (+https://www.adeqmedia.com)" },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!r.ok) throw new Error(`Wikidata ${cc}: HTTP ${r.status}`);
+  const j = await r.json();
+  const hosts = new Set();
+  for (const b of (j?.results?.bindings || [])) {
+    try { hosts.add(new URL(b.url.value).hostname.replace(/^www\./, "").toLowerCase()); } catch {}
+  }
+  return [...hosts];
+}
+
+async function _feederPullGeo(token, maxInject, sessionKnown) {
+  if (maxInject <= 0) return { crux: 0, wikidata: 0, pais: "" };
+  const cfg = await getConfig(token).catch(() => ({}));
+  const paises = String(cfg.feeder_geo_paises || _GEO_FEEDER_PAISES_DEFAULT)
+    .split(",").map(s => s.trim().toLowerCase()).filter(s => /^[a-z]{2}$/.test(s) && !_GEO_FEEDER_ANGLO.has(s));
+  if (!paises.length) return { crux: 0, wikidata: 0, pais: "" };
+  const cursor = parseInt(cfg.feeder_geo_cursor || "0", 10) || 0;
+  const cc = paises[cursor % paises.length];
+  await setConfigValue(token, "feeder_geo_cursor", String((cursor + 1) % paises.length)).catch(() => {});
+
+  const out = { crux: 0, wikidata: 0, pais: cc };
+  const _barajar = (a) => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(p => p[1]);
+
+  // 1) Wikidata primero: es medio por definición, así que casi todo lo que entra vale el hit.
+  try {
+    const medios = _barajar(await _wikidataMediosDelPais(cc)).map(_normalizeFeederDomain).filter(Boolean);
+    const known = await _findKnownDomainsWorker(token, medios);
+    const fresh = medios.filter(d => !known.has(d) && !sessionKnown.has(d)).slice(0, Math.max(5, Math.ceil(maxInject / 2)) * 2);
+    if (fresh.length) {
+      fresh.forEach(d => sessionKnown.add(d));
+      out.wikidata = await _injectIntoCsvQueue(token, fresh, "auto_feeder_wikidata");
+    }
+    log(`  🌍 Wikidata ${cc.toUpperCase()}: ${medios.length} medios → ${fresh.length} frescos → ${out.wikidata} encolados`);
+  } catch (e) { log(`  ⚠️ Wikidata ${cc}: ${e.message}`); }
+
+  // 2) CrUX: candidatos de sobra porque la puerta ads.txt va a descartar ~85%.
+  const resto = Math.max(0, maxInject - out.wikidata);
+  if (resto > 0) {
+    try {
+      const pool = _barajar(await _cruxDominiosDelPais(cc)).map(_normalizeFeederDomain).filter(Boolean);
+      const known = await _findKnownDomainsWorker(token, pool.slice(0, 600));
+      const fresh = pool.slice(0, 600).filter(d => !known.has(d) && !sessionKnown.has(d)).slice(0, Math.min(180, resto * 6));
+      if (fresh.length) {
+        fresh.forEach(d => sessionKnown.add(d));
+        out.crux = await _injectIntoCsvQueue(token, fresh, "auto_feeder_crux");
+      }
+      log(`  🌍 CrUX ${cc.toUpperCase()}: ${pool.length} en pool → ${fresh.length} candidatos → ${out.crux} encolados (la puerta ads.txt descartó el resto, gratis)`);
+    } catch (e) { log(`  ⚠️ CrUX ${cc}: ${e.message}`); }
+  }
+  return out;
+}
+
 const FEEDER_SOURCE_KEYS = [
   { key: "sellers",  tag: "auto_feeder_sellers"  },
   { key: "monday",   tag: "auto_feeder_monday"   },
@@ -4723,17 +4878,21 @@ async function _runFeederSlot(token, slotLabel) {
   // Va ENCIMA del split de las 3 (no compite por el yield) — supply extra que
   // crece sola con el tiempo. Cap modesto por slot para acotar el HTTP.
   const fromAdsTxt = await _feederPullAdsTxtGraph(token, Math.min(40, Math.max(15, allocSellers)), sessionKnown).catch(() => 0);
-  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic}+adstxt=${fromAdsTxt})`);
-  const grossTotal = fromSellers + fromMonday + fromMajestic + fromAdsTxt;
+  // BONUS GEO (2026-09-08): CrUX por país + Wikidata. Un país por slot, rotando. También va
+  // ENCIMA del split: la única forma de descubrir por GEO omitiendo a USA es una fuente que
+  // nazca por país, y esto es eso. Se mide aparte en el parte (crux / wikidata).
+  const fromGeo = await _feederPullGeo(token, Math.min(40, Math.max(15, allocMajestic)), sessionKnown).catch((e) => { log(`  ⚠️ feeder geo: ${e.message}`); return { crux: 0, wikidata: 0, pais: "" }; });
+  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic}+adstxt=${fromAdsTxt}+crux=${fromGeo.crux}+wikidata=${fromGeo.wikidata})`);
+  const grossTotal = fromSellers + fromMonday + fromMajestic + fromAdsTxt + fromGeo.crux + fromGeo.wikidata;
 
-  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} adstxt=${fromAdsTxt} = ${grossTotal} brutos`);
+  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} adstxt=${fromAdsTxt} geo(${fromGeo.pais})=${fromGeo.crux}+${fromGeo.wikidata} = ${grossTotal} brutos`);
 
   await _insertFeederRun(token, slotLabel, {
     status: grossTotal > 0 ? "ok" : "incomplete",
     gross_sellers: fromSellers, gross_monday: fromMonday, gross_majestic: fromMajestic,
     rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
     rq_valid_before: rqValid,
-    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/${(w.monday * 100).toFixed(0)}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt}`,
+    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/${(w.monday * 100).toFixed(0)}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt} geo=${fromGeo.pais}:crux${fromGeo.crux}/wd${fromGeo.wikidata}`,
   });
 }
 
@@ -7516,6 +7675,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // rutas, seguimos los links que el sitio realmente publica (contacto/kontakt/impressum/aviso
   // legal/publicidad/media-kit/about/equipo), aunque tengan nombres no estándar.
   const discovered = new Set();
+  const pdfLinks = new Set();   // media kits / tarifarios en PDF vistos en las páginas (se leen al final)
   let _homeHtmlCache = "";
   let _wafBloquea = false;   // Cloudflare/WAF nos cerró la puerta: no insistir con el crawl
   const _casasEditoras = new Set();   // dominios que PROBAMOS que son la matriz (ads.txt/MX/Play)
@@ -7642,6 +7802,21 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       }
       if (url === base && !_homeHtmlCache) _homeHtmlCache = html;   // para el JSON-LD
       for (const f of _facetasComerciales(html, url)) discovered.add(f);   // ?cat=obchod, ?dept=ventas
+      // ── MEDIA KITS EN PDF (2026-09-08) ─────────────────────────────────────────────────
+      // El tarifario de un medio casi siempre es un PDF ("media kit", "tarifas 2026",
+      // "kit de mídia") y casi siempre trae el mail de ventas. Hasta hoy el link se veía y no se
+      // abría: AutoGoogle busca `filetype:pdf` para DESCUBRIR sitios, pero nadie leía el archivo.
+      // Se cosechan hasta 3 por dominio, sólo los que por nombre o ancla parecen comerciales;
+      // se leen en la fase de PDFs, al final, si queda presupuesto de tiempo.
+      if (pdfLinks.size < 3) {
+        const _PDF_HINT = /media[-_ ]?kit|mediakit|mediadaten|tarif|rate[-_ ]?card|precios|pre[cç]os|publicid|pubblicit|werbung|reklam|anunci|advertis|pauta|kit[-_ ]?de[-_ ]?m[ií]dia|comercial/i;
+        for (const m of html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'\s>]+\.pdf(?:\?[^"'\s>]*)?)["'][^>]*>([\s\S]{0,140}?)<\/a>/gi)) {
+          if (pdfLinks.size >= 3) break;
+          const href = m[1], ancla = (m[2] || "").replace(/<[^>]+>/g, " ");
+          if (!_PDF_HINT.test(href) && !_PDF_HINT.test(ancla)) continue;
+          try { pdfLinks.add(new URL(href, url).href); } catch {}
+        }
+      }
       if (_stats) _stats.ok = (_stats.ok || 0) + 1;
       return; // éxito → no reintentar
     } catch (e) {
@@ -8054,6 +8229,38 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
     });
     if (socialResults.size > 0) {
       log(`  📱 ${domain}: ${socialResults.size} email(s) extraídos de redes sociales`);
+    }
+  }
+
+  // FASE PDF (2026-09-08) — los media kits cosechados en el crawl. Sólo si todavía no hay un
+  // contacto bueno y queda presupuesto: un PDF pesa y se lee en ~1-2 s. Máximo 2 archivos y 6 MB
+  // cada uno. `pdf-parse` se carga recién acá y con red: si en Railway faltara el binario
+  // nativo que trae, la fase se salta con un log y el resto del scrape no se entera.
+  if (_hayTiempo() && pdfLinks.size > 0 && !_tenemosContactoBueno(emails, cleanDomain)) {
+    let PDFParse = null;
+    try { ({ PDFParse } = await import("pdf-parse")); } catch (e) { log(`  📄 ${domain}: pdf-parse no disponible (${e.message.slice(0, 60)}) — se saltan ${pdfLinks.size} PDF`); }
+    if (PDFParse) {
+      for (const pdfUrl of [...pdfLinks].slice(0, 2)) {
+        if (!_hayTiempo()) break;
+        try {
+          const r = await fetch(pdfUrl, { headers: uaChrome, redirect: "follow", signal: AbortSignal.timeout(12_000) });
+          if (!r.ok) continue;
+          const len = parseInt(r.headers.get("content-length") || "0", 10);
+          if (len > 6_000_000) { log(`  📄 ${domain}: PDF de ${Math.round(len / 1e6)} MB, demasiado grande — se saltea`); continue; }
+          const buf = Buffer.from(await r.arrayBuffer());
+          if (buf.length > 6_000_000 || buf.subarray(0, 5).toString() !== "%PDF-") continue;
+          const parser = new PDFParse({ data: buf });
+          const texto = String((await parser.getText())?.text || "");
+          try { await parser.destroy?.(); } catch {}
+          const antes = emails.size;
+          extractEmailsFromHtml(texto).forEach(e => {
+            const lower = e.toLowerCase();
+            emails.add(e);
+            if (urlByEmail && !urlByEmail.has(lower)) urlByEmail.set(lower, pdfUrl);   // "lo publica el propio sitio": el PDF es suyo
+          });
+          log(`  📄 ${domain}: media kit ${pdfUrl.split("/").pop().slice(0, 40)} → ${emails.size - antes} email(s) nuevo(s)`);
+        } catch (e) { log(`  📄 ${domain}: no pude leer ${pdfUrl.slice(0, 60)} (${e?.message?.slice(0, 50) || e})`); }
+      }
     }
   }
 
@@ -13510,6 +13717,8 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     case "auto_feeder_monday":   source = "monday_refresh"; break;
     case "auto_feeder_adstxt":   source = "adstxt";       break;  // Maxi 2026-07-16: era "autopilot" (lumped) → label propio
     case "auto_feeder_similar":  source = "similar";      break;  // Maxi 2026-07-16: expansión por similares desde Prospects
+    case "auto_feeder_crux":     source = "crux";         break;  // 2026-09-08: top de Chrome por país (fuente GEO)
+    case "auto_feeder_wikidata": source = "wikidata";     break;  // 2026-09-08: medios con sitio oficial por país (fuente GEO)
     // Maxi 2026-06-22 FIX: los imports MANUALES ya vienen con el source correcto → PRESERVARLO.
     // Antes caían en default="csv" → el filtro de FUENTE en Prospects no respetaba nada.
     case "sellers_json":
