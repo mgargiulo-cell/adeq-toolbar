@@ -9503,6 +9503,150 @@ async function parteDelDia(token, opts = {}) {
       return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)${v.congelados ? ` · ${v.congelados} congelados` : ""}`;
     });
 
+  // ═══════════════════════════════════════════════════════════════════════════════════════
+  // 3c. ¿LA FUENTE TRAE BUENAS WEBS? EL EMBUDO, NO EL FILTRO (2026-09-08, pedido del user)
+  // ═══════════════════════════════════════════════════════════════════════════════════════
+  // "Pasó el filtro" NO prueba que la web sirva: prueba que no la rechazamos. Una web buena
+  // recorre cuatro pasos —entra a Prospects, consigue email, se le escribe, no rebota— y hasta
+  // hoy el parte sólo medía el primero. Con esto, si `crux` trae 200 y ninguna consigue email,
+  // se ve; y si `wikidata` trae 30 y las 30 se contactan, también.
+  // Ventana de 30 días porque el email y el envío llegan días después de la alta: con 7 el
+  // último tramo del embudo siempre mediría cerca de cero (es el mismo error de cohorte que
+  // costó el "todas las fuentes en 0%" del 25/08).
+  const _mes = new Date(Date.now() - 30 * 86400_000).toISOString();
+  const _sem7 = new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10);
+  const lineasEmbudo = [];
+  const lineasGeo = [];
+  const lineasVia = [];
+  const lineasRechazo = [];
+  let _cacheNeg = null, _cacheNegHoy = null;
+  const lineasMv = [];
+  try {
+    // Las altas del mes con su fuente, su email y su GEO. Una sola lectura para tres bloques.
+    const _altasMes = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${_mes}&select=domain,source,emails,email_sources,geo,geos_all,email_found_at,created_at&order=id`,
+      auth, { max: 30000 })) || [];
+    // A quién se le escribió de verdad. `toolbar_sendtrack` es el registro de envíos por
+    // dominio (una fila por envío), así que un Set de dominios responde "¿se contactó?".
+    const _enviados = new Set(((await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10)}&select=domain&order=domain`,
+      auth, { max: 30000 })) || []).map(r => String(r.domain || "").toLowerCase()));
+
+    // ── EMBUDO POR FUENTE ────────────────────────────────────────────────────────────────
+    const _emb = {};
+    const _nombreFuente = (s) => String(s || "?").replace(/^auto_feeder_/, "")
+      .replace(/^monday(_refresh)?$/, "crm_reciclado").replace(/^sellers_json$/, "sellers");
+    for (const a of _altasMes) {
+      const s = _nombreFuente(a.source);
+      const e = (_emb[s] = _emb[s] || { entraron: 0, conEmail: 0, enviados: 0 });
+      e.entraron++;
+      if (Array.isArray(a.emails) && a.emails.length) e.conEmail++;
+      if (_enviados.has(String(a.domain || "").toLowerCase())) e.enviados++;
+    }
+    for (const [s, v] of Object.entries(_emb).sort((a, b) => b[1].entraron - a[1].entraron)) {
+      const pctMail = v.entraron ? Math.round(100 * v.conEmail / v.entraron) : 0;
+      const pctEnv  = v.entraron ? Math.round(100 * v.enviados / v.entraron) : 0;
+      // La señal mira el TRAMO FINAL: contactar es lo único que factura. Una fuente que trae
+      // mucho y no se contacta nunca es peor que una que trae poco y se contacta todo.
+      const señal = pctEnv >= 20 ? "✅" : pctEnv >= 8 ? "⚠️" : "🔴";
+      lineasEmbudo.push(`   ${señal} ${s.padEnd(16)} entraron ${String(v.entraron).padStart(5)} · con email ${String(v.conEmail).padStart(5)} (${String(pctMail).padStart(3)}%) · contactadas ${String(v.enviados).padStart(4)} (${pctEnv}%)`);
+    }
+
+    // ── GEO DE LAS ALTAS: cuánto anglo sigue entrando (la razón de las fuentes por país) ──
+    // El filtro anglo es BLANDO a propósito (regla del user: sesgo, no rechazo), así que el
+    // número correcto no es cero: es "poco y bajando". Las fuentes por país (CrUX, Wikidata,
+    // directorio) existen para mover justamente este renglón.
+    const _ANGLO = new Set(["US", "CA", "GB", "UK", "AU", "NZ", "IE"]);
+    const _reg = { "🎯 foco (LATAM/EU/África/Asia)": 0, "🇺🇸 anglo (US/CA/UK/AU/NZ/IE)": 0, "sin dato de GEO": 0 };
+    const _ultimos7 = new Date(Date.now() - 7 * 86400_000).toISOString();
+    let _n7 = 0;
+    for (const a of _altasMes) {
+      if (String(a.created_at || "") < _ultimos7) continue;
+      _n7++;
+      const iso = (Array.isArray(a.geos_all) && a.geos_all[0]) ? String(a.geos_all[0]).toUpperCase()
+                : (COUNTRY_NAME_TO_CODE[a.geo] || "");
+      if (!iso) _reg["sin dato de GEO"]++;
+      else if (_ANGLO.has(iso)) _reg["🇺🇸 anglo (US/CA/UK/AU/NZ/IE)"]++;
+      else _reg["🎯 foco (LATAM/EU/África/Asia)"]++;
+    }
+    for (const [k, v] of Object.entries(_reg)) {
+      lineasGeo.push(`   ${k.padEnd(34)} ${String(v).padStart(4)}${_n7 ? ` (${Math.round(100 * v / _n7)}%)` : ""}`);
+    }
+
+    // ── DE DÓNDE SALEN LOS EMAILS, Y CUÁLES REBOTAN ──────────────────────────────────────
+    // El cruce con los rebotes es EXACTO: `bounce_detected` guarda la dirección que falló en
+    // `details.failed_email`, así que se puede atribuir el rebote a la vía que la encontró.
+    // Es la única forma de saber si una vía nueva (el patrón, el PDF, Instagram) trae
+    // direcciones que existen o sólo direcciones.
+    const _viaDe = new Map();   // email → vía que lo encontró
+    const _via = {};
+    for (const a of _altasMes) {
+      if (String(a.email_found_at || a.created_at || "") < _ultimos7) continue;
+      for (const [em, src] of Object.entries(a.email_sources || {})) {
+        const v = String(src || "?").toLowerCase();
+        _viaDe.set(String(em).toLowerCase(), v);
+        (_via[v] = _via[v] || { n: 0, rebotes: 0 }).n++;
+      }
+    }
+    const _rebotes = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.bounce_detected&created_at=gte.${_ultimos7}&select=details&order=id`,
+      auth, { max: 5000 })) || [];
+    let _rebotesSinVia = 0;
+    for (const r of _rebotes) {
+      const em = String(r?.details?.failed_email || "").toLowerCase();
+      const v = _viaDe.get(em);
+      if (v && _via[v]) _via[v].rebotes++;
+      else if (em) _rebotesSinVia++;
+    }
+    for (const [v, d] of Object.entries(_via).sort((a, b) => b[1].n - a[1].n).slice(0, 12)) {
+      const pct = d.n ? Math.round(100 * d.rebotes / d.n) : 0;
+      const señal = d.rebotes === 0 ? "✅" : pct <= 5 ? "⚠️" : "🔴";
+      lineasVia.push(`   ${señal} ${v.padEnd(18)} ${String(d.n).padStart(4)} email(s) · rebotaron ${String(d.rebotes).padStart(3)} (${pct}%)`);
+    }
+    if (_rebotesSinVia) lineasVia.push(`   · ${_rebotesSinVia} rebote(s) de direcciones que no están en el pool (envíos viejos o cargados a mano)`);
+
+    // ── POR QUÉ SE RECHAZA LO QUE SE RECHAZA ─────────────────────────────────────────────
+    // Agrupado por motivo. Sirve para dos cosas: ver si un veto está matando de más (fue el
+    // hallazgo del 08/09 con `nonpub_saas` sobre medios reales) y ver cuántos quedan
+    // REINTENTABLES —el estado nuevo para "no pude leer el ads.txt"— en vez de descartados.
+    const _rech = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${_ultimos7}&status=in.(skipped,next_day)&select=status,error_message&order=id`,
+      auth, { max: 20000 })) || [];
+    const _porMotivo = {};
+    let _reintentables = 0;
+    for (const r of _rech) {
+      const m = String(r.error_message || "?");
+      if (r.status === "next_day") { if (/reintentar|no_verificable|sin_cuota/i.test(m)) _reintentables++; continue; }
+      // El motivo viene como "not_publisher: haiku_corp" o "not_publisher: sin_ads_txt".
+      const k = (m.split(":").slice(0, 2).join(":") || "?").replace(/^not_publisher:\s*/, "").slice(0, 34);
+      _porMotivo[k] = (_porMotivo[k] || 0) + 1;
+    }
+    const _totalRech = Object.values(_porMotivo).reduce((a, b) => a + b, 0);
+    for (const [k, v] of Object.entries(_porMotivo).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
+      lineasRechazo.push(`   ${k.padEnd(34)} ${String(v).padStart(5)}${_totalRech ? ` (${Math.round(100 * v / _totalRech)}%)` : ""}`);
+    }
+    if (_reintentables) lineasRechazo.push(`   ↻ ${_reintentables} NO se descartaron: vuelven mañana (ads.txt ilegible o sin cuota de API)`);
+
+    // ── LO QUE YA NO SE VUELVE A PAGAR ───────────────────────────────────────────────────
+    // Cada fila `noData` es un dominio del que SimilarWeb no sabe nada y que antes se
+    // consultaba hasta 6 veces (3 intentos + 3 al descongelarse). Es el ahorro de la caché
+    // negativa del 08/09, y se mide contando el stock y lo de hoy.
+    _cacheNeg    = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?data->>noData=eq.true&select=domain`);
+    _cacheNegHoy = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?data->>noData=eq.true&fetched_at=gte.${desdeHoy}&select=domain`);
+
+    // ── MILLIONVERIFIER: QUÉ CONTESTÓ HOY ────────────────────────────────────────────────
+    // Vigila la inferencia por patrón: esa vía sólo acepta un "ok", así que si el gasto sube
+    // y los "ok" no, está adivinando mal y hay que bajarle el tope.
+    const _mv = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_mv_results?created_at=gte.${desdeHoy}&select=result,blocked&order=id`,
+      auth, { max: 5000 })) || [];
+    const _porRes = {};
+    for (const m of _mv) _porRes[String(m.result || "?")] = (_porRes[String(m.result || "?")] || 0) + 1;
+    for (const [k, v] of Object.entries(_porRes).sort((a, b) => b[1] - a[1])) {
+      lineasMv.push(`   ${k.padEnd(14)} ${String(v).padStart(4)}`);
+    }
+  } catch (e) { log(`⚠️ parte 3c (embudo/geo/vías): ${e.message}`); }
+
   // 4. LIMPIEZA: URLs que YA ESTABAN en Prospects y se sacaron hoy por no cumplir.
   // Ojo con la fecha: se filtra por `updated_at` (cuándo se rechazó), no por `created_at`
   // (cuándo entró el lead). Es un error fácil y da números que no significan nada.
@@ -10003,6 +10147,41 @@ async function parteDelDia(token, opts = {}) {
       ...lineasFuente,
       `   Menos de 10% que pasan = esa fuente está gastando créditos para nada.`,
     ] : []),
+    ...(lineasEmbudo.length ? [
+      ``,
+      `¿LA FUENTE TRAE BUENAS WEBS? EL EMBUDO A 30 DÍAS`,
+      ...lineasEmbudo,
+      `   "Pasó el filtro" no factura; contactar sí. Mirá la última columna: es la que decide.`,
+    ] : []),
+    ...(lineasGeo.length ? [
+      ``,
+      `GEO DE LAS ALTAS (7 días) — para qué existen las fuentes por país`,
+      ...lineasGeo,
+      `   El filtro anglo es blando a propósito (sesgo, no rechazo): la meta es "poco y bajando", no cero.`,
+    ] : []),
+    ...(lineasVia.length ? [
+      ``,
+      `DE DÓNDE SALEN LOS EMAILS (7 días) — y cuáles rebotan`,
+      ...lineasVia,
+      `   El rebote se atribuye a la dirección exacta que falló, así que una vía con muchos rebotes es una vía que inventa.`,
+    ] : []),
+    ...(lineasRechazo.length ? [
+      ``,
+      `POR QUÉ SE RECHAZA (7 días)`,
+      ...lineasRechazo,
+      `   Si un motivo se dispara, puede estar matando de más: el 08/09 "nonpub_saas" estaba rechazando diarios.`,
+    ] : []),
+    ...(_cacheNeg != null ? [
+      ``,
+      `CACHÉ NEGATIVA — dominios que SimilarWeb no conoce y ya no se vuelven a pagar`,
+      `   ${_num(_cacheNeg)} guardados en total · ${_num(_cacheNegHoy)} nuevos hoy (antes cada uno se consultaba hasta 6 veces)`,
+    ] : []),
+    ...(lineasMv.length ? [
+      ``,
+      `MILLIONVERIFIER — qué contestó hoy`,
+      ...lineasMv,
+      `   La inferencia por patrón sólo acepta un "ok". Si el gasto sube y los "ok" no, hay que bajarle el tope.`,
+    ] : []),
     ...((_kwTop.length || _kwMal.length || _kwSinNinguna) ? [
       ``,
       `AUTOGOOGLE — qué búsquedas están funcionando`,
@@ -10185,6 +10364,31 @@ async function parteDelDia(token, opts = {}) {
   ${lineasFuente.length ? _card("Rendimiento por fuente (7 días)",
     `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasFuente.join("\n"))}</pre>
      <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Menos de 10% que pasan = esa fuente gasta créditos para nada.</div>`) : ""}
+
+  ${lineasEmbudo.length ? _card("¿La fuente trae buenas webs? El embudo a 30 días",
+    `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasEmbudo.join("\n"))}</pre>
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">"Pasó el filtro" no factura; contactar sí. La última columna es la que decide.</div>`) : ""}
+
+  ${lineasGeo.length ? _card("GEO de las altas (7 días)",
+    `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasGeo.join("\n"))}</pre>
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">El filtro anglo es blando a propósito: la meta es "poco y bajando", no cero. Para eso existen CrUX, Wikidata y el directorio.</div>`) : ""}
+
+  ${lineasVia.length ? _card("De dónde salen los emails (7 días) — y cuáles rebotan",
+    `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasVia.join("\n"))}</pre>
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">El rebote se atribuye a la dirección exacta que falló: una vía con muchos rebotes es una vía que inventa.</div>`) : ""}
+
+  ${lineasRechazo.length ? _card("Por qué se rechaza (7 días)",
+    `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasRechazo.join("\n"))}</pre>
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Si un motivo se dispara puede estar matando de más: el 08/09 "nonpub_saas" rechazaba diarios.</div>`) : ""}
+
+  ${_cacheNeg != null ? _card("Caché negativa — lo que ya no se vuelve a pagar", _kv([
+    ["Dominios sin datos guardados", _num(_cacheNeg)],
+    ["Nuevos hoy", _num(_cacheNegHoy)],
+  ]) + `<div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Antes cada uno se consultaba hasta 6 veces (3 intentos + 3 al descongelarse).</div>`) : ""}
+
+  ${lineasMv.length ? _card("MillionVerifier — qué contestó hoy",
+    `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasMv.join("\n"))}</pre>
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">La inferencia por patrón sólo acepta un "ok". Si el gasto sube y los "ok" no, hay que bajarle el tope.</div>`) : ""}
 
   ${(_kwTop.length || _kwMal.length || _kwSinNinguna) ? _card("AutoGoogle — qué búsquedas funcionan",
     `${_agStats ? `<div style="font:13px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-bottom:8px">Último slot ${_e(_agStats.slot)}: ${_agStats.searches} búsquedas → ${_agStats.found} encontrados → <b style="color:${_agStats.inserted > 0 ? _VERDE : _ROJO}">${_agStats.inserted} nuevos</b></div>` : ""}
