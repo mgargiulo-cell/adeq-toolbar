@@ -5355,469 +5355,6 @@ async function bindButtons() {
     return { ...v, traffic, mailEnviado: !!state.emailSentInSession };
   }
 
-
-// ═══════════════════════════════════════════════════════════════════════════════════════
-// EL EMISOR AL CRM BOARD — reemplaza a Monday (Maxi 2026-09-02, corte pedido por el user)
-// ═══════════════════════════════════════════════════════════════════════════════════════
-// Monday quedó obsoleto: sus 10.564 items y los 18 tableros de negociaciones ya están
-// migrados, y el user apagó sus 101 automatizaciones. Los botones conservan el nombre que
-// los MB conocen, pero escriben acá.
-//
-// El board es IDEMPOTENTE por dominio (verificado: se reenvió el mismo con www. y siguieron
-// 2 filas, no 3). Por eso NO hay rama "crear vs actualizar" como en Monday: el mismo POST
-// sirve para las dos cosas y desaparece toda la lógica de mondayItemId, que era donde se
-// perdían los pushes cuando el id no estaba.
-// Los cinco índices de Monday siguen valiendo; el resto del <select> va con código ISO
-// (2026-09-04). Las etiquetas son EXACTAMENTE las de `crm_board_templates.idioma`.
-const _BOARD_IDIOMA = {
-  0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe",
-  en: "Ingles", es: "Español", it: "Italiano", pt: "Portugues", ar: "Arabe",
-  de: "Aleman", fr: "Frances", pl: "Polaco", ja: "Japones", ko: "Coreano", nl: "Holandes",
-  tr: "Turco", el: "Griego", cs: "Checo", hu: "Hungaro", ro: "Rumano", sv: "Sueco",
-  hr: "Croata", uk: "Ucraniano", id: "Indonesio", vi: "Vietnamita", th: "Tailandes", zh: "Chino",
-};
-const _BOARD_EJEC   = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
-// El board pide la ETIQUETA del estado; el formulario lo guarda como ÍNDICE.
-//
-// ⚠️ La etiqueta se lee del PROPIO <select>, no de una tabla aparte. Tenerla duplicada ya
-// falló: la copié de MONDAY_STATES, que estaba desactualizada — decía que el índice 4 era
-// "Rebotado" y el 7 "Avanzado", cuando el board real dice "Propuesta Vigente (T)" y
-// "PAUSADO". Y el 4 es el valor por DEFECTO del formulario, así que todo push manual entraba
-// al CRM como un rebote: un prospecto recién contactado quedaba marcado como dirección
-// muerta y encima "Rebotado" no bloquea el re-contacto, con lo cual el agente le volvía a
-// escribir. Leyendo del select es imposible que diverjan: lo que el MB ve es lo que se manda.
-function _estadoLabel(idx) {
-  const opt = document.querySelector(`#form-estado option[value="${String(idx)}"]`);
-  const txt = opt?.textContent?.trim();
-  if (txt) return txt;
-  // Sin opción que coincida NO se inventa un estado: se manda el default seguro del board.
-  // Un estado equivocado es peor que el default, porque decide si se le vuelve a escribir.
-  // ⚠️ El fallback tiene que ser una etiqueta que el CRM ACEPTE. Era "Propuesta Vigente (T)",
-  // que dejó de existir: el CRM la degradaba con un aviso que nadie ve.
-  console.warn("estado sin etiqueta en el formulario:", idx);
-  return "Propuesta Vigente";
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════════════
-// ¿SE PUEDE PROSPECTAR ESTA WEB? — el veredicto, dicho con todas las letras
-// ═══════════════════════════════════════════════════════════════════════════════════════
-// Regla del user (2026-09-07), textual:
-//   · no está en el CRM            → "Web prospectable. Nunca fue contactada."
-//   · Ciclo Finalizado             → "Web prospectable. Ya tiene ciclo finalizado."
-//   · Pausado                      → "Web prospectable. Cliente Antiguo Pausado."
-//   · Propuesta Vigente / En Negociacion / Personalizado → NO deja prospectar. "Propuesta en curso."
-//   · Live                         → NO deja prospectar. "Cliente activo."
-//
-// Antes esto no se decía en ningún lado: el recuadro mostraba "⚠️ YA ESTÁ EN ADEQ · <estado>"
-// y el MB tenía que saberse de memoria cuáles de los cinco estados permiten volver a escribir.
-// El veredicto ahora es la primera línea del recuadro y, cuando dice que no, el botón de
-// cargar y el de mandar el mail se niegan (no alcanza con avisar: el que apura, apura).
-//
-// ⚠️ MANDA LA COLUMNA `estado` DEL CRM, Y NADA MÁS (regla del user, 07/09: *"vos tenés que
-// matchear con el CRM por la columna estado, no sacar conclusiones"*). La primera versión
-// cruzaba además la lista `/dominios-activos` para "tapar huecos", y de ahí salió una
-// advertencia MÍA que era falsa: dije que los 62 `Pausado` facturaban porque están en
-// `crm_board_clientes_activos`, sin mirar POR QUÉ están. Medido después: de esos 62, **0
-// facturan** (54 "ex cliente: en la base y sin revenue", 8 marcados activos pero sin revenue
-// en 90 días), y los 45 `Live` facturan los 45. O sea: el CRM ya dice todo lo que hace falta
-// en una sola columna, y el que sacaba conclusiones era yo. Sin el cruce, además, el recuadro
-// contesta al instante en vez de esperar 2,4 s.
-const _CRM_LIVE_RE    = /^\s*live\s*$/i;
-const _CRM_EN_CURSO_RE = /propuesta\s*vigente|en\s*negociaci|personalizado/i;
-const _CRM_PAUSADO_RE = /pausad/i;
-const _CRM_CERRADO_RE = /ciclo\s*finalizado/i;
-
-function _veredictoCrm(dup) {
-  // "No pude preguntar" NUNCA es "está libre": es el error caro, y ya nos costó una vez.
-  if (!dup || dup.indeterminado) {
-    return { ok: false, duda: true, titulo: "No pude consultar el CRM",
-             detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
-  }
-  if (!dup.found) {
-    return { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
-  }
-  const estado = String(dup.status || "").trim();
-  // "Web NO prospectable" y no "No prospectable": el MB lee el recuadro de reojo mientras
-  // navega, y las dos respuestas tienen que empezar igual para que la diferencia salte a la
-  // vista en la misma palabra (pedido del user, 08/09: *"arriba en CRM debería decir web no
-  // prospectable"* / *"el MB debe saber enseguida el status de la web que está viendo"*).
-  if (_CRM_LIVE_RE.test(estado)) {
-    return { ok: false, titulo: "Web NO prospectable", detalle: "Cliente activo.", clase: "crm-no" };
-  }
-  if (_CRM_EN_CURSO_RE.test(estado)) {
-    return { ok: false, titulo: "Web NO prospectable", detalle: `Propuesta en curso (${estado}).`, clase: "crm-no" };
-  }
-  if (_CRM_PAUSADO_RE.test(estado)) {
-    return { ok: true, titulo: "Web prospectable", detalle: "Cliente Antiguo Pausado.", clase: "crm-si" };
-  }
-  if (_CRM_CERRADO_RE.test(estado)) {
-    return { ok: true, titulo: "Web prospectable", detalle: "Ya tiene ciclo finalizado.", clase: "crm-si" };
-  }
-  // Un estado que no conocemos no se declara prospectable: el vocabulario del CRM ya cambió
-  // tres veces en un día y afirmar de más acá significa un mail a un cliente.
-  return { ok: false, duda: true, titulo: "Revisalo a mano",
-           detalle: `Estado "${estado || "sin estado"}": no lo reconozco, no puedo decir si se puede escribir.`, clase: "crm-duda" };
-}
-
-// Mientras se pregunta. El "Checking..." del HTML no distinguía "estoy preguntando" de
-// "me colgué antes de preguntar": con este cartel, si el recuadro no cambia, ya se sabe que
-// la consulta arrancó.
-function _pintarEsperaCrm() {
-  const el = document.getElementById("duplicate-result");
-  if (!el) return;
-  if (state.crmVeredicto && !state.crmVeredicto.provisional) return;  // ya hay una respuesta real
-  el.className = "status-badge loading";
-  el.textContent = "⏳ Consultando ADEQ…";
-}
-
-function _pintarVeredictoCrm(v, dup) {
-  const el = document.getElementById("duplicate-result");
-  if (!el) return;
-  const ctx = [];
-  if (dup?.found) {
-    if (dup.ejecutivo) ctx.push(esc(dup.ejecutivo.split("@")[0]));
-    if (dup.status)    ctx.push(esc(dup.status));
-    if (dup.fecha)     ctx.push(`último contacto ${esc(dup.fecha)}`);
-    if (dup.board)     ctx.push(esc(dup.board));
-  }
-  // Cuánto tardó. Es la prueba en pantalla de lo que el user pidió medir ("máximo 2-3
-  // segundos"): si algún día vuelve a arrastrarse, se ve en el recuadro y no hay que abrir
-  // la consola para enterarse.
-  if (typeof dup?.ms === "number") ctx.push(`ADEQ en ${(dup.ms / 1000).toFixed(1)}s`);
-  el.className = `crm-veredicto ${v.clase}`;
-  el.innerHTML =
-    `<div class="crm-veredicto-t">${v.ok ? "✅" : v.duda ? "⚠️" : "⛔"} ${esc(v.titulo)}</div>` +
-    `<div class="crm-veredicto-d">${esc(v.detalle)}</div>` +
-    (ctx.length ? `<div class="crm-veredicto-ctx">${ctx.join(" · ")}</div>` : "") +
-    // Si no se pudo preguntar, el MB tiene que poder reintentar sin cerrar y abrir la toolbar.
-    (v.duda && !dup?.found ? `<button type="button" id="btn-crm-reintentar" class="crm-reintentar">🔄 Reintentar</button>` : "");
-  document.getElementById("btn-crm-reintentar")?.addEventListener("click", () => { _reintentarVeredictoCrm(); });
-}
-
-// Vuelve a preguntar, salteando la consulta que ya falló.
-async function _reintentarVeredictoCrm() {
-  const dom = state.domain;
-  if (!dom) return;
-  state.crmVeredicto = null;
-  _pintarEsperaCrm();
-  const r = await _crmConsultar(dom, { forzar: true });
-  if (state.domain !== dom) return;
-  state.duplicate = r;
-  const v = _veredictoCrm(r);
-  state.crmVeredicto = v;
-  _pintarVeredictoCrm(v, r);
-  _aplicarBloqueoCrm(v);
-}
-
-// ¿El CRM ya dijo que no? (Un veredicto con duda NO bloquea: avisa.)
-function _crmBloquea() {
-  const v = state.crmVeredicto;
-  return !!v && !v.ok && !v.duda;
-}
-
-// El mensaje único cuando algo se niega a seguir porque el CRM dice que no.
-function _motivoBloqueoCrm() {
-  const v = state.crmVeredicto;
-  if (!v || v.ok) return "";
-  return `⛔ ${v.titulo}: ${v.detalle}${v.duda ? "" : " No se le escribe ni se carga."}`;
-}
-
-// ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
-// Devuelve la MISMA forma que devolvía aquél para no tocar a los seis lugares que la
-// consumen — lo único nuevo es `descansando`, que Monday no sabía: un negocio cerrado hace
-// menos de 60 días existe pero NO hay que escribirle todavía.
-// ── LA CONSULTA TIENE RELOJ (2026-09-07, pedido del user) ────────────────────────────────
-// *"Nunca arroja resultado… máximo 2-3 segundos. Tiene que filtrar directo la url en prospects
-// ADEQ y ver la columna estado, nada más."* Del lado del servidor eso ya es lo que pasa: un
-// `.eq('domain', …)` con índice sobre `crm_board_prospects`, medido en 0,5-0,75 s. El agujero
-// estaba acá: `fetch` **sin timeout**. Un pedido que se cuelga (wifi que se cae, service worker
-// dormido, Vercel frío) no rechaza NUNCA, así que la promesa no se resolvía y el recuadro se
-// quedaba con el "Checking..." del HTML para siempre — sin error, sin aviso, sin manera de
-// reintentar. Es el mismo patrón de "no sé tratado como no": acá era "no sé" tratado como
-// "seguí esperando".
-// Ahora: 2,5 s por intento, dos intentos, y a los ~5 s como mucho hay un veredicto en pantalla
-// (aunque sea "no pude preguntar"). Se devuelve `ms` para poder mostrar cuánto tardó.
-// Medido contra producción el 08/09: **0,40-0,66 s en caliente**, y **3,15 s en el primer
-// pedido del día**, cuando Vercel tiene que levantar la función. Con el techo en 2,5 s ese
-// primer pedido —el que hace el MB al abrir la toolbar por la mañana, o sea el que más
-// importa— se abortaba SIEMPRE, y el veredicto salía por el segundo intento o no salía. El
-// techo tiene que dejar pasar el arranque en frío: 4 s cubre 3,15 s con margen y sigue muy
-// por debajo de lo que el user pidió sentir (*"el MB debe saber enseguida"*), porque en el
-// 99% de las aperturas contesta en medio segundo y no se espera nada.
-const _CRM_FICHA_TIMEOUT_MS = 4000;
-
-// ── EL DOMINIO QUE SE PREGUNTA ES EL RAÍZ (2026-09-08, regla del user) ───────────────────
-// *"Omití el www, el http y todo eso: que sea dominio real, ole.com y listo. En el CRM están
-// todos sin www ni https."*
-//
-// `extractDomain` ya saca protocolo, `www.` y la ruta, y el endpoint tolera esas tres cosas.
-// Lo que NO tolera —lo medí el 08/09— son los subdominios: `m.elpais.com` devuelve
-// `found:false` mientras `elpais.com` devuelve "Ciclo Finalizado". Y ese fallo cae para el
-// lado peligroso: "no encontrado" se pinta como **"Web prospectable"**, o sea la toolbar
-// invita a escribirle a un cliente activo porque el MB entró por la versión móvil o por una
-// sección (`deportes.ole.com`). Es el error caro, y silencioso.
-//
-// Se resuelve sin lista de sufijos: se pregunta el host tal cual —por si el CRM tuviera una
-// fila con subdominio— y, si no aparece, se repregunta por el raíz. Dos labels, salvo que los
-// dos últimos formen un sufijo compuesto (`com.ar`, `co.uk`, `gob.mx`), donde van tres.
-// El worker tiene la lista completa (`MULTI_PART_TLDS`, 200 entradas) pero vive en otro
-// bundle: duplicarla acá sería crear una segunda lista para que se desincronice de la primera.
-// Esta heurística cubre los sufijos compuestos reales; y si fallara, el peor caso es preguntar
-// un dominio que no existe y recibir "no encontrado", nunca un match equivocado.
-function _dominioRaiz(host) {
-  const p = String(host || "").toLowerCase().replace(/\.+$/, "").split(".").filter(Boolean);
-  if (p.length <= 2) return p.join(".");
-  const compuesto = /^(com|co|org|net|gov|gob|edu|ac|mil|nom|web|ind)$/.test(p[p.length - 2])
-                 && p[p.length - 1].length === 2;
-  return p.slice(compuesto ? -3 : -2).join(".");
-}
-
-async function buscarEnCrm(domain) {
-  const t0 = Date.now();
-  // El host como vino y, si tiene subdominio, el raíz. `Set` para no preguntar dos veces lo
-  // mismo, que es el caso normal (un dominio sin subdominio ya ES su raíz).
-  const candidatos = [...new Set([String(domain || "").toLowerCase().replace(/\.+$/, ""), _dominioRaiz(domain)].filter(Boolean))];
-  let ultimo = "";
-  for (const dom of candidatos) {
-  for (let intento = 1; intento <= 2; intento++) {
-    try {
-      const r = await fetch(
-        `${crmUrl("/ficha")}?domain=${encodeURIComponent(dom)}`,
-        {
-          headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
-          cache: "no-store",
-          signal: AbortSignal.timeout(_CRM_FICHA_TIMEOUT_MS),
-        },
-      );
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = await r.json();
-      const ms = Date.now() - t0;
-      // "No está" con este candidato no es la respuesta final: puede estar con el raíz.
-      // Se corta el bucle de reintentos y se prueba el siguiente.
-      if (!j.found) { ultimo = "no está en el CRM"; break; }
-      return {
-        found: true, itemId: null, ms, dominioConsultado: dom,
-        status: j.estado || "", ejecutivo: j.ejecutivo || "", trafico: j.pageviews || "",
-        email: j.email || "", geo: j.top_geo || "", fecha: j.fecha_contacto || "",
-        idioma: j.idioma || "", board: j.board || "",
-        // El endpoint ya mandaba estos dos y nadie los leía. Sirven para no autocompletar el
-        // formulario con una dirección que se sabe muerta: si rebotó, vale la del scraper.
-        rebotado: !!(j.email_rebotado || j.rebotado_at), reboteMotivo: j.rebote_motivo || "",
-        descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0,
-      };
-    } catch (e) {
-      // `AbortSignal.timeout` tira TimeoutError; se traduce para que el cartel diga algo que
-      // el MB entienda en vez de un nombre de excepción.
-      ultimo = e?.name === "TimeoutError" ? `no contestó en ${_CRM_FICHA_TIMEOUT_MS / 1000}s` : (e?.message || String(e));
-      console.warn(`buscarEnCrm ${dom} (intento ${intento}):`, ultimo);
-    }
-  }
-  // Si el corte fue por un error de red y no por "no está", no se sigue probando candidatos:
-  // el problema no es el dominio, y preguntar de nuevo sólo suma segundos al cartel.
-  if (ultimo && ultimo !== "no está en el CRM") break;
-  }
-  // Todos los candidatos contestaron y ninguno está: ésa es una respuesta legítima del CRM
-  // —la web nunca fue contactada— y tiene que leerse como "Web prospectable". Mezclarla con
-  // el caso de abajo convertiría cada sitio nuevo en un "no pude consultar", que es la alarma
-  // falsa que hace que el MB deje de mirar el cartel.
-  if (ultimo === "no está en el CRM") return { found: false, ms: Date.now() - t0 };
-  // ⚠️ Y al revés: NO se devuelve `{found:false}` ante un error. Eso le diría al MB "está
-  // libre, dale" justo cuando no pudimos verificar, que es el error caro. Se marca
-  // `indeterminado` y el cartel lo dice.
-  return { found: false, indeterminado: true, motivo: ultimo, ms: Date.now() - t0 };
-}
-
-// Una sola consulta por dominio, compartida por el chequeo temprano y por la pipeline: sin
-// esto el veredicto se pediría dos veces al abrir la toolbar.
-let _crmVuelo = null;   // { domain, promesa }
-function _crmConsultar(domain, { forzar = false } = {}) {
-  if (!forzar && _crmVuelo && _crmVuelo.domain === domain) return _crmVuelo.promesa;
-  const promesa = buscarEnCrm(domain);
-  _crmVuelo = { domain, promesa };
-  return promesa;
-}
-
-// ── EL VEREDICTO ARRANCA PRIMERO Y POR SU CUENTA (2026-09-07) ────────────────────────────
-// Va en un listener PROPIO de DOMContentLoaded, no adentro del grande. Dos razones:
-//  1. La ficha no necesita el JWT —se autentica con el `x-toolbar-secret` bakeado—, así que
-//     no tiene por qué hacer cola detrás del refresh de token, las keys y el resto del arranque.
-//  2. Si el handler grande se cae en cualquier línea previa a la pipeline, ese `throw` se lleva
-//     puesto TODO lo que venía después, incluido el chequeo del CRM, y el recuadro se queda con
-//     el "Checking..." del HTML sin que nadie se entere. Dos listeners son independientes: uno
-//     no puede matar al otro.
-// La consulta se comparte con `runDuplicateCheck` por `_crmConsultar`, así que sigue siendo
-// UN pedido.
-let _crmWatchdog = null;
-// Techo duro: 2 intentos × 4 s + margen de red. Si a los 9 s no hay veredicto, algo se colgó
-// en un lugar que no previmos y el MB tiene que enterarse, no seguir mirando un reloj.
-// ⚠️ Este número tiene que quedar POR ENCIMA de 2 × `_CRM_FICHA_TIMEOUT_MS`. Si queda por
-// debajo, el watchdog dispara mientras el segundo intento todavía está en vuelo y el MB ve
-// "no pude consultar" sobre una consulta que iba a contestar bien.
-const _CRM_WATCHDOG_MS = 2 * _CRM_FICHA_TIMEOUT_MS + 1000;
-function _armarWatchdogCrm() {
-  clearTimeout(_crmWatchdog);
-  _crmWatchdog = setTimeout(() => {
-    if (state.crmVeredicto) return;
-    const v = { ok: false, duda: true, provisional: true, titulo: "No pude consultar el CRM",
-                detalle: `La consulta no volvió en ${_CRM_WATCHDOG_MS / 1000} segundos. Verificá a mano en ADEQ o reintentá.`,
-                clase: "crm-duda" };
-    state.crmVeredicto = v;
-    _pintarVeredictoCrm(v, null);
-    _aplicarBloqueoCrm(v);
-  }, _CRM_WATCHDOG_MS);
-}
-
-document.addEventListener("DOMContentLoaded", async () => {
-  // ⚠️ El cartel y el watchdog van ANTES del primer `await`, no después. Con ellos abajo de
-  // los dos `await` de arriba, cualquier salida temprana —o un `chrome.storage` lento— dejaba
-  // el recuadro con el "Checking..." del HTML, que es texto muerto: no lo pinta nadie, no
-  // vence nunca y no distingue "estoy preguntando" de "me colgué antes de preguntar".
-  // El MB tiene que saber el estado de la web enseguida (regla del user, 08/09), y "todavía
-  // estoy preguntando" también es saberlo.
-  _pintarEsperaCrm();
-  _armarWatchdogCrm();
-  try {
-    const { auth } = await chrome.storage.local.get("auth");
-    if (!auth?.loggedIn) { clearTimeout(_crmWatchdog); return; }   // con el login en pantalla la tarjeta ni se ve
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    const dom = tab?.url && /^https?:/i.test(tab.url) ? extractDomain(tab.url) : "";
-    if (!dom) {
-      // Ni error ni espera eterna: en una pestaña que no es una web, se dice.
-      clearTimeout(_crmWatchdog);
-      const v = { ok: false, duda: true, titulo: "Sin web que consultar",
-                  detalle: "Abrí la pestaña de un sitio para ver su estado en ADEQ.", clase: "crm-duda" };
-      state.crmVeredicto = v;
-      _pintarVeredictoCrm(v, null);
-      return;
-    }
-    const r = await _crmConsultar(dom);
-    // Si el MB ya navegó a otra web, o la pipeline pintó antes, este resultado no manda.
-    // El cartel del watchdog sí se pisa: es un "todavía no sé", no una respuesta.
-    if (state.domain && state.domain !== dom) return;
-    if (state.crmVeredicto && !state.crmVeredicto.provisional) return;
-    clearTimeout(_crmWatchdog);
-    state.duplicate = r;
-    const v = _veredictoCrm(r);
-    state.crmVeredicto = v;
-    _pintarVeredictoCrm(v, r);
-    _aplicarBloqueoCrm(v);
-  } catch (e) {
-    console.warn("[CRM temprano]", e?.message || e);
-  }
-});
-
-// Qué plantilla del CRM salió en el mail, si fue una sin tocar. Con el pitch bloqueado es
-// igual por construcción; si el MB apretó Limpiar y escribió lo suyo, no hay plantilla.
-function _plantillaEnviadaAlCrm(pitchEnviado) {
-  const t = state.pitchTemplate;
-  if (!t || t.origen !== "crm") return null;
-  if (String(pitchEnviado || "").trim() !== String(t.body || "").trim()) return null;
-  return { ref: `crm:${t.id}`, variant: t.variant, idioma: t.lang, enviado_at: new Date().toISOString() };
-}
-
-// ── LOS CONTACTOS ADICIONALES VIAJAN CON EL PROSPECTO (2026-09-07) ──────────────────────
-// El CRM tiene desde hoy `crm_board_contactos` (commit 775c9dd de su lado) y acepta la lista
-// en el mismo push. Es lo que arregla el agujero más caro que teníamos: `scan-replies` matchea
-// por dirección, y como los adicionales no estaban en la ficha, **sus respuestas quedaban
-// huérfanas** — justo los que mejor responden (6,6% real sobre 499 envíos en 90 días, la mejor
-// de todas las fuentes).
-// Van TODOS en el push, con su hora — regla del user: *"que al momento del push se encolen
-// todos, a pesar de que nuestro envío tarde 3 minutos, para evitar errores"*. Si esto dependiera
-// de que el worker informe cada uno al despacharlo, un worker caído dejaría al CRM sin enterarse
-// nunca. `enviado_at` es la hora PROGRAMADA (+1/+2/+3 min): está a minutos de la real, y el CRM
-// la necesita para el caso del rebote —reenganchar la cadencia desde que esa persona recibió el
-// inicial y no desde hoy—. El worker igual confirma la hora exacta cuando lo manda; el endpoint
-// es idempotente. Si el mail todavía no se envió, se mandan sin hora: no se afirma lo que no pasó.
-function _contactosAdicionales() {
-  const enc = state.adicionalesEncolados;
-  if (enc && enc.domain === state.domain && enc.lista?.length) return enc.lista;
-  const ids = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
-  const vistos = new Set();
-  const out = [];
-  for (const id of ids) {
-    const v = (document.getElementById(id)?.value || "").trim().toLowerCase();
-    if (!v || !v.includes("@") || vistos.has(v)) continue;
-    vistos.add(v);
-    out.push({ email: v, tipo: "adicional", orden: out.length + 1 });
-  }
-  return out;
-}
-
-async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado, plantilla = null, contactos = null }) {
-  const hoy = new Date();
-  const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
-  const contacto = /^\d{4}-\d{2}-\d{2}$/.test(String(fecha || "")) ? fecha : mas(0);
-  const cuerpo = {
-    domain,
-    email: email || "",
-    deal_stage: _estadoLabel(estado),
-    ejecutivo_name: _BOARD_EJEC[ejecutivo] || state.loginEmail,
-    fecha_contacto: contacto,
-    // Las fechas de seguimiento se calculan desde el contacto, no desde hoy: si el MB carga
-    // un prospecto contactado la semana pasada, los follow-ups tienen que salir cuando le
-    // corresponden y no cinco días después de haberlo cargado.
-    // ⚠️ Las fechas de follow-up NO se mandan: las calcula el CRM desde `fecha_contacto`,
-    // con los offsets configurables de `crm_board_cadence_steps`. Acá estaban clavadas en
-    // +5 y +10, que hoy coinciden por casualidad; el día que se cambie la cadencia, todo lo
-    // que cargue el MB seguiría con las viejas. El MB elige el estado, no la cadencia.
-    top_geo: geo || "",
-    pageviews: typeof traffic === "number" ? formatTraffic(traffic) : (traffic || ""),
-    // ⚠️ El `<select>` ofrece "Language?" (valor 5) para cuando el MB NO sabe el idioma, y el
-    // fallback lo convertía en "Ingles": la respuesta honesta terminaba siendo una afirmación
-    // falsa, y el CRM le mandaba la plantilla en inglés a un sitio francés. Ahora se manda
-    // vacío y el CRM decide — "no sé" no se puede seguir tratando como "no". Caso nº9.
-    language: _BOARD_IDIOMA[String(idioma)] || "",
-    phone: telefono || "",
-    // La plantilla del CRM con la que salió el inicial, si salió con una sin tocar. Mismo
-    // contrato que usa el agente (acordado 03/09): el CRM siembra la fila en
-    // crm_board_template_sends y su panel cuenta el inicial. `template_ref` lleva su propio
-    // id ("crm:<uuid>") para que pueda enlazarlo con la plantilla exacta.
-    ...(plantilla ? {
-      template_ref: plantilla.ref, plantilla_variant: plantilla.variant,
-      plantilla_idioma: plantilla.idioma, enviado_at: plantilla.enviado_at,
-    } : {}),
-    // ⚠️ `comments` NO lleva el pitch (Maxi 2026-09-03). Del otro lado esa celda es la NOTA
-    // CORTA del media buyer ("who is - Mica", "NO TIENE CLEVER") y `sync-toolbar` la PISA en
-    // cada push: mandar el pitch acá no era sólo ruido, borraba la nota de la persona.
-    // Medido: 77 de 199 filas tenían el pitch en vez de una nota, la más larga de 826 chars.
-    // El pitch no se pierde: queda en `toolbar_sendtrack.pitch` (4.169 de 4.169 lo tienen).
-    source: "toolbar",
-    // ⚠️ EL MAIL INICIAL YA SALIÓ DESDE ACÁ. En Analysis la toolbar OBLIGA a mandarlo por
-    // Gmail antes de dejar cargar, así que cuando el prospecto llega al CRM el primer
-    // contacto ya ocurrió. Sin avisarlo, la cadencia del board le manda un SEGUNDO mail al
-    // día siguiente — el mismo pitch, dos veces, con dos días de diferencia.
-    // La cola "Guardar para después" es la excepción: ahí a propósito NO se exige el mail,
-    // y esos SÍ tienen que recibir el inicial del CRM. Por eso el dato viaja en vez de
-    // asumirse de un lado o del otro.
-    mail_ya_enviado: mailYaEnviado === undefined ? true : !!mailYaEnviado,
-  };
-  const _cts = contactos || _contactosAdicionales();
-  if (_cts.length) cuerpo.contactos = _cts;
-  const r = await fetch(CONFIG.CRM_BOARD_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
-    body: JSON.stringify({ prospects: [cuerpo] }),
-  });
-  const j = await r.json().catch(() => null);
-  if (!r.ok || !j) throw new Error(`el CRM respondió HTTP ${r.status}`);
-  // Un `errores` con contenido es un rechazo REAL aunque el HTTP sea 200. Tratarlo como
-  // éxito dejaría al MB creyendo que cargó un prospecto que no existe.
-  if (Array.isArray(j.errores) && j.errores.length) throw new Error(j.errores[0].motivo || "rechazado por el CRM");
-  // ── LOS AVISOS DEL CRM SE VEN EN PANTALLA (2026-09-07) ────────────────────────────────
-  // Acá aparece el idioma que el CRM no reconoce (y entonces la cadencia no encuentra
-  // plantilla y el follow-up no sale), el GEO que no parece un país, una fecha ignorada o un
-  // contacto adicional que no pudo guardar. El comentario viejo decía "no frenan pero se ven"
-  // y no se veían: iban a `console.warn`, que ningún media buyer abre. El push decía
-  // "✅ Cargado" y el dato quedaba mal en silencio — el fallo silencioso que la regla de oro
-  // prohíbe. Se devuelven para que quien llama los muestre junto al resultado.
-  const _av = (j.avisos || []).filter(a => !a?.domain || String(a.domain).toLowerCase() === String(domain).toLowerCase());
-  if (_av.length) {
-    _av.forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
-    j._avisoTexto = _av.map(a => a.motivo).join(" · ");
-  }
-  return j;
-}
-
   document.getElementById("btn-guardar-cola")?.addEventListener("click", async () => {
     const btn = document.getElementById("btn-guardar-cola");
     const res = document.getElementById("push-result");
@@ -6560,6 +6097,493 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
     resultEl.textContent = "✅ Keyword database cleared";
     filterKeywords();
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// ⚠️ ESTE BLOQUE VIVÍA ADENTRO DE bindButtons() Y NADIE LO SABÍA (2026-09-08)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// `bindButtons` es una función de ~1.300 líneas cuyo cuerpo está escrito SIN indentar, así
+// que cualquier cosa que se pegue en medio parece top-level y no lo es. Acá adentro fueron
+// cayendo, desde el corte de Monday del 02/09, el emisor al CRM (`enviarAlBoard`), la
+// consulta de la ficha (`buscarEnCrm`), el veredicto (`_veredictoCrm`, `_crmBloquea`…), las
+// constantes del CRM y hasta un `document.addEventListener("DOMContentLoaded")` — que
+// registrado desde adentro de una función que corre DESPUÉS del DOMContentLoaded, no dispara
+// nunca. Los módulos son strict: una `function` declarada dentro de otra sólo existe ahí.
+//
+// Consecuencia, medida en consola por el user en la v700: `_crmBloquea is not defined` en
+// `autofillDraftOnLoad`; `runDuplicateCheck` reventaba en su primera línea (`_pintarEsperaCrm`)
+// y el recuadro del CRM se quedaba con el "Checking..." del HTML; `resetAnalysisUI` asignaba
+// `_crmVuelo` (una `let` de adentro) y explotaba antes de relanzar el pipeline, así que cambiar
+// de URL no refrescaba; y `validateProspect` (Prospects) no encontraba `enviarAlBoard`. Todo
+// desde el 02/09, en todas las versiones. Se le echó la culpa al timeout (07/09) y a un
+// pipeline duplicado (08/09): los dos existían, ninguno era la causa.
+//
+// Desde los botones (que sí están adentro de bindButtons) todo esto funcionaba, y por eso el
+// push manual andaba mientras el cartel automático estaba muerto.
+//
+// Hay un test que lo impide de acá en más: `tests/alcance-popup.test.js` parsea popup.js y
+// falla si algo declarado adentro de una función se usa desde afuera.
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// EL EMISOR AL CRM BOARD — reemplaza a Monday (Maxi 2026-09-02, corte pedido por el user)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Monday quedó obsoleto: sus 10.564 items y los 18 tableros de negociaciones ya están
+// migrados, y el user apagó sus 101 automatizaciones. Los botones conservan el nombre que
+// los MB conocen, pero escriben acá.
+//
+// El board es IDEMPOTENTE por dominio (verificado: se reenvió el mismo con www. y siguieron
+// 2 filas, no 3). Por eso NO hay rama "crear vs actualizar" como en Monday: el mismo POST
+// sirve para las dos cosas y desaparece toda la lógica de mondayItemId, que era donde se
+// perdían los pushes cuando el id no estaba.
+// Los cinco índices de Monday siguen valiendo; el resto del <select> va con código ISO
+// (2026-09-04). Las etiquetas son EXACTAMENTE las de `crm_board_templates.idioma`.
+const _BOARD_IDIOMA = {
+  0: "Ingles", 1: "Español", 2: "Italiano", 3: "Portugues", 6: "Arabe",
+  en: "Ingles", es: "Español", it: "Italiano", pt: "Portugues", ar: "Arabe",
+  de: "Aleman", fr: "Frances", pl: "Polaco", ja: "Japones", ko: "Coreano", nl: "Holandes",
+  tr: "Turco", el: "Griego", cs: "Checo", hu: "Hungaro", ro: "Rumano", sv: "Sueco",
+  hr: "Croata", uk: "Ucraniano", id: "Indonesio", vi: "Vietnamita", th: "Tailandes", zh: "Chino",
+};
+const _BOARD_EJEC   = { Max: "mgargiulo@adeqmedia.com", Agus: "sales@adeqmedia.com", Diego: "dhorovitz@adeqmedia.com" };
+// El board pide la ETIQUETA del estado; el formulario lo guarda como ÍNDICE.
+//
+// ⚠️ La etiqueta se lee del PROPIO <select>, no de una tabla aparte. Tenerla duplicada ya
+// falló: la copié de MONDAY_STATES, que estaba desactualizada — decía que el índice 4 era
+// "Rebotado" y el 7 "Avanzado", cuando el board real dice "Propuesta Vigente (T)" y
+// "PAUSADO". Y el 4 es el valor por DEFECTO del formulario, así que todo push manual entraba
+// al CRM como un rebote: un prospecto recién contactado quedaba marcado como dirección
+// muerta y encima "Rebotado" no bloquea el re-contacto, con lo cual el agente le volvía a
+// escribir. Leyendo del select es imposible que diverjan: lo que el MB ve es lo que se manda.
+function _estadoLabel(idx) {
+  const opt = document.querySelector(`#form-estado option[value="${String(idx)}"]`);
+  const txt = opt?.textContent?.trim();
+  if (txt) return txt;
+  // Sin opción que coincida NO se inventa un estado: se manda el default seguro del board.
+  // Un estado equivocado es peor que el default, porque decide si se le vuelve a escribir.
+  // ⚠️ El fallback tiene que ser una etiqueta que el CRM ACEPTE. Era "Propuesta Vigente (T)",
+  // que dejó de existir: el CRM la degradaba con un aviso que nadie ve.
+  console.warn("estado sin etiqueta en el formulario:", idx);
+  return "Propuesta Vigente";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// ¿SE PUEDE PROSPECTAR ESTA WEB? — el veredicto, dicho con todas las letras
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Regla del user (2026-09-07), textual:
+//   · no está en el CRM            → "Web prospectable. Nunca fue contactada."
+//   · Ciclo Finalizado             → "Web prospectable. Ya tiene ciclo finalizado."
+//   · Pausado                      → "Web prospectable. Cliente Antiguo Pausado."
+//   · Propuesta Vigente / En Negociacion / Personalizado → NO deja prospectar. "Propuesta en curso."
+//   · Live                         → NO deja prospectar. "Cliente activo."
+//
+// Antes esto no se decía en ningún lado: el recuadro mostraba "⚠️ YA ESTÁ EN ADEQ · <estado>"
+// y el MB tenía que saberse de memoria cuáles de los cinco estados permiten volver a escribir.
+// El veredicto ahora es la primera línea del recuadro y, cuando dice que no, el botón de
+// cargar y el de mandar el mail se niegan (no alcanza con avisar: el que apura, apura).
+//
+// ⚠️ MANDA LA COLUMNA `estado` DEL CRM, Y NADA MÁS (regla del user, 07/09: *"vos tenés que
+// matchear con el CRM por la columna estado, no sacar conclusiones"*). La primera versión
+// cruzaba además la lista `/dominios-activos` para "tapar huecos", y de ahí salió una
+// advertencia MÍA que era falsa: dije que los 62 `Pausado` facturaban porque están en
+// `crm_board_clientes_activos`, sin mirar POR QUÉ están. Medido después: de esos 62, **0
+// facturan** (54 "ex cliente: en la base y sin revenue", 8 marcados activos pero sin revenue
+// en 90 días), y los 45 `Live` facturan los 45. O sea: el CRM ya dice todo lo que hace falta
+// en una sola columna, y el que sacaba conclusiones era yo. Sin el cruce, además, el recuadro
+// contesta al instante en vez de esperar 2,4 s.
+const _CRM_LIVE_RE    = /^\s*live\s*$/i;
+const _CRM_EN_CURSO_RE = /propuesta\s*vigente|en\s*negociaci|personalizado/i;
+const _CRM_PAUSADO_RE = /pausad/i;
+const _CRM_CERRADO_RE = /ciclo\s*finalizado/i;
+
+function _veredictoCrm(dup) {
+  // "No pude preguntar" NUNCA es "está libre": es el error caro, y ya nos costó una vez.
+  if (!dup || dup.indeterminado) {
+    return { ok: false, duda: true, titulo: "No pude consultar el CRM",
+             detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
+  }
+  if (!dup.found) {
+    return { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
+  }
+  const estado = String(dup.status || "").trim();
+  // "Web NO prospectable" y no "No prospectable": el MB lee el recuadro de reojo mientras
+  // navega, y las dos respuestas tienen que empezar igual para que la diferencia salte a la
+  // vista en la misma palabra (pedido del user, 08/09: *"arriba en CRM debería decir web no
+  // prospectable"* / *"el MB debe saber enseguida el status de la web que está viendo"*).
+  if (_CRM_LIVE_RE.test(estado)) {
+    return { ok: false, titulo: "Web NO prospectable", detalle: "Cliente activo.", clase: "crm-no" };
+  }
+  if (_CRM_EN_CURSO_RE.test(estado)) {
+    return { ok: false, titulo: "Web NO prospectable", detalle: `Propuesta en curso (${estado}).`, clase: "crm-no" };
+  }
+  if (_CRM_PAUSADO_RE.test(estado)) {
+    return { ok: true, titulo: "Web prospectable", detalle: "Cliente Antiguo Pausado.", clase: "crm-si" };
+  }
+  if (_CRM_CERRADO_RE.test(estado)) {
+    return { ok: true, titulo: "Web prospectable", detalle: "Ya tiene ciclo finalizado.", clase: "crm-si" };
+  }
+  // Un estado que no conocemos no se declara prospectable: el vocabulario del CRM ya cambió
+  // tres veces en un día y afirmar de más acá significa un mail a un cliente.
+  return { ok: false, duda: true, titulo: "Revisalo a mano",
+           detalle: `Estado "${estado || "sin estado"}": no lo reconozco, no puedo decir si se puede escribir.`, clase: "crm-duda" };
+}
+
+// Mientras se pregunta. El "Checking..." del HTML no distinguía "estoy preguntando" de
+// "me colgué antes de preguntar": con este cartel, si el recuadro no cambia, ya se sabe que
+// la consulta arrancó.
+function _pintarEsperaCrm() {
+  const el = document.getElementById("duplicate-result");
+  if (!el) return;
+  if (state.crmVeredicto && !state.crmVeredicto.provisional) return;  // ya hay una respuesta real
+  el.className = "status-badge loading";
+  el.textContent = "⏳ Consultando ADEQ…";
+}
+
+function _pintarVeredictoCrm(v, dup) {
+  const el = document.getElementById("duplicate-result");
+  if (!el) return;
+  const ctx = [];
+  if (dup?.found) {
+    if (dup.ejecutivo) ctx.push(esc(dup.ejecutivo.split("@")[0]));
+    if (dup.status)    ctx.push(esc(dup.status));
+    if (dup.fecha)     ctx.push(`último contacto ${esc(dup.fecha)}`);
+    if (dup.board)     ctx.push(esc(dup.board));
+  }
+  // Cuánto tardó. Es la prueba en pantalla de lo que el user pidió medir ("máximo 2-3
+  // segundos"): si algún día vuelve a arrastrarse, se ve en el recuadro y no hay que abrir
+  // la consola para enterarse.
+  if (typeof dup?.ms === "number") ctx.push(`ADEQ en ${(dup.ms / 1000).toFixed(1)}s`);
+  el.className = `crm-veredicto ${v.clase}`;
+  el.innerHTML =
+    `<div class="crm-veredicto-t">${v.ok ? "✅" : v.duda ? "⚠️" : "⛔"} ${esc(v.titulo)}</div>` +
+    `<div class="crm-veredicto-d">${esc(v.detalle)}</div>` +
+    (ctx.length ? `<div class="crm-veredicto-ctx">${ctx.join(" · ")}</div>` : "") +
+    // Si no se pudo preguntar, el MB tiene que poder reintentar sin cerrar y abrir la toolbar.
+    (v.duda && !dup?.found ? `<button type="button" id="btn-crm-reintentar" class="crm-reintentar">🔄 Reintentar</button>` : "");
+  document.getElementById("btn-crm-reintentar")?.addEventListener("click", () => { _reintentarVeredictoCrm(); });
+}
+
+// Vuelve a preguntar, salteando la consulta que ya falló.
+async function _reintentarVeredictoCrm() {
+  const dom = state.domain;
+  if (!dom) return;
+  state.crmVeredicto = null;
+  _pintarEsperaCrm();
+  const r = await _crmConsultar(dom, { forzar: true });
+  if (state.domain !== dom) return;
+  state.duplicate = r;
+  const v = _veredictoCrm(r);
+  state.crmVeredicto = v;
+  _pintarVeredictoCrm(v, r);
+  _aplicarBloqueoCrm(v);
+}
+
+// ¿El CRM ya dijo que no? (Un veredicto con duda NO bloquea: avisa.)
+function _crmBloquea() {
+  const v = state.crmVeredicto;
+  return !!v && !v.ok && !v.duda;
+}
+
+// El mensaje único cuando algo se niega a seguir porque el CRM dice que no.
+function _motivoBloqueoCrm() {
+  const v = state.crmVeredicto;
+  if (!v || v.ok) return "";
+  return `⛔ ${v.titulo}: ${v.detalle}${v.duda ? "" : " No se le escribe ni se carga."}`;
+}
+
+// ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
+// Devuelve la MISMA forma que devolvía aquél para no tocar a los seis lugares que la
+// consumen — lo único nuevo es `descansando`, que Monday no sabía: un negocio cerrado hace
+// menos de 60 días existe pero NO hay que escribirle todavía.
+// ── LA CONSULTA TIENE RELOJ (2026-09-07, pedido del user) ────────────────────────────────
+// *"Nunca arroja resultado… máximo 2-3 segundos. Tiene que filtrar directo la url en prospects
+// ADEQ y ver la columna estado, nada más."* Del lado del servidor eso ya es lo que pasa: un
+// `.eq('domain', …)` con índice sobre `crm_board_prospects`, medido en 0,5-0,75 s. El agujero
+// estaba acá: `fetch` **sin timeout**. Un pedido que se cuelga (wifi que se cae, service worker
+// dormido, Vercel frío) no rechaza NUNCA, así que la promesa no se resolvía y el recuadro se
+// quedaba con el "Checking..." del HTML para siempre — sin error, sin aviso, sin manera de
+// reintentar. Es el mismo patrón de "no sé tratado como no": acá era "no sé" tratado como
+// "seguí esperando".
+// Ahora: 2,5 s por intento, dos intentos, y a los ~5 s como mucho hay un veredicto en pantalla
+// (aunque sea "no pude preguntar"). Se devuelve `ms` para poder mostrar cuánto tardó.
+// Medido contra producción el 08/09: **0,40-0,66 s en caliente**, y **3,15 s en el primer
+// pedido del día**, cuando Vercel tiene que levantar la función. Con el techo en 2,5 s ese
+// primer pedido —el que hace el MB al abrir la toolbar por la mañana, o sea el que más
+// importa— se abortaba SIEMPRE, y el veredicto salía por el segundo intento o no salía. El
+// techo tiene que dejar pasar el arranque en frío: 4 s cubre 3,15 s con margen y sigue muy
+// por debajo de lo que el user pidió sentir (*"el MB debe saber enseguida"*), porque en el
+// 99% de las aperturas contesta en medio segundo y no se espera nada.
+const _CRM_FICHA_TIMEOUT_MS = 4000;
+
+// ── EL DOMINIO QUE SE PREGUNTA ES EL RAÍZ (2026-09-08, regla del user) ───────────────────
+// *"Omití el www, el http y todo eso: que sea dominio real, ole.com y listo. En el CRM están
+// todos sin www ni https."*
+//
+// `extractDomain` ya saca protocolo, `www.` y la ruta, y el endpoint tolera esas tres cosas.
+// Lo que NO tolera —lo medí el 08/09— son los subdominios: `m.elpais.com` devuelve
+// `found:false` mientras `elpais.com` devuelve "Ciclo Finalizado". Y ese fallo cae para el
+// lado peligroso: "no encontrado" se pinta como **"Web prospectable"**, o sea la toolbar
+// invita a escribirle a un cliente activo porque el MB entró por la versión móvil o por una
+// sección (`deportes.ole.com`). Es el error caro, y silencioso.
+//
+// Se resuelve sin lista de sufijos: se pregunta el host tal cual —por si el CRM tuviera una
+// fila con subdominio— y, si no aparece, se repregunta por el raíz. Dos labels, salvo que los
+// dos últimos formen un sufijo compuesto (`com.ar`, `co.uk`, `gob.mx`), donde van tres.
+// El worker tiene la lista completa (`MULTI_PART_TLDS`, 200 entradas) pero vive en otro
+// bundle: duplicarla acá sería crear una segunda lista para que se desincronice de la primera.
+// Esta heurística cubre los sufijos compuestos reales; y si fallara, el peor caso es preguntar
+// un dominio que no existe y recibir "no encontrado", nunca un match equivocado.
+function _dominioRaiz(host) {
+  const p = String(host || "").toLowerCase().replace(/\.+$/, "").split(".").filter(Boolean);
+  if (p.length <= 2) return p.join(".");
+  const compuesto = /^(com|co|org|net|gov|gob|edu|ac|mil|nom|web|ind)$/.test(p[p.length - 2])
+                 && p[p.length - 1].length === 2;
+  return p.slice(compuesto ? -3 : -2).join(".");
+}
+
+async function buscarEnCrm(domain) {
+  const t0 = Date.now();
+  // El host como vino y, si tiene subdominio, el raíz. `Set` para no preguntar dos veces lo
+  // mismo, que es el caso normal (un dominio sin subdominio ya ES su raíz).
+  const candidatos = [...new Set([String(domain || "").toLowerCase().replace(/\.+$/, ""), _dominioRaiz(domain)].filter(Boolean))];
+  let ultimo = "";
+  for (const dom of candidatos) {
+  for (let intento = 1; intento <= 2; intento++) {
+    try {
+      const r = await fetch(
+        `${crmUrl("/ficha")}?domain=${encodeURIComponent(dom)}`,
+        {
+          headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+          cache: "no-store",
+          signal: AbortSignal.timeout(_CRM_FICHA_TIMEOUT_MS),
+        },
+      );
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      const ms = Date.now() - t0;
+      // "No está" con este candidato no es la respuesta final: puede estar con el raíz.
+      // Se corta el bucle de reintentos y se prueba el siguiente.
+      if (!j.found) { ultimo = "no está en el CRM"; break; }
+      return {
+        found: true, itemId: null, ms, dominioConsultado: dom,
+        status: j.estado || "", ejecutivo: j.ejecutivo || "", trafico: j.pageviews || "",
+        email: j.email || "", geo: j.top_geo || "", fecha: j.fecha_contacto || "",
+        idioma: j.idioma || "", board: j.board || "",
+        // El endpoint ya mandaba estos dos y nadie los leía. Sirven para no autocompletar el
+        // formulario con una dirección que se sabe muerta: si rebotó, vale la del scraper.
+        rebotado: !!(j.email_rebotado || j.rebotado_at), reboteMotivo: j.rebote_motivo || "",
+        descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0,
+      };
+    } catch (e) {
+      // `AbortSignal.timeout` tira TimeoutError; se traduce para que el cartel diga algo que
+      // el MB entienda en vez de un nombre de excepción.
+      ultimo = e?.name === "TimeoutError" ? `no contestó en ${_CRM_FICHA_TIMEOUT_MS / 1000}s` : (e?.message || String(e));
+      console.warn(`buscarEnCrm ${dom} (intento ${intento}):`, ultimo);
+    }
+  }
+  // Si el corte fue por un error de red y no por "no está", no se sigue probando candidatos:
+  // el problema no es el dominio, y preguntar de nuevo sólo suma segundos al cartel.
+  if (ultimo && ultimo !== "no está en el CRM") break;
+  }
+  // Todos los candidatos contestaron y ninguno está: ésa es una respuesta legítima del CRM
+  // —la web nunca fue contactada— y tiene que leerse como "Web prospectable". Mezclarla con
+  // el caso de abajo convertiría cada sitio nuevo en un "no pude consultar", que es la alarma
+  // falsa que hace que el MB deje de mirar el cartel.
+  if (ultimo === "no está en el CRM") return { found: false, ms: Date.now() - t0 };
+  // ⚠️ Y al revés: NO se devuelve `{found:false}` ante un error. Eso le diría al MB "está
+  // libre, dale" justo cuando no pudimos verificar, que es el error caro. Se marca
+  // `indeterminado` y el cartel lo dice.
+  return { found: false, indeterminado: true, motivo: ultimo, ms: Date.now() - t0 };
+}
+
+// Una sola consulta por dominio, compartida por el chequeo temprano y por la pipeline: sin
+// esto el veredicto se pediría dos veces al abrir la toolbar.
+let _crmVuelo = null;   // { domain, promesa }
+function _crmConsultar(domain, { forzar = false } = {}) {
+  if (!forzar && _crmVuelo && _crmVuelo.domain === domain) return _crmVuelo.promesa;
+  const promesa = buscarEnCrm(domain);
+  _crmVuelo = { domain, promesa };
+  return promesa;
+}
+
+// ── EL VEREDICTO ARRANCA PRIMERO Y POR SU CUENTA (2026-09-07) ────────────────────────────
+// Va en un listener PROPIO de DOMContentLoaded, no adentro del grande. Dos razones:
+//  1. La ficha no necesita el JWT —se autentica con el `x-toolbar-secret` bakeado—, así que
+//     no tiene por qué hacer cola detrás del refresh de token, las keys y el resto del arranque.
+//  2. Si el handler grande se cae en cualquier línea previa a la pipeline, ese `throw` se lleva
+//     puesto TODO lo que venía después, incluido el chequeo del CRM, y el recuadro se queda con
+//     el "Checking..." del HTML sin que nadie se entere. Dos listeners son independientes: uno
+//     no puede matar al otro.
+// La consulta se comparte con `runDuplicateCheck` por `_crmConsultar`, así que sigue siendo
+// UN pedido.
+let _crmWatchdog = null;
+// Techo duro: 2 intentos × 4 s + margen de red. Si a los 9 s no hay veredicto, algo se colgó
+// en un lugar que no previmos y el MB tiene que enterarse, no seguir mirando un reloj.
+// ⚠️ Este número tiene que quedar POR ENCIMA de 2 × `_CRM_FICHA_TIMEOUT_MS`. Si queda por
+// debajo, el watchdog dispara mientras el segundo intento todavía está en vuelo y el MB ve
+// "no pude consultar" sobre una consulta que iba a contestar bien.
+const _CRM_WATCHDOG_MS = 2 * _CRM_FICHA_TIMEOUT_MS + 1000;
+function _armarWatchdogCrm() {
+  clearTimeout(_crmWatchdog);
+  _crmWatchdog = setTimeout(() => {
+    if (state.crmVeredicto) return;
+    const v = { ok: false, duda: true, provisional: true, titulo: "No pude consultar el CRM",
+                detalle: `La consulta no volvió en ${_CRM_WATCHDOG_MS / 1000} segundos. Verificá a mano en ADEQ o reintentá.`,
+                clase: "crm-duda" };
+    state.crmVeredicto = v;
+    _pintarVeredictoCrm(v, null);
+    _aplicarBloqueoCrm(v);
+  }, _CRM_WATCHDOG_MS);
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  // ⚠️ El cartel y el watchdog van ANTES del primer `await`, no después. Con ellos abajo de
+  // los dos `await` de arriba, cualquier salida temprana —o un `chrome.storage` lento— dejaba
+  // el recuadro con el "Checking..." del HTML, que es texto muerto: no lo pinta nadie, no
+  // vence nunca y no distingue "estoy preguntando" de "me colgué antes de preguntar".
+  // El MB tiene que saber el estado de la web enseguida (regla del user, 08/09), y "todavía
+  // estoy preguntando" también es saberlo.
+  _pintarEsperaCrm();
+  _armarWatchdogCrm();
+  try {
+    const { auth } = await chrome.storage.local.get("auth");
+    if (!auth?.loggedIn) { clearTimeout(_crmWatchdog); return; }   // con el login en pantalla la tarjeta ni se ve
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const dom = tab?.url && /^https?:/i.test(tab.url) ? extractDomain(tab.url) : "";
+    if (!dom) {
+      // Ni error ni espera eterna: en una pestaña que no es una web, se dice.
+      clearTimeout(_crmWatchdog);
+      const v = { ok: false, duda: true, titulo: "Sin web que consultar",
+                  detalle: "Abrí la pestaña de un sitio para ver su estado en ADEQ.", clase: "crm-duda" };
+      state.crmVeredicto = v;
+      _pintarVeredictoCrm(v, null);
+      return;
+    }
+    const r = await _crmConsultar(dom);
+    // Si el MB ya navegó a otra web, o la pipeline pintó antes, este resultado no manda.
+    // El cartel del watchdog sí se pisa: es un "todavía no sé", no una respuesta.
+    if (state.domain && state.domain !== dom) return;
+    if (state.crmVeredicto && !state.crmVeredicto.provisional) return;
+    clearTimeout(_crmWatchdog);
+    state.duplicate = r;
+    const v = _veredictoCrm(r);
+    state.crmVeredicto = v;
+    _pintarVeredictoCrm(v, r);
+    _aplicarBloqueoCrm(v);
+  } catch (e) {
+    console.warn("[CRM temprano]", e?.message || e);
+  }
+});
+
+// Qué plantilla del CRM salió en el mail, si fue una sin tocar. Con el pitch bloqueado es
+// igual por construcción; si el MB apretó Limpiar y escribió lo suyo, no hay plantilla.
+function _plantillaEnviadaAlCrm(pitchEnviado) {
+  const t = state.pitchTemplate;
+  if (!t || t.origen !== "crm") return null;
+  if (String(pitchEnviado || "").trim() !== String(t.body || "").trim()) return null;
+  return { ref: `crm:${t.id}`, variant: t.variant, idioma: t.lang, enviado_at: new Date().toISOString() };
+}
+
+// ── LOS CONTACTOS ADICIONALES VIAJAN CON EL PROSPECTO (2026-09-07) ──────────────────────
+// El CRM tiene desde hoy `crm_board_contactos` (commit 775c9dd de su lado) y acepta la lista
+// en el mismo push. Es lo que arregla el agujero más caro que teníamos: `scan-replies` matchea
+// por dirección, y como los adicionales no estaban en la ficha, **sus respuestas quedaban
+// huérfanas** — justo los que mejor responden (6,6% real sobre 499 envíos en 90 días, la mejor
+// de todas las fuentes).
+// Van TODOS en el push, con su hora — regla del user: *"que al momento del push se encolen
+// todos, a pesar de que nuestro envío tarde 3 minutos, para evitar errores"*. Si esto dependiera
+// de que el worker informe cada uno al despacharlo, un worker caído dejaría al CRM sin enterarse
+// nunca. `enviado_at` es la hora PROGRAMADA (+1/+2/+3 min): está a minutos de la real, y el CRM
+// la necesita para el caso del rebote —reenganchar la cadencia desde que esa persona recibió el
+// inicial y no desde hoy—. El worker igual confirma la hora exacta cuando lo manda; el endpoint
+// es idempotente. Si el mail todavía no se envió, se mandan sin hora: no se afirma lo que no pasó.
+function _contactosAdicionales() {
+  const enc = state.adicionalesEncolados;
+  if (enc && enc.domain === state.domain && enc.lista?.length) return enc.lista;
+  const ids = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
+  const vistos = new Set();
+  const out = [];
+  for (const id of ids) {
+    const v = (document.getElementById(id)?.value || "").trim().toLowerCase();
+    if (!v || !v.includes("@") || vistos.has(v)) continue;
+    vistos.add(v);
+    out.push({ email: v, tipo: "adicional", orden: out.length + 1 });
+  }
+  return out;
+}
+
+async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado, plantilla = null, contactos = null }) {
+  const hoy = new Date();
+  const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
+  const contacto = /^\d{4}-\d{2}-\d{2}$/.test(String(fecha || "")) ? fecha : mas(0);
+  const cuerpo = {
+    domain,
+    email: email || "",
+    deal_stage: _estadoLabel(estado),
+    ejecutivo_name: _BOARD_EJEC[ejecutivo] || state.loginEmail,
+    fecha_contacto: contacto,
+    // Las fechas de seguimiento se calculan desde el contacto, no desde hoy: si el MB carga
+    // un prospecto contactado la semana pasada, los follow-ups tienen que salir cuando le
+    // corresponden y no cinco días después de haberlo cargado.
+    // ⚠️ Las fechas de follow-up NO se mandan: las calcula el CRM desde `fecha_contacto`,
+    // con los offsets configurables de `crm_board_cadence_steps`. Acá estaban clavadas en
+    // +5 y +10, que hoy coinciden por casualidad; el día que se cambie la cadencia, todo lo
+    // que cargue el MB seguiría con las viejas. El MB elige el estado, no la cadencia.
+    top_geo: geo || "",
+    pageviews: typeof traffic === "number" ? formatTraffic(traffic) : (traffic || ""),
+    // ⚠️ El `<select>` ofrece "Language?" (valor 5) para cuando el MB NO sabe el idioma, y el
+    // fallback lo convertía en "Ingles": la respuesta honesta terminaba siendo una afirmación
+    // falsa, y el CRM le mandaba la plantilla en inglés a un sitio francés. Ahora se manda
+    // vacío y el CRM decide — "no sé" no se puede seguir tratando como "no". Caso nº9.
+    language: _BOARD_IDIOMA[String(idioma)] || "",
+    phone: telefono || "",
+    // La plantilla del CRM con la que salió el inicial, si salió con una sin tocar. Mismo
+    // contrato que usa el agente (acordado 03/09): el CRM siembra la fila en
+    // crm_board_template_sends y su panel cuenta el inicial. `template_ref` lleva su propio
+    // id ("crm:<uuid>") para que pueda enlazarlo con la plantilla exacta.
+    ...(plantilla ? {
+      template_ref: plantilla.ref, plantilla_variant: plantilla.variant,
+      plantilla_idioma: plantilla.idioma, enviado_at: plantilla.enviado_at,
+    } : {}),
+    // ⚠️ `comments` NO lleva el pitch (Maxi 2026-09-03). Del otro lado esa celda es la NOTA
+    // CORTA del media buyer ("who is - Mica", "NO TIENE CLEVER") y `sync-toolbar` la PISA en
+    // cada push: mandar el pitch acá no era sólo ruido, borraba la nota de la persona.
+    // Medido: 77 de 199 filas tenían el pitch en vez de una nota, la más larga de 826 chars.
+    // El pitch no se pierde: queda en `toolbar_sendtrack.pitch` (4.169 de 4.169 lo tienen).
+    source: "toolbar",
+    // ⚠️ EL MAIL INICIAL YA SALIÓ DESDE ACÁ. En Analysis la toolbar OBLIGA a mandarlo por
+    // Gmail antes de dejar cargar, así que cuando el prospecto llega al CRM el primer
+    // contacto ya ocurrió. Sin avisarlo, la cadencia del board le manda un SEGUNDO mail al
+    // día siguiente — el mismo pitch, dos veces, con dos días de diferencia.
+    // La cola "Guardar para después" es la excepción: ahí a propósito NO se exige el mail,
+    // y esos SÍ tienen que recibir el inicial del CRM. Por eso el dato viaja en vez de
+    // asumirse de un lado o del otro.
+    mail_ya_enviado: mailYaEnviado === undefined ? true : !!mailYaEnviado,
+  };
+  const _cts = contactos || _contactosAdicionales();
+  if (_cts.length) cuerpo.contactos = _cts;
+  const r = await fetch(CONFIG.CRM_BOARD_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+    body: JSON.stringify({ prospects: [cuerpo] }),
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !j) throw new Error(`el CRM respondió HTTP ${r.status}`);
+  // Un `errores` con contenido es un rechazo REAL aunque el HTTP sea 200. Tratarlo como
+  // éxito dejaría al MB creyendo que cargó un prospecto que no existe.
+  if (Array.isArray(j.errores) && j.errores.length) throw new Error(j.errores[0].motivo || "rechazado por el CRM");
+  // ── LOS AVISOS DEL CRM SE VEN EN PANTALLA (2026-09-07) ────────────────────────────────
+  // Acá aparece el idioma que el CRM no reconoce (y entonces la cadencia no encuentra
+  // plantilla y el follow-up no sale), el GEO que no parece un país, una fecha ignorada o un
+  // contacto adicional que no pudo guardar. El comentario viejo decía "no frenan pero se ven"
+  // y no se veían: iban a `console.warn`, que ningún media buyer abre. El push decía
+  // "✅ Cargado" y el dato quedaba mal en silencio — el fallo silencioso que la regla de oro
+  // prohíbe. Se devuelven para que quien llama los muestre junto al resultado.
+  const _av = (j.avisos || []).filter(a => !a?.domain || String(a.domain).toLowerCase() === String(domain).toLowerCase());
+  if (_av.length) {
+    _av.forEach(a => console.warn("CRM aviso:", a.domain, a.motivo));
+    j._avisoTexto = _av.map(a => a.motivo).join(" · ");
+  }
+  return j;
 }
 
 // ============================================================
