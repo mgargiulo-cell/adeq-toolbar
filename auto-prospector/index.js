@@ -12435,11 +12435,29 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   // (gobierno, universidad, muerto, acortador, CDN) y el techo de 40M.
   const _pasaPuertaGrande = _apruebaPorAdsTxtYTrafico(adsTxt, traffic);
 
+  // ── "NO PUDE LEER EL ads.txt" NO ES "NO TIENE" (2026-09-08, medido) ────────────────────
+  // Los vetos blandos de abajo (rubro por URL, tipo de la IA, categoría de SimilarWeb, título)
+  // sólo matan cuando la puerta grande está cerrada. Pero la puerta también está cerrada cuando
+  // el ads.txt quedó en "unknown" —Cloudflare 403, timeout, encoding— y ahí el veto blando se
+  // volvía DEFINITIVO (`skipped`, un estado que nadie vuelve a mirar). Medido el 08/09 sobre 210
+  // rechazados del CRM: fxstreet.com (601 líneas de ads.txt), sparknotes.com (95), mspoweruser.com
+  // (71) quedaron afuera como "finanzas", "educación" y "piratería" con un ads.txt de publisher
+  // que hoy se lee perfecto. Un veto blando sobre un dato que no tenemos es una adivinanza:
+  // se reintenta (next_day, cap de 30 días por caducarColaVieja), no se descarta.
+  const _adsDesconocido = adsTxt?.state === "unknown";
+  const _reintentarPorAdsDesconocido = (motivo) => ({
+    ok: false, retry: true, score: 0,
+    reason: `ads_txt_no_verificable_y_rubro_dudoso:${motivo}`,
+    señales: [`el rubro dice "${motivo}" pero el ads.txt no se pudo leer (${adsTxt?.why || "unknown"}): se reintenta, no se descarta`],
+  });
+
   // ── VETOS DUROS: ninguna suma los compensa ──
   if (urlVerdict && !urlVerdict.ok) {
     // Con ads.txt + tráfico, solo los rechazos ESTRUCTURALES siguen matando.
     const _esEstructural = _VETO_ESTRUCTURAL.test(String(urlVerdict.reason || ""));
-    if (_esEstructural || !_pasaPuertaGrande) {
+    if (_esEstructural) return { ok: false, score: -999, reason: urlVerdict.reason, señales: [urlVerdict.reason] };
+    if (!_pasaPuertaGrande) {
+      if (_adsDesconocido) return _reintentarPorAdsDesconocido(urlVerdict.reason);
       return { ok: false, score: -999, reason: urlVerdict.reason, señales: [urlVerdict.reason] };
     }
     señales.push(`rubro "${urlVerdict.reason}" perdonado: tiene ads.txt y tráfico`);
@@ -12459,25 +12477,43 @@ function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory
   // fuerte (schema de entidad, título de tienda, turnos) veta siempre; lo que sale de contar
   // palabras o de detectar un carrito sigue perdonado, como hasta hoy. Medido: 0 falsos
   // negativos sobre 687 publishers reales con el código exacto (ver nonPublisherFuerte).
-  if (pageContent?.nonPublisherType && (!_pasaPuertaGrande || pageContent.nonPublisherFuerte)) {
+  //
+  // ── …SALVO QUE EL ads.txt SEA DE PUBLISHER GRANDE (2026-09-08, medido) ────────────────
+  // El marcado fuerte se disparó sobre medios reales: nordest24.it (diario, schema
+  // NewsMediaOrganization, 1.159 líneas / 190 exchanges) salió como "saas"; psvfans.nl y
+  // vrouwenvoetbalnieuws.nl (60 exchanges cada uno) como "service". Un hospital o una tienda con
+  // ads.txt tiene 1-5 sistemas —el que le puso la agencia—, nunca 15+ exchanges: eso es un
+  // publisher con equipo comercial, y lo dice el propio archivo. Sobre los 234 clientes reales
+  // medidos, el 75% tiene ≥10 líneas; sobre los rechazados, el 10% — y casi todos esos 10% son
+  // medios mal clasificados. El umbral de 15 es el mismo que ya vale +45 puntos más abajo.
+  const _adsDePublisherGrande = adsTxt?.state === "yes" && Number(adsTxt.systems || 0) >= 15;
+  if (pageContent?.nonPublisherType && (!_pasaPuertaGrande || (pageContent.nonPublisherFuerte && !_adsDePublisherGrande))) {
+    if (!_pasaPuertaGrande && _adsDesconocido && !pageContent.nonPublisherFuerte) return _reintentarPorAdsDesconocido(`nonpub_${pageContent.nonPublisherType}`);
     const _perdonable = _pasaPuertaGrande ? " (ads.txt y tráfico no lo salvan: es marcado del propio sitio)" : "";
     return { ok: false, score: -999, reason: `nonpub_${pageContent.nonPublisherType}`, señales: [`estructural: ${pageContent.nonPublisherType}${_perdonable}`] };
   }
+  if (pageContent?.nonPublisherType && pageContent.nonPublisherFuerte && _adsDePublisherGrande) {
+    señales.push(`marcado "${pageContent.nonPublisherType}" perdonado: ads.txt de publisher grande (${adsTxt.systems} exchanges)`);
+  }
   if (haikuType && haikuType !== "publisher" && haikuType !== "other" && !_pasaPuertaGrande) {
+    if (_adsDesconocido) return _reintentarPorAdsDesconocido(`haiku_${haikuType}`);
     return { ok: false, score: -999, reason: `haiku_${haikuType}`, señales: [`IA: ${haikuType}`] };
   }
   // La categoría de SimilarWeb ya no veta por sí sola si hay ads.txt y tráfico: un
   // sitio de loterías o de finanzas que vende display es un cliente igual.
   if (_categoriaNoPublisher(swCategory) && !_pasaPuertaGrande) {
+    if (_adsDesconocido) return _reintentarPorAdsDesconocido(`categoria:${String(swCategory).slice(0, 30)}`);
     return { ok: false, score: -999, reason: `categoria_no_publisher:${String(swCategory).slice(0, 40)}`, señales: [`SimilarWeb: ${swCategory}`] };
   }
-  // Este se queda tal cual: la IA no lo reconoce como medio Y NO hay ads.txt. Sin
-  // ads.txt no hay puerta grande posible, así que la condición ya lo cubre.
+  // La IA no lo reconoce como medio Y NO hay ads.txt confirmado. Si el ads.txt directamente no
+  // se pudo leer, es la misma duda de arriba: se reintenta.
   if (haikuType === "other" && adsTxt?.state !== "yes") {
+    if (_adsDesconocido) return _reintentarPorAdsDesconocido("ia_other");
     return { ok: false, score: -999, reason: "ia_other_sin_ads_txt", señales: ["la IA no lo reconoce como medio y no tiene ads.txt"] };
   }
   const title = pageContent?.title || "";
   if (title && NON_PUBLISHER_TITLE_RE.test(title) && !_pasaPuertaGrande) {
+    if (_adsDesconocido) return _reintentarPorAdsDesconocido(`title:${title.slice(0, 30)}`);
     return { ok: false, score: -999, reason: `title_nonpub:"${title.slice(0, 40)}"`, señales: ["título de empresa/SaaS"] };
   }
 
