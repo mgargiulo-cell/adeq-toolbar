@@ -27,7 +27,12 @@ const ESTILO_PITCH = Object.freeze({ tone: "informal", length: "short", focus: "
 // `prensa@` valía 115 en el worker y era genérico acá; `dpo@`/`privacy@` eran "persona" acá y
 // basura allá; y los nueve cambios de la Fase 1 no llegaban al media buyer. Desde ahora el
 // popup importa el MISMO archivo que el worker. El zip lo incluye (scripts/empaquetar.sh).
-import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL } from "../auto-prospector/lib/email.js";
+import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails } from "../auto-prospector/lib/email.js";
+// La lista de dominios bloqueados existía en modules/blocklist.js y la usaba traffic.js para
+// no gastar API… pero NINGÚN botón del popup la consultaba (verificado el 08/09: cero llamadas
+// a checkDomainBlocked en este archivo). Un MB parado en mail.google.com cargó `mail.google.com`
+// al CRM como si fuera una web. El veredicto la consulta primero, antes que al CRM.
+import { checkDomainBlocked } from "../modules/blocklist.js";
 import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
@@ -4191,10 +4196,25 @@ function addEmailsWithSource(emails, source, domainGuard = null) {
     return false;
   };
 
-  for (const e of emails) {
-    if (!e) continue;
-    if (isGarbageEmail(e)) continue;
-    if (!_belongsToCurrent(e)) continue; // anti-leak entre dominios
+  // ── EL MISMO CRITERIO DE ACEPTACIÓN QUE EL WORKER (2026-09-08) ──────────────────────────
+  // `_belongsToCurrent` rechazaba TODO email de otro dominio salvo webmail. El worker, desde
+  // el 04/08 (regla del user), acepta el buzón de la casa editora si está impreso en el propio
+  // sitio o si es un rol comercial: hnonline.sk → inzercia@mafraslovakia.sk, elfinancierocr.com
+  // → @nacion.com. La extensión tiraba exactamente esos, que son el buzón de venta de pauta de
+  // los grupos de medios. Ahora pasa por `_cleanScrapedEmails` (la misma función, con la
+  // procedencia): Page/Scrape vienen del propio sitio, así que lo que publica ahí es su
+  // contacto; Informer/Social no traen URL de origen y siguen la regla estricta del worker
+  // (dominio del lead, webmail, rol de negocio o casa editora). Apollo y Cache conservan el
+  // filtro viejo: Apollo ya viene acotado al dominio por su API, y Cache ya pasó por acá.
+  let lista = (Array.isArray(emails) ? emails : []).filter(Boolean);
+  if (source === "Apollo" || source === "Cache") {
+    lista = lista.filter(e => !isGarbageEmail(e) && _belongsToCurrent(e));
+  } else {
+    const delSitio = source === "Page" || source === "Scrape";
+    const urlByEmail = delSitio && currentSite ? new Map(lista.map(e => [String(e).toLowerCase(), `https://${currentSite}/`])) : null;
+    lista = _cleanScrapedEmails(lista, currentSite, { urlByEmail }).filter(e => !isGarbageEmail(e));
+  }
+  for (const e of lista) {
     if (!state.emailSources.has(e)) state.emailSources.set(e, source);
     if (!state.emails.includes(e)) state.emails.push(e);
   }
@@ -6201,6 +6221,11 @@ function _veredictoCrm(dup) {
     return { ok: false, duda: true, titulo: "No pude consultar el CRM",
              detalle: "Verificá a mano en ADEQ antes de escribirle.", clase: "crm-duda" };
   }
+  // Bloqueado por lista (gigantes, TLD vetados, admin): no es prospectable aunque el CRM no lo
+  // conozca. Va ANTES de "no está en el CRM", que es justo lo que lo hacía pasar por libre.
+  if (dup.bloqueado) {
+    return { ok: false, titulo: "Web NO prospectable", detalle: `${dup.bloqueado}.`, clase: "crm-no" };
+  }
   if (!dup.found) {
     return { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
   }
@@ -6342,6 +6367,14 @@ function _dominioRaiz(host) {
 
 async function buscarEnCrm(domain) {
   const t0 = Date.now();
+  // ── PRIMERO LA LISTA DE BLOQUEADOS, DESPUÉS EL CRM (2026-09-08) ──────────────────────
+  // Gmail, Google, YouTube, los TLD vetados, la lista del admin: nada de eso es una web
+  // prospectable, esté o no en el CRM. Y hasta hoy el veredicto sólo preguntaba al CRM, así
+  // que `mail.google.com` daba "Web prospectable · Nunca fue contactada" y se cargó al CRM
+  // (parte del 08/09, Diego → cto@arise.tv registrado bajo mail.google.com). Es local y
+  // gratis (la lista del admin se cachea 5 min), y devuelve el motivo para el cartel.
+  const _bl = await checkDomainBlocked(domain, state?.accessToken).catch(() => ({ blocked: false }));
+  if (_bl.blocked) return { found: false, bloqueado: _bl.reason || "dominio bloqueado", ms: Date.now() - t0 };
   // El host como vino y, si tiene subdominio, el raíz. `Set` para no preguntar dos veces lo
   // mismo, que es el caso normal (un dominio sin subdominio ya ES su raíz).
   const candidatos = [...new Set([String(domain || "").toLowerCase().replace(/\.+$/, ""), _dominioRaiz(domain)].filter(Boolean))];

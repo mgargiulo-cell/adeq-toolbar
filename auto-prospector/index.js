@@ -6371,6 +6371,15 @@ async function getTrafficData(domain, rapidApiKey) {
         log(`  ✅ getTrafficData ${domain}: RapidAPI dijo 0 → scrape fallback rescató ${fb.visits} (${fb.source})`);
         return { visits: fb.visits, pageViews: fb.pageViews ?? null, pagesPerVisit, topCountry, topCountries3, swCategory, error: null, fromScrape: fb.source };
       }
+      // La API contestó bien y ni ella ni las tres fuentes públicas tienen datos: eso es un
+      // resultado, y se pagó. Se guarda con `noData` para que los reintentos y el descongelado
+      // salgan de la caché (ver getTrafficCacheServer). Sólo acá: las ramas de error de arriba
+      // ya devolvieron antes, así que un timeout o un 5xx nunca se guarda como "sin datos".
+      saveTrafficCacheServer(cleanD, {
+        rawVisits: 0, visits: 0, pageViews: 0, pagesPerVisit: null, noData: true,
+        topCountries: [], category: swCategory || "",
+      }).catch(() => {});
+      log(`  🗂️ getTrafficData ${domain}: sin datos en ningún lado → guardado como negativo (${_trafficNegCacheDias}d, no se vuelve a pagar)`);
     }
     return { visits, pagesPerVisit, topCountry, topCountries3, swCategory, error: null };
   } catch (e) {
@@ -6397,17 +6406,36 @@ async function getTrafficData(domain, rapidApiKey) {
 // dato viejo es peor que gastar la consulta. 90 días es el equilibrio; subilo si preferís
 // ahorrar, bajalo si empezás a ver leads con tráfico que no se corresponde.
 let _trafficCacheDias = 90;
+// ── "NO HAY DATOS" TAMBIÉN ES UN DATO COMPRADO (2026-09-08) ─────────────────────────────
+// La caché guardaba sólo los positivos (`if (visits)`). Un dominio del que SimilarWeb no sabe
+// nada se le preguntaba TRES veces facturadas (los 3 intentos antes del freeze), más tres
+// rondas de scraping, y a los 15/30/60 días —al descongelarse— otras tres. En el parte del
+// 07-08/09: 1.415 filas viejas de `autopilot` congeladas que se descongelan el 17-19/09 y van
+// a repetir el ciclo entero por dominios que ya eran basura en julio. Con la respuesta
+// negativa guardada, los intentos 2 y 3 y los del descongelado salen de acá a costo cero.
+// TTL más corto que el positivo (14 días, `traffic_neg_cache_dias`): un sitio sin datos hoy
+// puede tenerlos el mes que viene, y decidir sobre un "no" viejo sería peor que preguntar.
+// La extensión IGNORA estas filas (modules/supabase.js): la regla del 17/06 —"no cachear 0s,
+// la toolbar decía sin tráfico aunque SimilarWeb tuviera el dato horas después"— sigue en pie
+// para el MB. Esto ahorra sólo en el worker, que es donde estaba el gasto.
+let _trafficNegCacheDias = 14;
 async function getTrafficCacheServer(domain) {
   if (!domain) return null;
   try {
     const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - _trafficCacheDias);
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&fetched_at=gte.${cutoff.toISOString()}&select=data,fetched_at&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER}` } }
     );
     if (!res.ok) return null;
     const rows = await res.json();
-    return rows.length ? rows[0].data : null;
+    if (!rows.length) return null;
+    const { data, fetched_at } = rows[0];
+    if (data?.noData) {
+      const edadDias = (Date.now() - new Date(fetched_at).getTime()) / 86400_000;
+      if (!(edadDias <= _trafficNegCacheDias)) return null;   // negativo vencido → se vuelve a preguntar
+    }
+    return data;
   } catch { return null; }
 }
 
@@ -6848,9 +6876,13 @@ async function bumpApolloUnlocks(token, n = 1) {
 
 // ── Email scraping fallback (server-side HTTP) ────────────────
 
-// Maxi 2026-06-30: TLD 2-10 (paridad con el extractor del dashboard/popup). Antes 2-6
-// rechazaba .travel/.museum/.online/.agency/.media y emails válidos quedaban afuera.
-const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}(?=\s|$|[^a-zA-Z])/g;
+// Maxi 2026-06-30: TLD 2-10. Antes 2-6 rechazaba .travel/.museum/.online/.agency/.media.
+// ⚠️ Ese comentario decía "paridad con el extractor del popup" y el popup seguía en 2-6 hasta
+// el 08/09/2026 (modules/scraper.js). La paridad se anunció y no se hizo: dos meses de correos
+// en `.digital`/`.online` invisibles para los MB. Ahora 2-24 en los dos lados, y la validez
+// real del TLD la decide `_dominioEmailPlausible` en lib/email.js, que es UNA sola función
+// para el worker y la extensión.
+const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,24}(?=\s|$|[^a-zA-Z])/g;
 
 
 
@@ -7335,7 +7367,7 @@ async function scrapeInformerOnly(domain) {
         .replace(/\s+at\s+/gi, "@").replace(/\s+dot\s+/gi, ".");
       // Re-extract emails del HTML deobfuscado (esto agarra patrones que la
       // regex original puede haber perdido por espacios o entities)
-      const passTwoRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}/g;
+      const passTwoRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,24}/g;   // mismo tope que EMAIL_REGEX
       (deobfuscated.match(passTwoRegex) || []).forEach(e => {
         const low = e.toLowerCase();
         // Filtrar basura típica de WHOIS (proxies y registrar emails)
@@ -26100,8 +26132,12 @@ async function main() {
       // Vive en una variable de módulo porque getTrafficCacheServer se llama desde lugares
       // que no tienen la config a mano.
       try {
-        const _d = parseInt((await getConfig(token)).traffic_cache_dias || "90", 10);
+        const _cfgCache = await getConfig(token);
+        const _d = parseInt(_cfgCache.traffic_cache_dias || "90", 10);
         if (_d > 0) _trafficCacheDias = _d;
+        // TTL de los negativos ("sin datos"): más corto que el positivo a propósito.
+        const _dn = parseInt(_cfgCache.traffic_neg_cache_dias || "14", 10);
+        if (_dn > 0) _trafficNegCacheDias = _dn;
       } catch {}
 
       // Maxi 2026-08-18: libera las reservas de envío que quedaron colgadas. Va acá, en el loop,

@@ -382,6 +382,40 @@ export const TLD_PAIS_VALIDOS = new Set(("ad ae af ag ai al am ao aq ar as at au
  + "sa sb sc sd se sg sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug "
  + "um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw uk eu su ac").split(/\s+/));
 
+// ── ¿PUEDE EXISTIR UN BUZÓN EN ESTE DOMINIO? (2026-09-08) ─────────────────────────────────
+// Una sola cabeza para la pregunta "¿esto es un dominio de email posible?", que antes vivía
+// inline en `_cleanScrapedEmails` y NO existía en la extensión. Medido en el parte del 08/09:
+// `peopledaily.digital` — el popup topeaba el TLD en 6 letras (`.digital` tiene 7), así que
+// los correos del propio sitio nunca se extraían ni se aceptaban, y el MB terminó mandando a
+// `marketing@bulawayo24.com`. El worker había subido su tope a 10 el 30/06 "por paridad con el
+// popup"… y el popup seguía en 6. Con una función compartida la paridad deja de ser una promesa.
+// Reglas: TLD de 2 letras sólo si es un país real (`good@all.he` no); de 3 a 24 letras si no
+// es una extensión de archivo (`...@ronaldo-roots.html` no). `.digital`, `.online`, `.agency`,
+// `.network`, `.marketing` pasan. Los TLD internacionalizados (`xn--…`) quedan afuera: son
+// rarísimos en medios y aceptarlos obligaría a aflojar la regla de las letras.
+export function _dominioEmailPlausible(dom) {
+  const d = String(dom || "").toLowerCase();
+  if (!d.includes(".") || d.length < 4) return false;
+  const tld = d.split(".").pop() || "";
+  if (tld.length === 2) return TLD_PAIS_VALIDOS.has(tld);
+  return /^[a-z]{3,24}$/.test(tld)
+    && !/^(html?|php|aspx?|jsp|jpe?g|png|gif|webp|svg|css|js|json|xml|pdf|zip|mp[34]|txt|woff2?|ico|rss|amp)$/.test(tld);
+}
+
+// Validación de FORMATO y basura, sin política de dominio cruzado: lo que la extensión
+// necesita para decidir si un string extraído del HTML merece mostrarse. La política de
+// "¿es del sitio o de otro?" sigue en `_cleanScrapedEmails`, que llama a esto por dentro.
+export function esEmailPlausible(raw) {
+  const e = _sanitizeEmail(raw);
+  if (!e || !STRICT_EMAIL_RE.test(e)) return false;
+  if (IGNORE_EMAIL.some(p => e.includes(p))) return false;
+  const [local, dom] = e.split("@");
+  if (!local || !dom) return false;
+  if (JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local) || PLACEHOLDER_LOCAL.test(local)) return false;
+  if (JUNK_EMAIL_DOMAINS.has(dom)) return false;
+  return _dominioEmailPlausible(dom);
+}
+
 export function _cleanScrapedEmails(list, leadDomain, opts = {}) {
   const core = (leadDomain || "").replace(/^www\./, "").toLowerCase().trim();
   const urlByEmail = opts.urlByEmail || null;
@@ -447,18 +481,12 @@ export function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     // ensuciando la reputación del dominio.
     // Se exige que la parte del dominio termine en algo que pueda ser un TLD de verdad: 2 a 24
     // letras, y nunca una extensión de archivo. Es barato y corta justo esta familia.
-    const _tldAparente = (dom.split(".").pop() || "");
-    // Un TLD de DOS letras solo es válido si es un código de país de verdad. `good@all.he`
-    // salió del texto de una nota y `.he` no existe; `.fr` o `.io` sí. Los de 3+ letras se
-    // aceptan salvo que sean una extensión de archivo (el caso `...-early-days.html`).
-    // (No se reusa COUNTRY_CODES: tiene 86 entradas y le faltan .uk .io .tv .me .eu, así que
-    // rechazaría dominios legítimos — peor que el problema que arregla.)
-    const _dominioPlausible = dom.includes(".") && dom.length >= 4
-      && (_tldAparente.length === 2
-            ? TLD_PAIS_VALIDOS.has(_tldAparente)
-            : /^[a-z]{3,24}$/.test(_tldAparente)
-              && !/^(html?|php|aspx?|jsp|jpe?g|png|gif|webp|svg|css|js|json|xml|pdf|zip|mp[34]|txt|woff2?|ico|rss|amp)$/.test(_tldAparente));
-    const publicadoPorElSitio = _dominioPlausible && vieneDelPropioSitio(e);
+    // La regla vive ahora en `_dominioEmailPlausible` (compartida con la extensión). Y se aplica
+    // a TODOS, no sólo a los rescatados por procedencia: un `info@all.he` cross-domain con rol
+    // de negocio pasaba por `isBizRole` aunque `.he` no exista como TLD. Un dominio imposible
+    // es imposible venga de donde venga.
+    if (!_dominioEmailPlausible(dom)) continue;
+    const publicadoPorElSitio = vieneDelPropioSitio(e);
     const esCasaEditora = casasEditoras.has(dom) || [...casasEditoras].some(c => dom.endsWith("." + c));
     if (core && !isLeadDomain && !isPersonalWebmail && !isBizRole && !publicadoPorElSitio && !esCasaEditora) continue;
     seen.add(e);

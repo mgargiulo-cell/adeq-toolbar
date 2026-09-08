@@ -1253,6 +1253,11 @@ export async function getTrafficCache(domain) {
     if (!res.ok) return null;
     const rows = await res.json();
     if (!rows.length) return null;
+    // Las filas `noData` las escribe el worker para no volver a pagar por dominios de los que
+    // SimilarWeb no sabe nada (2026-09-08). Para el MB NO cuentan como caché: acá sigue valiendo
+    // la regla del 17/06 —no mostrar "sin tráfico" por un 0 guardado si el dato puede existir—,
+    // así que se trata como miss y la toolbar pregunta en vivo, igual que siempre.
+    if (rows[0]?.data?.noData) return null;
 
     const daysAgo = Math.floor((Date.now() - new Date(rows[0].fetched_at)) / 86_400_000);
     return { ...rows[0].data, fromCache: true, cachedDaysAgo: daysAgo };

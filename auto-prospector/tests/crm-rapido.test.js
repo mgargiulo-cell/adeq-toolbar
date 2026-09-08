@@ -62,11 +62,11 @@ ok(FUENTE_WD, "popup.js tiene que declarar _CRM_WATCHDOG_MS");
 const WATCHDOG_MS = Number(new Function("_CRM_FICHA_TIMEOUT_MS", `return ${FUENTE_WD[1]}`)(TIMEOUT_MS));
 
 /** Devuelve el buscarEnCrm real, con sus dependencias inyectadas. */
-function cargarBuscarEnCrm(fetchFalso) {
+function cargarBuscarEnCrm(fetchFalso, { bloqueo = async () => ({ blocked: false }) } = {}) {
   const cuerpo = extraer(popup, "function _dominioRaiz(host) {") + "\n" +
                  extraer(popup, "async function buscarEnCrm(domain) {");
   const fab = new Function(
-    "fetch", "AbortSignal", "console", "crmUrl", "CONFIG", "_CRM_FICHA_TIMEOUT_MS",
+    "fetch", "AbortSignal", "console", "crmUrl", "CONFIG", "_CRM_FICHA_TIMEOUT_MS", "checkDomainBlocked", "state",
     `${cuerpo}; return buscarEnCrm;`,
   );
   return fab(
@@ -74,8 +74,38 @@ function cargarBuscarEnCrm(fetchFalso) {
     () => "https://console.adeqmedia.com/api/crm/ficha",
     { CRM_BOARD_SECRET: "x" },
     TIMEOUT_MS,
+    bloqueo, { accessToken: "" },
   );
 }
+
+/** El _veredictoCrm real, con sus cuatro regex. */
+function cargarVeredicto() {
+  const ini = popup.indexOf("const _CRM_LIVE_RE");
+  const fin = popup.indexOf("\n}\n", popup.indexOf("function _veredictoCrm(dup) {")) + 3;
+  return new Function(popup.slice(ini, fin) + "; return _veredictoCrm;")();
+}
+
+// ── La lista de bloqueados se consulta ANTES que el CRM (2026-09-08) ────────────────────
+// Parte del 08/09: Diego, parado en mail.google.com, le mandó el pitch a cto@arise.tv y la
+// ficha quedó registrada bajo `mail.google.com`. El veredicto sólo preguntaba al CRM, y "no
+// está en el CRM" se pintaba como "Web prospectable · Nunca fue contactada".
+test("un dominio bloqueado da NO prospectable sin llegar a preguntarle al CRM", async () => {
+  let llamadasAlCrm = 0;
+  const buscar = cargarBuscarEnCrm(async () => { llamadasAlCrm++; return respuesta({ found: false }); },
+                                   { bloqueo: async (d) => d.endsWith("google.com") ? { blocked: true, reason: "Subdominio de google.com" } : { blocked: false } });
+  const r = await buscar("mail.google.com");
+  strictEqual(r.found, false);
+  strictEqual(r.bloqueado, "Subdominio de google.com");
+  strictEqual(llamadasAlCrm, 0, "bloqueado es bloqueado: no hace falta gastar la consulta");
+  const v = cargarVeredicto()(r);
+  strictEqual(v.ok, false);
+  ok(!v.duda, "no es una duda: es un no");
+  ok(/Web NO prospectable/.test(v.titulo) && /google\.com/.test(v.detalle), `${v.titulo} — ${v.detalle}`);
+  // Y uno que no está bloqueado sigue el camino normal.
+  const libre = await buscar("diario-nuevo.com");
+  strictEqual(libre.bloqueado, undefined);
+  strictEqual(llamadasAlCrm, 1);
+});
 
 const respuesta = (json) => ({ ok: true, json: async () => json });
 

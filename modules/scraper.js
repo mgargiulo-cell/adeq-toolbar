@@ -10,6 +10,10 @@
 import { CONFIG }    from "../config.js";
 import { callProxy } from "./apiProxy.js";
 import { getApolloCache, saveApolloCache, getApolloMonthlyUsage } from "./supabase.js";
+// La MISMA regla de "¿esto puede ser un email?" que usa el worker (el zip incluye lib/email.js,
+// ver scripts/empaquetar.sh). Antes este archivo tenía la suya, con el TLD topeado en 6 letras:
+// `.digital`, `.online`, `.agency`, `.network` y `.marketing` no existían para la extensión.
+import { esEmailPlausible } from "../auto-prospector/lib/email.js";
 
 const IGNORE_DOMAINS = [
   "example.com","domain.com","yoursite.com","sentry.io",
@@ -46,8 +50,9 @@ export async function scrapeEmailsFromPage(tabId) {
 function extractEmailsFromDOM() {
   const found = new Set();
   const socialLinks = new Set();
-  // TLD max 10 chars (.museum, .travel) + requiere no-letra después.
-  const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}(?=\s|$|[^a-zA-Z])/g;
+  // TLD de 2 a 24 letras (paridad con `_dominioEmailPlausible` de lib/email.js) + requiere
+  // no-letra después. Con 10 quedaban afuera `.international`, `.photography`, `.construction`.
+  const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,24}(?=\s|$|[^a-zA-Z])/g;
 
   // ── Desofuscador de emails ─────────────────────────────────
   function deobfuscate(text) {
@@ -715,8 +720,10 @@ export async function revealApolloEmail({ id, first_name, last_name, domain }) {
 function deobfuscateText(text) {
   if (!text) return "";
   return text
-    .replace(/&#64;|&#x40;/gi,     "@")
-    .replace(/&#46;|&#x2e;/gi,     ".")
+    // Entidades con o sin ceros a la izquierda (`&#064;` es frecuente en generadores viejos),
+    // la entidad con nombre, y la arroba de ancho completo que usan sitios asiáticos.
+    .replace(/&#0*64;|&#x0*40;|&commat;|＠/gi, "@")
+    .replace(/&#0*46;|&#x0*2e;|&period;/gi,   ".")
     .replace(/\[\s*at\s*\]/gi,     "@")
     .replace(/\(\s*at\s*\)/gi,     "@")
     .replace(/\{\s*at\s*\}/gi,     "@")
@@ -736,8 +743,12 @@ function deobfuscateText(text) {
 }
 
 function extractEmailsFromText(text) {
-  // TLD máximo 6 chars para evitar "comsoccer", "comfoo", etc.
-  const regex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}(?=\s|$|[^a-zA-Z])/g;
+  // TLD de 2 a 24 letras. El tope de 6 que había acá "para evitar comsoccer/comfoo" no evitaba
+  // nada (el lookahead de no-letra ya corta eso) y sí perdía todos los correos de sitios en
+  // `.digital`, `.online`, `.agency`, `.network`, `.marketing`… Caso real del parte del 08/09:
+  // peopledaily.digital — sus propios correos jamás se extrajeron. La plausibilidad del TLD la
+  // decide después `esEmailPlausible` (lib/email.js), que sí sabe cuáles existen.
+  const regex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,24}(?=\s|$|[^a-zA-Z])/g;
   const clean = deobfuscateText(text);
   return [...new Set((clean.match(regex) || []).map(e => e.toLowerCase()))];
 }
@@ -770,38 +781,25 @@ function isWhoIsProxyEmail(email) {
 }
 
 // Validación rápida sincrónica antes de mostrar (sin DNS)
+// ── LA MISMA REGLA QUE EL WORKER (2026-09-08) ────────────────────────────────────────────
+// Esta función tenía su propia idea de qué es un email: TLD de 2 a 6 letras y poco más. El
+// worker, mientras tanto, validaba con `_cleanScrapedEmails` (TLD de país real si tiene 2
+// letras, hasta 24 si no es extensión de archivo, listas de basura, placeholders). Dos
+// criterios distintos para la misma pregunta, y el de acá era el peor: descartaba
+// `contact@peopledaily.digital` por tener 7 letras de TLD. Ahora pregunta a lib/email.js y
+// conserva sólo lo que es específico de la extensión (los proxies de WHOIS de este archivo y
+// el local-part que parece dominio, artefacto típico del scrape en el navegador).
 export function quickValidateEmail(email) {
   if (!email || typeof email !== "string") return false;
-
   const parts = email.split("@");
   if (parts.length !== 2) return false;
-  const [local, domain] = parts;
-
-  // Local part no puede ser vacía ni mayor a 64 chars
+  const [local] = parts;
   if (!local || local.length > 64) return false;
-
-  // TLD entre 2 y 6 caracteres
-  const tld = domain.split(".").pop();
-  if (!tld || tld.length < 2 || tld.length > 6) return false;
-
-  // Dominio debe tener al menos una parte + TLD
-  const domainParts = domain.split(".");
-  if (domainParts.length < 2 || domainParts.some(p => p.length === 0)) return false;
-
-  // La parte local NO debe parecer un dominio en sí misma
-  // Ej: "owngoalnigeria.com@..." o "site.net@..."
+  // La parte local NO debe parecer un dominio en sí misma ("owngoalnigeria.com@…").
   const COMMON_TLDS = /\.(com|net|org|io|co|ar|es|mx|br|pt|fr|it|de|uk|au|ca|gov|edu|info|biz|us|tv|me|app|dev)$/i;
   if (COMMON_TLDS.test(local)) return false;
-
-  // El dominio no puede ser solo un TLD (ej: "@com")
-  if (domainParts.length === 1) return false;
-
-  // Bloquear proxies de WhoIs — no son contactos reales
   if (isWhoIsProxyEmail(email)) return false;
-
-  // Formato general válido
-  const emailRegex = /^[a-zA-Z0-9._%+\-]{1,64}@[a-zA-Z0-9.\-]{1,253}\.[a-zA-Z]{2,6}$/;
-  return emailRegex.test(email);
+  return esEmailPlausible(email);
 }
 
 function filterEmails(emails) {
