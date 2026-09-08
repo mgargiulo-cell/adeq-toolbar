@@ -402,6 +402,74 @@ export function _dominioEmailPlausible(dom) {
     && !/^(html?|php|aspx?|jsp|jpe?g|png|gif|webp|svg|css|js|json|xml|pdf|zip|mp[34]|txt|woff2?|ico|rss|amp)$/.test(tld);
 }
 
+// ── HIPÓTESIS DE PATRÓN: la única técnica de Hunter que no teníamos (2026-09-08) ──────────
+// Hunter, cuando no ENCUENTRA el correo, lo INFIERE: nombre de la persona + patrón de la
+// empresa (`nombre.apellido@`, `napellido@`, `nombre@`) + verificación. Nosotros teníamos las
+// etiquetas (`pattern`/`guess` en decidirVerificacionMV) y ningún generador. Esta función es
+// PURA —no verifica nada—: devuelve candidatos en orden de probabilidad, para que el pulido los
+// pase por MillionVerifier y se quede SÓLO con el que MV confirma "ok". Nunca se manda una
+// hipótesis sin verificar, y nunca contra un dominio catch-all (ahí MV no puede saber).
+//
+// Si el dominio ya tiene un email PERSONAL conocido, se copia su patrón (jperez@ → inicial +
+// apellido) y se genera UNA sola hipótesis: cuesta un crédito, no tres. Sin patrón conocido van
+// las tres formas más comunes en medios de habla hispana/portuguesa/europea, en ese orden.
+const _PATRONES = {
+  "nombre.apellido": (n, a) => `${n}.${a}`,
+  "napellido":       (n, a) => `${n[0]}${a}`,
+  "nombre":          (n)    => n,
+  "nombreapellido":  (n, a) => `${n}${a}`,
+  "nombre_apellido": (n, a) => `${n}_${a}`,
+  "n.apellido":      (n, a) => `${n[0]}.${a}`,
+  "apellido":        (_, a) => a,
+};
+const _HONORIFICOS = /^(sr|sra|srta|dr|dra|lic|ing|prof|mr|mrs|ms|don|doña|d)\.?$/i;
+const _ROLES_NO_NOMBRE = /(director|directora|editor|editora|gerente|jefe|jefa|redacci|comercial|ventas|publicidad|marketing|equipo|team|staff|contacto|contact|redacao|redazione|ceo|cto|cmo|founder|fundador|dueño|owner|manager|responsable)/i;
+const _sinAcentos = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+
+export function _partesDeNombre(nombre) {
+  const tokens = _sinAcentos(nombre).replace(/[^a-z\s'-]/g, " ").split(/\s+/).filter(t => t && !_HONORIFICOS.test(t));
+  if (tokens.length < 2 || tokens.length > 5) return null;
+  if (_ROLES_NO_NOMBRE.test(tokens.join(" "))) return null;
+  const limpio = tokens.map(t => t.replace(/['-]/g, "")).filter(t => t.length >= 2);
+  if (limpio.length < 2) return null;
+  // Con partículas ("de", "del", "da", "van") el apellido es el último token; el nombre, el primero.
+  return { nombre: limpio[0], apellido: limpio[limpio.length - 1] };
+}
+
+// Detecta el patrón de los emails PERSONALES ya conocidos del dominio ("jperez@" → napellido).
+// Sin nombres para comparar, sólo puede distinguir por la forma: con punto, sin punto, corto.
+export function _patronDeEmailsConocidos(emailsConocidos, dominio) {
+  const dom = String(dominio || "").toLowerCase().replace(/^www\./, "");
+  for (const e of Array.isArray(emailsConocidos) ? emailsConocidos : []) {
+    const [local, d] = String(e || "").toLowerCase().split("@");
+    if (!local || !d || (d !== dom && !d.endsWith("." + dom))) continue;
+    if (GENERIC_LOCAL_RE.test(local) || AD_SALES_LOCAL.test(local)) continue;   // info@/publicidad@ no dicen nada del patrón
+    // La inicial con punto va ANTES: `a.lopez` también matchea "letras.letras" y se leería como
+    // nombre.apellido, generando `juan.gomez@` donde la casa usa `j.gomez@`.
+    if (/^[a-z]\.[a-z]{3,}$/.test(local))     return "n.apellido";
+    if (/^[a-z]{2,}\.[a-z]{3,}$/.test(local)) return "nombre.apellido";
+    if (/^[a-z]+_[a-z]{3,}$/.test(local))  return "nombre_apellido";
+    if (/^[a-z][a-z]{4,}$/.test(local) && !/[.\d_-]/.test(local)) return null;   // "jperez" o "maria": ambiguo, no se adivina
+  }
+  return null;
+}
+
+export function generarHipotesisDePatron({ nombre, dominio, emailsConocidos = [] } = {}) {
+  const partes = _partesDeNombre(nombre);
+  const dom = String(dominio || "").toLowerCase().replace(/^www\./, "");
+  if (!partes || !dom || !_dominioEmailPlausible(dom)) return [];
+  const conocido = _patronDeEmailsConocidos(emailsConocidos, dom);
+  const orden = conocido ? [conocido] : ["nombre.apellido", "napellido", "nombre"];
+  const out = [];
+  for (const p of orden) {
+    const local = _PATRONES[p]?.(partes.nombre, partes.apellido);
+    if (!local) continue;
+    const e = `${local}@${dom}`;
+    if (!out.includes(e) && STRICT_EMAIL_RE.test(e)) out.push(e);
+  }
+  return out;
+}
+
 // Validación de FORMATO y basura, sin política de dominio cruzado: lo que la extensión
 // necesita para decidir si un string extraído del HTML merece mostrarse. La política de
 // "¿es del sitio o de otro?" sigue en `_cleanScrapedEmails`, que llama a esto por dentro.

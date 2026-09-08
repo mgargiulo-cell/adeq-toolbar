@@ -38,7 +38,8 @@ test("los anglo quedan afuera aunque alguien los ponga en la config", () => {
 test("la fuente GEO está enchufada al slot del feeder y se mide por separado", () => {
   const slot = worker.slice(worker.indexOf("async function _runFeederSlot("), worker.indexOf("async function _measureFeederRuns("));
   ok(/await _feederPullGeo\(token/.test(slot), "el slot tiene que llamar a la fuente GEO");
-  ok(/fromGeo\.crux \+ fromGeo\.wikidata/.test(slot), "sus brutos entran al total del slot");
+  ok(/fromGeoTotal = \(fromGeo\.crux \|\| 0\) \+ \(fromGeo\.wikidata \|\| 0\) \+ \(fromGeo\.directorio \|\| 0\)/.test(slot) && /\+ fromGeoTotal;/.test(slot),
+     "sus brutos (crux + wikidata + directorio) entran al total del slot");
   ok(/geo=\$\{fromGeo\.pais\}/.test(slot), "las notas del run dicen qué país tocó");
   // Cada fuente con su etiqueta: si una no rinde, el parte lo muestra y se baja sola.
   ok(/"auto_feeder_wikidata"\)/.test(worker) && /"auto_feeder_crux"\)/.test(worker), "las dos etiquetas tienen que inyectarse por separado");
@@ -80,6 +81,6 @@ test("Sudáfrica, Kenia, Nigeria y Ghana se buscan en inglés con gl local", () 
   for (const cc of ["za", "ke", "ng", "gh"]) ok(new RegExp(`\\b${cc}: "en"`).test(idioma), `${cc} tiene que mapear a inglés — sin esto sus ciudades se buscan con plantillas en español`);
   const ciudades = worker.slice(worker.indexOf("const _CIUDADES = {"), worker.indexOf("};", worker.indexOf("const _CIUDADES = {")));
   for (const cc of ["ke", "ng", "gh"]) ok(new RegExp(`\\n\\s+${cc}: \\[`).test(ciudades), `faltan las ciudades de ${cc}`);
-  ok(/en: \["za", "ke", "ng", "gh"\]/.test(worker), "_PAISES_POR_IDIOMA.en tiene que listar los cuatro");
-  ok(/en: \[".co.za", ".za", ".co.ke", ".ke", ".ng", ".com.ng", ".gh", ".com.gh"\]/.test(worker), "y sus TLDs para el sesgo de búsqueda");
+  ok(/en: \["za", "ke", "ng", "gh", "ph"\]/.test(worker), "_PAISES_POR_IDIOMA.en tiene que listar los cuatro africanos y Filipinas");
+  ok(/en: \[".co.za", ".za", ".co.ke", ".ke", ".ng", ".com.ng", ".gh", ".com.gh", ".ph", ".com.ph"\]/.test(worker), "y sus TLDs para el sesgo de búsqueda");
 });

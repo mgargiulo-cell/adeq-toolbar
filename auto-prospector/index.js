@@ -93,6 +93,7 @@ import {
   riesgoRebotePorDominio,
   _bouncedCache,
   _rebotesPorDominio,
+  generarHipotesisDePatron,
 } from "./lib/email.js";
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -1875,6 +1876,7 @@ const PER_SOURCE_ACTIVE_CAP = {
   auto_feeder_adstxt:   120,   // autopilot (ads.txt-graph)
   auto_feeder_crux:     120,   // 2026-09-08: fuente GEO — top de Chrome por país
   auto_feeder_wikidata: 120,   // 2026-09-08: fuente GEO — medios de Wikidata por país
+  auto_feeder_directorio: 120, // 2026-09-08: fuente GEO — directorio de prensa por país
   // Maxi 2026-08-11: 120 → 400. Los finalizados de Monday dejaron de ser una porción
   // del reparto del feeder y pasaron a ser un barrido DIARIO del 100% del board
   // (sincronizarFinalizadosDeMonday). Es la mejor fuente que tenemos —gente que ya
@@ -2437,6 +2439,16 @@ const _CIUDADES = {
   rs: ["Novi Sad", "Niš", "Kragujevac"],
   pt: ["Porto", "Braga", "Coimbra", "Faro", "Funchal"],
   id: ["Surabaya", "Bandung", "Medan", "Semarang", "Makassar", "Yogyakarta"],
+  // ── ASIA (2026-09-08, del plan del user: "algo de Asia") ────────────────────────────
+  // Japón, Corea, Vietnam, Tailandia y Malasia tenían idioma y plantillas de ciudad cargados
+  // desde el 04/09, pero NINGUNA ciudad: la búsqueda "medio local + ciudad", la que rinde 8×,
+  // nunca les tocaba. Filipinas entra en inglés con `gl=ph`, como África anglófona.
+  jp: ["大阪", "名古屋", "札幌", "福岡", "神戸", "京都", "広島", "仙台"],
+  kr: ["부산", "인천", "대구", "대전", "광주", "울산"],
+  vn: ["Hà Nội", "Đà Nẵng", "Hải Phòng", "Cần Thơ", "Nha Trang", "Huế"],
+  th: ["เชียงใหม่", "ขอนแก่น", "ภูเก็ต", "นครราชสีมา", "หาดใหญ่", "อุดรธานี"],
+  my: ["Johor Bahru", "Penang", "Ipoh", "Kota Kinabalu", "Kuching", "Melaka"],
+  ph: ["Cebu", "Davao", "Iloilo", "Cagayan de Oro", "Baguio", "Bacolod"],
   vn: ["Đà Nẵng", "Hải Phòng", "Cần Thơ", "Huế", "Nha Trang"],
   th: ["เชียงใหม่", "ขอนแก่น", "ภูเก็ต", "หาดใหญ่"],
   my: ["Johor Bahru", "Penang", "Ipoh", "Kuching", "Kota Kinabalu"],
@@ -2501,6 +2513,7 @@ const _IDIOMA_DE_PAIS = {
   // `_IDIOMA_DE_PAIS[pais] || "es"`, así que "Johannesburg" se buscaba con las plantillas EN
   // ESPAÑOL ("diario digital Johannesburg") durante cinco días. Cero medios sudafricanos.
   za: "en", ke: "en", ng: "en", gh: "en",   // África anglófona: inglés con `gl` local
+  ph: "en",                                 // Filipinas (2026-09-08): prensa en inglés, `gl=ph`
   eg: "ar",
 };
 
@@ -2607,7 +2620,7 @@ const _TLDS_POR_IDIOMA = {
   el: [".gr"],
   nl: [".nl", ".be"],
   cs: [".cz"],
-  en: [".co.za", ".za", ".co.ke", ".ke", ".ng", ".com.ng", ".gh", ".com.gh"],   // Sudáfrica (decisión 4) + Kenia/Nigeria/Ghana (2026-09-08)
+  en: [".co.za", ".za", ".co.ke", ".ke", ".ng", ".com.ng", ".gh", ".com.gh", ".ph", ".com.ph"],   // Sudáfrica (decisión 4) + Kenia/Nigeria/Ghana/Filipinas (2026-09-08)
 };
 
 // ── APAREAR IDIOMA, PAÍS E INTERFAZ (Maxi 2026-08-11) ────────────────────────
@@ -2654,7 +2667,7 @@ const _PAISES_POR_IDIOMA = {
   // sistema no los buscaba nunca: no por una exclusión, sino porque el inglés no existía como
   // idioma de búsqueda. Entra SÓLO con gl=za; el cinturón anti-anglo de abajo sigue vetando
   // us/ca/gb/au/nz aunque alguien los agregue acá.
-  en: ["za", "ke", "ng", "gh"],   // Sudáfrica (decisión 4) + África anglófona (2026-09-08, del parte: Kenia/Nigeria a mano)
+  en: ["za", "ke", "ng", "gh", "ph"],   // Sudáfrica (decisión 4) + África anglófona + Filipinas (2026-09-08)
 };
 // ── EL FOCO GEOGRÁFICO, DICHO POR EL USER (2026-08-26) ─────────────────────────────────
 // "Focalizar en países de América Central, Sur, Europa y Asia. Oceanía, USA, Canadá, UK y
@@ -4635,17 +4648,48 @@ async function _wikidataMediosDelPais(cc) {
   return [...hosts];
 }
 
+// Directorio de prensa curado a mano (onlinenewspapers.com): una página por país con ~50 medios.
+// Es la tercera fuente GEO, la más chica y la más "medio": la lista la armó una persona.
+// abyznewslinks y w3newspapers bloquean bots (probado el 08/09); este responde 200.
+const _DIRECTORIO_SLUG = {
+  co: "colombia", pe: "peru", ar: "argentina", cl: "chile", mx: "mexico", ec: "ecuador", uy: "uruguay",
+  py: "paraguay", bo: "bolivia", cr: "costa-rica", gt: "guatemala", do: "dominican-republic", pa: "panama",
+  br: "brazil", pt: "portugal", es: "spain", it: "italy", fr: "france", de: "germany", at: "austria",
+  nl: "netherlands", be: "belgium", pl: "poland", ro: "romania", hu: "hungary", cz: "czech-republic",
+  gr: "greece", tr: "turkey", ma: "morocco", eg: "egypt", ng: "nigeria", ke: "kenya", gh: "ghana",
+  za: "south-africa", id: "indonesia", my: "malaysia", ph: "philippines", vn: "vietnam", th: "thailand",
+};
+async function _directorioMediosDelPais(cc) {
+  const slug = _DIRECTORIO_SLUG[cc];
+  if (!slug) return [];
+  const r = await fetch(`https://www.onlinenewspapers.com/${slug}.shtml`, {
+    headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36" },
+    signal: AbortSignal.timeout(20_000), redirect: "follow",
+  });
+  if (!r.ok) return [];   // un slug que no existe da 404 y no pasa nada
+  const html = await r.text();
+  const hosts = new Set();
+  for (const m of html.matchAll(/href=["'](https?:\/\/[^"'\/\s]+)/gi)) {
+    try {
+      const h = new URL(m[1]).hostname.replace(/^www\./, "").toLowerCase();
+      if (/onlinenewspapers|google|facebook|twitter|youtube|instagram|amazon|apple|linkedin|wikipedia/.test(h)) continue;
+      hosts.add(h);
+    } catch {}
+  }
+  return [...hosts];
+}
+
 async function _feederPullGeo(token, maxInject, sessionKnown) {
-  if (maxInject <= 0) return { crux: 0, wikidata: 0, pais: "" };
+  if (maxInject <= 0) return { crux: 0, wikidata: 0, directorio: 0, pais: "" };
   const cfg = await getConfig(token).catch(() => ({}));
   const paises = String(cfg.feeder_geo_paises || _GEO_FEEDER_PAISES_DEFAULT)
     .split(",").map(s => s.trim().toLowerCase()).filter(s => /^[a-z]{2}$/.test(s) && !_GEO_FEEDER_ANGLO.has(s));
-  if (!paises.length) return { crux: 0, wikidata: 0, pais: "" };
+  if (!paises.length) return { crux: 0, wikidata: 0, directorio: 0, pais: "" };
   const cursor = parseInt(cfg.feeder_geo_cursor || "0", 10) || 0;
   const cc = paises[cursor % paises.length];
   await setConfigValue(token, "feeder_geo_cursor", String((cursor + 1) % paises.length)).catch(() => {});
 
-  const out = { crux: 0, wikidata: 0, pais: cc };
+  const out = { crux: 0, wikidata: 0, directorio: 0, pais: cc };
   const _barajar = (a) => a.map(x => [Math.random(), x]).sort((p, q) => p[0] - q[0]).map(p => p[1]);
 
   // 1) Wikidata primero: es medio por definición, así que casi todo lo que entra vale el hit.
@@ -4660,8 +4704,26 @@ async function _feederPullGeo(token, maxInject, sessionKnown) {
     log(`  🌍 Wikidata ${cc.toUpperCase()}: ${medios.length} medios → ${fresh.length} frescos → ${out.wikidata} encolados`);
   } catch (e) { log(`  ⚠️ Wikidata ${cc}: ${e.message}`); }
 
+  // 1b) Directorio de prensa (onlinenewspapers.com): ~50 medios por país, curados a mano por
+  //     humanos. Poco volumen pero medio puro. Sólo si Wikidata no llenó la mitad.
+  if (out.wikidata < Math.ceil(maxInject / 2)) {
+    try {
+      const medios = _barajar(await _directorioMediosDelPais(cc)).map(_normalizeFeederDomain).filter(Boolean);
+      if (medios.length) {
+        const known = await _findKnownDomainsWorker(token, medios);
+        const fresh = medios.filter(d => !known.has(d) && !sessionKnown.has(d)).slice(0, Math.ceil(maxInject / 2));
+        if (fresh.length) {
+          fresh.forEach(d => sessionKnown.add(d));
+          out.directorio = await _injectIntoCsvQueue(token, fresh, "auto_feeder_directorio");
+        }
+        log(`  🌍 Directorio ${cc.toUpperCase()}: ${medios.length} medios → ${fresh.length} frescos → ${out.directorio || 0} encolados`);
+      }
+    } catch (e) { log(`  ⚠️ Directorio ${cc}: ${e.message}`); }
+  }
+  out.directorio = out.directorio || 0;
+
   // 2) CrUX: candidatos de sobra porque la puerta ads.txt va a descartar ~85%.
-  const resto = Math.max(0, maxInject - out.wikidata);
+  const resto = Math.max(0, maxInject - out.wikidata - out.directorio);
   if (resto > 0) {
     try {
       const pool = _barajar(await _cruxDominiosDelPais(cc)).map(_normalizeFeederDomain).filter(Boolean);
@@ -4881,18 +4943,19 @@ async function _runFeederSlot(token, slotLabel) {
   // BONUS GEO (2026-09-08): CrUX por país + Wikidata. Un país por slot, rotando. También va
   // ENCIMA del split: la única forma de descubrir por GEO omitiendo a USA es una fuente que
   // nazca por país, y esto es eso. Se mide aparte en el parte (crux / wikidata).
-  const fromGeo = await _feederPullGeo(token, Math.min(40, Math.max(15, allocMajestic)), sessionKnown).catch((e) => { log(`  ⚠️ feeder geo: ${e.message}`); return { crux: 0, wikidata: 0, pais: "" }; });
-  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic}+adstxt=${fromAdsTxt}+crux=${fromGeo.crux}+wikidata=${fromGeo.wikidata})`);
-  const grossTotal = fromSellers + fromMonday + fromMajestic + fromAdsTxt + fromGeo.crux + fromGeo.wikidata;
+  const fromGeo = await _feederPullGeo(token, Math.min(40, Math.max(15, allocMajestic)), sessionKnown).catch((e) => { log(`  ⚠️ feeder geo: ${e.message}`); return { crux: 0, wikidata: 0, directorio: 0, pais: "" }; });
+  const fromGeoTotal = (fromGeo.crux || 0) + (fromGeo.wikidata || 0) + (fromGeo.directorio || 0);
+  log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic}+adstxt=${fromAdsTxt}+crux=${fromGeo.crux}+wikidata=${fromGeo.wikidata}+directorio=${fromGeo.directorio || 0})`);
+  const grossTotal = fromSellers + fromMonday + fromMajestic + fromAdsTxt + fromGeoTotal;
 
-  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} adstxt=${fromAdsTxt} geo(${fromGeo.pais})=${fromGeo.crux}+${fromGeo.wikidata} = ${grossTotal} brutos`);
+  log(`✅ cron ${slotLabel}: sellers=${fromSellers} monday=${fromMonday} majestic=${fromMajestic} adstxt=${fromAdsTxt} geo(${fromGeo.pais})=${fromGeo.crux}+${fromGeo.wikidata}+${fromGeo.directorio || 0} = ${grossTotal} brutos`);
 
   await _insertFeederRun(token, slotLabel, {
     status: grossTotal > 0 ? "ok" : "incomplete",
     gross_sellers: fromSellers, gross_monday: fromMonday, gross_majestic: fromMajestic,
     rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
     rq_valid_before: rqValid,
-    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/${(w.monday * 100).toFixed(0)}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt} geo=${fromGeo.pais}:crux${fromGeo.crux}/wd${fromGeo.wikidata}`,
+    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/${(w.monday * 100).toFixed(0)}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt} geo=${fromGeo.pais}:crux${fromGeo.crux}/wd${fromGeo.wikidata}/dir${fromGeo.directorio || 0}`,
   });
 }
 
@@ -7611,6 +7674,22 @@ async function _scrapeEmailsFromSocialLinksWorker(socialLinks) {
     }
     // Twitter/X DESACTIVADO (Maxi 2026-07-01, B8): nitter.net caído en 2026 → fetch fallaba
     // siempre gastando 6s. twitter.com/x.com con login wall. Re-agregar si hay Nitter vivo.
+    // ── INSTAGRAM Y TELEGRAM (2026-09-08) ─────────────────────────────────────────────────
+    // Instagram: el HTML público de un perfil trae `"biography":"…"` en el JSON embebido y la
+    // meta description; el mail de contacto de un medio chico vive ahí. Login wall a veces →
+    // el fetch falla y no pasa nada. Telegram: t.me/<canal> es una preview pública con la
+    // descripción. LinkedIn no se lee (sesión obligatoria): el link igual queda para el MB.
+    if (lower.includes("instagram.com") && !seen.has("ig")) {
+      seen.add("ig");
+      const m = lower.match(/instagram\.com\/([a-z0-9._]{2,40})\/?/i);
+      const user = m && !["p", "reel", "reels", "explore", "accounts", "stories", "tv"].includes(m[1]) ? m[1] : null;
+      if (user) tasks.push(tryFetchSocial(`https://www.instagram.com/${user}/`, "Instagram", UA_DESKTOP, 7000));
+    }
+    if (lower.includes("t.me/") && !seen.has("tg")) {
+      seen.add("tg");
+      const m = lower.match(/t\.me\/(?:s\/)?([a-z0-9_]{4,40})/i);
+      if (m && !["joinchat", "share", "addstickers", "proxy"].includes(m[1])) tasks.push(tryFetchSocial(`https://t.me/s/${m[1]}`, "Telegram", UA_DESKTOP, 6000));
+    }
   }
   await Promise.all(tasks);
   return found;
@@ -7646,6 +7725,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // problemas con soluciones OPUESTAS (uno se reintenta, el otro se busca por otra vía) que
   // el informe venía mostrando como el mismo renglón.
   const _stats = opts.statsOut || null;
+  // opts.nombresOut (2026-09-08): Set que recibe nombres de PERSONAS publicados por el sitio
+  // (autores en JSON-LD, <meta name="author">, staff). Es la materia prima de la inferencia por
+  // patrón del pulido: sin un nombre no hay `nombre.apellido@` que probar.
+  const nombresOut = opts.nombresOut || null;
   // Maxi 2026-06-17 v4: socialOut Map recibe emails extraídos de redes
   // sociales (FB business email, YT contact for business). Source: "Facebook",
   // "YouTube", "Twitter".
@@ -7762,7 +7845,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         if (urlByEmail && !urlByEmail.has(lower)) urlByEmail.set(lower, url);
       });
       // Maxi 2026-06-17 v4: detectar social media links en el HTML
-      const SOCIAL_RE = /(?:facebook\.com|youtube\.com|twitter\.com|x\.com)\/[A-Za-z0-9._@\-]{2,80}/gi;
+      // Instagram, LinkedIn y Telegram (2026-09-08): estaban en la lista de pendientes desde el
+      // 19/08. Instagram suele tener el mail en la bio; Telegram muestra la descripción del canal
+      // sin login; LinkedIn se guarda para el MB (la página de empresa exige sesión).
+      const SOCIAL_RE = /(?:facebook\.com|youtube\.com|twitter\.com|x\.com|instagram\.com|linkedin\.com\/company|t\.me)\/[A-Za-z0-9._@\-]{2,80}/gi;
       const socialMatches = html.match(SOCIAL_RE) || [];
       socialMatches.forEach(s => detectedSocialLinks.add(s.toLowerCase()));
       // Maxi 2026-06-18: detectar contact form URLs en el HTML. Patrones típicos:
@@ -7816,6 +7902,25 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
           if (!_PDF_HINT.test(href) && !_PDF_HINT.test(ancla)) continue;
           try { pdfLinks.add(new URL(href, url).href); } catch {}
         }
+      }
+      // ── NOMBRES DE PERSONAS PUBLICADOS POR EL SITIO (2026-09-08) ──────────────────────
+      // Para la inferencia por patrón hace falta un nombre real. Los medios los publican en el
+      // JSON-LD de las notas (`"author":{"@type":"Person","name":"…"}`) y en <meta name="author">.
+      // Se cosechan hasta 6, sin roles ni genéricos ("Redacción", "Staff"): eso lo filtra
+      // `_partesDeNombre` en lib/email.js al usarlos.
+      if (nombresOut && nombresOut.size < 6) {
+        for (const m of html.matchAll(/"@type"\s*:\s*"Person"[^{}]{0,200}?"name"\s*:\s*"([^"]{4,60})"/g)) { if (nombresOut.size >= 6) break; nombresOut.add(m[1].trim()); }
+        for (const m of html.matchAll(/"name"\s*:\s*"([^"]{4,60})"[^{}]{0,120}?"@type"\s*:\s*"Person"/g)) { if (nombresOut.size >= 6) break; nombresOut.add(m[1].trim()); }
+        const _meta = html.match(/<meta[^>]+name=["']author["'][^>]+content=["']([^"']{4,60})["']/i) || html.match(/<meta[^>]+content=["']([^"']{4,60})["'][^>]+name=["']author["']/i);
+        if (_meta) nombresOut.add(_meta[1].trim());
+      }
+      // ── EL MAIL ESTÁ EN UNA IMAGEN (2026-09-08) ──────────────────────────────────────
+      // Página de contacto sin un solo email en el texto pero con una imagen que se llama
+      // "email"/"correo"/"contacto": el mail está dibujado y no lo vamos a leer sin OCR. Se marca
+      // para que el pulido no lo reintente eternamente (`email_en_imagen`) y para que el MB sepa
+      // que tiene que abrir la página y leerlo él.
+      if (_stats && found.size === 0 && CONTACT_HINT.test(url) && /<img\b[^>]+(?:src|alt)=["'][^"']*(?:e-?mail|correo|kontakt|contact|contato|mail)[^"']*["']/i.test(html)) {
+        _stats.emailEnImagen = true;
       }
       if (_stats) _stats.ok = (_stats.ok || 0) + 1;
       return; // éxito → no reintentar
@@ -11523,6 +11628,7 @@ function _rolesAdivinables(domain, language) {
   return [...new Set([...base, "info"])].slice(0, 3).map(l => `${l}@${d}`);
 }
 let _rolMxHoy = { dia: "", n: 0 };
+let _patronHoy = { dia: "", n: 0 };   // créditos de MillionVerifier gastados hoy en hipótesis de patrón (5c)
 const POLISH_CONC = 12;                // 8→12: más dominios en paralelo por wave
 // ── TECHO DE TIEMPO POR CICLO (Maxi 2026-08-04) ────────────────────────────────────────────
 // polishPool corre ANTES de maybeRunAgentSlot en la misma vuelta del loop. Con el presupuesto
@@ -11771,6 +11877,8 @@ function _motivoSinEmail(diag, stats) {
   const ok   = Number(stats?.ok || 0);
   const fail = Number(stats?.fail || 0);
   if (stats?.waf) return "waf_nos_bloqueo";
+  // El mail está dibujado en una imagen: no se lee sin OCR y no cambia con reintentos.
+  if (stats?.emailEnImagen && (!diag || diag.crudos === 0)) return "email_en_imagen";
   if (ok === 0 && fail > 0) return "no_se_pudo_leer_el_sitio";
   if (!diag || diag.crudos === 0) return "la_web_no_publica_ningun_email";
   return `rechazados_por_ranking:${(diag.rechazados || []).join("|").slice(0, 120)}`;
@@ -11976,7 +12084,8 @@ async function polishPool(token) {
         const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
         const _crawlStats = { ok: 0, fail: 0, timeouts: 0, waf: false };
         const _urlPorEmail = new Map();   // dónde se encontró cada dirección
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats, urlByEmail: _urlPorEmail }).catch(() => []);
+        const _nombresOut = new Set();   // personas publicadas por el sitio, para la inferencia por patrón (5c)
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats, urlByEmail: _urlPorEmail, nombresOut: _nombresOut }).catch(() => []);
         // ── LO QUE EL SITIO IMPRIME ES SU CONTACTO, VALGA EL DOMINIO QUE VALGA (2026-09-04) ──
         // `lamoto@motorpress.com.ar` está en todas las páginas de lamoto.com.ar y el ranking le
         // daba -50 por "otra empresa": el lead quedaba en cero teniendo el contacto a la vista.
@@ -12083,6 +12192,41 @@ async function polishPool(token) {
               log(`  🔎👤 ${domain}: Google trajo ${cands.map(c => c.email).join(", ")} → ${foundEmail} (serper_persona ${_usadasHoy}/${_capP})`);
             } else {
               log(`  🔎👤 ${domain}: Google no tiene ningún email del dominio (${r.consultas} consultas, ${_usadasHoy}/${_capP})`);
+            }
+          }
+        }
+        // 5c) INFERENCIA POR PATRÓN (2026-09-08) — la técnica de Hunter que faltaba.
+        //     Con un NOMBRE real (Apollo, la ficha, o los autores que publica el propio sitio) se
+        //     generan `nombre.apellido@` / `napellido@` / `nombre@` en el dominio —o UNA sola
+        //     hipótesis si ya conocemos el patrón de la casa— y se pasan por MillionVerifier.
+        //     Sólo entra la que MV confirma "ok". Nunca sin verificar (sin key, esta fase no
+        //     existe), nunca contra un catch-all (decidirVerificacionMV lo frena antes de gastar),
+        //     y máximo 2 créditos por dominio con tope diario propio (`polish_patron_daily_cap`).
+        if (!foundEmail && String(cfg.polish_patron ?? "true") !== "false"
+            && String(process.env.MILLIONVERIFIER_API_KEY || cfg.millionverifier_api_key || "").trim()) {
+          const _mDay = _madridNowParts().dateISO;
+          if (_patronHoy.dia !== _mDay) _patronHoy = { dia: _mDay, n: 0 };
+          const _capPat = parseInt(cfg.polish_patron_daily_cap || "40", 10) || 40;
+          const _nombres = [foundName, lead.contact_name, ..._nombresOut].filter(Boolean);
+          if (_patronHoy.n < _capPat && _nombres.length) {
+            for (const _nom of _nombres.slice(0, 2)) {
+              const _hip = generarHipotesisDePatron({ nombre: _nom, dominio: domain, emailsConocidos: [...curEmails, ...(Array.isArray(scraped) ? scraped : [])] });
+              if (!_hip.length) continue;
+              let _gastados = 0;
+              for (const _e of _hip.slice(0, 2)) {
+                if (rankEmail(_e, domain, lead.category, _casasOut) <= 0) continue;    // dominio quemado / rebotado
+                const _dec = await decidirVerificacionMV(_e, "pattern").catch(() => ({ verificar: false }));
+                if (!_dec.verificar) { log(`  🧩 ${domain}: patrón ${_e} sin verificar posible (${_dec.motivo || "catch-all"}) → no se adivina`); break; }
+                _gastados++; _patronHoy.n++;
+                const _estado = await _verifyEmailMV(token, cfg, _e);
+                if (_estado === "ok") {
+                  foundEmail = _e; foundSource = "pattern"; foundName = _nom;
+                  log(`  🧩 ${domain}: hipótesis de patrón CONFIRMADA por MV → ${_e} (${_nom}) [patron ${_patronHoy.n}/${_capPat} hoy]`);
+                  break;
+                }
+                log(`  🧩 ${domain}: ${_e} → MV dijo "${_estado}", descartada`);
+              }
+              if (foundEmail || _gastados >= 2 || _patronHoy.n >= _capPat) break;
             }
           }
         }
@@ -13755,6 +13899,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     case "auto_feeder_similar":  source = "similar";      break;  // Maxi 2026-07-16: expansión por similares desde Prospects
     case "auto_feeder_crux":     source = "crux";         break;  // 2026-09-08: top de Chrome por país (fuente GEO)
     case "auto_feeder_wikidata": source = "wikidata";     break;  // 2026-09-08: medios con sitio oficial por país (fuente GEO)
+    case "auto_feeder_directorio": source = "directorio"; break;  // 2026-09-08: directorio de prensa por país (fuente GEO)
     // Maxi 2026-06-22 FIX: los imports MANUALES ya vienen con el source correcto → PRESERVARLO.
     // Antes caían en default="csv" → el filtro de FUENTE en Prospects no respetaba nada.
     case "sellers_json":

@@ -1,3 +1,5 @@
+// La MISMA regla de plausibilidad que el worker (2026-09-08): TLD real, sin placeholders, sin registradores.
+import { esEmailPlausible } from "../auto-prospector/lib/email.js";
 // ============================================================
 // ADEQ TOOLBAR — Verificación de Emails v2
 // Capas de verificación (sin SMTP, que no es posible desde browser):
@@ -144,6 +146,10 @@ export function isGarbageEmail(email) {
   if (!e.includes("@")) return true;
   const [local, domain] = e.split("@");
   if (!local || !domain) return true;
+  // Primero la regla compartida con el worker (TLD real, placeholders, registradores, dominios
+  // ignorados). Lo de abajo son los agregados propios de la extensión (proxies de WHOIS por
+  // sufijo, heurística de registrador en el dominio, sufijo "-abuse").
+  if (!esEmailPlausible(e)) return true;
 
   // 1. Dominio de proxy/whois (exacto o subdominio)
   for (const d of GARBAGE_DOMAIN_SUFFIXES) {
