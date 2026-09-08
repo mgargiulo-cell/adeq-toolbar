@@ -73,6 +73,17 @@ function bearer(key) { return `Bearer ${_sbAuthToken || key}`; }
 //   2) Reintenta los errores TRANSITORIOS (el 522 de Supabase es intermitente: en las
 //      pruebas el auth volvía en el 2º intento). 3 intentos con backoff 0.6s/1.5s.
 //   3) Mensaje CLARO: "servidor temporalmente caído, no es tu contraseña".
+//
+// ── Y CADA INTENTO TIENE RELOJ (2026-09-08) ──────────────────────────────────────────────
+// Faltaba lo más importante: `fetch` **sin timeout**. Un pedido que se cuelga —wifi que se
+// cae a mitad, TCP abierto que no contesta, Supabase detrás de Cloudflare sin cerrar la
+// conexión— no rechaza NUNCA. Los tres reintentos no servían de nada porque el primero jamás
+// terminaba. Y esta función se llama con `await` en la primera pantalla del arranque del
+// popup: colgada acá, NADA de lo que viene después corre — ni el análisis, ni el veredicto
+// del CRM, ni el borrador. El síntoma que reportó el user es exactamente ése: el recuadro
+// del CRM se queda con el "Checking..." del HTML para siempre, sin un solo error en consola.
+// Es la tercera vez que el mismo patrón nos deja un sistema mudo (Gmail 18/08, ficha 07/09).
+const _AUTH_TIMEOUT_MS = 8000;
 async function _supabaseAuthFetch(path, body) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
@@ -84,6 +95,7 @@ async function _supabaseAuthFetch(path, body) {
         method: "POST",
         headers: { "Content-Type": "application/json", "apikey": key },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(_AUTH_TIMEOUT_MS),
       });
       const ct = res.headers.get("content-type") || "";
       const isJson = ct.includes("application/json");
@@ -1597,7 +1609,11 @@ export async function getPitchDrafts(accessToken, userEmail, language = null) {
   try {
     const res = await fetch(
       `${url}/rest/v1/toolbar_pitch_drafts?${userFilter}${langFilter}&order=priority.asc,is_default.desc,updated_at.desc&select=id,user_email,name,language,subject,body,is_default,priority,updated_at`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
+      // Con reloj: `autofillDraftOnLoad` espera esta consulta Y la de plantillas con un
+      // `Promise.all`. Sin timeout, un pedido colgado acá deja el recuadro del mail vacío
+      // para siempre —sin asunto, sin plantilla y sin error— aunque el CRM haya contestado.
+      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(8000) }
     );
     if (!res.ok) return [];
     return await res.json();

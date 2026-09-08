@@ -273,6 +273,12 @@ function resetAnalysisUI() {
   // temprano se creyera ya pintado y no volviera a preguntar.
   state.crmVeredicto  = null;
   _crmVuelo           = null;
+  // El bloqueo del borrador era del dominio anterior: se destraba y se limpia el cartel.
+  // ⚠️ La bandera se baja ANTES de destrabar, no después: `_bloquearBorradorCrm(false)`
+  // dispara un autofill cuando viene de un bloqueo, y acá no corresponde — el borrador de la
+  // web nueva lo carga la pipeline, con su idioma, unas líneas más adelante.
+  _borradorBloqueado  = false;
+  try { _bloquearBorradorCrm(false); } catch {}
   // Los adicionales encolados son de la web anterior: si no se limpian, el push de la
   // siguiente le manda al CRM contactos que no son suyos. (El objeto igual lleva el dominio
   // adentro y se compara, pero limpiarlo acá es la barrera que corresponde.)
@@ -458,27 +464,43 @@ function showPersonalQuotaBanner({ used, limit, pct }) {
 // dispara onUpdated multiple veces durante un page load.
 let _pipelineRunning = false;
 let _pipelinePendingDomain = null;
+// Devuelve una promesa que resuelve cuando terminaron los seis chequeos. La necesita el
+// arranque, que después de analizar guarda la caché de sesión y cuenta el +400K: antes tenía
+// su PROPIA copia de este bloque y por eso los arreglos escritos acá no se veían al abrir la
+// toolbar (sólo al navegar de una URL a otra con el panel abierto). Un solo camino.
 function runAnalysisPipeline() {
   if (_pipelineRunning) {
     // Otro pipeline en curso — guardamos el domain por si cambió, para
     // re-correr cuando termine. Evita N pipelines paralelos.
     _pipelinePendingDomain = state.domain;
-    return;
+    return Promise.resolve();
   }
   _pipelineRunning = true;
   const startedDomain = state.domain;
 
-  // ── EL BORRADOR NO ESPERA AL ANÁLISIS (2026-09-07, pedido del user) ────────────────────
+  // ── LOS CAMPOS Y EL BORRADOR ESPERAN AL CRM, NO AL ANÁLISIS (2026-09-08) ───────────────
   // *"Apenas cambio de url todo se tiene que actualizar lo más rápido posible técnicamente."*
-  // El idioma de la plantilla se resuelve con el TLD y el contexto de la página, y las 69
-  // plantillas del CRM ya están en memoria desde la primera carga: no hay ninguna razón para
-  // que el recuadro del mail espere a SimilarWeb, al scraper de emails y a los banners.
-  // Se llena YA con lo que se sabe, y se vuelve a resolver al final por si el análisis
-  // corrigió la GEO.
-  autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill temprano]", e?.message || e));
+  // (07/09) · *"Los campos se completan todos rápidamente."* (08/09)
+  //
+  // La ficha del CRM contesta en 0,4-0,66 s y trae idioma, país y correo ya resueltos. El
+  // análisis completo —SimilarWeb, el scraper de 65 rutas, los banners— tarda mucho más. Antes
+  // el formulario se llenaba recién al final de TODO eso: los datos estaban disponibles en
+  // medio segundo y el MB los veía aparecer varios segundos después.
+  //
+  // Y el borrador se disparaba a ciegas, sin esperar a nadie. Eso tenía un costo que el commit
+  // de ayer no vio: en esa primera pasada no hay `<html lang>`, ni og:locale, ni texto, ni GEO,
+  // así que `_resolvePitchLang` caía al default y cargaba la plantilla EN INGLÉS sobre un
+  // diario español, hasta que la segunda pasada lo corregía. Colgado del chequeo del CRM, el
+  // idioma sale del propio CRM (`form-geo` ya completo) y sale bien la primera vez.
+  const chequeoCrm = runDuplicateCheck().catch(() => {});
+  chequeoCrm.then(() => {
+    if (state.domain !== startedDomain) return;   // el MB ya navegó a otra web
+    try { runAutoFill(); } catch (e) { console.warn("[AutoFill temprano]", e?.message || e); }
+    autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill temprano]", e?.message || e));
+  });
 
   const tasks = [
-    runDuplicateCheck().catch(() => {}),
+    chequeoCrm,
     runTrafficCheck().catch(() => {}),
     runEmailScraper().catch(() => {}),
   ];
@@ -486,7 +508,7 @@ function runAnalysisPipeline() {
   if (typeof runBannerDetection === "function") tasks.push(runBannerDetection().catch(() => {}));
   if (typeof runPageContext === "function")    tasks.push(runPageContext().catch(() => {}));
 
-  Promise.all(tasks).finally(() => {
+  return Promise.all(tasks).finally(() => {
     _pipelineRunning = false;
     // ⚠️ Esto FALTABA: al cambiar de URL se re-corrían los seis chequeos y después no se
     // llenaba nada. El formulario del CRM quedaba con los datos que el MB tuviera de antes y
@@ -2756,19 +2778,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Contador de API calls + límites del plan en footer
   updateApiFooter();
 
-  // Análisis core en paralelo — no bloquea el render del UI
-  Promise.all([
-    runDuplicateCheck() .catch(e => console.error("[DupCheck]",   e)),
-    runTrafficCheck()   .catch(e => console.error("[Traffic]",    e)),
-    runAuditCheck()     .catch(e => console.error("[Audit]",      e)),
-    runEmailScraper()   .catch(e => console.error("[Email]",      e)),
-    runBannerDetection().catch(e => console.error("[Banners]",    e)),
-    runPageContext()    .catch(e => console.error("[PageCtx]",    e)),
-  ]).then(async () => {
-    runAutoFill();
-    // Autocarga del borrador del idioma de la GEO (priority asc).
-    // Se hace AFTER runAutoFill para que form-geo ya esté seteado.
-    autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill]", e));
+  // ── UN SOLO CAMINO DE ANÁLISIS (2026-09-08) ─────────────────────────────────────────────
+  // Acá vivía una SEGUNDA copia del pipeline: los mismos seis chequeos, seguidos de
+  // `runAutoFill()` y `autofillDraftOnLoad()`. Como el arranque usaba su copia y no
+  // `runAnalysisPipeline()`, todo lo que se arreglaba en esa función NO se veía al abrir la
+  // toolbar —el caso normal—, sólo al navegar de una URL a otra con el panel ya abierto.
+  // Es exactamente lo que reportó el user: *"todas estas correcciones no están funcionando"*.
+  // Estaban escritas; corría el otro camino. Ahora hay uno solo, y lo que sigue acá abajo es
+  // lo único propio del arranque: la caché de sesión y el conteo del +400K.
+  runAnalysisPipeline().then(async () => {
     // Guardar en caché de sesión los datos costosos (evita créditos en subpáginas)
     setSessionCache(state.domain, {
       duplicate:   state.duplicate,
@@ -2882,7 +2900,14 @@ const TLD_TO_LANG = { es:"es",mx:"es",ar:"es",co:"es",cl:"es",pe:"es",uy:"es",py
 
 function detectLangFromDomain(domain) {
   const tld = (domain || "").split(".").pop()?.toLowerCase();
-  return TLD_TO_LANG[tld] || "";
+  if (!tld) return "";
+  if (TLD_TO_LANG[tld]) return TLD_TO_LANG[tld];
+  // `TLD_TO_LANG` sólo lista 12 dominios (es/pt/it) y quedó corta: un `.de`, un `.fr` o un
+  // `.pl` no daban idioma. Casi todos los TLD de país SON el código ISO del país, así que
+  // `GEO_TO_LANG` —la tabla que ya mantenemos, 23 idiomas— responde por los demás sin
+  // duplicar nada. Se consulta después de la lista explícita para que las excepciones
+  // escritas a mano sigan mandando.
+  return GEO_TO_LANG[tld.toUpperCase()] || "";
 }
 
 // ── Re-fetch ligero del HTML de un dominio (para Prospects card "🔍 Data") ──
@@ -2930,56 +2955,81 @@ async function _fetchPageMetaForProspect(domain) {
   } catch { return null; }
 }
 
+// ── LO QUE YA SABE EL CRM SE MUESTRA, NO SE VUELVE A ADIVINAR (2026-09-08, reporte del user) ──
+// Textual: *"no carga los datos del CRM en idioma, país y correo"*. Era literal. La ficha
+// devuelve `idioma` ("Español"), `top_geo` ("España") y `email` —lo verifiqué contra
+// producción— y esta función los ignoraba: sacaba la GEO de SimilarWeb, el idioma del TLD y el
+// correo del scraper, y usaba lo del CRM sólo como último recurso. Para un sitio que ADEQ ya
+// trabajó, el dato del CRM es el registro real; nuestra detección es una estimación. Iba
+// primero la estimación.
+//
+// Y encima había un portón: `shouldFill` sólo dejaba pasar sitios nuevos o contactados hace
+// más de 30 días. Para todo lo demás, idioma y correo quedaban vacíos a propósito — que es
+// justo el caso en que el CRM tiene el dato bueno.
+//
+// Ahora: el CRM primero, la detección como respaldo, y **nunca se pisa un campo que ya tiene
+// algo** (si el MB eligió, manda el MB). Se completa aunque la web no sea prospectable: el MB
+// tiene que ver el estado completo de lo que está mirando. Lo que no se prepara en ese caso es
+// el mail, y de eso se ocupa `_bloquearBorradorCrm`.
 function runAutoFill() {
-  // Si el CRM ya dijo que no, no se completa nada: los datos que están son los suyos y quedan
-  // congelados. Autocompletar acá volvía a llenar GEO y email encima del bloqueo.
-  if (_crmBloquea()) return;
-  const dup    = state.duplicate;
-  const isNew  = !dup?.found;
+  const dup = state.duplicate;
 
-  // Condición para llenar campos SENSIBLES (email, idioma): nuevo o dup > 30 días
-  let shouldFill = isNew;
-  if (!isNew && dup?.fecha) {
-    const daysSince = (Date.now() - new Date(dup.fecha).getTime()) / 86_400_000;
-    shouldFill = daysSince > 30;
+  // ── IDIOMA ────────────────────────────────────────────────────
+  // El <select> maneja dos vocabularios: los 5 heredados de Monday van por índice ("1" =
+  // Spanish) y los 18 que se agregaron el 04/09 van por ISO ("de"). `LANG_TO_IDIOMA` sólo
+  // conoce los cinco viejos, así que un sitio alemán no completaba nada. Se prueba el índice
+  // y, si no hay, el ISO contra las opciones reales del select.
+  const idSel = document.getElementById("form-idioma");
+  if (idSel && !idSel.value) {
+    const isoCrm  = _isoDeEtiquetaCrm(dup?.idioma);            // "Español" → "es"
+    const lang    = isoCrm || state.siteLanguage || detectLangFromDomain(state.domain);
+    const candidatos = [LANG_TO_IDIOMA[lang], lang].filter(v => v);
+    const val = candidatos.find(v => [...idSel.options].some(o => o.value === String(v)));
+    if (val) idSel.value = String(val);
   }
 
-  // ── GEO siempre se autocompleta si tenemos dato y el campo está vacío ────
-  // (no depende de shouldFill — si cambia el top country después de un mes,
-  //  debería reflejarse en Monday sin forzar que el ítem sea "nuevo")
-  let topCountry = state.trafficData?.topCountries?.[0]?.code;
-  if (!topCountry) {
-    const firstChip = document.querySelector(".country-flag-chip[data-code]");
-    if (firstChip) topCountry = firstChip.dataset.code;
-  }
-  if (topCountry && GEO_LABEL[topCountry]) {
-    const geoSel = document.getElementById("form-geo");
-    if (geoSel && !geoSel.value) { // solo si el select está vacío — no pisa selección manual del user
-      const opt = [...geoSel.options].find(o => o.text === GEO_LABEL[topCountry]);
+  // ── GEO ───────────────────────────────────────────────────────
+  // El CRM guarda el nombre del país ("España"); SimilarWeb da el código ("ES"). Se acepta
+  // cualquiera de los dos y se busca la opción por texto.
+  const geoSel = document.getElementById("form-geo");
+  if (geoSel && !geoSel.value) {
+    let nombrePais = String(dup?.geo || "").trim();
+    if (!nombrePais) {
+      let cc = state.trafficData?.topCountries?.[0]?.code
+            || document.querySelector(".country-flag-chip[data-code]")?.dataset.code;
+      if (cc) nombrePais = GEO_LABEL[cc] || "";
+    }
+    if (nombrePais) {
+      const opt = [...geoSel.options].find(o => o.text.trim().toLowerCase() === nombrePais.toLowerCase());
       if (opt) geoSel.value = opt.value || opt.text;
     }
   }
 
-  if (!shouldFill) return;
-
-  // ── IDIOMA: del DOM o TLD ─────────────────────────────────────
-  const lang = state.siteLanguage || detectLangFromDomain(state.domain);
-  if (lang) {
-    const idiomaVal = LANG_TO_IDIOMA[lang];
-    if (idiomaVal !== undefined) {
-      const idSel = document.getElementById("form-idioma");
-      if (idSel) idSel.value = idiomaVal;
-    }
+  // ── EMAIL ─────────────────────────────────────────────────────
+  // El del CRM es la dirección que ADEQ ya usó con este sitio: para una web que está en la
+  // base, gana. La excepción es que haya rebotado — una dirección muerta no sirve por más
+  // registrada que esté—; ahí vale la que encontró el scraper.
+  // `_bestEmailByTier` elige por tiering comercial (publicidad@/comercial@ o el
+  // decision-maker), no el [0] de inserción.
+  const emailEl = document.getElementById("form-email");
+  if (emailEl && !emailEl.value) {
+    // ⚠️ Sin `dup.email` como último recurso: ponerlo ahí reponía la dirección rebotada apenas
+    // el scraper no encontraba otra, que es exactamente el caso en que más daño hace.
+    const delCrm = dup?.rebotado ? "" : (dup?.email || "");
+    const mejor  = delCrm || _bestEmailByTier(state.emails) || "";
+    if (mejor) emailEl.value = mejor;
   }
+}
 
-  // ── EMAIL: mejor opción disponible ──────────────────────────
-  // Maxi 2026-07-09: mejor email por tiering comercial (no el [0] de inserción) → autofill Monday
-  // con publicidad@/comercial@ o el decision-maker de Apollo, según la elección del user (Q4).
-  const bestEmail = _bestEmailByTier(state.emails) || dup?.email || "";
-  if (bestEmail) {
-    const emailEl = document.getElementById("form-email");
-    if (emailEl && !emailEl.value) emailEl.value = bestEmail;
+// "Español" → "es". El CRM manda la etiqueta; el resto del popup piensa en ISO. Se deriva de
+// `IDIOMA_CRM`, que ya es la tabla oficial, para que no haya una segunda lista que mantener.
+let _etiquetaCrmAIso = null;
+function _isoDeEtiquetaCrm(etiqueta) {
+  if (!etiqueta) return "";
+  if (!_etiquetaCrmAIso) {
+    _etiquetaCrmAIso = Object.fromEntries(Object.entries(IDIOMA_CRM).map(([iso, et]) => [et.toLowerCase(), iso]));
   }
+  return _etiquetaCrmAIso[String(etiqueta).trim().toLowerCase()] || "";
 }
 
 // ============================================================
@@ -3236,40 +3286,74 @@ function _aplicarBloqueoCrm(v) {
     if (bloquea) { push.dataset.textoPrevio = push.dataset.textoPrevio || push.textContent; push.textContent = "⛔ No prospectable"; }
     else if (push.dataset.textoPrevio) { push.textContent = push.dataset.textoPrevio; delete push.dataset.textoPrevio; }
   }
-  _bloquearFormularioCrm(!!bloquea);
+  _bloquearBorradorCrm(!!bloquea);
 }
 
-// ── SI NO SE PUEDE PROSPECTAR, NO SE PREPARA NADA (2026-09-07, regla del user) ───────────
-// Textual: *"Si es un Live o alguien que no es prospectable, el borrador ni se debe cargar,
-// esos campos deben estar bloqueados."* Apagar sólo los dos botones no alcanzaba: el MB veía
-// un mail redactado, un email elegido y el formulario lleno, todo listo para mandarle a un
-// cliente activo. Un formulario que se puede completar es una invitación a completarlo.
-const _CAMPOS_CRM = [
-  "form-ejecutivo", "form-estado", "form-idioma", "form-geo", "form-pv-display",
-  "form-email-search", "form-fecha", "form-telefono", "form-subject", "pitch-text",
-  "form-email-futuro", "form-email-futuro-2", "form-email-futuro-3",
+// ── LOS DATOS CARGAN SIEMPRE; EL BORRADOR NO, Y AMBOS LO DICEN (2026-09-08, regla del user) ──
+// Dos frases del user que hay que leer juntas, porque hablan de cosas distintas:
+//   1. *"La carga de los DATOS de la tool tiene que ser de inmediato, como era antes, sea que
+//      es una web prospectable o no prospectable."*
+//   2. *"No debe cargar el borrador, y que en el campo aparezca que no carga porque es una web
+//      no prospectable. Pero arriba en CRM debería decir web no prospectable."*
+//
+// O sea: idioma, país, correo, tráfico y el resto del análisis se ven SIEMPRE —son información,
+// y verla no le hace nada a nadie—. Lo único que no se prepara es el mail.
+//
+// La versión del 07/09 no distinguía: deshabilitaba los 17 campos de una y vaciaba asunto y
+// cuerpo. Dos daños colaterales, los dos reportados como bug:
+//   · Los datos del CRM (idioma/país/correo) quedaban vacíos y bloqueados junto con el mail.
+//   · `pitch-country` y `btn-pitch-clear` entraban en la lista, así que el MB no podía elegir
+//     un país ni apretar Limpiar: un formulario muerto sin forma de revivirlo.
+// Y al vaciar en silencio, el campo no decía POR QUÉ estaba vacío — se leía como que la
+// toolbar se había roto, que es justamente lo que el user creyó.
+const _CAMPOS_BORRADOR = [
+  "form-subject", "pitch-text",
   "btn-pitch-flag", "btn-pitch-clear", "btn-generate-pitch", "pitch-country",
 ];
-function _bloquearFormularioCrm(bloquear) {
-  for (const id of _CAMPOS_CRM) {
+const _AVISO_NO_PROSPECTABLE = "⛔ No se carga borrador: web no prospectable.";
+let _borradorBloqueado = false;
+function _bloquearBorradorCrm(bloquear) {
+  const veniaBloqueado = _borradorBloqueado;
+  _borradorBloqueado = !!bloquear;
+  for (const id of _CAMPOS_BORRADOR) {
     const el = document.getElementById(id);
     if (!el) continue;
     el.disabled = bloquear;
     el.classList.toggle("campo-bloqueado-crm", bloquear);
   }
-  // Los radios de la lista de emails también: elegir destinatario es el primer paso del envío.
-  document.querySelectorAll("#email-result input").forEach(r => { r.disabled = bloquear; });
-  if (!bloquear) return;
-  // Y se vacía lo que ya se hubiera preparado. El borrador se llena apenas se abre la web
-  // (antes de que llegue el veredicto, a propósito, para que sea rápido), así que cuando el
-  // CRM contesta "no" hay que deshacerlo — no basta con no volver a llenarlo.
   const pitchEl = document.getElementById("pitch-text");
   const subjEl  = document.getElementById("form-subject");
-  if (pitchEl) pitchEl.value = "";
-  if (subjEl)  subjEl.value  = "";
+  if (!bloquear) {
+    // Se devuelven los placeholders originales, o el próximo dominio hereda el cartel de éste.
+    if (pitchEl) pitchEl.placeholder = pitchEl.dataset.phOriginal ?? pitchEl.placeholder;
+    if (subjEl)  subjEl.placeholder  = subjEl.dataset.phOriginal  ?? subjEl.placeholder;
+    // Si venía bloqueado, el borrador está vacío porque LO BORRAMOS nosotros: destrabar los
+    // campos y dejarlos en blanco sería quedarse a mitad de camino. Pasa de verdad cada vez que
+    // el MB aprieta 🔄 Reintentar sobre una consulta que había fallado y ahora contesta bien.
+    if (veniaBloqueado) {
+      _pista("");
+      autofillDraftOnLoad().catch(e => console.warn("[DraftAutofill tras destrabar]", e?.message || e));
+    }
+    return;
+  }
+  // El borrador se llena apenas se abre la web, ANTES de que conteste el CRM (a propósito,
+  // para que sea rápido): cuando el veredicto dice que no, hay que deshacerlo — no alcanza
+  // con no volver a llenarlo.
+  //
+  // El motivo va en el `placeholder`, no en el `value`. Un texto puesto como valor es un texto
+  // que se puede mandar: bastaría que alguien apretara enviar con el campo "lleno". Como
+  // placeholder se lee igual de bien, no viaja a ningún lado, y desaparece solo si el campo
+  // se vuelve a usar.
+  const motivo = _motivoBloqueoCrm() || _AVISO_NO_PROSPECTABLE;
+  for (const [el, txt] of [[pitchEl, `${_AVISO_NO_PROSPECTABLE} ${motivo}`], [subjEl, _AVISO_NO_PROSPECTABLE]]) {
+    if (!el) continue;
+    if (el.dataset.phOriginal === undefined) el.dataset.phOriginal = el.placeholder || "";
+    el.value = "";
+    el.placeholder = txt;
+  }
   state.pitchTemplate = null;
   try { _tradPitch?.invalidar?.(); } catch {}
-  try { _pista(_motivoBloqueoCrm() + " No se carga borrador."); } catch {}
+  try { _pista(`${_AVISO_NO_PROSPECTABLE} ${motivo}`); } catch {}
 }
 
 async function autoDetectPageLanguage() {
@@ -5353,11 +5437,15 @@ function _veredictoCrm(dup) {
     return { ok: true, titulo: "Web prospectable", detalle: "Nunca fue contactada.", clase: "crm-si" };
   }
   const estado = String(dup.status || "").trim();
+  // "Web NO prospectable" y no "No prospectable": el MB lee el recuadro de reojo mientras
+  // navega, y las dos respuestas tienen que empezar igual para que la diferencia salte a la
+  // vista en la misma palabra (pedido del user, 08/09: *"arriba en CRM debería decir web no
+  // prospectable"* / *"el MB debe saber enseguida el status de la web que está viendo"*).
   if (_CRM_LIVE_RE.test(estado)) {
-    return { ok: false, titulo: "No prospectable", detalle: "Cliente activo.", clase: "crm-no" };
+    return { ok: false, titulo: "Web NO prospectable", detalle: "Cliente activo.", clase: "crm-no" };
   }
   if (_CRM_EN_CURSO_RE.test(estado)) {
-    return { ok: false, titulo: "No prospectable", detalle: `Propuesta en curso (${estado}).`, clase: "crm-no" };
+    return { ok: false, titulo: "Web NO prospectable", detalle: `Propuesta en curso (${estado}).`, clase: "crm-no" };
   }
   if (_CRM_PAUSADO_RE.test(estado)) {
     return { ok: true, titulo: "Web prospectable", detalle: "Cliente Antiguo Pausado.", clase: "crm-si" };
@@ -5449,15 +5537,52 @@ function _motivoBloqueoCrm() {
 // "seguí esperando".
 // Ahora: 2,5 s por intento, dos intentos, y a los ~5 s como mucho hay un veredicto en pantalla
 // (aunque sea "no pude preguntar"). Se devuelve `ms` para poder mostrar cuánto tardó.
-const _CRM_FICHA_TIMEOUT_MS = 2500;
+// Medido contra producción el 08/09: **0,40-0,66 s en caliente**, y **3,15 s en el primer
+// pedido del día**, cuando Vercel tiene que levantar la función. Con el techo en 2,5 s ese
+// primer pedido —el que hace el MB al abrir la toolbar por la mañana, o sea el que más
+// importa— se abortaba SIEMPRE, y el veredicto salía por el segundo intento o no salía. El
+// techo tiene que dejar pasar el arranque en frío: 4 s cubre 3,15 s con margen y sigue muy
+// por debajo de lo que el user pidió sentir (*"el MB debe saber enseguida"*), porque en el
+// 99% de las aperturas contesta en medio segundo y no se espera nada.
+const _CRM_FICHA_TIMEOUT_MS = 4000;
+
+// ── EL DOMINIO QUE SE PREGUNTA ES EL RAÍZ (2026-09-08, regla del user) ───────────────────
+// *"Omití el www, el http y todo eso: que sea dominio real, ole.com y listo. En el CRM están
+// todos sin www ni https."*
+//
+// `extractDomain` ya saca protocolo, `www.` y la ruta, y el endpoint tolera esas tres cosas.
+// Lo que NO tolera —lo medí el 08/09— son los subdominios: `m.elpais.com` devuelve
+// `found:false` mientras `elpais.com` devuelve "Ciclo Finalizado". Y ese fallo cae para el
+// lado peligroso: "no encontrado" se pinta como **"Web prospectable"**, o sea la toolbar
+// invita a escribirle a un cliente activo porque el MB entró por la versión móvil o por una
+// sección (`deportes.ole.com`). Es el error caro, y silencioso.
+//
+// Se resuelve sin lista de sufijos: se pregunta el host tal cual —por si el CRM tuviera una
+// fila con subdominio— y, si no aparece, se repregunta por el raíz. Dos labels, salvo que los
+// dos últimos formen un sufijo compuesto (`com.ar`, `co.uk`, `gob.mx`), donde van tres.
+// El worker tiene la lista completa (`MULTI_PART_TLDS`, 200 entradas) pero vive en otro
+// bundle: duplicarla acá sería crear una segunda lista para que se desincronice de la primera.
+// Esta heurística cubre los sufijos compuestos reales; y si fallara, el peor caso es preguntar
+// un dominio que no existe y recibir "no encontrado", nunca un match equivocado.
+function _dominioRaiz(host) {
+  const p = String(host || "").toLowerCase().replace(/\.+$/, "").split(".").filter(Boolean);
+  if (p.length <= 2) return p.join(".");
+  const compuesto = /^(com|co|org|net|gov|gob|edu|ac|mil|nom|web|ind)$/.test(p[p.length - 2])
+                 && p[p.length - 1].length === 2;
+  return p.slice(compuesto ? -3 : -2).join(".");
+}
 
 async function buscarEnCrm(domain) {
   const t0 = Date.now();
+  // El host como vino y, si tiene subdominio, el raíz. `Set` para no preguntar dos veces lo
+  // mismo, que es el caso normal (un dominio sin subdominio ya ES su raíz).
+  const candidatos = [...new Set([String(domain || "").toLowerCase().replace(/\.+$/, ""), _dominioRaiz(domain)].filter(Boolean))];
   let ultimo = "";
+  for (const dom of candidatos) {
   for (let intento = 1; intento <= 2; intento++) {
     try {
       const r = await fetch(
-        `${crmUrl("/ficha")}?domain=${encodeURIComponent(domain)}`,
+        `${crmUrl("/ficha")}?domain=${encodeURIComponent(dom)}`,
         {
           headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
           cache: "no-store",
@@ -5467,24 +5592,38 @@ async function buscarEnCrm(domain) {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
       const ms = Date.now() - t0;
-      if (!j.found) return { found: false, ms };
+      // "No está" con este candidato no es la respuesta final: puede estar con el raíz.
+      // Se corta el bucle de reintentos y se prueba el siguiente.
+      if (!j.found) { ultimo = "no está en el CRM"; break; }
       return {
-        found: true, itemId: null, ms,
+        found: true, itemId: null, ms, dominioConsultado: dom,
         status: j.estado || "", ejecutivo: j.ejecutivo || "", trafico: j.pageviews || "",
         email: j.email || "", geo: j.top_geo || "", fecha: j.fecha_contacto || "",
         idioma: j.idioma || "", board: j.board || "",
+        // El endpoint ya mandaba estos dos y nadie los leía. Sirven para no autocompletar el
+        // formulario con una dirección que se sabe muerta: si rebotó, vale la del scraper.
+        rebotado: !!(j.email_rebotado || j.rebotado_at), reboteMotivo: j.rebote_motivo || "",
         descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0,
       };
     } catch (e) {
       // `AbortSignal.timeout` tira TimeoutError; se traduce para que el cartel diga algo que
       // el MB entienda en vez de un nombre de excepción.
       ultimo = e?.name === "TimeoutError" ? `no contestó en ${_CRM_FICHA_TIMEOUT_MS / 1000}s` : (e?.message || String(e));
-      console.warn(`buscarEnCrm (intento ${intento}):`, ultimo);
+      console.warn(`buscarEnCrm ${dom} (intento ${intento}):`, ultimo);
     }
   }
-  // ⚠️ NO se devuelve `{found:false}` ante un error: eso le diría al MB "está libre,
-  // dale" justo cuando no pudimos verificar, que es el error caro. Se marca `indeterminado`
-  // y el cartel lo dice.
+  // Si el corte fue por un error de red y no por "no está", no se sigue probando candidatos:
+  // el problema no es el dominio, y preguntar de nuevo sólo suma segundos al cartel.
+  if (ultimo && ultimo !== "no está en el CRM") break;
+  }
+  // Todos los candidatos contestaron y ninguno está: ésa es una respuesta legítima del CRM
+  // —la web nunca fue contactada— y tiene que leerse como "Web prospectable". Mezclarla con
+  // el caso de abajo convertiría cada sitio nuevo en un "no pude consultar", que es la alarma
+  // falsa que hace que el MB deje de mirar el cartel.
+  if (ultimo === "no está en el CRM") return { found: false, ms: Date.now() - t0 };
+  // ⚠️ Y al revés: NO se devuelve `{found:false}` ante un error. Eso le diría al MB "está
+  // libre, dale" justo cuando no pudimos verificar, que es el error caro. Se marca
+  // `indeterminado` y el cartel lo dice.
   return { found: false, indeterminado: true, motivo: ultimo, ms: Date.now() - t0 };
 }
 
@@ -5509,31 +5648,48 @@ function _crmConsultar(domain, { forzar = false } = {}) {
 // La consulta se comparte con `runDuplicateCheck` por `_crmConsultar`, así que sigue siendo
 // UN pedido.
 let _crmWatchdog = null;
+// Techo duro: 2 intentos × 4 s + margen de red. Si a los 9 s no hay veredicto, algo se colgó
+// en un lugar que no previmos y el MB tiene que enterarse, no seguir mirando un reloj.
+// ⚠️ Este número tiene que quedar POR ENCIMA de 2 × `_CRM_FICHA_TIMEOUT_MS`. Si queda por
+// debajo, el watchdog dispara mientras el segundo intento todavía está en vuelo y el MB ve
+// "no pude consultar" sobre una consulta que iba a contestar bien.
+const _CRM_WATCHDOG_MS = 2 * _CRM_FICHA_TIMEOUT_MS + 1000;
 function _armarWatchdogCrm() {
   clearTimeout(_crmWatchdog);
-  // Techo duro: 2 intentos × 2,5 s + margen. Si a los 6 s no hay veredicto, algo se colgó en
-  // un lugar que no previmos y el MB tiene que enterarse, no seguir mirando un reloj.
   _crmWatchdog = setTimeout(() => {
     if (state.crmVeredicto) return;
     const v = { ok: false, duda: true, provisional: true, titulo: "No pude consultar el CRM",
-                detalle: "La consulta no volvió en 6 segundos. Verificá a mano en ADEQ o reintentá.",
+                detalle: `La consulta no volvió en ${_CRM_WATCHDOG_MS / 1000} segundos. Verificá a mano en ADEQ o reintentá.`,
                 clase: "crm-duda" };
     state.crmVeredicto = v;
     _pintarVeredictoCrm(v, null);
     _aplicarBloqueoCrm(v);
-  }, 6000);
+  }, _CRM_WATCHDOG_MS);
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  // ⚠️ El cartel y el watchdog van ANTES del primer `await`, no después. Con ellos abajo de
+  // los dos `await` de arriba, cualquier salida temprana —o un `chrome.storage` lento— dejaba
+  // el recuadro con el "Checking..." del HTML, que es texto muerto: no lo pinta nadie, no
+  // vence nunca y no distingue "estoy preguntando" de "me colgué antes de preguntar".
+  // El MB tiene que saber el estado de la web enseguida (regla del user, 08/09), y "todavía
+  // estoy preguntando" también es saberlo.
+  _pintarEsperaCrm();
+  _armarWatchdogCrm();
   try {
     const { auth } = await chrome.storage.local.get("auth");
-    if (!auth?.loggedIn) return;               // con el login en pantalla la tarjeta ni se ve
+    if (!auth?.loggedIn) { clearTimeout(_crmWatchdog); return; }   // con el login en pantalla la tarjeta ni se ve
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.url || !/^https?:/i.test(tab.url)) return;
-    const dom = extractDomain(tab.url);
-    if (!dom) return;
-    _pintarEsperaCrm();
-    _armarWatchdogCrm();
+    const dom = tab?.url && /^https?:/i.test(tab.url) ? extractDomain(tab.url) : "";
+    if (!dom) {
+      // Ni error ni espera eterna: en una pestaña que no es una web, se dice.
+      clearTimeout(_crmWatchdog);
+      const v = { ok: false, duda: true, titulo: "Sin web que consultar",
+                  detalle: "Abrí la pestaña de un sitio para ver su estado en ADEQ.", clase: "crm-duda" };
+      state.crmVeredicto = v;
+      _pintarVeredictoCrm(v, null);
+      return;
+    }
     const r = await _crmConsultar(dom);
     // Si el MB ya navegó a otra web, o la pipeline pintó antes, este resultado no manda.
     // El cartel del watchdog sí se pisa: es un "todavía no sé", no una respuesta.
@@ -5858,6 +6014,10 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
           { method: "PATCH",
             headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
                        "Content-Type": "application/json", "Prefer": "return=representation" },
+            // Con reloj, como todo lo demás: este PATCH corre DESPUÉS de que la ficha del CRM
+            // ya se creó, así que un pedido colgado dejaría el botón girando sobre un push que
+            // en realidad salió bien, y al MB sin saber si mandar de nuevo.
+            signal: AbortSignal.timeout(8000),
             body: JSON.stringify({ status: "validated", validated_at: new Date().toISOString(), validated_by: state.loginEmail }) });
         const _cerradas = _r.ok ? ((await _r.json().catch(() => [])) || []).length : 0;
         if (_cerradas) res.textContent += " · también se cerró en Prospects";
@@ -8681,7 +8841,9 @@ function applyDraftToPitch(d, { silent = false } = {}) {
   _desbloquearPitch();
   state.pitchTemplate = { origen: "draft", id: d.id, lang: d.language || "", body };
   if (pitchEl)   pitchEl.value   = body;
-  if (subjectEl && subject) subjectEl.value = subject;
+  // Un borrador propio sin asunto dejaba el campo vacío y el mail sin poder salir. El asunto
+  // se completa sí o sí (regla del user, 08/09): si el borrador no trae, va el del CRM.
+  if (subjectEl) subjectEl.value = subject || _asuntoPorDefecto(d.language || "");
   const igual = _crmTpl.byLang.get(d.language || "")?.some(t => _mismoTexto(t.body, d.body));
   _pista(igual ? `⚠️ Este borrador es IGUAL a una plantilla del CRM: no tiene sentido usarlo para variar el mensaje.` : "");
   _tradPitch?.invalidar?.();   // el panel de traducción está encima: si no, muestra el texto anterior
@@ -8723,6 +8885,30 @@ async function loadCrmTemplates(force = false) {
 
 // "A veces uno, a veces otros": el punto de partida depende del dominio y del día, así el
 // mismo sitio abierto dos veces muestra la misma variante, y sitios distintos van rotando.
+// El asunto por default de un idioma. Se usa cuando hay que dejar el campo lleno y no hay
+// plantilla aplicada: al apretar 🗑️ Limpiar, y como red cuando un borrador no trae asunto.
+//
+// ⚠️ Van PRIMERO los borradores propios del MB. El motivo es el del user (08/09): *"los que
+// deben aparecer cuando se elige un país, justamente cuando le doy a limpiar porque no quiero
+// enviar lo que el CRM propone como inicial"*. Apretar Limpiar es rechazar la propuesta del
+// CRM: reponer justo el asunto del CRM sería devolver por la ventana lo que se acaba de sacar
+// por la puerta.
+//
+// Devuelve "" si no hay de dónde sacarlo, y en ese caso el campo queda vacío: inventar un
+// asunto sería peor que no ponerlo.
+function _asuntoPorDefecto(lang) {
+  const dominio = state.domain || "";
+  const deLista = (lista) => {
+    if (!lista?.length) return "";
+    const t = lista[_semillaRotacion(lista.length)] || lista[0];
+    return String(t?.subject || "").replace(/\{\{domain\}\}/g, dominio);
+  };
+  return deLista(_draftsState.byLang.get(lang))
+      || deLista(_crmTpl.byLang.get(lang))
+      || deLista(_draftsState.byLang.get("en"))
+      || deLista(_crmTpl.byLang.get("en"));
+}
+
 function _semillaRotacion(n) {
   const s = `${state.domain || ""}|${new Date().toISOString().slice(0, 10)}`;
   let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
@@ -8871,7 +9057,9 @@ function applyCrmTemplate(t, lang) {
   const pitchEl   = document.getElementById("pitch-text");
   const subjectEl = document.getElementById("form-subject");
   if (pitchEl)   pitchEl.value = body;
-  if (subjectEl && subject) subjectEl.value = subject;
+  // Las 69 plantillas del CRM tienen asunto (verificado el 08/09), pero si alguna se edita y
+  // queda sin él, el campo no puede terminar vacío: sin asunto el mail no sale.
+  if (subjectEl) subjectEl.value = subject || _asuntoPorDefecto(lang);
   // `body` es el texto YA resuelto (con el dominio adentro) porque es lo que se compara contra
   // lo que se envía. `bodyRaw` es el original con `{{domain}}`: sin él, comparar la plantilla
   // guardada contra la que devuelve el CRM daba SIEMPRE distinto —un texto sustituido nunca es
@@ -8962,7 +9150,16 @@ function _resolvePitchLang() {
   const langFromGeo = GEO_TO_LANG[geoCode];
   if (SUPPORTED_LANGS.has(langFromGeo)) return langFromGeo;
 
-  // 5. Default
+  // 5. El TLD del dominio. Estaba anunciado y no estaba escrito: el mensaje del commit del
+  // 07/09 decía *"el idioma sale del TLD"* para justificar cargar el borrador antes del
+  // análisis, pero esta función nunca miró el dominio. El resultado es que en la primera
+  // pasada —cuando todavía no hay `<html lang>`, ni og:locale, ni texto, ni GEO— caía al
+  // default de abajo y el MB veía un borrador EN INGLÉS sobre un diario español, hasta que
+  // la segunda pasada lo corregía. Un `.es` o un `.com.ar` alcanzan para no equivocarse.
+  const langFromTld = detectLangFromDomain(state.domain);
+  if (SUPPORTED_LANGS.has(langFromTld)) return langFromTld;
+
+  // 6. Default. Es el ÚLTIMO recurso, y hoy se llega acá mucho menos que antes.
   return "en";
 }
 
@@ -9023,7 +9220,7 @@ function updatePitchFlagButton() {
     // filtra). El país elegido se ve en el botón de la izquierda, no acá.
     const porEtiqueta = new Map(opciones.map(o => [`${_banderaDe(o.cc)} ${o.nombre} · ${LANG_NOMBRE[o.lang] || o.lang}`, o]));
     input.addEventListener("focus", () => { input.value = ""; });
-    input.addEventListener("change", () => {
+    input.addEventListener("change", async () => {
       const v = input.value.trim();
       // Primero la etiqueta exacta (lo que devuelve el datalist); el `includes` es sólo el
       // respaldo para cuando el MB escribe el país a mano y no elige de la lista. Buscar por
@@ -9037,13 +9234,30 @@ function updatePitchFlagButton() {
       // 3/3). Es lo único que lo habilita: ni Limpiar ni abrir la web lo hacen.
       _draftsState.paisElegido = true;
       _draftsState.flagIdxByLang.set(l, 0);
-      const list = _draftsState.byLang.get(l) || [];
-      if (list.length === 0) {
-        _pista(`Sin borrador propio en ${LANG_NOMBRE[l] || l}. Creá uno en 📝 (arriba) — tiene que ser distinto al del CRM.`);
+
+      // ── ELEGIR PAÍS = TUS PITCH DRAFTS, Y NADA MÁS (2026-09-08, regla del user) ─────────
+      // El orden de las dos vías, textual: *"Primero los mails del CRM siempre, y si el MB no
+      // quiere, pone sus template."* · *"Es una opción u otra."*
+      //
+      // Por eso acá NO hay respaldo al CRM. El filtro de país es la segunda vía: se llega
+      // después de apretar 🗑️ Limpiar, o sea después de rechazar la propuesta del CRM.
+      // Devolverle una plantilla del CRM al que acaba de descartarla sería deshacer su decisión
+      // sin avisar — y encima cargándola bloqueada, que es como se aplican las del CRM.
+      //
+      // Si no hay borrador propio en ese idioma, se dice y el recuadro queda libre para
+      // escribir. Callarse era el bug original (*"al seleccionar país no lo considera y queda
+      // vacío"*): el problema no era el vacío, era que nadie explicaba por qué.
+      const propios = _draftsState.byLang.get(l) || [];
+      if (!propios.length) {
+        _pista(`No tenés pitch draft en ${LANG_NOMBRE[l] || l}. Escribí el mail acá, o creá uno en 📝 (arriba). `
+             + `Para volver a la plantilla del CRM, recargá la web.`);
+        state.pitchTemplate = null;
+        _desbloquearPitch();
         updatePitchFlagButton();
         return;
       }
-      applyDraftToPitch(list[0]);
+      applyDraftToPitch(propios[0]);
+      _pista(`Tu pitch draft 1/${propios.length} en ${LANG_NOMBRE[l] || l}. Tocá 🚩 para pasar al siguiente.`);
       updatePitchFlagButton();
     });
   }
@@ -9055,11 +9269,20 @@ function updatePitchFlagButton() {
 // en la variante que toca por dominio y día (bloqueada). Si el CRM no responde o no tiene
 // ese idioma, el borrador propio del MB, como antes, y se dice por qué.
 async function autofillDraftOnLoad() {
-  // A un cliente activo no se le prepara un mail. Regla del user: si no es prospectable, el
-  // borrador ni se carga.
-  if (_crmBloquea()) { _pista(_motivoBloqueoCrm() + " No se carga borrador."); return; }
-  await Promise.all([loadDraftsCache(), loadCrmTemplates().catch(() => {})]);
-  if (_crmBloquea()) return;   // el veredicto pudo llegar mientras se leían las plantillas
+  // A un cliente activo no se le prepara un mail. Regla del user (07/09, ratificada el 08/09):
+  // si no es prospectable, el borrador ni se carga — y el campo tiene que DECIR por qué, no
+  // quedarse mudo y vacío como si la toolbar se hubiera roto.
+  if (_crmBloquea()) { _bloquearBorradorCrm(true); return; }
+  // Los dos con su propio `catch`: son fuentes independientes y una no puede llevarse puesta a
+  // la otra. Sin el catch de `loadDraftsCache`, un fallo leyendo los borradores propios del MB
+  // rechazaba el `Promise.all` y el mail se quedaba sin la plantilla del CRM, que había llegado
+  // bien. (Las dos consultas ya tienen timeout: sin él, un pedido colgado dejaba este `await`
+  // esperando para siempre y el recuadro del mail vacío, sin asunto y sin error.)
+  await Promise.all([
+    loadDraftsCache().catch(e => console.warn("[Borradores propios]", e?.message || e)),
+    loadCrmTemplates().catch(e => console.warn("[Plantillas CRM]", e?.message || e)),
+  ]);
+  if (_crmBloquea()) { _bloquearBorradorCrm(true); return; }   // el veredicto llegó mientras se leían
   const lang = _resolvePitchLang();
   _draftsState.currentLang = lang;
   const crm = _crmTpl.byLang.get(lang) || [];
@@ -9097,6 +9320,10 @@ function rotatePitchTemplate() {
   // siempre recibe la misma y el reparto entre las tres queda parejo solo. Si el MB pudiera
   // rotarla, elegiría siempre la que más le gusta y no habría con qué comparar cuál rinde.
   if (t?.origen === "crm") {
+    // (Acá había una excepción que dejaba rotar las 3 del CRM si el MB había elegido un país.
+    // Se borró el 08/09: con el filtro de país cargando SÓLO pitch drafts, este caso no puede
+    // darse, y dejarlo escrito contradecía la regla de arriba a la vista de cualquiera que
+    // leyera el archivo.)
     // El click no cambia la variante, pero SÍ sirve para algo: vuelve a pedirle las plantillas
     // al CRM salteando la caché de 6 h. Sin esto no había ninguna forma de traer una plantilla
     // recién editada —el `force` existía en el código y no lo llamaba nadie— y el MB tenía que
@@ -9153,8 +9380,14 @@ function initPitchInlineControls() {
     state.pitchTemplate = null;
     _desbloquearPitch();
     pitchEl.value = "";
-    // El asunto también: si queda el de la plantilla, el mail sale con un asunto que no es
-    // del texto que el MB acaba de escribir.
+    // ── LIMPIAR VACÍA LAS DOS COSAS, A PROPÓSITO (regla del user, 08/09) ────────────────
+    // *"Es una opción u otra: por default la del CRM en rotación; si el MB no quiere enviar
+    // eso, le da a Limpiar y luego redacta a mano su mail o elige un país del filtro que carga
+    // los pitch draft."*
+    // Apretar Limpiar es rechazar la propuesta del CRM. Reponer acá el asunto del CRM sería
+    // devolver por la ventana lo que se acaba de sacar por la puerta. El asunto vuelve solo
+    // por la vía que el MB elija: el pitch draft del país trae el suyo, y si escribe a mano,
+    // escribe las dos partes.
     const subjEl = document.getElementById("form-subject");
     if (subjEl) subjEl.value = "";
     // Y el panel de traducción, que está ENCIMA: sin esto el MB ve la traducción del mensaje

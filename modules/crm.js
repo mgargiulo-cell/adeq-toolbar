@@ -27,10 +27,16 @@ const _idiomaLabel = (v) => (v === "" || v == null ? "" : (_IDIOMA_LABEL[Number(
 // El replace va anclado al final (`$`): sin ancla matchea en cualquier parte de la URL.
 export const crmUrl = (ruta = "") => `${(CONFIG.CRM_BOARD_URL || "").replace(/\/sync-toolbar\/?$/, "")}${ruta}`;
 const CRM_BASE = () => crmUrl();
+// El reloj es obligatorio: `getPlantillasIniciales` se espera con `await` antes de escribir el
+// borrador, así que un pedido colgado acá deja el recuadro del mail vacío —sin asunto y sin
+// plantilla— y ni siquiera cae al borrador propio, porque el `catch` no atrapa una promesa que
+// nunca se resuelve. 10s: el endpoint mide 0,6s en caliente y ~3s cuando Vercel arranca en frío.
+const _CRM_GET_TIMEOUT_MS = 10_000;
 async function crmGet(ruta, params = {}) {
   const qs = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null));
   const r = await fetch(`${CRM_BASE()}${ruta}${qs.toString() ? `?${qs}` : ""}`,
-    { headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET } });
+    { headers: { "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+      signal: AbortSignal.timeout(_CRM_GET_TIMEOUT_MS) });
   if (!r.ok) throw new Error(`CRM ${ruta} → HTTP ${r.status}`);
   return r.json();
 }
