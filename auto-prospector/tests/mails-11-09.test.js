@@ -137,3 +137,16 @@ test("apolloQuemarCiclo mira 600 pendientes, no 120", () => {
   const fn = entre("async function apolloQuemarCiclo(", "// BARRIDO DE PROSPECTS");
   ok(/order=traffic\.desc\.nullslast&limit=600/.test(fn), "con 120 los de más tráfico ya tenían persona y el job decía 'candidatos 0' estando atrasado");
 });
+
+// ── 7. Lo que apareció al releer los "reales" ───────────────────────────────────────────
+test("el agente no vuelve a recorrer cada día los leads que ya salteó por MV dudoso", () => {
+  const fn = entre("async function runAgentCycle(", "const _conEmail = fresh.filter(_tieneEmail).length;");
+  ok(/reason=eq\.mv_dudoso&created_at=gte\./.test(fn), "se leen los salteados por mv_dudoso de la última semana");
+  ok(/fresh = fresh\.filter\(l => !_saltadosMv7d\.has\(/.test(fn), "y se sacan del lote antes de empezar, como los contactados en 30 días");
+  ok(/7 \* 86400_000/.test(fn), "siete días: el veredicto de MV vale un mes, pero el re-enrich puede traer otra dirección");
+});
+
+test("el barrido de no-publishers mide 'revisé el lote', no 'marqué todo lo que revisé'", () => {
+  const fn = entre("async function barridoNoPublisher(", "// QUEMAR EL CICLO DE APOLLO");
+  ok(/real: revisados, esperado: rows\.length/.test(fn), "con real=marcados/esperado=revisados estuvo 13 días 'rindiendo por debajo' sin que nada fallara");
+});

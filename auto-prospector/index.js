@@ -11447,7 +11447,10 @@ async function barridoNoPublisher(token) {
   // "Miré 25 y no pude ver ninguno" no es "todo bien": es la red o el fetch, y hay que avisarlo.
   const status = (revisados === 0 && sinHtml >= 5) ? "warn" : "ok";
   await saludPing(token, "barrido_no_publisher", {
-    status, cadenciaMin: 240, real: marcados, esperado: revisados,
+    // `real: marcados, esperado: revisados` esperaba que TODO lo revisado saliera marcado, así
+    // que el resumen de salud lo tuvo 13 días "rindiendo por debajo" (2026-09-11). Lo esperado
+    // es revisar el lote entero; cuántos se marcan es información, no meta.
+    status, cadenciaMin: 240, real: revisados, esperado: rows.length,
     detalle: `lote ${rows.length}: revisados ${revisados} · marcados ⚠️ ${marcados}${_top ? ` (${_top})` : ""} · pasan ${pasan} · sin html ${sinHtml} · hoy ${revisadosHoy}/${cap} · cursor ${String(cursor).slice(0, 16)}`,
   }).catch(() => {});
   log(`🧹 barrido no-publisher: ${revisados} revisados, ${marcados} marcados ⚠️${_top ? ` (${_top})` : ""}, ${sinHtml} sin html · ${Math.round((Date.now() - t0) / 1000)} s · hoy ${revisadosHoy}/${cap}`);
@@ -21635,6 +21638,24 @@ async function runAgentCycle(token, allFlags) {
   // `null` = no se pudo cargar. En ese caso NO se filtra nada en memoria y decide el guard
   // por dominio, que falla cerrado. Nunca se manda de más por no haber podido leer.
   if (_contactados30d) log(`  📋 ${_contactados30d.size} dominio(s) contactados en 30 días — se filtran antes del ciclo`);
+  // ── LOS SALTEADOS POR MV DUDOSO NO SE VUELVEN A RECORRER CADA DÍA (2026-09-11) ─────────
+  // El parte del 10/09: 269 envíos salteados por `mv_dudoso` contra 40 enviados. Eran los
+  // mismos leads todos los días: el ciclo los elegía, MillionVerifier volvía a decir "no
+  // pude confirmar" y se salteaban otra vez. El veredicto vale un mes, así que en 7 días no
+  // va a cambiar; lo que puede cambiar es que el re-enrich les encuentre otra dirección, y
+  // por eso la exclusión es de una semana y no permanente.
+  let _saltadosMv7d = new Set();
+  try {
+    const _corte7 = new Date(Date.now() - 7 * 86400_000).toISOString();
+    const _r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=eq.mv_dudoso&created_at=gte.${_corte7}&select=domain&limit=5000`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) });
+    if (_r.ok) {
+      const _f = await _r.json();
+      if (Array.isArray(_f)) _saltadosMv7d = new Set(_f.map(x => String(x.domain || "").toLowerCase()).filter(Boolean));
+    }
+  } catch {}
+  if (_saltadosMv7d.size) log(`  📋 ${_saltadosMv7d.size} dominio(s) salteados por MV dudoso en 7 días — se filtran antes del ciclo`);
 
   const _DIAS_STOCK_OBJETIVO = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
   let _recorteStock = null;
@@ -22184,6 +22205,12 @@ async function runAgentCycle(token, allFlags) {
       fresh = fresh.filter(l => !_contactados30d.has(String(l.domain || "").toLowerCase()));
       const _sacados = _antes - fresh.length;
       if (_sacados) log(`  🧹 ${_sacados} candidato(s) ya contactados en 30 días, fuera del ciclo antes de empezar`);
+    }
+    if (_saltadosMv7d.size) {
+      const _antes = fresh.length;
+      fresh = fresh.filter(l => !_saltadosMv7d.has(String(l.domain || "").toLowerCase()));
+      const _sacados = _antes - fresh.length;
+      if (_sacados) log(`  🧹 ${_sacados} candidato(s) salteados por MV dudoso esta semana, fuera del ciclo (vuelven en 7 días o con otra dirección)`);
     }
     const _conEmail = fresh.filter(_tieneEmail).length;
     log(`🤖 Agent ${userEmail}: pool de ${fresh.length} candidatos, ${_conEmail} ya con email (se prueban primero)`);
