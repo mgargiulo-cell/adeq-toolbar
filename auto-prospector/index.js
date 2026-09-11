@@ -2113,13 +2113,22 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
   // opts.returnDomains → devuelve la LISTA de dominios que entraron (no el count). Lo usa
   // _drainBacklog para borrar del pre-listado solo lo que realmente se inyectó.
   const _empty = () => (opts.returnDomains ? [] : 0);
+  // opts.resumen → el llamador recibe QUÉ pasó con lo que no entró (2026-09-11). "Encolé 0"
+  // tiene tres causas que no se parecen en nada: el carril estaba lleno y el lote quedó
+  // estacionado (no se perdió nada), ningún dominio tenía ads.txt (se descartó bien) o la cola
+  // rechazó el lote (eso sí es una falla). AutoGoogle gritaba "se está pagando Serper para
+  // nada" en los tres casos.
+  const _res = opts.resumen;
+  if (_res) Object.assign(_res, { estacionados: 0, sinAds: 0, encolados: 0, carrilLleno: false, rechazadoPorCola: false });
   if (laneRoom <= 0) {
     if (opts.parkOverflow) await _parkInBacklog(token, domains, sourceTag, opts.phraseByDomain);
+    if (_res) { _res.carrilLleno = true; _res.estacionados = opts.parkOverflow ? domains.length : 0; }
     log(`⏸️ ${sourceTag} SKIP inject: carril lleno (${laneUsed}/${laneCap})${opts.parkOverflow ? ` → ${domains.length} al pre-listado` : ""}`);
     return _empty();
   }
   if (domains.length > laneRoom) {
     if (opts.parkOverflow) await _parkInBacklog(token, domains.slice(laneRoom), sourceTag, opts.phraseByDomain);
+    if (_res) _res.estacionados = opts.parkOverflow ? domains.length - laneRoom : 0;
     domains = domains.slice(0, laneRoom);
   }
   // ── PUERTA ads.txt EN LA ENTRADA (Maxi 2026-07-28, regla del user) ────────────────────
@@ -2150,6 +2159,7 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
       // Se avisa al llamador cuáles murieron acá: `_drainBacklog` los necesita para poder
       // sacarlos del pre-listado. Sin esto quedaban estacionados para siempre (Maxi 2026-08-25).
       if (opts.sinAdsOut) sinAds.forEach(d => opts.sinAdsOut.add(d));
+      if (_res) _res.sinAds = sinAds.size;
       domains = domains.filter(d => !sinAds.has(d));
       log(`📄 ${sourceTag}: ${sinAds.size}/${antes} descartados SIN ads.txt antes de entrar a la cola (0 API gastada) — ej: ${[...sinAds].slice(0, 5).join(", ")}`);
     }
@@ -2210,10 +2220,12 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
         cuerpo: `${payload.length} dominios ya descubiertos (y pagados) no entraron. HTTP ${res.status}. ${_detalle.slice(0, 300)}`,
         severidad: "error",
       }).catch(() => {});
+      if (_res) _res.rechazadoPorCola = true;
       return _empty();
     }
     const rows = await res.json().catch(() => []);
     const _inserted = Array.isArray(rows) ? rows.map(r => r.domain).filter(Boolean) : [];
+    if (_res) _res.encolados = _inserted.length;
     return opts.returnDomains ? _inserted : _inserted.length;
   } catch { return _empty(); }
 }
@@ -3469,6 +3481,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   }
   // Dedup canónico (cola activa + Prospects) + inject, si hubo resultados.
   let freshCount = 0, inserted = 0, _freshSet = new Set();
+  const _resInj = {};   // qué pasó con lo que no se encoló: estacionado / sin ads.txt / rechazado por la cola
   if (found.size > 0) {
     // ── LOS FILTROS GRATIS QUE ESTE FEEDER NO APLICABA (Maxi 2026-08-11) ──────
     // AutoGoogle era el ÚNICO feeder que solo miraba el TLD. Los demás pasan además
@@ -3534,7 +3547,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
       for (const [kw, doms] of kwDomains) for (const d of doms) if (!_phraseByDomain.has(d)) _phraseByDomain.set(d, kw);
       // parkOverflow: lo que NO entre al carril se estaciona en el pre-listado en vez de tirarse
       // (ya se pagó con créditos de Serper). Lo levanta gratis un slot no-hispano. Maxi 2026-07-17.
-      inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle", { parkOverflow: true, phraseByDomain: _phraseByDomain });
+      inserted = await _injectIntoCsvQueue(token, fresh, "autogoogle", { parkOverflow: true, phraseByDomain: _phraseByDomain, resumen: _resInj });
       // Maxi 2026-07-16: guardar domain→keyword para reconciliar después (¿llegó a Prospects? → +qualified).
       const _attr = fresh.map(d => {
         const _kw = _phraseByDomain.get(d) || "";
@@ -3590,21 +3603,38 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     // mismo renglón en que decía "0 encolados", y dio verde los siete días que el motor
     // gastó Serper sin traer una sola URL. Es la regla de oro al revés: hay que alertar
     // sobre lo que NO pasó, no sobre lo que se intentó.
-    const _sinEncolar = queriesDone >= 10 && freshCount > 20 && inserted === 0;
+    // ── "CERO ENCOLADOS" SÓLO ES UNA FALLA SI SE PERDIÓ ALGO (2026-09-11) ─────────────────
+    // El 10/09 este aviso salió tres veces seguidas ("54 frescos y CERO encolados, se está
+    // pagando Serper para nada") y no se había perdido nada: el carril de autogoogle estaba
+    // lleno y los 54 quedaron ESTACIONADOS en el pre-listado, que un slot posterior drena
+    // gratis. Lo mismo pasa cuando ninguno tiene ads.txt: se descartaron bien. Ahora la
+    // inyección cuenta qué pasó con cada uno y se avisa sólo si la cola rechazó el lote o si
+    // hay dominios que no están ni encolados, ni estacionados, ni descartados por ads.txt.
+    const _estacionados = _resInj.estacionados || 0, _sinAds = _resInj.sinAds || 0;
+    const _perdidos = Math.max(0, freshCount - inserted - _estacionados - _sinAds);
+    const _sinEncolar = queriesDone >= 10 && freshCount > 20 && inserted === 0 && (_resInj.rechazadoPorCola || _perdidos > 0);
+    const _queFue = [
+      _estacionados ? `${_estacionados} al pre-listado (carril lleno)` : "",
+      _sinAds ? `${_sinAds} sin ads.txt` : "",
+      _resInj.rechazadoPorCola ? "la cola RECHAZÓ el lote" : "",
+    ].filter(Boolean).join(" · ");
     await saludPing(token, "autogoogle", {
       status: _sinEncolar ? "fail" : "ok", cadenciaMin: 240,
       detalle: `${queriesDone} búsquedas → ${found.size} dominios → ${freshCount} nuevos → ${inserted} encolados`
+        + (_queFue ? ` (${_queFue})` : "")
         + (_salteadasPorGeo ? ` · ${_salteadasPorGeo} salteada(s) por GEO bloqueada (crédito ahorrado)` : ""),
-      real: inserted, esperado: Math.max(1, Math.round(queriesDone * 0.15)),
+      // Lo esperado se mide sobre lo que ENTRÓ O QUEDÓ GUARDADO: un dominio estacionado es
+      // un dominio pagado que no se perdió.
+      real: inserted + _estacionados, esperado: Math.max(1, Math.round(queriesDone * 0.15)),
     });
     if (_sinEncolar) {
       await saludAlerta(token, {
         clave: "autogoogle-no-encola", severidad: "error",
         titulo: "🔎 AutoGoogle encontró dominios y no encoló ninguno",
-        cuerpo: `${queriesDone} búsquedas, ${found.size} dominios, ${freshCount} frescos y CERO encolados.\n`
-              + `Se está pagando Serper para nada. Mirar el carril de autogoogle, la puerta ads.txt y si la cola rechazó el lote.\n`
+        cuerpo: `${queriesDone} búsquedas, ${found.size} dominios, ${freshCount} frescos y CERO encolados${_queFue ? ` (${_queFue})` : ""}.\n`
+              + `${_perdidos} dominio(s) no quedaron en ningún lado: ni en la cola, ni en el pre-listado, ni descartados por ads.txt.\n`
               + `  SELECT status, count(*) FROM toolbar_csv_queue WHERE source='autogoogle' AND uploaded_at >= now() - interval '2 days' GROUP BY 1;`,
-        metadata: { queriesDone, found: found.size, freshCount, inserted },
+        metadata: { queriesDone, found: found.size, freshCount, inserted, estacionados: _estacionados, sinAds: _sinAds, perdidos: _perdidos },
       }).catch(() => {});
     }
   } else {
@@ -3870,6 +3900,7 @@ const MONDAY_FINALIZADO_STAGE = 5;          // deal_stage index del board 142026
 // Es la fuente que MEJOR convierte (24,7%) y la única de gente que ya trabajó con nosotros.
 // Se sube el techo y se hace configurable, para poder ajustarlo sin deployar.
 const MONDAY_SYNC_MAX_POR_DIA = 400;        // default; lo pisa `monday_sync_techo_dia`
+const MONDAY_SYNC_POOL_MAX    = 10000;      // cuántos reciclables se le piden al CRM en el barrido diario (hoy devuelve ~5.000)
 
 // ── EL ESTADO DE MONDAY, GUARDADO PARA PODER CONSULTARLO (Maxi 2026-08-25) ──────────
 // Regla del user, verificada contra las 11 etiquetas del board: solo se re-contacta si el
@@ -3985,56 +4016,41 @@ async function sincronizarFinalizadosDeMonday(token) {
   try {
     const cfg = await getConfig(token).catch(() => null);
     if (!cfg) return 0;
-    // Con Monday apagado esto quedó REDUNDANTE: `_feederPullMonday` ya trae los ciclos
-    // cerrados desde /api/crm/reciclables, que además descuenta clientes, negociaciones
-    // abiertas y los 60 días de descanso — cosas que el board de Monday no sabía.
-    // Se late igual con el motivo. Apagarlo en silencio dejaría al vigilante viendo un
-    // detector que dejó de reportar y no hay forma de distinguir eso de una falla.
-    if (String(cfg.monday_enabled ?? "true").toLowerCase() !== "true") {
-      await saludPing(token, "monday_sync", { status: "ok", cadenciaMin: 0,
-        detalle: "apagado: monday_enabled=false — los ciclos cerrados los trae el feeder desde /api/crm/reciclables" }).catch(() => {});
-      return 0;
-    }
+    // ── LOS CICLOS CERRADOS SALEN DEL CRM, NO DE MONDAY (2026-09-11) ─────────────────────
+    // Monday se cortó el 02/09 y este barrido siguió pidiéndole al board: nueve días de
+    // "sin api key de Monday" en el vigilante y un parte que mostraba el barrido del 02/09
+    // como el último ("hace 8 días que no corre"). `_feederPullMonday` ya leía
+    // /api/crm/reciclables por slot; este job es el barrido DIARIO con techo, y existe para
+    // que el parte diga cuántos elegibles esperan. El endpoint del CRM descuenta clientes,
+    // negociaciones abiertas y los 60 días de descanso — cosas que el board no sabía.
     if (String(cfg.monday_sync_finalizados ?? "true") !== "true") return 0;   // ON por default
     if (!(await _tocaCorrer(token, "monday_sync_finalizados", 24 * 60))) return 0;
     const _techoDia = parseInt(cfg.monday_sync_techo_dia || "", 10) || MONDAY_SYNC_MAX_POR_DIA;
 
-    const mondayApiKey = await _getMondayApiKeyForFeeder(token);
-    if (!mondayApiKey) {
-      await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "sin api key de Monday" });
+    if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) {
+      await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "falta CRM_SYNC_SECRET: no puedo leer /api/crm/reciclables" });
       return 0;
     }
-
-    // Traer TODOS los finalizados, paginando hasta el final (no un sample).
-    let cursor = null, items = [], vueltas = 0;
-    do {
-      const pageArgs = cursor
-        ? `cursor: "${cursor}", limit: 500`
-        : `limit: 500, query_params: { rules: [{ column_id: "deal_stage", compare_value: [${MONDAY_FINALIZADO_STAGE}], operator: any_of }] }`;
-      const query = `{ boards(ids: [1420268379]) { items_page(${pageArgs}) { cursor items { name } } } }`;
-      const res = await fetch("https://api.monday.com/v2", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": mondayApiKey, "API-Version": "2024-01" },
-        body: JSON.stringify({ query }),
-        signal: AbortSignal.timeout(30000),
-      });
+    let todos = [];
+    try {
+      const res = await fetch(`${_urlCrm("/reciclables")}?limit=${MONDAY_SYNC_POOL_MAX}`,
+        { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(30000) });
       if (!res.ok) {
-        await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: `Monday HTTP ${res.status}` });
-        return 0;   // no pude leer ≠ no hay finalizados
+        await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: `CRM /reciclables HTTP ${res.status}` });
+        return 0;   // no pude leer ≠ no hay reciclables
       }
       const data = await res.json().catch(() => null);
-      const page = data?.data?.boards?.[0]?.items_page;
-      if (!page) {
-        await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "respuesta inesperada de Monday" });
+      if (!data || !Array.isArray(data.domains)) {
+        await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "respuesta inesperada del CRM (/reciclables sin `domains`)" });
         return 0;
       }
-      items = items.concat(page.items || []);
-      cursor = page.cursor || null;
-    } while (cursor && ++vueltas < 20);
-
-    const todos = [...new Set(items.map(it => _normalizeFeederDomain(it.name || "")).filter(Boolean))];
+      todos = [...new Set(data.domains.map(d => _normalizeFeederDomain(d)).filter(Boolean))];
+    } catch (e) {
+      await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: `CRM /reciclables: ${e.message}` });
+      return 0;
+    }
     if (!todos.length) {
-      await saludPing(token, "monday_sync", { status: "ok", cadenciaMin: 24 * 60, detalle: "0 finalizados en el board" });
+      await saludPing(token, "monday_sync", { status: "ok", cadenciaMin: 24 * 60, detalle: "0 reciclables en el CRM" });
       return 0;
     }
 
@@ -4069,17 +4085,21 @@ async function sincronizarFinalizadosDeMonday(token) {
     // parte comparaba el techo contra sí mismo y siempre concluía "entró todo lo que se
     // podía". Con 5.790 elegibles y un techo de 400, decía que el board quedaba al día.
     const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d));
-    const candidatos = _elegibles.slice(0, _techoDia);
+    // El carril `auto_feeder_monday` lo comparte con el feeder por slot. Si ya está lleno,
+    // encolar 0 es lo esperado y no una falla: sin mirar el cupo, `_injectIntoCsvQueue`
+    // devolvería 0 y el aviso de abajo gritaría por nada (2026-09-11).
+    const _libre = Math.max(0, _capDeFuente("auto_feeder_monday") - await _countActiveCsvBySource(token, "auto_feeder_monday"));
+    const candidatos = _elegibles.slice(0, Math.min(_techoDia, _libre));
 
     let encolados = 0;
     if (candidatos.length) {
       encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true });   // `reactivar` ya es el comportamiento por defecto (on_conflict+merge); se deja como documentación de la intención
       await _limpiarMarcaDeEmail(token, candidatos).catch(() => {});
     }
-    log(`🔁 Monday finalizados: ${todos.length} en el board · ${recientes.size ? `${todos.filter(d => recientes.has(d)).length} contactados hace <${dias}d` : "0 recientes"} · ${enCola.size} ya en cola · ${candidatos.length} re-prospectables → ${encolados} encolados`);
+    log(`🔁 Reciclables del CRM: ${todos.length} · ${recientes.size ? `${todos.filter(d => recientes.has(d)).length} contactados hace <${dias}d` : "0 recientes"} · ${enCola.size} ya en cola · ${_elegibles.length} elegibles · carril libre ${_libre} → ${encolados} encolados (techo ${_techoDia}/día)`);
     await saludPing(token, "monday_sync", {
       status: "ok", cadenciaMin: 24 * 60,
-      detalle: `${todos.length} finalizados, ${candidatos.length} re-prospectables, ${encolados} encolados`,
+      detalle: `${todos.length} reciclables en el CRM, ${_elegibles.length} elegibles, ${encolados} encolados (techo ${_techoDia}, carril libre ${_libre})`,
       real: encolados, esperado: candidatos.length,
     });
     // Maxi 2026-08-19: estos números vivían SOLO en el log de Railway. El user preguntó
@@ -4095,12 +4115,13 @@ async function sincronizarFinalizadosDeMonday(token) {
       reprospectables: _elegibles.length,      // los ELEGIBLES, no los que entraron en el techo
       encolados,
       techo: _techoDia,
+      libre: _libre,                          // cupo del carril al momento del barrido: si era 0, encolar 0 es lo esperado
     })).catch(() => {});
     if (candidatos.length && encolados === 0) {
       await saludAlerta(token, {
         clave: "monday-sync-sin-encolar", severidad: "warning",
-        titulo: "🔁 Los finalizados de Monday no entraron",
-        cuerpo: `Había ${candidatos.length} re-prospectables y no se encoló ninguno. Suele ser el carril de la fuente lleno (auto_feeder_monday).`,
+        titulo: "🔁 Los reciclables del CRM no entraron",
+        cuerpo: `Había ${candidatos.length} re-prospectables con carril libre (${_libre}) y no se encoló ninguno. Mirar si la cola rechazó el lote o si ninguno tenía ads.txt.`,
         metadata: { candidatos: candidatos.length, total: todos.length },
       });
     }
@@ -9543,12 +9564,22 @@ async function parteDelDia(token, opts = {}) {
       if (Array.isArray(a.emails) && a.emails.length) e.conEmail++;
       if (_enviados.has(String(a.domain || "").toLowerCase())) e.enviados++;
     }
+    // ── LA SEÑAL ES RELATIVA AL PROMEDIO, NO A UN IDEAL (2026-09-11) ─────────────────────
+    // El parte del 10/09 pintó TODAS las fuentes en rojo con umbrales fijos (20%/8%). No podía
+    // ser de otra forma: entran ~220 altas por día y el envío tiene tope de 40. Con esa
+    // capacidad, contactar el 20% de lo que entra es imposible por diseño, y un rojo que no
+    // puede ponerse verde no dice nada. La pregunta correcta es "¿esta fuente se contacta más o
+    // menos que el resto?": ✅ por encima del promedio, ⚠️ entre la mitad y el promedio, 🔴 abajo.
+    const _totEnt = Object.values(_emb).reduce((a, v) => a + v.entraron, 0);
+    const _totEnv = Object.values(_emb).reduce((a, v) => a + v.enviados, 0);
+    const _tasaMedia = _totEnt ? Math.round(100 * _totEnv / _totEnt) : 0;
+    if (_totEnt) lineasEmbudo.push(`   Se contactó el ${_tasaMedia}% de lo que entró en 30 días (${_totEnv} de ${_totEnt}). El envío tiene tope diario, así que la señal compara cada fuente contra ese promedio, no contra un ideal.`);
     for (const [s, v] of Object.entries(_emb).sort((a, b) => b[1].entraron - a[1].entraron)) {
       const pctMail = v.entraron ? Math.round(100 * v.conEmail / v.entraron) : 0;
       const pctEnv  = v.entraron ? Math.round(100 * v.enviados / v.entraron) : 0;
       // La señal mira el TRAMO FINAL: contactar es lo único que factura. Una fuente que trae
       // mucho y no se contacta nunca es peor que una que trae poco y se contacta todo.
-      const señal = pctEnv >= 20 ? "✅" : pctEnv >= 8 ? "⚠️" : "🔴";
+      const señal = !_tasaMedia ? "🔴" : pctEnv >= _tasaMedia ? "✅" : pctEnv >= _tasaMedia / 2 ? "⚠️" : "🔴";
       lineasEmbudo.push(`   ${señal} ${s.padEnd(16)} entraron ${String(v.entraron).padStart(5)} · con email ${String(v.conEmail).padStart(5)} (${String(pctMail).padStart(3)}%) · contactadas ${String(v.enviados).padStart(4)} (${pctEnv}%)`);
     }
 
@@ -9583,7 +9614,10 @@ async function parteDelDia(token, opts = {}) {
     for (const a of _altasMes) {
       if (String(a.email_found_at || a.created_at || "") < _ultimos7) continue;
       for (const [em, src] of Object.entries(a.email_sources || {})) {
-        const v = String(src || "?").toLowerCase();
+        // `email_sources` guarda un string ("scrape") O un objeto ({source, url}) según quién
+        // lo escribió. El parte del 10/09 mostró "[object object]" con 3.352 emails: la vía
+        // más grande del pool, ilegible. `_normSrc` entiende las dos formas.
+        const v = String(_normSrc(src) || "?").toLowerCase();
         _viaDe.set(String(em).toLowerCase(), v);
         (_via[v] = _via[v] || { n: 0, rebotes: 0 }).n++;
       }
@@ -9613,19 +9647,24 @@ async function parteDelDia(token, opts = {}) {
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${_ultimos7}&status=in.(skipped,next_day)&select=status,error_message&order=id`,
       auth, { max: 20000 })) || [];
     const _porMotivo = {};
-    let _reintentables = 0;
+    let _reintentables = 0, _yaEstaban = 0;
     for (const r of _rech) {
       const m = String(r.error_message || "?");
       if (r.status === "next_day") { if (/reintentar|no_verificable|sin_cuota/i.test(m)) _reintentables++; continue; }
+      // "Ya estaba en Prospects" no es un rechazo: es el mismo dominio llegando por dos fuentes.
+      // Contarlo entre los motivos (el 10/09 era el más grande) tapaba los rechazos reales.
+      if (/^ya_estaba_en_prospects/.test(m)) { _yaEstaban++; continue; }
       // El motivo viene como "not_publisher: haiku_corp" o "not_publisher: sin_ads_txt".
-      const k = (m.split(":").slice(0, 2).join(":") || "?").replace(/^not_publisher:\s*/, "").slice(0, 34);
+      // 48 caracteres: con 34 se cortaba "tipo_no_prospectable:e-commerce" a la mitad.
+      const k = (m.split(":").slice(0, 2).join(":") || "?").replace(/^not_publisher:\s*/, "").slice(0, 48);
       _porMotivo[k] = (_porMotivo[k] || 0) + 1;
     }
     const _totalRech = Object.values(_porMotivo).reduce((a, b) => a + b, 0);
     for (const [k, v] of Object.entries(_porMotivo).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
-      lineasRechazo.push(`   ${k.padEnd(34)} ${String(v).padStart(5)}${_totalRech ? ` (${Math.round(100 * v / _totalRech)}%)` : ""}`);
+      lineasRechazo.push(`   ${k.padEnd(48)} ${String(v).padStart(5)}${_totalRech ? ` (${Math.round(100 * v / _totalRech)}%)` : ""}`);
     }
     if (_reintentables) lineasRechazo.push(`   ↻ ${_reintentables} NO se descartaron: vuelven mañana (ads.txt ilegible o sin cuota de API)`);
+    if (_yaEstaban) lineasRechazo.push(`   · ${_yaEstaban} ya estaban en Prospects: no es rechazo, es el mismo dominio llegando por dos fuentes`);
 
     // ── LO QUE YA NO SE VUELVE A PAGAR ───────────────────────────────────────────────────
     // Cada fila `noData` es un dominio del que SimilarWeb no sabe nada y que antes se
@@ -11455,7 +11494,10 @@ async function apolloQuemarCiclo(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let rows = [];
   try {
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&or=(email_ultimo_motivo.is.null,email_ultimo_motivo.neq.apollo_sin_contacto)&select=id,domain,traffic,emails,email_sources,contact_name&order=traffic.desc.nullslast&limit=120`, { headers: auth });
+    // 600 y no 120 (2026-09-11): el 10/09 el job estaba ATRASADO (0/2500 con el 96% del ciclo) y
+    // decía "candidatos 0". Los 120 de más tráfico ya tenían persona o ya pasaron por Apollo, y
+    // el filtro de "sin persona" es local, así que con 120 filas nunca llegaba a los que faltan.
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&or=(email_ultimo_motivo.is.null,email_ultimo_motivo.neq.apollo_sin_contacto)&select=id,domain,traffic,emails,email_sources,contact_name&order=traffic.desc.nullslast&limit=600`, { headers: auth, signal: AbortSignal.timeout(20000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     rows = await r.json();
   } catch (e) {
@@ -13374,6 +13416,7 @@ async function getAdminBlocklistWorker(token) {
 /** Snapshot de a quién NO escribirle, guardado por `guardarBloqueadosDeMonday` una vez al día. */
 let _bloqCrmCache = { set: null, ts: 0 };
 const BLOQ_CRM_TTL = 10 * 60 * 1000;   // 10 min: la fuente se refresca cada 24 h, esto sólo evita releer la config
+let _bloqCrmUltimoLatidoOk = 0;         // el "estoy bien" se manda como mucho cada 6 h (se lee cada 10 min)
 async function _bloqueadosDelCrm(token) {
   if (_bloqCrmCache.set && Date.now() - _bloqCrmCache.ts < BLOQ_CRM_TTL) return _bloqCrmCache.set;
   // ⚠️ Las tres ramas de fallo devolvían el caché anterior, que en el PRIMER arranque es null.
@@ -13400,7 +13443,18 @@ async function _bloqueadosDelCrm(token) {
         // que es justo el daño que esta lista existe para evitar.
         _bloqCrmCache = { set: new Set(arr.map(x => String(x).toLowerCase())), ts: Date.now() };
         if (horas > 48) motivo = `el snapshot tiene ${Math.round(horas)} h y lo escribe un job diario — se usa igual, pero está quedando viejo`;
-        else return _bloqCrmCache.set;
+        else {
+          // El latido sólo salía cuando FALLABA, así que trece días sanos se leían como
+          // "trabajo sin correr" en el resumen de salud (2026-09-11). Un "ok" cada 6 h alcanza.
+          if (Date.now() - _bloqCrmUltimoLatidoOk > 6 * 3600_000) {
+            _bloqCrmUltimoLatidoOk = Date.now();
+            await saludPing(token, "lista_no_recontactar", {
+              status: "ok", cadenciaMin: 24 * 60, real: arr.length, esperado: 100,
+              detalle: `${arr.length} dominios con deal activo, snapshot de hace ${Math.round(horas)} h`,
+            }).catch(() => {});
+          }
+          return _bloqCrmCache.set;
+        }
       }
     }
   } catch (e) { motivo = `no se pudo leer: ${e.message}`; }
@@ -19402,6 +19456,28 @@ function scoreWebsite(lead) {
 // API: GET https://api.millionverifier.com/api/v3/?api=KEY&email=EMAIL
 const _mvCache = new Map();
 const MV_CACHE_MAX = 8000;
+const MV_RESULTADO_VALIDO_DIAS = 30;   // un veredicto de MillionVerifier vale un mes; después se vuelve a preguntar
+
+/** Del `result` crudo de MillionVerifier al estado que usa el agente. Una sola tabla. */
+function _mvEstadoDe(res) {
+  const r = String(res || "").toLowerCase();
+  if (!r) return null;
+  return (r === "invalid" || r === "disposable") ? "no"
+       : (r === "unknown" || r === "risky") ? "dudoso"
+       : (r === "catch_all") ? "riesgo"
+       : "ok";
+}
+
+/** El último veredicto guardado para esta dirección (≤ 30 días), o null si nunca se verificó. */
+async function _mvResultadoGuardado(token, email) {
+  const desde = new Date(Date.now() - MV_RESULTADO_VALIDO_DIAS * 86_400_000).toISOString();
+  const r = await fetch(
+    `${SUPABASE_URL}/rest/v1/toolbar_mv_results?email=eq.${encodeURIComponent(email)}&created_at=gte.${desde}&select=result&order=id.desc&limit=1`,
+    { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(6000) });
+  if (!r.ok) return null;
+  const rows = await r.json().catch(() => []);
+  return Array.isArray(rows) && rows[0] ? _mvEstadoDe(rows[0].result) : null;
+}
 // TECHO ABSOLUTO hardcoded (Maxi 2026-07-24, pedido del user): ni la config ni un leak pueden pasar
 // de esto. 10.500 créditos / 90 días = 116/día break-even → 100 garantiza los 3 meses con margen.
 // Para subirlo hace falta un deploy (fuerza intención, no se cambia por accidente desde la DB).
@@ -19483,6 +19559,17 @@ async function _verifyEmailMV(token, cfg, email) {
   const lower = String(email || "").toLowerCase();
   if (!lower.includes("@")) return true;
   if (_mvCache.has(lower)) return _mvCache.get(lower);
+  // ── EL CACHÉ VIVE EN LA BASE, NO SÓLO EN MEMORIA (2026-09-11) ────────────────────────
+  // `_mvCache` es un Map en memoria y el worker reinicia cada ~7 minutos. El parte del 10/09
+  // mostró 269 envíos salteados por `mv_dudoso` en un día: el agente elegía los mismos leads,
+  // le pagaba a MillionVerifier la MISMA dirección otra vez y la volvía a saltear. Cada
+  // verificación queda guardada en `toolbar_mv_results`; se lee de ahí antes de gastar.
+  const _guardado = await _mvResultadoGuardado(token, lower).catch(() => null);
+  if (_guardado) {
+    if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
+    _mvCache.set(lower, _guardado);
+    return _guardado;
+  }
   const day = _madridNowParts().dateISO;
   // Cap DURABLE: al cambiar de día O tras un RESTART (_mvDay arranca ""), re-siembra el contador desde
   // el valor PERSISTIDO (millionverifier_used="YYYY-MM-DD:N"). Sin esto, cada reinicio del worker
@@ -19541,10 +19628,7 @@ async function _verifyEmailMV(token, cfg, email) {
     // devuelven "riesgo" más arriba y siguen siendo enviables, porque son ausencia de
     // información y no un veredicto. Tratar "no sé" como "no" es el error que ya pagamos ocho
     // veces en este proyecto.
-    const estado = (res === "invalid" || res === "disposable") ? "no"
-                 : (res === "unknown" || res === "risky") ? "dudoso"
-                 : (res === "catch_all") ? "riesgo"
-                 : "ok";
+    const estado = _mvEstadoDe(res) || "ok";
     const deliverable = estado !== "no";
     if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
     _mvCache.set(lower, estado);
@@ -21555,14 +21639,21 @@ async function runAgentCycle(token, allFlags) {
   const _DIAS_STOCK_OBJETIVO = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
   let _recorteStock = null;
   if (String(cfg.agent_regular_por_stock ?? "true") === "true") {
-    let _contactables = null;
+    let _contactables = null, _motivoStock = "";
     try {
       const r = await fetch(
         `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`,
-        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } });
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(10000) });
       if (r.ok) _contactables = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
-    } catch {}
-    // "No pude medir" NO recorta nada: sería frenar el envío por un glitch de la base.
+      else _motivoStock = `HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 160)}`;
+    } catch (e) { _motivoStock = e.message; }
+    // "No pude medir" NO recorta nada: sería frenar el envío por un glitch de la base. Pero
+    // tampoco se calla: trece días sin este latido se leyeron como "trabajo sin correr" y no
+    // había forma de saber si la lectura fallaba o si el regulador estaba apagado (2026-09-11).
+    if (_contactables == null) {
+      log(`  ⚠️ stock de envíos: no pude contar los contactables (${_motivoStock}) — no recorto nada`);
+      await saludPing(token, "stock_envios", { status: "fail", cadenciaMin: 60, detalle: `no pude contar el stock: ${_motivoStock}` }).catch(() => {});
+    }
     if (_contactables != null) {
       const _objetivoPleno = Math.max(1, allFlags.agentUsers.length) * (_agentCfg(cfg).maxPerDay || 20);
       const _dias = _contactables / _objetivoPleno;
@@ -21589,6 +21680,9 @@ async function runAgentCycle(token, allFlags) {
         real: Math.round(_dias), esperado: _DIAS_STOCK_OBJETIVO,
       }).catch(() => {});
     }
+  } else {
+    // Apagado a propósito ≠ sin correr: el vigilante tiene que saber la diferencia.
+    await saludApagado(token, "stock_envios", "agent_regular_por_stock=false").catch(() => {});
   }
 
   // ── EL ÚLTIMO MB YA NO SE MUERE DE HAMBRE (Maxi 2026-08-11) ─────────────────
@@ -25039,9 +25133,11 @@ async function _boletinPorSeccion(token) {
       const _resta = Math.max(0, (_mSync.reprospectables || 0) - (_mSync.encolados || 0));
       const _edad = Math.floor((Date.now() - Date.parse(`${_mSync.fecha}T12:00:00Z`)) / 86_400_000);
       const _techo = Number(_mSync.techo || 0);
-      const _cumplio = _resta === 0 || (_techo && (_mSync.encolados || 0) >= _techo * 0.9) || (_resta > 0 && (_mSync.encolados || 0) >= Math.min(_resta, _techo || Infinity) * 0.9);
+      // Y si el carril estaba lleno (`libre`), lo posible era ese cupo, no el techo (2026-09-11).
+      const _posible = Math.min(_resta, _techo || Infinity, _mSync.libre != null ? Number(_mSync.libre) : Infinity);
+      const _cumplio = _resta === 0 || (_techo && (_mSync.encolados || 0) >= _techo * 0.9) || (_resta > 0 && (_mSync.encolados || 0) >= _posible * 0.9);
       _nota("CICLOS FINALIZADOS → PROSPECTS (CRM)", _edad >= 2 ? "🔴" : _cumplio ? "✅" : "🟡", [
-        `Barrido del ${_mSync.fecha}${_edad >= 2 ? ` — ⚠️ hace ${_edad} días que no corre` : _edad === 1 ? " (ayer)" : ""}: ${_mSync.encolados} entraron (techo ${_techo || "?"}/día), ${_resta} elegibles siguen esperando su turno.`,
+        `Barrido del ${_mSync.fecha}${_edad >= 2 ? ` — ⚠️ hace ${_edad} días que no corre` : _edad === 1 ? " (ayer)" : ""}: ${_mSync.encolados} entraron (techo ${_techo || "?"}/día${_mSync.libre != null && Number(_mSync.libre) < (_techo || Infinity) ? `, carril con ${_mSync.libre} libres: el feeder ya lo alimenta por slot` : ""}), ${_resta} elegibles siguen esperando su turno.`,
         ...(_resta > 0 ? [`A este ritmo, ~${Math.ceil(_resta / Math.max(1, _mSync.encolados || 1))} día(s) para vaciar la espera. Es el techo diario, no una falla.`] : []),
       ]);
     }

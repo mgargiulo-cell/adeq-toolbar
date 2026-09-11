@@ -1283,7 +1283,12 @@ export function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, e
 
   if (_estricto && plantilla != null) {
     // Sobre la PLANTILLA, no sobre el mail entero: la firma no se juzga.
-    const palabras = plantilla.trim().split(/\s+/).filter(Boolean).length;
+    // Japonés, chino, coreano y tailandés no separan las palabras con espacios: el 10/09 un
+    // pitch en japonés de 250 caracteres contó 6 "palabras" y el agente lo frenó como
+    // `cuerpo_muy_corto_6` (herseyshiga.com). Cada dos caracteres de esas escrituras cuentan
+    // como una palabra, que es lo que mide un texto real en japonés.
+    const _cjk = (plantilla.match(/[぀-ヿ㐀-䶿一-鿿가-힯฀-๿]/g) || []).length;
+    const palabras = plantilla.trim().split(/\s+/).filter(Boolean).length + Math.round(_cjk / 2);
     if (palabras < 15) bloqueantes.push(`cuerpo_muy_corto_${palabras}`);
     if (palabras > 400) bloqueantes.push(`cuerpo_muy_largo_${palabras}`);
     if ((plantilla.match(/!/g) || []).length > 2) bloqueantes.push("exceso_de_exclamaciones");

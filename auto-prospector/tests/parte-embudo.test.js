@@ -29,7 +29,9 @@ const resp = (body, { status = 200, total } = {}) => ({
 const ALTAS = [
   // wikidata: 2 altas, las 2 con email, las 2 contactadas → 100%
   { domain: "larepublica.pe", source: "auto_feeder_wikidata", emails: ["dir@larepublica.pe"], email_sources: { "dir@larepublica.pe": "pattern" }, geo: "Perú", geos_all: ["PE"], created_at: ahora },
-  { domain: "atv.pe",         source: "auto_feeder_wikidata", emails: ["info@atv.pe"],        email_sources: { "info@atv.pe": "scrape" },        geo: "Perú", geos_all: ["PE"], created_at: ahora },
+  // `email_sources` también viene como OBJETO ({source, url}) según quién lo escribió: el
+  // parte del 10/09 mostró "[object object]" con 3.352 emails. Este es de esa forma.
+  { domain: "atv.pe",         source: "auto_feeder_wikidata", emails: ["info@atv.pe"],        email_sources: { "info@atv.pe": { source: "scrape", url: "https://atv.pe/contacto" } }, geo: "Perú", geos_all: ["PE"], created_at: ahora },
   // crux: 4 altas, 2 con email, 0 contactadas → 0%
   { domain: "tienda1.pe", source: "auto_feeder_crux", emails: ["a@tienda1.pe"], email_sources: { "a@tienda1.pe": "rol_mx" }, geo: "Perú", geos_all: ["PE"], created_at: ahora },
   { domain: "tienda2.pe", source: "auto_feeder_crux", emails: ["b@tienda2.pe"], email_sources: { "b@tienda2.pe": "pattern" }, geo: "Perú", geos_all: ["PE"], created_at: ahora },
@@ -56,6 +58,10 @@ function enrutador(registro) {
       { status: "skipped", error_message: "not_publisher: sin_ads_txt" },
       { status: "skipped", error_message: "not_publisher: haiku_corp" },
       { status: "next_day", error_message: "reintentar: ads_txt_no_verificable_y_rubro_dudoso:haiku_bank" },
+      // El mismo dominio llegando por dos fuentes NO es un rechazo: no puede entrar al %.
+      { status: "skipped", error_message: "ya_estaba_en_prospects" },
+      { status: "skipped", error_message: "ya_estaba_en_prospects" },
+      { status: "skipped", error_message: "ya_estaba_en_prospects" },
     ]);
     if (u.includes("toolbar_csv_queue?processed_at=gte.")) return resp([{ source: "auto_feeder_crux", status: "done" }]);
     if (u.includes("toolbar_traffic_cache") && u.includes("noData")) return resp([], { total: u.includes("fetched_at") ? 7 : 1415 });
@@ -95,12 +101,18 @@ const despuesDe = (etiqueta, n = 320) => {
 };
 
 test("el embudo separa la fuente que se contacta de la que sólo entra", () => {
-  const t = despuesDe("El embudo a 30 días", 700);
+  const t = despuesDe("El embudo a 30 días", 1000);
+  // La señal es RELATIVA al promedio (2026-09-11): con 220 altas/día y 40 envíos, un umbral
+  // fijo del 20% pintaba todo en rojo para siempre. Acá: 2 contactadas de 7 → 29%.
+  match(t, /Se contactó el 29% de lo que entró en 30 días \(2 de 7\)/, t);
   // wikidata: 2 entraron, 2 con email (100%), 2 contactadas (100%) → verde
-  match(t, /wikidata\s+entraron\s+2 · con email\s+2 \(100%\) · contactadas\s+2 \(100%\)/, t);
+  match(t, /✅ wikidata\s+entraron\s+2 · con email\s+2 \(100%\) · contactadas\s+2 \(100%\)/, t);
   // crux: 4 entraron, 2 con email (50%), 0 contactadas → rojo. Es la fuente a revisar.
-  match(t, /crux\s+entraron\s+4 · con email\s+2 \( 50%\) · contactadas\s+0 \(0%\)/, t);
-  ok(t.includes("✅") && t.includes("🔴"), `las señales tienen que distinguir las dos: ${t}`);
+  match(t, /🔴 crux\s+entraron\s+4 · con email\s+2 \( 50%\) · contactadas\s+0 \(0%\)/, t);
+});
+
+test("ninguna vía se llama '[object object]'", () => {
+  ok(!/\[object/i.test(html), "hay un email_sources en forma de objeto que el parte no entendió");
 });
 
 test("la GEO de las altas dice cuánto anglo entra, en porcentaje", () => {
@@ -119,10 +131,12 @@ test("cada vía de email muestra sus rebotes, atribuidos a la dirección exacta 
 });
 
 test("los motivos de rechazo se agrupan, y los reintentables NO se cuentan como descarte", () => {
-  const t = despuesDe("Por qué se rechaza", 420);
+  const t = despuesDe("Por qué se rechaza", 600);
+  // Los 3 "ya_estaba_en_prospects" NO entran al %: 2 + 1 = 3 rechazos reales.
   match(t, /sin_ads_txt\s+2 \(67%\)/, t);
   match(t, /haiku_corp\s+1 \(33%\)/, t);
   match(t, /↻ 1 NO se descartaron: vuelven mañana/, t);
+  match(t, /3 ya estaban en Prospects: no es rechazo/, t);
 });
 
 test("la caché negativa informa el stock y lo de hoy", () => {
