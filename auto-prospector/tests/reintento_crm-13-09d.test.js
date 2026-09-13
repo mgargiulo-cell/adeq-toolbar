@@ -2,6 +2,9 @@
 //
 //   R1. Un adicional que rebota no encontraba su sitio: `future_sent` sólo queda en agent_actions,
 //       nunca en sendtrack, así que el aviso al CRM no salía y el reintento usaba el dominio del correo.
+//  R1b. Ese rebote no puede llegar al CRM como `bounced_email`: le vaciaba el Email al principal vivo.
+//  R1c. El reintento que sale por esa dirección queda igual en sendtrack: si no, el re-engagement le
+//       repetía el pitch a los pocos días.
 //   R2. El reintento borraba de `email_sources` la vía de la dirección que rebotó: se perdía quién la
 //       había encontrado, justo el registro que el parte usa de respaldo.
 //   R3. El ranking de fuentes contaba un fuera de oficina como rebote de la fuente.
@@ -226,7 +229,10 @@ test("R1b: el reintento por el rebote de un adicional manda, pero no le cuenta a
       strictEqual(JSON.parse(sendtrack[0].b).email, c.nueva);
     } else {
       deepStrictEqual(alCrm, [], "el principal sigue vivo: ni `email` nuevo (lo reemplaza) ni un push vacío (marca formulario)");
-      strictEqual(sendtrack.length, 0, "sendtrack es el registro de la principal: con esta fila, su próximo rebote vaciaría la ficha");
+      // Desde R1c (abajo) el reintento queda en sendtrack igual: es lo que leen el re-engagement y los candados
+      // de 30 días. Que su próximo rebote no vacíe la ficha lo decide el último envío (`principal: false`).
+      strictEqual(sendtrack.length, 1, "el mail salió: sin esta fila el re-engagement le repite el pitch a esa dirección");
+      strictEqual(JSON.parse(sendtrack[0].b).email, c.nueva);
     }
   }
 });
@@ -240,6 +246,192 @@ test("R1b: sin alternativa, el rebote de un adicional no avisa 'contacto agotado
   for (const m of fn.matchAll(/pushToCrmPropio\(/g)) {
     ok(/if \(_eraPrincipal\) \{\s*await $/.test(fn.slice(Math.max(0, m.index - 60), m.index)), `un push al CRM sin la condición: ${fn.slice(m.index, m.index + 80)}`);
   }
+});
+
+// ── R1c. El reintento por un adicional o un 2º email queda en sendtrack ─────────────────────────────
+// R1b dejó de escribir toolbar_sendtrack cuando el reintento salía por una dirección que no era la
+// principal, para que "está en sendtrack" siguiera queriendo decir "es la principal". Pero sendtrack es
+// lo que leen el re-engagement (el freno de 30 días por dirección) y los candados de 30 días: la dirección
+// del reintento recibía otro pitch a los 6 días. Es un camino de punta a punta sobre una base con estado:
+// rebota → sale el reintento → corre el re-engagement → rebota la dirección del reintento.
+// Dominio y direcciones propios: la lista de rebotados vive en lib/, que se carga una vez por proceso, y los
+// tests de arriba ya quemaron direcciones de sitio.it.
+const DOM_C = "giornale-r1c.it";
+const PRINCIPAL_C = `info@${DOM_C}`, OTRA_C = `commerciale@${DOM_C}`;
+const ENVIOS_C = ["sent", "secondary_sent", "re_sent", "bounce_retry_sent", "future_sent"];
+function baseConEstado({ rebotada, accion, emails = [rebotada], emailFuturo = OTRA_C }) {
+  const db = {
+    sendtrack: [{ domain: DOM_C, send_date: "2026-09-14", email: PRINCIPAL_C }],
+    // Por defecto sin info@ en la ficha: con él adentro, `_elegirEnviable` consulta el DNS real y el orden
+    // depende de la máquina. La única alternativa es el Email Futuro del MB.
+    emails,
+    emailFuturo,
+    actions: [
+      { id: 1, domain: DOM_C, user_email: MB, action: "sent", email_to: PRINCIPAL_C, details: { email: PRINCIPAL_C }, created_at: "2026-09-14T10:00:00.000Z" },
+      { id: 2, domain: DOM_C, user_email: MB, action: accion, email_to: rebotada, details: {}, created_at: "2026-09-14T10:00:01.000Z" },
+    ],
+    gmail: [], crm: [], congelado: false, rebote: null,
+  };
+  let nextId = 100;
+  const router = async (url, opts = {}) => {
+    const u = decodeURIComponent(String(url)), m = (opts.method || "GET").toUpperCase(), b = String(opts.body || "");
+    if (u.includes("oauth2.googleapis.com")) return resp({ access_token: "falso", expires_in: 3600 });
+    if (u.includes("gmail.googleapis.com") && u.includes("/messages/send")) {
+      const txt = Buffer.from(String(JSON.parse(b).raw || "").replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+      db.gmail.push((txt.match(/^To:\s*(.+)$/mi) || [])[1]?.trim() || "?");
+      return resp({ id: `enviado${db.gmail.length}` });
+    }
+    if (u.includes("gmail.googleapis.com") && u.includes("messages?q=")) return resp({ messages: db.rebote ? [{ id: db.rebote.msg }] : [] });
+    if (u.includes("gmail.googleapis.com") && db.rebote && u.includes(`messages/${db.rebote.msg}?format=full`)) return resp({ payload: {
+      headers: [{ name: "X-Failed-Recipients", value: db.rebote.direccion }, { name: "Content-Type", value: "multipart/report; report-type=delivery-status" }],
+      body: { data: Buffer.from(`Delivery has failed to these recipients or groups:\n${db.rebote.direccion}\nRemote server returned '550 5.1.1 User unknown'`).toString("base64") },
+    } });
+    if (u.includes("gmail.googleapis.com")) return resp({});
+    if (u.includes("toolbar_config")) return resp([
+      { key: "crm_propio_enabled", value: "true" },
+      { key: "monday_bloqueados", value: CONFIG_CRM[1].value },
+      { key: "monday_bloqueados_at", value: new Date().toISOString() },
+      { key: "agent_reengagement_enabled", value: "true" },
+      { key: "agent_active_hours_start", value: "0" }, { key: "agent_active_hours_end", value: "24" },
+    ]);
+    if (m === "POST" && b.includes('"prospects"')) { db.crm.push(...JSON.parse(b).prospects); return resp({ ok: 1, errores: [], avisos: [] }); }
+    if (u.includes("toolbar_sendtrack")) {
+      if (m === "POST") { db.sendtrack.push(JSON.parse(b)); return resp(null, { status: 201 }); }
+      const em = (u.match(/[?&]email=eq\.([^&]+)/) || [])[1];
+      if (em) return resp(db.sendtrack.filter(r => r.email.toLowerCase() === em.toLowerCase()).map(r => ({ domain: r.domain })));
+      const desde = (u.match(/send_date=gte\.([^&]+)/) || [])[1] || "";
+      return resp(db.sendtrack.filter(r => u.includes(`domain=eq.${r.domain}&`) && r.send_date >= desde).map(r => ({ email: r.email, send_date: r.send_date })));
+    }
+    if (u.includes("toolbar_frozen_leads?domain=eq.")) return resp(db.congelado ? [{ domain: DOM_C }] : []);
+    // La dirección nueva la cargó el MB (Email Futuro): así la elección no depende del DNS de la máquina
+    // que corre el test (sin eso, el orden de `_elegirEnviable` consulta el proveedor de correo real).
+    if (u.includes("toolbar_reengagement_queue?domain=eq.")) return resp(db.emailFuturo ? [{ future_email: db.emailFuturo }] : []);
+    if (u.includes("toolbar_agent_actions")) {
+      if (m === "POST") { const fila = { id: nextId++, ...JSON.parse(b) }; db.actions.push(fila); return resp([fila], { status: 201 }); }
+      if (m === "PATCH") {
+        const fila = db.actions.find(a => a.id === Number((u.match(/id=eq\.(\d+)/) || [])[1]));
+        if (fila) Object.assign(fila, JSON.parse(b));
+        return resp([]);
+      }
+      const em = (u.match(/email_to=eq\.([^&]+)/) || [])[1];
+      if (em && !u.includes("user_email=eq.")) return resp(db.actions.filter(a => a.email_to === em && ENVIOS_C.includes(a.action)).slice(-1));
+      if (u.includes("domain=eq.") && u.includes("select=email_to")) {
+        return resp(db.actions.filter(a => u.includes(`domain=eq.${a.domain}&`) && ENVIOS_C.includes(a.action)).map(a => ({ email_to: a.email_to })));
+      }
+      if (u.includes("action=eq.sent&")) return resp(db.actions.filter(a => a.action === "sent"));
+      if (u.includes("action=in.(re_sent,reengagement_exhausted)")) return resp(db.actions.filter(a => ["re_sent", "reengagement_exhausted"].includes(a.action)));
+      if (u.includes("action=in.(sent,re_sent)&select=id")) return resp([], { total: db.actions.filter(a => ["sent", "re_sent"].includes(a.action)).length });
+      return resp([]);
+    }
+    if (u.includes("toolbar_review_queue")) {
+      if (m === "PATCH") { const p = JSON.parse(b); if (p.emails) db.emails = p.emails; return resp([]); }
+      if (u.includes("id=eq.")) return resp([{ emails: db.emails, email_sources: {} }]);
+      return resp([{ id: 5, monday_item_id: null, emails: db.emails, email_sources: {}, category: "", traffic: 0, pitch: PITCH,
+        pitch_subject: "Una consulta sobre publicidad", language: "it", geo: "IT", contact_name: "" }]);
+    }
+    if (u.includes("/ficha?domain=")) return resp({ found: false });
+    if (u.includes("toolbar_bounce_retries") && m === "GET") return resp([], { total: 0 });
+    return resp([]);
+  };
+  return { db, router };
+}
+
+test("R1c: el reintento por un 2º email o un adicional queda en sendtrack; el re-engagement no le repite el pitch y su rebote no vacía la ficha", async (t) => {
+  const casos = [
+    // Una dirección nueva por caso: el paso 3 la quema, y la lista de rebotados se comparte entre cargas.
+    { nombre: "2º email del agente", rebotada: `mario.rossi@${DOM_C}`, accion: "secondary_sent", otra: OTRA_C },
+    { nombre: "adicional del MB", rebotada: `redaccion2@${DOM_C}`, accion: "future_sent", otra: `pubblicita@${DOM_C}` },
+  ];
+  for (const c of casos) {
+    const w = await cargarWorker(["queueBounceRetry", "runReengagementCycle", "scanBouncesForUser", "_origenDeLaDireccion"], { fetchFalso: true });
+    const { db, router } = baseConEstado({ ...c, emailFuturo: c.otra });
+    globalThis.__fetchFalso = router;
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-15T10:00:00Z") });   // martes
+    try {
+      // 1. Rebota la dirección que no es la principal y sale el reintento.
+      await w.queueBounceRetry("t", MB, c.rebotada, "hard");
+      deepStrictEqual(db.gmail, [c.otra], `${c.nombre}: el reintento sale`);
+      strictEqual(db.actions.find(a => a.action === "bounce_retry_sent")?.details?.principal, false, c.nombre);
+      deepStrictEqual(db.crm, [], `${c.nombre}: el principal sigue vivo, el CRM no se entera de un reemplazo`);
+      ok(db.sendtrack.some(r => r.domain === DOM_C && r.email === c.otra),
+        `${c.nombre}: el mail salió y tiene que quedar donde lo ven el re-engagement y los candados de 30 días: ${JSON.stringify(db.sendtrack.map(r => r.email))}`);
+
+      // 2. Seis días después info@ no abrió y corre el re-engagement. Sin key de MillionVerifier el camino corta
+      //    antes de Gmail, así que lo que prueba que no le iba a escribir es que ni siquiera reserva el envío.
+      t.mock.timers.setTime(Date.parse("2026-09-21T10:00:00Z"));   // lunes
+      db.gmail.length = 0;
+      await w.runReengagementCycle("t");
+      const aLaOtra = db.actions.filter(a => a.email_to === c.otra && a.action !== "bounce_retry_sent");
+      deepStrictEqual(aLaOtra.map(a => `${a.action}:${a.reason || ""}`), [], `${c.nombre}: ${c.otra} recibió el reintento hace 6 días — el freno de 30 días tiene que verlo`);
+      deepStrictEqual(db.gmail, []);
+
+      // 3. Rebota la dirección del reintento. Está en sendtrack, pero el último envío a ella es un reintento
+      //    con `principal: false`: se quema sin avisarle al CRM, que vaciaría el Email de info@.
+      db.congelado = true;   // el reintento que dispara el scan corta ahí
+      db.rebote = { msg: `rebote-${c.accion}`, direccion: c.otra };
+      strictEqual(await w.scanBouncesForUser("t", MB), 1, c.nombre);
+      await esperar(100);   // el reintento y la acción salen sin await
+      deepStrictEqual(db.crm, [], `${c.nombre}: ${JSON.stringify(db.crm)}`);
+      deepStrictEqual(await w._origenDeLaDireccion("t", c.otra), { sitio: DOM_C, via: "sendtrack", accion: "bounce_retry_sent", principal: false });
+      // La principal está en sendtrack y su último envío es `sent`: sigue siendo la principal.
+      deepStrictEqual(await w._origenDeLaDireccion("t", PRINCIPAL_C), { sitio: DOM_C, via: "sendtrack", accion: "sent", principal: true });
+    } finally {
+      t.mock.timers.reset();
+    }
+  }
+});
+
+test("R1c: con la dirección en sendtrack, el último envío decide si es la principal; `_sitioDeLaDireccion` no consulta de más", async () => {
+  const { _origenDeLaDireccion, _sitioDeLaDireccion } = await cargarWorker(["_origenDeLaDireccion", "_sitioDeLaDireccion"], { fetchFalso: true });
+  let reg = [];
+  const origen = async (o) => { globalThis.__fetchFalso = enrutadorSitio(reg, o); return _origenDeLaDireccion("t", "x@sitio.it"); };
+  const st = [{ domain: "sitio.it" }];
+  for (const accion of ["future_sent", "secondary_sent"]) {
+    strictEqual((await origen({ st, aa: [{ domain: "sitio.it", action: accion, details: {} }] })).principal, false,
+      `${accion}: en un ciclo anterior pudo haber sido la principal, hoy le escribimos como adicional`);
+  }
+  strictEqual((await origen({ st, aa: [{ domain: "sitio.it", action: "bounce_retry_sent", details: { principal: false } }] })).principal, false);
+  strictEqual((await origen({ st, aa: [{ domain: "sitio.it", action: "bounce_retry_sent", details: { principal: true } }] })).principal, true);
+  deepStrictEqual(await origen({ st, aa: [] }), { sitio: "sitio.it", via: "sendtrack", accion: null, principal: true },
+    "sin envío registrado en 90 días, sendtrack alcanza (un envío viejo del popup)");
+  deepStrictEqual(await origen({ st, aa: [{ domain: "otro.it", action: "future_sent", details: {} }] }), { sitio: "sitio.it", via: "sendtrack", accion: null, principal: true },
+    "un envío a la misma dirección para OTRO sitio no dice nada de la ficha de este");
+  deepStrictEqual(await origen({ st, aa: "falla" }), { sitio: "sitio.it", via: "sendtrack", accion: null, principal: true },
+    "si no se puede leer el último envío queda lo de siempre: sendtrack es la principal");
+  reg = [];
+  globalThis.__fetchFalso = enrutadorSitio(reg, { st, aa: [{ domain: "sitio.it", action: "future_sent", details: {} }] });
+  strictEqual(await _sitioDeLaDireccion("t", "x@sitio.it"), "sitio.it");
+  ok(!reg.some(u => u.includes("toolbar_agent_actions")), "para el sitio sólo, sendtrack alcanza");
+});
+
+// Caso G de la revisión: rebota el 2º email (de webmail) y la única alternativa de la ficha es el principal,
+// que recibió el pitch ayer. Se le mandaba otra vez, y ese reintento (`principal: false`, ahora también en
+// sendtrack) hacía que `_origenDeLaDireccion` leyera al principal como adicional: su rebote después ya no se
+// le avisaba al CRM.
+test("R1c: con el rebote de un 2º email, el reintento no le repite el pitch a quien ya le escribimos (el principal vivo)", async () => {
+  const w = await cargarWorker(["queueBounceRetry", "_origenDeLaDireccion"], { fetchFalso: true });
+  const rebotada = "mario.rossi.r1c@gmail.com";
+  const { db, router } = baseConEstado({ rebotada, accion: "secondary_sent", emails: [PRINCIPAL_C, rebotada], emailFuturo: null });
+  globalThis.__fetchFalso = router;
+  await w.queueBounceRetry("t", MB, rebotada, "hard");
+  await esperar(50);   // el salto se anota sin await
+  deepStrictEqual(db.gmail, [], `${PRINCIPAL_C} recibió el pitch ayer y sigue vivo`);
+  ok(!db.actions.some(a => a.action === "bounce_retry_sent"), "no hay reintento que anotar");
+  deepStrictEqual(db.sendtrack.map(r => r.email), [PRINCIPAL_C]);
+  deepStrictEqual(db.crm, []);
+  const salto = db.actions.find(a => a.action === "bounce_retry_skipped");
+  strictEqual(salto?.reason, "alternativas_ya_contactadas", `el salto queda dicho: ${JSON.stringify(db.actions.map(a => a.action))}`);
+  strictEqual((await w._origenDeLaDireccion("t", PRINCIPAL_C)).principal, true, "y el principal sigue siendo el principal");
+
+  // Si no se puede saber a quién le escribimos, no se reintenta: el principal está vivo, no se pierde nada.
+  const w2 = await cargarWorker(["queueBounceRetry"], { fetchFalso: true });
+  const b2 = baseConEstado({ rebotada, accion: "secondary_sent", emails: [PRINCIPAL_C, rebotada], emailFuturo: `direzione@${DOM_C}` });
+  globalThis.__fetchFalso = async (url, opts) => (String(url).includes("toolbar_sendtrack?domain=eq.")
+    ? resp({ message: "boom" }, { status: 500 }) : b2.router(url, opts));
+  await w2.queueBounceRetry("t", MB, rebotada, "hard");
+  await esperar(50);
+  deepStrictEqual(b2.db.gmail, [], "ante la duda, no");
+  strictEqual(b2.db.actions.find(a => a.action === "bounce_retry_skipped")?.reason, "ya_escritas_no_verificable");
 });
 
 // ── R2. La vía de la dirección que rebotó ───────────────────────────────────────────────

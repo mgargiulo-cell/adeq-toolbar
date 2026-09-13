@@ -19339,7 +19339,7 @@ const REBOTE_BUZON_LLENO = new RegExp([
  * agent_actions: 90 días, una fila, con reloj. Mismas acciones que `_leEscribimosA`.
  */
 async function _sitioDeLaDireccion(token, email) {
-  return (await _origenDeLaDireccion(token, email)).sitio;
+  return (await _origenDeLaDireccion(token, email, { soloSitio: true })).sitio;
 }
 
 // Los envíos que dejan a esa dirección como el Email de la ficha del CRM. `future_sent` (adicional
@@ -19359,15 +19359,26 @@ const _ACCIONES_DEL_PRINCIPAL = new Set(["sent", "re_sent", "bounce_retry_sent"]
  * sin email). Un adicional muerto frenaba la cadencia del principal, que está vivo. Quemar la
  * dirección (markEmailBounced) necesita sólo el sitio; avisarle al CRM necesita las dos respuestas.
  *
- * Qué es principal:
- *   · estar en `toolbar_sendtrack`: lo escriben el agente (el principal), el popup (el mail que
- *     manda el MB) y el reintento que reemplaza al principal. Ni el adicional ni el 2º email.
- *   · en agent_actions, `sent` / `re_sent` / `bounce_retry_sent`, salvo que el reintento haya
- *     salido por el rebote de una dirección que NO era la principal (`details.principal === false`:
- *     ese reintento no se le cuenta al CRM, así que su dirección tampoco es la de la ficha).
+ * Qué es principal lo dice el ÚLTIMO envío a esa dirección para ese sitio (agent_actions, 90 días):
+ *   · `sent` / `re_sent` / `bounce_retry_sent` sí, salvo que el reintento haya salido por el rebote de
+ *     una dirección que NO era la principal (`details.principal === false`: ese reintento no se le
+ *     cuenta al CRM, así que su dirección tampoco es la de la ficha).
+ *   · `future_sent` / `secondary_sent` no.
+ *   · en `toolbar_sendtrack` sin ningún envío en agent_actions (un envío viejo del popup) o sin poder
+ *     leerlo: principal, como fue siempre. No avisar el rebote de la principal deja al CRM mandando
+ *     follow-ups a una casilla que no existe.
+ *
+ * ⚠️ ESTAR EN SENDTRACK YA NO ALCANZA PARA SER LA PRINCIPAL (2026-09-13). Para que "está en sendtrack"
+ * quisiera decir "es la principal", el reintento que sale por el rebote de un adicional o de un 2º email
+ * dejó de escribir sendtrack. Pero sendtrack es lo que leen el re-engagement (el freno de 30 días por
+ * dirección) y los candados de 30 días del agente, de Prospects y de la extensión: a esa dirección le
+ * volvía a llegar el pitch a los 6 días. El reintento vuelve a quedar en sendtrack como todo mail que
+ * sale; sendtrack da el sitio y el último envío dice si es la principal.
+ * `soloSitio` (`_sitioDeLaDireccion`): para el sitio solo, con sendtrack alcanza y no se consulta más.
  */
-async function _origenDeLaDireccion(token, email) {
+async function _origenDeLaDireccion(token, email, { soloSitio = false } = {}) {
   const sinDatos = { sitio: "", via: "", accion: null, principal: null };
+  let deSendtrack = "";   // el sitio, si sendtrack tiene la dirección
   const e = String(email || "").trim().toLowerCase();
   if (!e) return sinDatos;
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
@@ -19386,10 +19397,15 @@ async function _origenDeLaDireccion(token, email) {
     } else {
       const filas = await r.json();
       if (Array.isArray(filas) && filas[0]?.domain) {
-        return { sitio: String(filas[0].domain).toLowerCase(), via: "sendtrack", accion: null, principal: true };
+        const sitio = String(filas[0].domain).toLowerCase();
+        if (soloSitio) return { sitio, via: "sendtrack", accion: null, principal: true };
+        deSendtrack = sitio;
       }
     }
   } catch { /* se prueba el respaldo */ }
+  // Con el sitio de sendtrack y sin un último envío que lo desmienta, la regla de siempre: es la principal.
+  const soloSendtrack = deSendtrack ? { sitio: deSendtrack, via: "sendtrack", accion: null, principal: true } : null;
+  const sinWww = (d) => String(d || "").replace(/^www\./, "");
   try {
     const desde = new Date(Date.now() - 90 * 86_400_000).toISOString();
     const r = await fetch(
@@ -19398,17 +19414,19 @@ async function _origenDeLaDireccion(token, email) {
     );
     if (!r.ok) {
       log(`  ⚠️ _sitioDeLaDireccion(${e}): agent_actions HTTP ${r.status} — no es que falten datos, la consulta falló`);
-      return sinDatos;
+      return soloSendtrack || sinDatos;
     }
     const filas = await r.json();
     const fila = Array.isArray(filas) ? filas[0] : null;
     const d = fila?.domain ? String(fila.domain).trim().toLowerCase() : "";
     // Sólo un dominio de verdad: nunca un marcador como "_bounce_".
-    if (!d.includes(".") || d.startsWith("_")) return sinDatos;
+    if (!d.includes(".") || d.startsWith("_")) return soloSendtrack || sinDatos;
+    // Un envío a la misma dirección para OTRO sitio no dice nada de la ficha del que dio sendtrack.
+    if (deSendtrack && sinWww(d) !== sinWww(deSendtrack)) return soloSendtrack;
     const accion = String(fila.action || "") || null;
     const principal = _ACCIONES_DEL_PRINCIPAL.has(accion) && fila.details?.principal !== false;
-    return { sitio: d, via: "agent_actions", accion, principal };
-  } catch { return sinDatos; }
+    return { sitio: deSendtrack || d, via: deSendtrack ? "sendtrack" : "agent_actions", accion, principal };
+  } catch { return soloSendtrack || sinDatos; }
 }
 
 async function scanBouncesForUser(token, userEmail) {
@@ -20216,6 +20234,29 @@ async function _leEscribimosA(token, userEmail, email) {
   } catch { return null; }
 }
 
+// A qué direcciones ya les escribimos por este sitio (2026-09-13): sendtrack (cualquier fecha) y los envíos de
+// agent_actions de 90 días, porque el adicional (`future_sent`) y el 2º email (`secondary_sent`) no están en
+// sendtrack. Dos consultas gratis, con reloj. null = no se pudo saber (no es lo mismo que "a nadie").
+async function _direccionesYaEscritas(token, domain) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const d = encodeURIComponent(String(domain || "").trim().toLowerCase());
+  if (!d) return null;
+  const desde = new Date(Date.now() - 90 * 86_400_000).toISOString();
+  try {
+    const [rSt, rAa] = await Promise.all([
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${d}&select=email&limit=500`,
+        { headers: auth, signal: AbortSignal.timeout(10000) }),
+      fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?domain=eq.${d}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${desde}&select=email_to&limit=500`,
+        { headers: auth, signal: AbortSignal.timeout(10000) }),
+    ]);
+    if (!rSt.ok || !rAa.ok) return null;
+    const [st, aa] = await Promise.all([rSt.json(), rAa.json()]);
+    if (!Array.isArray(st) || !Array.isArray(aa)) return null;
+    return new Set([...st.map(f => f?.email), ...aa.map(f => f?.email_to)]
+      .map(e => String(e || "").trim().toLowerCase()).filter(e => e.includes("@")));
+  } catch { return null; }
+}
+
 async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
   try {
     // ⚠️ El dominio es el del SITIO al que le escribimos, no el de la dirección que rebotó.
@@ -20230,8 +20271,8 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     // ¿Moría la dirección de la ficha? (2026-09-13, ver `_origenDeLaDireccion`). El rebote o la ausencia de
     // un adicional (future_sent) o del 2º email del agente (secondary_sent) deja al principal VIVO: el
     // reintento sale igual, pero no se le cuenta al CRM como reemplazo (le pisaría el Email y la fecha de
-    // contacto al principal) ni como "contacto agotado", y no deja fila en sendtrack. Sin saber el origen
-    // se conserva lo de antes: sólo un "no era la principal" cambia algo.
+    // contacto al principal) ni como "contacto agotado". La fila de sendtrack sí queda (ver abajo). Sin saber
+    // el origen se conserva lo de antes: sólo un "no era la principal" cambia algo.
     const _eraPrincipal = _origen.principal !== false;
     const domain = _sitioReal || (bouncedEmail.split("@")[1] || "").toLowerCase();
     if (!domain) return;
@@ -20630,7 +20671,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const dynRank = await getDynamicSourceRank(token, mbEmail);
     const SOURCE_RANK = { ...dynRank, manual: Math.max(dynRank.manual || 0, 5) };
     const _sourcesMap = lead.email_sources || {};
-    const ranked = candidates
+    let ranked = candidates
       .map(e => ({
         email: e,
         source: (manualFutureEmail && e.toLowerCase() === manualFutureEmail) ? "manual" : _normSrc(_sourcesMap[e.toLowerCase()]),
@@ -20649,6 +20690,31 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       log(`  ⏭️ ${domain}: candidatos existen pero todos con score negativo — skip`);
       _registrarSalto("candidatos_score_negativo");
       return;
+    }
+
+    // 4a. SI NO ERA LA PRINCIPAL, EL REINTENTO ES PARA OTRA PERSONA (2026-09-13).
+    // ⚠️ Con el rebote de un adicional o del 2º email, el candidato solía ser el PRINCIPAL, que está vivo y
+    // recibió el pitch hace nada: se le mandaba el mismo mail otra vez (caso G de la revisión; con un 2º email
+    // de webmail es nuevo desde que el reintento encuentra el sitio real). Encima ese reintento queda con
+    // `principal: false` en agent_actions y en sendtrack, y `_origenDeLaDireccion` —que mira el último envío—
+    // pasaba a leer al principal como adicional: un rebote suyo después ya no se le avisaba al CRM.
+    // Quedan sólo direcciones a las que nunca les escribimos por este sitio. Va DESPUÉS del rescate a
+    // propósito: no se paga Apollo para esto. Ante la duda, no: el principal sigue vivo, no se pierde nada.
+    // No deja fila en toolbar_bounce_retries: contaría para el tope y congelaría el sitio del principal vivo.
+    if (!_eraPrincipal) {
+      const _escritas = await _direccionesYaEscritas(token, domain);
+      if (!_escritas) {
+        log(`  ⏸️ ${domain}: no pude ver a quién ya le escribimos — no reintento (${bouncedEmail} no era la principal, que sigue viva)`);
+        _registrarSalto("ya_escritas_no_verificable");
+        return;
+      }
+      const _todas = ranked.map(x => x.email);
+      ranked = ranked.filter(x => !_escritas.has(String(x.email || "").trim().toLowerCase()));
+      if (!ranked.length) {
+        log(`  ⏭️ ${domain}: las alternativas ya recibieron un mail nuestro (${_todas.join(", ")}) — no se les repite el pitch`);
+        _registrarSalto("alternativas_ya_contactadas", { direcciones: _todas.slice(0, 10) });
+        return;
+      }
     }
 
     // 4b. A QUIÉN SE LE MANDA: con las reglas del agente, no con `ranked[0]` (2026-09-13).
@@ -20836,16 +20902,17 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         await updateMondayReengagementDispatch(mondayApiKey, lead.monday_item_id, cfg.monday_active_board || cfg.monday_board_id || 1420268379, retryEmail)
           .catch(e => log(`  ⚠️ ${domain}: Monday update FAIL: ${e.message}`));
       }
-      // Sendtrack. Sólo cuando retryEmail reemplaza a la principal (2026-09-13): sendtrack es el registro
-      // de la dirección de la ficha, y `_origenDeLaDireccion` lee "está en sendtrack" como "es la
-      // principal". El dominio ya tiene su fila del envío original, así que el freno de 30 días no cambia.
-      if (_eraPrincipal) {
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
-          method: "POST",
-          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
-          body: JSON.stringify({ domain, send_date: new Date().toISOString().split("T")[0], email: retryEmail, pitch: body.substring(0, 1000) }),
-        }).catch(() => {});
-      }
+      // Sendtrack, SIEMPRE que el mail salió (2026-09-13). Se había dejado sólo para cuando retryEmail
+      // reemplaza a la principal, para que "está en sendtrack" quisiera decir "es la principal". Pero
+      // sendtrack es lo que leen el re-engagement (el freno de 30 días por dirección) y los candados de 30
+      // días: sin esta fila, a la dirección del reintento le volvía a llegar el pitch a los 6 días. Que un
+      // rebote posterior de retryEmail no le vacíe la ficha al principal lo decide `details.principal` de
+      // la acción de arriba: `_origenDeLaDireccion` mira el último envío, no sólo sendtrack.
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_sendtrack`, {
+        method: "POST",
+        headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ domain, send_date: new Date().toISOString().split("T")[0], email: retryEmail, pitch: body.substring(0, 1000) }),
+      }).catch(() => {});
 
       log(`  ✅ ${domain}: bounce retry enviado a ${retryEmail}`);
     } else {
