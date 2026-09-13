@@ -7457,13 +7457,25 @@ function _deobfuscateEmails(text) {
 // Dos defensas:
 //   1. sacar del HTML los bloques que el usuario NO ve, ANTES de extraer
 //   2. rechazar los local-part que delatan una trampa
+// ── EL FILTRO BORRABA BLOQUES QUE SÍ SE VEN (2026-09-13) ──────────────────────────────────────
+// La clase se comparaba como TEXTO SUELTO: "hidden" pegaba en "overflow-hidden" (Tailwind, en
+// cualquier footer), "elementor-hidden-mobile" (WordPress con Elementor), "hidden md:block" (se ve
+// en escritorio), "hide-on-scroll"; `\shidden` pegaba hasta en title="a hidden gem"; y
+// aria-hidden="true" sólo dice "decorativo para lectores de pantalla", no "invisible". Medido con
+// el código real: un footer `class="relative overflow-hidden bg-gray-900"` con el mail en texto
+// daba []. El MB abría la extensión (que lee el DOM sin este filtro) y veía el email.
+// Ahora: la clase se compara como token ENTERO, se excluye la clase que se prende por breakpoint,
+// `hidden` sólo cuenta como ATRIBUTO y aria-hidden sale del veto (la trampa de Mailchimp igual cae
+// por su style position:absolute;left:-5000px). La otra defensa, detectarTrampaEmail, no cambia.
 const _BLOQUE_OCULTO_RE = new RegExp(
   "<([a-z]+)\\b[^>]*(?:" +
     "style\\s*=\\s*[\"'][^\"']*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|opacity\\s*:\\s*0|" +
       "font-size\\s*:\\s*0|text-indent\\s*:\\s*-\\d{3,}|position\\s*:\\s*absolute\\s*;?\\s*left\\s*:\\s*-\\d{3,})[^\"']*[\"']" +
-    "|\\shidden(?:\\s|>|=)" +
-    "|aria-hidden\\s*=\\s*[\"']true[\"']" +
-    "|class\\s*=\\s*[\"'][^\"']*(?:hidden|hide|sr-only|screen-reader|visually-hidden|honeypot|hp-field|nospam|antispam)[^\"']*[\"']" +
+    // Atributo HTML `hidden` de verdad: detrás viene >, =, u otro atributo. La palabra dentro de un valor no cuenta.
+    "|\\shidden(?=\\s*(?:/?>|=|[a-z][\\w:-]*\\s*=))" +
+    // Clase con token EXACTO (bordes: principio del valor o espacio, y espacio o comilla). No valen
+    // overflow-hidden, hidden-xs, elementor-hidden-mobile ni md:hidden. Tampoco "hidden md:block".
+    "|class\\s*=\\s*[\"'](?![^\"']*(?:sm|md|lg|xl|2xl):(?:block|flex|grid|inline|table|contents))(?:[^\"']*\\s)?(?:hidden|sr-only|screen-reader-text|visually-hidden|honeypot|hp-field|nospam|antispam)(?=[\\s\"'])[^\"']*[\"']" +
   ")[^>]*>[\\s\\S]{0,4000}?</\\1>", "gi");
 
 function _quitarBloquesOcultos(html) {
@@ -7687,11 +7699,19 @@ function extractEmailsFromHtml(html) {
   // Cadena completa: sacar media → desarmar concatenación JS → entidades → palabras-arroba →
   // el deobfuscador clásico. El orden importa: sin decodificar entidades primero, la
   // concatenación de Joomla queda en '&#109;a&#105;l' y no sirve de nada.
+  // ── mailto CON LA ARROBA CODIFICADA (2026-09-13) ──────────────────────────────────────────
+  // `mailto:ventas%40medio.com`: el navegador lo decodifica y la extensión también lo lee
+  // (modules/scraper.js hace decodeURIComponent sobre a.href), pero todos los regex del worker
+  // exigían una "@" literal y el lead quedaba "la_web_no_publica_ningun_email". Se decodifican
+  // SÓLO %40 y %2E y SÓLO dentro del valor del mailto, acá en la cadena y no en el paso 5: así la
+  // dirección pasa por el filtro de bloques ocultos, _stripScrapePrefix y detectarTrampaEmail
+  // como cualquier otra. "usuario @dominio" con espacio queda afuera a propósito: la extensión
+  // tampoco lo toma y daría falsos ("Seguinos en Instagram @medio.com.ar").
   const clean = _deobfuscateEmails(
     _deobfAtWords(
       _decodeEntitiesAll(
         _deobfJsConcat(_quitarMediaDelHtml(_quitarBloquesOcultos(html)))
-      )
+      ).replace(/mailto:[^"'\s<>]+/gi, m => m.replace(/%40/gi, "@").replace(/%2e/gi, "."))
     )
   );
   (clean.match(EMAIL_REGEX) || []).forEach(e => {
@@ -7895,6 +7915,25 @@ async function _scrapeEmailsFromSocialLinksWorker(socialLinks) {
   return found;
 }
 
+// ── CUÁNDO UN 403/503 ES EL WAF Y NO UNA PÁGINA QUE NO EXISTE (2026-09-13) ────────────────────
+// tryFetch marcaba "Cloudflare nos bloquea" con CUALQUIER 403/503 que trajera cf-ray y en CUALQUIER
+// URL de la cascada: una ruta adivinada, la casa editora, informer, who.is. Pero cf-ray lo lleva
+// TODA respuesta que pasa por Cloudflare, no sólo el bloqueo. Caso real: xemboi.xemtuong.net —
+// home 200 y leído, /sitemap → /sitemap/ da el 403 de directorio del servidor (con cf-ray) y el
+// dominio entero quedaba "waf_nos_bloqueo", tapando que el ranking había descartado los candidatos.
+// Ahora cuenta sólo si (1) la URL es del propio sitio o de un subdominio suyo, y (2) hay evidencia
+// de bloqueo: cf-mitigated: challenge, o cf-ray + página de bloqueo (la misma _ANTIBOT_RE que usa la
+// lectura de ads.txt para reconocer un muro anti-bot). Sin cabecera de Cloudflare, como antes: no.
+function _esBloqueoWaf({ url, status, cfMitigated, cfRay, cuerpo } = {}, dominio) {
+  if (status !== 403 && status !== 503) return false;
+  const d = String(dominio || "").replace(/^www\./, "").toLowerCase();
+  let h = "";
+  try { h = new URL(url).hostname.replace(/^www\./, "").toLowerCase(); } catch { return false; }
+  if (!d || (h !== d && !h.endsWith("." + d))) return false;
+  if (String(cfMitigated || "").toLowerCase().includes("challenge")) return true;
+  return !!cfRay && _ANTIBOT_RE.test(String(cuerpo || "").slice(0, 20000));
+}
+
 async function scrapeEmailsForDomain(domain, opts = {}) {
   // Trae emails de muchas fuentes con concurrencia limitada (4 a la vez).
   // Usa User-Agent real (Chrome) para evitar anti-bot blocks comunes.
@@ -8021,9 +8060,16 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
         // no es un 403 de "esta página no existe", es el WAF diciendo que NO vamos a poder
         // crawlear NADA de este dominio. Seguir pidiendo 40 rutas es tiempo tirado. Lo marcamos
         // para cortar el crawl y saltar directo a las vías de afuera (DNS/CT/Play).
-        if ((r.status === 403 || r.status === 503) &&
-            (String(r.headers.get("cf-mitigated") || "").includes("challenge") || r.headers.get("cf-ray"))) {
-          _wafBloquea = true;
+        // Ya no alcanza con cf-ray ni con que la URL sea de otro host (2026-09-13): ver _esBloqueoWaf.
+        // El cuerpo se lee sólo cuando hace falta (cf-ray sin challenge declarado) y se corta en 20 KB.
+        // `wafPaginas` cuenta cuántas páginas del propio sitio nos cerraron la puerta.
+        if ((r.status === 403 || r.status === 503) && (r.headers.get("cf-mitigated") || r.headers.get("cf-ray"))) {
+          const _cfm = String(r.headers.get("cf-mitigated") || "");
+          const _cuerpo = _cfm.includes("challenge") ? "" : await r.text().then(t => t.slice(0, 20000)).catch(() => "");
+          if (_esBloqueoWaf({ url, status: r.status, cfMitigated: _cfm, cfRay: r.headers.get("cf-ray"), cuerpo: _cuerpo }, cleanDomain)) {
+            _wafBloquea = true;
+            if (_stats) _stats.wafPaginas = (_stats.wafPaginas || 0) + 1;
+          }
         }
         return;
       }
@@ -12415,15 +12461,24 @@ async function auditarEmailsDelPool(token) {
 //                                queda la vía de redes o Apollo. Insistir con el crawl no sirve.
 //   rechazados_por_ranking     → sí publica, pero el filtro las descartó. Acá el que puede
 //                                estar mal somos nosotros, y por eso lleva los ejemplos pegados.
+// ── EL ORDEN: PRIMERO LO ENCONTRADO, DESPUÉS LO ESPECÍFICO (2026-09-13) ──────────────────────
+// `waf` iba primero y le ganaba a todo: con un solo 403 en una ruta adivinada, un sitio leído
+// entero cuyos candidatos había descartado el ranking salía como "nos bloquean", y el renglón que
+// avisa de un filtro demasiado estricto no aparecía. Orden: rechazados_por_ranking (hubo
+// candidatos) → email_en_imagen → waf_nos_bloqueo → no_se_pudo_leer_el_sitio → no publica.
+// El WAF NO se condiciona a ok === 0: `ok` también cuenta informer, who.is y la casa editora, y
+// un 200 de esos no prueba que el sitio se haya leído. Efecto en el parte: menos waf_nos_bloqueo y
+// más rechazados_por_ranking / no publica — es reclasificación, no mejora.
 function _motivoSinEmail(diag, stats) {
-  const ok   = Number(stats?.ok || 0);
-  const fail = Number(stats?.fail || 0);
-  if (stats?.waf) return "waf_nos_bloqueo";
+  const ok     = Number(stats?.ok || 0);
+  const fail   = Number(stats?.fail || 0);
+  const crudos = Number(diag?.crudos || 0);
+  if (crudos > 0) return `rechazados_por_ranking:${(diag.rechazados || []).join("|").slice(0, 120)}`;
   // El mail está dibujado en una imagen: no se lee sin OCR y no cambia con reintentos.
-  if (stats?.emailEnImagen && (!diag || diag.crudos === 0)) return "email_en_imagen";
+  if (stats?.emailEnImagen) return "email_en_imagen";
+  if (stats?.waf) return "waf_nos_bloqueo";
   if (ok === 0 && fail > 0) return "no_se_pudo_leer_el_sitio";
-  if (!diag || diag.crudos === 0) return "la_web_no_publica_ningun_email";
-  return `rechazados_por_ranking:${(diag.rechazados || []).join("|").slice(0, 120)}`;
+  return "la_web_no_publica_ningun_email";
 }
 
 async function polishPool(token) {
