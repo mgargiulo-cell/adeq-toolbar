@@ -1,0 +1,599 @@
+{
+ "toolbar_adstxt_audit": [
+  "checks",
+  "domain",
+  "first_seen_at",
+  "gate",
+  "last_checked_at",
+  "reason",
+  "resolved_at",
+  "source",
+  "verdict"
+ ],
+ "toolbar_adsystem_seen": [
+  "domain",
+  "first_seen",
+  "last_seen",
+  "publishers",
+  "validada",
+  "veces",
+  "visto_en"
+ ],
+ "toolbar_agent_actions": [
+  "action",
+  "created_at",
+  "details",
+  "domain",
+  "email_to",
+  "id",
+  "monday_item_id",
+  "pitch_subject",
+  "reason",
+  "template_id",
+  "user_email"
+ ],
+ "toolbar_agent_open_rate": [
+  "language",
+  "open_rate_pct",
+  "pitch_subject",
+  "source",
+  "total_opened",
+  "total_sent"
+ ],
+ "toolbar_api_usage": [
+  "by_provider",
+  "day",
+  "total",
+  "updated_at",
+  "user_email"
+ ],
+ "toolbar_apollo_cache": [
+  "data",
+  "domain",
+  "fetched_at"
+ ],
+ "toolbar_audit_log": [
+  "action",
+  "created_at",
+  "details",
+  "id",
+  "target",
+  "user_email"
+ ],
+ "toolbar_autogoogle_attribution": [
+  "domain",
+  "injected_at",
+  "phrase"
+ ],
+ "toolbar_autopilot_feedback": [
+  "action",
+  "ad_networks",
+  "category",
+  "created_at",
+  "domain",
+  "geo",
+  "id",
+  "reason",
+  "traffic_bucket",
+  "user_email"
+ ],
+ "toolbar_autopilot_stats": [
+  "count",
+  "day",
+  "reason",
+  "user_email"
+ ],
+ "toolbar_bounce_retries": [
+  "attempt_number",
+  "bounce_type",
+  "created_at",
+  "domain",
+  "id",
+  "mb_email",
+  "monday_item_id",
+  "original_action_id",
+  "original_email",
+  "reason",
+  "retry_action_id",
+  "retry_email",
+  "retry_source",
+  "status",
+  "updated_at"
+ ],
+ "toolbar_bounce_seen": [
+  "msg_id",
+  "seen_at"
+ ],
+ "toolbar_bounced_emails": [
+  "bounced_at",
+  "detalle",
+  "email",
+  "evidencia",
+  "fuente",
+  "original_action_id",
+  "original_domain",
+  "reason",
+  "retry_attempted",
+  "tipo"
+ ],
+ "toolbar_claude_gasto": [
+  "actualizado",
+  "cache_in",
+  "dia",
+  "fuente",
+  "llamadas",
+  "modelo",
+  "motivo",
+  "tokens_in",
+  "tokens_out",
+  "usuario"
+ ],
+ "toolbar_config": [
+  "key",
+  "value"
+ ],
+ "toolbar_csv_queue": [
+  "domain",
+  "error_message",
+  "id",
+  "monday_item_id",
+  "processed_at",
+  "source",
+  "status",
+  "uploaded_at",
+  "uploaded_by"
+ ],
+ "toolbar_diag_descartes": [
+  "categoria",
+  "comentario",
+  "created_at",
+  "decidido_por",
+  "domain",
+  "etapa",
+  "geo",
+  "id",
+  "motivo",
+  "tenia_ads_txt",
+  "traffic"
+ ],
+ "toolbar_diag_sin_email": [
+  "bloqueado_por_waf",
+  "candidatos_rechazados",
+  "comentario",
+  "created_at",
+  "domain",
+  "emails_crudos",
+  "fase",
+  "id",
+  "intento",
+  "motivo",
+  "paginas_leidas"
+ ],
+ "toolbar_discovery_backlog": [
+  "domain",
+  "found_at",
+  "phrase",
+  "source"
+ ],
+ "toolbar_domain_geo_cache": [
+  "confidence",
+  "country",
+  "domain",
+  "source",
+  "updated_at"
+ ],
+ "toolbar_email_opens": [
+  "agent_action_id",
+  "id",
+  "ip_hash",
+  "opened_at",
+  "user_agent"
+ ],
+ "toolbar_email_picks": [
+  "candidates",
+  "category",
+  "chosen_email",
+  "chosen_source",
+  "chosen_tier",
+  "created_at",
+  "domain",
+  "id",
+  "lead_id",
+  "mb_email",
+  "n_candidates"
+ ],
+ "toolbar_feeder_runs": [
+  "conversion_pct",
+  "cron_at",
+  "effective_added",
+  "gross_majestic",
+  "gross_monday",
+  "gross_sellers",
+  "gross_total",
+  "id",
+  "notes",
+  "rapidapi_limit",
+  "rapidapi_used",
+  "rq_valid_after",
+  "rq_valid_before",
+  "slot_label",
+  "status"
+ ],
+ "toolbar_frozen_leads": [
+  "attempt_count",
+  "created_at",
+  "domain",
+  "frozen_until",
+  "id",
+  "last_error",
+  "source",
+  "updated_at",
+  "uploaded_by"
+ ],
+ "toolbar_gasto_claude_cruce": [
+  "con_motivo",
+  "dia",
+  "pct_sin_explicar",
+  "proxy",
+  "sin_explicar"
+ ],
+ "toolbar_gasto_claude_vista": [
+  "dia",
+  "entrada",
+  "fuente",
+  "llamadas",
+  "modelo",
+  "motivo",
+  "salida",
+  "usd_aprox"
+ ],
+ "toolbar_handoffs": [
+  "created_at",
+  "domain",
+  "from_email",
+  "id",
+  "monday_item_id",
+  "note",
+  "status",
+  "to_email"
+ ],
+ "toolbar_health": [
+  "esperado_cada_min",
+  "esperado_ultimo",
+  "fails_consecutivos",
+  "job",
+  "last_detail",
+  "last_ok_at",
+  "last_run_at",
+  "last_status",
+  "real_ultimo",
+  "updated_at"
+ ],
+ "toolbar_health_check": [
+  "esperado_cada",
+  "esperado_ultimo",
+  "estado",
+  "fails_consecutivos",
+  "hace_min",
+  "hace_min_activos",
+  "job",
+  "last_detail",
+  "last_run_at",
+  "last_status",
+  "real_ultimo"
+ ],
+ "toolbar_historial": [
+  "created_at",
+  "date",
+  "domain",
+  "ejecutivo",
+  "email",
+  "geo",
+  "id",
+  "is_new",
+  "media_buyer",
+  "page_views",
+  "partners",
+  "raw_visits",
+  "source"
+ ],
+ "toolbar_import_attempts": [
+  "at",
+  "attempted_count",
+  "deduped_count",
+  "id",
+  "inserted_count",
+  "source",
+  "source_detail",
+  "user_email"
+ ],
+ "toolbar_import_queue": [
+  "domain",
+  "expires_at",
+  "imported_at",
+  "imported_by"
+ ],
+ "toolbar_keyword_yield": [
+  "found",
+  "fresh",
+  "phrase",
+  "qualified",
+  "searches",
+  "updated_at"
+ ],
+ "toolbar_keywords": [
+  "id",
+  "lang",
+  "phrase",
+  "source"
+ ],
+ "toolbar_metricas_diarias": [
+  "altas",
+  "altas_por_fuente",
+  "congelados",
+  "creado_at",
+  "dia",
+  "emails_hallados",
+  "enviados",
+  "enviados_por_mb",
+  "limpiados",
+  "pool_con_email",
+  "pool_sin_email"
+ ],
+ "toolbar_metricas_tendencia": [
+  "altas",
+  "altas_por_fuente",
+  "congelados",
+  "dia",
+  "dif_altas",
+  "dif_enviados",
+  "dif_pool",
+  "emails_hallados",
+  "enviados",
+  "enviados_por_mb",
+  "limpiados",
+  "pool_con_email"
+ ],
+ "toolbar_mv_results": [
+  "blocked",
+  "created_at",
+  "domain",
+  "email",
+  "id",
+  "quality",
+  "result"
+ ],
+ "toolbar_notifications": [
+  "body",
+  "created_at",
+  "dedup_key",
+  "dismissed_at",
+  "id",
+  "mb_email",
+  "metadata",
+  "read_at",
+  "severity",
+  "title",
+  "type"
+ ],
+ "toolbar_pitch_drafts": [
+  "body",
+  "created_at",
+  "id",
+  "is_default",
+  "language",
+  "name",
+  "priority",
+  "subject",
+  "updated_at",
+  "user_email"
+ ],
+ "toolbar_pitch_feedback": [
+  "action",
+  "category",
+  "context",
+  "created_at",
+  "domain",
+  "embedding",
+  "geo",
+  "id",
+  "language",
+  "pitch_body",
+  "pitch_subject",
+  "traffic",
+  "user_email"
+ ],
+ "toolbar_pixel_ratelimit": [
+  "bucket",
+  "hits",
+  "updated_at"
+ ],
+ "toolbar_prospect_locks": [
+  "domain",
+  "expires_at",
+  "locked_at",
+  "locked_by"
+ ],
+ "toolbar_prospects_offline": [
+  "ad_networks",
+  "category",
+  "domain",
+  "geo",
+  "geos_all",
+  "id",
+  "intentos",
+  "language",
+  "motivo",
+  "page_title",
+  "page_views",
+  "parked_at",
+  "revived_at",
+  "source",
+  "traffic"
+ ],
+ "toolbar_reengagement_queue": [
+  "agent_action_id",
+  "created_at",
+  "domain",
+  "future_email",
+  "id",
+  "mb_email",
+  "monday_item_id",
+  "original_body",
+  "original_email",
+  "original_sent_at",
+  "original_subject",
+  "reason",
+  "scheduled_for",
+  "sequence",
+  "status",
+  "tracking_action_id",
+  "updated_at"
+ ],
+ "toolbar_response_tracking": [
+  "agent_action_id",
+  "category",
+  "created_at",
+  "domain",
+  "email_sent_to",
+  "geo",
+  "id",
+  "mb_email",
+  "responded_at",
+  "response_type",
+  "sent_at",
+  "source"
+ ],
+ "toolbar_review_queue": [
+  "ad_networks",
+  "category",
+  "contact_name",
+  "contact_name_source",
+  "contact_phone",
+  "created_at",
+  "created_by",
+  "domain",
+  "email_found_at",
+  "email_intentos",
+  "email_sources",
+  "email_ultimo_intento",
+  "email_ultimo_motivo",
+  "emails",
+  "geo",
+  "geos_all",
+  "id",
+  "language",
+  "monday_item_id",
+  "monday_payload",
+  "page_title",
+  "pitch",
+  "pitch_subject",
+  "pitch_subjects",
+  "rejected_at",
+  "score",
+  "source",
+  "status",
+  "suspect_checked_at",
+  "suspect_reason",
+  "suspect_reject",
+  "traffic",
+  "validated_at",
+  "validated_by"
+ ],
+ "toolbar_security_events": [
+  "actor",
+  "created_at",
+  "detail",
+  "id",
+  "kind",
+  "notified_at",
+  "severity"
+ ],
+ "toolbar_sendtrack": [
+  "created_at",
+  "domain",
+  "email",
+  "mb_email",
+  "pitch",
+  "send_date",
+  "updated_at"
+ ],
+ "toolbar_similar_sites_cache": [
+  "domain",
+  "fetched_at",
+  "sites"
+ ],
+ "toolbar_source_performance": [
+  "bounce_rate",
+  "bounces",
+  "computed_at",
+  "id",
+  "mb_email",
+  "open_rate",
+  "opens",
+  "score",
+  "sent",
+  "source",
+  "window_days"
+ ],
+ "toolbar_template_perf": [
+  "enviados",
+  "id",
+  "idioma",
+  "medido_el",
+  "pct",
+  "peso",
+  "puesto",
+  "respuestas",
+  "template_id",
+  "ventana_dias"
+ ],
+ "toolbar_traffic_cache": [
+  "data",
+  "domain",
+  "fetched_at"
+ ],
+ "toolbar_url_blocklist": [
+  "added_at",
+  "added_by",
+  "category",
+  "created_at",
+  "domain",
+  "reason"
+ ],
+ "toolbar_usage_sessions": [
+  "duration_sec",
+  "ended_at",
+  "id",
+  "kind",
+  "started_at",
+  "user_email"
+ ],
+ "toolbar_user_limits": [
+  "autopilot_daily_minutes",
+  "autopilot_daily_prospects",
+  "autopilot_enabled",
+  "daily_emails_cap",
+  "daily_monday_cap",
+  "monthly_api_cap",
+  "updated_at",
+  "user_email"
+ ],
+ "toolbar_user_prompts": [
+  "prompt",
+  "updated_at",
+  "user_email"
+ ],
+ "toolbar_user_snoozed_prospects": [
+  "created_at",
+  "domain",
+  "id",
+  "snooze_until",
+  "user_email"
+ ],
+ "toolbar_user_status": [
+  "updated_at",
+  "user_email",
+  "vacation_until"
+ ]
+}
