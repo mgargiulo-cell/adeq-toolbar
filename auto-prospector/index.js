@@ -3703,7 +3703,10 @@ async function _getMondayApiKeyForFeeder(token) {
 // entra desde la decisión 4 del user (04/09). Flag: `sellers_google_enabled` ("false" apaga).
 const _TLDS_OBJETIVO_GOOGLE = new Set([
   ...HISPANIC_TLDS, ".br", ".pt", ".it", ".fr", ".be", ".ch", ".de", ".at", ".pl", ".jp", ".kr", ".tr", ".gr", ".nl", ".cz", ".za",
-  ".hu", ".ro", ".se", ".hr", ".ua", ".rs", ".bg", ".sk", ".id", ".vn", ".th", ".my", ".ph", ".in", ".ng", ".ke", ".ma", ".dz", ".tn", ".sn", ".ci",
+  // Sin ".ua" (2026-09-13): Ucrania está en BLACKLIST_TLDS por decisión del user ("zona de conflicto";
+  // modules/keywords.js: "ruso/ucraniano excluidos"). Con .ua acá, esta fuente buscaba a propósito
+  // dominios que processCsvItem descarta después, con ads.txt bajado y carril ocupado.
+  ".hu", ".ro", ".se", ".hr", ".rs", ".bg", ".sk", ".id", ".vn", ".th", ".my", ".ph", ".in", ".ng", ".ke", ".ma", ".dz", ".tn", ".sn", ".ci",
 ]);
 const _GOOGLE_SELLERS_URL = "https://realtimebidding.google.com/sellers.json";
 async function _feederPullSellersGoogle(token, targetCount, sessionKnown) {
@@ -6755,7 +6758,11 @@ let _trafficCacheDias = 90;
 // rondas de scraping, y a los 15/30/60 días —al descongelarse— otras tres. En el parte del
 // 07-08/09: 1.415 filas viejas de `autopilot` congeladas que se descongelan el 17-19/09 y van
 // a repetir el ciclo entero por dominios que ya eran basura en julio. Con la respuesta
-// negativa guardada, los intentos 2 y 3 y los del descongelado salen de acá a costo cero.
+// negativa guardada, los intentos 2 y 3 salen de acá a costo cero. El DESCONGELADO paga una consulta
+// a propósito (2026-09-13: antes este comentario decía que también salía gratis y no podía): el
+// negativo dura 14 días y el primer congelado 15, así que cada vuelta se decide con un "no" recién
+// preguntado. Lo fija tests/pool-limpio-13-09.test.js. Si alguien sube traffic_neg_cache_dias, la
+// blocklist 'inoperativo' igual no se decide con un dato de caché (ver processCsvItem).
 // TTL más corto que el positivo (14 días, `traffic_neg_cache_dias`): un sitio sin datos hoy
 // puede tenerlos el mes que viene, y decidir sobre un "no" viejo sería peor que preguntar.
 // La extensión IGNORA estas filas (modules/supabase.js): la regla del 17/06 —"no cachear 0s,
@@ -14629,7 +14636,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         const days = _bk.dias;
         // Auto-blocklist permanente tras 3+ freeze cycles sin traffic data.
         // Dominios "inoperativos": están caídos o RapidAPI no los reconoce. No vale gastar más.
-        if (prevFreeze >= 2) {
+        // Nunca a la blocklist permanente por una respuesta sacada de la caché (2026-09-13): con el
+        // castigo progresivo funcionando, el tercer congelado es definitivo, y tiene que decidirse con
+        // un "sin datos" recién consultado, no con uno guardado hace semanas.
+        if (prevFreeze >= 2 && !trafficData.fromCache) {
           try {
             await fetch(`${SUPABASE_URL}/rest/v1/toolbar_url_blocklist`, {
               method: "POST",

@@ -160,3 +160,25 @@ test("el boletín no muestra una lectura fallida como cero ni la pinta de verde,
   ok(!/emails=eq\.%5B%5D&email_ultimo_motivo=not\.is\.null/.test(salud), "el 'stock' filtraba por motivo y salía con otro número que 'quedan N sin email'");
   ok(/SIN EMAIL — hay \$\{_pendSinMail\.length\} pendientes sin email/.test(salud));
 });
+
+// ── 8. Lo que no cambia reglas y se deja fijado ─────────────────────────────────────────
+test("sellers de Google no busca TLDs que la cola descarta (Ucrania está vetada por decisión del user)", async () => {
+  const { _TLDS_OBJETIVO_GOOGLE, BLACKLIST_TLDS } = await cargarWorker(["_TLDS_OBJETIVO_GOOGLE", "BLACKLIST_TLDS"]);
+  const choques = [..._TLDS_OBJETIVO_GOOGLE].filter(t => BLACKLIST_TLDS.some(b => t === b || t.endsWith(b)));
+  deepStrictEqual(choques, [], "un TLD objetivo que está en BLACKLIST_TLDS es trabajo tirado: ads.txt bajado y carril ocupado para un descarte seguro");
+});
+
+test("la caché negativa vence antes del primer congelado, y la blocklist 'inoperativo' nunca se decide con un dato de caché", () => {
+  const ttl = parseInt(worker.match(/let _trafficNegCacheDias = (\d+);/)?.[1] || "0", 10);
+  const primerCongelado = parseInt(cuerpoDe("_backoffCongelado").match(/prevFreeze === 0 \? (\d+)/)?.[1] || "0", 10);
+  ok(ttl > 0 && primerCongelado > 0, "no encontré los dos plazos");
+  ok(ttl < primerCongelado, `el negativo (${ttl}d) tiene que vencer antes del descongelado (${primerCongelado}d): cada vuelta se decide con un "no" recién preguntado`);
+  ok(/if \(prevFreeze >= 2 && !trafficData\.fromCache\) \{/.test(worker), "con el castigo progresivo funcionando, el tercer congelado es permanente: no puede salir de un dato guardado");
+});
+
+test("la tarjeta de Prospects marca las direcciones adivinadas y preselecciona una publicada", () => {
+  const popup = fs.readFileSync(path.join(RAIZ, "..", "popup", "popup.js"), "utf8");
+  ok(/rol_mx:\s+\{ txt: "adivinado \(no publicado\)"/.test(popup), "el detalle del chip mostraba el texto crudo 'rol_mx'");
+  ok(/adivinado · no publicado<\/span>/.test(popup), "la lista de radios no distinguía la dirección adivinada de la publicada");
+  ok(/const _idxPreseleccion = Math\.max\(0, emails\.findIndex\(e => _fuenteDeEmail\(e\) !== "rol_mx"\)\);/.test(popup), "si hay una publicada, la adivinada no queda preseleccionada");
+});

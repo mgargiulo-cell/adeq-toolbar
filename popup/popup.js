@@ -10873,10 +10873,18 @@ function renderProspectCard(r) {
     // abrir SimilarWeb del dominio (chequear visual si la web vale la pena).
     : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span><a href="https://hypestat.com/info/${esc(r.domain || "")}" target="_blank" rel="noopener" title="Ver tráfico de ${esc(r.domain || "")} (Hypestat — sin límite de sesión)" style="font-size:10px;font-weight:700;color:#fff;background:#10b981;border-radius:4px;padding:1px 6px;flex-shrink:0;text-decoration:none">📊</a>`;
 
+  // Las direcciones ADIVINADAS (fuente rol_mx) se marcan en la lista y no quedan preseleccionadas si
+  // hay alguna publicada (2026-09-13). Antes eran radios iguales a las reales: el 10/09 un MB mandó a
+  // redazione@galluraoggi.it, que el sitio no publica. No cambia qué se guarda ni qué se envía.
+  const _fuenteDeEmail = (e) => {
+    const v = (r.email_sources || {})[String(e || "").toLowerCase()];
+    return String(typeof v === "string" ? v : (v && v.source) || "").toLowerCase();
+  };
+  const _idxPreseleccion = Math.max(0, emails.findIndex(e => _fuenteDeEmail(e) !== "rol_mx"));
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
-      <input type="radio" name="email_${r.id}" value="${esc(e)}" ${i === 0 ? "checked" : ""} class="pcard-email-radio" />
-      ${esc(e)}
+      <input type="radio" name="email_${r.id}" value="${esc(e)}" ${i === _idxPreseleccion ? "checked" : ""} class="pcard-email-radio" />
+      ${esc(e)}${_fuenteDeEmail(e) === "rol_mx" ? ` <span title="Dirección de rol adivinada: el sitio no publica email y el dominio tiene servidor de correo. No está verificada." style="font-size:9px;font-weight:600;color:#b45309;background:#fef3c7;border-radius:3px;padding:0 4px">adivinado · no publicado</span>` : ""}
     </label>`).join("");
 
   const ownerOptions = ["Agus", "Diego", "Max"].map(o =>
@@ -11241,6 +11249,11 @@ function initProspectCard(card, data) {
       informer: { txt: "informer",   color: "#0ea5e9" },
       scrape:   { txt: "sitio",      color: "#10b981" },
       generic:  { txt: "genérico",   color: "#94a3b8" },
+      // 2026-09-13: la dirección de rol ADIVINADA (el sitio no publica email y el dominio tiene
+      // servidor de correo) se veía como el texto crudo "rol_mx" en gris. El MB tiene que saber que
+      // no la publicó el sitio antes de mandar a mano, que sale sin MillionVerifier.
+      rol_mx:   { txt: "adivinado (no publicado)", color: "#d97706" },
+      pattern:  { txt: "patrón (MV ok)", color: "#7c3aed" },
     };
     // Maxi 2026-06-18: botón "+" para asignar email a slot adicional (1/2/3).
     // Misma lógica que en Analysis (renderEmailList).
