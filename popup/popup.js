@@ -12668,6 +12668,25 @@ async function validateProspect(card, data, doSendEmail) {
   // el mail salía igual (Gmail usa su propio token) y recién moría el último paso con 401.
   await ensureFreshToken();
 
+  // ── EL PRINCIPAL PASA POR LA LISTA DE REBOTADOS, COMO EN ANALYSIS Y EN EL LOTE (2026-09-13) ──────
+  // La tarjeta sólo preguntaba por los adicionales: el principal iba directo a Gmail, al tracking y a la
+  // ficha del CRM. Una dirección rebotada llegaba igual si la lista de rebotados de la extensión no había
+  // cargado (no va al final y queda preseleccionada), si el MB clickeaba el chip rebotado o si la tipeaba.
+  // Regla: un rebotado nunca se reusa. Va después de apagar los botones (un doble click durante la
+  // consulta no manda dos veces) y, si no sale, los vuelve a prender para elegir otra o reintentar.
+  // "No pude preguntar" nunca es "no rebotó": tampoco se manda, y se dice por qué.
+  if (doSendEmail) {
+    const _rebote = await isEmailBounced(state.accessToken, email, { renovarToken: () => ensureFreshToken(Infinity) })
+      .catch(e => ({ bounced: null, indeterminado: true, motivo: e?.message || String(e) }));
+    if (_rebote.indeterminado || _rebote.bounced) {
+      setResult(_rebote.indeterminado
+        ? `⚠️ Not sent: I couldn't confirm that ${email} hasn't bounced (${_rebote.motivo}). Try again in a moment.`
+        : `🚫 Cannot send: ${email} is in the bounced emails database (${_rebote.reason || "bounced"}). Pick another address.`, false);
+      card.querySelectorAll("button").forEach(b => { b.disabled = false; });
+      return;
+    }
+  }
+
   // Si el mail ya salió y lo que falla es lo de después (la carga al CRM), la card no puede volver
   // a ofrecer "Push + Send Email": el segundo click le manda el mismo mail al mismo contacto.
   let mailSalio = false;
