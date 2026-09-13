@@ -95,6 +95,25 @@ test("un buzón funcional no es una persona: queda por debajo de info@ pero sigu
   strictEqual(rankEmail("techsupport@networld.hk", "discuss.com.hk", ""), 5, "de otro dominio no se toca: ya vale poco y bajarlo lo borraría");
 });
 
+// Revisión del 13/09: la primera versión de esBuzonFuncional miraba un solo trozo y pisaba al rol
+// comercial. Estos valores son los de lib/email.js en c0a6b82, antes de los buzones funcionales.
+test("un trozo comercial o de decisor le gana al buzón funcional: eventos.comercial@ sigue siendo comercial", () => {
+  for (const [l, antes] of [["eventos.comercial", 135], ["events.marketing", 135], ["events.sales", 135], ["eventi.pubblicita", 135], ["shop.advertising", 135],
+                            ["tienda.ventas", 135], ["eventos.patrocinio", 110], ["events.sponsorship", 110], ["awards.partnerships", 110], ["events.partner", 110], ["events.director", 110]]) {
+    strictEqual(esBuzonFuncional(`${l}@${D}`), false, `${l}@ es el área que vende o arma acuerdos, no un buzón funcional`);
+    strictEqual(rankEmail(`${l}@${D}`, D, ""), antes, `${l}@ tiene que valer lo mismo que antes de los buzones funcionales`);
+    strictEqual(_tipoDeEmailParaRanking(`${l}@${D}`, "scrape"), "persona", `${l}@ no puede bajar al tier de los genéricos`);
+  }
+  ok(rankEmail(`eventos.patrocinio@${D}`, D, "") >= 50, "debajo de 50 el worker lo trata como lead sin buen email y paga enriquecimiento");
+});
+
+test("los TLD reservados (.test, .example, .local) sólo cuentan en el dominio, no antes de la arroba", () => {
+  for (const e of [`maria.test@${D}`, `equipo.example@${D}`, `info.test@${D}`, `ana.local@${D}`]) strictEqual(vetoDuroEmail(e, D), "", `${e} es una dirección real del sitio`);
+  strictEqual(rankEmail(`maria.test@${D}`, D, ""), 110);
+  strictEqual(vetoDuroEmail("maria@lab.test.io", "lab.test.io"), "", "un subdominio que se llama test no es un TLD reservado");
+  for (const e of ["maria@foo.test", "maria@example.com", "maria@example.com.", "maria@site.local", "maria@site.invalid", "maria@localhost"]) strictEqual(vetoDuroEmail(e, D), "basura", `${e} es un dominio reservado`);
+});
+
 test("el agente clasifica el tipo de email por la dirección, como la extensión", () => {
   for (const src of ["scrape", "Facebook", "unknown", "cache", "rol_mx"]) strictEqual(_tipoDeEmailParaRanking(`info@${D}`, src), "generico", `info@ con fuente ${src}`);
   strictEqual(_tipoDeEmailParaRanking(`download@${D}`, "scrape"), "generico", "un buzón funcional va con los genéricos");

@@ -9755,40 +9755,56 @@ async function parteDelDia(token, opts = {}) {
     //     día que MV dio 69 inválidos de 161. Una vía que adivina se ve limpia justo porque MV la frena.
     //   · bounce_detected también cuenta buzón lleno y temporales, que no son rebotes.
     //   · El denominador era todo lo guardado en 7 días, no lo enviado: el % quedaba aplastado.
-    // Ahora los numeradores salen de toolbar_bounced_emails (rebote_smtp y verificador, con la fuente
-    // congelada al escribir) y cada tasa tiene su población: rebotes sobre enviados, descartes de MV
-    // sobre verificados. La señal mira sólo el rebote real: un descarte de MV es un envío evitado.
+    // Ahora los numeradores salen de toolbar_bounced_emails (rebote_smtp y verificador) y cada tasa
+    // tiene su población: rebotes sobre enviados, descartes de MV sobre verificados. La señal mira
+    // sólo el rebote real: un descarte de MV es un envío evitado.
+    // ⚠️ ARRIBA Y ABAJO, LA MISMA POBLACIÓN (revisión del 13/09). La primera versión atribuía el rebote
+    // por la fuente guardada y el envío sólo si el email se había encontrado en 7 días: el agente manda
+    // al pool viejo, así que un envío sano no sumaba y uno que rebotaba sí ("rebotaron 2 (100%) de 2"
+    // cuando eran 2 de 40). Ahora el envío lleva SU vía (details.source de la reserva) y un rebote
+    // cuenta sólo si su envío está en la ventana, con esa misma vía. MV no guarda fuente: verificados
+    // y descartes se miden sobre la cohorte encontrada en 7 días. Así ningún % puede pasar de 100.
     const _malos = (await _traerTodo(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${_ultimos7}&evidencia=in.(rebote_smtp,verificador)&select=email,evidencia,fuente&order=email`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${_ultimos7}&evidencia=in.(rebote_smtp,verificador)&select=email,evidencia&order=email`,
       auth, { max: 5000 })) || [];
     const _enviados7 = (await _traerTodo(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_ultimos7}&select=email_to&order=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_ultimos7}&select=email_to,details&order=id`,
       auth, { max: 5000 })) || [];
     const _verificados7 = (await _traerTodo(
       `${SUPABASE_URL}/rest/v1/toolbar_mv_results?created_at=gte.${_ultimos7}&select=email&order=id`,
       auth, { max: 5000 })) || [];
-    const _fuenteMalo = new Map(_malos.map(f => [String(f.email || "").toLowerCase(), f.fuente]));
     for (const d of Object.values(_via)) { d.env = 0; d.ver = 0; d.mvNo = 0; }
-    const _sumarVia = (em, campo) => {
-      const v = String(_normSrc(_fuenteMalo.get(em)) || _viaDe.get(em) || "").toLowerCase();
-      if (v && _via[v]) { _via[v][campo]++; return true; }
-      return false;
-    };
+    const _viaEnvio = new Map();   // email enviado en 7 días → vía con la que se mandó
+    for (const s of _enviados7) {
+      const em = String(s.email_to || "").toLowerCase();
+      if (!em) continue;
+      const v = String(_normSrc(s.details?.source) || _viaDe.get(em) || "").toLowerCase();
+      if (!v) continue;
+      _viaEnvio.set(em, v);
+      (_via[v] = _via[v] || { n: 0, rebotes: 0, env: 0, ver: 0, mvNo: 0 }).env++;
+    }
+    const _verSet = new Set(_verificados7.map(m => String(m.email || "").toLowerCase()).filter(Boolean));
+    for (const em of _verSet) { const v = _viaDe.get(em); if (v) _via[v].ver++; }
     let _rebotesSinVia = 0;
+    const _malosVistos = new Set();
     for (const f of _malos) {
       const em = String(f.email || "").toLowerCase();
-      if (!em) continue;
-      if (f.evidencia === "rebote_smtp") { if (!_sumarVia(em, "rebotes")) _rebotesSinVia++; }
-      else if (f.evidencia === "verificador") _sumarVia(em, "mvNo");
+      if (!em || _malosVistos.has(`${f.evidencia}|${em}`)) continue;
+      _malosVistos.add(`${f.evidencia}|${em}`);
+      if (f.evidencia === "rebote_smtp") {
+        const v = _viaEnvio.get(em);
+        if (v) _via[v].rebotes++; else _rebotesSinVia++;
+      } else if (f.evidencia === "verificador") {
+        const v = _viaDe.get(em);
+        if (v && _verSet.has(em)) _via[v].mvNo++;
+      }
     }
-    for (const s of _enviados7) { const em = String(s.email_to || "").toLowerCase(); if (em) _sumarVia(em, "env"); }
-    for (const m of _verificados7) { const em = String(m.email || "").toLowerCase(); if (em) _sumarVia(em, "ver"); }
-    for (const [v, d] of Object.entries(_via).sort((a, b) => b[1].n - a[1].n).slice(0, 12)) {
+    for (const [v, d] of Object.entries(_via).sort((a, b) => (b[1].n + b[1].env) - (a[1].n + a[1].env)).slice(0, 12)) {
       const pct = d.env ? Math.round(100 * d.rebotes / d.env) : 0;
       const señal = d.rebotes === 0 ? "✅" : pct <= 5 ? "⚠️" : "🔴";
       lineasVia.push(`   ${señal} ${v.padEnd(18)} ${String(d.n).padStart(4)} email(s) · rebotaron ${String(d.rebotes).padStart(3)} (${pct}%) de ${d.env} enviados · MV descartó ${d.mvNo} de ${d.ver} verificados`);
     }
-    if (_rebotesSinVia) lineasVia.push(`   · ${_rebotesSinVia} rebote(s) de direcciones que no están en el pool (envíos viejos o cargados a mano)`);
+    if (_rebotesSinVia) lineasVia.push(`   · ${_rebotesSinVia} rebote(s) de envíos anteriores a estos 7 días o que no hizo el agente`);
 
     // ── POR QUÉ SE RECHAZA LO QUE SE RECHAZA ─────────────────────────────────────────────
     // Agrupado por motivo. Sirve para dos cosas: ver si un veto está matando de más (fue el

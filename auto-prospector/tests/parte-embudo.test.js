@@ -59,9 +59,19 @@ function enrutador(registro) {
       { email: "b@tienda2.pe", evidencia: "rebote_smtp", fuente: "pattern" },
       { email: "a@tienda1.pe", evidencia: "verificador", fuente: "rol_mx" },
       { email: "x@otro.pe", evidencia: "rebote_temporal", fuente: "scrape" },
+      // Rebote de un envío que no está en la ventana: no puede inflar ninguna vía.
+      { email: "z@viejo2.pe", evidencia: "rebote_smtp", fuente: "scrape" },
     ]);
-    // Enviados y verificados de 7 días: los denominadores de cada tasa.
-    if (u.includes("action=eq.sent&created_at=gte.") && u.includes("select=email_to&order=id")) return resp([{ email_to: "b@tienda2.pe" }, { email_to: "dir@larepublica.pe" }]);
+    // Enviados y verificados de 7 días: los denominadores de cada tasa. `c@viejo.pe` es un envío
+    // SANO a un email encontrado hace más de 7 días (no está en ALTAS): tiene que sumar al
+    // denominador de su vía. Sin él, la primera versión daba 100% con 1 rebote de 40 envíos.
+    // `info@atv.pe` no trae la fuente en details: vale la del pool (scrape).
+    if (u.includes("action=eq.sent&created_at=gte.") && u.includes("select=email_to,details&order=id")) return resp([
+      { email_to: "b@tienda2.pe", details: { source: "pattern" } },
+      { email_to: "dir@larepublica.pe", details: { source: "pattern" } },
+      { email_to: "c@viejo.pe", details: { source: "pattern" } },
+      { email_to: "info@atv.pe", details: {} },
+    ]);
     if (u.includes("toolbar_mv_results?created_at=gte.") && u.includes("select=email&order=id")) return resp([{ email: "a@tienda1.pe" }]);
     if (u.includes("toolbar_csv_queue?processed_at=gte.") && u.includes("status=in.(skipped,next_day)")) return resp([
       { status: "skipped", error_message: "not_publisher: sin_ads_txt" },
@@ -134,9 +144,11 @@ test("la GEO de las altas dice cuánto anglo entra, en porcentaje", () => {
 
 test("cada vía de email muestra sus rebotes, atribuidos a la dirección exacta que falló", () => {
   const t = despuesDe("y cuáles rebotan", 1400);
-  // `pattern`: 2 enviados y uno rebotó → 50% SOBRE ENVIADOS (13/09), en rojo. Es la vigilancia de E1.
-  match(t, /pattern\s+2 email\(s\) · rebotaron\s+1 \(50%\) de 2 enviados/, t);
-  match(t, /scrape\s+1 email\(s\) · rebotaron\s+0 \(0%\)/, t);
+  // `pattern`: 3 enviados (uno a un email viejo) y uno rebotó → 33% SOBRE ENVIADOS, en rojo.
+  match(t, /pattern\s+2 email\(s\) · rebotaron\s+1 \(33%\) de 3 enviados/, t);
+  match(t, /scrape\s+1 email\(s\) · rebotaron\s+0 \(0%\) de 1 enviados/, t);
+  // El rebote cuyo envío no está en la ventana va aparte, no a la vía que lo guardó.
+  match(t, /1 rebote\(s\) de envíos anteriores a estos 7 días/, t);
   // `rol_mx`: ningún rebote, pero MillionVerifier descartó la dirección adivinada. Antes no se veía.
   match(t, /rol_mx\s+1 email\(s\) · rebotaron\s+0 \(0%\) de 0 enviados · MV descartó 1 de 1 verificados/, t);
 });

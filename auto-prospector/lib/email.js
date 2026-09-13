@@ -1263,7 +1263,10 @@ export const GARBAGE_DOMAIN_PATTERN = new RegExp([
 // de Prospects como basura. Ahora sólo cuentan los dominios reservados de verdad: example.com,
 // test.com, localhost y los TLD .local/.invalid/.test/.example. Lookahead y no `$`: rankEmail no
 // hace trim, y un "x@example.com." con punto final tiene que seguir siendo basura.
-"(^|[.@])(?:example|test)\\.(?:com|org|net)(?![a-z0-9-])|(^|[.@])localhost(?![a-z0-9-])|\\.(?:local|invalid|test|example|localhost)(?![a-z0-9-])",
+// Y SÓLO EN EL DOMINIO (revisión del 13/09): `(?![^@]*@)` descarta lo que está antes de la arroba.
+// Sin eso maria.test@diario.com y equipo.example@medio.pe pasaban a basura, y el `\.[a-z0-9]`
+// deja afuera un subdominio real como lab.test.io. `rankEmail` le pasa sólo el dominio y también anda.
+"(^|[.@])(?:example|test)\\.(?:com|org|net)(?![a-z0-9-])(?![^@]*@)|(^|[.@])localhost(?![a-z0-9-])(?![^@]*@)|\\.(?:local|invalid|test|example|localhost)(?![a-z0-9-]|\\.[a-z0-9])(?![^@]*@)",
 ].join("|"), "i");
 
 export const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
@@ -1429,9 +1432,17 @@ export const BUZON_FUNCIONAL_SEGMENT = new Set([
   "translate", "translations", "report", "reports", "accessibility", "ethics", "standards", "letters",
   "subscribe", "subscriptions", "techsupport", "websupport",
 ]);
+// Un trozo comercial o de decisor le gana al funcional (revisión del 13/09): eventos.comercial@,
+// events.marketing@, eventos.patrocinio@ y events.partner@ son el área que vende o arma acuerdos
+// de eventos, no un buzón de descargas. Sin esto bajaban a "generico" y los de patrocinio a 48,
+// debajo de info@. Son los mismos trozos que rankEmail usa para AD_SALES y COMMERCIAL.
+const _SEGMENTO_DECISOR = /^(?:(?:business|partnership|partner|propaganda|director|gerente|manager|jefe|brand|media)|(?:bd|head)$)/i;
 export function esBuzonFuncional(emailOLocal) {
   const local = String(emailOLocal || "").toLowerCase().split("@")[0];
-  return !!local && local.split(/[._-]+/).some(seg => BUZON_FUNCIONAL_SEGMENT.has(seg));
+  if (!local) return false;
+  const segs = local.split(/[._-]+/);
+  if (!segs.some(seg => BUZON_FUNCIONAL_SEGMENT.has(seg))) return false;
+  return !segs.some(seg => AD_SALES_LOCAL.test(seg) || _SEGMENTO_DECISOR.test(seg));
 }
 
 export function _tipoDeEmailParaRanking(email, source) {
