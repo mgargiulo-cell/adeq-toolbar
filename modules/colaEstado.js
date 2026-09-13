@@ -287,8 +287,10 @@ export function textoResultadoSacar(hechos, total, grupoPorId, { minTraffic = 35
 // minuto, escribe `future_sent`, la fila de response_tracking y le avisa al CRM.
 // `body` es el cuerpo con firma y SIN el píxel del principal: un píxel copiado a otro buzón
 // contaría como apertura del principal.
+// `sinConfirmar`: direcciones para las que la lista de rebotados no contestó (2026-09-13). No se
+// programan: el worker las despacha sin volver a mirar la lista, y "no pude preguntar" no es "no rebotó".
 export function adicionalesDeLaTarjeta({ domain = "", mbEmail = "", principal = "", candidatos = [], rebotados = new Set(),
-  subject = "", body = "", ahoraMs = Date.now() } = {}) {
+  sinConfirmar = new Set(), subject = "", body = "", ahoraMs = Date.now() } = {}) {
   const ppal = String(principal || "").trim().toLowerCase();
   const vistos = new Set([ppal]);
   const filas = [], avisos = [];
@@ -299,6 +301,7 @@ export function adicionalesDeLaTarjeta({ domain = "", mbEmail = "", principal = 
     if (vistos.has(fe)) { avisos.push(`⏭️ ${fe} repetido`); continue; }
     vistos.add(fe);
     if (rebotados && rebotados.has(fe)) { avisos.push(`🚫 ${fe} bounced`); continue; }
+    if (sinConfirmar && sinConfirmar.has(fe)) { avisos.push(`⚠️ ${fe}: no pude confirmar si rebotó, no se programó`); continue; }
     const orden = filas.length + 1;
     filas.push({
       domain, mb_email: String(mbEmail || "").toLowerCase(), original_email: ppal, future_email: fe,
@@ -333,6 +336,10 @@ export function contactosDeAdicionales(filas, { programados = true } = {}) {
 /** Foto del veredicto del CRM en el momento de guardar. null si todavía no había veredicto. */
 export function fotoCrmAlGuardar(veredicto, dup) {
   if (!veredicto) return null;
+  // (2026-09-13) La ficha que creó nuestro propio envío (veredictoConEnvioPropio): lo que vale es lo que
+  // decía el CRM cuando salió el mail, antes de que el aviso la creara. Con la foto de ahora
+  // ("Propuesta Vigente": no) el lote la salteaba por "el CRM ya decía que no al guardar".
+  if (veredicto.fichaPropia === true) return veredicto.crmAlEnviar ?? null;
   return {
     ok: veredicto.ok === true, duda: veredicto.duda === true, found: dup?.found === true,
     estado: String(dup?.status || ""), ejecutivo: String(dup?.ejecutivo || "").trim().toLowerCase(),
@@ -419,18 +426,26 @@ export function contactadoDeCola(f, lectura) {
 // que no mandara el inicial y tomaba por nuestra una "Propuesta Vigente" ajena.
 // Ahora el envío se anota por sitio en el momento en que sale (anotarEnvioDeSesion), "Guardar" lo
 // lee para el sitio que guarda (envioDeSesion), y la fila lo escribe con el sitio (filaColaDesdeFormulario).
-// La bandera de sesión queda sólo para el Guard #3 del botón verde, que no cambia acá.
+// (2026-09-13) El Guard #3 del botón verde también lee este mapa (envioParaCargar) y la bandera de sesión
+// se retiró: mandarle a A dejaba cargar B sin mail, con mail_ya_enviado=true, y el CRM nunca le escribía a B.
 
 /** Mismo dominio escrito de dos formas ("WWW.Sitio.com" y "sitio.com") es el mismo sitio. */
 export function normDominioCola(d) {
   return String(d || "").trim().toLowerCase().replace(/^www\./, "");
 }
 
-/** Anota que a `dominio` le salió un mail en esta sesión. Si sendtrack lo aceptó alguna vez, queda aceptado. */
-export function anotarEnvioDeSesion(envios, dominio, { el = "", enSendtrack = false } = {}) {
+/**
+ * Anota que a `dominio` le salió un mail en esta sesión. Si sendtrack lo aceptó alguna vez, queda aceptado.
+ * `crm` (2026-09-13): la foto del CRM de antes del PRIMER mail a ese sitio (fotoCrmAlGuardar); un segundo
+ * mail no la reemplaza, porque para entonces la ficha puede ser la que creó nuestro propio aviso.
+ */
+export function anotarEnvioDeSesion(envios, dominio, { el = "", enSendtrack = false, crm } = {}) {
   const d = normDominioCola(dominio);
   if (!(envios instanceof Map) || !d) return;
-  envios.set(d, { el: String(el || ""), enSendtrack: enSendtrack === true || envios.get(d)?.enSendtrack === true });
+  const prev = envios.get(d);
+  const foto = prev && Object.prototype.hasOwnProperty.call(prev, "crm") ? prev.crm : crm;
+  envios.set(d, { el: String(el || ""), enSendtrack: enSendtrack === true || prev?.enSendtrack === true,
+                  ...(foto !== undefined ? { crm: foto } : {}) });
 }
 
 /** El envío de esta sesión a `dominio`, o null si a ese sitio no se le escribió. */
@@ -449,4 +464,72 @@ export function envioAnotado(f) {
   const mp = f?.monday_payload || {};
   const d = normDominioCola(f?.domain);
   return mp.mail_enviado === true && !!d && normDominioCola(mp.mail_enviado_dominio) === d;
+}
+
+// ── LA FICHA QUE CREÓ NUESTRO ENVÍO, VISTA DESDE ANALYSIS (2026-09-13) ────────────────────────────
+// El caso que decidirLoteCrm resolvió para el lote, del lado de Analysis. El MB manda desde Analysis con
+// adicionales, cierra la toolbar y la vuelve a abrir cuando el worker ya los despachó y su aviso
+// (`adicional_enviado`) creó la ficha "Propuesta Vigente" sin ejecutivo. El veredicto sale "propuesta
+// en curso" y Analysis bloqueaba "Enviar a ADEQ" y "Guardar para enviar después": el sitio al que este MB
+// le escribió no se podía cargar nunca con sus datos. En la misma sesión no pasaba porque el veredicto era
+// el de antes de mandar; al volver a entrar al sitio, sí.
+// La regla es decidirLoteCrm, con el envío de este MB a este sitio como `contactado` y la foto del CRM de
+// cuando salió el mail como `alGuardar`. El botón del mail NO se desbloquea: ya salió, y repetirlo es un
+// duplicado al mismo contacto.
+
+/** ¿El CRM bloquea CARGAR o GUARDAR? Un "no" firme, salvo la ficha que creó nuestro envío. (El mail usa el "no" a secas.) */
+export function crmBloqueaCarga(v) {
+  return !!v && v.ok !== true && v.duda !== true && v.fichaPropia !== true;
+}
+
+/**
+ * El veredicto del CRM con el envío de este MB a este sitio. Sin envío, o si la ficha no es la nuestra,
+ * vuelve el mismo objeto. Si lo es: `fichaPropia`, la foto de cuando se mandó (`crmAlEnviar`, la que
+ * "Guardar" anota vía fotoCrmAlGuardar) y el envío (`envioPropio`, el que habilita cargar sin repetir el mail).
+ *   envio  { el, enSendtrack?, crm? } — de envioDeSesion o de envioPropioGuardado.
+ */
+export function veredictoConEnvioPropio(veredicto, { dup = null, envio = null } = {}) {
+  const v = veredicto;
+  if (!v || v.ok === true || v.duda === true || !envio) return v;
+  const crm = Object.prototype.hasOwnProperty.call(envio, "crm") ? envio.crm : null;
+  if (decidirLoteCrm({ dup, veredicto: v, alGuardar: crm, contactado: true }).fichaPropia !== true) return v;
+  const el = /^\d{4}-\d{2}-\d{2}$/.test(String(envio.el || "")) ? String(envio.el) : "";
+  return {
+    ...v, fichaPropia: true, crmAlEnviar: crm,
+    envioPropio: { el, enSendtrack: envio.enSendtrack === true },
+    titulo: "Ficha creada por tu envío",
+    detalle: `Le escribiste${el ? ` el ${el}` : ""} y esta "${dup.status}" sin ejecutivo apareció después (la crea el aviso de los adicionales): no es de otro. No le vuelvas a escribir; cargala con Enviar a ADEQ o guardala para enviar después.`,
+    clase: "crm-duda",
+  };
+}
+
+/**
+ * El envío de este MB a este sitio que quedó en la copia local de sendtrack (saveSendDate), para cuando la
+ * toolbar se cerró y el mapa de la sesión se perdió. Cuenta sólo si nombra a este MB (las entradas de antes
+ * del 13/09 no lo tienen: no prueban nada) y cae dentro de la ventana de la cola (30 días). El más reciente.
+ * `enSendtrack: false`: la copia local se escribe antes del POST y no sabe si entró.
+ */
+export function envioPropioGuardado(local, dominio, { mbEmail = "", ahoraMs = Date.now(), dias = 30 } = {}) {
+  const d = normDominioCola(dominio);
+  const mb = String(mbEmail || "").trim().toLowerCase();
+  if (!d || !mb || !local || typeof local !== "object") return null;
+  const corte = new Date(ahoraMs - dias * 86_400_000).toISOString().slice(0, 10);
+  let mejor = null;
+  for (const [k, r] of Object.entries(local)) {
+    if (!r || typeof r !== "object" || normDominioCola(k) !== d) continue;
+    if (String(r.mbEmail || "").trim().toLowerCase() !== mb) continue;
+    const el = String(r.sendDate || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(el) || el < corte || (mejor && mejor.el >= el)) continue;
+    mejor = { el, enSendtrack: false, ...(Object.prototype.hasOwnProperty.call(r, "crm") ? { crm: r.crm } : {}) };
+  }
+  return mejor;
+}
+
+/**
+ * El mail a este sitio que habilita cargarlo sin repetirlo: el de esta sesión (envioDeSesion) o, si el CRM
+ * muestra la ficha que creó nuestro envío, ese envío. Lo leen "Guardar para enviar después" (qué se anota)
+ * y el Guard #3 del botón verde (sin un mail a ESTE sitio no se carga).
+ */
+export function envioParaCargar(envios, dominio, veredicto) {
+  return envioDeSesion(envios, dominio) || (veredicto?.fichaPropia === true ? veredicto.envioPropio || null : null);
 }

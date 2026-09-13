@@ -40,18 +40,27 @@ raiz = sys.argv[1]; errores = []
 m = json.load(open(os.path.join(raiz, "manifest.json")))
 if "key" in m: errores.append("el manifest del paquete todavía tiene `key`")
 if os.path.exists(os.path.join(raiz, "auto-prospector", "index.js")): errores.append("entró el worker (auto-prospector/index.js)")
-n = 0
+# (2026-09-13) La expresión vieja exigía el `from` en la MISMA línea que el `import`: los imports
+# escritos en varias líneas (supabase.js, colaEstado.js, userLimits.js y coordination.js en popup.js)
+# no se miraban, y tampoco los import() dinámicos. Un import así hacia un archivo que el zip no copia
+# daba el tilde verde y la extensión publicada no abría el popup. `[^;]` cruza saltos de línea; los
+# dos totales tienen que coincidir con los que cuenta acorn (tests/extension_envio-13-09c.test.js).
+RE_EST = re.compile(r'^[ \t]*(?:import|export)\b[^;]*?\bfrom\s*["\'](\.[^"\']+)["\']', re.M)
+RE_DIN = re.compile(r'\bimport\s*\(\s*["\'](\.[^"\']+)["\']\s*\)')
+n_est = n_din = 0
 for dp, _, fs in os.walk(raiz):
     for f in fs:
         if not f.endswith(".js"): continue
         p = os.path.join(dp, f); src = open(p, encoding="utf8", errors="replace").read()
-        for mm in re.finditer(r'^\s*(?:import|export)[^;\n]*?from\s+["\'](\.[^"\']+)["\']', src, re.M):
-            n += 1
-            if not os.path.exists(os.path.normpath(os.path.join(dp, mm.group(1)))):
-                errores.append(f"{os.path.relpath(p, raiz)} importa {mm.group(1)} y no está en el paquete")
+        for dinamico, rx in ((False, RE_EST), (True, RE_DIN)):
+            for mm in rx.finditer(src):
+                if dinamico: n_din += 1
+                else: n_est += 1
+                if not os.path.exists(os.path.normpath(os.path.join(dp, mm.group(1)))):
+                    errores.append(f"{os.path.relpath(p, raiz)} importa {mm.group(1)}{' (import dinámico)' if dinamico else ''} y no está en el paquete")
 if errores:
     print("❌ PAQUETE INVÁLIDO:"); [print("   - " + e) for e in errores]; sys.exit(1)
-print(f"   imports relativos verificados: {n} · sin `key` · sin worker")
+print(f"   imports relativos verificados: estáticos {n_est} · dinámicos {n_din} · sin `key` · sin worker")
 PY
 
 rm -f "$ZIP"

@@ -305,7 +305,11 @@ test("C46: toda carga al CRM mira antes el veredicto del CRM", () => {
   ok(verde.indexOf("state.crmVeredicto") >= 0 && verde.indexOf("state.crmVeredicto") < verde.indexOf("enviarAlBoard("),
      "el Guard #0 tiene que seguir adentro del botón verde, antes de cargar");
   const validar = texto(funcion("_validarProspectoMonday"));
-  ok(validar.indexOf("_crmBloquea()") >= 0 && validar.indexOf("_crmBloquea()") < validar.indexOf("getMondayFormValues()"),
+  // (2026-09-13, ronda final) El candado pasó de _crmBloquea() a crmBloqueaCarga(state.crmVeredicto): el mismo
+  // "no" firme del CRM, salvo la ficha que creó nuestro propio envío a ese sitio (tests/extension_envio-13-09c,
+  // punto a). Lo que este test cuida no cambia: el candado va antes de leer el formulario.
+  const candado = validar.indexOf("crmBloqueaCarga(state.crmVeredicto)");
+  ok(candado >= 0 && candado < validar.indexOf("getMondayFormValues()"),
      "'Guardar para enviar después' tiene que frenar a un sitio que el CRM marca como no prospectable");
   const bloqueo = texto(funcion("_aplicarBloqueoCrm"));
   ok(/"btn-guardar-cola"/.test(bloqueo) && /cola\.disabled = /.test(bloqueo), "el botón de la cola tiene que verse bloqueado, como los otros dos");

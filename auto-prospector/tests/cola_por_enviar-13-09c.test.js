@@ -34,7 +34,7 @@ import * as walk from "acorn-walk";
 import {
   decidirLoteCrm, fotoCrmAlGuardar, lecturaDeEnvios, contactadoDeCola, estadoAlSacarDeCola, planSacarDeCola,
   textoConfirmarSacar, filaColaDesdeFormulario, adicionalesDeLaTarjeta, contactosDeAdicionales,
-  anotarEnvioDeSesion, envioDeSesion, envioAnotado,
+  anotarEnvioDeSesion, envioDeSesion, envioAnotado, envioParaCargar, crmBloqueaCarga,
 } from "../../modules/colaEstado.js";
 import { dominiosConEnvioReciente } from "../../modules/supabase.js";
 
@@ -522,6 +522,10 @@ function validarGuardar({ dominio, envios }) {
     isValidEmail: () => true, _esFormularioUrl: () => false,
     state: { domain: dominio, traffic: 900000, visits: 0, emailSentInSession: true },
     _enviosDeLaSesion: envios, envioDeSesion,
+    // (2026-09-13, ronda final) _validarProspectoMonday pasó a crmBloqueaCarga(state.crmVeredicto) y a
+    // envioParaCargar: la ficha que creó nuestro propio envío no bloquea guardar (extension_envio-13-09c).
+    // Sin veredicto en `state`, los dos se comportan como antes: este test sigue probando lo mismo.
+    envioParaCargar, crmBloqueaCarga,
   };
   const nombres = Object.keys(deps);
   const fn = new Function(...nombres, `${texto(funcion("_validarProspectoMonday"))}\nreturn _validarProspectoMonday;`)(...nombres.map(n => deps[n]));
@@ -539,7 +543,7 @@ test("B2: 'Guardar para enviar después' dice 'enviado' sólo para el sitio al q
   strictEqual(envioAnotado({ domain: "a.com", monday_payload: filaColaDesdeFormulario(a, { domain: "a.com" }).monday_payload }), true);
 });
 
-test("B2: el botón de Gmail anota el envío para el sitio tomado antes de mandar, y el Guard #3 no cambia", () => {
+test("B2: el botón de Gmail anota el envío para el sitio tomado antes de mandar (lo que lee el Guard #3)", () => {
   const h = handlerDe("btn-send-gmail");
   let decl = null;
   walk.full(h, (n) => { if (!decl && n.type === "VariableDeclarator" && n.init?.type === "MemberExpression" && texto(n.init) === "state.domain") decl = n; });
@@ -556,7 +560,10 @@ test("B2: el botón de Gmail anota el envío para el sitio tomado antes de manda
   strictEqual(texto(llamadas(h, "saveSendDate")[0].nodo.arguments[0]), sitio, "sendtrack y la anotación tienen que hablar del mismo sitio");
   const enSendtrack = anota[0].nodo.arguments[2]?.properties?.find(p => p.key?.name === "enSendtrack");
   ok(enSendtrack && /\.ok === true/.test(texto(enSendtrack.value)), "si sendtrack no aceptó el envío, no se anota como aceptado");
-  ok(/state\.emailSentInSession = true/.test(texto(h)), "el Guard #3 del botón verde no se toca en este arreglo");
+  // (2026-09-13, ronda final) Esta revisión dejaba el Guard #3 con la bandera de sesión a propósito. La ronda
+  // final lo ató al sitio (punto b de tests/extension_envio-13-09c.test.js) y retiró la bandera: lo que este
+  // test cuida ahora es que no vuelva, porque volvería a dejar cargar B después de mandarle a A.
+  ok(!/state\.emailSentInSession\s*=/.test(texto(h)), "la bandera de sesión volvió: el Guard #3 tiene que leer el envío por sitio");
 });
 
 test("B2: la tarjeta anota su envío por sitio y lo deja escrito en 'Por enviar' cuando el CRM falla", async () => {

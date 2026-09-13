@@ -61,7 +61,8 @@ import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking
 import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, planSacarDeCola, textoConfirmarSacar,
          textoResultadoSacar, adicionalesDeLaTarjeta, contactosDeAdicionales,
          fotoCrmAlGuardar, decidirLoteCrm, lecturaDeEnvios, contactadoDeCola,
-         anotarEnvioDeSesion, envioDeSesion } from "../modules/colaEstado.js";
+         anotarEnvioDeSesion, envioDeSesion, crmBloqueaCarga, veredictoConEnvioPropio, envioPropioGuardado,
+         envioParaCargar } from "../modules/colaEstado.js";
 import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -2417,7 +2418,7 @@ function renderRapidApiUsageBanner({ used, limit, period, scope } = {}) {
 const state = {
   domain: "", url: "", tabId: null,
   traffic: 0, visits: 0, pagesPerVisit: null, trafficData: null, filaPool: null,
-  emails: [], emailSources: new Map(), emailSentInSession: false, techStack: [], partners: [], banners: null,
+  emails: [], emailSources: new Map(), techStack: [], partners: [], banners: null,
   adsTxt: null, revenueGap: null,
   pitch: "", duplicate: null,
   mediaBuyer: "Agus",
@@ -3200,7 +3201,8 @@ async function runDuplicateCheck() {
 
     // El veredicto, antes que cualquier otra cosa: es lo primero que el MB tiene que leer.
     // Sale de la columna `estado` de la ficha del CRM y de nada más (regla del user, 07/09).
-    const veredicto = _veredictoCrm(result);
+    // (2026-09-13) …salvo la ficha que creó nuestro propio envío a este sitio (_veredictoAnalisis).
+    const veredicto = await _veredictoAnalisis(result, state.domain);
     clearTimeout(_crmWatchdog);
     state.crmVeredicto = veredicto;
     _pintarVeredictoCrm(veredicto, result);
@@ -3273,10 +3275,14 @@ function _aplicarBloqueoCrm(v) {
   const push = document.getElementById("btn-push-monday");
   const gmail = document.getElementById("btn-send-gmail");
   const bloquea = v && !v.ok && !v.duda;
-  for (const b of [push, gmail]) {
+  // (2026-09-13) Cargar y guardar tienen su propia regla (crmBloqueaCarga): la "Propuesta Vigente" sin
+  // ejecutivo que creó el aviso de nuestros adicionales, en un sitio al que este MB le escribió, no se
+  // bloquea. Bloqueada, el sitio no se cargaba nunca con sus datos. El mail sigue bloqueado: ya salió.
+  const bloqueaCarga = crmBloqueaCarga(v);
+  for (const [b, si] of [[push, bloqueaCarga], [gmail, !!bloquea]]) {
     if (!b) continue;
-    b.classList.toggle("btn-bloqueado-crm", !!bloquea);
-    b.title = bloquea ? `${v.titulo}: ${v.detalle}` : "";
+    b.classList.toggle("btn-bloqueado-crm", si);
+    b.title = si ? `${v.titulo}: ${v.detalle}` : "";
   }
   // "Guardar para enviar después" también carga en el CRM, un rato más tarde y en lote (2026-09-13).
   // Quedaba activo sobre un cliente vivo: el lote empujaba la ficha a "Propuesta Vigente" con
@@ -3284,12 +3290,12 @@ function _aplicarBloqueoCrm(v) {
   // vuelve a preguntar por cada sitio; esto es para que el MB lo vea antes de guardar.
   const cola = document.getElementById("btn-guardar-cola");
   if (cola) {
-    cola.classList.toggle("btn-bloqueado-crm", !!bloquea);
-    cola.title = bloquea ? `${v.titulo}: ${v.detalle}` : "Guarda este prospecto en la cola 'Por enviar'. Después los mandás todos juntos desde Prospects.";
-    cola.disabled = !!bloquea;
+    cola.classList.toggle("btn-bloqueado-crm", bloqueaCarga);
+    cola.title = bloqueaCarga ? `${v.titulo}: ${v.detalle}` : "Guarda este prospecto en la cola 'Por enviar'. Después los mandás todos juntos desde Prospects.";
+    cola.disabled = bloqueaCarga;
   }
   if (push) {
-    if (bloquea) { push.dataset.textoPrevio = push.dataset.textoPrevio || push.textContent; push.textContent = "⛔ No prospectable"; }
+    if (bloqueaCarga) { push.dataset.textoPrevio = push.dataset.textoPrevio || push.textContent; push.textContent = "⛔ No prospectable"; }
     else if (push.dataset.textoPrevio) { push.textContent = push.dataset.textoPrevio; delete push.dataset.textoPrevio; }
   }
   _bloquearBorradorCrm(!!bloquea);
@@ -5505,8 +5511,11 @@ async function bindButtons() {
       // Un email rebotado nunca se reusa: el lote no lo cambia por otro en silencio, lo saltea.
       const email = emailDeCola(f);
       if (email && !_esFormularioUrl(email)) {
-        const b = await isEmailBounced(state.accessToken, email).catch(() => ({ bounced: false }));
+        const b = await isEmailBounced(state.accessToken, email).catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
         if (b.bounced) { salteados.push(`${f.domain}: ${email} rebotó, elegí otro`); continue; }
+        // (2026-09-13) "No pude preguntar" contaba como "no rebotó" y la fila salía. Ahora falla con el
+        // motivo: el CRM le escribiría a una dirección que quizás ya rebotó.
+        if (b.ok === false) { fallaron.push(`${f.domain}: no pude confirmar si ${email} rebotó (${b.error || "sin respuesta"})`); continue; }
       }
       try {
         // ── AHORA VA AL CRM BOARD PROPIO, NO A MONDAY (Maxi 2026-09-02) ─────────────
@@ -5637,7 +5646,8 @@ async function bindButtons() {
     // protege al negocio de afuera: el veredicto del CRM. Se AGREGA acá; el Guard #0 del botón
     // verde queda donde está (el botón verde no usa esta función). El candado de verdad está en
     // el lote, que vuelve a preguntar por cada sitio al mandar.
-    if (_crmBloquea()) {
+    // (2026-09-13) crmBloqueaCarga: la ficha que creó nuestro propio envío a este sitio no bloquea guardar.
+    if (crmBloqueaCarga(state.crmVeredicto)) {
       res.textContent = _motivoBloqueoCrm(); res.className = "push-result error";
       document.getElementById("duplicate-result")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return null;
@@ -5668,7 +5678,9 @@ async function bindButtons() {
     // significa que después no se vea cuáles quedaron sin contactar.
     // (2026-09-13) Si salió A ESTE SITIO, no si salió alguno en la sesión: `emailSentInSession` no se
     // baja al cambiar de dominio, y mandarle a A dejaba "enviado" todo lo que se guardaba después.
-    const envio = envioDeSesion(_enviosDeLaSesion, state.domain);
+    // (2026-09-13) O el envío que explica la ficha que creó nuestro propio aviso (envioParaCargar): la
+    // toolbar pudo cerrarse después de mandar, y el mapa de la sesión se pierde con ella.
+    const envio = envioParaCargar(_enviosDeLaSesion, state.domain, state.crmVeredicto);
     return { ...v, traffic, mailEnviado: !!envio, mailEnviadoEl: envio?.el || "", mailEnviadoEnSendtrack: envio?.enSendtrack === true };
   }
 
@@ -5781,7 +5793,9 @@ async function bindButtons() {
     // Guard #0: el CRM dice que esta web NO se prospecta (cliente activo, propuesta en curso,
     // o cerrada dentro de su descanso). Va PRIMERO: es el único guard que protege al negocio
     // de afuera —escribirle a un cliente vivo— y no a nuestros datos.
-    if (state.crmVeredicto && !state.crmVeredicto.ok && !state.crmVeredicto.duda) {
+    // (2026-09-13) crmBloqueaCarga: la "Propuesta Vigente" sin ejecutivo que creó el aviso de nuestros
+    // adicionales, en un sitio al que este MB le escribió, no bloquea cargarla (veredictoConEnvioPropio).
+    if (crmBloqueaCarga(state.crmVeredicto)) {
       res.textContent = _motivoBloqueoCrm(); res.className = "push-result error";
       document.getElementById("duplicate-result")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -5809,7 +5823,12 @@ async function bindButtons() {
     // en esta sesión. Aplica también a duplicados (botón "🔄 Actualizar en ADEQ")
     // para evitar que se actualice un item sin haber re-mandado el pitch.
     // Con un formulario en vez de email no hay mail que mandar: el contacto fue por el sitio.
-    if (!state.emailSentInSession && !esFormulario) {
+    // (2026-09-13) A ESTE SITIO, no "en la sesión". La bandera `emailSentInSession` se prendía con el
+    // primer mail y no se bajaba al cambiar de dominio: mandarle a A dejaba cargar B sin mail, y como
+    // enviarAlBoard manda mail_ya_enviado=true, el CRM nunca le mandaba el inicial a B. Ahora sale del
+    // mapa por sitio que ya usa "Guardar" (envioParaCargar): el mail de esta sesión a este sitio —desde
+    // Analysis o desde la tarjeta—, o el que explica la ficha que creó nuestro propio aviso.
+    if (!envioParaCargar(_enviosDeLaSesion, state.domain, state.crmVeredicto) && !esFormulario) {
       const action = state.duplicate?.found ? "update" : "push";
       const msg = `❌ Mandá primero el mail (botón Send via Gmail) antes de ${action === "update" ? "actualizar" : "cargar"} en ADEQ.`;
       res.textContent = msg; res.className = "push-result error";
@@ -5936,6 +5955,10 @@ async function bindButtons() {
     // abrir el login, y mientras tanto el panel cambia de dominio solo (scheduleRecheck). El mail sale
     // con el email y el pitch que ya se leyeron; lo que se anota después tiene que ser de este sitio.
     const dominioDelMail = state.domain;
+    // (2026-09-13) Y lo que decía el CRM de ese sitio ANTES de mandar, tomado en el mismo momento. Si el
+    // aviso de los adicionales crea la ficha, al volver a abrir el sitio Analysis la reconoce como nuestra
+    // (veredictoConEnvioPropio) y el lote no la toma por una propuesta ajena.
+    const crmDelMail = fotoCrmAlGuardar(state.crmVeredicto, state.duplicate);
     if (_esFormularioUrl(email)) {
       res.textContent = "📋 Es un formulario de contacto, no un email: completalo en el sitio y cargá directo en ADEQ (no hace falta mandar mail).";
       res.className = "push-result error"; return;
@@ -5945,14 +5968,20 @@ async function bindButtons() {
     }
     // Guard anti-rebote: si el email ya está marcado como bounced en la DB
     // global, NO se permite enviarle. Evita re-contactar direcciones muertas.
-    try {
-      const b = await isEmailBounced(state.accessToken, email);
-      if (b.bounced) {
-        res.textContent = `🚫 Cannot send: ${email} is in the bounced emails database (${b.reason || "bounced"}). Use a different address.`;
-        res.className   = "push-result error";
-        return;
-      }
-    } catch {}
+    // (2026-09-13) Y si la lista no contesta, tampoco se manda: "no pude preguntar" pasaba como "no rebotó"
+    // (un rebotado nunca se reusa). Token fresco antes, para que un JWT vencido no se lea como una caída.
+    const b = await isEmailBounced((await ensureFreshToken()) || state.accessToken, email)
+      .catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
+    if (b.bounced) {
+      res.textContent = `🚫 Cannot send: ${email} is in the bounced emails database (${b.reason || "bounced"}). Use a different address.`;
+      res.className   = "push-result error";
+      return;
+    }
+    if (b.ok === false) {
+      res.textContent = `⚠️ No pude confirmar en la lista de rebotados si ${email} rebotó (${b.error || "sin respuesta"}). No se envió: reintentá en un momento.`;
+      res.className   = "push-result error";
+      return;
+    }
     // Cap diario de emails enviados por usuario (admin lo configura)
     const can = await checkUserCanDo(state.accessToken, state.loginEmail, "send_email");
     if (!can.allowed) {
@@ -6031,16 +6060,16 @@ async function bindButtons() {
     }
 
     if (result.ok) {
-      state.emailSentInSession = true; // unlock el push a Monday
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
       const today = new Date().toISOString().split("T")[0];
       // Persistir el envío para tracking/historial (sin generar follow-ups,
       // los hace el CRM externo).
-      const _sendtrack = await saveSendDate(dominioDelMail, { sendDate: today, pitch, email, mbEmail: state.loginEmail }).catch(() => null);
-      // (2026-09-13) El envío queda anotado para ESTE sitio. "Guardar para enviar después" lo lee
-      // por dominio (envioDeSesion): la bandera emailSentInSession no se baja nunca en la sesión, y
-      // con ella todo lo que se guardaba después del primer mail quedaba "enviado".
-      anotarEnvioDeSesion(_enviosDeLaSesion, dominioDelMail, { el: today, enSendtrack: _sendtrack?.ok === true });
+      const _sendtrack = await saveSendDate(dominioDelMail, { sendDate: today, pitch, email, mbEmail: state.loginEmail, crmAlEnviar: crmDelMail }).catch(() => null);
+      // (2026-09-13) El envío queda anotado para ESTE sitio. "Guardar para enviar después" y el Guard #3
+      // del botón verde lo leen por dominio (envioParaCargar). La bandera de sesión que había acá (y que
+      // desbloqueaba el push) se retiró: no se bajaba nunca, y con ella todo lo que se guardaba o cargaba
+      // después del primer mail quedaba "enviado".
+      anotarEnvioDeSesion(_enviosDeLaSesion, dominioDelMail, { el: today, enSendtrack: _sendtrack?.ok === true, crm: crmDelMail });
       // Marcar review_queue items de este dominio como contactados — desaparecen
       // de Prospects inmediato (otros MBs no los van a re-contactar).
       markReviewQueueAsContacted(state.accessToken, dominioDelMail, state.loginEmail).catch(() => {});
@@ -6069,8 +6098,10 @@ async function bindButtons() {
         // que es la firma clásica del spam. (Maxi 2026-08-28)
         if (_yaEnviados.has(futureEmail)) { failMsgs.push(`⏭️ ${futureEmail} repetido`); continue; }
         _yaEnviados.add(futureEmail);
-        const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(() => ({ bounced: false }));
+        const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
         if (bFut.bounced) { failMsgs.push(`🚫 ${futureEmail} bounced`); continue; }
+        // (2026-09-13) Sin respuesta de la lista no se programa: el worker lo despacha sin volver a mirarla.
+        if (bFut.ok === false) { failMsgs.push(`⚠️ ${futureEmail}: no pude confirmar si rebotó (${bFut.error || "sin respuesta"}), no se programó`); continue; }
         // ── UNO POR MINUTO, NO LOS CUATRO JUNTOS (2026-09-07, pedido del user) ────────────
         // Salían los cuatro (principal + 3) en el mismo minuto, con el mismo asunto y el mismo
         // cuerpo, desde el mismo remitente. Si los adicionales son del mismo dominio, el
@@ -6113,12 +6144,14 @@ async function bindButtons() {
           const _r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_reengagement_queue`, {
             method: "POST",
             headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            // (2026-09-13) Con reloj, como el de la tarjeta: se espera después de que el mail salió.
+            signal: AbortSignal.timeout(8000),
             body: JSON.stringify(_colaAdicionales),
           });
           if (!_r.ok) throw new Error(`HTTP ${_r.status}`);
         } catch (e) {
           sentMsgs.length = 0;
-          failMsgs.push(`❌ no se pudieron programar los adicionales (${e.message}) — mandalos a mano`);
+          failMsgs.push(`❌ no se pudieron programar los adicionales (${e?.name === "TimeoutError" ? "la base no contestó en 8 s" : e.message}) — mandalos a mano`);
         }
       }
       if (futStatusEl && (sentMsgs.length || failMsgs.length)) {
@@ -6612,7 +6645,7 @@ function _pintarVeredictoCrm(v, dup) {
   if (typeof dup?.ms === "number") ctx.push(`ADEQ en ${(dup.ms / 1000).toFixed(1)}s`);
   el.className = `crm-veredicto ${v.clase}`;
   el.innerHTML =
-    `<div class="crm-veredicto-t">${v.ok ? "✅" : v.duda ? "⚠️" : "⛔"} ${esc(v.titulo)}</div>` +
+    `<div class="crm-veredicto-t">${v.ok ? "✅" : (v.duda || v.fichaPropia) ? "⚠️" : "⛔"} ${esc(v.titulo)}</div>` +
     `<div class="crm-veredicto-d">${esc(v.detalle)}</div>` +
     (ctx.length ? `<div class="crm-veredicto-ctx">${ctx.join(" · ")}</div>` : "") +
     // Si no se pudo preguntar, el MB tiene que poder reintentar sin cerrar y abrir la toolbar.
@@ -6627,9 +6660,9 @@ async function _reintentarVeredictoCrm() {
   state.crmVeredicto = null;
   _pintarEsperaCrm();
   const r = await _crmConsultar(dom, { forzar: true });
+  const v = await _veredictoAnalisis(r, dom);
   if (state.domain !== dom) return;
   state.duplicate = r;
-  const v = _veredictoCrm(r);
   state.crmVeredicto = v;
   _pintarVeredictoCrm(v, r);
   _aplicarBloqueoCrm(v);
@@ -6645,7 +6678,31 @@ function _crmBloquea() {
 function _motivoBloqueoCrm() {
   const v = state.crmVeredicto;
   if (!v || v.ok) return "";
+  // La ficha que creó nuestro envío sólo frena el mail, y su detalle ya dice cómo cargarla.
+  if (v.fichaPropia) return `⛔ ${v.titulo}: ${v.detalle}`;
   return `⛔ ${v.titulo}: ${v.detalle}${v.duda ? "" : " No se le escribe ni se carga."}`;
+}
+
+// ── EL VEREDICTO DE ANALYSIS RECONOCE LA FICHA QUE CREÓ NUESTRO ENVÍO (2026-09-13) ──────────────
+// El MB manda con adicionales, cierra la toolbar y la vuelve a abrir: para entonces el aviso de los
+// adicionales creó la ficha "Propuesta Vigente" sin ejecutivo, y Analysis bloqueaba cargarla y guardarla.
+// Misma regla que el lote (decidirLoteCrm), en veredictoConEnvioPropio. El envío se busca sólo cuando el
+// CRM dice que no con una ficha: es el único caso en que cambia algo.
+async function _veredictoAnalisis(dup, dominio, mbEmail = state.loginEmail) {
+  const v = _veredictoCrm(dup);
+  if (v.ok || v.duda || !dup?.found) return v;
+  return veredictoConEnvioPropio(v, { dup, envio: await _envioPropio(dominio, mbEmail) });
+}
+
+// El envío de este MB a este sitio: el de esta sesión o, si la toolbar se cerró, el de la copia local de
+// sendtrack que escribe saveSendDate. Nunca tira: sin dato, el bloqueo queda como estaba.
+async function _envioPropio(dominio, mbEmail = state.loginEmail) {
+  const enSesion = envioDeSesion(_enviosDeLaSesion, dominio);
+  if (enSesion) return enSesion;
+  try {
+    const { sendtrack } = await chrome.storage.local.get("sendtrack");
+    return envioPropioGuardado(sendtrack, dominio, { mbEmail });
+  } catch { return null; }
 }
 
 // ¿Este dominio ya está cargado en el CRM? Reemplaza a `checkDuplicate` de Monday.
@@ -6825,13 +6882,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
     const r = await _crmConsultar(dom);
+    // (2026-09-13) El envío propio se busca ANTES de los chequeos de abajo: una espera entre ellos y la
+    // asignación dejaría pisar el veredicto que la pipeline pintó mientras tanto. El login todavía no
+    // está en `state` a esta altura: sale de `auth.user`, igual que en el arranque.
+    const v = await _veredictoAnalisis(r, dom, String(auth?.user || "").toLowerCase().trim());
     // Si el MB ya navegó a otra web, o la pipeline pintó antes, este resultado no manda.
     // El cartel del watchdog sí se pisa: es un "todavía no sé", no una respuesta.
     if (state.domain && state.domain !== dom) return;
     if (state.crmVeredicto && !state.crmVeredicto.provisional) return;
     clearTimeout(_crmWatchdog);
     state.duplicate = r;
-    const v = _veredictoCrm(r);
     state.crmVeredicto = v;
     _pintarVeredictoCrm(v, r);
     _aplicarBloqueoCrm(v);
@@ -6877,6 +6937,12 @@ function _contactosAdicionales() {
   return out;
 }
 
+// (2026-09-13) La carga al CRM tiene reloj. Era el único pedido de las tres puertas sin tope, y en la
+// tarjeta y en Analysis corre DESPUÉS de que el mail salió: colgado, la tarjeta quedaba en "Processing…"
+// con los botones apagados y el MB cerraba el panel sin ficha. 15 s y no los 4 de la consulta: este POST
+// crea la ficha y siembra la cadencia. Un timeout no prueba que no entró, pero el board es idempotente por
+// dominio: reintentar (o cargarlo desde "Por enviar") no duplica.
+const _CRM_CARGA_TIMEOUT_MS = 15000;
 async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch, ejecutivo, traffic, telefono, mailYaEnviado, plantilla = null, contactos = null }) {
   const hoy = new Date();
   const mas = (d) => new Date(hoy.getTime() + d * 86400000).toISOString().slice(0, 10);
@@ -6927,12 +6993,19 @@ async function enviarAlBoard({ domain, email, geo, idioma, estado, fecha, pitch,
   };
   const _cts = contactos || _contactosAdicionales();
   if (_cts.length) cuerpo.contactos = _cts;
-  const r = await fetch(CONFIG.CRM_BOARD_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
-    body: JSON.stringify({ prospects: [cuerpo] }),
-  });
-  const j = await r.json().catch(() => null);
+  let r, j;
+  try {
+    r = await fetch(CONFIG.CRM_BOARD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-toolbar-secret": CONFIG.CRM_BOARD_SECRET },
+      body: JSON.stringify({ prospects: [cuerpo] }),
+      signal: AbortSignal.timeout(_CRM_CARGA_TIMEOUT_MS),
+    });
+    j = await r.json().catch(() => null);
+  } catch (e) {
+    if (e?.name === "TimeoutError") throw new Error(`el CRM no contestó en ${_CRM_CARGA_TIMEOUT_MS / 1000} s`);
+    throw e;
+  }
   if (!r.ok || !j) throw new Error(`el CRM respondió HTTP ${r.status}`);
   // Un `errores` con contenido es un rechazo REAL aunque el HTTP sea 200. Tratarlo como
   // éxito dejaría al MB creyendo que cargó un prospecto que no existe.
@@ -12322,10 +12395,11 @@ async function flushPendingMarks() {
 
 // ── LOS MAILS QUE SALIERON EN ESTA SESIÓN, POR SITIO (2026-09-13) ─────────────────────────────
 // Lo escriben el botón de Gmail de Analysis y la tarjeta de Prospects en el momento en que el mail
-// sale; lo lee "Guardar para enviar después" para el sitio que guarda. Reemplaza, para la cola, a
-// `state.emailSentInSession`, que se prende con el primer mail y no se apaga al cambiar de sitio.
-// (Vive afuera de `state` a propósito: sólo lo tocan esas tres puertas, vía anotarEnvioDeSesion y
-// envioDeSesion de modules/colaEstado.js.)
+// sale; lo leen "Guardar para enviar después" y el Guard #3 del botón verde para el sitio que cargan
+// (envioParaCargar), y el veredicto de Analysis (_envioPropio). Reemplaza a la bandera de sesión
+// `emailSentInSession`, que se prendía con el primer mail y no se apagaba al cambiar de sitio (retirada
+// el 13/09). (Vive afuera de `state` a propósito: sólo se toca vía anotarEnvioDeSesion y se lee vía
+// envioDeSesion / envioParaCargar de modules/colaEstado.js.)
 const _enviosDeLaSesion = new Map();
 
 // ── LA SALIDA DE EMERGENCIA DE LA TARJETA: EL SITIO QUEDA EN "POR ENVIAR" (2026-09-13) ──────────
@@ -12570,10 +12644,12 @@ async function validateProspect(card, data, doSendEmail) {
       mailSalio = true;
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
       const _hoyEnvio = new Date().toISOString().split("T")[0];
-      const _sendtrack = await saveSendDate(data.domain, { sendDate: _hoyEnvio, pitch, email, mbEmail: state.loginEmail }).catch(() => null);
+      // (2026-09-13) Con la foto del CRM de antes de mandar, como Analysis (ver veredictoConEnvioPropio).
+      const _crmAlEnviar = fotoCrmAlGuardar(_vPool, _dupPool);
+      const _sendtrack = await saveSendDate(data.domain, { sendDate: _hoyEnvio, pitch, email, mbEmail: state.loginEmail, crmAlEnviar: _crmAlEnviar }).catch(() => null);
       // (2026-09-13) Anotado por sitio, igual que en Analysis: si el MB abre este sitio y lo guarda
       // "para enviar después" (la salida del cartel de abajo), la fila dice que el mail ya salió.
-      const _envio = { el: _hoyEnvio, enSendtrack: _sendtrack?.ok === true };
+      const _envio = { el: _hoyEnvio, enSendtrack: _sendtrack?.ok === true, crm: _crmAlEnviar };
       anotarEnvioDeSesion(_enviosDeLaSesion, data.domain, _envio);
       markReviewQueueAsContacted(state.accessToken, data.domain, state.loginEmail).catch(() => {});
 
@@ -12586,12 +12662,15 @@ async function validateProspect(card, data, doSendEmail) {
       const futStatusEl = card.querySelector(".pcard-future-status");
       const candidatos = [".pcard-future-1", ".pcard-future-2", ".pcard-future-3"].map(sel => card.querySelector(sel)?.value || "");
       const rebotados = new Set();
+      // (2026-09-13) Si la lista de rebotados no contesta, el adicional no se programa (lo dice el cartel).
+      const sinConfirmar = new Set();
       for (const fe of new Set(candidatos.map(c => c.trim().toLowerCase()).filter(c => c.includes("@") && c !== email.toLowerCase()))) {
-        const bFut = await isEmailBounced(state.accessToken, fe).catch(() => ({ bounced: false }));
+        const bFut = await isEmailBounced(state.accessToken, fe).catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
         if (bFut.bounced) rebotados.add(fe);
+        else if (bFut.ok === false) sinConfirmar.add(fe);
       }
       const { filas: adicionales, avisos } = adicionalesDeLaTarjeta({
-        domain: data.domain, mbEmail: state.loginEmail, principal: email, candidatos, rebotados,
+        domain: data.domain, mbEmail: state.loginEmail, principal: email, candidatos, rebotados, sinConfirmar,
         subject, body: fullBody, ahoraMs: Date.now(),
       });
 

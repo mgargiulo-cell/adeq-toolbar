@@ -286,6 +286,10 @@ export async function createManualSendTracking(accessToken, payload) {
         "apikey": key, "Authorization": `Bearer ${accessToken}`,
         "Content-Type": "application/json", "Prefer": "return=representation",
       },
+      // (2026-09-13) Con reloj. Se espera ANTES de mandar el mail, con la tarjeta ya en "Processing…" y
+      // los botones apagados: un pedido colgado la dejaba así sin mandar nada. Sin id el mail sale igual,
+      // sin píxel (así estaba pensado).
+      signal: AbortSignal.timeout(8000),
       body: JSON.stringify({
         user_email:    (payload.user_email || "").toLowerCase(),
         domain:        (payload.domain || "").toLowerCase(),
@@ -327,6 +331,7 @@ export async function markManualSendFailed(accessToken, actionId, motivo = "") {
         "Content-Type": "application/json", "Prefer": "return=minimal",
       },
       body: JSON.stringify({ action: "failed", reason: String(motivo || "").slice(0, 300) }),
+      signal: AbortSignal.timeout(8000),
     });
     return res.ok ? { ok: true } : { ok: false, status: res.status };
   } catch (e) { return { ok: false, error: e.message }; }
@@ -379,22 +384,33 @@ export async function queueReengagement(accessToken, payload) {
 // Chequea si un email está en toolbar_bounced_emails (lista global de
 // emails que ya rebotaron en cualquier MB). Si está, no se debe permitir
 // usarlo como destinatario — ni manual ni como future_email.
+// ⚠️ (2026-09-13) "NO PUDE PREGUNTAR" NO ES "NO REBOTÓ". Devolvía {bounced:false} ante un 401, un 500,
+// una respuesta ilegible o la red caída, y sin reloj: un pedido colgado dejaba la tarjeta en
+// "Processing…" y el lote en "Enviando 3 de 40…" para siempre, después de que el mail ya había salido.
+// Ahora: `ok: true` = la lista contestó (bounced dice la verdad); `ok: false` = no se sabe. La forma no
+// cambia para quien sólo mira `bounced`; quien manda a una dirección sin ojos humanos (el lote, los
+// adicionales) mira `ok` y no manda. El worker no vuelve a chequear los adicionales al despacharlos.
 export async function isEmailBounced(accessToken, email) {
-  if (!accessToken || !email) return { bounced: false };
-  const clean = String(email).trim().toLowerCase();
-  if (!clean.includes("@")) return { bounced: false };
+  const clean = String(email || "").trim().toLowerCase();
+  // No es un email (vacío o una URL de formulario): no hay nada que pueda haber rebotado.
+  if (!clean.includes("@")) return { bounced: false, ok: true };
+  if (!accessToken) return { bounced: false, ok: false, error: "sin sesión" };
   try {
     const res = await fetch(
       `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?email=eq.${encodeURIComponent(clean)}&evidencia=in.(rebote_smtp,verificador,sin_clasificar)&select=email,reason,created_at&limit=1`,
-      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` } }
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(8000) }
     );
-    if (!res.ok) return { bounced: false };
-    const rows = await res.json().catch(() => []);
-    if (Array.isArray(rows) && rows.length > 0) {
-      return { bounced: true, reason: rows[0].reason || "bounced", since: rows[0].created_at };
+    if (!res.ok) return { bounced: false, ok: false, status: res.status, error: `HTTP ${res.status}` };
+    const rows = await res.json().catch(() => null);
+    if (!Array.isArray(rows)) return { bounced: false, ok: false, error: "respuesta ilegible" };
+    if (rows.length > 0) {
+      return { bounced: true, ok: true, reason: rows[0].reason || "bounced", since: rows[0].created_at };
     }
-    return { bounced: false };
-  } catch { return { bounced: false }; }
+    return { bounced: false, ok: true };
+  } catch (e) {
+    return { bounced: false, ok: false, error: e?.name === "TimeoutError" ? "no contestó en 8 s" : (e?.message || String(e)) };
+  }
 }
 
 // ── Notifications ─────────────────────────────────────────────
@@ -816,6 +832,9 @@ export async function validateReviewItem(accessToken, id, validatedBy) {
       method: "PATCH",
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ status: "validated", validated_by: validatedBy, validated_at: new Date().toISOString() }),
+      // (2026-09-13) Con reloj: en la tarjeta se espera DESPUÉS de que el mail salió y la ficha entró.
+      // Colgado, la tarjeta quedaba en "Processing…" sin sacarse; con error, la marca se encola sola.
+      signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
     return { ok: true };
@@ -900,13 +919,15 @@ export async function markReviewQueueAsContacted(accessToken, domain, validatedB
   const key = CONFIG.SUPABASE_ANON_KEY;
   const cleanDomain = (domain || "").toLowerCase().replace(/^www\./, "").trim();
   try {
-    await fetch(`${url}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(cleanDomain)}&status=eq.pending`, {
+    // (2026-09-13) Con reloj, y dice si entró: devolvía ok:true aunque la base contestara 401 o 500.
+    const res = await fetch(`${url}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(cleanDomain)}&status=eq.pending`, {
       method: "PATCH",
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
       body: JSON.stringify({ status: "validated", validated_by: validatedBy, validated_at: new Date().toISOString() }),
+      signal: AbortSignal.timeout(8000),
     });
-    return { ok: true };
-  } catch (e) { return { ok: false, error: e.message }; }
+    return res.ok ? { ok: true } : { ok: false, status: res.status, error: `HTTP ${res.status}` };
+  } catch (e) { return { ok: false, error: e?.name === "TimeoutError" ? "no contestó en 8 s" : e.message }; }
 }
 
 // Maxi 2026-08-10: acepta `motivo` y lo deja escrito en suspect_reason con el prefijo "mb:".
@@ -1035,6 +1056,8 @@ export async function saveHistory(entry) {
         geo:         entry.geo        || "",
         date:        entry.date       || new Date().toISOString().split("T")[0],
       }),
+      // (2026-09-13) Con reloj: la tarjeta de Prospects lo espera después de mandar el mail y cargar la ficha.
+      signal: AbortSignal.timeout(8000),
     });
   } catch (err) {
     console.warn("Supabase saveHistory failed:", err.message);
@@ -1348,9 +1371,16 @@ export async function saveTrafficCache(domain, data) {
 // Tabla: toolbar_sendtrack — historial de pitches enviados por dominio.
 // (Los follow-ups los maneja el CRM externo, no la toolbar.)
 // ============================================================
-export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail }) {
+export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail, crmAlEnviar }) {
   const { sendtrack = {} } = await chrome.storage.local.get("sendtrack");
-  sendtrack[domain] = { sendDate, pitch, email };
+  // (2026-09-13) La copia local anota también QUIÉN mandó y qué decía el CRM en ese momento. Es lo que
+  // lee Analysis al volver a abrir el sitio (envioPropioGuardado en modules/colaEstado.js): si el CRM
+  // muestra ahora la "Propuesta Vigente" sin ejecutivo que creó el aviso de nuestros adicionales, no es
+  // una propuesta ajena y no bloquea cargarla. `crmAlEnviar` es la foto de fotoCrmAlGuardar (o null).
+  sendtrack[domain] = {
+    sendDate, pitch, email, mbEmail: (mbEmail || "").toLowerCase(),
+    ...(crmAlEnviar !== undefined ? { crm: crmAlEnviar } : {}),
+  };
   await chrome.storage.local.set({ sendtrack });
 
   const { url, key } = await getConfig();
@@ -1376,6 +1406,9 @@ export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail }) 
           email:     email || "",
           mb_email:  (mbEmail || "").toLowerCase() || null,
         }),
+        // (2026-09-13) Con reloj. Se espera justo después de que el mail salió y ANTES de cargar la
+        // ficha: colgado, la tarjeta quedaba en "Processing…" y el CRM no recibía nada.
+        signal: AbortSignal.timeout(8000),
       });
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
@@ -1384,8 +1417,9 @@ export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail }) 
       }
       return { ok: true };
     } catch (err) {
-      console.warn("SendTrack save failed:", err.message);
-      return { ok: false, error: err.message };
+      const motivo = err?.name === "TimeoutError" ? "no contestó en 8 s" : err.message;
+      console.warn("SendTrack save failed:", motivo);
+      return { ok: false, error: motivo };
     }
   }
   return { ok: false, error: "sin config" };
