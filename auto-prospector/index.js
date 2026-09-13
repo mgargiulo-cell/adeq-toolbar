@@ -3520,7 +3520,7 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     let _tirados = 0;
     const cands = [...found].filter(d => {
       if (DEPRIO_TLD_RE.test(d)) { _tirados++; return false; }
-      if (_MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || BRAND_BLOCKLIST.has(d)) { _tirados++; return false; }
+      if (_MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || esMarcaBloqueada(d) || esTldVetado(d)) { _tirados++; return false; }
       try { if (!isDomainAllowed(d)) { _tirados++; return false; } } catch {}
       // Solo se descarta por IMPOSIBILIDAD estructural (gobierno, universidad,
       // acortador, CDN, placeholder). Los rechazos por RUBRO —tienda, apuestas,
@@ -3744,7 +3744,7 @@ async function _feederPullSellersGoogle(token, targetCount, sessionKnown) {
         const d = _normalizeFeederDomain(m[1]); if (!d || !/^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)) continue;
         const cc = ccDe(d);
         if (!incluirGtld && !(cc && _TLDS_OBJETIVO_GOOGLE.has(`.${cc}`))) continue;
-        if (DEPRIO_TLD_RE.test(d) || _MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || BRAND_BLOCKLIST.has(d)) continue;
+        if (DEPRIO_TLD_RE.test(d) || _MAJESTIC_NAME_SKIP_RE.test(d) || isCorporatePattern(d) || esMarcaBloqueada(d) || esTldVetado(d)) continue;
         cands.add(d);
       }
       objetivo = cands.size;
@@ -4098,19 +4098,9 @@ async function sincronizarFinalizadosDeMonday(token) {
     // figuraba en ningún lado, así que el reciclado lo volvía a encolar: 88 dominios
     // duplicando trabajo y gastando de nuevo el hit de RapidAPI para llegar al mismo lead
     // que ya teníamos listo para contactar.
-    const _yaEnProspects = new Set();
-    try {
-      const auth2 = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
-      for (let i = 0; i < todos.length; i += 200) {
-        const lote = todos.slice(i, i + 200).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
-        const r = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=in.(${encodeURIComponent(lote)})&select=domain`,
-          { headers: auth2 });
-        if (!r.ok) continue;
-        const f = await r.json();
-        if (Array.isArray(f)) f.forEach(x => x.domain && _yaEnProspects.add(x.domain));
-      }
-    } catch (e) { log(`  ⚠️ monday: no pude cruzar contra Prospects (${e.message}) — sigo sin ese filtro`); }
+    const _pendProspects = await _dominiosPendientesEnProspects(token, todos);
+    if (_pendProspects === null) log(`  ⚠️ monday: no pude cruzar contra Prospects — sigo sin ese filtro`);
+    const _yaEnProspects = _pendProspects || new Set();
     if (_yaEnProspects.size) log(`  ℹ️ monday: ${_yaEnProspects.size} ya están esperando en Prospects — no se re-encolan`);
     // ⚠️ EL CORTE Y EL CONTEO ERAN LA MISMA VARIABLE (Maxi 2026-08-25). `reprospectables`
     // guardaba `candidatos.length`, que ya venía cortado por el techo diario, así que el
@@ -4226,6 +4216,29 @@ async function _dominiosActivosEnCola(token, candidatos) {
   return out;
 }
 
+// Dominios que ya esperan en Prospects (pending). Una sola función para los dos reciclados —el
+// barrido diario y el feeder por slot— desde el 13/09: el barrido cruzaba contra Prospects desde el
+// 25/08 y el feeder no, así que un reciclable pending volvía a la cola y le borraban la espera de
+// búsqueda de email. `null` = algún lote no se pudo leer; nunca significa "ninguno está".
+async function _dominiosPendientesEnProspects(token, candidatos) {
+  const out = new Set();
+  if (!Array.isArray(candidatos) || !candidatos.length) return out;
+  const BATCH = 200;
+  for (let i = 0; i < candidatos.length; i += BATCH) {
+    const inList = candidatos.slice(i, i + BATCH).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=in.(${encodeURIComponent(inList)})&select=domain`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) });
+      if (!r.ok) return null;
+      const rows = await r.json();
+      if (!Array.isArray(rows)) return null;
+      rows.forEach(x => x.domain && out.add(String(x.domain).toLowerCase()));
+    } catch { return null; }
+  }
+  return out;
+}
+
 // Borra la marca de "ya le busqué email y no encontré" para que la caza vuelva sobre
 // estos dominios. Al re-prospectar un cliente que cerró ciclo queremos un contacto
 // NUEVO, no el mismo de hace seis meses que quizás ya no trabaja ahí.
@@ -4235,7 +4248,11 @@ async function _limpiarMarcaDeEmail(token, dominios) {
   for (let i = 0; i < dominios.length; i += BATCH) {
     const inList = dominios.slice(i, i + BATCH).map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
     try {
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=in.(${encodeURIComponent(inList)})`, {
+      // `status=neq.pending` (2026-09-13): un lead que YA está en Prospects nunca pierde su espera de
+      // búsqueda de email, venga de donde venga el reciclado o aunque el cruce haya fallado. Borrarla
+      // mandaba de nuevo a scrape, Serper, Apollo y MV a sitios que ya demostraron no publicar email.
+      // Se sigue limpiando la fila vieja validated/rejected del cliente que cerró ciclo.
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=neq.pending&domain=in.(${encodeURIComponent(inList)})`, {
         method: "PATCH",
         headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
         body: JSON.stringify({ email_intentos: 0, email_ultimo_intento: null, email_ultimo_motivo: null }),
@@ -4286,7 +4303,12 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     const _recientes = await _dominiosContactadosDesde(token, _diasReprospect).catch(() => null);
     if (_recientes === null) { log(`  ⚠️ reciclables: no pude leer los contactados recientes — no re-prospecto a ciegas`); return 0; }
     const _enCola = await _dominiosActivosEnCola(token, pool).catch(() => new Set());
-    const fresh = pool.filter(d => !_recientes.has(d) && !_enCola.has(d) && !sessionKnown.has(d));
+    // Faltaba mirar Prospects también acá (2026-09-13): ver _dominiosPendientesEnProspects. Si no se
+    // puede leer, se sigue: processCsvItem frena el duplicado gratis y la espera de email ya no se borra.
+    const _pendProspects = await _dominiosPendientesEnProspects(token, pool);
+    if (_pendProspects === null) log(`  ⚠️ reciclables: no pude cruzar contra Prospects — sigo sin ese filtro`);
+    const _yaEnProspects = _pendProspects || new Set();
+    const fresh = pool.filter(d => !_recientes.has(d) && !_enCola.has(d) && !_yaEnProspects.has(d) && !sessionKnown.has(d));
     if (fresh.length === 0) { log(`  🌱 reciclables: ${pool.length} del CRM, ninguno re-prospectable (todos contactados en los últimos ${_diasReprospect}d o ya en cola)`); return 0; }
     const slice = fresh.slice(0, targetCount);
     slice.forEach(d => sessionKnown.add(d));
@@ -4364,7 +4386,7 @@ async function _feederPullMajestic(token, targetCount, sessionKnown, hispanicSlo
     // Filtros BARATOS (sin red): TLD deprio Anglo + nombre obvio no-publisher + corporate/brand.
     let cands = win.filter(d =>
       d && !DEPRIO_TLD_RE.test(d) && !_MAJESTIC_NAME_SKIP_RE.test(d) &&
-      !isCorporatePattern(d) && !BRAND_BLOCKLIST.has(d)
+      !isCorporatePattern(d) && !esMarcaBloqueada(d) && !esTldVetado(d)
     );
     // SESGO GEO: poner los dominios de los TLDs objetivo ADELANTE (no exclusivo: si no alcanzan, se
     // completa con el resto de la ventana → nunca frena el feeder por falta de match GEO).
@@ -8268,7 +8290,8 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // Capeado por el mismo contador diario de Serper que las otras cuatro vías (2026-09-13). Antes el
   // comentario lo decía y el código no lo hacía: sin tope, sin contador y sin anotar el dominio, así
   // que polishPool y el agente volvían a pagar el mismo dominio minutos después.
-  if (_hayTiempo() && !_hasReal && SERPER_API_KEY) {
+  // `opts.sinSerper`: la mejora de contacto de la auditoría del pool promete ser gratis (13/09).
+  if (_hayTiempo() && !_hasReal && SERPER_API_KEY && !opts.sinSerper) {
     try {
       const _cfgSerper = await getConfig(_workerToken).catch(() => null);
       const g = _serperContactoPermitido(_cfgSerper, _workerToken, cleanDomain) ? await _serperContactSearch(domain).catch(() => null) : null;
@@ -11643,7 +11666,10 @@ async function apolloQuemarCiclo(token) {
       patch.emails = await validateEmailsBatch(merged);
       patch.email_sources = { ...(lead.email_sources || {}), [ap.email.toLowerCase()]: "apollo" };
       if (!lead.contact_name && ap.contact_name) patch.contact_name = ap.contact_name;
-      patch.email_found_at = new Date().toISOString();
+      // RESCATE = el lead no tenía NINGÚN email (misma regla que polishPool). Sumar una persona sobre
+      // un info@ es una mejora de contacto, no un rescate: sin esta condición inflaba "emails
+      // encontrados a leads que no tenían" y metricas_diarias.emails_hallados (2026-09-13).
+      if (!cur.length) patch.email_found_at = new Date().toISOString();
       conEmail++;
       log(`  💎 apollo quemar: ${domain} → ${ap.email}${ap.title ? ` (${ap.title})` : ""}`);
     } else {
@@ -11948,6 +11974,17 @@ function _serperContactoPermitido(cfg, token, domain) {
   setConfigValue(token, "serper_contact_used", `${dia}:${_serperContactCount}`).catch(() => {});  // SIEMPRE: un restart perdía la cuenta
   return true;
 }
+
+// ── LOS TOPES DIARIOS DE polishPool SOBREVIVEN AL REINICIO (2026-09-13) ─────────────────────
+// `_rolMxHoy` y `_patronHoy` vivían sólo en memoria y arrancaban con `dia: ""`: con el worker
+// reiniciando cada ~7 minutos, polish_rol_mx_daily_cap (60) y polish_patron_daily_cap (40, que gasta
+// MillionVerifier) se volvían "60 y 40 por reinicio". Es el mismo bug que ya se arregló para MV y
+// para Serper contacto. Se siembra desde la config ("YYYY-MM-DD:N") y se persiste en cada uso.
+function _sembrarTopeDiario(estado, cfg, clave, dia) {
+  if (estado && estado.dia === dia) return estado;
+  const p = String(cfg?.[clave] || "");
+  return { dia, n: p.startsWith(dia + ":") ? (parseInt(p.split(":")[1], 10) || 0) : 0 };
+}
 // Maxi 2026-07-15: ritmo subido para pulir el pool grande (1133 pendientes) en horas, no días.
 // Seguro ahora que (a) el cursor commitea por wave (sobrevive restarts) y (b) se arregló el OOM.
 // Es red-bound (fetch+scrape), no memoria → más concurrencia impacta poco en RSS.
@@ -12042,6 +12079,17 @@ const POLISH_MAX_MS = 120 * 1000;
 // muerto que no sale nunca.
 const AUDITORIA_EMAILS_LOTE = 750;      // ~4 semanas para recorrer el pool entero
 const AUDITORIA_EMAILS_CORTE_SEGURIDAD = 0.30;   // si vaciaría más del 30%, NO aplica y avisa
+// "Email de última", el criterio del media buyer: un genérico que no es comercial (info@, contacto@,
+// press@…) o una dirección ADIVINADA por rol_mx, que no es un contacto publicado. publicidad@,
+// comercial@ o ventas@ nunca son de última, aunque figuren en la lista de genéricos. (2026-09-13)
+function _esEmailDeUltima(email, fuente) {
+  const local = String(email || "").toLowerCase().split("@")[0];
+  if (!local) return false;
+  if (String(_normSrc(fuente) || "").toLowerCase() === "rol_mx") return true;
+  if (AD_SALES_LOCAL.test(local) || AD_SALES_CONTIENE.test(local)) return false;
+  return _isGenericLocalPart(email);
+}
+
 async function auditarEmailsDelPool(token) {
   try {
     const cfg = await getConfig(token).catch(() => null);
@@ -12147,59 +12195,6 @@ async function auditarEmailsDelPool(token) {
       return;
     }
 
-    // ── BUSCAR UNO MEJOR DONDE SOLO HAY EL "DE ÚLTIMA" ────────────────────────
-    // Criterio del media buyer, textual: "voy por el correo que dice el nombre del espacio
-    // —webmaster, editor, sales, encargado de ventas—; de última, si no hay, info o contacto".
-    // Medido sobre el pool: 187 de 762 leads (uno de cada cuatro) SOLO tienen el de última.
-    // A esos se les hace un scrape del sitio, que es GRATIS —no gasta Apollo ni Serper— para
-    // ver si en alguna página hay un publicidad@ o un editor@ que no habíamos capturado.
-    // Con techo: 20 por pasada y corte por tiempo. Un job en cadena sin techo se come la
-    // vida del worker y deja sin correr a todo lo que viene detrás; hoy pasó exactamente eso.
-    const _LIMITE_UPGRADE = 20;
-    const _CORTE_UPGRADE_MS = 90 * 1000;
-    const _finUpgrade = Date.now() + _CORTE_UPGRADE_MS;
-    let _mejorados = 0, _buscados = 0;
-    if (String(cfg.auditoria_emails_busca_mejor ?? "true") === "true") {
-      const _soloGenerico = leads.filter(l => {
-        const ms = (Array.isArray(l.emails) ? l.emails : []).filter(e => typeof e === "string" && e);
-        if (!ms.length) return false;
-        // "Solo genérico" = ninguno supera el umbral de rol/persona. 40 deja afuera a
-        // info@/contacto@ (15) y a los departamentos (8), y adentro a todo lo demás.
-        return ms.every(e => rankEmail(e, l.domain, l.category || "") < 40);
-      });
-      for (const lead of _soloGenerico) {
-        if (_buscados >= _LIMITE_UPGRADE || Date.now() > _finUpgrade) break;
-        _buscados++;
-        try {
-          const encontrados = await scrapeEmailsForDomain(lead.domain).catch(() => []);
-          const fuentes = lead.email_sources || {};
-          const yaEstan = new Set((lead.emails || []).map(e => String(e).toLowerCase()));
-          const mejores = [...new Set(encontrados)]
-            .filter(e => !yaEstan.has(String(e).toLowerCase()))
-            .filter(e => !isBouncedSync(e))
-            .filter(e => _brandMatches(e, lead.domain, "scrape"))
-            .map(e => ({ e, s: rankEmail(e, lead.domain, lead.category || "") }))
-            .filter(x => x.s >= 40)                       // solo si es MEJOR que el de última
-            .sort((a, b) => b.s - a.s);
-          if (mejores.length) {
-            const _nuevos = [...mejores.map(x => x.e), ...(lead.emails || [])];
-            const _srcs = { ...fuentes };
-            mejores.forEach(x => { _srcs[x.e.toLowerCase()] = { source: "scrape", url: `https://${lead.domain}` }; });
-            const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-              method: "PATCH",
-              headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify({ emails: _nuevos, email_sources: _srcs }),
-            }).catch(() => null);
-            if (r && r.ok) {
-              _mejorados++;
-              log(`  ⬆️ ${lead.domain}: solo tenía genérico → encontré ${mejores[0].e} (${mejores[0].s} pts)`);
-            }
-          }
-        } catch (e) { log(`  ⚠️ upgrade ${lead.domain}: ${e.message}`); }
-      }
-      if (_buscados) log(`📧 upgrade de contacto: ${_buscados} sitios revisados (gratis) → ${_mejorados} con un email MEJOR que el genérico`);
-    }
-
     // ── SEGUNDA PASADA: aplicar ───────────────────────────────────────────────
     let _aplicados = 0, _dejadosSinEmail = 0;
     for (const plan of planes) {
@@ -12221,6 +12216,71 @@ async function auditarEmailsDelPool(token) {
 
     const ultimo = leads[leads.length - 1]?.created_at || cursor;
     await setConfigValue(token, "auditoria_emails_cursor", ultimo).catch(() => {});
+
+    // ── BUSCAR UNO MEJOR DONDE SOLO HAY EL "DE ÚLTIMA" ────────────────────────
+    // Criterio del media buyer, textual: "voy por el correo que dice el nombre del espacio
+    // —webmaster, editor, sales, encargado de ventas—; de última, si no hay, info o contacto".
+    // Medido sobre el pool: 187 de 762 leads (uno de cada cuatro) SOLO tienen el de última.
+    // A esos se les hace un scrape del sitio, GRATIS (sin Serper ni Apollo), para ver si en alguna
+    // página hay un publicidad@ o un editor@ que no habíamos capturado. Con techo: 20 por pasada y
+    // corte por tiempo.
+    // ⚠️ TRES ARREGLOS DEL 13/09:
+    //   · "Sólo de última" se decidía con `rankEmail < 40` creyendo que info@ valía 15. En el dominio
+    //     propio vale 55 (+40 por dominio): la búsqueda no corría para NADIE. Ahora lo decide
+    //     `_esEmailDeUltima`, que además cuenta las direcciones adivinadas por rol_mx.
+    //   · "Mejor" era `>= 40`: un contact@ nuevo contaba como mejora. Un de última nunca lo es.
+    //   · Corría ANTES de aplicar los planes y de guardar el cursor: el PATCH de planes pisaba el email
+    //     recién encontrado y un reinicio a mitad perdía todo. Ahora corre después, sobre lo aplicado.
+    const _LIMITE_UPGRADE = 20;
+    const _CORTE_UPGRADE_MS = 90 * 1000;
+    const _finUpgrade = Date.now() + _CORTE_UPGRADE_MS;
+    let _mejorados = 0, _buscados = 0;
+    if (String(cfg.auditoria_emails_busca_mejor ?? "true") === "true") {
+      const _planPorId = new Map(planes.map(p => [p.id, p]));
+      const _emailsHoy = (l) => {
+        const p = _planPorId.get(l.id);
+        return (p ? p.buenos : (Array.isArray(l.emails) ? l.emails : [])).filter(e => typeof e === "string" && e);
+      };
+      const _soloGenerico = leads.filter(l => {
+        if (_planPorId.get(l.id)?.vaciaria) return false;          // los vaciados los toma polishPool
+        const ms = _emailsHoy(l);
+        if (!ms.length) return false;
+        const fuentes = l.email_sources || {};
+        return ms.every(e => _esEmailDeUltima(e, fuentes[String(e).toLowerCase()]));
+      });
+      for (const lead of _soloGenerico) {
+        if (_buscados >= _LIMITE_UPGRADE || Date.now() > _finUpgrade) break;
+        _buscados++;
+        try {
+          const encontrados = await scrapeEmailsForDomain(lead.domain, { sinSerper: true }).catch(() => []);
+          const fuentes = lead.email_sources || {};
+          const base = _emailsHoy(lead);
+          const yaEstan = new Set(base.map(e => String(e).toLowerCase()));
+          const mejores = [...new Set(encontrados)]
+            .filter(e => !yaEstan.has(String(e).toLowerCase()))
+            .filter(e => !isBouncedSync(e))
+            .filter(e => _brandMatches(e, lead.domain, "scrape"))
+            .map(e => ({ e, s: rankEmail(e, lead.domain, lead.category || "") }))
+            .filter(x => x.s > 0 && !_esEmailDeUltima(x.e, "scrape"))   // sólo si es MEJOR que el de última
+            .sort((a, b) => b.s - a.s);
+          if (mejores.length) {
+            const _nuevos = [...mejores.map(x => x.e), ...base];
+            const _srcs = { ...fuentes };
+            mejores.forEach(x => { _srcs[x.e.toLowerCase()] = { source: "scrape", url: `https://${lead.domain}` }; });
+            const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH",
+              headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ emails: _nuevos, email_sources: _srcs }),
+            }).catch(() => null);
+            if (r && r.ok) {
+              _mejorados++;
+              log(`  ⬆️ ${lead.domain}: sólo tenía de última → encontré ${mejores[0].e} (${mejores[0].s} pts)`);
+            }
+          }
+        } catch (e) { log(`  ⚠️ upgrade ${lead.domain}: ${e.message}`); }
+      }
+      if (_buscados) log(`📧 upgrade de contacto: ${_buscados} sitios revisados (gratis) → ${_mejorados} con un email MEJOR que el de última`);
+    }
     await setConfigValue(token, "auditoria_emails_ultimo", JSON.stringify({
       fecha: _madridDateStr(), lote: leads.length, tirados: _tirados, rebotados: _rebotados,
       otraMarca: _otraMarca, basura: _basura, reordenados: _reordenados, sinEmail: _dejadosSinEmail,
@@ -12572,7 +12632,7 @@ async function polishPool(token) {
         if (!foundEmail && String(cfg.polish_patron ?? "true") !== "false"
             && String(process.env.MILLIONVERIFIER_API_KEY || cfg.millionverifier_api_key || "").trim()) {
           const _mDay = _madridNowParts().dateISO;
-          if (_patronHoy.dia !== _mDay) _patronHoy = { dia: _mDay, n: 0 };
+          _patronHoy = _sembrarTopeDiario(_patronHoy, cfg, "polish_patron_used", _mDay);
           const _capPat = parseInt(cfg.polish_patron_daily_cap || "40", 10) || 40;
           const _nombres = [foundName, lead.contact_name, ..._nombresOut].filter(Boolean);
           if (_patronHoy.n < _capPat && _nombres.length) {
@@ -12584,7 +12644,10 @@ async function polishPool(token) {
                 if (rankEmail(_e, domain, lead.category, _casasOut) <= 0) continue;    // dominio quemado / rebotado
                 const _dec = await decidirVerificacionMV(_e, "pattern").catch(() => ({ verificar: false }));
                 if (!_dec.verificar) { log(`  🧩 ${domain}: patrón ${_e} sin verificar posible (${_dec.motivo || "catch-all"}) → no se adivina`); break; }
+                // polishPool procesa 12 dominios en paralelo: el tope se re-chequea justo antes de gastar.
+                if (_patronHoy.n >= _capPat) break;
                 _gastados++; _patronHoy.n++;
+                setConfigValue(token, "polish_patron_used", `${_mDay}:${_patronHoy.n}`).catch(() => {});
                 const _estado = await _verifyEmailMV(token, cfg, _e);
                 if (_estado === "ok") {
                   foundEmail = _e; foundSource = "pattern"; foundName = _nom;
@@ -12602,7 +12665,7 @@ async function polishPool(token) {
         let _extraRol = [];
         if (!foundEmail && curEmails.length === 0 && String(cfg.polish_rol_mx ?? "true") !== "false") {
           const _mDay = _madridNowParts().dateISO;
-          if (_rolMxHoy.dia !== _mDay) _rolMxHoy = { dia: _mDay, n: 0 };
+          _rolMxHoy = _sembrarTopeDiario(_rolMxHoy, cfg, "polish_rol_mx_used", _mDay);
           const _capRol = parseInt(cfg.polish_rol_mx_daily_cap || "60", 10) || 60;
           if (_rolMxHoy.n < _capRol) {
             try {
@@ -12611,8 +12674,10 @@ async function polishPool(token) {
                 const cands = _rolesAdivinables(domain, lead.language)
                   .map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) }))
                   .filter(c => c.score > 0);            // el dominio quemado o la dirección rebotada ya dan -1
-                if (cands.length) {
+                // El tope se re-chequea después del await de MX (12 dominios en paralelo) y se persiste.
+                if (cands.length && _rolMxHoy.n < _capRol) {
                   _rolMxHoy.n++;
+                  setConfigValue(token, "polish_rol_mx_used", `${_mDay}:${_rolMxHoy.n}`).catch(() => {});
                   foundEmail = cands[0].email; foundSource = "rol_mx";
                   _extraRol = cands.slice(1).map(c => c.email);   // el segundo va de reserva en la lista
                   log(`  🎯 ${domain}: sin email publicado → rol estándar del idioma con MX: ${cands.map(c => c.email.split("@")[0]).join(", ")} (rol_mx ${_rolMxHoy.n}/${_capRol} hoy)`);
@@ -12856,7 +12921,7 @@ async function runProspectSimilarExpansion(token) {
     try {
       const sims = await findSimilarSites(s.domain, rapidapi_key).catch(() => []);
       if (!Array.isArray(sims) || sims.length === 0) continue;
-      const cands = sims.filter(d => d && !DEPRIO_TLD_RE.test(d) && !_MAJESTIC_NAME_SKIP_RE.test(d) && !isCorporatePattern(d) && !BRAND_BLOCKLIST.has(d));
+      const cands = sims.filter(d => d && !DEPRIO_TLD_RE.test(d) && !_MAJESTIC_NAME_SKIP_RE.test(d) && !isCorporatePattern(d) && !esMarcaBloqueada(d) && !esTldVetado(d));
       const known = await _findKnownDomainsWorker(token, cands);
       const fresh = cands.filter(d => !known.has(d) && !sessionKnown.has(d));
       fresh.forEach(d => sessionKnown.add(d));
@@ -13482,13 +13547,30 @@ const BRAND_BLOCKLIST = new Set([
   "admiralmarkets","etoro","plus500","xtb","interactivebrokers","binance","coinbase","kraken", // brokers/exchanges (auditoría 2026-07-14)
 ]);
 
+// La lista guarda MARCAS sin TLD ("google", "mercadolibre"). Los feeders preguntaban
+// `BRAND_BLOCKLIST.has(d)` con el dominio entero, que nunca coincide: mercadolibre.com.ar,
+// zalando.de o binance.com pasaban el prefiltro, ocupaban carril y bajaban ads.txt, y recién
+// processCsvItem los descartaba como brand-root. Un solo helper para todos, el mismo criterio que
+// usa isDomainBlocked. (2026-09-13)
+function esMarcaBloqueada(d) {
+  return BRAND_BLOCKLIST.has(coreDomain(String(d || "")));
+}
+
+// Mismo criterio que isDomainBlocked ("geo-blacklist-tld") para los prefiltros de los feeders: el de
+// sellers de Google buscaba .ua a propósito y los otros dejaban pasar .ru/.ua, que la cola descartaba
+// después de bajarles ads.txt y ocupar carril. (2026-09-13)
+function esTldVetado(d) {
+  const x = String(d || "").toLowerCase();
+  return BLACKLIST_TLDS.some(t => x.endsWith(t));
+}
+
 function isDomainBlocked(domain) {
   const d = domain.toLowerCase().replace(/^www\./, "");
   if (CORPORATE_BLOCKLIST.has(d)) return "corporate/brand";
   // Subdominios de un dominio blocklisteado (ej. m.amazon.com, fr.wix.com si wix.com está)
   for (const b of CORPORATE_BLOCKLIST) { if (d.endsWith("." + b)) return "corporate/subdomain"; }
   // Marca por 2do-nivel en cualquier TLD/subdominio (news.google.at, rakuten.tv, fr.wix.com)
-  if (BRAND_BLOCKLIST.has(coreDomain(d))) return "corporate/brand-root";
+  if (esMarcaBloqueada(d)) return "corporate/brand-root";
   // ⚠️ SE COMPARABA POR SUBCADENA (Maxi 2026-08-25). `d.includes(".mil")` bloqueaba
   // `noticias.milenio.com` y `www.milanotoday.it` como si fueran sitios militares, y
   // `.ac.` mataba a cualquier dominio con esas dos letras entre puntos. Se perdían
@@ -14510,8 +14592,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
           { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
         );
         const rows = await existing.json();
-        const prevFreeze = Array.isArray(rows) && rows[0] ? parseInt(rows[0].attempt_count || 1, 10) : 0;
-        const days = prevFreeze === 0 ? 15 : prevFreeze === 1 ? 30 : 60;
+        // El ciclo sale de la fila si existe, o de la marca `freeze_N` que dejó el unfreezer (que
+        // borra la fila al liberar). Ver _backoffCongelado. (2026-09-13)
+        const _bk = _backoffCongelado({ attemptFila: Array.isArray(rows) && rows[0] ? parseInt(rows[0].attempt_count || 1, 10) : 0, errorMessage: item.error_message });
+        const prevFreeze = _bk.prevFreeze;
+        const days = _bk.dias;
         // Auto-blocklist permanente tras 3+ freeze cycles sin traffic data.
         // Dominios "inoperativos": están caídos o RapidAPI no los reconoce. No vale gastar más.
         if (prevFreeze >= 2) {
@@ -17216,13 +17301,13 @@ async function loadBouncedEmails(token) {
       //                     caído. Había 5 direcciones sanas bloqueadas de por vida por eso.
       // Se filtra por COLUMNA y no por regex sobre el texto del motivo: un `reason` nuevo que
       // nadie previó volvía a colarse como rebote sin que se notara.
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=10000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA}&limit=10000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (res.ok) {
       const rows = await res.json();
       _bouncedCache.set = new Set((rows || []).map(r => (r.email || "").toLowerCase()));
-      _recontarRebotesPorDominio();   // memoria de rebote a nivel DOMINIO (auditoría 2026-08-04)
+      _recontarRebotesPorDominio(rows);   // memoria de rebote a nivel DOMINIO (auditoría 2026-08-04); las adivinanzas rechazadas por MV no cuentan (13/09)
       _bouncedCache.ts = Date.now();
     }
   } catch {}
@@ -17246,7 +17331,7 @@ async function _cargarDominiosQueRechazan(token) {
   if (Date.now() - _dominiosRechazoAt < 30 * 60 * 1000) return;   // refresco cada 30 min
   try {
     const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo&${EVIDENCIA_BLOQUEA}&limit=5000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo,evidencia,fuente&${EVIDENCIA_BLOQUEA}&limit=5000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
     if (!r.ok) return;                      // no pude leer ≠ nadie rechaza
     const filas = await r.json();
@@ -17255,6 +17340,7 @@ async function _cargarDominiosQueRechazan(token) {
     for (const f of filas) {
       const dom = String(f.email || "").split("@")[1]?.toLowerCase();
       if (!dom) continue;
+      if (!_cuentaParaElDominio(f)) continue;   // una adivinanza que MV rechazó no es "el dominio rechaza" (13/09)
       const acc = _DOMINIOS_QUE_RECHAZAN.get(dom) || { usuarios: 0, dominioMuerto: false };
       if (f.tipo === "dominio_inexistente") acc.dominioMuerto = true;
       else if (f.tipo === "usuario_inexistente" || !f.tipo) acc.usuarios++;
@@ -17302,6 +17388,31 @@ async function _fuenteDelEmail(token, email) {
 // lugar porque hay cuatro lectores que deciden bloqueos y tres leían la tabla entera: una
 // autorespuesta contaba como dirección muerta y llegó a vaciarle los emails a un lead.
 const EVIDENCIA_BLOQUEA = "evidencia=in.(rebote_smtp,verificador,sin_clasificar)";
+
+// ── UNA ADIVINANZA QUE MV RECHAZÓ NO PRUEBA QUE EL DOMINIO RECHACE (2026-09-13) ─────────────
+// polishPool guarda hasta 3 direcciones de rol ADIVINADAS (rol_mx) para los leads sin email.
+// Cuando MillionVerifier daba "no" a dos, se guardaban como rebotes y la memoria por dominio lo
+// bloqueaba: desde ahí cualquier email REAL que apareciera (un publicidad@ publicado, una persona de
+// Apollo) daba -1 en rankEmail y la auditoría del pool lo borraba. La dirección adivinada sigue
+// quemada para siempre; lo único que cambia es que no cuenta como rechazo del dominio. Un rebote
+// SMTP real, o un "no" sobre una dirección publicada, siguen contando igual.
+const _FUENTE_HIPOTESIS = /^(rol_mx|pattern|guess|apollo_pattern)$/i;
+function _cuentaParaElDominio(fila) {
+  return !(fila?.evidencia === "verificador" && _FUENTE_HIPOTESIS.test(String(_normSrc(fila?.fuente) || "")));
+}
+
+// ── EL CASTIGO PROGRESIVO DE LOS CONGELADOS POR FALTA DE TRÁFICO (2026-09-13) ───────────────
+// 15 días la primera vez, 30 la segunda, 60 y blocklist 'inoperativo' la tercera. Nunca pasaba de
+// la primera: el unfreezer BORRA la fila de toolbar_frozen_leads al liberar, así que al re-congelar
+// no había de dónde leer el ciclo y siempre daba 0. Cada dominio sin datos de SimilarWeb volvía
+// cada ~15 días para siempre, y cada vuelta pagaba RapidAPI (la caché negativa dura 14). Ahora el
+// unfreezer deja el ciclo en el error_message de la cola (`freeze_N`), que llega intacto hasta acá.
+// Pura para poder probarla (tests/senales-10-09.test.js).
+function _backoffCongelado({ attemptFila = 0, errorMessage = "" } = {}) {
+  const marca = parseInt(String(errorMessage || "").match(/\bfreeze_(\d+)/)?.[1] || "0", 10) || 0;
+  const prevFreeze = Math.max(Number(attemptFila) || 0, marca);
+  return { prevFreeze, dias: prevFreeze === 0 ? 15 : prevFreeze === 1 ? 30 : 60, blocklist: prevFreeze >= 2, attemptNuevo: prevFreeze + 1 };
+}
 
 
 // ⚠️ El lookahead solo por la derecha protegía "software" pero NO "microsoft": un
@@ -19845,9 +19956,14 @@ async function _hasMxRecords(domain) {
   return null;
 }
 
-function _recontarRebotesPorDominio() {
+function _recontarRebotesPorDominio(filas = null) {
   _rebotesPorDominio.clear();
-  for (const em of (_bouncedCache.set || new Set())) {
+  // Con las filas (email, evidencia, fuente) se saltean las adivinanzas que MV rechazó: siguen en
+  // `_bouncedCache.set` (nunca se les escribe) pero no bloquean al dominio. Sin filas, como antes.
+  const _emails = Array.isArray(filas)
+    ? filas.filter(_cuentaParaElDominio).map(f => String(f?.email || "").toLowerCase()).filter(Boolean)
+    : (_bouncedCache.set || new Set());
+  for (const em of _emails) {
     const d = String(em).split("@")[1];
     if (!d) continue;
     if (!_rebotesPorDominio.has(d)) _rebotesPorDominio.set(d, new Set());
@@ -23043,7 +23159,7 @@ async function runAgentCycle(token, allFlags) {
               if (_mv === "no") {
                 // No entregable → marcar para que no se re-elija y seguir con el siguiente
                 markEmailBounced(token, {
-                  email: cand.email, reason: "mv_undeliverable", evidencia: "verificador",
+                  email: cand.email, reason: "mv_undeliverable", evidencia: "verificador", fuente: _normSrc(cand.source) || null,
                   originalDomain: cand.email.split("@")[1] || "",
                 }).catch(() => {});
                 descartados++;
@@ -25182,6 +25298,9 @@ async function _boletinPorSeccion(token) {
   const _cnt = async (url) => {
     try {
       const r = await fetch(url, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      // Un 500/400 no es un cero (2026-09-13): sin esto, una lectura fallida salía como
+      // "✅ 0 encontrados · quedan 0 sin email". El parte ya lo resolvía así en `_contar`.
+      if (!r.ok) return null;
       return parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
     } catch { return null; }
   };
@@ -25261,7 +25380,10 @@ async function _boletinPorSeccion(token) {
       const f = vals[vals.length - 1] || "?";     // la última fuente escrita es la del rescate
       _porFuenteResc[f] = (_porFuenteResc[f] || 0) + 1;
     }
-    _nota("BÚSQUEDA DE EMAILS (24h)", (_rescatados ?? 0) > 0 || (_mudos ?? 1) < 100 ? "✅" : "🟡", [
+    // Un conteo que no se pudo leer nunca da ✅ (2026-09-13): `_mudos ?? 1` convertía un timeout en
+    // "quedan 1 sin email" y lo pintaba verde.
+    _nota("BÚSQUEDA DE EMAILS (24h)", _rescatados == null || _mudos == null ? "🟡" : (_rescatados > 0 || _mudos < 100) ? "✅" : "🟡", [
+      ...(_rescatados == null || _mudos == null ? ["No se pudo leer la base para uno de estos conteos: el \"?\" no es un cero."] : []),
       `${_rescatados ?? "?"} email(s) encontrados a leads que no tenían · quedan ${_mudos ?? "?"} sin email.`,
       ...(Object.keys(_porFuenteResc).length ? [`Quién los encontró: ${Object.entries(_porFuenteResc).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(" · ")}`] : []),
       ...(Object.keys(_porMot).length ? [`Por qué fallan (${_diag24.length} intentos): ${Object.entries(_porMot).sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(" · ")}`] : []),
@@ -25273,7 +25395,8 @@ async function _boletinPorSeccion(token) {
     const _porSt = {};
     for (const st of ["pending", "processing", "waiting_pool", "next_day", "error"]) {
       const n = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.${st}&select=id`);
-      if (n) _porSt[st] = n;
+      if (n == null) _porSt[st] = "?";        // una lectura fallida no es "vacía" (2026-09-13)
+      else if (n) _porSt[st] = n;
     }
     const _drenado = _proc.length;
     _nota("COLA", _drenado >= 100 ? "✅" : _drenado >= 30 ? "🟡" : "🔴", [
@@ -25644,10 +25767,15 @@ async function enviarResumenSalud(token) {
       // 24h. El mail lo mostraba sin decirlo, al lado de dos conteos de 24h del mismo
       // concepto con otros números (154/139/78 · 167/165/67 · 82/86/32), y encima cortado en
       // 400 filas (167+165+67+1 = 400). Ahora dice lo que es y cuenta todo.
-      const _sinMail = (await _traerTodo(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&email_ultimo_motivo=not.is.null&select=domain,email_ultimo_motivo`,
+      // ⚠️ "EL STOCK DE N" ERA UN PEDAZO (2026-09-13). Filtraba `email_ultimo_motivo=not.is.null` y
+      // salía en el mismo mail que "quedan N sin email" con otro número (331/292, 477/297, 438/327).
+      // Ahora es la misma población, y se dice cuántos todavía no tienen motivo del barrido.
+      const _pendSinMail = (await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=domain,email_ultimo_motivo`,
         _auth)) || [];
-      if (Array.isArray(_sinMail) && _sinMail.length) {
+      const _sinMail = Array.isArray(_pendSinMail) ? _pendSinMail.filter(l => l.email_ultimo_motivo) : [];
+      const _sinPasar = (Array.isArray(_pendSinMail) ? _pendSinMail.length : 0) - _sinMail.length;
+      if (Array.isArray(_pendSinMail) && _pendSinMail.length) {
         const _porMotivo = {};
         for (const l of _sinMail) {
           // Los motivos con detalle traen el ejemplo pegado; se agrupa por el prefijo.
@@ -25656,7 +25784,7 @@ async function enviarResumenSalud(token) {
           if (_porMotivo[_k].ej.size < 2) _porMotivo[_k].ej.add(l.domain);
         }
         const _top = Object.entries(_porMotivo).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
-        _errs.push(`SIN EMAIL — el stock de ${_sinMail.length} pendientes sin email, por su último motivo (no es de hoy: es lo acumulado):`);
+        _errs.push(`SIN EMAIL — hay ${_pendSinMail.length} pendientes sin email (lo acumulado, no es de hoy): ${_sinMail.length} ya tienen motivo del barrido de emails y ${_sinPasar} todavía no.${_sinMail.length ? " Los que tienen motivo, agrupados:" : ""}`);
         for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}. Ej: ${[...v.ej].join(", ")}`);
       }
 
@@ -26891,7 +27019,7 @@ async function main() {
       try {
         const now = new Date().toISOString();
         const res = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?frozen_until=lte.${encodeURIComponent(now)}&select=domain,source,uploaded_by,attempt_count&limit=20`,
+          `${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?frozen_until=lte.${encodeURIComponent(now)}&select=domain,source,uploaded_by,attempt_count,last_error&limit=20`,
           { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
         );
         // ⚠️ "No pude leer" no puede reportarse como "no había nada" (Maxi 2026-08-25).
@@ -26921,7 +27049,10 @@ async function main() {
                 source: row.source || "frozen_retry",
                 uploaded_by: row.uploaded_by || "",
                 processed_at: null,
-                error_message: `unfrozen_retry_attempt_${(row.attempt_count || 1) + 1}`,
+                // `freeze_N` sólo en los congelados por falta de tráfico (2026-09-13): el re-congelado
+                // lo lee para escalar 15→30→60 días. Los de rebotes o re-engagement tienen su propio
+                // conteo y no tienen que heredar este.
+                error_message: `unfrozen_retry_attempt_${(row.attempt_count || 1) + 1}${row.last_error === "no_traffic_data_after_3_attempts" ? ` freeze_${row.attempt_count || 1}` : ""}`,
               }),
             }).catch(() => {});
             // Borrar de frozen — si vuelve a fallar 3 veces, se re-congela con backoff mayor
