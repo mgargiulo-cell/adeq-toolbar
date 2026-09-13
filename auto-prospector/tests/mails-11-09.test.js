@@ -133,16 +133,22 @@ test("lista_no_recontactar y stock_envios laten también cuando están bien (o a
 });
 
 // ── 6. Apollo: el job "atrasado" tiene de dónde elegir ──────────────────────────────────
-test("apolloQuemarCiclo mira 600 pendientes, no 120", () => {
+test("apolloQuemarCiclo le pide a la base los leads sin email, no los busca entre los de más tráfico", () => {
   const fn = entre("async function apolloQuemarCiclo(", "// BARRIDO DE PROSPECTS");
-  ok(/order=traffic\.desc\.nullslast&limit=600/.test(fn), "con 120 los de más tráfico ya tenían persona y el job decía 'candidatos 0' estando atrasado");
+  // 11/09: subir de 120 a 600 no alcanzó (salió UN candidato). Los de más tráfico casi siempre
+  // ya tienen email; los que no tienen hay que pedirlos con el filtro en la consulta (13/09).
+  ok(/&emails=eq\.%5B%5D&limit=300/.test(fn), "los sin email se piden directo");
+  ok(/real: intentos, esperado: Math\.min\(presupuesto, candidatos\.length\)/.test(fn), "y mide si gastó lo que podía, no si Apollo tenía a alguien");
+  ok(/i \+= 150/.test(fn), "el caché de Apollo se consulta en lotes: una URL con cientos de dominios se pasaba de largo");
 });
 
 // ── 7. Lo que apareció al releer los "reales" ───────────────────────────────────────────
-test("el agente no vuelve a recorrer cada día los leads que ya salteó por MV dudoso", () => {
+test("el agente no vuelve a recorrer cada día un lead sin dirección enviable (MV dudoso o todas no entregables)", () => {
   const fn = entre("async function runAgentCycle(", "const _conEmail = fresh.filter(_tieneEmail).length;");
-  ok(/reason=eq\.mv_dudoso&created_at=gte\./.test(fn), "se leen los salteados por mv_dudoso de la última semana");
-  ok(/fresh = fresh\.filter\(l => !_saltadosMv7d\.has\(/.test(fn), "y se sacan del lote antes de empezar, como los contactados en 30 días");
+  // 12/09: mvsnoticias.com salteado por `all_candidates_undeliverable` dos días seguidos. Es la
+  // misma regla que `mv_dudoso`, así que es la misma exclusión (13/09).
+  ok(/reason=in\.\(mv_dudoso,all_candidates_undeliverable\)&created_at=gte\./.test(fn), "se leen los dos motivos de la última semana");
+  ok(/fresh = fresh\.filter\(l => !_saltadosSinDireccion7d\.has\(/.test(fn), "y se sacan del lote antes de empezar, como los contactados en 30 días");
   ok(/7 \* 86400_000/.test(fn), "siete días: el veredicto de MV vale un mes, pero el re-enrich puede traer otra dirección");
 });
 

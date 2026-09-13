@@ -24,8 +24,12 @@ export async function cargarWorker(funciones, { fetchFalso = false } = {}) {
   if (n !== 1) throw new Error(`esperaba 1 main().catch( en index.js, hay ${n}`);
   s = s.replace("main().catch(", "false && main().catch(");
   if (fetchFalso) {
-    if (!/^import fetch from "node-fetch";/m.test(s)) throw new Error("no encontré el import de node-fetch para reemplazarlo");
-    s = s.replace(/^import fetch from "node-fetch";/m, 'const fetch = (...a) => globalThis.__fetchFalso(...a);');
+    // Se reemplaza el fetch de node-fetch y NO el envoltorio con reloj (2026-09-13): así los tests
+    // corren el mismo `fetch` que producción, timeout por defecto incluido, contra las respuestas
+    // inventadas.
+    const importNodo = /^import fetchNodo from "node-fetch";/m;
+    if (!importNodo.test(s)) throw new Error("no encontré el import de node-fetch para reemplazarlo");
+    s = s.replace(importNodo, 'const fetchNodo = (...a) => globalThis.__fetchFalso(...a);');
   }
   s += `\nexport { ${funciones.join(", ")} };\n`;
   fs.writeFileSync(path.join(tmp, "index.js"), s);

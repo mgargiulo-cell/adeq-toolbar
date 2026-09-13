@@ -7,7 +7,17 @@
 // Deploy: Railway
 // ============================================================
 
-import fetch from "node-fetch";
+import fetchNodo from "node-fetch";
+// ── NINGÚN FETCH SIN RELOJ (2026-09-13) ─────────────────────────────────────────────────
+// Un fetch sin timeout dejó el sistema mudo tres veces (el envío seis días del 12 al 18/08, el
+// descubrimiento tres semanas): no hay excepción ni log, el await no vuelve nunca y el loop no
+// llega a su propio chequeo de tiempo. Los relojes se agregaban de a uno y el 13/09 quedaban
+// 345 de 419 llamadas sin reloj. Ahora el reloj va acá: quien no pasa `signal` recibe uno de
+// 120 s (holgado para la consulta más lenta, acotado frente a "para siempre"). Quien necesita
+// otro tiempo, lo pasa. Un fetch que corta en vez de colgar cae en el catch de quien lo llamó;
+// los rechazos sin catch los registra el handler de unhandledRejection sin tirar el proceso.
+const FETCH_TIMEOUT_POR_DEFECTO_MS = 120_000;
+const fetch = (url, opts) => fetchNodo(url, opts?.signal ? opts : { ...(opts || {}), signal: AbortSignal.timeout(FETCH_TIMEOUT_POR_DEFECTO_MS) });
 import { pickRandomTemplate, fillTemplate, pickPitchSource, getSenderName, getBakedTemplates } from "./templates.js";
 import { KEYWORDS as _AG_KEYWORDS } from "./keywordsData.js";  // 3490 frases (12 idiomas) para AutoGoogle
 import {
@@ -3826,6 +3836,11 @@ async function _feederPullSellers(token, targetCount, sessionKnown) {
   const _usadoCarril = await _countActiveCsvBySource(token, "auto_feeder_sellers");
   if (_usadoCarril >= _cupoCarril) {
     log(`⏸️ sellers: carril lleno (${_usadoCarril}/${_cupoCarril}) — no bajo ningún sellers.json, sería trabajo tirado`);
+    // ── NO HACER FALTA NO ES ESTAR CAÍDO (2026-09-13) ──────────────────────────────────
+    // Esta salida saltea también la fuente de Google (encola en este mismo carril), que declara
+    // cadencia diaria. El 12/09 llevaba 71 h sin latir por diseño y el vigilante la iba a dar
+    // "sin correr". Mismo criterio que similar_expansion: "carril lleno, no hacía falta".
+    await saludPing(token, "sellers_google", { status: "ok", cadenciaMin: 1440, detalle: `carril de sellers lleno (${_usadoCarril}/${_cupoCarril}): no hacía falta leer más` }).catch(() => {});
     return 0;
   }
 
@@ -4084,7 +4099,27 @@ async function sincronizarFinalizadosDeMonday(token) {
     // guardaba `candidatos.length`, que ya venía cortado por el techo diario, así que el
     // parte comparaba el techo contra sí mismo y siempre concluía "entró todo lo que se
     // podía". Con 5.790 elegibles y un techo de 400, decía que el board quedaba al día.
-    const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d));
+    // ── LO QUE YA SE DESCARTÓ SIN ADS.TXT NO SE VUELVE A PROBAR CADA DÍA (2026-09-13) ──────
+    // El 11/09 el carril tenía 695 lugares y entraron 602: la puerta de entrada descartó 93 sin
+    // ads.txt. El CRM los devuelve en el mismo orden, así que al día siguiente volvían a estar
+    // primeros, se volvían a descartar y el resumen pintaba 🟡 por algo ya decidido. Cada "no"
+    // queda en `toolbar_adstxt_audit`; lo descartado en los últimos 30 días no se elige.
+    // Si no se puede leer, se sigue sin este filtro: la puerta de entrada chequea igual.
+    const _sinAdsReciente = new Set();
+    try {
+      const _corte30 = encodeURIComponent(new Date(Date.now() - 30 * 86_400_000).toISOString());
+      const _h = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+      for (let i = 0; i < todos.length; i += 150) {
+        const lote = todos.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+        const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?verdict=eq.no&last_checked_at=gte.${_corte30}&domain=in.(${encodeURIComponent(lote)})&select=domain`,
+          { headers: _h, signal: AbortSignal.timeout(10000) });
+        if (!r.ok) continue;
+        const f = await r.json();
+        if (Array.isArray(f)) f.forEach(x => x.domain && _sinAdsReciente.add(String(x.domain).toLowerCase()));
+      }
+    } catch (e) { log(`  ⚠️ reciclables: no pude leer la auditoría de ads.txt (${e.message}) — sigo sin ese filtro`); }
+    const _resRec = {};
+    const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d) && !_sinAdsReciente.has(d));
     // El carril `auto_feeder_monday` lo comparte con el feeder por slot. Si ya está lleno,
     // encolar 0 es lo esperado y no una falla: sin mirar el cupo, `_injectIntoCsvQueue`
     // devolvería 0 y el aviso de abajo gritaría por nada (2026-09-11).
@@ -4093,7 +4128,7 @@ async function sincronizarFinalizadosDeMonday(token) {
 
     let encolados = 0;
     if (candidatos.length) {
-      encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true });   // `reactivar` ya es el comportamiento por defecto (on_conflict+merge); se deja como documentación de la intención
+      encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true, resumen: _resRec });   // `reactivar` ya es el comportamiento por defecto (on_conflict+merge); se deja como documentación de la intención
       await _limpiarMarcaDeEmail(token, candidatos).catch(() => {});
     }
     log(`🔁 Reciclables del CRM: ${todos.length} · ${recientes.size ? `${todos.filter(d => recientes.has(d)).length} contactados hace <${dias}d` : "0 recientes"} · ${enCola.size} ya en cola · ${_elegibles.length} elegibles · carril libre ${_libre} → ${encolados} encolados (techo ${_techoDia}/día)`);
@@ -4116,6 +4151,8 @@ async function sincronizarFinalizadosDeMonday(token) {
       encolados,
       techo: _techoDia,
       libre: _libre,                          // cupo del carril al momento del barrido: si era 0, encolar 0 es lo esperado
+      sin_ads: _resRec.sinAds || 0,           // descartados HOY en la puerta por no tener ads.txt: procesados, no pendientes
+      sin_ads_30d: _sinAdsReciente.size,      // los que ya no se eligen porque se descartaron en los últimos 30 días
     })).catch(() => {});
     if (candidatos.length && encolados === 0) {
       await saludAlerta(token, {
@@ -5800,11 +5837,13 @@ async function getApolloUsageToday(token) {
   try {
     const res = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_today,apollo_calls_date,apollo_daily_limit,apollo_calls_month,apollo_calls_month_period,apollo_monthly_limit)&select=key,value`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) }
     );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const rows = await res.json();
+    if (!Array.isArray(rows)) throw new Error("la config no devolvió filas");
     const map  = {};
-    if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
+    rows.forEach(r => { map[r.key] = r.value; });
 
     const today   = new Date().toISOString().slice(0, 10);
     const storedDate  = map.apollo_calls_date  || "";
@@ -5826,6 +5865,25 @@ async function getApolloUsageToday(token) {
       _apolloPeriodReset = period;
       setConfigValue(token, "apollo_calls_month", "0").catch(() => {});
       setConfigValue(token, "apollo_calls_month_period", period).catch(() => {});
+      // ── UN PERÍODO QUE NO ES EL ANTERIOR NO ES UN CAMBIO DE CICLO (2026-09-13) ──────────
+      // El 11/09 este contador dijo "0 de 2.500 con el 100% del ciclo" mientras Apollo
+      // encontraba emails y otro job proyectaba 717. El reinicio de acá es correcto sólo el día
+      // que empieza un ciclo, cuando lo guardado es el ciclo ANTERIOR. Si lo guardado es otra
+      // cosa (otro formato, otro día de corte), el período lo está escribiendo otra regla —el
+      // RPC `bump_api_counter` vive en la base y no está en el repo— y cada reinicio del worker
+      // pone el contador en 0. Se sigue reiniciando como antes, pero ya no en silencio.
+      const _anterior = new Date(`${period}T00:00:00Z`);
+      _anterior.setUTCMonth(_anterior.getUTCMonth() - 1);
+      if (storedPeriod && storedPeriod !== _anterior.toISOString().slice(0, 10)) {
+        log(`⚠️ Apollo: el contador guardado es del período "${storedPeriod}" y el ciclo vigente empezó el ${period} — lo escribe otra regla`);
+        saludAlerta(token, {
+          clave: "apollo-contador-periodo", severidad: "warning",
+          titulo: "💳 El contador de Apollo se reinicia a mitad de ciclo",
+          cuerpo: `El período guardado es "${storedPeriod}" y el ciclo 12→12 vigente empezó el ${period}. Cada reinicio del worker lo vuelve a 0, así que el uso mensual que ven los jobs no es el real.\n`
+                + `Para ver qué escribe el período:\n  SELECT key, value FROM toolbar_config WHERE key LIKE 'apollo_calls%';\n  SELECT pg_get_functiondef('public.bump_api_counter'::regproc);`,
+          metadata: { guardado: storedPeriod, vigente: period, contador: storedMonth },
+        }).catch(() => {});
+      }
     }
 
     // Tope diario = presupuesto dinámico (restante/días que faltan), acotado por
@@ -5835,8 +5893,16 @@ async function getApolloUsageToday(token) {
     const configuredDaily = parseInt(map.apollo_daily_limit || String(APOLLO_DAILY_BURST_MAX), 10);
     const limit = Math.min(configuredDaily, _apolloPacedDailyCap(monthRemaining));
 
-    return { usedToday, limit, today, usedThisMonth, monthLimit, period, monthRemaining };
-  } catch { return { usedToday: 0, limit: 50, today: new Date().toISOString().slice(0, 10), usedThisMonth: 0, monthLimit: APOLLO_MONTHLY_HARD_CAP, period: "" }; }
+    return { usedToday, limit, today, usedThisMonth, monthLimit, period, monthRemaining, sinDatos: false };
+  } catch (e) {
+    // ── NO PUDE LEER ≠ NO GASTÉ NADA (2026-09-13) ──────────────────────────────────────
+    // Devolvía "0 usados, tope 50": ante un error de red, todos los que consultan el cupo
+    // creían tener Apollo intacto y podían desbloquear. Es el error que este proyecto ya pagó
+    // varias veces: tratar "no sé" como "no". Ahora sin datos el cupo figura agotado —nadie
+    // gasta esta vuelta— y `sinDatos` le permite a quien lo necesite decir que no pudo leer.
+    log(`⚠️ getApolloUsageToday: ${e.message} — sin datos, Apollo queda frenado esta vuelta`);
+    return { usedToday: 1, limit: 0, today: new Date().toISOString().slice(0, 10), usedThisMonth: APOLLO_MONTHLY_HARD_CAP, monthLimit: APOLLO_MONTHLY_HARD_CAP, period: _apolloCyclePeriod(), monthRemaining: 0, sinDatos: true };
+  }
 }
 
 // ── Hard cap MENSUAL de RapidAPI ────────────────────────────────────
@@ -11477,7 +11543,7 @@ async function apolloQuemarCiclo(token) {
   const key = cfg.apollo_api_key;
   if (!key) { await saludPing(token, "apollo_quemar_ciclo", { status: "warn", cadenciaMin: 240, detalle: "sin apollo_api_key en la config" }).catch(() => {}); return; }
   const usage = await getApolloUsageToday(token).catch(() => null);
-  if (!usage) { await saludPing(token, "apollo_quemar_ciclo", { status: "fail", cadenciaMin: 240, detalle: "no pude leer el uso de Apollo" }).catch(() => {}); return; }
+  if (!usage || usage.sinDatos) { await saludPing(token, "apollo_quemar_ciclo", { status: "fail", cadenciaMin: 240, detalle: "no pude leer el uso de Apollo" }).catch(() => {}); return; }
   const cap = usage.monthLimit || APOLLO_MONTHLY_HARD_CAP;
   const used = usage.usedThisMonth || 0;
   const ritmo = _cycleElapsedRatio(_apolloCyclePeriod());
@@ -11497,12 +11563,21 @@ async function apolloQuemarCiclo(token) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let rows = [];
   try {
-    // 600 y no 120 (2026-09-11): el 10/09 el job estaba ATRASADO (0/2500 con el 96% del ciclo) y
-    // decía "candidatos 0". Los 120 de más tráfico ya tenían persona o ya pasaron por Apollo, y
-    // el filtro de "sin persona" es local, así que con 120 filas nunca llegaba a los que faltan.
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&or=(email_ultimo_motivo.is.null,email_ultimo_motivo.neq.apollo_sin_contacto)&select=id,domain,traffic,emails,email_sources,contact_name&order=traffic.desc.nullslast&limit=600`, { headers: auth, signal: AbortSignal.timeout(20000) });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    rows = await r.json();
+    // ── LOS QUE NO TIENEN NINGÚN EMAIL SE PIDEN A LA BASE, NO SE BUSCAN EN MEMORIA (2026-09-13) ──
+    // Traía los N de más tráfico y filtraba "sin persona" en memoria. Los de más tráfico casi
+    // siempre ya tienen email, así que subir N no alcanzaba: el 11/09, con 600 filas, salió UN
+    // candidato estando atrasado. Ahora se piden directo los que no tienen email (hay ~440) y,
+    // aparte, los de más tráfico para cubrir los que sólo tienen genéricos.
+    const _base = `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&or=(email_ultimo_motivo.is.null,email_ultimo_motivo.neq.apollo_sin_contacto)&select=id,domain,traffic,emails,email_sources,contact_name&order=traffic.desc.nullslast`;
+    const [rSin, rTop] = await Promise.all([
+      fetch(`${_base}&emails=eq.%5B%5D&limit=300`, { headers: auth, signal: AbortSignal.timeout(20000) }),
+      fetch(`${_base}&limit=300`, { headers: auth, signal: AbortSignal.timeout(20000) }),
+    ]);
+    if (!rSin.ok || !rTop.ok) throw new Error(`HTTP ${rSin.status}/${rTop.status}`);
+    const _ids = new Set();
+    rows = [...(await rSin.json()), ...(await rTop.json())]
+      .filter(l => l && l.id != null && !_ids.has(l.id) && _ids.add(l.id))
+      .sort((a, b) => Number(b.traffic || 0) - Number(a.traffic || 0));
   } catch (e) {
     await saludPing(token, "apollo_quemar_ciclo", { status: "fail", cadenciaMin: 240, detalle: `no pude leer el pool: ${e.message}` }).catch(() => {});
     return;
@@ -11520,9 +11595,11 @@ async function apolloQuemarCiclo(token) {
   try {
     const desde = new Date(Date.now() - 7 * 86_400_000).toISOString();
     const doms = sinPersona.map(l => String(l.domain).toLowerCase().replace(/^www\./, ""));
-    if (doms.length) {
-      const rc = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_apollo_cache?domain=in.(${doms.map(encodeURIComponent).join(",")})&fetched_at=gte.${desde}&select=domain`, { headers: auth });
-      if (rc.ok) recientes = new Set((await rc.json()).map(x => String(x.domain).toLowerCase()));
+    // De a 150: con cientos de candidatos la URL del `in.(...)` pasaba el largo que acepta el
+    // servidor, la consulta fallaba y `recientes` quedaba vacío sin decir nada.
+    for (let i = 0; i < doms.length; i += 150) {
+      const rc = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_apollo_cache?domain=in.(${doms.slice(i, i + 150).map(encodeURIComponent).join(",")})&fetched_at=gte.${desde}&select=domain`, { headers: auth, signal: AbortSignal.timeout(10000) });
+      if (rc.ok) (await rc.json()).forEach(x => recientes.add(String(x.domain).toLowerCase()));
     }
   } catch {}
   const candidatos = sinPersona.filter(l => !recientes.has(String(l.domain).toLowerCase().replace(/^www\./, ""))).slice(0, presupuesto);
@@ -11556,7 +11633,10 @@ async function apolloQuemarCiclo(token) {
   // candidatos, no el presupuesto.
   const status = (candidatos.length === 0) ? "warn" : "ok";
   const detalle = `${atrasado ? "ATRASADO" : "fin de ciclo"} · ${estado} · candidatos ${sinPersona.length} (${recientes.size} recientes) · intentos ${intentos} → ${conEmail} con email, ${sinContacto} sin contacto · presupuesto ${presupuesto}`;
-  await saludPing(token, "apollo_quemar_ciclo", { status, cadenciaMin: 240, real: conEmail, esperado: intentos, detalle }).catch(() => {});
+  // real/esperado = "¿gastó lo que podía gastar?", que es el propósito del job (2026-09-13).
+  // Medía con-email sobre intentos: con UN intento sin contacto salía "rindiendo por debajo",
+  // y que Apollo no tenga a alguien no es una falla del job.
+  await saludPing(token, "apollo_quemar_ciclo", { status, cadenciaMin: 240, real: intentos, esperado: Math.min(presupuesto, candidatos.length), detalle }).catch(() => {});
   log(`💎 apollo quemar ciclo: ${detalle} · ${Math.round((Date.now() - t0) / 1000)} s`);
 }
 
@@ -13463,7 +13543,7 @@ async function _bloqueadosDelCrm(token) {
   } catch (e) { motivo = `no se pudo leer: ${e.message}`; }
 
   log(`  🔴 lista de no-recontactar: ${motivo}`);
-  await saludPing(token, "lista_no_recontactar", { status: "fail", cadenciaMin: 60, detalle: motivo }).catch(() => {});
+  await saludPing(token, "lista_no_recontactar", { status: "fail", cadenciaMin: 24 * 60, detalle: motivo }).catch(() => {});
   if (!_bloqCrmCache.set) {   // sólo cuando no hay NINGUNA lista: eso sí es "no sé a quién no escribirle"
     await saludAlerta(token, {
       clave: `sin_lista_bloqueados_${new Date().toISOString().slice(0, 10)}`,
@@ -13949,6 +14029,12 @@ function _comentarioSinEmail(d) {
   // Ahora, si no sabemos cuántas páginas se leyeron, se dice que no se sabe.
   if (!d.ok && d.ok !== 0 && !d.paginas) {
     return "No quedó registro de cuántas páginas se leyeron, así que no se puede afirmar por qué falta el email. Si se repite en este dominio, mirarlo a mano.";
+  }
+  // `email_en_imagen` salía con el comentario genérico de "ninguna página publica un correo,
+  // suele ser un sitio que sólo tiene formulario" (gastrolabweb.com, 12/09). Es otra cosa y se
+  // resuelve distinto: el email existe, está dibujado.
+  if (d.emailEnImagen && !d.crudos) {
+    return `La página de contacto muestra el email como IMAGEN, no como texto: el crawl no lo puede leer (${d.paginas ?? d.ok ?? 0} página(s) leídas). El email existe; hay que copiarlo a mano desde la web. Insistir con el crawl no lo va a cambiar.`;
   }
   if (!d.crudos) {
     const _leidas = d.paginas ?? d.ok ?? 0;
@@ -21638,24 +21724,26 @@ async function runAgentCycle(token, allFlags) {
   // `null` = no se pudo cargar. En ese caso NO se filtra nada en memoria y decide el guard
   // por dominio, que falla cerrado. Nunca se manda de más por no haber podido leer.
   if (_contactados30d) log(`  📋 ${_contactados30d.size} dominio(s) contactados en 30 días — se filtran antes del ciclo`);
-  // ── LOS SALTEADOS POR MV DUDOSO NO SE VUELVEN A RECORRER CADA DÍA (2026-09-11) ─────────
+  // ── UN LEAD SIN DIRECCIÓN ENVIABLE NO SE VUELVE A RECORRER CADA DÍA (2026-09-11 / 13) ──
   // El parte del 10/09: 269 envíos salteados por `mv_dudoso` contra 40 enviados. Eran los
   // mismos leads todos los días: el ciclo los elegía, MillionVerifier volvía a decir "no
-  // pude confirmar" y se salteaban otra vez. El veredicto vale un mes, así que en 7 días no
-  // va a cambiar; lo que puede cambiar es que el re-enrich les encuentre otra dirección, y
-  // por eso la exclusión es de una semana y no permanente.
-  let _saltadosMv7d = new Set();
+  // pude confirmar" y se salteaban otra vez. El 12/09 apareció el mismo patrón con
+  // `all_candidates_undeliverable` (mvsnoticias.com, dos días seguidos): la regla es una sola
+  // —si ninguna dirección del lead se puede mandar, no se lo vuelve a elegir por una semana—
+  // y ahora cubre los dos motivos. Una semana y no permanente: el re-enrich puede traerle
+  // otra dirección.
+  let _saltadosSinDireccion7d = new Set();
   try {
     const _corte7 = new Date(Date.now() - 7 * 86400_000).toISOString();
     const _r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=eq.mv_dudoso&created_at=gte.${_corte7}&select=domain&limit=5000`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=in.(mv_dudoso,all_candidates_undeliverable)&created_at=gte.${_corte7}&select=domain&limit=5000`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) });
     if (_r.ok) {
       const _f = await _r.json();
-      if (Array.isArray(_f)) _saltadosMv7d = new Set(_f.map(x => String(x.domain || "").toLowerCase()).filter(Boolean));
+      if (Array.isArray(_f)) _saltadosSinDireccion7d = new Set(_f.map(x => String(x.domain || "").toLowerCase()).filter(Boolean));
     }
   } catch {}
-  if (_saltadosMv7d.size) log(`  📋 ${_saltadosMv7d.size} dominio(s) salteados por MV dudoso en 7 días — se filtran antes del ciclo`);
+  if (_saltadosSinDireccion7d.size) log(`  📋 ${_saltadosSinDireccion7d.size} dominio(s) sin dirección enviable en 7 días (MV dudoso o todos no entregables) — se filtran antes del ciclo`);
 
   const _DIAS_STOCK_OBJETIVO = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
   let _recorteStock = null;
@@ -21673,7 +21761,7 @@ async function runAgentCycle(token, allFlags) {
     // había forma de saber si la lectura fallaba o si el regulador estaba apagado (2026-09-11).
     if (_contactables == null) {
       log(`  ⚠️ stock de envíos: no pude contar los contactables (${_motivoStock}) — no recorto nada`);
-      await saludPing(token, "stock_envios", { status: "fail", cadenciaMin: 60, detalle: `no pude contar el stock: ${_motivoStock}` }).catch(() => {});
+      await saludPing(token, "stock_envios", { status: "fail", cadenciaMin: 240, detalle: `no pude contar el stock: ${_motivoStock}` }).catch(() => {});
     }
     if (_contactables != null) {
       const _objetivoPleno = Math.max(1, allFlags.agentUsers.length) * (_agentCfg(cfg).maxPerDay || 20);
@@ -21696,7 +21784,11 @@ async function runAgentCycle(token, allFlags) {
         }).catch(() => {});
       }
       await saludPing(token, "stock_envios", {
-        status: _nuevoTope != null ? "warn" : "ok", cadenciaMin: 60,
+        // 240 y no 60 (2026-09-13): esto corre dentro del ciclo del agente, que sólo dispara en
+        // los slots de 13 a 17. Declarando 60, el vigilante lo daba "sin correr" cada noche y
+        // cada mañana antes de las 13 — 14 días seguidos en el resumen. Misma cadencia que
+        // agente_envios; tests/vigilante.test.js verifica que alcance para cubrir la noche.
+        status: _nuevoTope != null ? "warn" : "ok", cadenciaMin: 240,
         detalle: `${_contactables} contactables · ${_dias.toFixed(1)} días · tope ${_nuevoTope ?? _agentCfg(cfg).maxPerDay}/MB`,
         real: Math.round(_dias), esperado: _DIAS_STOCK_OBJETIVO,
       }).catch(() => {});
@@ -22206,11 +22298,11 @@ async function runAgentCycle(token, allFlags) {
       const _sacados = _antes - fresh.length;
       if (_sacados) log(`  🧹 ${_sacados} candidato(s) ya contactados en 30 días, fuera del ciclo antes de empezar`);
     }
-    if (_saltadosMv7d.size) {
+    if (_saltadosSinDireccion7d.size) {
       const _antes = fresh.length;
-      fresh = fresh.filter(l => !_saltadosMv7d.has(String(l.domain || "").toLowerCase()));
+      fresh = fresh.filter(l => !_saltadosSinDireccion7d.has(String(l.domain || "").toLowerCase()));
       const _sacados = _antes - fresh.length;
-      if (_sacados) log(`  🧹 ${_sacados} candidato(s) salteados por MV dudoso esta semana, fuera del ciclo (vuelven en 7 días o con otra dirección)`);
+      if (_sacados) log(`  🧹 ${_sacados} candidato(s) sin dirección enviable esta semana, fuera del ciclo (vuelven en 7 días)`);
     }
     const _conEmail = fresh.filter(_tieneEmail).length;
     log(`🤖 Agent ${userEmail}: pool de ${fresh.length} candidatos, ${_conEmail} ya con email (se prueban primero)`);
@@ -24116,8 +24208,13 @@ async function saludPing(token, job, { status = "ok", detalle = "", cadenciaMin 
     // exitosa (847 similares). Un job que nadie pidió no está atrasado, está esperando.
     if (cadenciaMin === 0) fila.esperado_cada_min = null;
     else if (cadenciaMin != null) fila.esperado_cada_min = cadenciaMin;
-    if (real     != null)    fila.real_ultimo     = real;
-    if (esperado != null)    fila.esperado_ultimo = esperado;
+    // ── LOS NÚMEROS DESCRIBEN LA ÚLTIMA CORRIDA, NO LA ÚLTIMA QUE LOS TRAJO (2026-09-13) ──
+    // Sólo se escribían si venían en el ping. Un latido sin números ("tope diario, sigue
+    // mañana") dejaba guardados los de otra corrida, y el vigilante seguía diciendo "rindiendo
+    // por debajo" con datos viejos: barrido_no_publisher, 14 días. 20 de los 50 jobs mandan
+    // números sólo en algunos latidos. Ahora un latido sin números los borra.
+    fila.real_ultimo     = real     != null ? real     : null;
+    fila.esperado_ultimo = esperado != null ? esperado : null;
 
     // ⚠️ "warn" NO ESCRIBÍA `last_ok_at` (Maxi 2026-08-25). Los vigilantes que usan ese
     // estado —el del embudo, el del agente frenado— quedaban con la fecha del último ok
@@ -24858,8 +24955,15 @@ async function vigilarAprovechamientoDeApollo(token) {
     const cfg = await getConfig(token).catch(() => null);
     if (!cfg || !cfg.apollo_api_key) return;
 
-    const usadas = parseInt(cfg.apollo_calls_month || "0", 10) || 0;
-    const inicio = Date.parse(`${cfg.apollo_calls_month_period || ""}T00:00:00Z`);
+    // ── UN SOLO LECTOR PARA UN SOLO CONTADOR (2026-09-13) ─────────────────────────────────
+    // Leía `apollo_calls_month` y su período directo de la config, con su propia cuenta de
+    // días. `apolloQuemarCiclo` lee lo mismo con `getApolloUsageToday`, que compara el período
+    // contra el ciclo 12→12. El 11/09 uno dijo "0 de 2.500" y el otro "va a usar 717": el mismo
+    // contador leído con dos reglas en el mismo mail. Ahora los dos usan la misma función.
+    const _uso = await getApolloUsageToday(token);
+    if (_uso.sinDatos) return;
+    const usadas = _uso.usedThisMonth || 0;
+    const inicio = Date.parse(`${_uso.period}T00:00:00Z`);
     if (!inicio) return;
     const diasCorridos = Math.max(1, Math.floor((Date.now() - inicio) / 86400000));
     if (diasCorridos < 5) return;                       // muy temprano para juzgar el ritmo
@@ -24868,8 +24972,10 @@ async function vigilarAprovechamientoDeApollo(token) {
     const pct = proyectado / APOLLO_MONTHLY_HARD_CAP;
     await saludPing(token, "aprovechamiento_apollo", {
       status: "ok", cadenciaMin: 24 * 60,
+      // Sin real/esperado (2026-09-13): el "💸 Apollo va a usar N" de abajo ya lo dice. Con
+      // números, el vigilante lo repetía como "aprovechamiento_apollo rindiendo por debajo" y
+      // el mismo hecho salía dos veces en el resumen.
       detalle: `${usadas} usadas en ${diasCorridos}d → proyección ${proyectado} de ${APOLLO_MONTHLY_HARD_CAP}`,
-      real: proyectado, esperado: APOLLO_MONTHLY_HARD_CAP,
     });
 
     // Por debajo de la mitad del plan hay plata tirada, y es accionable: significa que
@@ -25162,9 +25268,16 @@ async function _boletinPorSeccion(token) {
       const _techo = Number(_mSync.techo || 0);
       // Y si el carril estaba lleno (`libre`), lo posible era ese cupo, no el techo (2026-09-11).
       const _posible = Math.min(_resta, _techo || Infinity, _mSync.libre != null ? Number(_mSync.libre) : Infinity);
-      const _cumplio = _resta === 0 || (_techo && (_mSync.encolados || 0) >= _techo * 0.9) || (_resta > 0 && (_mSync.encolados || 0) >= _posible * 0.9);
+      // Los descartados por no tener ads.txt se PROCESARON: la puerta hizo su trabajo. Contarlos
+      // como "no entraron" pintó 🟡 el 12/09 con 602 + 93 = 695 de 695 lugares (2026-09-13).
+      const _sinAdsHoy = Number(_mSync.sin_ads || 0);
+      const _procesados = (_mSync.encolados || 0) + _sinAdsHoy;
+      const _cumplio = _resta === 0 || (_techo && _procesados >= _techo * 0.9) || (_resta > 0 && _procesados >= _posible * 0.9);
       _nota("CICLOS FINALIZADOS → PROSPECTS (CRM)", _edad >= 2 ? "🔴" : _cumplio ? "✅" : "🟡", [
-        `Barrido del ${_mSync.fecha}${_edad >= 2 ? ` — ⚠️ hace ${_edad} días que no corre` : _edad === 1 ? " (ayer)" : ""}: ${_mSync.encolados} entraron (techo ${_techo || "?"}/día${_mSync.libre != null && Number(_mSync.libre) < (_techo || Infinity) ? `, carril con ${_mSync.libre} libres: el feeder ya lo alimenta por slot` : ""}), ${_resta} elegibles siguen esperando su turno.`,
+        // El cupo del carril se nombra sólo si LIMITÓ (menos del 90% del techo). El 12/09 decía
+        // "carril con 695 libres: el feeder ya lo alimenta por slot" con 695 de 700: una
+        // explicación de un límite que no existió.
+        `Barrido del ${_mSync.fecha}${_edad >= 2 ? ` — ⚠️ hace ${_edad} días que no corre` : _edad === 1 ? " (ayer)" : ""}: ${_mSync.encolados} entraron (techo ${_techo || "?"}/día${_sinAdsHoy ? `; ${_sinAdsHoy} descartados por no tener ads.txt` : ""}${_mSync.libre != null && _techo && Number(_mSync.libre) < _techo * 0.9 ? `; el carril sólo tenía ${_mSync.libre} lugares porque el feeder también lo usa` : ""}), ${_resta} elegibles siguen esperando su turno.`,
         ...(_resta > 0 ? [`A este ritmo, ~${Math.ceil(_resta / Math.max(1, _mSync.encolados || 1))} día(s) para vaciar la espera. Es el techo diario, no una falla.`] : []),
       ]);
     }
@@ -25659,6 +25772,86 @@ const _CURAS_CONOCIDAS = {
   },
 };
 
+// ════════════════════════════════════════════════════════════════════════════════════════
+// LA REGLA DEL VIGILANTE, EN UNA FUNCIÓN PURA (2026-09-13)
+// ════════════════════════════════════════════════════════════════════════════════════════
+// Vivía adentro de saludWatchdog leyendo el reloj en cinco lugares, así que no se podía probar
+// sin esperar a que pasara la hora: cada mail traía un falso distinto y cada arreglo se
+// verificaba recién al día siguiente. Ahora recibe la hora como parámetro y
+// tests/vigilante.test.js fija los escenarios que ya dieron falsos.
+//
+// Las reglas, y de qué error viene cada una:
+//  · Minutos ACTIVOS, no de reloj (12/08): el worker duerme fuera de la ventana y el fin de
+//    semana. El atraso = días hábiles intermedios × ventana + lo que va abierto hoy, acotado
+//    por el reloj de pared. Los días intermedios cuentan enteros (25/08: con el techo en "lo
+//    que va de hoy", ningún job diario podía salir atrasado nunca).
+//  · El fin de semana no suma minutos de hoy (13/09).
+//  · Multiplicador 3× para jobs frecuentes, 1,5× para diarios (25/08).
+//  · "Nunca corrió" sólo si la ventana lleva más de 2 h abierta, y NUNCA para un job que sólo
+//    late cuando falla: ese se juzga por sus fallos seguidos (13/09).
+//  · Apagado a propósito (`off`) no está roto.
+//  · "Rinde poco" = el ÚLTIMO latido trajo real < la mitad de lo esperado. Un latido sin
+//    números no rinde poco: saludPing ahora los borra (13/09).
+
+function _partesMadrid(ts) {
+  const p = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit",
+    weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date(ts)).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+  return { fecha: `${p.year}-${p.month}-${p.day}`, dia: p.weekday, hora: (parseInt(p.hour, 10) || 0) % 24, minuto: parseInt(p.minute, 10) || 0 };
+}
+
+/** Días hábiles ESTRICTAMENTE entre dos fechas de Madrid ("YYYY-MM-DD"). */
+function _diasHabilesEntre(desde, hasta) {
+  let n = 0;
+  const d = new Date(`${desde}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  while (d.toISOString().slice(0, 10) < hasta && n < 60) {
+    const wd = d.getUTCDay();
+    if (wd !== 0 && wd !== 6) n++;
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return n;
+}
+
+/**
+ * Filas de toolbar_health → { atrasados, fallando, rindenPoco }, cada uno [{ job, texto }].
+ * Pura: no lee el reloj ni la base.
+ */
+function _clasificarLatidos(filas, { ahora = Date.now(), horaIni = 9, horaFin = 23 } = {}) {
+  const hoy = _partesMadrid(ahora);
+  const finDeSemana = hoy.dia === "Sat" || hoy.dia === "Sun";
+  const ventanaDiaria = Math.max(60, (horaFin - horaIni) * 60);
+  const abiertosHoy = finDeSemana ? 0 : Math.max(0, Math.min(ventanaDiaria, (hoy.hora - horaIni) * 60 + hoy.minuto));
+  const atrasoActivo = (okTs) => {
+    const pared = Math.round((ahora - okTs) / 60000);
+    const activos = _diasHabilesEntre(_partesMadrid(okTs).fecha, hoy.fecha) * ventanaDiaria + abiertosHoy;
+    return Math.min(pared, Math.max(activos, 1));
+  };
+  const atrasados = [], fallando = [], rindenPoco = [];
+  for (const f of Array.isArray(filas) ? filas : []) {
+    if (!f || !f.job || f.last_status === "off") continue;
+    const cad = Number(f.esperado_cada_min) || 0;
+    const okTs = Date.parse(f.last_ok_at || "") || 0;
+    const mult = cad >= 720 ? 1.5 : 3;
+    if (cad && okTs) {
+      const activos = atrasoActivo(okTs);
+      // Los DOS números: el de reloj es el que duele y el activo es el que dispara (25/08).
+      if (activos > cad * mult) atrasados.push({ job: f.job, texto: `${f.job} (hace ${Math.round((ahora - okTs) / 3_600_000)}h reales / ${activos} min activos, esperado cada ${cad})` });
+    }
+    if (cad && !okTs && f.last_status !== "fail" && abiertosHoy > 120) {
+      atrasados.push({ job: f.job, texto: `${f.job} (nunca corrió)` });
+    }
+    if ((Number(f.fails_consecutivos) || 0) >= 3) {
+      fallando.push({ job: f.job, texto: `${f.job} (${f.fails_consecutivos} fallos seguidos: ${f.last_detail || "sin detalle"})` });
+    }
+    if (f.esperado_ultimo != null && f.real_ultimo != null && Number(f.real_ultimo) < Number(f.esperado_ultimo) * 0.5) {
+      rindenPoco.push({ job: f.job, texto: `${f.job} (${f.real_ultimo} de ${f.esperado_ultimo} esperados)` });
+    }
+  }
+  return { atrasados, fallando, rindenPoco };
+}
+
 // Cada cuánto corre el vigilante (minutos de reloj, NO iteraciones del loop:
 // iterCount se resetea en cada restart y por eso los jobs con `% 60` no corrían).
 const SALUD_WATCHDOG_CADA_MIN = 15;
@@ -25701,105 +25894,50 @@ async function saludWatchdog(token) {
     // Ahora se acumulan los minutos activos de los días hábiles transcurridos, que es lo
     // que la corrección original quería decir: no contar la noche ni el fin de semana,
     // pero sí contar los días.
-    const _horaIni = parseInt(cfg.active_hours_start ?? cfg.agent_active_hours_start ?? "9", 10) || 9;   // la clave guardada lleva prefijo agent_
-    const _horaFin = parseInt(cfg.active_hours_end ?? cfg.agent_active_hours_end ?? "23", 10) || 23;
-    const _minsVentanaDiaria = Math.max(60, (_horaFin - _horaIni) * 60);
-    const _minsVentanaAbierta = Math.max(0, (_spainHour() - _horaIni) * 60);
-    const _diasHabilesDesde = (okTs) => {
-      let n = 0;
-      const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
-      const d = new Date(okTs); d.setHours(0, 0, 0, 0);
-      d.setDate(d.getDate() + 1);
-      while (d < hoy && n < 60) {
-        const wd = d.getDay();
-        if (wd !== 0 && wd !== 6) n++;
-        d.setDate(d.getDate() + 1);
-      }
-      return n;
-    };
-    const _atrasoReal = (okTs) => {
-      const pared = Math.round((Date.now() - okTs) / 60000);
-      const activos = _diasHabilesDesde(okTs) * _minsVentanaDiaria + _minsVentanaAbierta;
-      return Math.min(pared, Math.max(activos, 1));
-    };
-
-    const atrasados = [], rindenPoco = [], fallando = [];
-    for (const f of filas) {
-      const cad = f.esperado_cada_min;
-      const okTs = Date.parse(f.last_ok_at || "") || 0;
-      // Un job APAGADO a propósito no está roto. `last_status='off'` lo pone el propio
-      // job cuando su flag está en false: sin esto, similar_expansion (que arranca
-      // apagado por default) figuraba "atrasado" para siempre.
-      if (f.last_status === "off") continue;
-      // El multiplicador se afloja para los jobs frecuentes y se aprieta para los diarios.
-      // Con 3× fijo, un job de cadencia diaria necesitaba ~5 días hábiles caído para
-      // aparecer; a esa altura ya perdimos una semana. Maxi 2026-08-25.
-      const _mult = cad >= 720 ? 1.5 : 3;
-      if (cad && okTs && _atrasoReal(okTs) > cad * _mult) {
-        // Los DOS números: el de reloj es el que duele (4 días caído se leía como "840 min"
-        // y parecía un retraso menor) y el activo es el que dispara. Maxi 2026-08-25.
-        const _pared = Math.round((Date.now() - okTs) / 60000);
-        atrasados.push(`${f.job} (hace ${Math.round(_pared / 60)}h reales / ${_atrasoReal(okTs)} min activos, esperado cada ${cad})`);
-      }
-      // "Nunca corrió" solo se reporta si la ventana ya lleva un rato abierta: al
-      // arrancar el worker, TODOS los jobs están sin correr por definición.
-      if (cad && !okTs && _minsVentanaAbierta > 120) {
-        atrasados.push(`${f.job} (nunca corrió)`);
-      }
-      if ((f.fails_consecutivos || 0) >= 3) fallando.push(`${f.job} (${f.fails_consecutivos} fallos seguidos: ${f.last_detail || "sin detalle"})`);
-      if (f.esperado_ultimo != null && f.real_ultimo != null && Number(f.real_ultimo) < Number(f.esperado_ultimo) * 0.5) {
-        rindenPoco.push(`${f.job} (${f.real_ultimo} de ${f.esperado_ultimo} esperados)`);
-      }
-    }
+    // La regla vive en `_clasificarLatidos` (función pura, con la hora como parámetro) para que
+    // tests/vigilante.test.js pueda fijar los escenarios que ya dieron falsos.
+    const { atrasados, rindenPoco, fallando } = _clasificarLatidos(filas, {
+      ahora: Date.now(),
+      horaIni: parseInt(cfg.active_hours_start ?? cfg.agent_active_hours_start ?? "9", 10) || 9,   // la clave guardada lleva prefijo agent_
+      horaFin: parseInt(cfg.active_hours_end ?? cfg.agent_active_hours_end ?? "23", 10) || 23,
+    });
 
     // ── AUTOCURACIÓN: arreglar antes de molestar (Maxi 2026-08-12) ─────────
     // Pedido del user: "la idea es que vos puedas autogestionarte con los errores
     // que enviás y autocorregirlos". Lo que tiene arreglo conocido se arregla solo y
     // se cuenta en el resumen; solo se reporta como problema lo que NO se pudo curar.
     const curados = [];
-    if (atrasados.length) {
-      for (const _txt of [...atrasados]) {
-        const job = _txt.split(" ")[0];
-        const _arreglo = _CURAS_CONOCIDAS[job];
-        if (!_arreglo) continue;
-        try {
-          const hecho = await _arreglo(token, cfg);
-          if (hecho) {
-            curados.push(`${job}: ${hecho}`);
-            atrasados.splice(atrasados.indexOf(_txt), 1);
-          }
-        } catch (e) { log(`⚠️ autocuración ${job}: ${e.message}`); }
-      }
-      if (curados.length) {
-        log(`🔧 autocuración: ${curados.join(" · ")}`);
-        for (const c of curados) await _acumularCuracion(token, c).catch(() => {});
-      }
+    for (const a of [...atrasados]) {
+      const _arreglo = _CURAS_CONOCIDAS[a.job];
+      if (!_arreglo) continue;
+      try {
+        const hecho = await _arreglo(token, cfg);
+        if (hecho) {
+          curados.push(`${a.job}: ${hecho}`);
+          atrasados.splice(atrasados.indexOf(a), 1);
+        }
+      } catch (e) { log(`⚠️ autocuración ${a.job}: ${e.message}`); }
     }
-    if (atrasados.length) {
-      await saludAlerta(token, {
-        clave: "jobs-atrasados", severidad: "error",
-        // Con nombres: "1 trabajo(s) sin correr — desde hace 6 días" no dice cuál, y en la
-        // lista de crónicos sólo se ve el título.
-        titulo: `⏰ ${atrasados.length} trabajo(s) sin correr: ${atrasados.slice(0, 3).map(t => String(t).split(/[\s(:—]/)[0]).join(", ")}${atrasados.length > 3 ? "…" : ""}`,
-        cuerpo: atrasados.join("\n"), metadata: { jobs: atrasados },
-      });
+    if (curados.length) {
+      log(`🔧 autocuración: ${curados.join(" · ")}`);
+      for (const c of curados) await _acumularCuracion(token, c).catch(() => {});
     }
-    if (fallando.length) {
-      await saludAlerta(token, {
-        clave: "jobs-fallando", severidad: "error",
-        titulo: `💥 ${fallando.length} trabajo(s) fallando: ${fallando.slice(0, 3).map(t => String(t).split(/[\s(:—]/)[0]).join(", ")}${fallando.length > 3 ? "…" : ""}`,
-        cuerpo: fallando.join("\n"), metadata: { jobs: fallando },
-      });
+    // ── UNA ALERTA POR JOB, NO UNA POR GRUPO (2026-09-13) ───────────────────────────────
+    // Eran tres alertas con clave fija ("jobs-rinden-poco") y la lista de jobs en el título. El
+    // resumen decide qué es "nuevo" y qué "sigue igual" por la CLAVE, así que cuando entraba un
+    // job nuevo al grupo se mostraba como "sin cambios desde hace 14 días": el 12/09
+    // apollo_quemar_ciclo apareció así el primer día que falló. Con una clave por job, cada uno
+    // tiene su propia fecha, y un job nuevo sale arriba como nuevo.
+    // Severidad "error" en las tres (lección del 25/08: AutoGoogle 4 días sin encolar y sólo
+    // sonaba la campanita).
+    for (const a of atrasados) {
+      await saludAlerta(token, { clave: `jobs-atrasados-${a.job}`, severidad: "error", titulo: `⏰ ${a.job} sin correr`, cuerpo: a.texto, metadata: { job: a.job } });
     }
-    if (rindenPoco.length) {
-      await saludAlerta(token, {
-        // ERA "warning" = solo campanita. AutoGoogle estuvo 4 días hábiles sin encolar
-        // nada, con la señal correcta escrita en toolbar_health, y nadie se enteró
-        // porque el aviso no salía del panel. Un motor que deja de producir es grave.
-        clave: "jobs-rinden-poco", severidad: "error",
-        titulo: `📉 ${rindenPoco.length} trabajo(s) rindiendo por debajo: ${rindenPoco.slice(0, 3).map(t => String(t).split(/[\s(:—]/)[0]).join(", ")}${rindenPoco.length > 3 ? "…" : ""}`,
-        cuerpo: rindenPoco.join("\n"), metadata: { jobs: rindenPoco },
-      });
+    for (const a of fallando) {
+      await saludAlerta(token, { clave: `jobs-fallando-${a.job}`, severidad: "error", titulo: `💥 ${a.job} fallando`, cuerpo: a.texto, metadata: { job: a.job } });
+    }
+    for (const a of rindenPoco) {
+      await saludAlerta(token, { clave: `jobs-rinden-poco-${a.job}`, severidad: "error", titulo: `📉 ${a.job} rindiendo por debajo`, cuerpo: a.texto, metadata: { job: a.job } });
     }
 
     // ── 2. El KPI del negocio: ¿salieron los 20 por MB? ────────────────────
