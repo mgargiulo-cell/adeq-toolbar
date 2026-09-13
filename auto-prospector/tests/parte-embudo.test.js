@@ -66,7 +66,8 @@ function enrutador(registro) {
     // SANO a un email encontrado hace más de 7 días (no está en ALTAS): tiene que sumar al
     // denominador de su vía. Sin él, la primera versión daba 100% con 1 rebote de 40 envíos.
     // `info@atv.pe` no trae la fuente en details: vale la del pool (scrape).
-    if (u.includes("action=eq.sent&created_at=gte.") && u.includes("select=email_to,details&order=id")) return resp([
+    // Con el 2º email (ACCION_ENVIO_PARA_REBOTE, 13/09): el rebote de un 2º email también tiene su envío en la ventana.
+    if ((u.includes("action=eq.sent&created_at=gte.") || u.includes("action=in.(sent,secondary_sent)&created_at=gte.")) && u.includes("select=email_to,details&order=id")) return resp([
       { email_to: "b@tienda2.pe", details: { source: "pattern" } },
       { email_to: "dir@larepublica.pe", details: { source: "pattern" } },
       { email_to: "c@viejo.pe", details: { source: "pattern" } },

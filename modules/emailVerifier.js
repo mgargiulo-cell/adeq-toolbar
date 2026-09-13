@@ -193,7 +193,10 @@ export function isGarbageEmail(email, siteDomain = "") {
 export const EVIDENCIA_BLOQUEA_EXTENSION = "evidencia=in.(rebote_smtp,verificador,sin_clasificar)";
 export async function traerRebotados(accessToken, { max = 50000, pagina = 1000, fetchImpl = fetch } = {}) {
   if (!accessToken) return null;
-  const url = `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA_EXTENSION}`;
+  // `order=email` (2026-09-13, revisión final): de a páginas con Range pero sin orden, Postgres no garantiza
+  // el mismo orden entre pedidos y el worker actualiza filas de esta tabla: una dirección podía quedar
+  // afuera y otra repetida, y el resultado se guarda 30 minutos. Mismo orden que loadBouncedEmails.
+  const url = `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA_EXTENSION}&order=email`;
   const out = [];
   for (let desde = 0; desde < max; desde += pagina) {
     let r;

@@ -10191,7 +10191,7 @@ async function parteDelDia(token, opts = {}) {
       `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${_ultimos7}&evidencia=in.(rebote_smtp,verificador)&select=email,evidencia&order=email`,
       auth, { max: 5000 })) || [];
     const _enviados7 = (await _traerTodo(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_ultimos7}&select=email_to,details&order=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${_ultimos7}&select=email_to,details&order=id`,
       auth, { max: 5000 })) || [];
     const _verificados7 = (await _traerTodo(
       `${SUPABASE_URL}/rest/v1/toolbar_mv_results?created_at=gte.${_ultimos7}&select=email&order=id`,

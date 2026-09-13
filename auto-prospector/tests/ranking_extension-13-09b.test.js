@@ -217,7 +217,7 @@ test("C26: la extensión trae la lista con el mismo filtro que el worker, de a p
   strictEqual(EVIDENCIA_BLOQUEA_EXTENSION, indexJs.match(/const EVIDENCIA_BLOQUEA = "([^"]+)"/)?.[1], "el mismo filtro de evidencia que EVIDENCIA_BLOQUEA");
   const pedidos = [];
   const fetchImpl = async (url, opts) => {
-    pedidos.push(opts);
+    pedidos.push({ ...opts, url: String(url) });
     return respuesta(desdeDe(opts) === 0
       ? Array.from({ length: 1000 }, (_, i) => ({ email: `X${i}@a.com`, evidencia: "verificador", fuente: { source: "rol_mx", url: "https://a.com" } }))
       : [{ email: "ultimo@b.com", evidencia: "rebote_smtp", fuente: "scrape" }]);
@@ -226,6 +226,7 @@ test("C26: la extensión trae la lista con el mismo filtro que el worker, de a p
   strictEqual(filas.length, 1001);
   deepStrictEqual(filas[0], { email: "x0@a.com", evidencia: "verificador", fuente: "rol_mx" }, "minúsculas y la fuente como texto");
   ok(pedidos.every(o => o.signal) && pedidos.every(o => o.headers.Authorization === "Bearer tok"), "cada página con reloj y con el token del MB");
+  ok(pedidos.every(o => /[?&]order=email\b/.test(o.url) && !/limit=/.test(o.url)), "de a páginas y por su clave: sin orden, dos páginas pueden repetir o saltear una dirección");
   strictEqual(await traerRebotados("tok", { fetchImpl: async () => respuesta({}, { status: 500 }) }), null);
   strictEqual(await traerRebotados("tok", { fetchImpl: async () => { throw new Error("red"); } }), null);
   strictEqual(await traerRebotados("", { fetchImpl }), null);
