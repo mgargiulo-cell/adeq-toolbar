@@ -14,6 +14,13 @@
 //       le escribió".
 //   M6  Con la base caída el lote seguía fila por fila (300 × 8 s).
 //   M8  Dos tests del 13/09 buscaban texto: un comentario los dejaba en verde. Acá se mira el árbol.
+//   B2  (tercera revisión) "Guardar" anotaba mail_enviado con una bandera de sesión que nunca vuelve a
+//       false: después del primer mail, todo lo guardado quedaba "enviado". Con eso lecturaDeEnvios
+//       desconfiaba de todo sendtrack y apagaba el lote, "Quitar" cerraba como contactados sitios a
+//       los que nunca se les escribió y el lote tomaba por nuestra una Propuesta Vigente ajena.
+//       Ahora el envío se anota por sitio y la fila lo escribe con su sitio (envioAnotado).
+//   M9  flushPendingMarks escribía la lista que había leído al empezar: una marca que el lote
+//       encolaba mientras tanto se perdía y la fila, ya en el CRM, volvía a verse en "Por enviar".
 //
 // Run: npm test
 /* eslint-disable no-new-func */
@@ -27,6 +34,7 @@ import * as walk from "acorn-walk";
 import {
   decidirLoteCrm, fotoCrmAlGuardar, lecturaDeEnvios, contactadoDeCola, estadoAlSacarDeCola, planSacarDeCola,
   textoConfirmarSacar, filaColaDesdeFormulario, adicionalesDeLaTarjeta, contactosDeAdicionales,
+  anotarEnvioDeSesion, envioDeSesion, envioAnotado,
 } from "../../modules/colaEstado.js";
 import { dominiosConEnvioReciente } from "../../modules/supabase.js";
 
@@ -155,13 +163,16 @@ test("M3: lecturaDeEnvios distingue 'no hay envíos' de 'no pude saber'", () => 
   strictEqual(falla.conocida, false);
   ok(/HTTP 403/.test(falla.motivo), falla.motivo);
 
-  const enviada = { id: 1, domain: "Diario.com.mx", monday_payload: { mail_enviado: true, fecha: "2026-09-10" } };
+  // (2026-09-13, B2) "Sabemos que salió" es un envío anotado con su sitio y aceptado por sendtrack al
+  // mandarlo; la bandera sola ya no alcanza (ver los tests B2 más abajo).
+  const enviada = { id: 1, domain: "Diario.com.mx", monday_payload: {
+    mail_enviado: true, mail_enviado_dominio: "diario.com.mx", mail_enviado_el: "2026-09-10", mail_enviado_en_sendtrack: true, fecha: "2026-09-10" } };
   const otra = { id: 2, domain: "otro.com", monday_payload: { status_previo: "pending" } };
   strictEqual(lecturaDeEnvios({ ok: true, dominios: new Set(["diario.com.mx"]) }, [enviada, otra], op).conocida, true);
   const vacia = lecturaDeEnvios({ ok: true, dominios: new Set() }, [enviada, otra], op);
   strictEqual(vacia.conocida, false, "si la base no muestra un envío que sabemos que salió, tampoco se le puede creer el resto");
   ok(/diario\.com\.mx/.test(vacia.motivo), vacia.motivo);
-  const vieja = { ...enviada, monday_payload: { mail_enviado: true, fecha: "2026-07-01" } };
+  const vieja = { ...enviada, monday_payload: { ...enviada.monday_payload, mail_enviado_el: "2026-07-01", fecha: "2026-07-01" } };
   strictEqual(lecturaDeEnvios({ ok: true, dominios: new Set() }, [vieja, otra], op).conocida, true, "un envío de hace más de 30 días no tiene por qué estar en la ventana");
 
   strictEqual(contactadoDeCola(enviada, falla), true, "lo anotado al guardar no depende de sendtrack");
@@ -175,7 +186,8 @@ test("M3: 'Quitar' sin lectura creíble no devuelve nada al pool, y saca lo que 
   strictEqual(estadoAlSacarDeCola({ status_previo: "pending", contactado_sendtrack: null }).grupo, "sin_confirmar");
   const filas = [
     { id: 1, domain: "a.com", source: "autogoogle", traffic: 900000, monday_payload: { status_previo: "pending" } },
-    { id: 2, domain: "b.com", source: "autogoogle", traffic: 900000, monday_payload: { status_previo: "pending", mail_enviado: true } },
+    // (2026-09-13, B2) El envío anotado con su sitio; la bandera sola queda sin confirmar (tests B2).
+    { id: 2, domain: "b.com", source: "autogoogle", traffic: 900000, monday_payload: { status_previo: "pending", mail_enviado: true, mail_enviado_dominio: "b.com" } },
     { id: 3, domain: "c.com", source: "csv", traffic: 900000, monday_payload: { status_previo: "rejected" } },
     { id: 4, domain: "d.com", source: "manual_cola", traffic: 900000, monday_payload: {} },
     { id: 5, domain: "e.com", source: "autogoogle", traffic: 120000, monday_payload: { status_previo: "pending" } },
@@ -252,8 +264,9 @@ test("M6: si la base no confirma que la fila siga en la cola, el lote se frena",
 // validateProspect vive en popup.js (arranca el DOM entero y no se puede importar). Se extrae con
 // acorn y se ejecuta con dobles de todo lo que toca: así se prueba el ORDEN real de las llamadas y
 // el cartel que ve el MB, no un texto.
-function armarTarjeta({ crmFalla = false, historialFalla = false, colaResponde = null } = {}) {
+function armarTarjeta({ crmFalla = false, historialFalla = false, colaResponde = null, sendtrackFalla = false } = {}) {
   const log = [], pedidos = [], fichas = [], toasts = [];
+  const envios = new Map();
   const valores = {
     ".pcard-pitch": "Hola, somos ADEQ", ".pcard-subject": "Propuesta", ".pcard-owner": "mb", ".pcard-status": "Propuesta Vigente",
     ".pcard-lang": "1", ".pcard-geo": "Mexico", ".pcard-date": "13/09/2026", ".pcard-traffic": "900K",
@@ -285,10 +298,11 @@ function armarTarjeta({ crmFalla = false, historialFalla = false, colaResponde =
     sendEmail: async ({ to }) => { log.push(`mail:${to}`); return { ok: true }; },
     markManualSendFailed: async () => {},
     incrementUserDailyCounter: async () => {},
-    saveSendDate: async () => { log.push("sendtrack"); return { ok: true }; },
+    saveSendDate: async () => { log.push("sendtrack"); return sendtrackFalla ? { ok: false, status: 500 } : { ok: true }; },
     markReviewQueueAsContacted: async () => ({ ok: true }),
     isEmailBounced: async () => ({ bounced: false }),
     adicionalesDeLaTarjeta, contactosDeAdicionales, filaColaDesdeFormulario, fotoCrmAlGuardar,
+    anotarEnvioDeSesion, _enviosDeLaSesion: envios,
     fetch: async (url, opts = {}) => {
       const tabla = url.split("/rest/v1/")[1].split("?")[0];
       pedidos.push({ url, opts, tabla, cuerpo: opts.body ? JSON.parse(opts.body) : null });
@@ -313,7 +327,7 @@ function armarTarjeta({ crmFalla = false, historialFalla = false, colaResponde =
   const fuente = `${texto(funcion("_tarjetaAPorEnviar"))}\n${texto(funcion("validateProspect"))}\nreturn validateProspect;`;
   const validateProspect = new Function(...nombres, fuente)(...nombres.map(n => deps[n]));
   const data = { id: 42, domain: "diario.com.mx", traffic: 900000, language: "es", emails: ["publicidad@diario.com.mx", "ventas@diario.com.mx"], email_sources: {}, contact_phone: "" };
-  return { correr: () => validateProspect(card, data, true), card, log, pedidos, fichas, toasts, resultado: () => card.querySelector(".pcard-result").textContent };
+  return { correr: () => validateProspect(card, data, true), card, log, pedidos, fichas, toasts, envios, resultado: () => card.querySelector(".pcard-result").textContent };
 }
 
 test("M1 y M2: con el CRM caído la tarjeta no programa adicionales y deja el sitio en 'Por enviar'", async () => {
@@ -416,4 +430,182 @@ test("M8: toda carga al CRM mira el veredicto en código, y todo envío de la ta
     const despues = llamadas(fn, "saveSendDate").some(c => c.nodo.start > nodo.start);
     ok(antes && despues, `sendEmail en L${nodo.loc.start.line}: tiene que registrar el envío (tracking antes, sendtrack después)`);
   }
+});
+
+// ═══ B2 — "mail enviado" es de un sitio, no de la sesión ═══════════════════════════════════
+// La repro de la tercera revisión: el MB le manda a A y en la misma sesión guarda B sin escribirle.
+// B quedó con mail_enviado=true (la bandera de sesión, que nunca vuelve a false) y sin sitio anotado.
+// C y D son filas normales. sendtrack contestó bien y vacío.
+const HOY = "2026-09-13";
+const AHORA = Date.parse("2026-09-13T12:00:00Z");
+const B_VIEJA = { id: 2, domain: "b.com", source: "autogoogle", traffic: 900000, monday_payload: { mail_enviado: true, fecha: HOY, status_previo: "pending" } };
+const C_NORMAL = { id: 3, domain: "c.com", source: "autogoogle", traffic: 900000, monday_payload: { mail_enviado: false, fecha: HOY, status_previo: "pending" } };
+const D_NORMAL = { id: 4, domain: "d.com", source: "import", traffic: 900000, monday_payload: { mail_enviado: false, fecha: HOY, status_previo: "pending" } };
+const leerVacio = (filas) => lecturaDeEnvios({ ok: true, dominios: new Set() }, filas, { ahoraMs: AHORA });
+
+test("B2: una fila con la bandera de sesión vieja no apaga el lote", () => {
+  const L = leerVacio([B_VIEJA, C_NORMAL, D_NORMAL]);
+  strictEqual(L.conocida, true, `una bandera sin sitio hacía desconfiar de todo sendtrack y saltear C y D: ${L.motivo}`);
+  deepStrictEqual([B_VIEJA, C_NORMAL, D_NORMAL].map(f => contactadoDeCola(f, L)), [false, false, false],
+    "sendtrack contestó bien y no tiene a ninguno: a ninguno se le escribió");
+  strictEqual(envioAnotado(B_VIEJA), false, "la bandera sin sitio no prueba un envío");
+});
+
+test("B2: 'Quitar' no cierra como contactada una fila cuyo único respaldo es la bandera", () => {
+  const filas = [B_VIEJA, C_NORMAL, D_NORMAL];
+  const L = leerVacio(filas);
+  const plan = planSacarDeCola(filas, { contactados: L.conocida ? L.dominios : null, minTraffic: 350000, loginEmail: "mb@x.com", ahoraIso: "2026-09-13T12:00:00Z" });
+  const destinos = Object.fromEntries(plan.lotes.flatMap(l => l.ids.map(id => [id, l.body.status])));
+  deepStrictEqual(destinos, { 2: "pending", 3: "pending", 4: "pending" }, "B pasaba a validated con sello de contactado y salía del pool para siempre");
+  deepStrictEqual(plan.sinConfirmar, []);
+  // Sin lectura de sendtrack tampoco se cierra: "no se sabe" deja la fila en la cola.
+  const sinLectura = planSacarDeCola([B_VIEJA], { contactados: null });
+  deepStrictEqual([sinLectura.lotes.length, sinLectura.sinConfirmar], [0, ["2"]]);
+  strictEqual(contactadoDeCola(B_VIEJA, { conocida: false, dominios: new Set() }), null, "sin sendtrack, la bandera vieja es 'no se sabe', no 'sí'");
+  // Si sendtrack sí la tiene (el mail salió de verdad), se cierra como contactada igual que siempre.
+  strictEqual(planSacarDeCola([B_VIEJA], { contactados: new Set(["b.com"]), loginEmail: "mb@x.com", ahoraIso: "x" }).lotes[0].body.status, "validated");
+});
+
+test("B2: el lote no toma por nuestra una Propuesta Vigente por la bandera vieja", () => {
+  const L = leerVacio([B_VIEJA]);
+  const pv = { found: true, status: "Propuesta Vigente", ejecutivo: "" };
+  strictEqual(decidir(pv, { contactado: contactadoDeCola(B_VIEJA, L), alGuardar: null }).enviar, false,
+    "con la bandera vieja, una propuesta sin ejecutivo pasaba como la ficha de nuestros adicionales");
+  const anotada = { domain: "b.com", monday_payload: { mail_enviado: true, mail_enviado_dominio: "b.com" } };
+  strictEqual(decidir(pv, { contactado: contactadoDeCola(anotada, L), alGuardar: null }).enviar, true, "B1 sigue igual para un envío anotado con su sitio");
+});
+
+test("B2: sólo un envío anotado con su sitio, y aceptado por sendtrack al mandarlo, hace desconfiar de la lectura", () => {
+  const mp = { mail_enviado: true, mail_enviado_dominio: "diario.com.mx", mail_enviado_el: "2026-09-12", mail_enviado_en_sendtrack: true };
+  const anotada = { id: 1, domain: "diario.com.mx", monday_payload: mp };
+  strictEqual(leerVacio([anotada, C_NORMAL]).conocida, false, "un envío que sendtrack aceptó y ya no muestra sí es sospechoso");
+  const sinInsert = { ...anotada, monday_payload: { ...mp, mail_enviado_en_sendtrack: false } };
+  strictEqual(leerVacio([sinInsert, C_NORMAL]).conocida, true, "si sendtrack no lo aceptó al mandar, que no esté no dice nada de la lectura");
+  strictEqual(contactadoDeCola(sinInsert, { conocida: false, dominios: new Set() }), true, "pero el mail salió: sigue contactado");
+  strictEqual(envioAnotado({ ...anotada, domain: "otro.com" }), false, "un envío anotado para otro sitio no prueba nada de esta fila");
+  strictEqual(envioAnotado({ domain: "WWW.Diario.com.mx", monday_payload: mp }), true);
+});
+
+test("B2: 'Guardar' escribe de qué sitio y qué día salió el mail", () => {
+  const v = { email: "a@diario.com.mx", geo: "Mexico", idioma: "1", traffic: 900000, mailEnviado: true, mailEnviadoEl: "2026-09-13", mailEnviadoEnSendtrack: true };
+  const mp = filaColaDesdeFormulario(v, { prev: null, domain: "WWW.Diario.com.mx" }).monday_payload;
+  deepStrictEqual([mp.mail_enviado, mp.mail_enviado_dominio, mp.mail_enviado_el, mp.mail_enviado_en_sendtrack], [true, "diario.com.mx", "2026-09-13", true]);
+  strictEqual(envioAnotado({ domain: "diario.com.mx", monday_payload: mp }), true, "la fila que escribe 'Guardar' tiene que servir de prueba");
+  const sin = filaColaDesdeFormulario({ ...v, mailEnviado: false }, { prev: { id: 1, status: "pending", traffic: 900000 }, domain: "diario.com.mx" }).monday_payload;
+  deepStrictEqual([sin.mail_enviado, "mail_enviado_dominio" in sin], [false, false]);
+  strictEqual(filaColaDesdeFormulario({ ...v, mailEnviadoEl: "13/09/2026" }, { domain: "diario.com.mx" }).monday_payload.mail_enviado_el, "",
+    "una fecha que no es ISO no entra a la ventana de sendtrack");
+});
+
+test("B2: los envíos de la sesión se anotan por sitio", () => {
+  const envios = new Map();
+  anotarEnvioDeSesion(envios, "WWW.A.com", { el: "2026-09-13", enSendtrack: true });
+  anotarEnvioDeSesion(envios, "b.com", { el: "2026-09-13", enSendtrack: false });
+  deepStrictEqual(envioDeSesion(envios, "a.com"), { el: "2026-09-13", enSendtrack: true });
+  deepStrictEqual(envioDeSesion(envios, "B.com"), { el: "2026-09-13", enSendtrack: false });
+  strictEqual(envioDeSesion(envios, "c.com"), null, "a C no se le escribió: guardar C no dice 'enviado'");
+  anotarEnvioDeSesion(envios, "a.com", { el: "2026-09-14", enSendtrack: false });
+  deepStrictEqual(envioDeSesion(envios, "a.com"), { el: "2026-09-14", enSendtrack: true }, "si sendtrack aceptó un envío a ese sitio, lo sigue teniendo");
+  anotarEnvioDeSesion(envios, "", {});
+  anotarEnvioDeSesion(null, "x.com", {});
+  strictEqual(envios.size, 2);
+  strictEqual(envioDeSesion(null, "a.com"), null);
+});
+
+// _validarProspectoMonday, ejecutado con dobles en una sesión en la que ya salió un mail (la bandera
+// vieja está prendida): el valor de mailEnviado tiene que depender de state.domain.
+function validarGuardar({ dominio, envios }) {
+  const deps = {
+    _crmBloquea: () => false, _motivoBloqueoCrm: () => "",
+    document: { getElementById: () => null },
+    getMondayFormValues: () => ({ email: "ventas@sitio.com", geo: "Mexico", idioma: "1", estado: "Propuesta Vigente", fecha: HOY, ejecutivo: "mb", pitch: "" }),
+    isValidEmail: () => true, _esFormularioUrl: () => false,
+    state: { domain: dominio, traffic: 900000, visits: 0, emailSentInSession: true },
+    _enviosDeLaSesion: envios, envioDeSesion,
+  };
+  const nombres = Object.keys(deps);
+  const fn = new Function(...nombres, `${texto(funcion("_validarProspectoMonday"))}\nreturn _validarProspectoMonday;`)(...nombres.map(n => deps[n]));
+  return fn({ textContent: "", className: "" });
+}
+
+test("B2: 'Guardar para enviar después' dice 'enviado' sólo para el sitio al que le salió el mail", () => {
+  const envios = new Map();
+  anotarEnvioDeSesion(envios, "a.com", { el: HOY, enSendtrack: true });
+  const b = validarGuardar({ dominio: "b.com", envios });
+  strictEqual(b.mailEnviado, false, "mandarle a A dejaba 'enviado' todo lo que se guardaba después en la sesión");
+  const a = validarGuardar({ dominio: "www.a.com", envios });
+  deepStrictEqual([a.mailEnviado, a.mailEnviadoEl, a.mailEnviadoEnSendtrack], [true, HOY, true]);
+  strictEqual(envioAnotado({ domain: "b.com", monday_payload: filaColaDesdeFormulario(b, { domain: "b.com" }).monday_payload }), false);
+  strictEqual(envioAnotado({ domain: "a.com", monday_payload: filaColaDesdeFormulario(a, { domain: "a.com" }).monday_payload }), true);
+});
+
+test("B2: el botón de Gmail anota el envío para el sitio tomado antes de mandar, y el Guard #3 no cambia", () => {
+  const h = handlerDe("btn-send-gmail");
+  let decl = null;
+  walk.full(h, (n) => { if (!decl && n.type === "VariableDeclarator" && n.init?.type === "MemberExpression" && texto(n.init) === "state.domain") decl = n; });
+  ok(decl, "el handler tiene que tomar el sitio del mail en una constante");
+  let esperaAntes = false;
+  walk.full(h, (n) => { if (n.type === "AwaitExpression" && n.start < decl.start) esperaAntes = true; });
+  ok(!esperaAntes, "el sitio se toma antes de la primera espera: después el panel puede estar en otro dominio");
+  const sitio = decl.id.name;
+  const [envio] = llamadas(h, "sendEmail");
+  const anota = llamadas(h, "anotarEnvioDeSesion");
+  strictEqual(anota.length, 1, "el envío de Analysis tiene que quedar anotado por sitio");
+  ok(anota[0].nodo.start > envio.nodo.start, "se anota después de que el mail salió");
+  deepStrictEqual(anota[0].nodo.arguments.slice(0, 2).map(texto), ["_enviosDeLaSesion", sitio]);
+  strictEqual(texto(llamadas(h, "saveSendDate")[0].nodo.arguments[0]), sitio, "sendtrack y la anotación tienen que hablar del mismo sitio");
+  const enSendtrack = anota[0].nodo.arguments[2]?.properties?.find(p => p.key?.name === "enSendtrack");
+  ok(enSendtrack && /\.ok === true/.test(texto(enSendtrack.value)), "si sendtrack no aceptó el envío, no se anota como aceptado");
+  ok(/state\.emailSentInSession = true/.test(texto(h)), "el Guard #3 del botón verde no se toca en este arreglo");
+});
+
+test("B2: la tarjeta anota su envío por sitio y lo deja escrito en 'Por enviar' cuando el CRM falla", async () => {
+  const t = armarTarjeta({ crmFalla: true });
+  await t.correr();
+  const envio = envioDeSesion(t.envios, "diario.com.mx");
+  ok(envio && envio.enSendtrack === true && /^\d{4}-\d{2}-\d{2}$/.test(envio.el), JSON.stringify(envio));
+  const patch = (x) => x.pedidos.find(p => p.tabla === "toolbar_review_queue" && p.opts.method === "PATCH").cuerpo.monday_payload;
+  const mp = patch(t);
+  deepStrictEqual([mp.mail_enviado_dominio, mp.mail_enviado_el, mp.mail_enviado_en_sendtrack], ["diario.com.mx", envio.el, true]);
+  strictEqual(envioAnotado({ domain: "diario.com.mx", monday_payload: mp }), true, "el lote tiene que poder cargarla aunque sendtrack no conteste");
+  const t2 = armarTarjeta({ crmFalla: true, sendtrackFalla: true });
+  await t2.correr();
+  strictEqual(patch(t2).mail_enviado_en_sendtrack, false, "si sendtrack rechazó el envío, la fila no lo afirma");
+});
+
+// ═══ M9 — las marcas pendientes no se pisan entre sí ═══════════════════════════════════════
+// queuePendingMark y flushPendingMarks, extraídas del popup y ejecutadas con un chrome.storage falso.
+function armarMarcas(validar) {
+  const almacen = {};
+  const copia = (x) => (x === undefined ? undefined : JSON.parse(JSON.stringify(x)));
+  const deps = {
+    chrome: { storage: { local: {
+      get: async (k) => ({ [k]: copia(almacen[k]) }),
+      set: async (o) => { for (const [k, v] of Object.entries(o)) almacen[k] = copia(v); },
+    } } },
+    ensureFreshToken: async () => "tk",
+    state: { loginEmail: "mb@adeqmedia.com" },
+    console: { log() {}, warn() {} },
+    validateReviewItem: (...a) => validar(...a),
+  };
+  const ini = popup.indexOf("const PENDING_MARKS_KEY");
+  const fin = funcion("flushPendingMarks").end;
+  ok(ini > 0 && fin > ini, "no encontré las marcas pendientes en popup.js");
+  const nombres = Object.keys(deps);
+  const api = new Function(...nombres, `${popup.slice(ini, fin)}\nreturn { PENDING_MARKS_KEY, queuePendingMark, flushPendingMarks };`)(...nombres.map(n => deps[n]));
+  return { ...api, almacen };
+}
+
+test("M9: una marca que el lote encola mientras se reintentan las otras no se pierde", async () => {
+  let m = null;
+  m = armarMarcas(async (_tk, id) => {
+    // El lote de la cola, a mitad del reintento: una fila entró al CRM y su marca falló.
+    if (String(id) === "1") await m.queuePendingMark(99, "mb@adeqmedia.com");
+    return String(id) === "1" ? { ok: true } : { ok: false, error: "HTTP 500" };
+  });
+  const ahora = Date.now();
+  m.almacen[m.PENDING_MARKS_KEY] = [{ id: 1, by: "mb", at: ahora }, { id: 2, by: "mb", at: ahora }, { id: 3, by: "mb", at: ahora - 8 * 86_400_000 }];
+  await m.flushPendingMarks();
+  deepStrictEqual(m.almacen[m.PENDING_MARKS_KEY].map(x => x.id), [2, 99],
+    "la 1 entró, la 2 se reintenta, la 3 lleva más de 7 días; la 99 se perdía y su fila volvía a verse en 'Por enviar'");
 });

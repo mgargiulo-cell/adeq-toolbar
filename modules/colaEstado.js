@@ -128,6 +128,15 @@ export function filaColaDesdeFormulario(v, {
   const monday_payload = {
     estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma,
     traffic_text: trafficTexto, mail_enviado: v.mailEnviado === true,
+    // (2026-09-13) De qué sitio y qué día salió el mail, y si sendtrack lo aceptó. `mail_enviado`
+    // sola salía de una bandera de sesión que nunca volvía a false: después del primer mail, todo lo
+    // que el MB guardaba en esa sesión quedaba "enviado". Una fila sin estas claves (las de antes)
+    // ya no se toma como prueba de envío: decide sendtrack (ver envioAnotado).
+    ...(v.mailEnviado === true ? {
+      mail_enviado_dominio: normDominioCola(domain),
+      mail_enviado_el: /^\d{4}-\d{2}-\d{2}$/.test(String(v.mailEnviadoEl || "")) ? String(v.mailEnviadoEl) : "",
+      mail_enviado_en_sendtrack: v.mailEnviadoEnSendtrack === true,
+    } : {}),
     geo_form: v.geo || "",
     email: em.payloadEmail,
     ...(em.contactoFormulario ? { contacto_formulario: em.contactoFormulario } : {}),
@@ -160,8 +169,8 @@ export function filaColaDesdeFormulario(v, {
 
 // ── "Quitar de la cola" ─────────────────────────────────────────────────────────────────
 // Cada fila vuelve a donde estaba, no a pending fijo. En este orden:
-//   1. Si el mail salió (anotado al guardar, o el dominio figura en sendtrack de los últimos
-//      30 días) → validated. Un contactado nunca vuelve a Prospects como nuevo.
+//   1. Si el mail salió (anotado al guardar CON SU SITIO —envioAnotado—, o el dominio figura en
+//      sendtrack de los últimos 30 días) → validated. Un contactado nunca vuelve a Prospects como nuevo.
 //   2. Estaba validated → validated.   3. Estaba rejected → rejected (el motivo original sigue
 //      en suspect_reason: "Guardar" nunca lo borró).
 //   4. Sin estado anterior y creada por la cola (`manual_cola`): nunca pasó el filtro de entrada
@@ -207,8 +216,9 @@ export function planSacarDeCola(filas, { contactados = new Set(), minTraffic = 3
   for (const f of filas || []) {
     if (!f || f.id == null) continue;
     const mp = f.monday_payload || {};
+    // (2026-09-13) La bandera sola no cierra una fila como contactada: tiene que nombrar a este sitio.
     const d = estadoAlSacarDeCola({
-      status_previo: mp.status_previo ?? null, source: f.source || "", mail_enviado: mp.mail_enviado,
+      status_previo: mp.status_previo ?? null, source: f.source || "", mail_enviado: envioAnotado(f),
       contactado_sendtrack: contactados ? contactados.has(String(f.domain || "").toLowerCase()) : null, traffic: f.traffic, minTraffic,
     });
     if (d.status == null) { sinConfirmar.push(String(f.id)); grupoPorId.set(String(f.id), d.grupo); continue; }
@@ -326,7 +336,8 @@ const _PROPUESTA_VIGENTE_RE = /propuesta\s*vigente/i;
  *   dup        la ficha de hoy (buscarEnCrm). "El CRM no contesta" lo corta quien llama.
  *   veredicto  _veredictoCrm(dup): la misma regla que el recuadro de Analysis.
  *   alGuardar  monday_payload.crm_al_guardar (null en las filas guardadas antes del 13/09).
- *   contactado el mail ya salió: anotado al guardar o visto en sendtrack.
+ *   contactado el mail ya salió: anotado al guardar con su sitio o visto en sendtrack (contactadoDeCola;
+ *              la bandera de sesión sola no cuenta, 2026-09-13).
  * Se saltea: dominio bloqueado; Live / En Negociación / Personalizado; estado que no se reconoce;
  * el CRM ya decía que no al guardar; una Propuesta Vigente con ejecutivo, o que ya existía al
  * guardar, o sin un envío nuestro que la explique. Se manda: lo prospectable, y la Propuesta
@@ -353,8 +364,13 @@ export function decidirLoteCrm({ dup = null, veredicto = null, alGuardar = null,
 // política de RLS le esconde al MB los envíos de otros (sql/rls_hardening.sql define una por
 // dueño; desde el repo no se puede saber si está aplicada en la base), "no hay envío" no es un
 // dato: con eso "Quitar" devolvía a Prospects un sitio contactado.
-// Sospechosa: una fila anotó al guardar que el mail salió, con fecha de contacto dentro de la
-// ventana, y sendtrack no la muestra. Si no ve ése, no se puede creer que no haya otros.
+// Sospechosa: una fila anotó al guardar que el mail salió A ESTE SITIO, sendtrack lo aceptó en ese
+// momento, la fecha del envío cae dentro de la ventana, y ahora sendtrack no lo muestra. Si no ve
+// ése, no se puede creer que no haya otros.
+// (2026-09-13) Antes alcanzaba con `mail_enviado` y la fecha del formulario. Esa bandera salía de la
+// sesión, no del sitio: una sola fila guardada después de mandarle a otro apagaba el lote entero
+// ("puede que no vea los de otros MB", falso). Y si el insert en sendtrack había fallado al mandar,
+// su ausencia no dice nada de la lectura.
 export function lecturaDeEnvios(env, filas, { dias = 30, ahoraMs = Date.now() } = {}) {
   if (!env || env.ok !== true) {
     return { conocida: false, dominios: new Set(), motivo: `no pude leer los envíos (${env?.error || "sin respuesta"})` };
@@ -364,9 +380,9 @@ export function lecturaDeEnvios(env, filas, { dias = 30, ahoraMs = Date.now() } 
   const faltan = [];
   for (const f of filas || []) {
     const mp = f?.monday_payload || {};
-    const fecha = String(mp.fecha || "");
+    const el = String(mp.mail_enviado_el || "");
     const d = String(f?.domain || "").toLowerCase();
-    if (mp.mail_enviado === true && /^\d{4}-\d{2}-\d{2}$/.test(fecha) && fecha >= corte && d && !dominios.has(d)) faltan.push(d);
+    if (envioAnotado(f) && mp.mail_enviado_en_sendtrack === true && /^\d{4}-\d{2}-\d{2}$/.test(el) && el >= corte && !dominios.has(d)) faltan.push(d);
   }
   if (faltan.length) {
     return { conocida: false, dominios,
@@ -375,9 +391,49 @@ export function lecturaDeEnvios(env, filas, { dias = 30, ahoraMs = Date.now() } 
   return { conocida: true, dominios, motivo: "" };
 }
 
-/** ¿Ya se le escribió? true / false / null (no se puede saber). Lo anotado al guardar no depende de sendtrack. */
+/** ¿Ya se le escribió? true / false / null (no se puede saber). Un envío anotado con su sitio no depende de sendtrack. */
 export function contactadoDeCola(f, lectura) {
-  if (f?.monday_payload?.mail_enviado === true) return true;
+  if (envioAnotado(f)) return true;
   if (!lectura || lectura.conocida !== true) return null;
   return lectura.dominios.has(String(f?.domain || "").toLowerCase());
+}
+
+// ── "MAIL ENVIADO" ES DE UN SITIO, NO DE LA SESIÓN (2026-09-13) ─────────────────────────────
+// "Guardar" anotaba `mail_enviado: !!state.emailSentInSession`, y esa bandera sólo se prende: el
+// panel lateral cambia de dominio sin recargar (scheduleRecheck) y resetAnalysisUI no la baja.
+// Mandarle a A y después guardar B, C y D sin escribirles dejaba a los tres "enviados". Con eso
+// "Quitar" los cerraba como contactados (salían del pool para siempre), el lote le decía al CRM
+// que no mandara el inicial y tomaba por nuestra una "Propuesta Vigente" ajena.
+// Ahora el envío se anota por sitio en el momento en que sale (anotarEnvioDeSesion), "Guardar" lo
+// lee para el sitio que guarda (envioDeSesion), y la fila lo escribe con el sitio (filaColaDesdeFormulario).
+// La bandera de sesión queda sólo para el Guard #3 del botón verde, que no cambia acá.
+
+/** Mismo dominio escrito de dos formas ("WWW.Sitio.com" y "sitio.com") es el mismo sitio. */
+export function normDominioCola(d) {
+  return String(d || "").trim().toLowerCase().replace(/^www\./, "");
+}
+
+/** Anota que a `dominio` le salió un mail en esta sesión. Si sendtrack lo aceptó alguna vez, queda aceptado. */
+export function anotarEnvioDeSesion(envios, dominio, { el = "", enSendtrack = false } = {}) {
+  const d = normDominioCola(dominio);
+  if (!(envios instanceof Map) || !d) return;
+  envios.set(d, { el: String(el || ""), enSendtrack: enSendtrack === true || envios.get(d)?.enSendtrack === true });
+}
+
+/** El envío de esta sesión a `dominio`, o null si a ese sitio no se le escribió. */
+export function envioDeSesion(envios, dominio) {
+  const d = normDominioCola(dominio);
+  return (envios instanceof Map && d && envios.get(d)) || null;
+}
+
+/**
+ * ¿Lo anotado al guardar prueba que a este sitio se le escribió? Sólo si nombra al sitio de la fila.
+ * Las filas guardadas antes del arreglo tienen `mail_enviado` sin sitio, que puede ser la bandera
+ * vieja: para ellas decide sendtrack, y si sendtrack no se pudo leer, "no se sabe" (null en
+ * contactadoDeCola), nunca "sí". La cola existe desde el 02/09 y sendtrack se lee con 30 días.
+ */
+export function envioAnotado(f) {
+  const mp = f?.monday_payload || {};
+  const d = normDominioCola(f?.domain);
+  return mp.mail_enviado === true && !!d && normDominioCola(mp.mail_enviado_dominio) === d;
 }

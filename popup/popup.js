@@ -60,7 +60,8 @@ import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking
 // Las reglas de la cola "Por enviar" y de los adicionales de la tarjeta, sin DOM y con tests (2026-09-13).
 import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, planSacarDeCola, textoConfirmarSacar,
          textoResultadoSacar, adicionalesDeLaTarjeta, contactosDeAdicionales,
-         fotoCrmAlGuardar, decidirLoteCrm, lecturaDeEnvios, contactadoDeCola } from "../modules/colaEstado.js";
+         fotoCrmAlGuardar, decidirLoteCrm, lecturaDeEnvios, contactadoDeCola,
+         anotarEnvioDeSesion, envioDeSesion } from "../modules/colaEstado.js";
 import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -5665,7 +5666,10 @@ async function bindButtons() {
     // registro no sirve el día que se manda, y el MB se enteraría recién ahí.
     // Se anota si el mail salió o no, para poder marcarlo en la lista: que sea de un click no
     // significa que después no se vea cuáles quedaron sin contactar.
-    return { ...v, traffic, mailEnviado: !!state.emailSentInSession };
+    // (2026-09-13) Si salió A ESTE SITIO, no si salió alguno en la sesión: `emailSentInSession` no se
+    // baja al cambiar de dominio, y mandarle a A dejaba "enviado" todo lo que se guardaba después.
+    const envio = envioDeSesion(_enviosDeLaSesion, state.domain);
+    return { ...v, traffic, mailEnviado: !!envio, mailEnviadoEl: envio?.el || "", mailEnviadoEnSendtrack: envio?.enSendtrack === true };
   }
 
   document.getElementById("btn-guardar-cola")?.addEventListener("click", async () => {
@@ -5928,6 +5932,10 @@ async function bindButtons() {
       document.getElementById("duplicate-result")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
+    // (2026-09-13) El sitio de ESTE mail, tomado antes de la primera espera: la firma de Gmail puede
+    // abrir el login, y mientras tanto el panel cambia de dominio solo (scheduleRecheck). El mail sale
+    // con el email y el pitch que ya se leyeron; lo que se anota después tiene que ser de este sitio.
+    const dominioDelMail = state.domain;
     if (_esFormularioUrl(email)) {
       res.textContent = "📋 Es un formulario de contacto, no un email: completalo en el sitio y cargá directo en ADEQ (no hace falta mandar mail).";
       res.className = "push-result error"; return;
@@ -5989,7 +5997,7 @@ async function bindButtons() {
     try {
       const tr = await createManualSendTracking(state.accessToken, {
         user_email:    state.loginEmail,
-        domain:        state.domain,
+        domain:        dominioDelMail,
         email_to:      email,
         pitch_subject: subject,
         language:      lang,
@@ -6028,10 +6036,14 @@ async function bindButtons() {
       const today = new Date().toISOString().split("T")[0];
       // Persistir el envío para tracking/historial (sin generar follow-ups,
       // los hace el CRM externo).
-      await saveSendDate(state.domain, { sendDate: today, pitch, email, mbEmail: state.loginEmail }).catch(() => {});
+      const _sendtrack = await saveSendDate(dominioDelMail, { sendDate: today, pitch, email, mbEmail: state.loginEmail }).catch(() => null);
+      // (2026-09-13) El envío queda anotado para ESTE sitio. "Guardar para enviar después" lo lee
+      // por dominio (envioDeSesion): la bandera emailSentInSession no se baja nunca en la sesión, y
+      // con ella todo lo que se guardaba después del primer mail quedaba "enviado".
+      anotarEnvioDeSesion(_enviosDeLaSesion, dominioDelMail, { el: today, enSendtrack: _sendtrack?.ok === true });
       // Marcar review_queue items de este dominio como contactados — desaparecen
       // de Prospects inmediato (otros MBs no los van a re-contactar).
-      markReviewQueueAsContacted(state.accessToken, state.domain, state.loginEmail).catch(() => {});
+      markReviewQueueAsContacted(state.accessToken, dominioDelMail, state.loginEmail).catch(() => {});
 
       // ── Emails Adicionales (hasta 3) — Maxi 2026-06-18 ──────────────
       // CAMBIO DE LÓGICA: ya NO se encolan para +11/+22/+33d. Ahora salen
@@ -12289,16 +12301,29 @@ async function flushPendingMarks() {
     if (!q.length) return;
     const token = await ensureFreshToken();
     if (!token) return;
-    const quedan = [];
+    const resueltas = new Set();
     for (const m of q) {
       const r = await validateReviewItem(token, m.id, m.by || state.loginEmail);
       // Se descarta también lo que lleva más de 7 días intentando (la fila ya no existe).
-      if (!r.ok && Date.now() - (m.at || 0) < 7 * 24 * 3600 * 1000) quedan.push(m);
+      if (r.ok || Date.now() - (m.at || 0) >= 7 * 24 * 3600 * 1000) resueltas.add(String(m.id));
     }
-    await chrome.storage.local.set({ [PENDING_MARKS_KEY]: quedan });
-    if (q.length !== quedan.length) console.log(`[PendingMarks] recuperadas ${q.length - quedan.length}`);
+    // (2026-09-13) Se vuelve a leer antes de escribir y sólo se sacan las resueltas. Escribía la lista
+    // que había leído al empezar: una marca que el lote de la cola encolaba mientras tanto se perdía,
+    // y la fila que ya había entrado al CRM volvía a verse en "Por enviar". Desde el 13/09 corren
+    // varias a la vez (al abrir Prospects, y en cada refresco del contador de la cola).
+    const { [PENDING_MARKS_KEY]: ahora = [] } = await chrome.storage.local.get(PENDING_MARKS_KEY);
+    await chrome.storage.local.set({ [PENDING_MARKS_KEY]: ahora.filter(m => !resueltas.has(String(m.id))) });
+    if (resueltas.size) console.log(`[PendingMarks] recuperadas ${resueltas.size}`);
   } catch {}
 }
+
+// ── LOS MAILS QUE SALIERON EN ESTA SESIÓN, POR SITIO (2026-09-13) ─────────────────────────────
+// Lo escriben el botón de Gmail de Analysis y la tarjeta de Prospects en el momento en que el mail
+// sale; lo lee "Guardar para enviar después" para el sitio que guarda. Reemplaza, para la cola, a
+// `state.emailSentInSession`, que se prende con el primer mail y no se apaga al cambiar de sitio.
+// (Vive afuera de `state` a propósito: sólo lo tocan esas tres puertas, vía anotarEnvioDeSesion y
+// envioDeSesion de modules/colaEstado.js.)
+const _enviosDeLaSesion = new Map();
 
 // ── LA SALIDA DE EMERGENCIA DE LA TARJETA: EL SITIO QUEDA EN "POR ENVIAR" (2026-09-13) ──────────
 // Cuando el mail de la tarjeta ya salió y la ficha no entra al CRM, no había botón que la cargara
@@ -12541,7 +12566,12 @@ async function validateProspect(card, data, doSendEmail) {
       }
       mailSalio = true;
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
-      await saveSendDate(data.domain, { sendDate: new Date().toISOString().split("T")[0], pitch, email, mbEmail: state.loginEmail }).catch(() => {});
+      const _hoyEnvio = new Date().toISOString().split("T")[0];
+      const _sendtrack = await saveSendDate(data.domain, { sendDate: _hoyEnvio, pitch, email, mbEmail: state.loginEmail }).catch(() => null);
+      // (2026-09-13) Anotado por sitio, igual que en Analysis: si el MB abre este sitio y lo guarda
+      // "para enviar después" (la salida del cartel de abajo), la fila dice que el mail ya salió.
+      const _envio = { el: _hoyEnvio, enSendtrack: _sendtrack?.ok === true };
+      anotarEnvioDeSesion(_enviosDeLaSesion, data.domain, _envio);
       markReviewQueueAsContacted(state.accessToken, data.domain, state.loginEmail).catch(() => {});
 
       // ── LOS ADICIONALES VAN A LA COLA DEL WORKER, UNO POR MINUTO (2026-09-13) ─────────────
@@ -12576,6 +12606,7 @@ async function validateProspect(card, data, doSendEmail) {
       } catch (e) {
         colaEmergencia = await _tarjetaAPorEnviar(data, {
           estado, fecha: fechaISO, ejecutivo, idioma, email, geo, traffic: trafficNum, pitch, mailEnviado: true,
+          mailEnviadoEl: _envio.el, mailEnviadoEnSendtrack: _envio.enSendtrack,
         }, {
           trafficTexto: traffic, contactos: contactosDeAdicionales(adicionales, { programados: false }),
           crmAlGuardar: fotoCrmAlGuardar(_vPool, _dupPool),
