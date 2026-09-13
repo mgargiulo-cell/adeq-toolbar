@@ -1,0 +1,281 @@
+// ══════════════════════════════════════════════════════════════════════════════════════
+// LA COLA "POR ENVIAR" Y LOS ENVÍOS A MANO DESDE LA TARJETA — las reglas, sin DOM (2026-09-13)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// Por qué existe este archivo. La auditoría del 13/09 encontró que los botones de la cola
+// (Guardar, Quitar, Enviar) y el envío desde la tarjeta de Prospects decidían cosas caras
+// adentro de un handler de popup.js, donde ningún test llega:
+//   · "Guardar" pisaba el status sin anotar el anterior y "Quitar" lo dejaba siempre en
+//     pending: contactados, descartados y sitios que nunca pasaron el filtro volvían al pool.
+//   · "Guardar" reescribía idioma y país con el vocabulario del formulario de Monday ("1",
+//     "España") sobre filas que usan ISO e inglés, reemplazaba la lista de emails por uno solo
+//     y pisaba el tráfico que ya había pasado el piso.
+//   · Los adicionales de la tarjeta salían los cuatro juntos y sin registro.
+// Acá quedan las reglas como funciones puras: el popup las llama y los tests las prueban sin
+// abrir Chrome. Lo único que importa es lib/geo.js, que ya viaja en el zip de la extensión.
+import { COUNTRY_CODES } from "../auto-prospector/lib/geo.js";
+
+// ── Idioma ──────────────────────────────────────────────────────────────────────────────
+// El <select id="form-idioma"> guarda el ÍNDICE de la columna de Monday para los cinco
+// idiomas viejos y el código ISO para los nuevos. El pool (y el agente) usan ISO. Es el
+// inverso exacto de LANG_TO_IDX de popup.js: el test lo exige, para que no se desincronicen.
+// "5" es "Language?": el MB no sabe el idioma, y "no sé" no se escribe como un idioma.
+export const IDIOMA_DE_INDICE_MONDAY = { "0": "en", "1": "es", "2": "it", "3": "pt", "6": "ar" };
+
+export function idiomaIsoDelFormulario(valor) {
+  const s = String(valor ?? "").trim().toLowerCase();
+  if (IDIOMA_DE_INDICE_MONDAY[s]) return IDIOMA_DE_INDICE_MONDAY[s];
+  return /^[a-z]{2}$/.test(s) ? s : "";
+}
+
+// ── País ────────────────────────────────────────────────────────────────────────────────
+// MONDAY_COUNTRIES (el desplegable) tiene duplicados que GEO_LABEL (ISO → etiqueta) no cubre,
+// porque GEO_LABEL guarda una sola etiqueta por país. Sin estos, "Holanda" o "Dubai" no
+// resolverían a ningún ISO y el país se perdería.
+const ETIQUETAS_MONDAY_EXTRA = {
+  "Holanda": "NL", "Netherlands": "NL", "Gran Bretaña": "GB", "Emiratos Arabes": "AE", "Dubai": "AE",
+  "Jordan": "JO", "Catar": "QA", "Argelia": "DZ", "Bosnia": "BA", "Corea": "KR", "Republica de Corea": "KR",
+};
+const _normEtiqueta = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
+
+/** Etiqueta del desplegable de Monday → ISO de 2 letras, o "" si no la conocemos. */
+export function isoDeEtiquetaMonday(etiqueta, geoLabel = {}) {
+  const buscada = _normEtiqueta(etiqueta);
+  if (!buscada) return "";
+  for (const [iso, label] of Object.entries(geoLabel || {})) if (_normEtiqueta(label) === buscada) return iso;
+  for (const [label, iso] of Object.entries(ETIQUETAS_MONDAY_EXTRA)) if (_normEtiqueta(label) === buscada) return iso;
+  // Un ISO tal cual también vale (una fila que ya venía con "ES").
+  const up = String(etiqueta).trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(up) && (COUNTRY_CODES[up] || Object.prototype.hasOwnProperty.call(geoLabel || {}, up)) ? up : "";
+}
+
+// ── Emails ──────────────────────────────────────────────────────────────────────────────
+// "Guardar" escribía `emails: [lo del campo]`: se perdían las demás direcciones que el pool
+// ya tenía (pagadas en Apollo, raspadas, verificadas), y un campo vacío o una URL de formulario
+// dejaban la fila sin email, así que el pulido volvía a gastar en buscarlas.
+// Regla: la elección del MB va PRIMERA y las demás se conservan; un campo vacío no borra nada;
+// una URL de formulario no es un email y no entra a la lista.
+export function fusionarEmailsCola(prev, emailForm, { loginEmail = "", esFormulario = false } = {}) {
+  const prevEmails = Array.isArray(prev?.emails) ? prev.emails.filter(e => typeof e === "string" && e.trim()) : [];
+  const prevSources = prev?.email_sources && typeof prev.email_sources === "object" && !Array.isArray(prev.email_sources)
+    ? prev.email_sources : {};
+  const valor = String(emailForm || "").trim();
+  if (!valor) return { cambia: false, payloadEmail: "", contactoFormulario: "" };
+  if (esFormulario) return { cambia: false, payloadEmail: "", contactoFormulario: valor };
+  const e = valor.toLowerCase();
+  const vistos = new Set([e]);
+  const resto = [];
+  for (const x of prevEmails) { const k = x.trim().toLowerCase(); if (!vistos.has(k)) { vistos.add(k); resto.push(x); } }
+  const emails = [e, ...resto];
+  const email_sources = { ...prevSources };
+  if (!email_sources[e]) email_sources[e] = { source: "manual_mb", by: String(loginEmail || "").toLowerCase() };
+  const cambia = !prevSources[e] || emails.length !== prevEmails.length || emails.some((x, i) => x !== prevEmails[i]);
+  return { cambia, emails, email_sources, payloadEmail: e, contactoFormulario: "" };
+}
+
+// A quién le escribe el CRM cuando se manda el lote. La auditoría de emails del worker también
+// recorre las filas `por_enviar` y reordena la lista por puntaje: mandar `emails[0]` podía
+// terminar en una casilla distinta de la que eligió el MB (y a la que quizás ya le escribió).
+// Manda lo que el MB eligió al guardar; las filas de antes del arreglo no tienen esa clave y
+// siguen usando la primera de la lista, como hasta hoy.
+export function emailDeCola(f) {
+  const mp = (f && f.monday_payload) || {};
+  if (mp.contacto_formulario) return String(mp.contacto_formulario);
+  if (Object.prototype.hasOwnProperty.call(mp, "email")) return String(mp.email || "");
+  return (Array.isArray(f?.emails) && f.emails[0]) || "";
+}
+
+// ── Estado anterior ─────────────────────────────────────────────────────────────────────
+// Lo que la fila era ANTES de entrar a la cola. Si se guarda dos veces, la segunda lectura ya
+// ve `por_enviar`: el estado verdadero es el que quedó anotado la primera vez.
+export function statusPrevioAlGuardar(prev) {
+  if (!prev) return null;
+  const previo = prev.status === "por_enviar" ? (prev.monday_payload?.status_previo ?? null) : (prev.status || null);
+  return previo === "por_enviar" ? null : previo;
+}
+
+// Qué decirle al MB al guardar. El cartel "YA figura contactado" saltaba en casi todos los
+// guardados, porque el flujo normal es mandar el mail desde Analysis y después guardar: el
+// contacto era el suyo de hace un minuto, y el MB aprendía a ignorar el único aviso que importa.
+export function avisoAlGuardarEnCola(prev, { loginEmail = "", ahoraMs = Date.now() } = {}) {
+  if (!prev) return "nuevo";
+  const previo = statusPrevioAlGuardar(prev);
+  if (previo === "rejected") return "descartado";
+  if (prev.monday_item_id) return "contactado";
+  if (previo === "validated") {
+    const mio = !!loginEmail && String(prev.validated_by || "").toLowerCase() === String(loginEmail).toLowerCase();
+    const t = Date.parse(prev.validated_at || "");
+    const reciente = Number.isFinite(t) && ahoraMs - t <= 12 * 3600 * 1000;
+    return mio && reciente ? "contactado_por_vos" : "contactado";
+  }
+  if (prev.status === "por_enviar") return "ya_en_cola";
+  return "en_pool";
+}
+
+// ── La fila que escribe "Guardar" ───────────────────────────────────────────────────────
+// Fila NUEVA (el sitio no estaba en la tabla): se escribe todo, traducido al vocabulario del
+// pool — idioma ISO, país en inglés o ISO y `geos_all` — nunca la etiqueta del formulario.
+// Fila EXISTENTE: el pool conserva lo que midió. No se tocan idioma, país ni geos_all; el
+// tráfico sólo si no tenía (el que ya pasó el piso de 350K no se reescribe: si el MB lo tipeaba
+// más bajo y después sacaba la fila de la cola, cleanup_pool la borraba en 15 minutos); los
+// emails se fusionan; el pitch sólo si el MB escribió uno.
+// Lo que el formulario eligió viaja entero en `monday_payload`, que es lo que lee el lote.
+export function filaColaDesdeFormulario(v, {
+  prev = null, domain = "", loginEmail = "", esFormulario = false, geoLabel = {}, contactos = [], trafficTexto = "",
+} = {}) {
+  const em = fusionarEmailsCola(prev, v.email, { loginEmail, esFormulario });
+  const previo = statusPrevioAlGuardar(prev);
+  const monday_payload = {
+    estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma,
+    traffic_text: trafficTexto, mail_enviado: v.mailEnviado === true,
+    geo_form: v.geo || "",
+    email: em.payloadEmail,
+    ...(em.contactoFormulario ? { contacto_formulario: em.contactoFormulario } : {}),
+    ...(previo ? { status_previo: previo } : {}),
+    contactos: Array.isArray(contactos) ? contactos : [],
+  };
+  const fila = { domain, status: "por_enviar", monday_payload };
+  if (!prev) {
+    const iso = isoDeEtiquetaMonday(v.geo, geoLabel);
+    Object.assign(fila, {
+      traffic: v.traffic,
+      geo: iso ? (COUNTRY_CODES[iso] || iso) : "",
+      geos_all: iso ? [iso] : null,
+      language: idiomaIsoDelFormulario(v.idioma),
+      emails: em.cambia ? em.emails : [],
+      ...(em.cambia ? { email_sources: em.email_sources } : {}),
+      pitch: v.pitch || "",
+      source: "manual_cola",
+      created_by: loginEmail,
+    });
+  } else {
+    if (!(Number(prev.traffic) > 0)) fila.traffic = v.traffic;
+    if (em.cambia) { fila.emails = em.emails; fila.email_sources = em.email_sources; }
+    if (v.pitch) fila.pitch = v.pitch;
+  }
+  return fila;
+}
+
+// ── "Quitar de la cola" ─────────────────────────────────────────────────────────────────
+// Cada fila vuelve a donde estaba, no a pending fijo. En este orden:
+//   1. Si el mail salió (anotado al guardar, o el dominio figura en sendtrack de los últimos
+//      30 días) → validated. Un contactado nunca vuelve a Prospects como nuevo.
+//   2. Estaba validated → validated.   3. Estaba rejected → rejected (el motivo original sigue
+//      en suspect_reason: "Guardar" nunca lo borró).
+//   4. Sin estado anterior y creada por la cola (`manual_cola`): nunca pasó el filtro de entrada
+//      (ads.txt, tipo de negocio, GEO). Soltarla en pending la ponía en Prospects y en manos del
+//      agente sin filtro. Queda rejected con motivo `mb:`.
+//   5. Otro estado conocido → se restaura tal cual.
+//   6. Pending (o una fila de antes del arreglo) → pending; si su tráfico está por debajo del
+//      piso, cleanup_pool la va a borrar, y el MB lo tiene que saber ANTES de confirmar.
+export function estadoAlSacarDeCola({ status_previo = null, source = "", mail_enviado = false,
+  contactado_sendtrack = false, traffic = null, minTraffic = 350000 } = {}) {
+  const previo = status_previo === "por_enviar" ? null : status_previo;
+  if (mail_enviado === true || contactado_sendtrack === true) {
+    return { status: "validated", grupo: "contactado", sello: previo !== "validated" };
+  }
+  if (previo === "validated") return { status: "validated", grupo: "contactado", sello: false };
+  if (previo === "rejected") return { status: "rejected", grupo: "descartado" };
+  if (!previo && source === "manual_cola") {
+    return { status: "rejected", grupo: "sin_filtro", suspect_reject: true, suspect_reason: "mb: sacada_de_cola_sin_filtro" };
+  }
+  if (previo && previo !== "pending") return { status: previo, grupo: "restaurado" };
+  const t = Number(traffic);
+  if (t > 0 && t < minTraffic) return { status: "pending", grupo: "bajo_piso" };
+  return { status: "pending", grupo: "prospects" };
+}
+
+// Agrupa las filas marcadas en un PATCH por cuerpo distinto (como mucho cinco).
+// ⚠️ `rejected_at` NO se escribe: el parte cuenta como "purgadas hoy" toda fila con
+// rejected_at de hoy (index.js, sección 4 de parteDelDia), y una fila que el MB saca de su cola
+// no es una purga del pool. `status_previo` tampoco se limpia: en cuanto la fila sale de
+// `por_enviar`, statusPrevioAlGuardar lo ignora, y limpiarlo obligaría a un PATCH por fila.
+export function planSacarDeCola(filas, { contactados = new Set(), minTraffic = 350000, loginEmail = "", ahoraIso = new Date().toISOString() } = {}) {
+  const lotes = new Map();
+  const grupoPorId = new Map();
+  for (const f of filas || []) {
+    if (!f || f.id == null) continue;
+    const mp = f.monday_payload || {};
+    const d = estadoAlSacarDeCola({
+      status_previo: mp.status_previo ?? null, source: f.source || "", mail_enviado: mp.mail_enviado,
+      contactado_sendtrack: contactados.has(String(f.domain || "").toLowerCase()), traffic: f.traffic, minTraffic,
+    });
+    const body = { status: d.status };
+    if (d.sello) Object.assign(body, { validated_by: loginEmail, validated_at: ahoraIso });
+    if (d.suspect_reject) Object.assign(body, { suspect_reject: true, suspect_reason: d.suspect_reason });
+    const clave = JSON.stringify(body);
+    if (!lotes.has(clave)) lotes.set(clave, { body, ids: [] });
+    lotes.get(clave).ids.push(String(f.id));
+    grupoPorId.set(String(f.id), d.grupo);
+  }
+  return { lotes: [...lotes.values()], grupoPorId };
+}
+
+export function contarGrupos(ids, grupoPorId) {
+  const c = { prospects: 0, bajo_piso: 0, contactado: 0, descartado: 0, sin_filtro: 0, restaurado: 0 };
+  for (const id of ids || []) { const g = grupoPorId.get(String(id)); if (g in c) c[g]++; }
+  return c;
+}
+
+const _partes = (c, minTraffic) => [
+  c.prospects && `${c.prospects} vuelven a Prospects`,
+  c.contactado && `${c.contactado} ya estaban contactados y quedan cerrados`,
+  c.descartado && `${c.descartado} vuelven a descartados`,
+  c.sin_filtro && `${c.sin_filtro} se descartan (se guardaron sin pasar el filtro de entrada)`,
+  c.restaurado && `${c.restaurado} vuelven a su estado anterior`,
+  c.bajo_piso && `${c.bajo_piso} tienen menos de ${Math.round(minTraffic / 1000)}K y se eliminan (Prospects no admite menos de ${Math.round(minTraffic / 1000)}K)`,
+].filter(Boolean);
+
+// El confirm decía "Quedan en Prospects como pendientes, no se borran", y no era verdad ni
+// para los contactados ni para los de menos de 350K.
+export function textoConfirmarSacar(plan, { minTraffic = 350000 } = {}) {
+  const ids = plan.lotes.flatMap(l => l.ids);
+  const c = contarGrupos(ids, plan.grupoPorId);
+  return `¿Sacar ${ids.length} de la cola? Cada uno vuelve a su estado anterior: ${_partes(c, minTraffic).join("; ")}.`;
+}
+
+export function textoResultadoSacar(hechos, total, grupoPorId, { minTraffic = 350000, fallas = [] } = {}) {
+  const c = contarGrupos(hechos, grupoPorId);
+  const partes = _partes(c, minTraffic);
+  let txt = `Se sacaron ${hechos.length} de ${total}${partes.length ? ` (${partes.join("; ")})` : ""}.`;
+  if (fallas.length) txt += ` ⚠️ ${fallas.join(" · ")}`;
+  return txt;
+}
+
+// ── Los adicionales de la tarjeta de Prospects ──────────────────────────────────────────
+// Salían los cuatro en el mismo minuto desde el popup (principal + 3), sin fila en
+// agent_actions ni en sendtrack: el lector de rebotes no los reconocía como nuestros y el
+// rebote de Exchange se descartaba entero. Ahora van a la misma cola que usa Analysis
+// (toolbar_reengagement_queue, reason 'adicional_manual'): los despacha el worker de a uno por
+// minuto, escribe `future_sent`, la fila de response_tracking y le avisa al CRM.
+// `body` es el cuerpo con firma y SIN el píxel del principal: un píxel copiado a otro buzón
+// contaría como apertura del principal.
+export function adicionalesDeLaTarjeta({ domain = "", mbEmail = "", principal = "", candidatos = [], rebotados = new Set(),
+  subject = "", body = "", ahoraMs = Date.now() } = {}) {
+  const ppal = String(principal || "").trim().toLowerCase();
+  const vistos = new Set([ppal]);
+  const filas = [], avisos = [];
+  for (const c of candidatos || []) {
+    const fe = String(c || "").trim().toLowerCase();
+    if (!fe || !fe.includes("@")) continue;
+    if (fe === ppal) { avisos.push(`⏭️ ${fe} igual al principal`); continue; }
+    if (vistos.has(fe)) { avisos.push(`⏭️ ${fe} repetido`); continue; }
+    vistos.add(fe);
+    if (rebotados && rebotados.has(fe)) { avisos.push(`🚫 ${fe} bounced`); continue; }
+    const orden = filas.length + 1;
+    filas.push({
+      domain, mb_email: String(mbEmail || "").toLowerCase(), original_email: ppal, future_email: fe,
+      original_subject: subject, original_body: body, original_sent_at: new Date(ahoraMs).toISOString(),
+      scheduled_for: new Date(ahoraMs + orden * 60_000).toISOString(),
+      status: "pending", reason: "adicional_manual", sequence: orden, tracking_action_id: null,
+    });
+  }
+  return { filas, avisos };
+}
+
+// Los contactos que viajan al CRM con la ficha. Si la cola de envío falló, van sin hora: no se
+// afirma que recibieron un mail que no salió.
+export function contactosDeAdicionales(filas, { programados = true } = {}) {
+  return (filas || []).map((f, i) => ({
+    email: f.future_email, tipo: "adicional", orden: i + 1, ...(programados ? { enviado_at: f.scheduled_for } : {}),
+  }));
+}

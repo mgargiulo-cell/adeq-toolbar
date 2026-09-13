@@ -56,7 +56,10 @@ import { saveHistory, loadHistory, clearHistory, saveSendDate,
          setDomainGeo, getDomainGeo }                                                          from "../modules/supabase.js";
 import { voyageEmbed, buildPitchContext }                                                    from "../modules/voyageEmbed.js";
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
-import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, markManualSendFailed, isEmailBounced } from "../modules/supabase.js";
+import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, markManualSendFailed, isEmailBounced, dominiosConEnvioReciente } from "../modules/supabase.js";
+// Las reglas de la cola "Por enviar" y de los adicionales de la tarjeta, sin DOM y con tests (2026-09-13).
+import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, planSacarDeCola, textoConfirmarSacar,
+         textoResultadoSacar, adicionalesDeLaTarjeta, contactosDeAdicionales } from "../modules/colaEstado.js";
 import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -3273,6 +3276,16 @@ function _aplicarBloqueoCrm(v) {
     b.classList.toggle("btn-bloqueado-crm", !!bloquea);
     b.title = bloquea ? `${v.titulo}: ${v.detalle}` : "";
   }
+  // "Guardar para enviar después" también carga en el CRM, un rato más tarde y en lote (2026-09-13).
+  // Quedaba activo sobre un cliente vivo: el lote empujaba la ficha a "Propuesta Vigente" con
+  // mail_enviado=false y el CRM le mandaba el inicial. El candado de verdad está en el lote, que
+  // vuelve a preguntar por cada sitio; esto es para que el MB lo vea antes de guardar.
+  const cola = document.getElementById("btn-guardar-cola");
+  if (cola) {
+    cola.classList.toggle("btn-bloqueado-crm", !!bloquea);
+    cola.title = bloquea ? `${v.titulo}: ${v.detalle}` : "Guarda este prospecto en la cola 'Por enviar'. Después los mandás todos juntos desde Prospects.";
+    cola.disabled = !!bloquea;
+  }
   if (push) {
     if (bloquea) { push.dataset.textoPrevio = push.dataset.textoPrevio || push.textContent; push.textContent = "⛔ No prospectable"; }
     else if (push.dataset.textoPrevio) { push.textContent = push.dataset.textoPrevio; delete push.dataset.textoPrevio; }
@@ -5284,12 +5297,30 @@ async function bindButtons() {
   // El user lo pidió así: ver URL + email + GEO + idioma, tildar los que quiera (o todos) y
   // mandarlos. El botón solo aparece si hay algo guardado, para no ensuciar la barra siempre.
   let _colaFilas = [];
+  let _colaError = "";
 
+  // ── LA LECTURA TIENE RELOJ Y NO MUESTRA LO QUE YA ENTRÓ AL CRM (2026-09-13) ─────────────
+  // Sin reloj, un pedido colgado dejaba el panel mudo. Y si la lectura fallaba (un 401), el
+  // panel decía "La cola está vacía": escondía el problema justo cuando había filas esperando.
+  // Además, una fila que entró al CRM pero cuya marca quedó pendiente (queuePendingMark) se
+  // seguía viendo y se podía mandar dos veces. Mismo criterio que Prospects: se reintentan las
+  // marcas y se esconden las que siguen pendientes.
   async function _colaCargar() {
-    const r = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.por_enviar&select=id,domain,emails,geo,language,traffic,monday_payload,created_at&order=created_at.desc&limit=300`,
-      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } });
-    _colaFilas = r.ok ? await r.json().catch(() => []) : [];
+    flushPendingMarks().catch(() => {});
+    try {
+      const r = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.por_enviar&select=id,domain,emails,geo,language,traffic,monday_payload,source,contact_phone,created_at&order=created_at.desc&limit=300`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` },
+          signal: AbortSignal.timeout(8000) });
+      const filas = r.ok ? await r.json().catch(() => null) : null;
+      if (!Array.isArray(filas)) { _colaError = r.ok ? "respuesta ilegible" : `HTTP ${r.status}`; _colaFilas = []; return _colaFilas; }
+      const pendientes = await getPendingMarkIds();
+      _colaError = "";
+      _colaFilas = filas.filter(f => !pendientes.has(String(f.id)));
+    } catch (e) {
+      _colaError = e?.name === "TimeoutError" ? "no contestó en 8 s" : (e?.message || String(e));
+      _colaFilas = [];
+    }
     return _colaFilas;
   }
 
@@ -5319,20 +5350,33 @@ async function bindButtons() {
   function _colaPintar() {
     const cont = document.getElementById("cola-lista");
     if (!cont) return;
+    if (_colaError) {
+      cont.innerHTML = `<div style="color:#fca5a5;padding:6px">No pude leer la cola (${esc(_colaError)}). Cerrá y abrí el panel para reintentar.</div>`;
+      _colaSel(); return;
+    }
     if (!_colaFilas.length) { cont.innerHTML = '<div style="color:var(--muted);padding:6px">La cola está vacía.</div>'; _colaSel(); return; }
     cont.innerHTML = _colaFilas.map(f => {
-      const mail = Array.isArray(f.emails) && f.emails.length ? f.emails[0] : "—";
-      const idi = _IDIOMA_TXT[Number(f.monday_payload?.idioma ?? f.language)] ?? (f.language || "—");
+      const mp = f.monday_payload || {};
+      // Lo que el lote va a mandar, no el primero de la lista (ver emailDeCola).
+      const mail = emailDeCola(f) || "—";
+      const idi = _IDIOMA_TXT[Number(mp.idioma ?? f.language)] ?? (f.language || "—");
       // Un prospecto guardado SIN haber mandado el mail es legítimo (se guarda en un click),
       // pero tiene que verse: si no, entra al CRM como contactado y nunca lo fue.
-      const sinMail = f.monday_payload?.mail_enviado === false
+      const sinMail = mp.mail_enviado === false
         ? ' <span title="Todavía no se le mandó el mail" style="color:#fbbf24">✉︎?</span>' : "";
+      // La auditoría de emails del worker también recorre la cola y saca direcciones (basura,
+      // rebotada, otra marca). El lote manda igual la que eligió el MB: tiene que verse antes.
+      const elegida = String(mp.email || "");
+      const sacada = elegida.includes("@") && Array.isArray(f.emails) && !f.emails.some(e => String(e).toLowerCase() === elegida.toLowerCase())
+        ? ' <span title="El sistema sacó esta dirección de la lista del sitio (basura, rebote u otra marca): revisala antes de mandar" style="color:#fbbf24">⚠️</span>' : "";
+      // El país como lo eligió el MB en el formulario, que es lo que recibe el CRM.
+      const geo = mp.geo_form || f.geo || "—";
       return `<label style="display:flex;align-items:center;gap:6px;padding:4px 2px;border-bottom:1px solid var(--border);cursor:pointer">
-        <input type="checkbox" class="cola-chk" data-id="${f.id}" />
-        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${f.domain}">${f.domain}${sinMail}</span>
-        <span style="width:34%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)" title="${mail}">${mail}</span>
-        <span style="width:74px;color:var(--muted)">${f.geo || "—"}</span>
-        <span style="width:60px;color:var(--muted)">${idi}</span>
+        <input type="checkbox" class="cola-chk" data-id="${esc(String(f.id))}" />
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(f.domain)}">${esc(f.domain)}${sinMail}</span>
+        <span style="width:34%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)" title="${esc(mail)}">${esc(mail)}${sacada}</span>
+        <span style="width:74px;color:var(--muted)">${esc(geo)}</span>
+        <span style="width:60px;color:var(--muted)">${esc(String(idi))}</span>
       </label>`;
     }).join("");
     cont.querySelectorAll(".cola-chk").forEach(c => c.addEventListener("change", _colaSel));
@@ -5361,6 +5405,53 @@ async function bindButtons() {
     _colaSel();
   });
 
+  // ── TODA ESCRITURA DE LA COLA MIRA LA RESPUESTA, TIENE RELOJ Y SÓLO TOCA LO QUE SIGUE EN COLA ──
+  // (2026-09-13) Los PATCH de "Enviar" y "Quitar" eran `fetch(...).catch(() => {})`: un 401 o un
+  // 5xx contaba como hecho ("Los 40 entraron a ADEQ") y las filas quedaban en por_enviar para que
+  // otro MB las volviera a mandar. Y "Quitar" filtraba sólo por id: con un panel viejo abierto
+  // devolvía a pending filas que otro MB ya había mandado al CRM.
+  // `status=eq.por_enviar` hace que una fila que ya salió de la cola no se toque, y `select=id`
+  // con return=representation dice cuáles se tocaron de verdad.
+  async function _colaPatchPorEnviar(filtro, body, ctx = { refrescado: false }) {
+    const pedir = (tk) => fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?${filtro}&status=eq.por_enviar&select=id`,
+      { method: "PATCH",
+        headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${tk}`,
+                   "Content-Type": "application/json", "Prefer": "return=representation" },
+        signal: AbortSignal.timeout(8000),
+        body: JSON.stringify(body) });
+    try {
+      let r = await pedir((await ensureFreshToken()) || state.accessToken);
+      // Un token vencido se renueva UNA vez por lote, no una por fila.
+      if ((r.status === 401 || r.status === 403) && !ctx.refrescado) {
+        ctx.refrescado = true;
+        const fresco = await ensureFreshToken(Infinity);
+        if (fresco) r = await pedir(fresco);
+      }
+      if (!r.ok) return { ok: false, error: `HTTP ${r.status}` };
+      const filas = await r.json().catch(() => null);
+      if (!Array.isArray(filas)) return { ok: false, error: "respuesta ilegible" };
+      return { ok: true, ids: filas.map(x => String(x.id)) };
+    } catch (e) {
+      return { ok: false, error: e?.name === "TimeoutError" ? "no contestó en 8 s" : (e?.message || String(e)) };
+    }
+  }
+
+  // ¿La fila sigue en la cola? true / false / null (no se pudo saber). El panel puede tener horas:
+  // otro MB pudo haberla mandado o sacado, y mandarla de nuevo pisa una ficha viva del CRM.
+  async function _colaSigueEnCola(id) {
+    try {
+      const tk = (await ensureFreshToken()) || state.accessToken;
+      const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${encodeURIComponent(id)}&select=status`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${tk}` }, signal: AbortSignal.timeout(8000) });
+      if (!r.ok) return null;
+      const filas = await r.json().catch(() => null);
+      return Array.isArray(filas) ? filas[0]?.status === "por_enviar" : null;
+    } catch { return null; }
+  }
+
+  const _colaLista = (items) => items.slice(0, 6).map(x => `· ${esc(x)}`).join("<br>");
+
   document.getElementById("btn-cola-enviar")?.addEventListener("click", async () => {
     const ids = _colaMarcados();
     const out = document.getElementById("cola-result");
@@ -5368,13 +5459,47 @@ async function bindButtons() {
     if (!confirm(`Se van a crear ${ids.length} ficha(s) en ADEQ. ¿Confirmás?`)) return;
     const btn = document.getElementById("btn-cola-enviar");
     btn.disabled = true;
-    let ok = 0; const fallaron = [];
-    for (const [i, id] of ids.entries()) {
-      const f = _colaFilas.find(x => String(x.id) === String(id));
-      if (!f) continue;
-      out.textContent = `Enviando ${i + 1} de ${ids.length}…`; out.style.color = "var(--muted)";
+    const filas = ids.map(id => _colaFilas.find(x => String(x.id) === String(id))).filter(Boolean);
+    let ok = 0; let corte = "";
+    const fallaron = [], salteados = [], marcaPendiente = [], cambiadasPorOtro = [];
+
+    // ── ¿A QUIÉN YA SE LE ESCRIBIÓ? (2026-09-13) ─────────────────────────────────────────
+    // `mail_enviado` se anota al guardar y queda viejo si el MB manda el mail después: el CRM
+    // recibía mail_ya_enviado=false y le mandaba el inicial a alguien que ya lo tenía. Una sola
+    // consulta a sendtrack para todo el lote; si no contesta, no se manda nada.
+    out.textContent = "Revisando a quién ya se le escribió…"; out.style.color = "var(--muted)";
+    const _env = await dominiosConEnvioReciente((await ensureFreshToken()) || state.accessToken, filas.map(f => f.domain));
+    if (!_env.ok) {
+      out.textContent = `No pude consultar a quién ya se le escribió (${_env.error}): no se mandó nada, reintentá.`;
+      out.style.color = "#fca5a5"; btn.disabled = false; return;
+    }
+    const ctx = { refrescado: false };
+    for (const [i, f] of filas.entries()) {
+      out.textContent = `Enviando ${i + 1} de ${filas.length}…`; out.style.color = "var(--muted)";
+      const mp = f.monday_payload || {};
+      const sigue = await _colaSigueEnCola(f.id);
+      if (sigue === false) { salteados.push(`${f.domain}: ya no estaba en la cola (lo mandó o lo sacó otro)`); continue; }
+      if (sigue === null) { fallaron.push(`${f.domain}: no pude confirmar que siga en la cola`); continue; }
+
+      // ── EL LOTE PREGUNTA AL CRM POR CADA SITIO, EN EL MOMENTO (2026-09-13) ─────────────
+      // Era la única puerta al CRM sin el candado del veredicto: se guardaba un cliente activo y
+      // días después el lote lo empujaba a "Propuesta Vigente" con mail_enviado=false, y el CRM
+      // le mandaba el inicial. Se pregunta fila por fila (lo guardado puede tener días) con
+      // buscarEnCrm y no con _crmConsultar, para no pisar la consulta en vuelo de Analysis.
+      //  · El CRM no contesta → se corta el lote: sin corte, 300 filas × 8 s son 40 minutos.
+      //  · NO firme o duda → se saltea con el motivo. La duda también: en un lote nadie mira el
+      //    cartel de cada web, y "no pude preguntar" nunca es "está libre".
+      const dup = await buscarEnCrm(f.domain);
+      if (dup?.indeterminado) { corte = `El CRM no contesta: se frenó en ${f.domain}, reintentá.`; break; }
+      const vc = _veredictoCrm(dup);
+      if (!vc.ok) { salteados.push(`${f.domain}: ${vc.titulo}: ${vc.detalle}`); continue; }
+      // Un email rebotado nunca se reusa: el lote no lo cambia por otro en silencio, lo saltea.
+      const email = emailDeCola(f);
+      if (email && !_esFormularioUrl(email)) {
+        const b = await isEmailBounced(state.accessToken, email).catch(() => ({ bounced: false }));
+        if (b.bounced) { salteados.push(`${f.domain}: ${email} rebotó, elegí otro`); continue; }
+      }
       try {
-        const mp = f.monday_payload || {};
         // ── AHORA VA AL CRM BOARD PROPIO, NO A MONDAY (Maxi 2026-09-02) ─────────────
         // Monday queda obsoleto: sus 10.557 items ya se migraron al board (sin borrar nada
         // de Monday, que sigue intacto como respaldo). El botón conserva el nombre porque
@@ -5393,8 +5518,10 @@ async function bindButtons() {
         // desincronizar. Se desincronizaron.
         await enviarAlBoard({
           domain: f.domain,
-          email: (Array.isArray(f.emails) && f.emails[0]) || "",
-          geo: f.geo || "",
+          email,
+          // El país como lo eligió el MB (etiqueta del board). Las filas guardadas antes del
+          // 13/09 no tienen geo_form y ya tenían la etiqueta en `geo`.
+          geo: mp.geo_form || f.geo || "",
           idioma: mp.idioma,
           estado: mp.estado,
           fecha: mp.fecha,
@@ -5402,46 +5529,78 @@ async function bindButtons() {
           ejecutivo: mp.ejecutivo,
           traffic: mp.traffic_text || f.traffic,
           telefono: f.contact_phone || "",
-          // Lo que se anotó al guardar: si el MB no había mandado el mail, el CRM tiene que
-          // mandarle el inicial.
-          mailYaEnviado: mp.mail_enviado === true,
+          // Los adicionales de ESTE sitio, anotados al guardar. Sin esto enviarAlBoard leía los
+          // de la pantalla de Analysis, que a esa hora es otro dominio.
+          contactos: Array.isArray(mp.contactos) ? mp.contactos : [],
+          // Lo que se anotó al guardar, o sendtrack: si el mail ya salió, el CRM no lo repite.
+          mailYaEnviado: mp.mail_enviado === true || _env.dominios.has(String(f.domain || "").toLowerCase()),
         });
-        // Uno por uno y marcando al vuelo: si el lote se corta a la mitad, lo que ya entró
-        // NO se reenvía. Un duplicado en el CRM es más caro que reintentar el resto.
-        await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${f.id}`, {
-          method: "PATCH",
-          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
-                     "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ status: "validated", validated_at: new Date().toISOString(), validated_by: state.loginEmail }),
-        }).catch(() => {});
-        ok++;
       } catch (e) {
         fallaron.push(`${f.domain}: ${String(e.message || e).slice(0, 60)}`);
+        continue;
+      }
+      // Uno por uno y marcando al vuelo: si el lote se corta a la mitad, lo que ya entró
+      // NO se reenvía. Un duplicado en el CRM es más caro que reintentar el resto.
+      const marca = await _colaPatchPorEnviar(`id=eq.${encodeURIComponent(f.id)}`,
+        { status: "validated", validated_at: new Date().toISOString(), validated_by: state.loginEmail }, ctx);
+      if (!marca.ok) {
+        // Ya está en el CRM: no es un fallo ni un éxito limpio. La marca se reintenta sola y la
+        // fila deja de verse en la cola mientras tanto (ver _colaCargar).
+        await queuePendingMark(f.id, state.loginEmail);
+        marcaPendiente.push(`${f.domain} (${marca.error})`);
+      } else if (!marca.ids.length) {
+        cambiadasPorOtro.push(f.domain);
+      } else {
+        ok++;
       }
     }
     // Decir CUÁL falló, no solo cuántos: si el mail no puede señalar a nadie, el MB tiene que
-    // revisar los 40 a mano para encontrar los 2 que no entraron.
-    out.innerHTML = fallaron.length
-      ? `✅ ${ok} enviado(s) · ❌ ${fallaron.length} fallaron:<br>` + fallaron.slice(0, 6).map(x => `· ${x}`).join("<br>")
-      : `✅ Los ${ok} entraron a ADEQ.`;
-    out.style.color = fallaron.length ? "#fca5a5" : "#86efac";
+    // revisar los 40 a mano para encontrar los 2 que no entraron. Nada se saltea en silencio.
+    const lineas = [];
+    if (ok) lineas.push(`✅ ${ok} entraron a ADEQ.`);
+    if (marcaPendiente.length) lineas.push(`⚠️ ${marcaPendiente.length} entraron al CRM; la marca en la cola se reintenta sola:<br>${_colaLista(marcaPendiente)}`);
+    if (cambiadasPorOtro.length) lineas.push(`⚠️ ${cambiadasPorOtro.length} entraron al CRM, pero otro MB ya había cambiado la fila:<br>${_colaLista(cambiadasPorOtro)}`);
+    if (salteados.length) lineas.push(`⏭️ ${salteados.length} salteado(s):<br>${_colaLista(salteados)}`);
+    if (fallaron.length) lineas.push(`❌ ${fallaron.length} fallaron:<br>${_colaLista(fallaron)}`);
+    if (corte) lineas.push(`⛔ ${esc(corte)}`);
+    out.innerHTML = lineas.length ? lineas.join("<br>") : "No se mandó nada.";
+    out.style.color = (fallaron.length || corte) ? "#fca5a5"
+      : (salteados.length || marcaPendiente.length || cambiadasPorOtro.length) ? "#fbbf24" : "#86efac";
     btn.disabled = false;
     await _colaRefrescarContador();
     _colaPintar();
   });
 
+  // ── "QUITAR" DEVUELVE CADA FILA A DONDE ESTABA (2026-09-13) ───────────────────────────
+  // Antes: PATCH `status: "pending"` a todas, con el cartel "Quedan en Prospects como
+  // pendientes, no se borran". Un contactado volvía al pool como nuevo, un descartado volvía a
+  // verse, un sitio guardado sin pasar el filtro quedaba en manos del agente, y uno de menos de
+  // 350K se borraba a los 15 minutos contra lo que decía el cartel. La regla está en
+  // planSacarDeCola (modules/colaEstado.js) y el cartel dice a dónde va cada uno ANTES de confirmar.
   document.getElementById("btn-cola-borrar")?.addEventListener("click", async () => {
     const ids = _colaMarcados();
     const out = document.getElementById("cola-result");
     if (!ids.length) { out.textContent = "Marcá al menos uno."; out.style.color = "var(--muted)"; return; }
-    if (!confirm(`Sacar ${ids.length} de la cola? Quedan en Prospects como pendientes, no se borran.`)) return;
-    await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${ids.join(",")})`, {
-      method: "PATCH",
-      headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
-                 "Content-Type": "application/json", "Prefer": "return=minimal" },
-      body: JSON.stringify({ status: "pending" }),
-    }).catch(() => {});
-    out.textContent = `Se sacaron ${ids.length} de la cola.`; out.style.color = "var(--muted)";
+    const filas = ids.map(id => _colaFilas.find(x => String(x.id) === String(id))).filter(Boolean);
+    if (!filas.length) { out.textContent = "No encontré esas filas: cerrá y abrí la cola para refrescarla."; out.style.color = "var(--muted)"; return; }
+    out.textContent = "Revisando a dónde vuelve cada uno…"; out.style.color = "var(--muted)";
+    const _env = await dominiosConEnvioReciente((await ensureFreshToken()) || state.accessToken, filas.map(f => f.domain));
+    if (!_env.ok) {
+      out.textContent = `No pude consultar a quién ya se le escribió (${_env.error}): no se sacó nada, reintentá.`;
+      out.style.color = "#fca5a5"; return;
+    }
+    const plan = planSacarDeCola(filas, { contactados: _env.dominios, minTraffic: CONFIG.MIN_TRAFFIC, loginEmail: state.loginEmail });
+    if (!confirm(textoConfirmarSacar(plan, { minTraffic: CONFIG.MIN_TRAFFIC }))) { out.textContent = ""; return; }
+    const ctx = { refrescado: false };
+    const hechos = [], fallas = [];
+    for (const lote of plan.lotes) {
+      const r = await _colaPatchPorEnviar(`id=in.(${lote.ids.map(encodeURIComponent).join(",")})`, lote.body, ctx);
+      if (!r.ok) { fallas.push(`${lote.ids.length} no se pudieron sacar (${r.error})`); continue; }
+      hechos.push(...r.ids);
+      if (r.ids.length < lote.ids.length) fallas.push(`${lote.ids.length - r.ids.length} ya no estaban en la cola`);
+    }
+    out.textContent = textoResultadoSacar(hechos, filas.length, plan.grupoPorId, { minTraffic: CONFIG.MIN_TRAFFIC, fallas });
+    out.style.color = fallas.length ? "#fbbf24" : "var(--muted)";
     await _colaRefrescarContador(); _colaPintar();
   });
 
@@ -5456,6 +5615,16 @@ async function bindButtons() {
   // compartida: si mañana cambia un requisito y quedan dos copias, la cola se llena de
   // prospectos que Monday después rechaza, y el MB se entera recién al mandar el lote.
   function _validarProspectoMonday(res) {
+    // ── EL CRM PRIMERO, COMO EN EL BOTÓN VERDE (2026-09-13) ──────────────────────────────
+    // Este comentario prometía "EXACTAMENTE las del botón verde" y le faltaba la única que
+    // protege al negocio de afuera: el veredicto del CRM. Se AGREGA acá; el Guard #0 del botón
+    // verde queda donde está (el botón verde no usa esta función). El candado de verdad está en
+    // el lote, que vuelve a preguntar por cada sitio al mandar.
+    if (_crmBloquea()) {
+      res.textContent = _motivoBloqueoCrm(); res.className = "push-result error";
+      document.getElementById("duplicate-result")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return null;
+    }
     const v = getMondayFormValues();
     if (v.email && !isValidEmail(v.email) && !_esFormularioUrl(v.email)) {
       res.textContent = "❌ Invalid email format"; res.className = "push-result error"; return null;
@@ -5491,20 +5660,6 @@ async function bindButtons() {
     const orig = btn.textContent;
     btn.disabled = true; btn.textContent = "⏳ Guardando…";
     try {
-      const fila = {
-        domain: state.domain,
-        traffic: v.traffic,
-        geo: v.geo,
-        language: String(v.idioma ?? ""),
-        emails: v.email ? [v.email] : [],
-        pitch: v.pitch || "",
-        status: "por_enviar",
-        source: "manual_cola",
-        created_by: state.loginEmail,
-        // Lo que la tabla no tiene y Monday sí necesita, guardado tal cual para que el envío
-        // en lote no tenga que reconstruir nada ni volver a preguntarle al MB.
-        monday_payload: { estado: v.estado, fecha: v.fecha, ejecutivo: v.ejecutivo, idioma: v.idioma, traffic_text: formatTraffic(v.traffic), mail_enviado: v.mailEnviado },
-      };
       // ⚠️ EL DOMINIO ES ÚNICO EN LA TABLA (Maxi 2026-09-02).
       // El insert a secas reventaba con "duplicate key violates
       // toolbar_review_queue_domain_key" cada vez que el MB guardaba un sitio que YA estaba en
@@ -5519,40 +5674,57 @@ async function bindButtons() {
       //     invertir. El dato de origen es histórico: se conserva.
       //   · `created_at`: es la antigüedad real en el pool.
       // Por eso se mira primero y se actualiza sólo lo que el MB acaba de cargar.
-      const _prev = await fetch(
-        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(state.domain)}&select=id,status,source,monday_item_id`,
-        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` } },
-      ).then(x => x.ok ? x.json() : []).catch(() => []);
-      const _ya = Array.isArray(_prev) && _prev[0];
+      // 2026-09-13: se lee todo lo que la fila nueva tiene que respetar (estado anterior,
+      // tráfico, emails y sus fuentes) — la regla está en filaColaDesdeFormulario. Y si la
+      // lectura falla no se adivina "no existe": se dice.
+      const _prevR = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(state.domain)}&select=id,status,source,monday_item_id,monday_payload,validated_by,validated_at,suspect_reason,traffic,emails,email_sources`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` },
+          signal: AbortSignal.timeout(8000) },
+      );
+      const _prev = _prevR.ok ? await _prevR.json().catch(() => null) : null;
+      if (!Array.isArray(_prev)) throw new Error(`no pude leer si el sitio ya estaba en la tabla (${_prevR.ok ? "respuesta ilegible" : `HTTP ${_prevR.status}`})`);
+      const _ya = _prev[0] || null;
+      const fila = filaColaDesdeFormulario(v, {
+        prev: _ya, domain: state.domain, loginEmail: state.loginEmail,
+        esFormulario: _esFormularioUrl(v.email), geoLabel: GEO_LABEL,
+        contactos: _contactosAdicionales(), trafficTexto: formatTraffic(v.traffic),
+      });
 
-      let r;
-      if (_ya) {
-        delete fila.source;        // el origen es histórico, no se reescribe
-        delete fila.created_by;    // idem: quién lo dio de alta
-        r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${_ya.id}`, {
-          method: "PATCH",
-          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
-                     "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify(fila),
-        });
-      } else {
-        r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
-          method: "POST",
-          headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
-                     "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify(fila),
-        });
-      }
+      const r = _ya
+        ? await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${_ya.id}`, {
+            method: "PATCH",
+            headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                       "Content-Type": "application/json", "Prefer": "return=minimal" },
+            signal: AbortSignal.timeout(8000),
+            body: JSON.stringify(fila),
+          })
+        : await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue`, {
+            method: "POST",
+            headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`,
+                       "Content-Type": "application/json", "Prefer": "return=minimal" },
+            signal: AbortSignal.timeout(8000),
+            body: JSON.stringify(fila),
+          });
       if (!r.ok) throw new Error((await r.text()).slice(0, 160));
 
-      // Decir QUÉ pasó, no sólo que salió bien. El caso que importa es el tercero: si el
-      // prospecto ya había sido contactado, el MB tiene que saberlo ANTES de mandarlo, porque
-      // lo que sale del otro lado es un primer contacto. No se bloquea —él sabrá si lo está
-      // re-trabajando a propósito—, pero no puede pasar callado.
-      if (_ya && (_ya.status === "validated" || _ya.monday_item_id)) {
+      // Decir QUÉ pasó, no sólo que salió bien. No se bloquea —él sabrá si lo está re-trabajando
+      // a propósito—, pero lo que importa no puede pasar callado: que ya lo contactó OTRO (lo que
+      // sale del otro lado es un primer contacto) o que el sistema lo había descartado.
+      const aviso = avisoAlGuardarEnCola(_ya, { loginEmail: state.loginEmail });
+      if (aviso === "descartado") {
+        res.textContent = `📥 Guardado ⚠️ este sitio estaba descartado (${_ya.suspect_reason || "sin motivo anotado"}): si lo sacás de la cola vuelve a descartado`;
+        res.className = "push-result warn";
+      } else if (aviso === "contactado") {
         res.textContent = "📥 Guardado ⚠️ ojo: este dominio YA figura contactado — al mandarlo se actualiza la ficha, no se crea otra";
         res.className = "push-result warn";
-      } else if (_ya) {
+      } else if (aviso === "contactado_por_vos") {
+        res.textContent = "📥 Guardado — lo contactaste vos hoy y pasó a la cola";
+        res.className = "push-result ok";
+      } else if (aviso === "ya_en_cola") {
+        res.textContent = "📥 Actualizado — ya estaba en la cola";
+        res.className = "push-result ok";
+      } else if (aviso === "en_pool") {
         res.textContent = `📥 Guardado — ya estaba en Prospects (${_ya.source || "sin origen"}) y pasó a la cola`;
         res.className = "push-result ok";
       } else {
@@ -5561,7 +5733,8 @@ async function bindButtons() {
       }
       _colaRefrescarContador();
     } catch (e) {
-      res.textContent = "❌ No se pudo guardar: " + String(e.message || e).slice(0, 140);
+      const motivo = e?.name === "TimeoutError" ? "la base no contestó en 8 s" : String(e.message || e);
+      res.textContent = "❌ No se pudo guardar: " + motivo.slice(0, 140);
       res.className = "push-result error";
     }
     btn.disabled = false; btn.textContent = orig;
@@ -12227,6 +12400,9 @@ async function validateProspect(card, data, doSendEmail) {
   // el mail salía igual (Gmail usa su propio token) y recién moría el último paso con 401.
   await ensureFreshToken();
 
+  // Si el mail ya salió y lo que falla es lo de después (la carga al CRM), la card no puede volver
+  // a ofrecer "Push + Send Email": el segundo click le manda el mismo mail al mismo contacto.
+  let mailSalio = false;
   try {
     // 1. Carga en el CRM. El board es idempotente por dominio, así que da igual si el
     //    prospecto vino de Autopilot, de un CSV o del refresh: el mismo POST crea o pisa,
@@ -12272,56 +12448,96 @@ async function validateProspect(card, data, doSendEmail) {
       ).trimEnd();
       const bodyWithClosing = appendClosingIfMissing(stripped, lang);
       const fullBody  = bodyWithClosing + (signature ? "\n\n" + signature : "");
-      const result    = await sendEmail({ to: email, subject, body: fullBody, expectedFrom: state.loginEmail });
-      if (!result.ok) throw new Error(result.error || "Gmail error");
+
+      // ── EL ENVÍO DESDE LA TARJETA QUEDA REGISTRADO, IGUAL QUE EL DE ANALYSIS (2026-09-13) ──
+      // Esta puerta mandaba el mail sin fila en toolbar_agent_actions ni en toolbar_sendtrack:
+      //  · el lector de rebotes sólo reconoce como nuestras las direcciones de agent_actions, y
+      //    un rebote de Exchange (que no trae X-Failed-Recipients) se descartaba entero: la
+      //    dirección muerta nunca entraba a la lista de rebotados y se seguía usando;
+      //  · el aviso de rebote al CRM busca el sitio en sendtrack, y callaba;
+      //  · el candado de 30 días de saveToReviewQueue lee sendtrack y no veía este contacto;
+      //  · el parte contaba de menos los envíos manuales.
+      // Mismo orden que Analysis: la fila va ANTES del envío porque el píxel de apertura necesita
+      // su id; si Gmail rechaza, la fila se corrige a "failed" para no inflar el parte.
+      let trackingActionId = null;
+      let cuerpoPrincipal  = fullBody;
+      try {
+        const tr = await createManualSendTracking(state.accessToken, {
+          user_email:    state.loginEmail,
+          domain:        data.domain,
+          email_to:      email,
+          pitch_subject: subject,
+          language:      lang,
+          // Crudo: puede ser "apollo" o {source, url}. createManualSendTracking lo normaliza.
+          email_source:  (data.email_sources || {})[email.toLowerCase()],
+        });
+        if (tr.ok && tr.id) {
+          trackingActionId = tr.id;
+          cuerpoPrincipal  = `${fullBody}\n\n<img src="${CONFIG.SUPABASE_URL}/functions/v1/track-open?aid=${tr.id}" width="1" height="1" alt="" style="display:none" />`;
+        } else {
+          console.warn("[tracking] tarjeta: no se registró el envío antes de mandar:", tr.status, tr.error);
+        }
+      } catch (e) { console.warn("[tracking] tarjeta:", e.message); }
+
+      const result = await sendEmail({ to: email, subject, body: cuerpoPrincipal, expectedFrom: state.loginEmail });
+      if (!result.ok) {
+        if (trackingActionId) markManualSendFailed(state.accessToken, trackingActionId, result.error || "gmail error").catch(() => {});
+        throw new Error(result.error || "Gmail error");
+      }
+      mailSalio = true;
       incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
+      await saveSendDate(data.domain, { sendDate: new Date().toISOString().split("T")[0], pitch, email, mbEmail: state.loginEmail }).catch(() => {});
+      markReviewQueueAsContacted(state.accessToken, data.domain, state.loginEmail).catch(() => {});
 
-      // El mail salió: recién ahora la ficha puede decir que este prospecto fue contactado.
-      await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "" });
-      incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
-
-      // Maxi 2026-06-18: contactos adicionales se envían EN PARALELO día 0
-      // (no se encolan). Si el original rebota/OOO, bounce handler en worker
-      // actualiza Monday con el adicional que respondió bien.
-      const futSels = [".pcard-future-1", ".pcard-future-2", ".pcard-future-3"];
+      // ── LOS ADICIONALES VAN A LA COLA DEL WORKER, UNO POR MINUTO (2026-09-13) ─────────────
+      // Salían desde acá los cuatro juntos (la regla del user del 07/09 es "uno por minuto", y
+      // Analysis ya la cumplía), sin registro de envío. Ahora usan la misma cola que Analysis: el
+      // worker los manda, deja `future_sent`, escribe la fila de response_tracking (por eso se
+      // sacó el POST que había acá: contaría doble) y le avisa al CRM. El cuerpo va SIN el píxel
+      // del principal: copiado a otro buzón, contaría aperturas que no son del principal.
       const futStatusEl = card.querySelector(".pcard-future-status");
-      const sentMsgs = [];
-      const failMsgs = [];
-      for (const sel of futSels) {
-        const fe = card.querySelector(sel)?.value?.trim()?.toLowerCase();
-        if (!fe || !fe.includes("@")) continue;
-        if (fe === email.toLowerCase()) { failMsgs.push(`⏭️ ${fe} igual al principal`); continue; }
+      const candidatos = [".pcard-future-1", ".pcard-future-2", ".pcard-future-3"].map(sel => card.querySelector(sel)?.value || "");
+      const rebotados = new Set();
+      for (const fe of new Set(candidatos.map(c => c.trim().toLowerCase()).filter(c => c.includes("@") && c !== email.toLowerCase()))) {
         const bFut = await isEmailBounced(state.accessToken, fe).catch(() => ({ bounced: false }));
-        if (bFut.bounced) { failMsgs.push(`🚫 ${fe} bounced`); continue; }
-        const altRes = await sendEmail({ to: fe, subject, body: fullBody, expectedFrom: state.loginEmail });
-        if (altRes.ok) {
-          sentMsgs.push(fe);
-          incrementUserDailyCounter(state.accessToken, state.loginEmail, "emails").catch(() => {});
-          // Registrar en response_tracking
-          fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
+        if (bFut.bounced) rebotados.add(fe);
+      }
+      const { filas: adicionales, avisos } = adicionalesDeLaTarjeta({
+        domain: data.domain, mbEmail: state.loginEmail, principal: email, candidatos, rebotados,
+        subject, body: fullBody, ahoraMs: Date.now(),
+      });
+      let programados = true;
+      if (adicionales.length) {
+        // Si la cola falla hay que DECIRLO: el MB tiene que saber que esos mails no van a salir.
+        try {
+          const _r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_reengagement_queue`, {
             method: "POST",
             headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({
-              mb_email:      state.loginEmail.toLowerCase(),
-              domain:        data.domain,
-              email_sent_to: fe,
-              source:        "manual_extra",
-              geo:           geo,
-              category:      data.category || "",
-              sent_at:       new Date().toISOString(),
-            }),
-          }).catch(() => {});
-        } else {
-          failMsgs.push(`❌ ${fe}: ${altRes.error || "send fail"}`);
+            signal: AbortSignal.timeout(8000),
+            body: JSON.stringify(adicionales),
+          });
+          if (!_r.ok) throw new Error(`HTTP ${_r.status}`);
+        } catch (e) {
+          programados = false;
+          avisos.push(`❌ no se pudieron programar los adicionales (${e?.name === "TimeoutError" ? "la base no contestó" : e.message}) — mandalos a mano`);
         }
       }
-      if (futStatusEl && (sentMsgs.length || failMsgs.length)) {
+      const salieron = adicionales.length > 0 && programados;
+      if (futStatusEl && (adicionales.length || avisos.length)) {
         const parts = [];
-        if (sentMsgs.length) parts.push(`✅ Adicionales día 0: ${sentMsgs.join(", ")}`);
-        if (failMsgs.length) parts.push(`Problemas: ${failMsgs.join(" · ")}`);
+        if (salieron) parts.push(`⏱️ Adicionales programados (1 por minuto): ${adicionales.map(a => a.future_email).join(", ")}`);
+        if (avisos.length) parts.push(`Problemas: ${avisos.join(" · ")}`);
         futStatusEl.textContent = parts.join(" | ");
-        futStatusEl.style.color = failMsgs.length && !sentMsgs.length ? "#dc2626" : sentMsgs.length ? "#16a34a" : "#d97706";
+        futStatusEl.style.color = salieron ? (avisos.length ? "#d97706" : "#16a34a") : "#dc2626";
       }
+
+      // El mail salió: recién ahora la ficha puede decir que este prospecto fue contactado.
+      // Con SUS adicionales: sin `contactos`, enviarAlBoard leía los de la pantalla de Analysis
+      // (que a esa hora puede ser otro dominio) y las respuestas de los de la tarjeta quedaban
+      // huérfanas en el CRM.
+      await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "",
+                            contactos: contactosDeAdicionales(adicionales, { programados }) });
+      incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
     }
 
     // 3. Save to historial
@@ -12364,8 +12580,16 @@ async function validateProspect(card, data, doSendEmail) {
 
   } catch (err) {
     console.error("[Prospects validate]", err.message);
-    setResult("❌ " + err.message, false);
-    card.querySelectorAll("button").forEach(b => { b.disabled = false; });
+    if (mailSalio) {
+      // (2026-09-13) El envío ya quedó registrado (agent_actions + sendtrack) y la fila del pool se
+      // marcó contactada: lo que falta es la ficha. Se dice qué hacer y el botón de enviar queda
+      // apagado; el resto de la card sigue usable.
+      setResult(`✅ Mail enviado · ❌ la carga al CRM falló (${err.message}). NO lo vuelvas a mandar: cargalo desde Analysis.`, false);
+      card.querySelectorAll("button").forEach(b => { b.disabled = b.classList.contains("pcard-validate-expanded"); });
+    } else {
+      setResult("❌ " + err.message, false);
+      card.querySelectorAll("button").forEach(b => { b.disabled = false; });
+    }
   }
 }
 

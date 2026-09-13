@@ -275,6 +275,10 @@ export async function createManualSendTracking(accessToken, payload) {
   const url = CONFIG.SUPABASE_URL;
   const key = CONFIG.SUPABASE_ANON_KEY;
   if (!accessToken || !payload?.user_email) return { ok: false, error: "auth required" };
+  // La fuente llega en dos formas (2026-09-13): texto en Analysis ("apollo") y, desde la tarjeta
+  // de Prospects, el valor crudo de email_sources, que puede ser un objeto {source, url}. Un
+  // objeto escrito tal cual es el "[object Object]" que ensució el parte del 11/09.
+  const _fuente = typeof payload.email_source === "string" ? payload.email_source : (payload.email_source?.source || "");
   try {
     const res = await fetch(`${url}/rest/v1/toolbar_agent_actions`, {
       method: "POST",
@@ -289,7 +293,7 @@ export async function createManualSendTracking(accessToken, payload) {
         email_to:      payload.email_to || null,
         pitch_subject: payload.pitch_subject || null,
         details:       {
-          source:    payload.email_source || "manual",
+          source:    String(_fuente || "").toLowerCase() || "manual",
           ui_origin: "toolbar_manual",
           language:  payload.language || null,
         },
@@ -1385,6 +1389,37 @@ export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail }) 
     }
   }
   return { ok: false, error: "sin config" };
+}
+
+// ¿A cuáles de estos dominios ya se les escribió en los últimos N días? (2026-09-13)
+// La cola "Por enviar" anota `mail_enviado` en el momento de guardar, y ese dato queda viejo: el
+// flujo documentado es guardar y mandar el mail después. Con el dato viejo, "Quitar" devolvía a
+// Prospects un sitio ya contactado y "Enviar" le decía al CRM que mandara el inicial otra vez.
+// sendtrack es la prueba de envío que ya usa el candado de 30 días del agente.
+// ⚠️ Un fallo NO es "no hay envíos": devuelve ok:false y quien llama no sigue. "No pude
+// preguntar" tratado como "no le escribió nadie" es el error caro.
+export async function dominiosConEnvioReciente(accessToken, domains, { dias = 30, ahoraMs = Date.now() } = {}) {
+  const lista = [...new Set((domains || []).map(d => String(d || "").trim().toLowerCase()).filter(Boolean))];
+  const dominios = new Set();
+  if (!lista.length) return { ok: true, dominios };
+  const corte = new Date(ahoraMs - dias * 86_400_000).toISOString().slice(0, 10);
+  try {
+    for (let i = 0; i < lista.length; i += 100) {
+      const lote = lista.slice(i, i + 100).map(d => `"${d.replace(/"/g, "")}"`).join(",");
+      const res = await fetch(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=in.(${encodeURIComponent(lote)})&send_date=gte.${corte}&select=domain`,
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken || CONFIG.SUPABASE_ANON_KEY}` },
+          signal: AbortSignal.timeout(8000) },
+      );
+      if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+      const filas = await res.json().catch(() => null);
+      if (!Array.isArray(filas)) return { ok: false, error: "respuesta ilegible" };
+      for (const f of filas) if (f?.domain) dominios.add(String(f.domain).toLowerCase());
+    }
+    return { ok: true, dominios };
+  } catch (e) {
+    return { ok: false, error: e?.name === "TimeoutError" ? "no contestó en 8 s" : (e?.message || String(e)) };
+  }
 }
 
 // ── CSV Queue — batch de dominios a procesar por el auto-prospector ───
