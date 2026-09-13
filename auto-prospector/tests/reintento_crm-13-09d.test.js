@@ -14,10 +14,19 @@ import { ok, strictEqual, deepStrictEqual } from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { generateKeyPairSync } from "node:crypto";
 import { cargarWorker } from "./_worker-exportado.mjs";
 
-// lib/config.js se evalúa UNA vez por proceso: el secreto del CRM tiene que estar antes de la primera carga.
+// lib/config.js se evalúa UNA vez por proceso: el secreto del CRM y la cuenta de servicio de Gmail (R1b:
+// el scan de rebotes y el reintento) tienen que estar antes de la primera carga.
 process.env.CRM_SYNC_SECRET = process.env.CRM_SYNC_SECRET || "secreto-de-prueba";
+if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({
+    client_email: "reintento-test@falso.iam.gserviceaccount.com",
+    private_key: privateKey.export({ type: "pkcs8", format: "pem" }),
+  });
+}
 // Sin key de MillionVerifier la verificación devuelve true: el re-engagement (que exige "ok") corta antes de Gmail.
 delete process.env.MILLIONVERIFIER_API_KEY;
 
@@ -82,9 +91,155 @@ test("R1: el scan de rebotes resuelve el sitio una vez y lo usa para la lista y 
   const i = fn.indexOf("if (_esRebote) {");
   ok(i > 0, "no encontré la rama del rebote");
   const tramo = fn.slice(i, fn.indexOf("queueBounceRetry(token, userEmail, failed", i));
-  strictEqual((tramo.match(/_sitioDeLaDireccion\(/g) || []).length, 1, "con el respaldo son hasta dos consultas por llamada: se pedía dos veces");
+  // Desde R1b (abajo) el scan pide el ORIGEN (sitio + si es la principal); `_sitioDeLaDireccion` es su envoltorio.
+  strictEqual((tramo.match(/_(?:sitio|origen)DeLaDireccion\(/g) || []).length, 1, "con el respaldo son hasta dos consultas por llamada: se pedía dos veces");
   ok(/originalDomain: _sitio \|\| failed\.split\("@"\)\[1\]/.test(tramo));
   ok(/reportarReboteAlCrm\(token, \{ email: failed, originalDomain: _sitio,/.test(tramo));
+});
+
+// ── R1b. El rebote de un adicional o del 2º email no le vacía el Email al principal ─────────────────
+// El CRM (sync-toolbar) no compara `bounced_email` con la dirección cargada: vacía el Email, borra los
+// follow-ups y sube otro contacto como principal, o deja la ficha del agente sin email. Con el respaldo
+// de R1 esos rebotes encontraban su sitio y el aviso salía. La dirección se quema igual; el aviso al CRM
+// y el "email nuevo" del reintento son sólo para la principal.
+const CONFIG_CRM = [
+  { key: "crm_propio_enabled", value: "true" },
+  { key: "monday_bloqueados", value: JSON.stringify(Array.from({ length: 120 }, (_, i) => `bloqueado${i}.com`)) },
+  { key: "monday_bloqueados_at", value: new Date().toISOString() },
+];
+const esperar = (ms) => new Promise(r => setTimeout(r, ms));
+
+test("R1b: el origen separa 'de qué sitio es' de 'es la principal'", async () => {
+  const { _origenDeLaDireccion, _sitioDeLaDireccion } = await cargarWorker(["_origenDeLaDireccion", "_sitioDeLaDireccion"], { fetchFalso: true });
+  const reg = [];
+  const origen = async (o) => { globalThis.__fetchFalso = enrutadorSitio(reg, o); return _origenDeLaDireccion("t", "x@sitio.it"); };
+  deepStrictEqual(await origen({ st: [{ domain: "Sitio.it" }] }), { sitio: "sitio.it", via: "sendtrack", accion: null, principal: true },
+    "sendtrack lo escriben el agente, el popup y el reintento que reemplaza: siempre la principal");
+  for (const accion of ["future_sent", "secondary_sent"]) {
+    deepStrictEqual(await origen({ aa: [{ domain: "sitio.it", action: accion, details: {} }] }),
+      { sitio: "sitio.it", via: "agent_actions", accion, principal: false }, `${accion} sale a otra persona del sitio`);
+  }
+  for (const accion of ["sent", "re_sent", "bounce_retry_sent"]) {
+    strictEqual((await origen({ aa: [{ domain: "sitio.it", action: accion, details: {} }] })).principal, true, accion);
+  }
+  strictEqual((await origen({ aa: [{ domain: "sitio.it", action: "bounce_retry_sent", details: { principal: false } }] })).principal, false,
+    "el reintento que salió por un adicional tampoco es la dirección de la ficha");
+  deepStrictEqual(await origen({ st: "falla", aa: "falla" }), { sitio: "", via: "", accion: null, principal: null });
+  const q = reg.filter(u => u.includes("toolbar_agent_actions?email_to=eq.")).pop();
+  ok(/select=domain,action,details&/.test(q) && /[?&]limit=1(&|$)/.test(q), q);
+  globalThis.__fetchFalso = enrutadorSitio(reg, { aa: [{ domain: "sitio.it", action: "future_sent" }] });
+  strictEqual(await _sitioDeLaDireccion("t", "x@sitio.it"), "sitio.it", "quemar la dirección sigue necesitando sólo el sitio");
+});
+
+/** Un rebote en Gmail (con X-Failed-Recipients) y la base contestando el origen de la dirección. */
+function enrutadorScan(reg, o) {
+  return async (url, opts = {}) => {
+    const u = String(url), m = (opts.method || "GET").toUpperCase(), b = String(opts.body || "");
+    reg.push({ u, m, b });
+    if (u.includes("oauth2.googleapis.com")) return resp({ access_token: "falso", expires_in: 3600 });
+    if (u.includes("gmail.googleapis.com") && u.includes("messages?q=")) return resp({ messages: [{ id: o.msg }] });
+    if (u.includes("gmail.googleapis.com") && u.includes(`messages/${o.msg}?format=full`)) return resp({ payload: {
+      headers: [{ name: "X-Failed-Recipients", value: o.direccion }, { name: "Content-Type", value: "multipart/report; report-type=delivery-status" }],
+      body: { data: Buffer.from(`Delivery has failed to these recipients or groups:\n${o.direccion}\nRemote server returned '550 5.1.1 User unknown'`).toString("base64") },
+    } });
+    if (u.includes("toolbar_config")) return resp(CONFIG_CRM);
+    if (u.includes("toolbar_sendtrack?email=eq.")) return resp(o.st || []);
+    if (u.includes("toolbar_agent_actions?email_to=eq.")) return resp(o.aa || []);
+    if (u.includes("toolbar_frozen_leads?domain=eq.")) return resp([{ domain: "sitio.it" }]);   // el reintento corta ahí
+    if (m === "POST" && b.includes('"prospects"')) return resp({ ok: 1, errores: [], avisos: [] });
+    return resp([]);
+  };
+}
+
+test("R1b: en el scan, el rebote de un future_sent o un secondary_sent se quema sin aviso al CRM; el de la principal sí se avisa", async () => {
+  const casos = [
+    { nombre: "adicional del MB", direccion: "redaccion2@sitio.it", aa: [{ domain: "sitio.it", action: "future_sent", details: {} }], avisa: false },
+    { nombre: "2º email del agente", direccion: "mario.rossi@gmail.com", aa: [{ domain: "sitio.it", action: "secondary_sent", details: {} }], avisa: false },
+    { nombre: "principal del agente sin fila en sendtrack", direccion: "publicidad@sitio.it", aa: [{ domain: "sitio.it", action: "sent", details: {} }], avisa: true },
+    { nombre: "principal en sendtrack", direccion: "ventas@sitio.it", st: [{ domain: "sitio.it" }], avisa: true },
+  ];
+  for (const [i, c] of casos.entries()) {
+    const { scanBouncesForUser } = await cargarWorker(["scanBouncesForUser"], { fetchFalso: true });
+    const reg = [];
+    globalThis.__fetchFalso = enrutadorScan(reg, { ...c, msg: `rebote${i}` });
+    strictEqual(await scanBouncesForUser("t", MB), 1, c.nombre);
+    await esperar(100);   // el reintento y la acción salen sin await
+    const quemada = reg.find(r => r.m === "POST" && r.u.includes("toolbar_bounced_emails"));
+    ok(quemada && JSON.parse(quemada.b).email === c.direccion && JSON.parse(quemada.b).original_domain === "sitio.it",
+      `${c.nombre}: la dirección se quema con el sitio, sea principal o no`);
+    const alCrm = reg.filter(r => r.m === "POST" && r.b.includes('"prospects"'));
+    const detectado = reg.find(r => r.m === "POST" && r.u.includes("toolbar_agent_actions") && r.b.includes("bounce_detected"));
+    strictEqual(JSON.parse(detectado.b).details.principal, c.avisa, `${c.nombre}: queda dicho en la acción`);
+    if (c.avisa) {
+      strictEqual(alCrm.length, 1, c.nombre);
+      deepStrictEqual(JSON.parse(alCrm[0].b).prospects.map(p => [p.domain, p.bounced_email]), [["sitio.it", c.direccion]]);
+    } else {
+      // Ningún push: un `bounced_email` vacía el Email del principal, y uno sin email ni bounced_email
+      // marca la ficha como contacto por formulario.
+      strictEqual(alCrm.length, 0, `${c.nombre}: ${alCrm.map(r => r.b).join(" | ")}`);
+    }
+  }
+});
+
+/** Lo que el reintento necesita para llegar a mandar: el lead, la dirección que cargó el MB y Gmail. */
+const DOM_R = "medio-ejemplo.es";
+const PITCH = "Hola, te escribo porque vi el sitio y me pareció un medio con muy buena audiencia. Trabajamos con editores de toda la región ayudándolos a sumar ingresos por publicidad sin tocar la experiencia del lector. Si te interesa, te cuento en dos líneas cómo lo hacemos y qué resultados vienen teniendo sitios parecidos.\n\nSaludos";
+function enrutadorReintento(reg, o) {
+  return async (url, opts = {}) => {
+    const u = String(url), m = (opts.method || "GET").toUpperCase(), b = String(opts.body || "");
+    reg.push({ u, m, b });
+    if (u.includes("oauth2.googleapis.com")) return resp({ access_token: "falso", expires_in: 3600 });
+    if (u.includes("gmail.googleapis.com") && u.includes("/messages/send")) return resp({ id: "enviado" });
+    if (u.includes("gmail.googleapis.com")) return resp({});
+    if (u.includes("toolbar_config")) return resp(CONFIG_CRM);
+    if (u.includes("toolbar_sendtrack?email=eq.")) return resp(o.st || []);
+    if (u.includes("toolbar_agent_actions?email_to=eq.")) return resp(o.aa || []);
+    if (u.includes("/ficha?domain=")) return resp({ found: false });
+    if (u.includes("toolbar_review_queue?domain=eq.")) return resp([{ id: 5, monday_item_id: null, emails: [o.rebotada], email_sources: {},
+      category: "", traffic: 0, pitch: PITCH, pitch_subject: "Una consulta sobre publicidad", language: "es", geo: "" }]);
+    if (u.includes("toolbar_reengagement_queue?domain=eq.")) return resp(o.nueva ? [{ future_email: o.nueva }] : []);
+    if (m === "POST" && b.includes('"prospects"')) return resp({ ok: 1, errores: [], avisos: [] });
+    if (m === "POST" && u.includes("toolbar_agent_actions")) return resp([{ id: 77 }], { status: 201 });
+    return resp([]);
+  };
+}
+
+test("R1b: el reintento por el rebote de un adicional manda, pero no le cuenta al CRM la dirección nueva como si muriera el principal", async () => {
+  const casos = [
+    { nombre: "adicional", rebotada: `redaccion2@${DOM_R}`, nueva: `director@${DOM_R}`, aa: [{ domain: DOM_R, action: "future_sent", details: {} }], principal: false },
+    { nombre: "principal", rebotada: `info@${DOM_R}`, nueva: `publicidad@${DOM_R}`, st: [{ domain: DOM_R }], principal: true },
+  ];
+  for (const c of casos) {
+    const { queueBounceRetry } = await cargarWorker(["queueBounceRetry"], { fetchFalso: true });
+    const reg = [];
+    globalThis.__fetchFalso = enrutadorReintento(reg, c);
+    await queueBounceRetry("t", MB, c.rebotada, "hard");
+    ok(reg.some(r => r.m === "POST" && r.u.includes("/messages/send")), `${c.nombre}: el reintento sale igual: ${reg.map(r => r.u.split("?")[0].slice(-40)).join(" | ")}`);
+    const accion = reg.find(r => r.m === "POST" && r.u.includes("toolbar_agent_actions") && r.b.includes("bounce_retry_sent"));
+    ok(accion, `${c.nombre}: falta la acción del reintento`);
+    strictEqual(JSON.parse(accion.b).details.principal, c.principal, `${c.nombre}: si esta dirección rebota después, no se la toma por la principal`);
+    const alCrm = reg.filter(r => r.m === "POST" && r.b.includes('"prospects"')).flatMap(r => JSON.parse(r.b).prospects);
+    const sendtrack = reg.filter(r => r.m === "POST" && r.u.includes("toolbar_sendtrack"));
+    if (c.principal) {
+      deepStrictEqual(alCrm.map(p => [p.domain, p.email]), [[DOM_R, c.nueva]], "murió la principal: el CRM se entera del reemplazo");
+      strictEqual(sendtrack.length, 1);
+      strictEqual(JSON.parse(sendtrack[0].b).email, c.nueva);
+    } else {
+      deepStrictEqual(alCrm, [], "el principal sigue vivo: ni `email` nuevo (lo reemplaza) ni un push vacío (marca formulario)");
+      strictEqual(sendtrack.length, 0, "sendtrack es el registro de la principal: con esta fila, su próximo rebote vaciaría la ficha");
+    }
+  }
+});
+
+test("R1b: sin alternativa, el rebote de un adicional no avisa 'contacto agotado' (el principal está vivo)", () => {
+  const fn = cuerpoDe("queueBounceRetry");
+  ok(/const _origen = await _origenDeLaDireccion\(token, bouncedEmail\);/.test(fn));
+  ok(/const _eraPrincipal = _origen\.principal !== false;/.test(fn), "sin saber el origen se conserva lo de antes; sólo un 'no era la principal' cambia algo");
+  ok(/if \(_eraPrincipal\) \{\s*await pushToCrmPropio\(token, \{ domain, contacto_agotado: true \}/.test(fn), "contacto_agotado sólo cuando murió la principal");
+  ok(/if \(_eraPrincipal\) \{\s*await pushToCrmPropio\(token, \{\s*domain,\s*email: retryEmail,/.test(fn), "el email nuevo sólo reemplaza a la principal");
+  for (const m of fn.matchAll(/pushToCrmPropio\(/g)) {
+    ok(/if \(_eraPrincipal\) \{\s*await $/.test(fn.slice(Math.max(0, m.index - 60), m.index)), `un push al CRM sin la condición: ${fn.slice(m.index, m.index + 80)}`);
+  }
 });
 
 // ── R2. La vía de la dirección que rebotó ───────────────────────────────────────────────
