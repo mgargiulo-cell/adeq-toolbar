@@ -5988,7 +5988,26 @@ async function bindButtons() {
         return;
       }
 
-      const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+      // ── LO QUE YA ESTÁ EN CURSO NO SE VUELVE A ENCOLAR (2026-09-13) ─────────────────────
+      // Tomaba 15 al azar de los reciclables y los subía sin cruzar nada. uploadCsvDomains hace
+      // merge-duplicates: un dominio que ya esperaba en la cola se pisaba (y podía procesarse dos
+      // veces), y uno que ya estaba en Prospects pagaba ads.txt, scrape y búsqueda de email para
+      // terminar en "dup". Se cruza con la misma regla que el reciclado del worker (cola activa +
+      // Prospects pending + blocklist) ANTES de elegir, así el MB sigue recibiendo 15 útiles.
+      resultEl.textContent = `🔍 ${candidates.length} candidates, checking duplicates...`;
+      const { findKnownDomains } = await import("../modules/sellersJson.js");
+      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken,
+        candidates.map(c => String(c.domain || "").toLowerCase()).filter(Boolean), { mode: "reciclable" });
+      const _libres = candidates.filter(c => c.domain && !_known.has(String(c.domain).toLowerCase()));
+      const _yaEstaban = candidates.length - _libres.length;
+      if (_libres.length === 0) {
+        resultEl.textContent = `ℹ️ Los ${candidates.length} dominios con esos filtros ya estaban en cola o en Prospects. 0 para agregar — no es un error.`;
+        resultEl.className = "push-result";
+        btn.disabled = false; btn.textContent = "📤 Send to Queue";
+        return;
+      }
+
+      const shuffled = [..._libres].sort(() => Math.random() - 0.5);
       const selected = shuffled.slice(0, 15);
 
       listEl.innerHTML = selected.map((item, i) => `
@@ -5998,13 +6017,14 @@ async function bindButtons() {
           <span class="import-meta">${item.traffic ? esc(formatTraffic(item.traffic)) + " vis" : ""}</span>
         </div>`).join("");
 
-      resultEl.textContent = `Uploading ${selected.length} domains to queue...`;
+      const _notaYaEstaban = _yaEstaban ? ` · ${_yaEstaban} ya estaban en cola o en Prospects` : "";
+      resultEl.textContent = `Uploading ${selected.length} domains to queue${_notaYaEstaban}...`;
 
       // Maxi 2026-07-01: carga HUMANA (no feeder) → source "manual", NO "csv".
       // Diego se quejó: "sigue diciendo csv cuando no cargó csv". El default "csv" mentía.
       const upload = await uploadCsvDomains(selected.map(s => s.domain), state.loginEmail, state.accessToken, "manual");
 
-      { const r = formatUploadResult(upload, selected.length); resultEl.textContent = r.msg; resultEl.style.color = r.color; }
+      { const r = formatUploadResult(upload, selected.length); resultEl.textContent = r.msg + _notaYaEstaban; resultEl.style.color = r.color; }
       resultEl.className = "push-result ok";
 
     } catch (err) {
@@ -8485,13 +8505,14 @@ async function initCsvQueue() {
         resultEl.className = "push-result error";
         return;
       }
-      // Dedup against system — Maxi 2026-06-18: para Monday refresh solo
-      // chequeamos csv_queue activo + blocklist (NO review_queue cerrado,
-      // sendtrack, historial). Esos son del ciclo viejo que YA terminó
-      // (por eso está en "Ciclo Finalizado" en Monday). Re-prospectar = OK.
+      // Dedup against system — Maxi 2026-06-18: para Monday refresh NO se mira review_queue
+      // cerrado, sendtrack ni historial: son del ciclo viejo que YA terminó. Re-prospectar = OK.
+      // 2026-09-13: modo "reciclable", la regla del worker: cola activa (con next_day) + Prospects
+      // pending + blocklist. Antes un reciclable que ya esperaba en Prospects se re-encolaba y la
+      // cola lo procesaba entero para terminar en "dup".
       resultEl.textContent = `🔍 Found ${domains.length}, checking duplicates...`;
       const { findKnownDomains } = await import("../modules/sellersJson.js");
-      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains, { mode: "monday_refresh" });
+      const _known = await findKnownDomains(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY, state.accessToken, domains, { mode: "reciclable" });
       const _fresh = domains.filter(d => !_known.has(d));
       const _skippedKnown = domains.length - _fresh.length;
       if (_fresh.length === 0) {

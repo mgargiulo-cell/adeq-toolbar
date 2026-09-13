@@ -308,11 +308,19 @@ export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candid
   //    (uso desde "IMPORT MONDAY BOARD WEBSITES" → Ciclo Finalizado = querés
   //     re-prospectar aunque tenga sendtrack/historial viejo)
   let tables;
-  if (opts.mode === "monday_refresh") {
+  if (opts.mode === "reciclable" || opts.mode === "monday_refresh") {
+    // ── RECICLABLES: LA MISMA REGLA QUE EL WORKER (2026-09-13) ──────────────────────────
+    // Era "monday_refresh" y miraba sólo la cola activa sin next_day. Los dos botones que traen
+    // reciclables del CRM ("Send to Queue" y "Traer y encolar desde ADEQ") re-encolaban dominios
+    // que ya esperaban en Prospects: la cola los procesaba enteros (ads.txt, scrape, email, quizá
+    // Apollo) para terminar en "dup". Ahora es la regla canónica de dedup, igual que
+    // _dominiosActivosEnCola + _dominiosPendientesEnProspects del worker: cola activa + Prospects
+    // pending. Un rechazado o un validado viejo NO bloquea: el worker tampoco lo hace.
+    // "monday_refresh" queda como alias para no caer en "all" por un nombre viejo.
     tables = [
-      // Solo csv_queue activo (pending/processing) — evita duplicar job actual
-      { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool)" },
-      // Blocklist sí — no re-procesar dominios bloqueados aunque vengan de Monday
+      { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool,next_day)" },
+      { table: "toolbar_review_queue",  col: "domain", filter: "&status=eq.pending" },
+      // Blocklist sí — no re-procesar dominios bloqueados aunque vengan del CRM
       { table: "toolbar_url_blocklist", col: "domain", filter: "" },
     ];
   } else {
@@ -334,9 +342,11 @@ export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candid
     const inList = slice.map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
     await Promise.all(tables.map(async ({ table, col, filter }) => {
       try {
+        // Con reloj (2026-09-13): sin él, una tabla colgada dejaba el botón en "checking duplicates"
+        // para siempre. Si no contesta, se sigue sin ese filtro, igual que con un HTTP de error.
         const res = await fetch(
           `${supabaseUrl}/rest/v1/${table}?${col}=in.(${encodeURIComponent(inList)})&select=${col}${filter || ""}`,
-          { headers }
+          { headers, signal: AbortSignal.timeout(15000) }
         );
         if (!res.ok) return;
         const rows = await res.json();

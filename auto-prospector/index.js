@@ -1077,6 +1077,54 @@ async function promoteWaitlist(token) {
   }
 }
 
+// ── UNA FILA QUE VUELVE A PROSPECTS NO PUEDE TRAER LAS MARCAS DE SU VIDA ANTERIOR (2026-09-13) ──
+// saveToReviewQueue hace upsert por dominio: PostgREST pisa SOLO las columnas del payload y deja el
+// resto como estaba. Una fila rechazada por una purga volvía `pending` con `suspect_reject=true`: el
+// agente la salteaba para siempre, el pulido le seguía gastando y el MB la veía en Alert con un motivo
+// de otro momento. Y un lead de AutoGoogle congelado por el agente volvía etiquetado "agent" y firmado
+// por el MB: "altas por fuente" dejaba de contarlo y el filtro USUARIO lo mostraba como carga de él.
+//
+// Etiquetas que dicen "esto es un REINTENTO", no de dónde salió el lead. Con una de estas la fila
+// conserva su fuente y su firma. `monday_refresh` y los imports de una persona NO están: ahí pisar es
+// a propósito (el ejecutivo de la ficha, o el MB que lo trajo a mano).
+const _ETIQUETAS_DE_REINTENTO = new Set(["agent", "frozen_retry", "prospects_offline", "origen_desconocido", "bounce_retry", "agent_reengagement"]);
+// Marcas del worker que rechazan en el mismo paso: el filtro de entrada de hoy ya volvió a juzgar la
+// web, así que se limpian. `barrido:` sólo marca, no rechaza: si la fila terminó `rejected`, la
+// rechazó una persona y la marca se queda. Todo lo demás también se queda, porque no se puede
+// distinguir de un rechazo a mano: "mb: …", y el ❌ SIN motivo, que deja suspect_reject=true con la
+// razón vacía (rejectReviewItem). Esas vuelven a Alert para que el MB decida con ✓ o ❌.
+const _MARCA_AUTOMATICA_RE = /^(purge|urlpurge|envio|descongelado):/i;
+
+/**
+ * Qué hacer con la fila que ya existe para el dominio. Pura.
+ * @returns {{ devolver: null|"dup"|"en_cola_de_envio", extra: object }} `extra` se suma al payload.
+ * No toca validated_by/validated_at/rejected_at: son historia real y nada las lee junto a `pending`.
+ */
+function _ajustesDeReactivacion(prev, { source = "" } = {}) {
+  if (!prev || typeof prev !== "object") return { devolver: null, extra: {} };
+  const st = String(prev.status || "").toLowerCase();
+  if (st === "pending") return { devolver: "dup", extra: {} };
+  // `por_enviar` es la tanda de envío manual del MB: pasarla a pending la sacaba de su cola y el
+  // agente la podía mandar por segunda vez.
+  if (st === "por_enviar") return { devolver: "en_cola_de_envio", extra: {} };
+  const extra = {};
+  const razon = String(prev.suspect_reason || "").trim();
+  const automatica = _MARCA_AUTOMATICA_RE.test(razon) || (/^barrido:/i.test(razon) && st !== "rejected");
+  if ((prev.suspect_reject === true || razon) && automatica) {
+    Object.assign(extra, { suspect_reject: false, suspect_reason: null, suspect_checked_at: null });
+  }
+  const src = String(source || "").trim().toLowerCase();
+  if (_ETIQUETAS_DE_REINTENTO.has(src)) {
+    const prevSrc = String(prev.source || "").trim();
+    if (prevSrc && !_ETIQUETAS_DE_REINTENTO.has(prevSrc.toLowerCase())) extra.source = prevSrc;
+    if (String(prev.created_by || "").trim()) extra.created_by = prev.created_by;
+  }
+  // Re-prospectar un ciclo cerrado busca un contacto NUEVO: misma regla que _limpiarMarcaDeEmail, que
+  // cubre el reciclado del worker pero no el import de Monday desde la extensión.
+  if (src === "monday_refresh") Object.assign(extra, { email_intentos: 0, email_ultimo_intento: null, email_ultimo_motivo: null });
+  return { devolver: null, extra };
+}
+
 async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, language, category, contactName, contactNameSource = "", contactPhone, emails, emailSources = {}, pitch, pitchSubject, pitchSubjects, score, adNetworks, pageTitle, createdBy, source = "autopilot", mondayItemId = null }) {
   // Maxi 2026-06-18: GUARD EXPLÍCITO contra leads sin tráfico. Antes saveToReviewQueue
   // confiaba en que el caller filtraba. Pero rows con NaN/0 se colaban. Ahora se
@@ -1107,16 +1155,39 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   // Supabase dependía de un unique constraint que podría no existir → dups en
   // review_queue. Ahora chequeamos: si ya hay row pending con mismo domain,
   // skip insert (evita doble enriquecimiento + doble envío del agente).
+  // 2026-09-13: la consulta trae la fila en CUALQUIER estado, para saber qué arrastra si se reactiva
+  // (ver _ajustesDeReactivacion). Si falla, se vuelve a la consulta de siempre (sólo pending) y el
+  // upsert sale sin ajustes: nunca se pierde el lead ni el chequeo de duplicado.
+  let _ajustes = { devolver: null, extra: {} };
   try {
-    const dupRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=eq.pending&select=id,source,created_at&order=created_at.desc&limit=1`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
+    const _hdr = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    let dupRes = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,status,source,created_by,suspect_reject,suspect_reason&limit=1`,
+      { headers: _hdr }
+    ).catch(() => null);
+    let _soloPending = false;
+    if (!dupRes || !dupRes.ok) {
+      _soloPending = true;
+      dupRes = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=eq.pending&select=id,source,created_at&order=created_at.desc&limit=1`,
+        { headers: _hdr }
+      );
+    }
     if (dupRes.ok) {
       const dupRows = await dupRes.json();
       if (Array.isArray(dupRows) && dupRows.length > 0) {
-        log(`  ⏭️ saveToReviewQueue ${domain}: ya existe pending (id=${dupRows[0].id}, source=${dupRows[0].source || "?"}) — skip dup`);
-        return "dup";
+        _ajustes = _soloPending ? { devolver: "dup", extra: {} } : _ajustesDeReactivacion(dupRows[0], { source });
+        if (_ajustes.devolver === "dup") {
+          log(`  ⏭️ saveToReviewQueue ${domain}: ya existe pending (id=${dupRows[0].id}, source=${dupRows[0].source || "?"}) — skip dup`);
+          return "dup";
+        }
+        if (_ajustes.devolver === "en_cola_de_envio") {
+          log(`  ⏭️ saveToReviewQueue ${domain}: está en la cola 'Por enviar' de un MB (id=${dupRows[0].id}) — no se toca`);
+          return "en_cola_de_envio";
+        }
+        if (Object.keys(_ajustes.extra).length) {
+          log(`  ♻️ saveToReviewQueue ${domain}: reactiva fila ${dupRows[0].status} — ajusta ${Object.keys(_ajustes.extra).join(",")}`);
+        }
       }
     }
     // ── UN LEAD YA CONTACTADO NO PUEDE VOLVER A PROSPECTS (Maxi 2026-08-27) ────────────
@@ -1175,6 +1246,9 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
     created_by:     createdBy      || "",
     source,
     monday_item_id: mondayItemId,
+    // Si la fila ya existía: limpia la marca automática vieja, conserva fuente y firma de un
+    // reintento y resetea la búsqueda de email de un reciclado (2026-09-13, _ajustesDeReactivacion).
+    ..._ajustes.extra,
     status:         "pending",
   };
   // Maxi 2026-06-19 — INSERT AUTO-CURATIVO: si Postgres/PostgREST rechaza por una
@@ -17631,6 +17705,99 @@ function _backoffCongelado({ attemptFila = 0, errorMessage = "" } = {}) {
   return { prevFreeze, dias: prevFreeze === 0 ? 15 : prevFreeze === 1 ? 30 : 60, blocklist: prevFreeze >= 2, attemptNuevo: prevFreeze + 1 };
 }
 
+// ── CON QUÉ DATOS VUELVE UN LEAD QUE CONGELÓ EL AGENTE (2026-09-13) ─────────────────────────
+// Pura. `fila` = { source, created_by } de la fila de Prospects. El descongelador re-encola con estos
+// datos, así que definen si el reproceso es de worker (filtros GEO completos) o de una persona.
+//  - source: la fuente real del lead; si no hay o es una etiqueta de reintento, "frozen_retry".
+//  - uploadedBy: la persona que lo cargó a mano, si la firma es un mail real. Si no, el worker.
+//    En un reciclado del CRM la firma es el ejecutivo de la ficha, no quien lo cargó (misma regla
+//    que el parte: "la fuente manda sobre la firma"), así que vuelve como del worker.
+function _origenParaCongelar(fila) {
+  const src = String(fila?.source || "").trim();
+  const source = src && !_ETIQUETAS_DE_REINTENTO.has(src.toLowerCase()) ? src : "frozen_retry";
+  const firma = String(fila?.created_by || "").trim();
+  const esPersona = /^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(firma) && !/autofeeder|worker@|@backend/i.test(firma);
+  const reciclado = /monday|crm_recicl/i.test(source);
+  return { source, uploadedBy: esPersona && !reciclado ? firma : AGENT_UPLOADER };
+}
+
+// ── FILAS 'frozen' QUE NADIE VA A LIBERAR (2026-09-13) ──────────────────────────────────────
+// El agente pone la fila de Prospects en 'frozen' y la anota en toolbar_frozen_leads. El descongelador
+// la re-encola y BORRA esa anotación. Si el reproceso termina bien, el upsert la vuelve a pending. Si
+// la cola la descarta (sin ads.txt, no publisher, CRM activo) o falla, nadie la vuelve a tocar: queda
+// 'frozen' para siempre. El MB no la ve, el vigilante cuenta congelados desde toolbar_frozen_leads y
+// los feeders la dan por conocida. Mientras tanto el pulido no le busca email.
+// La regla es pura; el paso que la aplica corre en la vuelta del descongelador y no gasta APIs.
+const _COLA_EN_CURSO = new Set(["pending", "processing", "waiting_pool", "next_day"]);
+// Descartes que fueron culpa nuestra (API, cuota, base), no un veredicto sobre el dominio.
+const _SKIP_TRANSITORIO_RE = /traffic_api_transient|sin_cuota|freeze_failed|review_queue_insert_fail:http_/i;
+
+/** "dejar" | "rejected" | "pending" para una fila 'frozen' de Prospects. Pura. */
+function _destinoHuerfanoFrozen({ enFrozenLeads = false, csvStatus = null, csvError = "" } = {}) {
+  if (enFrozenLeads) return "dejar";                       // sigue congelada de verdad
+  const st = String(csvStatus || "").toLowerCase();
+  if (_COLA_EN_CURSO.has(st)) return "dejar";              // todavía se está evaluando
+  const err = String(csvError || "").trim();
+  // La cola ya dio un veredicto sobre el dominio: se aplica, como las purgas del worker.
+  if (st === "skipped" && err && !_SKIP_TRANSITORIO_RE.test(err)) return "rejected";
+  // error, expired, done, frozen sin anotación, sin fila, o un skip transitorio: nadie la va a
+  // reintentar. Vuelve a verse; el agente sólo la toma si tiene email.
+  return "pending";
+}
+
+const HUERFANOS_FROZEN_LOTE = 200;
+let _cursorHuerfanosFrozen = null;   // en memoria: un reinicio vuelve a empezar, y no importa
+
+/**
+ * Aplica _destinoHuerfanoFrozen a un lote de filas 'frozen' de Prospects. Tira si no puede leer
+ * ("no pude leer" nunca es "no había nada"). Devuelve { revisados, aPending, aRejected }.
+ */
+async function reconciliarHuerfanosFrozen(token) {
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const _cur = _cursorHuerfanosFrozen != null ? `&id=gt.${encodeURIComponent(_cursorHuerfanosFrozen)}` : "";
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.frozen${_cur}&select=id,domain&order=id.asc&limit=${HUERFANOS_FROZEN_LOTE}`, { headers });
+  if (!r.ok) throw new Error(`no se pudo leer los 'frozen' de Prospects (HTTP ${r.status})`);
+  const filas = await r.json();
+  if (!Array.isArray(filas)) throw new Error("respuesta inesperada al leer los 'frozen' de Prospects");
+  // Cursor: los congelados legítimos no pueden tapar para siempre a los huérfanos de más adelante.
+  _cursorHuerfanosFrozen = filas.length >= HUERFANOS_FROZEN_LOTE ? filas[filas.length - 1].id : null;
+  const res = { revisados: filas.length, aPending: 0, aRejected: 0 };
+  const lote = filas.filter(f => f && f.id != null && f.domain);
+  if (!lote.length) return res;
+
+  const inList = lote.map(f => `"${String(f.domain).replace(/"/g, '\\"')}"`).join(",");
+  const [rf, rc] = await Promise.all([
+    fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?domain=in.(${encodeURIComponent(inList)})&select=domain`, { headers }),
+    fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?domain=in.(${encodeURIComponent(inList)})&select=domain,status,error_message`, { headers }),
+  ]);
+  if (!rf.ok || !rc.ok) throw new Error(`no se pudo cruzar con congelados y cola (HTTP ${rf.status}/${rc.status})`);
+  const congelados = await rf.json(), cola = await rc.json();
+  if (!Array.isArray(congelados) || !Array.isArray(cola)) throw new Error("respuesta inesperada al cruzar con congelados y cola");
+  const enFrozen = new Set(congelados.map(x => String(x?.domain || "").toLowerCase()));
+  const porDominio = new Map(cola.map(x => [String(x?.domain || "").toLowerCase(), x]));
+
+  const ahora = new Date().toISOString();
+  for (const f of lote) {
+    const d = String(f.domain).toLowerCase();
+    const c = porDominio.get(d);
+    const destino = _destinoHuerfanoFrozen({ enFrozenLeads: enFrozen.has(d), csvStatus: c?.status ?? null, csvError: c?.error_message || "" });
+    if (destino === "dejar") continue;
+    const body = destino === "rejected"
+      ? { status: "rejected", suspect_reject: true, suspect_reason: `descongelado: ${c.error_message}`.slice(0, 200), rejected_at: ahora }
+      : { status: "pending" };
+    try {
+      // `status=eq.frozen`: si en el medio el reproceso la volvió a pending, no se pisa.
+      const p = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${encodeURIComponent(f.id)}&status=eq.frozen`, {
+        method: "PATCH",
+        headers: { ...headers, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify(body),
+      });
+      if (p.ok) { if (destino === "rejected") res.aRejected++; else res.aPending++; }
+    } catch {}
+  }
+  return res;
+}
+
 
 // ⚠️ El lookahead solo por la derecha protegía "software" pero NO "microsoft": un
 // "550 5.1.1 ... sent by Microsoft Exchange Server" quedaba como temporal y le seguíamos
@@ -23435,11 +23602,23 @@ async function runAgentCycle(token, allFlags) {
             if (failsToday >= 3) {
               // Mark lead as 'frozen' so agent query (status=pending) lo excluye.
               // Y agregalo a toolbar_frozen_leads para retry en 15d.
-              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-                method: "PATCH",
-                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-                body: JSON.stringify({ status: "frozen" }),
-              }).catch(() => {});
+              // ⚠️ EL CONGELADO SE DISFRAZABA DE IMPORT MANUAL (2026-09-13). Guardaba source "agent" y
+              // uploaded_by = el MB que corría el agente. El descongelador lo re-encola con esos datos y
+              // processCsvItem lo tomaba como import manual: salteaba la despriorización GEO y el cupo
+              // anglo, y el upsert pisaba la fuente real (AutoGoogle, similares) y la firma. Ahora se
+              // guarda el origen del lead (_origenParaCongelar). La consulta es de una fila y sólo corre
+              // al congelar. Se sigue con 15 días fijos: escalar leyendo attempt_count no sirve, porque
+              // el descongelador borra esa fila.
+              let _filaOrigen = null;
+              try {
+                const _ro = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}&select=source,created_by&limit=1`, {
+                  headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+                });
+                if (_ro.ok) { const _a = await _ro.json(); _filaOrigen = Array.isArray(_a) ? (_a[0] || null) : null; }
+              } catch {}
+              const _origen = _origenParaCongelar(_filaOrigen);
+              // Primero se anota el congelado y DESPUÉS cambia el estado: una fila 'frozen' sin pareja en
+              // toolbar_frozen_leads es lo que el reconciliador de huérfanos devuelve a Prospects.
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
                 method: "POST",
                 headers: {
@@ -23449,9 +23628,14 @@ async function runAgentCycle(token, allFlags) {
                 body: JSON.stringify({
                   domain, frozen_until: new Date(Date.now() + 15 * 86400_000).toISOString(),
                   attempt_count: 1, last_error: "no_email_3_attempts",
-                  source: "agent", uploaded_by: userEmail,
+                  source: _origen.source, uploaded_by: _origen.uploadedBy,
                   updated_at: new Date().toISOString(),
                 }),
+              }).catch(() => {});
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+                method: "PATCH",
+                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+                body: JSON.stringify({ status: "frozen" }),
               }).catch(() => {});
               log(`  🧊 ${domain}: 3 fails sin email → FREEZE 15d`);
             }
@@ -27684,6 +27868,19 @@ async function main() {
       } catch (e) {
         await saludPing(token, "unfreezer", { status: "fail", cadenciaMin: 15, detalle: e.message });
         log(`⚠️ unfreezer: ${e.message}`);
+      }
+      // ── Huérfanos 'frozen' (2026-09-13) ── filas de Prospects en 'frozen' sin anotación en
+      // toolbar_frozen_leads: la cola ya dio su veredicto y nadie lo aplicaba. Try propio: si falla
+      // no frena al descongelador, y su latido no se mezcla con el de él.
+      try {
+        const _h = await reconciliarHuerfanosFrozen(token);
+        const _resueltos = _h.aPending + _h.aRejected;
+        if (_resueltos) log(`🧊 Huérfanos frozen: ${_h.aPending} vuelven a Prospects, ${_h.aRejected} rechazados con el veredicto de la cola (de ${_h.revisados} revisados)`);
+        await saludPing(token, "huerfanos_frozen", { status: "ok", cadenciaMin: 15, real: _resueltos,
+          detalle: `${_h.revisados} revisados · ${_h.aPending} a pending · ${_h.aRejected} a rejected` });
+      } catch (e) {
+        await saludPing(token, "huerfanos_frozen", { status: "fail", cadenciaMin: 15, detalle: e.message });
+        log(`⚠️ huérfanos frozen: ${e.message}`);
       }
     }
 
