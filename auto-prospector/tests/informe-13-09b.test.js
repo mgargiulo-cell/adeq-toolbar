@@ -400,7 +400,7 @@ test("el resumen de salud: descartes de la cola que cuadran, stock sin email ent
   ok(comentario.endsWith("."), `cortado a la mitad: …${comentario.slice(-40)}`);
   // Stock sin email: el mismo número que "quedan N" y todos los leads con renglón.
   match(plano, /quedan 8 sin email/);
-  match(plano, /SIN EMAIL — hay 8 pendientes sin email \(lo acumulado, no es de hoy\): 6 ya tienen motivo del barrido de emails y 2 todavía no/);
+  match(plano, /SIN EMAIL — hay 8 pendientes sin email \(lo acumulado, no es de hoy\): 6 ya tienen un motivo anotado y 2 todavía no/);   // (13/09c) no todos los motivos son del barrido: agente, auditoría, Apollo
   match(plano, /· waf_nos_bloqueo → 2/);
   match(plano, /· otros motivos → 2/);
   // Salteados: eventos y dominios.

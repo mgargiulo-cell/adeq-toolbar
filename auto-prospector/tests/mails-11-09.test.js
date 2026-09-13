@@ -141,7 +141,8 @@ test("apolloQuemarCiclo le pide a la base los leads sin email, no los busca entr
   const fn = entre("async function apolloQuemarCiclo(", "// BARRIDO DE PROSPECTS");
   // 11/09: subir de 120 a 600 no alcanzó (salió UN candidato). Los de más tráfico casi siempre
   // ya tienen email; los que no tienen hay que pedirlos con el filtro en la consulta (13/09).
-  ok(/&emails=eq\.%5B%5D&limit=300/.test(fn), "los sin email se piden directo");
+  // 13/09c: la misma consulta, ahora de a páginas de 300 hasta llenar el presupuesto (ver apollo_marcas-13-09c).
+  ok(/&emails=eq\.%5B%5D&limit=\$\{_PAGINA\}&offset=/.test(fn) && /_PAGINA = 300/.test(fn), "los sin email se piden directo");
   ok(/real: intentos, esperado: Math\.min\(presupuesto, candidatos\.length\)/.test(fn), "y mide si gastó lo que podía, no si Apollo tenía a alguien");
   ok(/i \+= 150/.test(fn), "el caché de Apollo se consulta en lotes: una URL con cientos de dominios se pasaba de largo");
 });
