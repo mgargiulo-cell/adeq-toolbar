@@ -384,32 +384,48 @@ export async function queueReengagement(accessToken, payload) {
 // Chequea si un email está en toolbar_bounced_emails (lista global de
 // emails que ya rebotaron en cualquier MB). Si está, no se debe permitir
 // usarlo como destinatario — ni manual ni como future_email.
-// ⚠️ (2026-09-13) "NO PUDE PREGUNTAR" NO ES "NO REBOTÓ". Devolvía {bounced:false} ante un 401, un 500,
-// una respuesta ilegible o la red caída, y sin reloj: un pedido colgado dejaba la tarjeta en
-// "Processing…" y el lote en "Enviando 3 de 40…" para siempre, después de que el mail ya había salido.
-// Ahora: `ok: true` = la lista contestó (bounced dice la verdad); `ok: false` = no se sabe. La forma no
-// cambia para quien sólo mira `bounced`; quien manda a una dirección sin ojos humanos (el lote, los
-// adicionales) mira `ok` y no manda. El worker no vuelve a chequear los adicionales al despacharlos.
-export async function isEmailBounced(accessToken, email) {
+//
+// ⚠️ TRES RESPUESTAS, NO DOS (2026-09-13). Pedía `created_at`, una columna que la tabla no tiene (la
+// fecha es `bounced_at`, sql/2026-05-12_bounced_emails.sql): la base contestaba 400 a CADA consulta y
+// la función respondía "no rebotó". Desde el 03/09 ni Análisis, ni el lote de "Por enviar", ni los
+// adicionales frenaron a una dirección rebotada. Y un 400, un 500 o un reloj vencido tampoco son "no
+// rebotó": son "no pude preguntar", y ése es el error caro (mismo criterio que buscarEnCrm y
+// dominiosConEnvioReciente). Devuelve:
+//   · { bounced: true, reason, since }  — está en la lista: no se le escribe.
+//   · { bounced: false }                — se preguntó y no está.
+//   · { bounced: null, indeterminado: true, motivo, status? } — no se pudo preguntar. Quien llama NO
+//     manda a esa dirección y dice por qué; el botón queda usable para reintentar.
+// Un token vencido se renueva UNA vez con `renovarToken`, como en dominiosConEnvioReciente. `fetchImpl`
+// es para los tests.
+export async function isEmailBounced(accessToken, email, { renovarToken = null, reloj = 8000, fetchImpl = null } = {}) {
   const clean = String(email || "").trim().toLowerCase();
-  // No es un email (vacío o una URL de formulario): no hay nada que pueda haber rebotado.
-  if (!clean.includes("@")) return { bounced: false, ok: true };
-  if (!accessToken) return { bounced: false, ok: false, error: "sin sesión" };
+  if (!clean.includes("@")) return { bounced: false };
+  const url = `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?email=eq.${encodeURIComponent(clean)}&evidencia=in.(rebote_smtp,verificador,sin_clasificar)&select=email,reason,bounced_at&limit=1`;
+  const noSe = (motivo, status) => ({ bounced: null, indeterminado: true, motivo, ...(status ? { status } : {}) });
+  const renovar = async () => (typeof renovarToken === "function" ? await renovarToken().catch(() => null) : null);
   try {
-    const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?email=eq.${encodeURIComponent(clean)}&evidencia=in.(rebote_smtp,verificador,sin_clasificar)&select=email,reason,created_at&limit=1`,
-      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` },
-        signal: AbortSignal.timeout(8000) }
-    );
-    if (!res.ok) return { bounced: false, ok: false, status: res.status, error: `HTTP ${res.status}` };
-    const rows = await res.json().catch(() => null);
-    if (!Array.isArray(rows)) return { bounced: false, ok: false, error: "respuesta ilegible" };
-    if (rows.length > 0) {
-      return { bounced: true, ok: true, reason: rows[0].reason || "bounced", since: rows[0].created_at };
+    let token = accessToken || await renovar();
+    if (!token) return noSe("sin sesión en la base");
+    // El fetch real va escrito con su `signal` a la vista: el detector de esperas sin reloj del envío
+    // (tests/extension_envio-13-09c) lo lee así. `fetchImpl` es sólo para los tests.
+    const intentar = (tk) => {
+      const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${tk}` };
+      return fetchImpl
+        ? fetchImpl(url, { headers, signal: AbortSignal.timeout(reloj) })
+        : fetch(url, { headers, signal: AbortSignal.timeout(reloj) });
+    };
+    let res = await intentar(token);
+    if (res.status === 401 || res.status === 403) {
+      const nuevo = await renovar();
+      if (nuevo) res = await intentar(nuevo);
     }
-    return { bounced: false, ok: true };
+    if (!res.ok) return noSe(`la base contestó HTTP ${res.status}`, res.status);
+    const rows = await res.json().catch(() => null);
+    if (!Array.isArray(rows)) return noSe("respuesta ilegible de la base");
+    if (rows.length > 0) return { bounced: true, reason: rows[0].reason || "bounced", since: rows[0].bounced_at };
+    return { bounced: false };
   } catch (e) {
-    return { bounced: false, ok: false, error: e?.name === "TimeoutError" ? "no contestó en 8 s" : (e?.message || String(e)) };
+    return noSe(e?.name === "TimeoutError" ? `la base no contestó en ${Math.round(reloj / 1000)} s` : (e?.message || String(e)));
   }
 }
 

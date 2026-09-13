@@ -176,24 +176,28 @@ test("I21: todo lo que la tarjeta y Analysis esperan después de que salió el m
   }
 });
 
-test("I21: isEmailBounced dice 'no sé' (ok:false) cuando no pudo preguntar, y 'no rebotó' sólo con la lista en la mano", async () => {
-  const senales = [];
-  const pedir = (resp) => async (_u, o) => { senales.push(o?.signal); if (resp instanceof DOMException || resp instanceof Error) throw resp; return resp; };
+// Integración (13/09): lecturas_1000 (c5479c1) cerró este mismo contrato con tres respuestas —rebotó,
+// no rebotó, no se pudo preguntar— y con la columna real `bounced_at` (se pedía `created_at`, que la tabla
+// no tiene: la base contestaba 400 a todo y la extensión nunca frenó un rebotado). Las preguntas son las mismas.
+test("I21: isEmailBounced dice 'no sé' (indeterminado) cuando no pudo preguntar, y 'no rebotó' sólo con la lista en la mano", async () => {
+  const senales = [], urls = [];
+  const pedir = (resp) => async (u, o) => { urls.push(String(u)); senales.push(o?.signal); if (resp instanceof DOMException || resp instanceof Error) throw resp; return resp; };
   const r1 = await conFetch(pedir(vencido()), () => isEmailBounced("tk", "Ventas@Diario.com.mx"));
-  deepStrictEqual([r1.bounced, r1.ok, r1.error], [false, false, "no contestó en 8 s"], "un pedido que no contesta no es 'no rebotó'");
+  deepStrictEqual([r1.bounced, r1.indeterminado, r1.motivo], [null, true, "la base no contestó en 8 s"], "un pedido que no contesta no es 'no rebotó'");
   ok(senales[0] instanceof AbortSignal, "sin reloj, el pedido podía colgar la tarjeta y el lote para siempre");
+  ok(/select=email,reason,bounced_at/.test(urls[0]) && !/created_at/.test(urls[0]), `la tabla no tiene created_at: ${urls[0]}`);
   const r2 = await conFetch(pedir({ ok: false, status: 500 }), () => isEmailBounced("tk", "a@b.com"));
-  deepStrictEqual([r2.bounced, r2.ok, r2.status], [false, false, 500]);
+  deepStrictEqual([r2.bounced, r2.indeterminado, r2.status], [null, true, 500]);
   const r3 = await conFetch(pedir({ ok: true, status: 200, json: async () => { throw new Error("html de Cloudflare"); } }), () => isEmailBounced("tk", "a@b.com"));
-  deepStrictEqual([r3.bounced, r3.ok], [false, false], "una respuesta ilegible no es una lista vacía");
+  deepStrictEqual([r3.bounced, r3.indeterminado], [null, true], "una respuesta ilegible no es una lista vacía");
   const r4 = await conFetch(pedir({ ok: true, status: 200, json: async () => [] }), () => isEmailBounced("tk", "a@b.com"));
-  deepStrictEqual([r4.bounced, r4.ok], [false, true]);
-  const r5 = await conFetch(pedir({ ok: true, status: 200, json: async () => [{ reason: "550", created_at: "2026-09-01" }] }), () => isEmailBounced("tk", "a@b.com"));
-  deepStrictEqual([r5.bounced, r5.ok, r5.reason], [true, true, "550"]);
+  deepStrictEqual([r4.bounced, r4.indeterminado], [false, undefined]);
+  const r5 = await conFetch(pedir({ ok: true, status: 200, json: async () => [{ reason: "550", bounced_at: "2026-09-01" }] }), () => isEmailBounced("tk", "a@b.com"));
+  deepStrictEqual([r5.bounced, r5.reason, r5.since], [true, "550", "2026-09-01"]);
   const r6 = await isEmailBounced("", "a@b.com");
-  deepStrictEqual([r6.bounced, r6.ok], [false, false], "sin sesión tampoco se pudo preguntar");
+  deepStrictEqual([r6.bounced, r6.indeterminado], [null, true], "sin sesión tampoco se pudo preguntar");
   const r7 = await isEmailBounced("tk", "https://sitio.com/contacto");
-  deepStrictEqual([r7.bounced, r7.ok], [false, true], "una URL de formulario no es un email: no hay nada que haya rebotado");
+  deepStrictEqual([r7.bounced, r7.indeterminado], [false, undefined], "una URL de formulario no es un email: no hay nada que haya rebotado");
 });
 
 test("I21: sendtrack, el tracking y la marca de contactado llevan reloj y dicen cuando no entraron", async () => {
@@ -227,9 +231,11 @@ test("I21: el lote no carga una fila si no pudo preguntar si su email rebotó", 
   const [chequeo] = llamadas(h, "isEmailBounced");
   const [carga] = llamadas(h, "enviarAlBoard");
   ok(chequeo && carga, "no encontré el chequeo de rebote o la carga en el lote");
-  const corta = ifCon(h, "b.ok === false");
+  // Integración (13/09): con el contrato de tres respuestas, "no pude preguntar" corta el lote con el motivo
+  // (como cuando no contesta el CRM): lo que no se cargó queda en la cola para reintentar.
+  const corta = ifCon(h, "b.indeterminado");
   ok(corta && corta.start > chequeo.nodo.start && corta.start < carga.nodo.start, "'no pude preguntar' contaba como 'no rebotó' y la fila salía");
-  ok(contiene(corta.consequent, "ContinueStatement") && /fallaron\.push\(/.test(texto(corta.consequent)), "la fila tiene que figurar como fallada, con el motivo");
+  ok(contiene(corta.consequent, "BreakStatement") && /corte = /.test(texto(corta.consequent)), "el lote se frena y dice por qué");
   let respaldo = null;
   walk.full(h, (n) => {
     if (!respaldo && n.type === "CallExpression" && n.callee.type === "MemberExpression" && n.callee.object === chequeo.nodo && n.callee.property?.name === "catch") respaldo = n;
@@ -243,10 +249,11 @@ test("I21: en Analysis, sin respuesta de la lista de rebotados no sale el mail n
   const [envio] = llamadas(h, "sendEmail");
   ok(principal && adicional && envio, "no encontré los chequeos de rebote del botón de Gmail");
   ok(principal.nodo.start < envio.nodo.start && adicional.nodo.start > envio.nodo.start);
-  ok(/ensureFreshToken\(/.test(texto(principal.nodo.arguments[0])), "con un token vencido la lista 'no contesta': hace falta el token fresco antes");
-  const noSale = ifCon(h, "b.ok === false");
+  // El token fresco puede ir antes o como `renovarToken` (lo renueva una vez ante un 401/403).
+  ok(/ensureFreshToken\(/.test(principal.nodo.arguments.map(texto).join(", ")), "con un token vencido la lista 'no contesta': hace falta el token fresco");
+  const noSale = ifCon(h, "b.indeterminado");
   ok(noSale && noSale.start < envio.nodo.start && contiene(noSale.consequent, "ReturnStatement"), "sin saber si rebotó, el mail salía igual");
-  const noSePrograma = ifCon(h, "bFut.ok === false");
+  const noSePrograma = ifCon(h, "bFut.indeterminado");
   ok(noSePrograma && contiene(noSePrograma.consequent, "ContinueStatement"), "sin saber si rebotó, el adicional se programaba igual (el worker no vuelve a mirar)");
 });
 
@@ -254,10 +261,10 @@ test("I21: los adicionales de la tarjeta sin respuesta de la lista no se program
   const { filas, avisos } = adicionalesDeLaTarjeta({
     domain: "diario.com.mx", mbEmail: "mb@adeqmedia.com", principal: "publicidad@diario.com.mx",
     candidatos: ["ventas@diario.com.mx", "direccion@diario.com.mx", "prensa@diario.com.mx"],
-    rebotados: new Set(["prensa@diario.com.mx"]), sinConfirmar: new Set(["ventas@diario.com.mx"]), ahoraMs: AHORA,
+    rebotados: new Set(["prensa@diario.com.mx"]), sinConfirmar: new Map([["ventas@diario.com.mx", "la base no contestó en 8 s"]]), ahoraMs: AHORA,
   });
   deepStrictEqual(filas.map(f => [f.future_email, f.sequence]), [["direccion@diario.com.mx", 1]]);
-  ok(avisos.some(a => /ventas@diario\.com\.mx: no pude confirmar si rebotó/.test(a)), avisos.join(" · "));
+  ok(avisos.some(a => /ventas@diario\.com\.mx: no pude confirmar que no rebotó \(la base no contestó en 8 s\)/.test(a)), avisos.join(" · "));
   ok(avisos.some(a => /prensa@diario\.com\.mx bounced/.test(a)), avisos.join(" · "));
 });
 
@@ -310,13 +317,13 @@ function armarTarjeta({ rebote = async () => ({ bounced: false, ok: true }) } = 
 }
 
 test("I21: la tarjeta manda el principal y no programa el adicional cuya lista de rebotados no contestó", async () => {
-  const t = armarTarjeta({ rebote: async (e) => (e === "ventas@diario.com.mx" ? { bounced: false, ok: false, error: "no contestó en 8 s" } : { bounced: false, ok: true }) });
+  const t = armarTarjeta({ rebote: async (e) => (e === "ventas@diario.com.mx" ? { bounced: null, indeterminado: true, motivo: "la base no contestó en 8 s" } : { bounced: false }) });
   await t.correr();
   ok(t.log.includes("mail:publicidad@diario.com.mx"), t.log.join(" → "));
   strictEqual(t.fichas.length, 1);
   deepStrictEqual(t.fichas[0].contactos, [], "la ficha no puede anotar un adicional que no se programó");
   ok(!t.pedidos.some(p => p.tabla === "toolbar_reengagement_queue"), "el adicional sin respuesta de la lista se programaba igual");
-  ok(/no pude confirmar si rebotó/.test(t.card.querySelector(".pcard-future-status").textContent), t.card.querySelector(".pcard-future-status").textContent);
+  ok(/no pude confirmar que no rebotó/.test(t.card.querySelector(".pcard-future-status").textContent), t.card.querySelector(".pcard-future-status").textContent);
 });
 
 // enviarAlBoard, extraída con su reloj y ejecutada con un fetch falso.

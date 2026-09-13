@@ -481,3 +481,244 @@ test("ninguna lectura ordena por una columna que su tabla no tiene, y los rebote
   ok(revisadas >= 20, `se revisaron ${revisadas} lecturas con orden a tablas de sql/: el scan dejó de ver el código`);
   deepStrictEqual(fuera, [], "PostgREST contesta 400 a una columna que no existe: _traerTodo devuelve null y lo que dependía de la lista no corre. Si la columna se agregó desde el panel, dejar su ALTER en sql/");
 });
+
+// ── 10. Las columnas REALES de cada tabla: select, order y filtros ─────────────────────────────────
+// isEmailBounced (la extensión) le pedía a toolbar_bounced_emails `created_at`, que no existe (la fecha
+// es `bounced_at`). La base contestaba 400 a cada consulta y la función decía "no rebotó": el guard de
+// Análisis, el del lote de "Por enviar" y el de los adicionales no frenaron a nadie desde el 03/09. La
+// regla de la sección 9 no lo veía: sólo mira `order=`, sólo en tablas creadas en sql/, y lee la parte de
+// la URL que sigue a una interpolación pegada a lo anterior.
+//
+// COLUMNAS_REALES: las columnas que el código nombra en cada tabla, con su fuente. "GET 13/09" es un pedido
+// de SÓLO LECTURA `?select=<columnas>&limit=0` a la base: no trae filas; contesta 200 [] si todas existen y
+// 400 42703 si una no. Una columna nueva se agrega acá DESPUÉS de verificarla así (o con su CREATE/ALTER en
+// sql/). `noTiene`: nombres que parecen obvios, no existen, y ya rompieron una lectura.
+const COLUMNAS_REALES = {
+  toolbar_agent_actions:          { cols: "id action user_email domain email_to reason template_id details created_at", fuente: "GET 13/09" },
+  toolbar_autogoogle_attribution: { cols: "domain phrase injected_at", fuente: "sql/2026-07-16_autogoogle_qualified_yield.sql" },
+  toolbar_autopilot_feedback:     { cols: "id user_email domain action category geo traffic_bucket reason created_at", fuente: "GET 13/09" },
+  toolbar_bounce_retries:         { cols: "id domain monday_item_id mb_email original_email retry_email retry_source bounce_type attempt_number status original_action_id retry_action_id reason created_at updated_at", fuente: "sql/2026-05-13_bounce_retries.sql" },
+  toolbar_bounce_seen:            { cols: "msg_id seen_at", fuente: "sql/2026-07-17_bounce_seen.sql" },
+  toolbar_bounced_emails:         { cols: "email bounced_at reason original_action_id original_domain retry_attempted evidencia tipo detalle fuente", noTiene: "id created_at",
+                                    fuente: "sql/2026-05-12_bounced_emails.sql y sql/2026-09-03_evidencia_rebotes.sql; tipo, detalle y fuente los escribe markEmailBounced (GET 13/09)" },
+  toolbar_csv_queue:              { cols: "id domain status source uploaded_at uploaded_by processed_at error_message monday_item_id", noTiene: "updated_at", fuente: "GET 13/09" },
+  toolbar_diag_descartes:         { cols: "id domain motivo comentario created_at", fuente: "GET 13/09" },
+  toolbar_diag_sin_email:         { cols: "id domain motivo comentario fase created_at", fuente: "GET 13/09" },
+  toolbar_historial:              { cols: "id domain media_buyer email geo is_new page_views source date created_at", fuente: "GET 13/09" },
+  toolbar_keyword_yield:          { cols: "phrase searches found fresh qualified updated_at", fuente: "sql/2026-07-16_autogoogle_keyword_yield.sql; qualified: GET 13/09" },
+  toolbar_keywords:               { cols: "id phrase lang", fuente: "GET 13/09" },
+  toolbar_mv_results:             { cols: "id email result blocked created_at", fuente: "GET 13/09" },
+  toolbar_response_tracking:      { cols: "id agent_action_id mb_email domain email_sent_to source geo category sent_at responded_at response_type created_at", fuente: "sql/2026-06-18_response_tracking.sql" },
+  toolbar_review_queue:           { cols: "id domain status source traffic geo geos_all language category page_title ad_networks score emails email_sources email_found_at email_intentos email_ultimo_intento email_ultimo_motivo contact_name contact_phone pitch pitch_subject pitch_subjects monday_item_id monday_payload created_at created_by validated_at validated_by rejected_at suspect_checked_at suspect_reason suspect_reject", fuente: "GET 13/09" },
+  toolbar_sendtrack:              { cols: "domain email send_date", noTiene: "id", fuente: "GET 13/09" },
+  toolbar_traffic_cache:          { cols: "domain data fetched_at", noTiene: "id", fuente: "GET 13/09" },
+  toolbar_usage_sessions:         { cols: "id user_email started_at ended_at duration_sec", fuente: "GET 13/09" },
+};
+const columnasDe = (tabla) => new Set(COLUMNAS_REALES[tabla].cols.split(/\s+/));
+
+// Por qué alcanza cada orden de las lecturas de a páginas. Con Range, PostgREST pagina con LIMIT/OFFSET: si
+// el orden no es total, dos páginas pueden repetir o saltear filas. Alcanza con una clave única (sola o
+// al final), o con que quien llama use sólo el CONJUNTO de valores de la columna de orden: un empate entre
+// filas con el mismo valor no puede sacar ese valor del conjunto.
+const ORDEN_DE_A_PAGINAS = {
+  "toolbar_agent_actions|id":                         "id: clave (toolbar_bounced_emails.original_action_id la referencia)",
+  "toolbar_autogoogle_attribution|injected_at.asc,domain": "domain: clave primaria (sql/2026-07-16_autogoogle_qualified_yield.sql) desempata injected_at",
+  "toolbar_autopilot_feedback|id":                    "id: clave",
+  "toolbar_autopilot_feedback|created_at.desc,id":    "id desempata created_at",
+  "toolbar_bounce_retries|id":                        "id: identity primary key (sql/2026-05-13_bounce_retries.sql)",
+  "toolbar_bounce_seen|msg_id":                       "msg_id: clave primaria (sql/2026-07-17_bounce_seen.sql)",
+  "toolbar_bounced_emails|email":                     "email: clave primaria; la tabla NO tiene id (sql/2026-05-12_bounced_emails.sql)",
+  "toolbar_csv_queue|id":                             "id: clave (los PATCH y DELETE van por id=in.(...))",
+  "toolbar_csv_queue|uploaded_at.asc,id":             "id desempata uploaded_at",
+  "toolbar_csv_queue|uploaded_at.desc,id":            "id desempata uploaded_at",
+  "toolbar_diag_descartes|created_at.desc":           "informe: sólo busca un ejemplo con comentario; un empate exacto de created_at (microsegundos) cambia el ejemplo, no una decisión",
+  "toolbar_diag_sin_email|created_at.desc":           "informe: agrupa por motivo y muestra un ejemplo; mismo caso que diag_descartes",
+  "toolbar_historial|id":                             "id: clave",
+  "toolbar_historial|created_at.asc,id":              "id desempata created_at",
+  "toolbar_keyword_yield|phrase":                     "phrase: clave primaria (sql/2026-07-16_autogoogle_keyword_yield.sql)",
+  "toolbar_mv_results|id":                            "id: clave",
+  "toolbar_response_tracking|id":                     "id: bigserial primary key (sql/2026-06-18_response_tracking.sql)",
+  "toolbar_review_queue|id":                          "id: clave (los PATCH van por id=eq.)",
+  "toolbar_review_queue|created_at.desc,id.desc":     "id desempata created_at",
+  "toolbar_sendtrack|domain":                         "sin id; se escribe con merge-duplicates (una fila por dominio) y quien lee usa el conjunto de dominios",
+  "toolbar_traffic_cache|domain":                     "sin id; caché por dominio y quien lee usa el conjunto de dominios",
+  "toolbar_usage_sessions|id":                        "id: clave",
+};
+
+// Las columnas que nombra la parte de la URL que sigue al `?`: select (sin recursos embebidos ni alias),
+// order, filtros `col=op.valor` y las columnas dentro de or=/and=. PH marca una interpolación: lo que la
+// toca no se puede leer y se saltea, pero lo que sigue sí.
+const PH = String.fromCharCode(1);
+const _partirSelect = (s) => {
+  const out = []; let prof = 0, cur = "";
+  for (const ch of s) { if (ch === "(") prof++; if (ch === ")") prof--; if (ch === "," && prof === 0) { out.push(cur); cur = ""; } else cur += ch; }
+  out.push(cur);
+  return out;
+};
+const _OPERADORES = "eq|neq|gt|gte|lt|lte|like|ilike|is|in|cs|cd|ov|fts|plfts|phfts|wfts|match|imatch|isdistinct";
+const columnasDeQuery = (q) => {
+  const cols = [];
+  for (const par of String(q).split(/[&#\s]/)) {
+    const i = par.indexOf("=");
+    if (i < 0) continue;
+    const k = par.slice(0, i);
+    let v = par.slice(i + 1);
+    try { v = decodeURIComponent(v); } catch {}
+    if (!k || k.includes(PH)) continue;
+    if (k === "select") {
+      for (const it of _partirSelect(v)) {
+        if (/[()*]/.test(it) || it.includes(PH)) continue;
+        const c = it.replace(/^\s*\w+:(?!:)/, "").split(/->|::/)[0].trim();
+        if (c) cols.push(c);
+      }
+    } else if (k === "order") {
+      for (const it of v.split(",")) { if (it.includes(PH)) continue; const c = it.split(/->|\./)[0].trim(); if (c) cols.push(c); }
+    } else if (/^(not\.)?(or|and)$/.test(k)) {
+      for (const m of v.matchAll(new RegExp(`(?:^|[(,])(\\w+)(?:->>?\\w+)*\\.(?:not\\.)?(?:${_OPERADORES})\\.`, "g"))) cols.push(m[1]);
+    } else if (!/^(limit|offset|on_conflict|columns)$/.test(k)) {
+      const c = k.split("->")[0].trim();
+      if (/^\w+$/.test(c)) cols.push(c);
+    }
+  }
+  return [...new Set(cols.map(c => c.toLowerCase()))];
+};
+const urlsDelCodigo = () => {
+  const dir = (rel) => fs.readdirSync(path.join(RAIZ, rel)).filter(f => f.endsWith(".js")).map(f => `${rel}/${f}`);
+  const archivos = ["auto-prospector/index.js", "auto-prospector/discovery.js", "auto-prospector/templates.js",
+    ...dir("auto-prospector/lib"), ...dir("modules"), "popup/popup.js", ...dir("background")];
+  const out = [];
+  for (const rel of archivos) {
+    const ast = acorn.parse(leer(rel), { ecmaVersion: "latest", sourceType: "module", locations: true });
+    walk.fullAncestor(ast, (node, _s, anc) => {
+      let txt;
+      if (node.type === "Literal" && typeof node.value === "string") txt = node.value;
+      else if (node.type === "TemplateLiteral") txt = node.quasis.map(q => q.value.cooked ?? q.value.raw).join(PH);
+      else return;
+      const m = /\/rest\/v1\/(\w+)\?([\s\S]*)$/.exec(txt);
+      if (!m) return;
+      const padre = anc[anc.length - 2];
+      const deAPaginas = padre?.type === "CallExpression" && padre.arguments[0] === node
+        && /^_?traerTodo$/.test(padre.callee.name || padre.callee.property?.name || "");
+      out.push({ donde: `${rel}:${node.loc.start.line}`, tabla: m[1], query: m[2], deAPaginas,
+        orden: /(?:^|&)order=([^&\s#]+)/.exec(m[2])?.[1] || "" });
+    });
+  }
+  return out;
+};
+// Una base falsa que contesta como PostgREST a una columna que la tabla no tiene: 400 42703.
+const baseEstricta = (pedidos, contestar) => async (url, opts = {}) => {
+  const u = String(url);
+  pedidos.push({ u, auth: String(opts.headers?.Authorization || "") });
+  const m = /\/rest\/v1\/(\w+)\?(.*)$/.exec(u);
+  if (m && COLUMNAS_REALES[m[1]]) {
+    const falta = columnasDeQuery(m[2]).find(c => !columnasDe(m[1]).has(c));
+    if (falta) return resp({ code: "42703", message: `column ${m[1]}.${falta} does not exist` }, { status: 400 });
+  }
+  return contestar(u, opts);
+};
+
+test("extensión: isEmailBounced encuentra al rebotado contra una base que rechaza columnas inexistentes, y 'no pude preguntar' no es 'no rebotó'", async () => {
+  const S = await import("../../modules/supabase.js");
+  const antes = globalThis.fetch;
+  const rebotada = { email: "muerto@diario.com", reason: "550 No such user", bounced_at: "2026-09-10T10:00:00Z" };
+  const pedidos = [];
+  try {
+    globalThis.fetch = baseEstricta(pedidos, (u) => resp(decodeURIComponent(u).includes("email=eq.muerto@diario.com") ? [rebotada] : []));
+    const b = await S.isEmailBounced("tk", " Muerto@Diario.com ");
+    deepStrictEqual([b.bounced, b.since, b.reason], [true, rebotada.bounced_at, rebotada.reason],
+      `con select=...,created_at la base contestaba 400 y la función respondía "no rebotó": ${JSON.stringify(b)}`);
+    const v = await S.isEmailBounced("tk", "vivo@diario.com");
+    deepStrictEqual([v.bounced, Boolean(v.indeterminado)], [false, false], "se preguntó y no está: se puede usar");
+
+    // Un error de la base, un reloj vencido o una respuesta ilegible: no se sabe, y quien llama no manda.
+    for (const [que, falso] of [
+      ["HTTP 503", async () => resp({ message: "caído" }, { status: 503 })],
+      ["columna inexistente", async () => resp({ code: "42703" }, { status: 400 })],
+      ["reloj", async () => { throw Object.assign(new Error("The operation timed out"), { name: "TimeoutError" }); }],
+      ["respuesta ilegible", async () => resp({ no: "es una lista" })],
+    ]) {
+      globalThis.fetch = falso;
+      const r = await S.isEmailBounced("tk", "x@diario.com");
+      ok(r.indeterminado === true && r.bounced !== false && r.bounced !== true && r.motivo, `${que}: ${JSON.stringify(r)}`);
+    }
+
+    // Un token vencido se renueva una vez; sin sesión, tampoco se sabe.
+    const tokens = [];
+    let n = 0;
+    globalThis.fetch = async (_u, o) => { tokens.push(o.headers.Authorization); return ++n === 1 ? resp({ message: "JWT expired" }, { status: 401 }) : resp([]); };
+    const r = await S.isEmailBounced("viejo", "x@diario.com", { renovarToken: async () => "nuevo" });
+    deepStrictEqual([r.bounced, tokens], [false, ["Bearer viejo", "Bearer nuevo"]]);
+    ok((await S.isEmailBounced("", "x@diario.com")).indeterminado, "sin token no se puede preguntar");
+  } finally { globalThis.fetch = antes; }
+});
+
+test("toda URL a una tabla de la lista nombra columnas que la tabla tiene, y toda lectura de a páginas va a una tabla de la lista", () => {
+  const urls = urlsDelCodigo();
+  const fuera = [];
+  let revisadas = 0;
+  for (const u of urls) {
+    const t = COLUMNAS_REALES[u.tabla];
+    if (!t) {
+      if (u.deAPaginas) fuera.push(`${u.donde} ${u.tabla}: lectura de a páginas a una tabla sin lista de columnas — agregarla a COLUMNAS_REALES con su fuente`);
+      continue;
+    }
+    revisadas++;
+    const faltan = columnasDeQuery(u.query).filter(c => !columnasDe(u.tabla).has(c));
+    if (faltan.length) fuera.push(`${u.donde} ${u.tabla}: ${faltan.join(", ")} no está entre sus columnas (${t.fuente})`);
+  }
+  ok(revisadas >= 150, `se revisaron ${revisadas} URLs: el scan dejó de ver el código`);
+  for (const [tabla, t] of Object.entries(COLUMNAS_REALES)) {
+    for (const c of String(t.noTiene || "").split(/\s+/).filter(Boolean)) ok(!columnasDe(tabla).has(c), `${tabla} no tiene ${c}`);
+  }
+  deepStrictEqual(fuera, [], "PostgREST contesta 400 a una columna que no existe y la lectura se cae entera. Verificar la columna con un GET limit=0 (o su SQL) y recién ahí agregarla a COLUMNAS_REALES");
+});
+
+test("cada orden de las lecturas de a páginas tiene su justificación en ORDEN_DE_A_PAGINAS, y la tabla no tiene entradas muertas", () => {
+  const fuera = [];
+  const usadas = new Set();
+  for (const u of urlsDelCodigo().filter(x => x.deAPaginas && x.orden)) {
+    const clave = `${u.tabla}|${u.orden}`;
+    if (ORDEN_DE_A_PAGINAS[clave]) usadas.add(clave);
+    else fuera.push(`${u.donde} ${clave}: sin justificación (¿clave única al final, o sólo se usa el conjunto?)`);
+  }
+  deepStrictEqual(fuera, []);
+  deepStrictEqual(Object.keys(ORDEN_DE_A_PAGINAS).filter(k => !usadas.has(k)), [], "una entrada ya no se usa: sacarla");
+});
+
+test("todo llamador de isEmailBounced frena si no se pudo preguntar, y el lote de 'Por enviar' se corta", () => {
+  const dir = (rel) => fs.readdirSync(path.join(RAIZ, rel)).filter(f => f.endsWith(".js")).map(f => `${rel}/${f}`);
+  const fuera = [];
+  let llamadas = 0;
+  for (const rel of ["popup/popup.js", ...dir("modules"), ...dir("background")]) {
+    const src = leer(rel);
+    for (const m of src.matchAll(/\bisEmailBounced\(/g)) {
+      const linea = src.slice(src.lastIndexOf("\n", m.index) + 1, src.indexOf("\n", m.index));
+      if (/function isEmailBounced\(/.test(linea)) continue;
+      llamadas++;
+      const donde = `${rel}:${src.slice(0, m.index).split("\n").length}`;
+      const asig = /(?:const|let)\s+(\w+)\s*=\s*await isEmailBounced\(/.exec(linea);
+      if (!asig) { fuera.push(`${donde}: el resultado no se guarda en una variable`); continue; }
+      if (/\.catch\(/.test(linea)) fuera.push(`${donde}: un .catch que inventa una respuesta`);
+      const despues = src.slice(m.index, m.index + 700);
+      const iInd = despues.indexOf(`${asig[1]}.indeterminado`), iReb = despues.indexOf(`${asig[1]}.bounced`);
+      if (iInd < 0 || (iReb >= 0 && iReb < iInd)) fuera.push(`${donde}: no mira ${asig[1]}.indeterminado antes de ${asig[1]}.bounced`);
+    }
+  }
+  ok(llamadas >= 4, `encontré ${llamadas} llamadas`);
+  deepStrictEqual(fuera, [], "isEmailBounced devuelve indeterminado cuando no pudo preguntar: tratarlo como 'no rebotó' manda a direcciones muertas");
+  const popup = leer("popup/popup.js");
+  const iLote = popup.indexOf('getElementById("btn-cola-enviar")?.addEventListener');
+  const iCorte = popup.search(/if \(b\.indeterminado\) \{ corte = [^\n]*break; \}/);
+  ok(iLote > 0 && iCorte > iLote && iCorte < popup.indexOf("enviarAlBoard(", iLote), "sin respuesta de la lista de rebotados el lote se corta antes de cargar");
+});
+
+test("tarjeta: un adicional cuya consulta de rebote falló no se programa y el aviso dice por qué", async () => {
+  const { adicionalesDeLaTarjeta } = await import("../../modules/colaEstado.js");
+  const { filas, avisos } = adicionalesDeLaTarjeta({
+    domain: "diario.com", mbEmail: "mb@adeqmedia.com", principal: "a@diario.com",
+    candidatos: ["b@diario.com", "c@diario.com", "d@diario.com"], rebotados: new Set(["c@diario.com"]),
+    sinConfirmar: new Map([["d@diario.com", "la base contestó HTTP 503"]]), subject: "s", body: "b", ahoraMs: 0,
+  });
+  deepStrictEqual(filas.map(f => f.future_email), ["b@diario.com"], "ni el rebotado ni el que no se pudo confirmar se programan");
+  ok(avisos.some(a => /d@diario\.com: no pude confirmar que no rebotó \(la base contestó HTTP 503\)/.test(a)), avisos.join(" | "));
+});

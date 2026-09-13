@@ -5603,13 +5603,14 @@ async function bindButtons() {
       const dec = decidirLoteCrm({ dup, veredicto: vc, alGuardar: mp.crm_al_guardar || null, contactado });
       if (!dec.enviar) { salteados.push(`${f.domain}: ${dec.motivo}`); continue; }
       // Un email rebotado nunca se reusa: el lote no lo cambia por otro en silencio, lo saltea.
+      // (2026-09-13) Si la lista de rebotados no contesta se corta el lote, como cuando no contesta el CRM
+      // o la base: "no pude preguntar" no es "no rebotó", y seguir eran 300 filas × 8 s contra una base
+      // caída. Lo que no se cargó queda en la cola para reintentar.
       const email = emailDeCola(f);
       if (email && !_esFormularioUrl(email)) {
-        const b = await isEmailBounced(state.accessToken, email).catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
+        const b = await isEmailBounced(state.accessToken, email, { renovarToken: () => ensureFreshToken(Infinity) });
+        if (b.indeterminado) { corte = `No pude confirmar que ${email} no rebotó (${b.motivo}): se frenó el lote en ${f.domain}, reintentá.`; break; }
         if (b.bounced) { salteados.push(`${f.domain}: ${email} rebotó, elegí otro`); continue; }
-        // (2026-09-13) "No pude preguntar" contaba como "no rebotó" y la fila salía. Ahora falla con el
-        // motivo: el CRM le escribiría a una dirección que quizás ya rebotó.
-        if (b.ok === false) { fallaron.push(`${f.domain}: no pude confirmar si ${email} rebotó (${b.error || "sin respuesta"})`); continue; }
       }
       try {
         // ── AHORA VA AL CRM BOARD PROPIO, NO A MONDAY (Maxi 2026-09-02) ─────────────
@@ -6062,19 +6063,21 @@ async function bindButtons() {
     }
     // Guard anti-rebote: si el email ya está marcado como bounced en la DB
     // global, NO se permite enviarle. Evita re-contactar direcciones muertas.
-    // (2026-09-13) Y si la lista no contesta, tampoco se manda: "no pude preguntar" pasaba como "no rebotó"
-    // (un rebotado nunca se reusa). Token fresco antes, para que un JWT vencido no se lea como una caída.
-    const b = await isEmailBounced((await ensureFreshToken()) || state.accessToken, email)
-      .catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
-    if (b.bounced) {
-      res.textContent = `🚫 Cannot send: ${email} is in the bounced emails database (${b.reason || "bounced"}). Use a different address.`;
-      res.className   = "push-result error";
-      return;
-    }
-    if (b.ok === false) {
-      res.textContent = `⚠️ No pude confirmar en la lista de rebotados si ${email} rebotó (${b.error || "sin respuesta"}). No se envió: reintentá en un momento.`;
-      res.className   = "push-result error";
-      return;
+    // (2026-09-13) Sin respuesta de la base no se manda: "no pude preguntar" nunca es "no rebotó". El
+    // `catch {}` que envolvía esto dejaba pasar cualquier fallo. El botón todavía no se deshabilitó, así
+    // que se puede reintentar enseguida.
+    {
+      const b = await isEmailBounced(state.accessToken, email, { renovarToken: () => ensureFreshToken(Infinity) });
+      if (b.indeterminado) {
+        res.textContent = `⚠️ Not sent: I couldn't confirm that ${email} hasn't bounced (${b.motivo}). Try again in a moment.`;
+        res.className   = "push-result error";
+        return;
+      }
+      if (b.bounced) {
+        res.textContent = `🚫 Cannot send: ${email} is in the bounced emails database (${b.reason || "bounced"}). Use a different address.`;
+        res.className   = "push-result error";
+        return;
+      }
     }
     // Cap diario de emails enviados por usuario (admin lo configura)
     const can = await checkUserCanDo(state.accessToken, state.loginEmail, "send_email");
@@ -6192,10 +6195,10 @@ async function bindButtons() {
         // que es la firma clásica del spam. (Maxi 2026-08-28)
         if (_yaEnviados.has(futureEmail)) { failMsgs.push(`⏭️ ${futureEmail} repetido`); continue; }
         _yaEnviados.add(futureEmail);
-        const bFut = await isEmailBounced(state.accessToken, futureEmail).catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
+        // (2026-09-13) Sin respuesta de la lista de rebotados ese adicional no se programa, con el motivo.
+        const bFut = await isEmailBounced(state.accessToken, futureEmail, { renovarToken: () => ensureFreshToken(Infinity) });
+        if (bFut.indeterminado) { failMsgs.push(`⚠️ ${futureEmail}: no pude confirmar que no rebotó (${bFut.motivo}), no se programó`); continue; }
         if (bFut.bounced) { failMsgs.push(`🚫 ${futureEmail} bounced`); continue; }
-        // (2026-09-13) Sin respuesta de la lista no se programa: el worker lo despacha sin volver a mirarla.
-        if (bFut.ok === false) { failMsgs.push(`⚠️ ${futureEmail}: no pude confirmar si rebotó (${bFut.error || "sin respuesta"}), no se programó`); continue; }
         // ── UNO POR MINUTO, NO LOS CUATRO JUNTOS (2026-09-07, pedido del user) ────────────
         // Salían los cuatro (principal + 3) en el mismo minuto, con el mismo asunto y el mismo
         // cuerpo, desde el mismo remitente. Si los adicionales son del mismo dominio, el
@@ -10483,7 +10486,10 @@ async function renderProspectsEmptyState(listEl) {
   const [statsRes, flagsRes, csvCountRes] = await Promise.all([
     fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(auto_session_stats,auto_prospecting_enabled,csv_queue_enabled,auto_session_user,auto_heartbeat_at)&select=key,value`, { headers }),
     Promise.resolve(null), // placeholder
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=domain,status,source&limit=5&order=updated_at.desc.nullslast`, { headers }),
+    // (2026-09-13) Ordenaba por `updated_at`, que toolbar_csv_queue no tiene (es `uploaded_at`): la base
+    // contestaba 400 y el cartel nunca mostraba lo que la cola estaba procesando. `status.desc` pone
+    // "processing" antes que "pending", que es lo primero que el cartel busca.
+    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing)&select=domain,status,source&limit=5&order=status.desc,uploaded_at.desc,id.desc`, { headers }),
   ]);
 
   const cfgMap = {};
@@ -12770,13 +12776,13 @@ async function validateProspect(card, data, doSendEmail) {
       // del principal: copiado a otro buzón, contaría aperturas que no son del principal.
       const futStatusEl = card.querySelector(".pcard-future-status");
       const candidatos = [".pcard-future-1", ".pcard-future-2", ".pcard-future-3"].map(sel => card.querySelector(sel)?.value || "");
+      // (2026-09-13) Una consulta que falla no es "no rebotó": ese adicional no se programa (sinConfirmar).
       const rebotados = new Set();
-      // (2026-09-13) Si la lista de rebotados no contesta, el adicional no se programa (lo dice el cartel).
-      const sinConfirmar = new Set();
+      const sinConfirmar = new Map();
       for (const fe of new Set(candidatos.map(c => c.trim().toLowerCase()).filter(c => c.includes("@") && c !== email.toLowerCase()))) {
-        const bFut = await isEmailBounced(state.accessToken, fe).catch(e => ({ bounced: false, ok: false, error: e?.message || String(e) }));
-        if (bFut.bounced) rebotados.add(fe);
-        else if (bFut.ok === false) sinConfirmar.add(fe);
+        const bFut = await isEmailBounced(state.accessToken, fe, { renovarToken: () => ensureFreshToken(Infinity) });
+        if (bFut.indeterminado) sinConfirmar.set(fe, bFut.motivo);
+        else if (bFut.bounced) rebotados.add(fe);
       }
       const { filas: adicionales, avisos } = adicionalesDeLaTarjeta({
         domain: data.domain, mbEmail: state.loginEmail, principal: email, candidatos, rebotados, sinConfirmar,

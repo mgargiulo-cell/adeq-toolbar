@@ -309,10 +309,10 @@ export function textoResultadoSacar(hechos, total, grupoPorId, { minTraffic = 35
 // minuto, escribe `future_sent`, la fila de response_tracking y le avisa al CRM.
 // `body` es el cuerpo con firma y SIN el píxel del principal: un píxel copiado a otro buzón
 // contaría como apertura del principal.
-// `sinConfirmar`: direcciones para las que la lista de rebotados no contestó (2026-09-13). No se
-// programan: el worker las despacha sin volver a mirar la lista, y "no pude preguntar" no es "no rebotó".
+// `sinConfirmar` (Map email → motivo, 2026-09-13): las direcciones cuya consulta a la lista de rebotados
+// falló. "No pude preguntar" no es "no rebotó": no se programan y el aviso dice por qué.
 export function adicionalesDeLaTarjeta({ domain = "", mbEmail = "", principal = "", candidatos = [], rebotados = new Set(),
-  sinConfirmar = new Set(), subject = "", body = "", ahoraMs = Date.now() } = {}) {
+  sinConfirmar = new Map(), subject = "", body = "", ahoraMs = Date.now() } = {}) {
   const ppal = String(principal || "").trim().toLowerCase();
   const vistos = new Set([ppal]);
   const filas = [], avisos = [];
@@ -323,7 +323,11 @@ export function adicionalesDeLaTarjeta({ domain = "", mbEmail = "", principal = 
     if (vistos.has(fe)) { avisos.push(`⏭️ ${fe} repetido`); continue; }
     vistos.add(fe);
     if (rebotados && rebotados.has(fe)) { avisos.push(`🚫 ${fe} bounced`); continue; }
-    if (sinConfirmar && sinConfirmar.has(fe)) { avisos.push(`⚠️ ${fe}: no pude confirmar si rebotó, no se programó`); continue; }
+    if (sinConfirmar && sinConfirmar.has(fe)) {
+      const motivo = typeof sinConfirmar.get === "function" ? sinConfirmar.get(fe) : "";
+      avisos.push(`⚠️ ${fe}: no pude confirmar que no rebotó${motivo ? ` (${motivo})` : ""}, no se programó`);
+      continue;
+    }
     const orden = filas.length + 1;
     filas.push({
       domain, mb_email: String(mbEmail || "").toLowerCase(), original_email: ppal, future_email: fe,
