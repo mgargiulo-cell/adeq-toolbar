@@ -15569,7 +15569,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // (2026-09-13) `por_enviar` también: es un lead de Prospects que un MB pasó a su tanda de envío.
   // Con sólo `pending` se pagaba tráfico, Haiku y quizá Apollo para que al final saveToReviewQueue
   // dijera "en_cola_de_envio". Misma regla que _dominiosPendientesEnProspects.
-  if (!isManualImport) {
+  // (2026-09-13, integración) Vale también para el import manual del MB. La regla del 01/07 dice que un
+  // import manual no se re-rechaza por calidad, pero un sitio que YA está pendiente en Prospects no es un
+  // rechazo: saveToReviewQueue terminaba igual en "dup" (o "en_cola_de_envio") después de pagar tráfico,
+  // scrape, Haiku y quizá Apollo. El resultado es el mismo, sin el gasto; el MB lo encuentra en Prospects.
+  {
     try {
       const yaEsta = await fetch(
         `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=in.(pending,por_enviar)&select=id&limit=1`,

@@ -115,9 +115,23 @@ test("E1 processCsvItem de verdad: un item del worker cuyo dominio está en 'Por
   ok(!alertaDeBaseRota(reg), "sin alerta roja");
 });
 
-test("E1 processCsvItem de verdad: un import del MB (que no tiene chequeo previo) termina 'skipped' y sin alerta", async () => {
+test("E1 processCsvItem de verdad: un import del MB que llega a guardar con el sitio ya en 'Por enviar' termina 'skipped' y sin alerta", async () => {
   const domain = "otragacetadeprueba.com.pe";
   const reg = baseConPorEnviar(domain);
+  // Integración (13/09): el import del MB ahora también pasa por el chequeo previo (ya_estaba_en_prospects,
+  // tests/integracion-13-09.test.js). Para seguir probando la salida de saveToReviewQueue se simula la
+  // carrera real: el MB pasa el sitio a 'Por enviar' después del chequeo previo y antes de guardar.
+  const base = globalThis.__fetchFalso;
+  let previoVisto = false;
+  globalThis.__fetchFalso = async (url, opts = {}) => {
+    const u = String(url);
+    if (!previoVisto && u.includes("toolbar_review_queue?domain=eq.") && u.includes("select=id&limit=1")) {
+      previoVisto = true;
+      reg.push({ u, m: "GET", b: "" });
+      return resp([]);
+    }
+    return base(url, opts);
+  };
   await W.processCsvItem("t", { id: 302, domain, source: "csv", uploaded_by: "diego@adeqmedia.com", error_message: "" },
     { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
   const p = patchesDeCola(reg, 302);
