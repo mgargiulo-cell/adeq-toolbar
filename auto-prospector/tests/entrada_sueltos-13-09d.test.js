@@ -202,7 +202,10 @@ test("E3: los que llaman al scrape guardan google_contact para lo que trajo Goog
   match(auto, /googleSetAuto\.has\(lower\)[^\n]*\n[^\n]*source: "google_contact"/);
   const pulido = cuerpoDe("polishPool");
   match(pulido, /scrapeEmailsForDomain\(domain, \{[^}]*googleOut: _googleOut[^}]*\}\)/);
-  match(pulido, /foundSource = _googleOut\.has\(_le\) \? "google_contact"/);
+  // La vía de cada dirección se arma en _viaCrawl, que el pulido usa para sacar el webmail del registrante antes de
+  // rankear y para foundSource (revisión final del 13/09, tests/worker_final-13-09e.test.js B1).
+  match(pulido, /const _viaCrawl = \(e\) => \{[^\n]*_googleOut\.has\(_le\) \? "google_contact"/);
+  match(pulido, /foundSource = _viaCrawl\(foundEmail\);/);
   const rebote = cuerpoDe("queueBounceRetry");
   match(rebote, /scrapeEmailsForDomain\(domain, \{[^}]*googleOut: _google[^}]*\}\)/);
   match(rebote, /_google\.has\(l\) \? "google_contact"/);

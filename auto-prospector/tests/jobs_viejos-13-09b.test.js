@@ -180,7 +180,9 @@ test("el autopilot no aprende rubros ni países de los rechazos de la limpieza",
   const r = await getRejectionPatterns("t");
   deepStrictEqual(r.categories, { News: 1 });
   ok(urls[0].includes("status=eq.rejected"), urls[0]);
-  ok(urls[0].includes("suspect_reason.not.like.%22cleanup:*%22") && urls[0].includes("suspect_reason.is.null"),
+  // `ilike` desde la revisión final del 13/09: la regla de getRejectionPatterns compara sin mayúsculas y deja
+  // afuera más prefijos que cleanup: (tests/worker_final-13-09e.test.js, B3, la prueba con la tabla entera).
+  ok(/suspect_reason\.not\.i?like\.%22cleanup:\*%22/.test(urls[0]) && urls[0].includes("suspect_reason.is.null"),
      `los rechazos 'cleanup:' son por tráfico, no por rubro: ${urls[0]}`);
 });
 

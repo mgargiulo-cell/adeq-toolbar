@@ -430,8 +430,11 @@ test("el pulido deja el diagnóstico cuando encontró un email y la validación 
   });
   globalThis.__fetchFalso = r.fn;
   await polishPool("t");
+  // Desde la revisión final del 13/09 el motivo va en su propio PATCH, con el filtro que no pisa apollo_sin_contacto
+  // (tests/worker_final-13-09e.test.js, B4): se juntan los pedidos para leer lo que quedó en la fila.
   const p = patches(r.pedidos, 81).map(x => JSON.parse(x.b));
-  ok(p.some(x => x.email_ultimo_motivo === "validacion_descarto:scrape" && x.email_intentos === 3), JSON.stringify(p));
+  const fila = Object.assign({}, ...p);
+  ok(fila.email_ultimo_motivo === "validacion_descarto:scrape" && fila.email_intentos === 3, JSON.stringify(p));
   const diag = altasDiag(r.pedidos).filter(a => a.domain === DOM);
   strictEqual(diag.length, 1, "antes: la columna decía validacion_descarto y la tabla de diagnóstico no tenía nada");
   deepStrictEqual([diag[0].fase, diag[0].motivo, diag[0].intento], ["pulido", "validacion_descarto", 3], "el mismo motivo que la columna");

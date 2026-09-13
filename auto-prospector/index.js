@@ -6431,14 +6431,78 @@ async function saveApolloUsage(token, callsThisSession, today) {
   } catch {}
 }
 
+// ── EL AUTOPILOT APRENDE RUBROS SÓLO DE LOS RECHAZOS QUE JUZGAN EL RUBRO (2026-09-13, revisión final) ──
+// getRejectionPatterns cuenta las categorías de los últimos 150 rechazados y el autopilot le resta hasta 10
+// puntos a cada una. Sólo dejaba afuera `cleanup:` (tráfico), pero hay más rechazos que no dicen nada del
+// rubro: el descongelador de huérfanos frozen rechaza con `descongelado: <error de la cola>` por tráfico,
+// CRM activo, descanso o GEO; "Quitar" de la cola 'Por enviar' deja `cola: sacada_sin_filtro`; y la limpieza
+// diaria de los bloqueados del CRM, el sitio caído, el subdominio duplicado y los topes de tráfico llegan
+// como `purge:`, `urlpurge:` o `envio:`. Un cliente LIVE de noticias le restaba puntos a "noticias".
+// La regla es una tabla de prefijos, en minúscula y sin distinguir mayúsculas (la cola llegó a escribir
+// "Gigante_120M"). Gana el prefijo más largo que coincide; lo que no coincide con ninguno cuenta como antes:
+// el ❌ del MB con o sin motivo, `barrido:` y los veredictos de tipo (nonpub, sin ads.txt, url_<rubro>…).
+// No es una lista de los que SÍ cuentan: el ❌ del MB sin motivo conserva el suspect_reason que tenía la fila,
+// y la revisión de sospechosos escribe ahí `tipo detectado: <tipo>`, sin ninguno de estos prefijos. Con una
+// lista blanca, ese rechazo humano (y cualquier marca nueva de ese estilo) dejaría de enseñar sin avisar.
+// La blocklist cuenta igual por las dos vías (`purge: blocklist:` y `descongelado: blocked:`): corporativo,
+// gobierno y adulto son tipos; la lista del CRM y el TLD de país (geo-blacklist-tld) no.
+// La consulta a la base se arma con la MISMA tabla y un test compara las dos, fila por fila.
+// `cleanup:` va escrito: CLEANUP_PREFIJO se declara más abajo y leerlo al cargar el módulo tira
+// ReferenceError. Un test ata las dos puntas.
+const _RECHAZOS_Y_RUBRO = [
+  ["cleanup:", false],                                   // _cleanupPool: tráfico
+  ["cola:", false],                                      // colaEstado.js: sacada sin pasar el filtro
+  ["descongelado:", false],                              // la cola lo descartó por tráfico, CRM, descanso, GEO…
+  ["descongelado: not_publisher", true],                 //   …salvo los veredictos de tipo
+  ["descongelado: not_publisher: gigante", false],       //   (un not_publisher por tráfico no es un tipo)
+  ["descongelado: not_publisher: bajo_trafico", false],
+  ["descongelado: not_publisher: unreachable", false],   //   (ni el sitio caído de classifyPublisher)
+  ["descongelado: no_prospectable_tipo", true],
+  ["descongelado: category-blocked", true],
+  ["descongelado: blocked:", true],                      //   la blocklist fija, como `purge: blocklist:`
+  ["descongelado: blocked: crm-no-recontactar", false],  //   …salvo la lista del CRM
+  ["descongelado: blocked: geo-blacklist-tld", false],   //   …y el TLD de país
+  ["purge: crm_no_recontactar", false],                  // CRM_BLOQUEADOS_MOTIVO
+  ["purge: blocklist:crm-no-recontactar", false],        // la lista del CRM, vía isDomainBlockedFull
+  ["purge: blocklist:geo-blacklist-tld", false],         // GEO por TLD (isDomainBlocked)
+  ["purge: gigante", false],                             // tráfico
+  ["purge: bajo_trafico", false],
+  ["purge: unreachable", false],                         // sitio caído
+  ["purge: subdominio_duplicado_de:", false],            // duplicado
+  ["urlpurge: gigante", false],                          // classifyByUrlOnly por tráfico
+  ["urlpurge: bajo_trafico", false],
+  ["envio: gigante", false],
+  ["envio: bajo_trafico", false],
+];
+/** ¿Este suspect_reason de un rechazo le enseña algo del rubro al autopilot? Pura. */
+function _rechazoJuzgaElRubro(motivo) {
+  if (!motivo) return true;                              // el ❌ del MB sin motivo
+  const m = String(motivo).toLowerCase();
+  let largo = -1, cuenta = true;
+  for (const [prefijo, valor] of _RECHAZOS_Y_RUBRO) {
+    if (m.startsWith(prefijo) && prefijo.length > largo) { largo = prefijo.length; cuenta = valor; }
+  }
+  return cuenta;
+}
+// El mismo criterio en PostgREST: cada prefijo que no cuenta deja afuera sus filas, salvo las que coinciden con
+// uno más largo que sí cuenta (que a su vez tiene su propia cláusula si hay otro más largo que no).
+function _filtroRechazosQueJuzganElRubro() {
+  const patron = (p) => `%22${p.replace(/ /g, "%20")}*%22`;
+  const clausulas = _RECHAZOS_Y_RUBRO.filter(([, cuenta]) => !cuenta).map(([p]) => {
+    const salvo = _RECHAZOS_Y_RUBRO.filter(([q, c]) => c && q.length > p.length && q.startsWith(p)).map(([q]) => `suspect_reason.ilike.${patron(q)}`);
+    const fuera = `suspect_reason.not.ilike.${patron(p)}`;
+    return salvo.length ? `or(${[fuera, ...salvo].join(",")})` : fuera;
+  });
+  return `or=(suspect_reason.is.null,and(${clausulas.join(",")}))`;
+}
+
 async function getRejectionPatterns(token) {
   try {
-    // Sin los rechazos de la limpieza del pool (2026-09-13). _cleanupPool saca con status rejected
-    // lo que no tiene tráfico o está debajo de 350K; eso no dice nada del RUBRO ni del país, y el
-    // autopilot castiga categorías con esta cuenta. Sin el filtro, el descubrimiento cambiaba
-    // solo por rechazos de tráfico. (Antes esas filas se borraban y no llegaban acá.)
+    // Sin los rechazos que no juzgan el rubro (2026-09-13): la limpieza del pool por tráfico, y desde la
+    // revisión final también el descongelador, la cola 'Por enviar', el CRM y el sitio caído (ver
+    // _RECHAZOS_Y_RUBRO). El autopilot castiga categorías con esta cuenta.
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=category,geo&status=eq.rejected&or=(suspect_reason.is.null,suspect_reason.not.like.%22${CLEANUP_PREFIJO}*%22)&order=created_at.desc&limit=150`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=category,geo&status=eq.rejected&${_filtroRechazosQueJuzganElRubro()}&order=created_at.desc&limit=150`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
@@ -12941,14 +13005,17 @@ function _payloadConAviso(payload, aviso, fecha) {
 // Vaciaba con {emails: [], email_found_at: null} y sin motivo. En el stock sin email del informe el lead
 // caía en "todavía no buscado" aunque ya se le hubiera encontrado un email que después rebotó, justo lo
 // que ese renglón quería mostrar ("si la auditoría vacía de más"). Ahora escribe `auditoria_vacio:<por qué>`
-// (ya_reboto > otra_marca > basura_o_departamento), como reabrirLeadsRebotados escribe
+// (ya_reboto > registrante_webmail > otra_marca > basura_o_departamento), como reabrirLeadsRebotados escribe
 // todos_los_emails_rebotaron. Son dos PATCH: el motivo va sólo si el vaciado se aplicó, y con el filtro
 // del agente para no pisar `apollo_sin_contacto` (sin esa marca la quema volvería a pagar el lead). No
 // toca email_intentos ni email_ultimo_intento: el pulido lo toma con la espera que ya tenía.
+// registrante_webmail faltaba en la lista (2026-09-13, revisión final): un lead vaciado sólo por el gmail del
+// WHOIS quedaba "sin_email_valido", y con un email de otra marca al lado, "otra_marca". Va en el mismo orden
+// en que _planAuditoriaLead lo evalúa; un test exige que todo motivo de esa función esté en esta lista.
 function _pedidosVaciadoAuditoria(plan) {
   const ruta = `/rest/v1/toolbar_review_queue?id=eq.${encodeURIComponent(String(plan?.id))}`;
   const motivos = new Set((Array.isArray(plan?.malos) ? plan.malos : []).map(m => m?.motivo));
-  const motivo = ["ya_reboto", "otra_marca", "basura_o_departamento"].find(m => motivos.has(m)) || "sin_email_valido";
+  const motivo = ["ya_reboto", "registrante_webmail", "otra_marca", "basura_o_departamento"].find(m => motivos.has(m)) || "sin_email_valido";
   return [
     { ruta, body: { emails: [], email_found_at: null } },
     { ruta: `${ruta}&${_FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR}`, body: { email_ultimo_motivo: `auditoria_vacio:${motivo}` } },
@@ -13025,13 +13092,16 @@ async function auditarEmailsDelPool(token) {
     // entran en `planes`: no cuentan para el freno del 30% ni para real/esperado, y sólo avisan.
     const planes = [];
     const avisos = [];
-    let _tirados = 0, _reordenados = 0, _rebotados = 0, _otraMarca = 0, _basura = 0;
+    let _tirados = 0, _reordenados = 0, _rebotados = 0, _registrante = 0, _otraMarca = 0, _basura = 0;
     for (const lead of leads) {
       const { plan, malos, cambioOrden, aviso } = _planAuditoriaLead(lead);
       if (aviso) avisos.push({ lead, ...aviso });
       malos.forEach(m => {
         _tirados++;
         if (m.motivo === "ya_reboto") _rebotados++;
+        // El gmail del WHOIS con su propia cuenta (2026-09-13, revisión final): caía en "basura", y en la
+        // alerta del freno del 30% parecía una regla de ranking mal calibrada.
+        else if (m.motivo === "registrante_webmail") _registrante++;
         else if (m.motivo === "otra_marca") _otraMarca++;
         else _basura++;
       });
@@ -13087,7 +13157,7 @@ async function auditarEmailsDelPool(token) {
         cuerpo: `${_vaciarian} de ${leads.length} leads se quedarían sin ningún email válido.\n`
               + `Eso no parece un pool sucio, parece una regla mal calibrada (rankEmail o _brandMatches).\n`
               + `No toqué nada. Revisar antes de dejarla correr.`,
-        metadata: { lote: leads.length, vaciarian: _vaciarian, rebotados: _rebotados, otraMarca: _otraMarca, basura: _basura },
+        metadata: { lote: leads.length, vaciarian: _vaciarian, rebotados: _rebotados, registranteWebmail: _registrante, otraMarca: _otraMarca, basura: _basura },
       }).catch(() => {});
       await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 84 * 60, detalle: `freno de seguridad: vaciaría ${_vaciarian}/${leads.length}${avisos.length ? ` · ${_avisadosEnFreno}/${avisos.length} avisos en la cola por enviar` : ""}` });
       log(`🛑 auditoría de emails: vaciaría ${_vaciarian} de ${leads.length} — freno de seguridad, no aplico`);
@@ -13196,12 +13266,12 @@ async function auditarEmailsDelPool(token) {
     }
     await setConfigValue(token, "auditoria_emails_ultimo", JSON.stringify({
       fecha: _madridDateStr(), lote: leads.length, tirados: _tirados, rebotados: _rebotados,
-      otraMarca: _otraMarca, basura: _basura, reordenados: _reordenados, sinEmail: _dejadosSinEmail,
+      registranteWebmail: _registrante, otraMarca: _otraMarca, basura: _basura, reordenados: _reordenados, sinEmail: _dejadosSinEmail,
       buscadosMejor: _buscados, mejorados: _mejorados, avisosPorEnviar: _avisadosPorEnviar,
     })).catch(() => {});
     await saludPing(token, "auditoria_emails", {
       status: "ok", cadenciaMin: 84 * 60,
-      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_mejorados}/${_buscados} mejorados desde genérico · ${_dejadosSinEmail} sin contacto${avisos.length ? ` · ${_avisadosPorEnviar}/${avisos.length} avisos en la cola por enviar` : ""}`,
+      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_registrante} del registrante, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_mejorados}/${_buscados} mejorados desde genérico · ${_dejadosSinEmail} sin contacto${avisos.length ? ` · ${_avisadosPorEnviar}/${avisos.length} avisos en la cola por enviar` : ""}`,
       real: _aplicados, esperado: planes.length,
     });
     log(`📧 auditoría de emails: ${leads.length} leads revisados · ${_tirados} direcciones malas eliminadas · ${_dejadosSinEmail} leads quedaron sin email (polishPool les buscará otro)`);
@@ -13325,6 +13395,27 @@ function _armarPatchDeRescate({ lead, curEmails = [], foundEmail, foundSource, f
   return { patch, resultado: repetido ? "sin_novedad" : "descartado", elegido: "" };
 }
 
+// ── EL PULIDO NO PISA apollo_sin_contacto (2026-09-13, revisión final) ──────────────────────────
+// Si la quema de Apollo no puede anotar en el registro que Apollo contestó sin contacto, deja la marca de
+// respaldo `apollo_sin_contacto` en la columna, y es lo único que la frena de volver a pagar reveals por ese
+// dominio. El agente y la auditoría escriben el motivo con _FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR; el
+// pulido lo escribía con un PATCH por id sin filtro (la_web_no_publica_ningun_email, validacion_descarto:…),
+// y es justo el job que más pasa por los leads sin email, los candidatos de la quema. Ahora son dos PATCH,
+// como en _pedidosMarcaSinDireccion: lo demás (intentos, fecha, emails) va siempre; el motivo, sólo en la
+// fila que no tiene la marca, y lo resuelve la base aunque la quema escriba en el medio. Un motivo null (el
+// pulido eligió una dirección NUEVA) va en el mismo PATCH, como antes: levantar la marca con un contacto
+// nuevo es a propósito (_armarPatchDeRescate, que no cambia). Pura.
+function _pedidosPatchDelPulido(leadId, patch) {
+  const ruta = `/rest/v1/toolbar_review_queue?id=eq.${encodeURIComponent(String(leadId))}`;
+  const cuerpo = (patch && typeof patch === "object") ? patch : {};
+  if (typeof cuerpo.email_ultimo_motivo !== "string") return Object.keys(cuerpo).length ? [{ ruta, body: cuerpo }] : [];
+  const { email_ultimo_motivo, ...resto } = cuerpo;
+  return [
+    ...(Object.keys(resto).length ? [{ ruta, body: resto }] : []),
+    { ruta: `${ruta}&${_FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR}`, body: { email_ultimo_motivo } },
+  ];
+}
+
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
@@ -13343,6 +13434,18 @@ async function polishPool(token) {
   }
   _lastPolishRunAt = Date.now();
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  // Lo que el pulido escribe en un lead sale por _pedidosPatchDelPulido (2026-09-13, revisión final): el motivo
+  // va aparte y sólo si lo demás se aplicó, como el vaciado de la auditoría. Devuelve si quedó guardado.
+  const _patchLead = async (id, patch) => {
+    for (const p of _pedidosPatchDelPulido(id, patch)) {
+      const r = await fetch(`${SUPABASE_URL}${p.ruta}`, {
+        method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+        body: JSON.stringify(p.body), signal: AbortSignal.timeout(10000),
+      }).catch(() => null);
+      if (!r || !r.ok) return false;
+    }
+    return true;
+  };
   // Apollo capado, opcional (off si polish_use_apollo='false'). NUNCA RapidAPI.
   const useApollo = String(cfg.polish_use_apollo ?? "true") !== "false";
   const apollo_api_key = cfg.apollo_api_key;
@@ -13502,9 +13605,12 @@ async function polishPool(token) {
         // "Ya tiene contacto" = un rol comercial o una persona, con la clase con la que el agente elige
         // (esDecisor → claseDeEmail), no con la lista de genéricos (2026-09-13): un lead con sólo rrhh@,
         // informatique@ o redaccion@ quedaba como "con contacto" y el pulido no le buscaba a nadie.
+        // El webmail del registrante no es contacto (2026-09-13, revisión final): con fuente informer contaba como
+        // "ya tiene uno bueno" y en la pasada general nadie le buscaba un contacto real mientras estuviera en la ficha.
         const hasGood = !_marcado && curEmails.some(e => {
           const raw = srcMap[e.toLowerCase()];
           const src = (typeof raw === "string" ? raw : (raw?.source || "")).toLowerCase();
+          if (esRegistranteWebmail(e, src)) return false;
           if (src === "apollo" || src === "informer") return true;
           return esDecisor(e);
         });
@@ -13609,18 +13715,26 @@ async function polishPool(token) {
           // portal-islam.id publica `portalislam@yahoo.com` en texto plano en /contact, el
           // home linkea esa página, y el lead figura "no_encontrado" tras 2 intentos.
           // Sin este dato hay que ir a mano, sitio por sitio, a adivinar qué pasó.
+          // La vía de cada dirección, la misma que se guarda en email_sources. Lo que trajo la búsqueda en Google
+          // del scrape es google_contact, como el respaldo de abajo (13/09).
+          const _viaCrawl = (e) => { const _le = String(e || "").toLowerCase(); return _googleOut.has(_le) ? "google_contact" : _socialOut.has(_le) ? "social" : (_informerOut.has(_le) ? "informer" : "scrape"); };
+          // ── EL WEBMAIL DEL REGISTRANTE TAMPOCO ES UN HALLAZGO DEL PULIDO (2026-09-13, revisión final) ──────
+          // informer sólo se consulta cuando el sitio no dio nada, y el gmail del WHOIS puntúa 65: el pulido lo
+          // guardaba como rescate (email_found_at, intentos en 0), el agente no le escribía (informer_webmail) y
+          // la auditoría lo vaciaba. En la pasada siguiente se repetía: el parte sumaba un rescate falso por vuelta
+          // y la espera nunca crecía. Sale antes de rankear, con la regla de la entrada (esRegistranteWebmail con
+          // la vía real), y queda en los rechazados del diagnóstico para que el motivo diga qué se descartó.
+          const _esDelRegistrante = (e) => esRegistranteWebmail(e, _viaCrawl(e));
           const _todos = scraped.map(e => ({ email: e, score: rankEmail(e, domain, lead.category, _casasOut) }));
-          const ranked = _todos.filter(r => r.score > 0).sort((a, b) => b.score - a.score);
+          const ranked = _todos.filter(r => r.score > 0 && !_esDelRegistrante(r.email)).sort((a, b) => b.score - a.score);
           _diagEmail = {
             crudos: scraped.length,
-            rechazados: _todos.filter(r => r.score <= 0).map(r => r.email).slice(0, 3),
+            rechazados: _todos.filter(r => r.score <= 0 || _esDelRegistrante(r.email)).map(r => r.email).slice(0, 3),
           };
           const _elegidoCrawl = _marcado ? await _primeroNuevo(ranked.map(r => r.email)) : (ranked[0]?.email || null);
           if (_elegidoCrawl) {
             foundEmail = _elegidoCrawl;
-            const _le = foundEmail.toLowerCase();
-            // Lo que trajo la búsqueda en Google del scrape es google_contact, como el respaldo de abajo (13/09).
-            foundSource = _googleOut.has(_le) ? "google_contact" : _socialOut.has(_le) ? "social" : (_informerOut.has(_le) ? "informer" : "scrape");
+            foundSource = _viaCrawl(foundEmail);
           }
         }
         // ── APOLLO TAMBIÉN PARA MEJORAR UN GENÉRICO (Maxi 2026-08-24) ──────────
@@ -13786,13 +13900,10 @@ async function polishPool(token) {
           const merged = foundEmail ? [foundEmail, ..._extraRol, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())] : [];
           const validados = foundEmail ? await validateEmailsBatch(merged) : [];
           const { patch: _patch, resultado } = _armarPatchDeRescate({ lead, curEmails, foundEmail, foundSource, foundName, extraRol: _extraRol, validados, foundPhone });
-          if (Object.keys(_patch).length) {
-            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-              method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify(_patch),
-            });
-          }
-          if (resultado === "rescatado" || resultado === "enriquecido") enriched++;
+          // El motivo va aparte, con el filtro que no pisa apollo_sin_contacto (_pedidosPatchDelPulido, 13/09), y
+          // un rescate cuenta sólo si quedó guardado.
+          const _guardado = await _patchLead(lead.id, _patch);
+          if (_guardado && (resultado === "rescatado" || resultado === "enriquecido")) enriched++;
           else if (resultado === "descartado") {
             if (_patch.email_ultimo_motivo) {
               sinEmail++;
@@ -13824,9 +13935,9 @@ async function polishPool(token) {
           // directa de los ~310 leads sin email estancados. Ahora se registra el intento
           // para poder reintentar con backoff en vez de darlo por perdido.
           sinEmail++;
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({
+          // La espera cuenta siempre; el motivo va en su propio PATCH, con el filtro que no pisa la marca de
+          // respaldo apollo_sin_contacto (_pedidosPatchDelPulido, 2026-09-13, revisión final).
+          await _patchLead(lead.id, {
               email_intentos: (lead.email_intentos || 0) + 1,
               email_ultimo_intento: new Date().toISOString(),
               // El motivo REAL, no una etiqueta genérica. Distingue los tres casos que
@@ -13842,8 +13953,7 @@ async function polishPool(token) {
               // no existía. Ahora el motivo sale de `_crawlStats`, que cuenta lo que de verdad
               // ocurrió, en vez de asumirlo.
               email_ultimo_motivo: _motivoSinEmail(_diagEmail, _crawlStats),
-            }),
-          }).catch(() => {});
+          });
           // Queda el rastro COMPLETO en su propia tabla: la columna del lead se pisa en cada
           // intento y se pierde la historia. Acá se puede agrupar y verificar a mano.
           const _mot = _motivoSinEmail(_diagEmail, _crawlStats).split(":")[0];
@@ -20599,7 +20709,13 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       const viaDe = new Map();
       const _anotar = (e, via) => {
         const l = String(e || "").trim().toLowerCase();
-        if (l && l !== _rebotadaLow && !viaDe.has(l)) viaDe.set(l, via);
+        if (!l || l === _rebotadaLow || viaDe.has(l)) return;
+        // El webmail del registrante no es una alternativa (2026-09-13, revisión final), con la vía real y la regla
+        // de la entrada y del pulido: se guardaba en la ficha con email_found_at y el agente nunca lo manda
+        // (informer_webmail). Sale acá y no en el filtro de `rescued` para que tampoco apague el respaldo de
+        // Google (`viaDe.size === 0`): el pulido lo busca cuando no encontró nada, y el gmail del WHOIS es nada.
+        if (esRegistranteWebmail(l, via)) { log(`  ✂️ ${domain}: ${l} vino de informer (quien registró el dominio) — no es contacto`); return; }
+        viaDe.set(l, via);
       };
       try {
         // Las mismas vías que polishPool: redes, informer (WHOIS) o el propio sitio.
@@ -20634,8 +20750,11 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           if (g?.emails?.length) g.emails.forEach(e => _anotar(e, "google_contact"));
         }
       }
-      // Filtrar lo que ya bounced o garbage
-      const rescued = [...viaDe.keys()].filter(e => !isBouncedSync(e) && rankEmail(e, domain, lead.category || "") >= 0);
+      // Filtrar lo que ya bounced o garbage, y el webmail del registrante (2026-09-13, revisión final), con la vía
+      // real y la regla de la entrada y del pulido: se guardaba en la ficha con email_found_at y el agente nunca lo
+      // manda (informer_webmail). Sin otra dirección, el rescate es "sin alternativa".
+      for (const e of viaDe.keys()) if (esRegistranteWebmail(e, viaDe.get(e))) log(`  ✂️ ${domain}: ${e} vino de informer (quien registró el dominio) — no es contacto`);
+      const rescued = [...viaDe.keys()].filter(e => !isBouncedSync(e) && !esRegistranteWebmail(e, viaDe.get(e)) && rankEmail(e, domain, lead.category || "") >= 0);
       if (rescued.length > 0) {
         log(`  💊 ${domain}: rescate encontró ${rescued.length} email(s) nuevos: ${rescued.map(e => `${e} (${viaDe.get(e)})`).join(", ")}`);
         // Persist al lead para que próximas vueltas y otros MBs los vean
