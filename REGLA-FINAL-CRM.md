@@ -77,7 +77,10 @@ formulario. Si alguna vez ves `deal_stage` llegando con `source:"agente"`, es un
 - **El reintento tras rebote usaba el dominio del CORREO, no el del sitio** — el bug que creó la
   ficha falsa de `yahoo.fr`. Ahora resuelve el sitio real y **te avisa la dirección nueva**.
 - **El reintento pedía tu ficha y tiraba tu veredicto**: ahora respeta `enNegociacion` y
-  `descansando`, así que ya no le escribe a alguien que vos moviste hace 3 minutos.
+  `descansando`, así que ya no le escribe a alguien que vos moviste hace 3 minutos. Y desde el
+  13/09 vale para **todo lead**, no sólo para los que estaban en tu board: antes de buscar otra
+  dirección, gastar o mandar, el reintento pide tu ficha fresca siempre (también cuando el lead
+  sigue en Prospects, que es el caso normal). Si tu endpoint no contesta, no manda.
 - **Reportar un rebote re-etiquetaba el envío del agente como manual** (no mandaba `source`).
 - **Backfill**: pasé las fichas con rebote marcado de 3 a 247, sin tocar 65 que ya tenían otro
   email vivo.
