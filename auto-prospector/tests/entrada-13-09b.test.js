@@ -47,7 +47,7 @@ globalThis.__fetchFalso = async () => resp([]);
 const W = await cargarWorker([
   "_conMarcaFreeze", "_vaABlocklistInoperativo", "_estadoTrasGuardar", "_guardadoFallidoPorRed",
   "_estadoTrasFreezeFallido", "_estadoTrasTimeout", "_marcarCsvSiSigueProcesando", "_backoffCongelado",
-  "processCsvItem", "_agruparRechazosCola",
+  "processCsvItem", "_agruparRechazosCola", "_crmCaidoCortaLaTanda", "getNextCsvItem",
 ], { fetchFalso: true });
 
 // Un ads.txt de 25 líneas, una home con nota y título, y el CRM que dice "no está".
@@ -228,12 +228,49 @@ test("processCsvItem de verdad: el CRM que no contesta devuelve la fila a pendin
 
   const cuerpo = cuerpoDe("runCsvQueue");
   match(cuerpo, /_resultadoItem = await Promise\.race\(/);
-  match(cuerpo, /if \(_resultadoItem === "crm_indeterminado"\) \{[\s\S]{0,500}?break;/);
+  match(cuerpo, /if \(_resultadoItem === "crm_indeterminado"\) \{[\s\S]{0,900}?break;/);
   const iAviso = cuerpo.indexOf('clave: "ficha-crm-no-responde"');
   ok(iAviso >= 0, "falta el aviso del CRM");
   const aviso = cuerpo.slice(cuerpo.lastIndexOf("if (", iAviso), cuerpo.indexOf("}).catch(", iAviso));
   doesNotMatch(aviso, /entraron/i, "esos dominios no entraron: el aviso y el latido tienen que decir lo que pasó");
   match(aviso, /volvi(ó|eron) a la cola|vuelven a la cola/);
+});
+
+// ── 6b. Un dominio que el CRM no contesta no frena la cola entera (2026-09-13) ───────────
+// La fila vuelve a 'pending' con su uploaded_at, y getNextCsvItem pide `order=uploaded_at.asc`: la
+// próxima vuelta la trae PRIMERA. Si la tanda se cortaba al primer "no pude consultar", un solo
+// dominio que el CRM nunca contesta (15 s de timeout fijo, un 4xx/5xx para ese nombre) dejaba la
+// cola en cero para siempre, como cachalot.k.
+test("un dominio que el CRM no contesta queda afuera de la tanda y se prueba el siguiente; sólo dos seguidos cortan", async () => {
+  strictEqual(W._crmCaidoCortaLaTanda(1), false, "uno solo puede ser ese dominio: se prueba el siguiente");
+  strictEqual(W._crmCaidoCortaLaTanda(2), true, "dos dominios distintos seguidos: el caído es el CRM");
+  strictEqual(W._crmCaidoCortaLaTanda(0), false);
+
+  // getNextCsvItem de verdad: los excluidos no vuelven a salir en la misma tanda.
+  const reg = ruteador();
+  const r = await W.getNextCsvItem("t", new Set(), new Set([7, 9]));
+  strictEqual(r, null);
+  const pedidos = reg.filter(x => x.m === "GET" && x.u.includes("toolbar_csv_queue?status=eq.pending"));
+  ok(pedidos.length >= 1, "no pidió la cola");
+  for (const p of pedidos) ok(p.u.includes("&id=not.in.(7,9)"), `el pedido no excluye los dominios sin CRM: ${p.u}`);
+  const reg2 = ruteador();
+  await W.getNextCsvItem("t");
+  ok(reg2.filter(x => x.m === "GET").every(x => !x.u.includes("id=not.in")), "sin excluidos no agrega el filtro");
+
+  const cuerpo = cuerpoDe("runCsvQueue");
+  match(cuerpo, /const item = await getNextCsvItem\(token, blockedUsers, _idsSinCrm\);/, "la tanda tiene que pasarle los excluidos");
+  const i = cuerpo.indexOf('if (_resultadoItem === "crm_indeterminado") {');
+  ok(i >= 0);
+  const bloque = cuerpo.slice(i, cuerpo.indexOf("\n    }\n", i));
+  match(bloque, /_idsSinCrm\.add\(item\.id\);/);
+  match(bloque, /if \(_crmCaidoCortaLaTanda\(_crmFallosSeguidos\)\) \{[\s\S]*?break;\s*\}/, "el corte depende de la regla, no del primer fallo");
+  match(bloque, /continue;/, "con un solo fallo sigue con el próximo");
+  doesNotMatch(bloque.replace(/if \(_crmCaidoCortaLaTanda\(_crmFallosSeguidos\)\) \{[\s\S]*?break;\s*\}/, ""), /break;/, "no queda un break incondicional");
+  match(cuerpo, /_crmFallosSeguidos = 0;/, "un dominio que sí se procesó reinicia la cuenta");
+  // Si lo único pendiente es lo excluido, no es "cola vacía": no se apaga la cola.
+  const iVacia = cuerpo.indexOf("if (!item) {");
+  ok(iVacia >= 0);
+  match(cuerpo.slice(0, iVacia), /if \(!item && _idsSinCrm\.size > 0\) \{[\s\S]*?break;/);
 });
 
 // ── 7. El orden de las puertas ──────────────────────────────────────────────────────────
