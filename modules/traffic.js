@@ -352,8 +352,16 @@ export function armarTraficoDePool(fila, cache, domain) {
 }
 
 // ── getTraffic ────────────────────────────────────────────────
+// ── soloGratis: LA TARJETA DE PROSPECTS NO PAGA (2026-09-13) ────────────────────────────────
+// Regla del dueño (18/08): el tráfico de un lead de Prospects no se vuelve a consultar. La tarjeta
+// pedía getTraffic al dibujarse y al expandirse cuando su fila venía con tráfico 0 o vacío, y la
+// fila del pool sólo cuenta con traffic >= 1000: sin caché (o con un negativo del worker, que para
+// el MB no es caché) se pagaba RapidAPI por cada tarjeta, en cada dibujo, sin guardar nada si daba 0.
+// Con soloGratis se lee lo que ya está (blocklist, pool, caché) y si no hay dato vuelve null sin
+// llamar a la API: la tarjeta lo muestra como faltante. forceRefresh no aplica.
 export async function getTraffic(domain, opts = {}) {
-  const { forceRefresh = false } = opts;
+  const { soloGratis = false } = opts;
+  const forceRefresh = !!opts.forceRefresh && !soloGratis;
   const cleanDomain = domain
     .replace(/^https?:\/\//, "")
     .replace(/^www\./, "")
@@ -390,6 +398,9 @@ export async function getTraffic(domain, opts = {}) {
     }
     return cached;
   }
+
+  // Sin fila del pool y sin caché: quien pidió soloGratis se queda sin dato, no paga.
+  if (soloGratis) return null;
 
   try {
     // ── Primario: /all-insights — devuelve TODO en una sola call ──

@@ -11461,15 +11461,18 @@ function initProspectCard(card, data) {
     .filter((e, i, arr) => arr.indexOf(e) === i);
 
   // Auto-fetch tráfico — antes solo corría on-expand. Ahora dispara también al
-  // renderizar (delayed un poco para no bloquear scroll inicial). Cache 90d
-  // hace que en la mayoría de los casos sea hit gratis (0 RapidAPI calls).
+  // renderizar (delayed un poco para no bloquear scroll inicial).
+  // 2026-09-13: SÓLO LO GRATIS. Un lead de Prospects no vuelve a pagar RapidAPI (regla del 18/08).
+  // Sin soloGratis, una fila con tráfico 0 o vacío y sin caché pagaba en cada dibujo de la tarjeta
+  // (el pool sólo cuenta filas con traffic >= 1000). Ahora se lee pool y caché; si no hay dato, la
+  // tarjeta lo muestra como faltante y el MB lo completa a mano.
   function autoFetchTraffic() {
     if (card.dataset._trafficFetched) return;
     card.dataset._trafficFetched = "1";
     const trafficInput = card.querySelector(".pcard-traffic");
     if (!trafficInput || trafficInput.value) return;
     trafficInput.placeholder = "⏳ Fetching traffic…";
-    getTraffic(data.domain).then(t => {
+    getTraffic(data.domain, { soloGratis: true }).then(t => {
       const v = t?.pageViews || t?.rawVisits || 0;
       // Guard: card pudo haberse re-renderizado por enrich antes del timeout.
       // isConnected es true si sigue en el DOM, false si fue reemplazada.
@@ -11528,8 +11531,8 @@ function initProspectCard(card, data) {
       } else {
         lockProspect(state.accessToken, data.domain, state.loginEmail).catch(() => {});
       }
-      // Auto-fetch tráfico si la card no lo tiene — usa cache 90d → 0 hits
-      // si ya fue analizado por cualquier MB. Solo gasta hit si es dominio fresh.
+      // Auto-fetch tráfico si la card no lo tiene — sólo pool y caché, nunca RapidAPI (2026-09-13):
+      // es un lead de Prospects, si no hay dato queda como faltante.
       if (!data.traffic && !card.dataset._trafficFetched) {
         autoFetchTraffic();
       }

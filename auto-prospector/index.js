@@ -25371,6 +25371,32 @@ const SOURCE_RANK_DEFAULT = { manual: 5, apollo: 4, informer: 3, scrape: 2, gene
 
 let _tierOrdenCache = { orden: null, ts: 0 };
 
+// ── UN TIPO SIN MUESTRA SE QUEDA EN SU LUGAR (2026-09-13) ──────────────────────────────────
+// El orden semanal por respuestas, pura. Antes vivía adentro de un sort cuyo comparador mandaba al
+// final a todo tipo con menos de 15 envíos (`if (sa == null) return 1`), aunque el comentario decía
+// que conservaba su posición. "apollo" es lo que un MB eligió a mano (source manual) y casi nunca
+// junta 15 envíos en 90 días: quedaba debajo de info@ y el agente prefería el genérico. Ahora cada
+// tipo sin muestra se queda en su casillero del orden por defecto, y sólo los medidos se reordenan
+// entre los casilleros que ocupan, con el mismo suavizado y el mismo margen del 15% de siempre.
+function _ordenTiposEmailPorRespuesta(agg, base = _TIER_ORDEN_DEFAULT) {
+  const tasa = (t) => {
+    const v = agg?.[t];
+    return v && v.n >= 15 ? (v.ok + 1) / (v.n + 10) : null;
+  };
+  const medidos = base.filter(t => tasa(t) != null).sort((a, b) => {
+    const sa = tasa(a), sb = tasa(b);
+    // ⚠️ MARGEN MÍNIMO: solo reordena una diferencia que SIGNIFIQUE algo. Con los datos
+    // reales de hoy genérico da 6,5% y persona 6,3% — eso es un empate, no una señal, y
+    // sin margen un decimal pondría un info@ por encima de una persona con nombre, que es
+    // justo la regla que el user pidió al revés. Se exige 15% relativo de ventaja para
+    // mover el orden; por debajo, gana el que ya estaba (el sort es estable).
+    const _mejor = Math.max(sa, sb);
+    if (Math.abs(sa - sb) / (_mejor || 1) < 0.15) return 0;
+    return sb - sa;
+  });
+  let i = 0;
+  return base.map(t => (tasa(t) == null ? t : medidos[i++]));
+}
 
 async function reajustarPrioridadTiposEmail(token) {
   try {
@@ -25389,24 +25415,8 @@ async function reajustarPrioridadTiposEmail(token) {
       (agg[t] = agg[t] || { n: 0, ok: 0 }).n++;
       if (r.responded_at && r.response_type !== "out_of_office") agg[t].ok++;
     }
-    const orden = [..._TIER_ORDEN_DEFAULT].sort((a, b) => {
-      const va = agg[a], vb = agg[b];
-      // Sin muestra suficiente conserva su posición por defecto (Infinity-safe: se comparan
-      // solo los medidos; el resto empata y el sort estable respeta el default).
-      const sa = va && va.n >= 15 ? (va.ok + 1) / (va.n + 10) : null;
-      const sb = vb && vb.n >= 15 ? (vb.ok + 1) / (vb.n + 10) : null;
-      if (sa == null && sb == null) return 0;
-      if (sa == null) return 1;
-      if (sb == null) return -1;
-      // ⚠️ MARGEN MÍNIMO: solo reordena una diferencia que SIGNIFIQUE algo. Con los datos
-      // reales de hoy genérico da 6,5% y persona 6,3% — eso es un empate, no una señal, y
-      // sin margen un decimal pondría un info@ por encima de una persona con nombre, que es
-      // justo la regla que el user pidió al revés. Se exige 15% relativo de ventaja para
-      // mover el orden; por debajo, gana el que ya estaba (el sort es estable).
-      const _mejor = Math.max(sa, sb);
-      if (Math.abs(sa - sb) / (_mejor || 1) < 0.15) return 0;
-      return sb - sa;
-    });
+    // Sin muestra suficiente, un tipo conserva su casillero del orden por defecto (2026-09-13).
+    const orden = _ordenTiposEmailPorRespuesta(agg);
     const medido = Object.fromEntries(Object.entries(agg).map(([t, v]) => [t, `${v.ok}/${v.n} (${(100 * v.ok / v.n).toFixed(1)}%)`]));
     await setConfigValue(token, "email_tier_ranking", JSON.stringify({ orden, medido, fecha: new Date().toISOString().slice(0, 10) }));
     _tierOrdenCache = { orden, ts: Date.now() };
