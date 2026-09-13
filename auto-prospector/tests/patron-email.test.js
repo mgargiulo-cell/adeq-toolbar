@@ -101,6 +101,9 @@ test("Japón, Corea, Vietnam, Tailandia, Malasia y Filipinas tienen ciudades, y 
 // ── Extensión: una sola regla de basura ─────────────────────────────────────────────────
 test("isGarbageEmail (extensión) consulta primero la regla compartida del worker", () => {
   ok(/import \{ esEmailPlausible \} from "\.\.\/auto-prospector\/lib\/email\.js"/.test(verifier));
-  const fn = verifier.slice(verifier.indexOf("export function isGarbageEmail(email) {"), verifier.indexOf("\n}\n", verifier.indexOf("export function isGarbageEmail(email) {")));
+  // Anclado al nombre y no a la firma: desde el 13/09 recibe también el dominio del sitio.
+  const _i = verifier.indexOf("export function isGarbageEmail(");
+  ok(_i >= 0, "no encontré isGarbageEmail en emailVerifier.js");
+  const fn = verifier.slice(_i, verifier.indexOf("\n}\n", _i));
   ok(/if \(!esEmailPlausible\(e\)\) return true;/.test(fn), "lo que el worker considera imposible, la extensión tampoco lo muestra");
 });

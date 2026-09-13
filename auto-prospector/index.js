@@ -7232,6 +7232,14 @@ const EMAIL_REGEX  = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,24}(?=\s|$|
 
 function _normSrc(v) { return typeof v === "string" ? v : (v && v.source) || ""; }
 
+// El nombre de una fuente en los informes: el parte y el boletín de salud la escribían distinto
+// (el parte juntaba monday/monday_refresh en crm_reciclado y sellers_json en sellers; el boletín no),
+// así que el mismo día un mail decía "monday 373" y el otro "crm_reciclado". Una sola regla. (13/09)
+function _nombreFuenteInforme(s) {
+  return String(s || "?").replace(/^auto_feeder_/, "")
+    .replace(/^monday(_refresh)?$/, "crm_reciclado").replace(/^sellers_json$/, "sellers");
+}
+
 
 
 // ¿El local-part parece una persona real (nombre)? Usado para decidir si
@@ -9669,8 +9677,7 @@ async function parteDelDia(token, opts = {}) {
 
     // ── EMBUDO POR FUENTE ────────────────────────────────────────────────────────────────
     const _emb = {};
-    const _nombreFuente = (s) => String(s || "?").replace(/^auto_feeder_/, "")
-      .replace(/^monday(_refresh)?$/, "crm_reciclado").replace(/^sellers_json$/, "sellers");
+    const _nombreFuente = _nombreFuenteInforme;   // la misma regla que el boletín de salud (13/09)
     for (const a of _altasMes) {
       const s = _nombreFuente(a.source);
       const e = (_emb[s] = _emb[s] || { entraron: 0, conEmail: 0, enviados: 0 });
@@ -9736,20 +9743,43 @@ async function parteDelDia(token, opts = {}) {
         (_via[v] = _via[v] || { n: 0, rebotes: 0 }).n++;
       }
     }
-    const _rebotes = (await _traerTodo(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.bounce_detected&created_at=gte.${_ultimos7}&select=details&order=id`,
+    // ⚠️ "REBOTARON" MIRABA POCO Y DIVIDÍA POR DE MÁS (2026-09-13). Tres fallas:
+    //   · Los "no" de MillionVerifier nunca llegaban: rol_mx mostraba "14 rebotes de 1387" el mismo
+    //     día que MV dio 69 inválidos de 161. Una vía que adivina se ve limpia justo porque MV la frena.
+    //   · bounce_detected también cuenta buzón lleno y temporales, que no son rebotes.
+    //   · El denominador era todo lo guardado en 7 días, no lo enviado: el % quedaba aplastado.
+    // Ahora los numeradores salen de toolbar_bounced_emails (rebote_smtp y verificador, con la fuente
+    // congelada al escribir) y cada tasa tiene su población: rebotes sobre enviados, descartes de MV
+    // sobre verificados. La señal mira sólo el rebote real: un descarte de MV es un envío evitado.
+    const _malos = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${_ultimos7}&evidencia=in.(rebote_smtp,verificador)&select=email,evidencia,fuente&order=email`,
       auth, { max: 5000 })) || [];
+    const _enviados7 = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_ultimos7}&select=email_to&order=id`,
+      auth, { max: 5000 })) || [];
+    const _verificados7 = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_mv_results?created_at=gte.${_ultimos7}&select=email&order=id`,
+      auth, { max: 5000 })) || [];
+    const _fuenteMalo = new Map(_malos.map(f => [String(f.email || "").toLowerCase(), f.fuente]));
+    for (const d of Object.values(_via)) { d.env = 0; d.ver = 0; d.mvNo = 0; }
+    const _sumarVia = (em, campo) => {
+      const v = String(_normSrc(_fuenteMalo.get(em)) || _viaDe.get(em) || "").toLowerCase();
+      if (v && _via[v]) { _via[v][campo]++; return true; }
+      return false;
+    };
     let _rebotesSinVia = 0;
-    for (const r of _rebotes) {
-      const em = String(r?.details?.failed_email || "").toLowerCase();
-      const v = _viaDe.get(em);
-      if (v && _via[v]) _via[v].rebotes++;
-      else if (em) _rebotesSinVia++;
+    for (const f of _malos) {
+      const em = String(f.email || "").toLowerCase();
+      if (!em) continue;
+      if (f.evidencia === "rebote_smtp") { if (!_sumarVia(em, "rebotes")) _rebotesSinVia++; }
+      else if (f.evidencia === "verificador") _sumarVia(em, "mvNo");
     }
+    for (const s of _enviados7) { const em = String(s.email_to || "").toLowerCase(); if (em) _sumarVia(em, "env"); }
+    for (const m of _verificados7) { const em = String(m.email || "").toLowerCase(); if (em) _sumarVia(em, "ver"); }
     for (const [v, d] of Object.entries(_via).sort((a, b) => b[1].n - a[1].n).slice(0, 12)) {
-      const pct = d.n ? Math.round(100 * d.rebotes / d.n) : 0;
+      const pct = d.env ? Math.round(100 * d.rebotes / d.env) : 0;
       const señal = d.rebotes === 0 ? "✅" : pct <= 5 ? "⚠️" : "🔴";
-      lineasVia.push(`   ${señal} ${v.padEnd(18)} ${String(d.n).padStart(4)} email(s) · rebotaron ${String(d.rebotes).padStart(3)} (${pct}%)`);
+      lineasVia.push(`   ${señal} ${v.padEnd(18)} ${String(d.n).padStart(4)} email(s) · rebotaron ${String(d.rebotes).padStart(3)} (${pct}%) de ${d.env} enviados · MV descartó ${d.mvNo} de ${d.ver} verificados`);
     }
     if (_rebotesSinVia) lineasVia.push(`   · ${_rebotesSinVia} rebote(s) de direcciones que no están en el pool (envíos viejos o cargados a mano)`);
 
@@ -14769,6 +14799,16 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // antes, en su propio chequeo. Esto solo perdona el RUBRO, que es lo que el user pidió.
   // La puerta grande perdona el RUBRO, no el TIPO DE NEGOCIO. Un banco o una plataforma de
   // streaming con ads.txt y tráfico sigue sin ser un publisher al que venderle display.
+  // ── EL DIAGNÓSTICO DICE EL ESTADO REAL DEL ADS.TXT Y LOS PAGEVIEWS REALES (2026-09-13) ───────
+  // Los dos descartes de abajo grababan siempre `adsTxt: true` y "Tiene ads.txt y tráfico de sobra"
+  // / "Cumple todo salvo el país", sin mirar: `_ads` puede llegar acá como "yes", como la excepción
+  // de AdSense (NO tiene ads.txt) o como "unknown" (ilegible), y el tráfico sólo pasó el piso. El
+  // resumen de salud copia ese comentario textual. Ilegible se guarda como null, no como "no tiene".
+  const _adsTxtDiag = _ads?.state === "yes" ? true : (_ads?.state === "unknown" ? null : false);
+  const _pvTxt = Number(effectivePageViews || 0).toLocaleString("es-AR");
+  const _adsFrase = _ads?.state === "yes" ? `Tiene ads.txt (${_ads.lines || 0} sellers) y ${_pvTxt} pageviews`
+    : _ads?.state === "adsense" ? `No tiene ads.txt (entró por la excepción de AdSense activo) y tiene ${_pvTxt} pageviews`
+    : `Su ads.txt no se pudo leer (bloqueado o timeout) y tiene ${_pvTxt} pageviews`;
   const _nunca = _categoriaNuncaProspectable(swCategory);
   if (_nunca) {
     await markCsvItem(token, item.id, "skipped", {
@@ -14776,8 +14816,8 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     });
     registrarDiagDescarte(token, {
       domain, etapa: "tipo_de_negocio", motivo: `tipo_no_prospectable:${_nunca}`,
-      categoria: swCategory, geo: topCountry || "", traffic: effectivePageViews, adsTxt: true,
-      comentario: `Tiene ads.txt y tráfico de sobra, pero es "${swCategory}" → ${_nunca}. No es un publisher al que se le venda display: monetiza su propio inventario o vende producto. Regla del user (27/08): aunque cumpla los requisitos, banco/ecommerce/porno/streaming no entran.`,
+      categoria: swCategory, geo: topCountry || "", traffic: effectivePageViews, adsTxt: _adsTxtDiag,
+      comentario: `${_adsFrase}, pero es "${swCategory}" → ${_nunca}. No es un publisher al que se le venda display: monetiza su propio inventario o vende producto. Regla del user (27/08): aunque cumpla los requisitos, banco/ecommerce/porno/streaming no entran.`,
     }).catch(() => {});
     log(`  ⛔ ${domain} — "${swCategory}" es ${_nunca}: no es un publisher de display, no entra`);
     return;
@@ -14904,8 +14944,8 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
       registrarDiagDescarte(token, {
         domain, etapa: "geo_bloqueada", motivo: `geo_excluida:${topCountry || iso}`,
-        categoria: category, geo: topCountry || iso, traffic: effectivePageViews, adsTxt: true,
-        comentario: `Cumple todo salvo el país: ${topCountry || iso} está destildado hoy. NO se pierde — quedó aparcado en Prospects-2 y vuelve solo si se vuelve a habilitar ese país.`,
+        categoria: category, geo: topCountry || iso, traffic: effectivePageViews, adsTxt: _adsTxtDiag,
+        comentario: `${_adsFrase}; pasó los demás filtros salvo el país: ${topCountry || iso} está destildado hoy. NO se pierde — quedó aparcado en Prospects-2 y vuelve solo si se vuelve a habilitar ese país.`,
       }).catch(() => {});
       log(`  🅿️ ${domain} — GEO ${topCountry || iso} excluida hoy → aparcado en Prospects-2 (no se pierde)`);
       return;
@@ -25347,21 +25387,34 @@ async function _boletinPorSeccion(token) {
     // toolbar_csv_queue). El 04/09 decía "275 altas" y la suma por fuente daba 195 — y encima
     // esa suma era exactamente 1.000 procesados: el tope de PostgREST. Ahora cada uno con su
     // nombre, y sin tope.
-    const _proc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=source,status`, auth)) || [];
+    // ⚠️ "PASARON" NO ES "ALTA" (2026-09-13). saveToReviewQueue hace upsert por dominio: una fila que
+    // ya existía (congelada, rechazada o reciclada del CRM) se REACTIVA, cuenta como "pasó" y conserva
+    // su fecha de alta vieja. Por eso "agent 26→20" salía con 0 altas "agent" y "similar 525→181" con
+    // 141 altas. Se separan cruzando por DOMINIO (el CRM reetiqueta la fuente a monday_refresh), con
+    // los mismos nombres de fuente que el parte. `order=id`: sin orden la paginación puede repetir filas.
+    const _proc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=source,status,domain&order=id`, auth)) || [];
+    const _altasFilas = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=source,domain&order=id`, auth)) || [];
+    const _nuevosDom = new Set(_altasFilas.map(a => String(a.domain || "").toLowerCase()));
     const _porSrc = {};
+    let _reactivadas = 0;
     for (const f of _proc) {
-      const k = String(f.source || "?").replace(/^auto_feeder_/, "");
-      (_porSrc[k] = _porSrc[k] || { n: 0, ok: 0 }).n++;
-      if (f.status === "done") _porSrc[k].ok++;
+      const k = _nombreFuenteInforme(f.source);
+      const e = (_porSrc[k] = _porSrc[k] || { n: 0, ok: 0, nuevas: 0 });
+      e.n++;
+      if (f.status === "done") {
+        e.ok++;
+        if (_nuevosDom.has(String(f.domain || "").toLowerCase())) e.nuevas++; else _reactivadas++;
+      }
     }
-    const _altasFilas = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=source`, auth)) || [];
     const _altas = _altasFilas.length;
     const _altasPor = {};
-    for (const a of _altasFilas) { const k = String(a.source || "?"); _altasPor[k] = (_altasPor[k] || 0) + 1; }
+    for (const a of _altasFilas) { const k = _nombreFuenteInforme(a.source); _altasPor[k] = (_altasPor[k] || 0) + 1; }
     const _fuentes = Object.entries(_porSrc).sort((a, b) => b[1].n - a[1].n);
+    const _llegaron = _fuentes.reduce((s, [, v]) => s + v.ok, 0);
     _nota("DESCUBRIMIENTO (24h)", _altas >= 15 ? "✅" : _altas >= 5 ? "🟡" : "🔴", [
       `${_altas} alta(s) en Prospects: ${Object.entries(_altasPor).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(" · ") || "ninguna"}`,
-      `La cola procesó ${_proc.length} (→ pasaron): ${_fuentes.map(([k, v]) => `${k} ${v.n}→${v.ok}`).join(" · ") || "nada procesado"}`,
+      `La cola procesó ${_proc.length} · llegaron a Prospects ${_llegaron} (${_llegaron - _reactivadas} nuevas, ${_reactivadas} ya estaban y se reactivaron): ${_fuentes.map(([k, v]) => `${k} ${v.n}→${v.ok}${v.ok && v.nuevas !== v.ok ? ` (${v.nuevas} nuevas)` : ""}`).join(" · ") || "nada procesado"}`,
+      ...(_reactivadas ? ["Las altas cuentan sólo filas nuevas: una reactivada ya estaba en la base (congelada, rechazada o reciclada del CRM) y conserva su fecha de alta."] : []),
       ...(_altas < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en DESCARTES DEL DESCUBRIMIENTO, abajo."] : []),
     ]);
 

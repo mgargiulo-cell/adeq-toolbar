@@ -27,7 +27,7 @@ const ESTILO_PITCH = Object.freeze({ tone: "informal", length: "short", focus: "
 // `prensa@` valía 115 en el worker y era genérico acá; `dpo@`/`privacy@` eran "persona" acá y
 // basura allá; y los nueve cambios de la Fase 1 no llegaban al media buyer. Desde ahora el
 // popup importa el MISMO archivo que el worker. El zip lo incluye (scripts/empaquetar.sh).
-import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails } from "../auto-prospector/lib/email.js";
+import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esBuzonFuncional } from "../auto-prospector/lib/email.js";
 // La lista de dominios bloqueados existía en modules/blocklist.js y la usaba traffic.js para
 // no gastar API… pero NINGÚN botón del popup la consultaba (verificado el 08/09: cero llamadas
 // a checkDomainBlocked en este archivo). Un MB parado en mail.google.com cargó `mail.google.com`
@@ -3939,8 +3939,10 @@ function _rankClient(email) {
 function _emailPickTierClient(email) {
   const src = (state.emailSources.get(email) || "").toLowerCase();
   const local = String(email || "").toLowerCase().split("@")[0];
-  // Basura según el ranking compartido (dpo@, privacy@, dmarc@, rebotados…): último de todo.
-  if (_rankClient(email) < 0) return -1;
+  // Basura según los vetos compartidos con el worker (dpo@, privacy@, dmarc@, copyright@, owner@…):
+  // último de todo. Veto y NO `rankEmail < 0` (2026-09-13): un buzón del grupo editor sin la casa
+  // editora cargada vale -35 y es legítimo; con el puntaje se hundía debajo de los genéricos.
+  if (vetoDuroEmail(email, state.domain || "")) return -1;
   // Maxi 2026-07-15 (D1 sync worker _pickTier): informer (WHOIS/registrar) NO es top-tier — baja a 1
   // (o 3 si el local es rol comercial). Antes estaba en 4 junto a apollo → el popup mostraba como
   // "mejor contacto" un domainmanagement@ que el worker rankea ÚLTIMO. Ahora coincide con el envío real.
@@ -3948,9 +3950,12 @@ function _emailPickTierClient(email) {
   if (src === "manual") return 4;                            // lo eligió el MB a mano
   // Apollo compite por resultado (decisión del user, 04/09; paridad con _tipoDeEmailParaRanking
   // del worker): su email vale lo que es — rol comercial, persona o genérico — no por venir de Apollo.
-  if (src === "apollo") return _AD_SALES_LOCAL_RE.test(local) ? 3 : (_isGenericEmailLocal(email) ? 0 : 2);
+  if (src === "apollo") return _AD_SALES_LOCAL_RE.test(local) ? 3 : ((_isGenericEmailLocal(email) || esBuzonFuncional(email)) ? 0 : 2);
   if (_AD_SALES_LOCAL_RE.test(local)) return 3;              // rol comercial/publicidad
-  if (!_isGenericEmailLocal(email)) return 2;                // persona / rol no-genérico
+  // Un buzón funcional (download@, rewards@, advent@, store@) va con los genéricos, igual que en el
+  // agente (_tipoDeEmailParaRanking). Antes era "persona" y quedaba preseleccionado sobre info@ y
+  // press@: el 10/09 una MB escribió a download@pixelmonmod.com y advent@bisafans.de. (2026-09-13)
+  if (!_isGenericEmailLocal(email) && !esBuzonFuncional(email)) return 2;   // persona / rol no-genérico
   return 0;                                                   // genérico
 }
 // Orden: tier de fuente primero, y dentro del tier el puntaje del ranking compartido.
@@ -4208,11 +4213,11 @@ function addEmailsWithSource(emails, source, domainGuard = null) {
   // filtro viejo: Apollo ya viene acotado al dominio por su API, y Cache ya pasó por acá.
   let lista = (Array.isArray(emails) ? emails : []).filter(Boolean);
   if (source === "Apollo" || source === "Cache") {
-    lista = lista.filter(e => !isGarbageEmail(e) && _belongsToCurrent(e));
+    lista = lista.filter(e => !isGarbageEmail(e, state.domain || "") && _belongsToCurrent(e));
   } else {
     const delSitio = source === "Page" || source === "Scrape";
     const urlByEmail = delSitio && currentSite ? new Map(lista.map(e => [String(e).toLowerCase(), `https://${currentSite}/`])) : null;
-    lista = _cleanScrapedEmails(lista, currentSite, { urlByEmail }).filter(e => !isGarbageEmail(e));
+    lista = _cleanScrapedEmails(lista, currentSite, { urlByEmail }).filter(e => !isGarbageEmail(e, currentSite || ""));
   }
   for (const e of lista) {
     if (!state.emailSources.has(e)) state.emailSources.set(e, source);
@@ -4425,7 +4430,7 @@ function renderEmailList(emails) {
   //    Estos emails nunca deberían aparecer en la UI — son inservibles.
   const cleaned = [...new Set(emails.map(e => e.trim()).filter(Boolean))]
     .filter(e => e !== mondayEmail)
-    .filter(e => !isGarbageEmail(e));
+    .filter(e => !isGarbageEmail(e, state.domain || ""));
 
   // 2. ORDEN (Maxi 2026-07-09): tiering comercial (paridad worker). apollo/informer nominal >
   //    publicidad@/comercial@/ventas@ > persona scrapeada > genérico. Sort estable (Chrome) →
@@ -10838,7 +10843,7 @@ function renderProspectCard(r) {
   const emails      = (Array.isArray(r.emails) ? r.emails : [])
     .map(e => (e || "").trim())
     .filter(Boolean)
-    .filter(e => !isGarbageEmail(e))
+    .filter(e => !isGarbageEmail(e, r.domain || ""))
     .filter((e, i, arr) => arr.indexOf(e) === i);
   const hasEmail    = emails.length > 0;
   // Owner = SIEMPRE el usuario logueado (mediaBuyer). Antes usaba
@@ -11109,7 +11114,7 @@ function initProspectCard(card, data) {
   const emails = (Array.isArray(data.emails) ? data.emails : [])
     .map(e => (e || "").trim())
     .filter(Boolean)
-    .filter(e => !isGarbageEmail(e))
+    .filter(e => !isGarbageEmail(e, data.domain || ""))
     .filter((e, i, arr) => arr.indexOf(e) === i);
 
   // Auto-fetch tráfico — antes solo corría on-expand. Ahora dispara también al

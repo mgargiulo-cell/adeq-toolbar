@@ -53,6 +53,16 @@ function enrutador(registro) {
     if (u.includes("toolbar_sendtrack?send_date=gte.")) return resp([{ domain: "larepublica.pe" }, { domain: "atv.pe" }]);
     // Un rebote, de la dirección que encontró el PATRÓN en crux → tiene que atribuirse a `pattern`.
     if (u.includes("action=eq.bounce_detected")) return resp([{ details: { failed_email: "b@tienda2.pe" } }]);
+    // Desde el 13/09 los rebotes por vía salen de toolbar_bounced_emails: un rebote SMTP real (pattern),
+    // un "no" de MillionVerifier sobre una dirección adivinada (rol_mx) y un temporal que no cuenta.
+    if (u.includes("toolbar_bounced_emails?bounced_at=gte.")) return resp([
+      { email: "b@tienda2.pe", evidencia: "rebote_smtp", fuente: "pattern" },
+      { email: "a@tienda1.pe", evidencia: "verificador", fuente: "rol_mx" },
+      { email: "x@otro.pe", evidencia: "rebote_temporal", fuente: "scrape" },
+    ]);
+    // Enviados y verificados de 7 días: los denominadores de cada tasa.
+    if (u.includes("action=eq.sent&created_at=gte.") && u.includes("select=email_to&order=id")) return resp([{ email_to: "b@tienda2.pe" }, { email_to: "dir@larepublica.pe" }]);
+    if (u.includes("toolbar_mv_results?created_at=gte.") && u.includes("select=email&order=id")) return resp([{ email: "a@tienda1.pe" }]);
     if (u.includes("toolbar_csv_queue?processed_at=gte.") && u.includes("status=in.(skipped,next_day)")) return resp([
       { status: "skipped", error_message: "not_publisher: sin_ads_txt" },
       { status: "skipped", error_message: "not_publisher: sin_ads_txt" },
@@ -123,11 +133,12 @@ test("la GEO de las altas dice cuánto anglo entra, en porcentaje", () => {
 });
 
 test("cada vía de email muestra sus rebotes, atribuidos a la dirección exacta que falló", () => {
-  const t = despuesDe("y cuáles rebotan", 520);
-  // `pattern` encontró 2 direcciones y una rebotó → 50%, en rojo. Es la vigilancia de E1.
-  match(t, /pattern\s+2 email\(s\) · rebotaron\s+1 \(50%\)/, t);
+  const t = despuesDe("y cuáles rebotan", 1400);
+  // `pattern`: 2 enviados y uno rebotó → 50% SOBRE ENVIADOS (13/09), en rojo. Es la vigilancia de E1.
+  match(t, /pattern\s+2 email\(s\) · rebotaron\s+1 \(50%\) de 2 enviados/, t);
   match(t, /scrape\s+1 email\(s\) · rebotaron\s+0 \(0%\)/, t);
-  match(t, /rol_mx\s+1 email\(s\) · rebotaron\s+0 \(0%\)/, t);
+  // `rol_mx`: ningún rebote, pero MillionVerifier descartó la dirección adivinada. Antes no se veía.
+  match(t, /rol_mx\s+1 email\(s\) · rebotaron\s+0 \(0%\) de 0 enviados · MV descartó 1 de 1 verificados/, t);
 });
 
 test("los motivos de rechazo se agrupan, y los reintentables NO se cuentan como descarte", () => {

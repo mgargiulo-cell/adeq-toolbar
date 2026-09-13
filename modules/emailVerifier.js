@@ -1,5 +1,7 @@
 // La MISMA regla de plausibilidad que el worker (2026-09-08): TLD real, sin placeholders, sin registradores.
 import { esEmailPlausible } from "../auto-prospector/lib/email.js";
+// Los vetos duros del worker (2026-09-13): lo que el agente nunca usaría, la extensión tampoco lo muestra.
+import { vetoDuroEmail } from "../auto-prospector/lib/email.js";
 // ============================================================
 // ADEQ TOOLBAR — Verificación de Emails v2
 // Capas de verificación (sin SMTP, que no es posible desde browser):
@@ -140,7 +142,7 @@ const REGISTRAR_DOMAIN_REGEX = /\b(registrar|registry|dnshosting|domainsby|domai
 // (ej: "Csitio.com@whoisprotectservice.net" — scraped wrong, no es real).
 const MALFORMED_LOCAL_REGEX = /^[a-z]?[a-z0-9-]+\.(com|net|org|io|co|tv|me|info|biz)$/i;
 
-export function isGarbageEmail(email) {
+export function isGarbageEmail(email, siteDomain = "") {
   if (!email || typeof email !== "string") return true;
   const e = email.toLowerCase().trim();
   if (!e.includes("@")) return true;
@@ -150,6 +152,11 @@ export function isGarbageEmail(email) {
   // ignorados). Lo de abajo son los agregados propios de la extensión (proxies de WHOIS por
   // sufijo, heurística de registrador en el dominio, sufijo "-abuse").
   if (!esEmailPlausible(e)) return true;
+  // Y los vetos duros de rankEmail (2026-09-13). copyright@, owner@, jobs@, billing@, info@gmail:
+  // el worker los descarta con -1 y la extensión sólo los mandaba al final de la lista, así que si
+  // eran la única dirección quedaban preseleccionados. OJO: veto, no puntaje negativo — un buzón del
+  // grupo editor puede valer -35 sin la casa editora cargada y es legítimo.
+  if (vetoDuroEmail(e, siteDomain)) return true;
 
   // 1. Dominio de proxy/whois (exacto o subdominio)
   for (const d of GARBAGE_DOMAIN_SUFFIXES) {

@@ -803,22 +803,33 @@ export function detectarEmailSospechoso(email, siteDomain = "") {
   return "";
 }
 
-export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
-  if (!email || typeof email !== "string" || !email.includes("@")) return -1;
+// ════════════════════════════════════════════════════════════════════════════════════════
+// LOS VETOS DUROS: LO QUE NUNCA ES UN CONTACTO (extraídos de rankEmail el 2026-09-13)
+// ════════════════════════════════════════════════════════════════════════════════════════
+// Estaban adentro de rankEmail como `return -1`. El worker descarta todo lo que da -1, pero la
+// extensión sólo lo mandaba al final de la lista: copyright@pokecommunity.com u owner@pokexperto.net
+// aparecían como chip y, si eran la única dirección, quedaban preseleccionadas. El 10/09 una MB les
+// escribió. Ahora la regla es una función: rankEmail la consulta primero (el resultado es idéntico,
+// lo fija tests/ranking-paridad-13-09.test.js) y la extensión esconde exactamente lo mismo que el
+// worker nunca usaría. Devuelve el motivo, o "" si la dirección no está vetada.
+// OJO: un puntaje NEGATIVO no es un veto. Un buzón del grupo editor sin la casa editora cargada vale
+// -35 y es legítimo: filtrar por `rankEmail < 0` escondería justo esos.
+export function vetoDuroEmail(email, siteDomain = "") {
+  if (!email || typeof email !== "string" || !email.includes("@")) return "no_es_email";
   const lower = email.toLowerCase();
-  if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return -1;
-  if (isBouncedSync(lower)) return -1; // hard reject: ya bounceó antes
+  if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return "basura";
+  if (isBouncedSync(lower)) return "ya_reboto"; // hard reject: ya bounceó antes
   // Dominio quemado: 2+ rebotes distintos ahí. El rebote casi nunca es de la casilla sino del
   // dominio, así que insistir con otro buzón del mismo lugar es tirar reputación (2026-08-04).
   const _rd = riesgoRebotePorDominio(lower.split("@")[1] || "");
-  if (_rd.bloquear) return -1;
+  if (_rd.bloquear) return "dominio_quemado";
   const [local, dom] = lower.split("@");
-  if (!local || !dom) return -1;
-  if (GARBAGE_LOCAL_CONTAINS.test(local)) return -1;
+  if (!local || !dom) return "no_es_email";
+  if (GARBAGE_LOCAL_CONTAINS.test(local)) return "basura";
   // Veto por phishing / suplantación (pedido del user 2026-08-04). Escribirle a una trampa nos
   // mete en listas de spam, que es justo lo que venimos peleando.
   const _sosp = detectarEmailSospechoso(lower, siteDomain);
-  if (_sosp) return -1;
+  if (_sosp) return "sospechoso";
   // Local-part de 1-2 caracteres ("a@olm.vn", "66@manhuaren.com") = artefacto de scrape,
   // nunca un contacto real. Se permiten 2 chars solo si son iniciales con punto (j.p@).
   // Maxi 2026-08-04: la regla original rechazaba TODO local de ≤2 caracteres y se llevaba
@@ -826,9 +837,9 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // comunes en sitios chicos y startups). Ahora solo cae 1 carácter, o 2 si trae dígitos
   // (`a1@`, `66@` = artefacto de scrape).
   const _localSinSep = local.replace(/[._-]/g, "");
-  if (_localSinSep.length <= 1) return -1;
-  if (_localSinSep.length === 2 && /\d/.test(_localSinSep)) return -1;
-  if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) return -1; // Capa 3: keywords/subdominios garbage
+  if (_localSinSep.length <= 1) return "local_corto";
+  if (_localSinSep.length === 2 && /\d/.test(_localSinSep)) return "local_corto";
+  if (GARBAGE_DOMAIN_KEYWORDS.test(dom) || GARBAGE_DOMAIN_SUBDOMAIN.test(dom)) return "dominio_basura"; // Capa 3: keywords/subdominios garbage
 
   // Malformed local-part: contiene TLD (.com/.net/.io/etc) → scrape artifact
   // Caso real 2026-05-13: "lindaikejisblog.com@protecteddomainservices.com"
@@ -838,7 +849,7 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // existe para cazar artefactos de scrape tipo "site.com@registrar.com", así que solo aplica
   // cuando el destinatario NO es un webmail.
   if (/\.(com|net|org|io|co|tv|me|info|biz|us|uk|de|es|fr|it|br|ar|mx)$/i.test(local)
-      && !/^(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\./i.test(dom)) return -1;
+      && !/^(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\./i.test(dom)) return "local_con_tld";
 
   // Hash/random-string detection: emails como "a8f9d2k1@x.com" probablemente auto-gen.
   // Maxi 2026-08-04 — ESTA LÍNEA ERA EL BUG MÁS CARO DEL RANKING.
@@ -856,8 +867,8 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   const _soloLetras = local.replace(/[^a-z]/g, "");
   const _vocales = (local.match(/[aeiou]/g) || []).length;
   const _ratioVocal = local.length ? _vocales / local.length : 0;
-  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.22 && _soloLetras.length < local.length * 0.8) return -1;
-  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.15) return -1;   // solo letras pero sin vocales = hash
+  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.22 && _soloLetras.length < local.length * 0.8) return "hash";
+  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.15) return "hash";   // solo letras pero sin vocales = hash
 
   // Maxi 2026-07-13 (auditoría 48h): rechazo DURO SOLO de lo que NUNCA es un contacto real:
   //  a) PLACEHOLDERS/FALSOS que se colaban como "persona" (vorname.name@/firstname.lastname@/
@@ -866,34 +877,47 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   //  b) WHOIS/gestión de DOMINIO (domainmanagement@axa, dominios.lantik@bizkaia): son del registrar.
   // OJO (feedback user 2026-07-13): sistemas@/system@/IT/gmail NO van acá — en un medio chico pueden
   // ser un contacto real ("sistemas.diariodovale@ no lo veo mal") → van a PENALTY abajo, no a reject.
-  if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return -1;
-  if (/^(domainmanagement|domainadmin|domainname|dominios?)([._-]|$)/i.test(local)) return -1;
+  if (PLACEHOLDER_LOCAL.test(local) || JUNK_LOCAL_RE.test(local) || JUNK_LOCAL_TOKENS.test(local)) return "placeholder";
+  if (/^(domainmanagement|domainadmin|domainname|dominios?)([._-]|$)/i.test(local)) return "whois";
   // ── ARTEFACTOS DE ESCAPE HTML/JSON (Maxi 2026-08-31) ──────────────────────────────
   // Caso real: le escribimos a `u003eenquiry@mytvsuper.com` y rebotó. `\u003e` es un ">"
   // escapado en JSON; al leer el sitio se perdió la barra y quedó pegado al local-part.
   // Puntuaba 40 y se enviaba. La dirección de verdad existe (`enquiry@`), así que el
   // scrape no solo mandó a una dirección rota: además quemó la buena, porque el dominio
   // suma un rebote. Cubre \u003e (>), \u0026 (&), \u0027 ('), \u003c (<) y familia.
-  if (/^[ux]00[0-9a-f]{2}./i.test(local)) return -1;
+  if (/^[ux]00[0-9a-f]{2}./i.test(local)) return "escape_html";
   // Buzones de informes DMARC/SPF: los llena un robot con XML todos los días y no los lee
   // nadie. `dmarcreport@opopular.com.br` puntuaba 95 —el ranking lo leía como nombre de
   // persona— y se envió. `dmca` ya estaba en la lista de basura; `dmarc` no.
-  if (/(^|[._-])(dmarc|spf|rua|ruf)([._-]|report|rep|$)/i.test(local)) return -1;
+  if (/(^|[._-])(dmarc|spf|rua|ruf)([._-]|report|rep|$)/i.test(local)) return "robot_dmarc";
   // Maxi 2026-07-14 (auditoría rebotes 11-15/07): "owner@" bare = etiqueta de WHOIS/informer, NO un
   // buzón real → rebotó 4/4 (cnnturk/expansion/arealme/vetogate). El ranking lo tomaba como EXEC (+90)
   // y lo mandaba primero. Un dueño real escribe desde su nombre, no owner@. Reject (source-agnóstico).
-  if (/^owner$/.test(local)) return -1;
+  if (/^owner$/.test(local)) return "owner";
   // Maxi 2026-07-24 (auditoría 22-24/07): casos basura que SÍ se enviaron.
   //  a) local de UNA sola letra ("a@olm.vn") → scrape roto, nunca un buzón real.
-  if (/^[a-z0-9]$/i.test(local)) return -1;
+  if (/^[a-z0-9]$/i.test(local)) return "local_corto";
   //  b) roles genéricos que NO son contacto comercial: cuenta/account (corotos.com.do → cuenta@gmail),
   //     alumno/student/estudiante (sportlife → alumno@), socio/member, cliente/customer. Reject duro.
-  if (/^(cuenta|account|alumno|alumna|student|estudiante|aluno|socio|member|miembro|cliente|customer|usuario|user|abonado|suscriptor|subscriber|lector|reader|visitante|visitor)s?$/i.test(local)) return -1;
+  if (/^(cuenta|account|alumno|alumna|student|estudiante|aluno|socio|member|miembro|cliente|customer|usuario|user|abonado|suscriptor|subscriber|lector|reader|visitante|visitor)s?$/i.test(local)) return "rol_no_comercial";
   //  c) FREEMAIL (gmail/hotmail/…) cuyo local es una palabra genérica de contacto — un negocio real
   //     no usa cuenta@gmail/info@gmail para vender. Si es freemail Y el local es genérico → reject.
   //     (Un freemail con NOMBRE de persona —juanperez@gmail— sigue pasando: puede ser un medio chico.)
   //     Regex inline: la const isFreeWebmail se declara más abajo (evita TDZ).
-  if (/^(gmail|yahoo|ymail|hotmail|outlook|live|aol|icloud|protonmail|gmx|yandex)\.|^mail\.ru$/i.test(dom) && _isGenericLocalPart(`${local}@x.com`)) return -1;
+  if (/^(gmail|yahoo|ymail|hotmail|outlook|live|aol|icloud|protonmail|gmx|yandex)\.|^mail\.ru$/i.test(dom) && _isGenericLocalPart(`${local}@x.com`)) return "freemail_generico";
+  return "";
+}
+
+export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
+  if (!email || typeof email !== "string" || !email.includes("@")) return -1;
+  // Todo lo que NUNCA es un contacto se decide en vetoDuroEmail (arriba). Desde acá, se puntúa.
+  if (vetoDuroEmail(email, siteDomain)) return -1;
+  const lower = email.toLowerCase();
+  const [local, dom] = lower.split("@");
+  // Se usan más abajo: la penalidad de UN rebote previo en el dominio (-40) y el chequeo de locales
+  // cortos. En vetoDuroEmail sólo deciden el veto; acá se recalculan.
+  const _rd = riesgoRebotePorDominio(dom || "");
+  const _localSinSep = local.replace(/[._-]/g, "");
 
   let score = 0;
   const cleanSite = (siteDomain || "").replace(/^www\./, "");
@@ -1053,6 +1077,11 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   // Un genérico con sufijo o prefijo de región (`info.lat@`, `contacto.mx@`, `gq.contacto@`)
   // es un genérico, no una persona llamada "info lat". Va antes del patrón nombre.apellido.
   else if (/[._-]/.test(local) && local.split(/[._-]+/).some(seg => IS_GENERIC.test(seg))) score += 15;
+  // Un buzón FUNCIONAL (download@, rewards@, store@, events@…) no es una persona: caía en
+  // PERSON_LIKELY (+55) y en el dominio propio le ganaba a info@ (2026-09-13, ver
+  // esBuzonFuncional). Sólo en el dominio propio o de la misma marca: uno de otro dominio ya vale
+  // poco, y bajarlo más lo dejaría negativo y la auditoría del pool lo borraría.
+  else if (!isCrossDomainCorporate && !isFreeWebmail && esBuzonFuncional(local)) { score += 8; matchedRole = "DEPARTMENT"; }
   // Pattern firstname.lastname (juan.perez@x.com) = persona real.
   // También inicial.apellido (j.perez@, m.rossi@): es el formato corporativo más común en
   // Italia, Francia y Alemania, y el patrón exigía dos letras antes del punto, así que
@@ -1382,6 +1411,29 @@ export function _sourceHardTier(source) {
 //   · el resultado se guarda en config y se LOGUEA: cada reajuste queda visible en el resumen.
 export const _TIER_ORDEN_DEFAULT = ["apollo", "rol", "persona", "generico"];
 
+// ── BUZONES FUNCIONALES: NO SON PERSONAS (2026-09-13) ─────────────────────────────────────────
+// rankEmail le daba +55 ("PERSON_LIKELY") a cualquier palabra de 5 a 15 letras que no fuera un
+// genérico conocido. Así download@, rewards@, advent@, series@, store@ o events@ valían 95 en el
+// dominio propio, por encima de info@ (55), y la extensión los preseleccionaba: el 10/09 una MB
+// escribió a download@pixelmonmod.com, advent@bisafans.de y series@racingnews365.com. Son buzones de
+// un servicio, no de alguien que compra pauta. Se compara cada trozo entero del local (un Set, no el
+// principio de la palabra): donatella, storey, reportero o guillermo no cambian. Quedan afuera a
+// propósito staff (la bandeja del equipo), affiliates, licensing y permissions (cerca de
+// monetización): eso lo decide el dueño.
+export const BUZON_FUNCIONAL_SEGMENT = new Set([
+  "download", "downloads", "descargas", "descarga", "rewards", "recompensas", "premios", "awards", "advent", "series",
+  "store", "shop", "tienda", "loja", "boutique", "negozio", "donate", "donations", "donaciones", "doacoes", "donazioni", "spenden",
+  "membership", "memberships", "orders", "refunds", "returns", "booking", "bookings", "reservas",
+  "events", "eventos", "eventi", "evenements", "entradas", "ingressos", "investors", "corrections", "appeals",
+  "moderators", "moderator", "mods", "moderacion", "volunteer", "volunteers", "voluntarios", "volontari",
+  "translate", "translations", "report", "reports", "accessibility", "ethics", "standards", "letters",
+  "subscribe", "subscriptions", "techsupport", "websupport",
+]);
+export function esBuzonFuncional(emailOLocal) {
+  const local = String(emailOLocal || "").toLowerCase().split("@")[0];
+  return !!local && local.split(/[._-]+/).some(seg => BUZON_FUNCIONAL_SEGMENT.has(seg));
+}
+
 export function _tipoDeEmailParaRanking(email, source) {
   const src = String(source || "").toLowerCase();
   const local = String(email || "").toLowerCase().split("@")[0];
@@ -1394,9 +1446,13 @@ export function _tipoDeEmailParaRanking(email, source) {
   // Apollo devolvió es un genérico — y se ordena con los de su clase.
   if (src === "apollo") {
     if (AD_SALES_LOCAL.test(local)) return "rol";
-    return _isGenericLocalPart(email) ? "generico" : "persona";
+    return (_isGenericLocalPart(email) || esBuzonFuncional(email)) ? "generico" : "persona";
   }
   if (AD_SALES_LOCAL.test(local)) return "rol";
+  // Un genérico (info@, press@) o un buzón funcional (download@, store@) es "generico" venga de donde
+  // venga (2026-09-13). Antes decidía la fuente: un info@ de redes, de caché o sin fuente caía en
+  // "persona", y el agente lo ordenaba distinto que la extensión, que mira la dirección.
+  if (_isGenericLocalPart(email) || esBuzonFuncional(email)) return "generico";
   if (_sourceHardTier(source) === 1) return "persona";
   return "generico";
 }
