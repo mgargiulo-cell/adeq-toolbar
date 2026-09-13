@@ -39,8 +39,11 @@ speed-test/whois/DNS/IP lookup, screenshot, survey/form builders, herramientas d
 
 ### Plataformas transaccionales / servicios digitales
 Procesadores de pago, hosting/registradores de dominio, cloud storage/file-sharing, webmail, ticketing/eventos,
-citas/dating, app stores, portales de descarga, antivirus/VPN, streaming (Netflix/Spotify), hosting de podcasts,
+citas/dating, app stores, portales de descarga, antivirus/VPN, plataformas de streaming por suscripción
+(Netflix/Spotify: las frenan la marca, el techo de tráfico y el ads.txt), hosting de podcasts,
 crowdfunding, programas de fidelidad, reservas/booking, marketplaces freelance, print-on-demand, ride-hailing/delivery.
+Desde el 13/09 (decisión del dueño) los sitios y guías de streaming de música, películas, series y TV con
+publicidad NO son un tipo excluido: pasan por las mismas puertas que cualquier medio. El streaming ilegal sigue abajo.
 
 ### Developer / técnico
 API docs/portales dev, registries de paquetes (npm/pypi), repos (github), sitios de documentación,

@@ -244,6 +244,8 @@ const URL_REJECT_RULES = [
   [/(^|\.)(compara|comparador|comparateur|vergleich)[a-z-]*\./i, "comparador"],
   [/(^|\.)[a-z-]*(clasificados|classificados|kleinanzeigen|annonces|marktplaats)[a-z-]*\./i, "clasificados"],
   // ── Plataformas de streaming (tienen su propio inventario) ──
+  // Es una lista de MARCAS, no del tipo streaming: se deja igual el 13/09. Como rubro por URL la puerta
+  // grande lo perdona; a estas marcas las frenan la blocklist de marcas, el techo de tráfico y el ads.txt.
   [/^(disneyplus|netflix|primevideo|hbomax|paramountplus|pluto|roku|sling|fubo|plex|tubitv|viki|mxplayer|crunchyroll|spotify|deezer|tidal|apple|itunes)\./i, "plataforma_streaming"],
   // ── Viajes / aerolíneas / hoteles ──
   [/^(jetsmart|lastminute|hotels|booking|expedia|despegar|kayak|trivago|airbnb|latam|avianca|aeromexico|iberia|ryanair|easyjet|jetstar|air-)\./i, "viajes"],
@@ -9069,11 +9071,15 @@ async function fetchPageContent(domain, _yaReintentado = false, _reintentoDns = 
     const sinSenalEditorial = !_senalEditorial;
 
     // Categoría heurística — keywords en title + description + URL (gratis, sin API call)
-    // Adult/Streaming PRIMERO porque scoreWebsite los usa como gates duros (descarte total).
+    // Adult/streaming pirata PRIMERO porque scoreWebsite los usa como gates duros (descarte total).
+    // Desde el 13/09 el streaming se separa en dos (decisión del dueño, ver _STREAMING_PIRATA_RE): lo
+    // pirata y las retransmisiones en vivo quedan "streaming_pirata", vetado al enviar como antes; el
+    // streaming de música, películas, series y TV queda "streaming", un medio más.
     const textForCategory = `${title} ${desc} ${domain}`.toLowerCase();
     let category = "other";
     if      (/\b(porn|xxx|sex|adult|escort|fetish|hentai|onlyfans|pornhub|xvideos|xnxx|redtube|cam[\s-]?girl|webcam|nude|nudes|brazzer)\b|videos?xxx|sexo[\s-]?gratis|chicas[\s-]?desnudas/i.test(textForCategory)) category = "adult";
-    else if (/\b(streaming|stream[\s-]?online|cuevana|repelis|pelis24|pelisplus|gnula|magis[\s-]?tv|futbol[\s-]?en[\s-]?vivo|live[\s-]?stream|free[\s-]?movies|watch[\s-]?free|123movies|fmovies|putlocker|soap2day|netflix[\s-]?free|disney[\s-]?free|hbo[\s-]?free)\b|ver[\s-]?(peliculas|series|partidos|futbol)[\s-]?(online|gratis|en[\s-]?vivo)/i.test(textForCategory)) category = "streaming";
+    else if (_esStreamingPirata(textForCategory)) category = "streaming_pirata";
+    else if (/\bstreaming\b/i.test(textForCategory)) category = "streaming";
     else if (/sport|futbol|futebol|soccer|football|nba|basket|tennis|béisbol|beisbol|liga|mlb|f1|motor|boxeo|boxing/.test(textForCategory)) category = "sports";
     else if (/noticia|news|diario|periódico|periodico|press|journalism|último|ultimo momento|actualidad/.test(textForCategory))            category = "news";
     else if (/finanz|banco|econom|invest|crypto|bolsa|stock|finance|mercad/.test(textForCategory))                                          category = "finance";
@@ -9404,6 +9410,7 @@ async function fetchPageContent(domain, _yaReintentado = false, _reintentoDns = 
 // "finance" y cobraba +25 "categoría de medios"; la de una clínica caía en "health"; la de una
 // universidad con carrera de sistemas, en "technology". Era el motor de que se colaran.
 // Quedan solo las que un no-publisher no puede fingir con las palabras de su home.
+// "streaming" es el de música, películas, series y TV (13/09); "streaming_pirata" no suma como medio.
 const PUBLISHER_CATEGORIES = new Set(["news","sports","entertainment","streaming","food"]);
 
 // ── CATEGORÍAS QUE NO VAN — VETO, NO PUNTAJE (Maxi 2026-08-01) ────────────────────────
@@ -11828,7 +11835,8 @@ const _TIPOS_SITIO = ["publisher","corp","gov","edu","saas","ecommerce","bank","
 function _SYS_CLASIFICA_SITIO(trashRules = "") {
   return "Clasificás sitios web para un ad-network. Un 'publisher' (ÚNICO target válido) es un "
     + "medio/blog/revista/portal de CONTENIDO editorial que vive de publicidad display/programmatic: "
-    + "noticias, deportes, entretenimiento, farándula, estilo de vida, tecnología, gaming, recetas, etc. "
+    + "noticias, deportes, entretenimiento, farándula, música, películas, series y TV (guías y sitios de "
+    + "streaming con publicidad incluidos), estilo de vida, tecnología, gaming, recetas, etc. "
     + "El sitio muestra ARTÍCULOS/NOTAS y coloca avisos alrededor.\n\n"
     + "NO son publishers (descartar SIEMPRE, aunque tengan pixel de retargeting o ads.txt):\n"
     + "- ecommerce: tiendas online, marcas que venden producto, marketplaces, clasificados (carrito/precio/comprar).\n"
@@ -14484,9 +14492,10 @@ max_tokens: 12,
 system: [
   "Sos un analista de medios digitales. Te dan un dominio que NO pudimos inspeccionar (nos bloquea el scraper).",
   "Decidí si es un MEDIO DE CONTENIDO que monetiza con publicidad display/programática (diario, revista,",
-  "portal de noticias, deportes, entretenimiento, blog grande, sitio de recetas/tecnología con ads).",
+  "portal de noticias, deportes, entretenimiento, guía o sitio de música, películas, series y TV con ads,",
+  "blog grande, sitio de recetas/tecnología con ads).",
   "NO son medios: bancos, seguros, gobiernos, universidades, e-commerce, SaaS, casas de apuestas,",
-  "aerolíneas, marcas corporativas, plataformas de streaming, herramientas, redes sociales.",
+  "aerolíneas, marcas corporativas, streaming pirata o descargas ilegales, herramientas, redes sociales.",
   "Respondé UNA sola palabra: 'publisher' si estás razonablemente seguro de que es un medio con ads,",
   "'no' si estás razonablemente seguro de que no lo es, 'duda' si no lo conocés o no estás seguro.",
   "Ante la duda respondé 'duda'. Sin explicación.",
@@ -14714,8 +14723,9 @@ const CORPORATE_PATTERNS = [
 // SÍ pueden ser publishers de contenido: finanzas/inversión (sitios de noticias
 // financieras), telecom, ecommerce/shopping (sitios de deals/reviews), viajes
 // (blogs/guías), inmobiliaria (portales con contenido), pharma, logística, etc.
-// Esas, si no sirven, las rechaza el MB a mano (botón rojo). Adult/streaming/gambling
-// los corta scoreWebsite (gate duro). Objetivo: dejar pasar, no sobre-filtrar.
+// Esas, si no sirven, las rechaza el MB a mano (botón rojo). Adult/streaming pirata/gambling
+// los corta scoreWebsite (gate duro; el streaming legítimo dejó de estar ahí el 13/09).
+// Objetivo: dejar pasar, no sobre-filtrar.
 const BLOCKED_CATEGORY_KEYWORDS = [
   "government", "law and government", "public administration", "military",
   "universities", "higher education", "academic",
@@ -16310,8 +16320,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // nunca llegaba a la puerta que debía perdonarlo. La regla existía y no se aplicaba.
   // Los vetos ESTRUCTURALES (gobierno, universidad, muerto) no pasan por acá: se filtran
   // antes, en su propio chequeo. Esto solo perdona el RUBRO, que es lo que el user pidió.
-  // La puerta grande perdona el RUBRO, no el TIPO DE NEGOCIO. Un banco o una plataforma de
-  // streaming con ads.txt y tráfico sigue sin ser un publisher al que venderle display.
+  // La puerta grande perdona el RUBRO, no el TIPO DE NEGOCIO. Un banco o una tienda con ads.txt y
+  // tráfico sigue sin ser un publisher al que venderle display. (El streaming dejó de ser un tipo no
+  // prospectable el 13/09, decisión del dueño: ver _STREAMING_PIRATA_RE y CATEGORIAS_NUNCA.)
   // ── EL DIAGNÓSTICO DICE EL ESTADO REAL DEL ADS.TXT Y LOS PAGEVIEWS REALES (2026-09-13) ───────
   // Los dos descartes de abajo grababan siempre `adsTxt: true` y "Tiene ads.txt y tráfico de sobra"
   // / "Cumple todo salvo el país", sin mirar: `_ads` puede llegar acá como "yes", como la excepción
@@ -16330,7 +16341,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     registrarDiagDescarte(token, {
       domain, etapa: "tipo_de_negocio", motivo: `tipo_no_prospectable:${_nunca}`,
       categoria: swCategory, geo: topCountry || "", traffic: effectivePageViews, adsTxt: _adsTxtDiag,
-      comentario: `${_adsFrase}, pero es "${swCategory}" → ${_nunca}. No es un publisher al que se le venda display: monetiza su propio inventario o vende producto. Regla del user (27/08): aunque cumpla los requisitos, banco/ecommerce/porno/streaming no entran.`,
+      comentario: `${_adsFrase}, pero es "${swCategory}" → ${_nunca}. No es un publisher al que se le venda display: monetiza su propio inventario o vende producto. Regla del user (27/08): aunque cumpla los requisitos, banco/ecommerce/porno/apuestas no entran (el streaming salió de la lista el 13/09).`,
     }).catch(() => {});
     log(`  ⛔ ${domain} — "${swCategory}" es ${_nunca}: no es un publisher de display, no entra`);
     return;
@@ -21931,7 +21942,7 @@ messages: [{ role: "user", content: userMsg }],
 // ── Website composite scoring ──────────────────────────────
 // Score 0-100 por lead, con gates duros (return -1 = descartar).
 // Basado en: GEO target ADEQ (LATAM/ES/EU prioritario, Tier1/UK/RU descarta),
-// Engagement (≥400K + datos completos), Categoría (adult/streaming descartan),
+// Engagement (≥400K + datos completos), Categoría (adult/streaming pirata/gambling descartan),
 // Ad networks (menos partners detectadas = más open), Idioma (ru/zh penaliza).
 
 
@@ -21946,8 +21957,33 @@ function scoreGeo(geo) {
   return 10; // desconocido pero no blocked — neutro
 }
 
-// Categorías que descartan el lead (gate duro)
-const BLOCKED_CATEGORIES = new Set(["adult","streaming","gambling"]);
+// ── STREAMING: DECISIÓN DEL DUEÑO DEL 13/09 (noche) ─────────────────────────────────────────────
+// "Streaming: si es de música podría ser, de películas también, podríamos intentar."
+// Hasta hoy "streaming" era un TIPO no prospectable en dos listas: CATEGORIAS_NUNCA (un sitio o una
+// guía de streaming de música, películas, series o TV no entraba ni con ads.txt y tráfico) y
+// BLOCKED_CATEGORIES (si entraba por otra categoría de SimilarWeb, la heurística de fetchPageContent
+// le guardaba "streaming" y el agente no le escribía nunca). Desde hoy pasa por las mismas puertas
+// que cualquier medio: ads.txt, piso y techo de tráfico, marca/blocklist, vetos estructurales y GEO.
+// Netflix, Spotify, YouTube y compañía siguen afuera por lo que ya los frena (marca, techo, sin
+// ads.txt), no por el tipo.
+// Lo que NO se abre: la heurística juntaba bajo "streaming" a los sitios piratas (cuevana, repelis,
+// 123movies, "ver películas online gratis") y a las retransmisiones en vivo ("fútbol en vivo", "live
+// stream", "stream online"), que en el pool son sobre todo sin derechos y no son lo que pidió el
+// dueño. Esos se llaman ahora "streaming_pirata" y siguen vetados al enviar, con esta única regla
+// para la heurística de entrada y para las filas viejas en scoreWebsite. La piratería con marcado
+// (torrents, magnet) la sigue vetando piracyRe en fetchPageContent y en la extensión.
+// Los nombres de los sitios piratas van SIN borde de palabra al final a propósito: casi todos llevan un
+// número pegado (cuevana3.io, repelis24, pelis24), y con `\b` la regex vieja no los veía cuando lo único
+// que había para mirar era el dominio. Son marcas inequívocas; el resto sigue pidiendo palabra entera.
+const _STREAMING_PIRATA_RE = /(cuevana|repelis|pelis24|pelisplus|gnula|123movies|fmovies|putlocker|soap2day)|\b(stream[\s-]?online|magis[\s-]?tv|futbol[\s-]?en[\s-]?vivo|live[\s-]?stream|free[\s-]?movies|watch[\s-]?free|netflix[\s-]?free|disney[\s-]?free|hbo[\s-]?free)\b|ver[\s-]?(peliculas|series|partidos|futbol)[\s-]?(online|gratis|en[\s-]?vivo)/i;
+/** ¿Este texto (título, descripción, dominio) es de streaming pirata o de retransmisión en vivo? Pura. */
+function _esStreamingPirata(texto) {
+  return _STREAMING_PIRATA_RE.test(String(texto || ""));
+}
+
+// Categorías que descartan el lead al enviar (gate duro de scoreWebsite). "streaming" a secas ya no
+// está: es un medio más desde el 13/09 (ver arriba).
+const BLOCKED_CATEGORIES = new Set(["adult","streaming_pirata","gambling"]);
 
 // ── LO QUE NO PERDONA NI LA PUERTA GRANDE (Maxi 2026-08-27) ─────────────────────────────
 // El 25/08 se puso una "puerta grande": con ads.txt y +400k pageviews, la categoría se
@@ -21963,8 +21999,11 @@ const BLOCKED_CATEGORIES = new Set(["adult","streaming","gambling"]);
 // y la puerta grande lo puede perdonar. Esta es "no es un publisher que venda display
 // nuestro", y no hay tráfico que lo cambie.
 const CATEGORIAS_NUNCA = [
-  // Plataformas de video/TV: monetizan su propio inventario, no venden display a terceros.
-  "streaming", "video_streaming", "tv_streaming", "arts_and_entertainment/streaming",
+  // Streaming ("streaming", "video_streaming", "tv_streaming", "arts_and_entertainment/streaming")
+  // SALIÓ de esta lista el 13/09 por decisión del dueño (ver _STREAMING_PIRATA_RE): se comparaba por
+  // pedazo de texto y se llevaba "arts_and_entertainment/tv_movies_and_streaming" y cualquier categoría
+  // de música o video con "streaming" adentro. Las plataformas gigantes las siguen frenando la marca, el
+  // techo de tráfico y el ads.txt; la piratería, piracyRe y "streaming_pirata".
   // Adulto y apuestas: fuera del portfolio y un riesgo de marca.
   "adult", "pornography", "gambling", "casino", "betting",
   // Banca y finanzas reguladas: no compran display programático de este tipo.
@@ -22024,6 +22063,12 @@ function scoreWebsite(lead) {
 
   if (BLOCKED_CATEGORIES.has(cat)) {
     return { score: -1, color: "red", reasons: [`cat_blocked:${cat}`] };
+  }
+  // Filas guardadas antes del 13/09: la heurística ponía "streaming" también a los piratas y a las
+  // retransmisiones en vivo. Con el título guardado y el dominio se aplica la misma regla que hoy los
+  // separa al entrar; el streaming de música, películas, series y TV sigue de largo.
+  if (cat === "streaming" && _esStreamingPirata(`${lead.page_title || ""} ${domain}`)) {
+    return { score: -1, color: "red", reasons: ["cat_blocked:streaming_pirata"] };
   }
   // Mega-corps — usa el mismo set de EXCLUDE_DOMAINS que el autopilot
   if (EXCLUDE_DOMAINS.has(domain) || EXCLUDE_DOMAINS.has(domain.replace(/^www\./, ""))) {
@@ -24826,7 +24871,7 @@ async function runAgentCycle(token, allFlags) {
       // diario y quema reputación con alguien que nunca iba a comprar.
       // Se sacan del pool del agente. NO se borran: siguen en Prospects para que el MB
       // confirme o levante la marca, que es como estaba pensado.
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&traffic=gte.${aCfg.thresholdTraffic}${filtros}&select=id,domain,score,traffic,geo,geos_all,language,category,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_reject=not.is.true&traffic=gte.${aCfg.thresholdTraffic}${filtros}&select=id,domain,score,traffic,geo,geos_all,language,category,page_title,emails,email_sources,ad_networks,contact_name,contact_phone${orden}&limit=${POOL_SIZE}`; // Maxi 2026-07-03 perf: select=* → solo columnas usadas. Egress ALTO: POOL_SIZE filas de tabla ancha
     const _hdrsPool = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
     // ══════════════════════════════════════════════════════════════════════════════════
@@ -24893,7 +24938,8 @@ async function runAgentCycle(token, allFlags) {
 
     // ── COMPOSITE SCORING ─────────────────────────────────────
     // scoreWebsite() devuelve {score, stars 1-5, color, reasons}.
-    // Filtramos los que cayeron en gates duros (geo blocked, adult/streaming).
+    // Filtramos los que cayeron en gates duros (geo blocked, adult/streaming pirata/gambling). El
+    // page_title va en la consulta para que las filas viejas con "streaming" se juzguen con la regla del 13/09.
     // Persistimos el score a review_queue para que el popup muestre las stars.
     const scored = [];
     for (const c of candidatesRaw) {
