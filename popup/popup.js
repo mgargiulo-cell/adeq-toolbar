@@ -59,7 +59,8 @@ import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllC
 import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, markManualSendFailed, isEmailBounced, dominiosConEnvioReciente } from "../modules/supabase.js";
 // Las reglas de la cola "Por enviar" y de los adicionales de la tarjeta, sin DOM y con tests (2026-09-13).
 import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, planSacarDeCola, textoConfirmarSacar,
-         textoResultadoSacar, adicionalesDeLaTarjeta, contactosDeAdicionales } from "../modules/colaEstado.js";
+         textoResultadoSacar, adicionalesDeLaTarjeta, contactosDeAdicionales,
+         fotoCrmAlGuardar, decidirLoteCrm, lecturaDeEnvios, contactadoDeCola } from "../modules/colaEstado.js";
 import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
@@ -5464,20 +5465,25 @@ async function bindButtons() {
     // ── ¿A QUIÉN YA SE LE ESCRIBIÓ? (2026-09-13) ─────────────────────────────────────────
     // `mail_enviado` se anota al guardar y queda viejo si el MB manda el mail después: el CRM
     // recibía mail_ya_enviado=false y le mandaba el inicial a alguien que ya lo tenía. Una sola
-    // consulta a sendtrack para todo el lote; si no contesta, no se manda nada.
+    // consulta a sendtrack para todo el lote; si no contesta, sólo sale lo que ya se sabe enviado.
     out.textContent = "Revisando a quién ya se le escribió…"; out.style.color = "var(--muted)";
-    const _env = await dominiosConEnvioReciente((await ensureFreshToken()) || state.accessToken, filas.map(f => f.domain));
-    if (!_env.ok) {
-      out.textContent = `No pude consultar a quién ya se le escribió (${_env.error}): no se mandó nada, reintentá.`;
-      out.style.color = "#fca5a5"; btn.disabled = false; return;
-    }
+    const _env = await dominiosConEnvioReciente((await ensureFreshToken()) || state.accessToken, filas.map(f => f.domain),
+      { renovarToken: () => ensureFreshToken(Infinity) });
+    // (2026-09-13) Si sendtrack no contesta, o su respuesta no es creíble (ver lecturaDeEnvios), el
+    // lote ya no se apaga entero: manda las filas que anotaron al guardar que el mail salió y
+    // saltea el resto con el motivo. Sin saber si ya se le escribió, el CRM le mandaría el inicial.
+    const _lectura = lecturaDeEnvios(_env, filas);
     const ctx = { refrescado: false };
     for (const [i, f] of filas.entries()) {
       out.textContent = `Enviando ${i + 1} de ${filas.length}…`; out.style.color = "var(--muted)";
       const mp = f.monday_payload || {};
       const sigue = await _colaSigueEnCola(f.id);
       if (sigue === false) { salteados.push(`${f.domain}: ya no estaba en la cola (lo mandó o lo sacó otro)`); continue; }
-      if (sigue === null) { fallaron.push(`${f.domain}: no pude confirmar que siga en la cola`); continue; }
+      // (2026-09-13) Si la base no contesta se corta, igual que cuando no contesta el CRM: seguir
+      // eran hasta 300 filas × 8 s esperando a una base caída.
+      if (sigue === null) { corte = `No pude confirmar en la base que ${f.domain} siga en la cola: se frenó el lote, reintentá.`; break; }
+      const contactado = contactadoDeCola(f, _lectura);
+      if (contactado === null) { salteados.push(`${f.domain}: ${_lectura.motivo}; sin saber si ya se le escribió no se carga`); continue; }
 
       // ── EL LOTE PREGUNTA AL CRM POR CADA SITIO, EN EL MOMENTO (2026-09-13) ─────────────
       // Era la única puerta al CRM sin el candado del veredicto: se guardaba un cliente activo y
@@ -5487,10 +5493,14 @@ async function bindButtons() {
       //  · El CRM no contesta → se corta el lote: sin corte, 300 filas × 8 s son 40 minutos.
       //  · NO firme o duda → se saltea con el motivo. La duda también: en un lote nadie mira el
       //    cartel de cada web, y "no pude preguntar" nunca es "está libre".
+      //  · (2026-09-13) Pero una "Propuesta Vigente" sin ejecutivo que apareció DESPUÉS de nuestro
+      //    envío es la ficha que crea el aviso de los adicionales, no una propuesta ajena: saltearla
+      //    dejaba la fila afuera del CRM para siempre. La regla, con sus casos, en decidirLoteCrm.
       const dup = await buscarEnCrm(f.domain);
       if (dup?.indeterminado) { corte = `El CRM no contesta: se frenó en ${f.domain}, reintentá.`; break; }
       const vc = _veredictoCrm(dup);
-      if (!vc.ok) { salteados.push(`${f.domain}: ${vc.titulo}: ${vc.detalle}`); continue; }
+      const dec = decidirLoteCrm({ dup, veredicto: vc, alGuardar: mp.crm_al_guardar || null, contactado });
+      if (!dec.enviar) { salteados.push(`${f.domain}: ${dec.motivo}`); continue; }
       // Un email rebotado nunca se reusa: el lote no lo cambia por otro en silencio, lo saltea.
       const email = emailDeCola(f);
       if (email && !_esFormularioUrl(email)) {
@@ -5531,7 +5541,8 @@ async function bindButtons() {
           // de la pantalla de Analysis, que a esa hora es otro dominio.
           contactos: Array.isArray(mp.contactos) ? mp.contactos : [],
           // Lo que se anotó al guardar, o sendtrack: si el mail ya salió, el CRM no lo repite.
-          mailYaEnviado: mp.mail_enviado === true || _env.dominios.has(String(f.domain || "").toLowerCase()),
+          // (Si no se pudo saber, la fila ya se salteó arriba: acá siempre es true o false.)
+          mailYaEnviado: contactado,
         });
       } catch (e) {
         fallaron.push(`${f.domain}: ${String(e.message || e).slice(0, 60)}`);
@@ -5582,13 +5593,19 @@ async function bindButtons() {
     const filas = ids.map(id => _colaFilas.find(x => String(x.id) === String(id))).filter(Boolean);
     if (!filas.length) { out.textContent = "No encontré esas filas: cerrá y abrí la cola para refrescarla."; out.style.color = "var(--muted)"; return; }
     out.textContent = "Revisando a dónde vuelve cada uno…"; out.style.color = "var(--muted)";
-    const _env = await dominiosConEnvioReciente((await ensureFreshToken()) || state.accessToken, filas.map(f => f.domain));
-    if (!_env.ok) {
-      out.textContent = `No pude consultar a quién ya se le escribió (${_env.error}): no se sacó nada, reintentá.`;
+    const _env = await dominiosConEnvioReciente((await ensureFreshToken()) || state.accessToken, filas.map(f => f.domain),
+      { renovarToken: () => ensureFreshToken(Infinity) });
+    // (2026-09-13) Sin una lectura creíble de sendtrack, "Quitar" no adivina "no se le escribió": lo que
+    // volvería al pool se queda en la cola con el motivo. Lo demás (contactados anotados, descartados,
+    // guardados sin filtro) no depende de sendtrack y sale igual. Antes un 401/403 dejaba el botón
+    // inutilizable, y una lectura vacía por RLS devolvía a Prospects un sitio contactado por otro.
+    const _lectura = lecturaDeEnvios(_env, filas);
+    const plan = planSacarDeCola(filas, { contactados: _lectura.conocida ? _lectura.dominios : null, minTraffic: CONFIG.MIN_TRAFFIC, loginEmail: state.loginEmail });
+    if (!plan.lotes.length) {
+      out.textContent = `No se sacó nada: ${plan.sinConfirmar.length} quedan en la cola porque ${_lectura.motivo || "no pude confirmar si ya se les escribió"}. Reintentá en un rato.`;
       out.style.color = "#fca5a5"; return;
     }
-    const plan = planSacarDeCola(filas, { contactados: _env.dominios, minTraffic: CONFIG.MIN_TRAFFIC, loginEmail: state.loginEmail });
-    if (!confirm(textoConfirmarSacar(plan, { minTraffic: CONFIG.MIN_TRAFFIC }))) { out.textContent = ""; return; }
+    if (!confirm(textoConfirmarSacar(plan, { minTraffic: CONFIG.MIN_TRAFFIC, motivoSinConfirmar: _lectura.motivo }))) { out.textContent = ""; return; }
     const ctx = { refrescado: false };
     const hechos = [], fallas = [];
     for (const lote of plan.lotes) {
@@ -5597,6 +5614,7 @@ async function bindButtons() {
       hechos.push(...r.ids);
       if (r.ids.length < lote.ids.length) fallas.push(`${lote.ids.length - r.ids.length} ya no estaban en la cola`);
     }
+    if (plan.sinConfirmar.length) fallas.push(`${plan.sinConfirmar.length} se quedaron en la cola (${_lectura.motivo})`);
     out.textContent = textoResultadoSacar(hechos, filas.length, plan.grupoPorId, { minTraffic: CONFIG.MIN_TRAFFIC, fallas });
     out.style.color = fallas.length ? "#fbbf24" : "var(--muted)";
     await _colaRefrescarContador(); _colaPintar();
@@ -5687,6 +5705,10 @@ async function bindButtons() {
         prev: _ya, domain: state.domain, loginEmail: state.loginEmail,
         esFormulario: _esFormularioUrl(v.email), geoLabel: GEO_LABEL,
         contactos: _contactosAdicionales(), trafficTexto: formatTraffic(v.traffic),
+        // (2026-09-13) Lo que el CRM decía AHORA, antes de que el worker despache los adicionales
+        // y su aviso cree una ficha "Propuesta Vigente" sin ejecutivo: el lote lo necesita para no
+        // confundir esa ficha nuestra con una propuesta ajena (decidirLoteCrm).
+        crmAlGuardar: fotoCrmAlGuardar(state.crmVeredicto, state.duplicate),
       });
 
       const r = _ya
@@ -12278,6 +12300,37 @@ async function flushPendingMarks() {
   } catch {}
 }
 
+// ── LA SALIDA DE EMERGENCIA DE LA TARJETA: EL SITIO QUEDA EN "POR ENVIAR" (2026-09-13) ──────────
+// Cuando el mail de la tarjeta ya salió y la ficha no entra al CRM, no había botón que la cargara
+// sin repetir el mail: el verde de Analysis exige haberlo mandado en esa sesión. La cola "Por enviar"
+// sí puede: carga la ficha con mail_ya_enviado=true, y "Quitar" la cierra como contactada.
+// Misma regla que "Guardar" (filaColaDesdeFormulario), con la fila del pool como anterior en estado
+// "validated", que es lo que es: ya se le escribió. Sólo toca la fila si sigue pending o validated, y
+// dice si la tocó de verdad (return=representation).
+async function _tarjetaAPorEnviar(data, v, { trafficTexto = "", contactos = [], crmAlGuardar = null } = {}) {
+  const fila = filaColaDesdeFormulario(v, {
+    prev: { id: data.id, status: "validated", traffic: data.traffic, emails: data.emails, email_sources: data.email_sources },
+    domain: data.domain, loginEmail: state.loginEmail, trafficTexto, contactos, crmAlGuardar,
+  });
+  try {
+    const tk = (await ensureFreshToken()) || state.accessToken;
+    const r = await fetch(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${encodeURIComponent(data.id)}&status=in.(pending,validated)&select=id`,
+      { method: "PATCH",
+        headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${tk}`,
+                   "Content-Type": "application/json", "Prefer": "return=representation" },
+        signal: AbortSignal.timeout(8000),
+        body: JSON.stringify(fila) });
+    if (!r.ok) return { ok: false, error: `HTTP ${r.status}` };
+    const filas = await r.json().catch(() => null);
+    if (!Array.isArray(filas)) return { ok: false, error: "respuesta ilegible" };
+    if (!filas.length) return { ok: false, error: "la fila ya no estaba en Prospects" };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e?.name === "TimeoutError" ? "la base no contestó en 8 s" : (e?.message || String(e)) };
+  }
+}
+
 async function validateProspect(card, data, doSendEmail) {
   const resultEl = card.querySelector(".pcard-result");
   const setResult = (msg, ok = true) => {
@@ -12401,6 +12454,10 @@ async function validateProspect(card, data, doSendEmail) {
   // Si el mail ya salió y lo que falla es lo de después (la carga al CRM), la card no puede volver
   // a ofrecer "Push + Send Email": el segundo click le manda el mismo mail al mismo contacto.
   let mailSalio = false;
+  // (2026-09-13) Qué llegó a pasar, para que el cartel del catch diga la verdad: si la ficha entró,
+  // lo que falló no es el CRM; si no entró, si el sitio pudo quedar en "Por enviar".
+  let crmCargado = false;
+  let colaEmergencia = null;
   try {
     // 1. Carga en el CRM. El board es idempotente por dominio, así que da igual si el
     //    prospecto vino de Autopilot, de un CSV o del refresh: el mismo POST crea o pisa,
@@ -12504,6 +12561,34 @@ async function validateProspect(card, data, doSendEmail) {
         domain: data.domain, mbEmail: state.loginEmail, principal: email, candidatos, rebotados,
         subject, body: fullBody, ahoraMs: Date.now(),
       });
+
+      // ── PRIMERO LA FICHA; LOS ADICIONALES, SÓLO SI ENTRÓ (2026-09-13) ─────────────────────
+      // Se encolaban antes de cargar la ficha. Si el CRM fallaba, el worker los mandaba igual a los
+      // pocos minutos y su aviso `adicional_enviado` creaba en el CRM una ficha sin datos
+      // ("Propuesta Vigente" por defecto, sin ejecutivo) que después bloqueaba el sitio en Analysis.
+      // La ficha lleva los contactos con su hora programada, como en Analysis (regla del user, 07/09).
+      // Si NO entra, el sitio queda en "Por enviar" con todo lo de la tarjeta: el mail no se puede
+      // repetir, y el botón verde de Analysis exige haberlo mandado en esa sesión, así que el cartel
+      // "cargalo desde Analysis" no tenía salida real. Los adicionales no se programan.
+      try {
+        await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "",
+                              contactos: contactosDeAdicionales(adicionales, { programados: true }) });
+      } catch (e) {
+        colaEmergencia = await _tarjetaAPorEnviar(data, {
+          estado, fecha: fechaISO, ejecutivo, idioma, email, geo, traffic: trafficNum, pitch, mailEnviado: true,
+        }, {
+          trafficTexto: traffic, contactos: contactosDeAdicionales(adicionales, { programados: false }),
+          crmAlGuardar: fotoCrmAlGuardar(_vPool, _dupPool),
+        });
+        if (futStatusEl && adicionales.length) {
+          futStatusEl.textContent = `⏸️ Adicionales NO programados (la ficha no entró al CRM): ${adicionales.map(a => a.future_email).join(", ")}`;
+          futStatusEl.style.color = "#dc2626";
+        }
+        throw e;
+      }
+      crmCargado = true;
+      incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
+
       let programados = true;
       if (adicionales.length) {
         // Si la cola falla hay que DECIRLO: el MB tiene que saber que esos mails no van a salir.
@@ -12517,7 +12602,9 @@ async function validateProspect(card, data, doSendEmail) {
           if (!_r.ok) throw new Error(`HTTP ${_r.status}`);
         } catch (e) {
           programados = false;
-          avisos.push(`❌ no se pudieron programar los adicionales (${e?.name === "TimeoutError" ? "la base no contestó" : e.message}) — mandalos a mano`);
+          // La ficha ya los tiene anotados con la hora programada: si no se mandan a mano, quedan
+          // afirmando algo que no pasó. Por eso el cartel lo pide explícito.
+          avisos.push(`❌ no se pudieron programar los adicionales (${e?.name === "TimeoutError" ? "la base no contestó" : e.message}) — mandalos a mano ahora, la ficha ya los tiene anotados`);
         }
       }
       const salieron = adicionales.length > 0 && programados;
@@ -12528,14 +12615,8 @@ async function validateProspect(card, data, doSendEmail) {
         futStatusEl.textContent = parts.join(" | ");
         futStatusEl.style.color = salieron ? (avisos.length ? "#d97706" : "#16a34a") : "#dc2626";
       }
-
-      // El mail salió: recién ahora la ficha puede decir que este prospecto fue contactado.
-      // Con SUS adicionales: sin `contactos`, enviarAlBoard leía los de la pantalla de Analysis
-      // (que a esa hora puede ser otro dominio) y las respuestas de los de la tarjeta quedaban
-      // huérfanas en el CRM.
-      await enviarAlBoard({ ...mondayPayload, telefono: data.contact_phone || "",
-                            contactos: contactosDeAdicionales(adicionales, { programados }) });
-      incrementUserDailyCounter(state.accessToken, state.loginEmail, "monday").catch(() => {});
+      // (La ficha ya entró arriba, con SUS adicionales: sin `contactos`, enviarAlBoard leía los de la
+      // pantalla de Analysis, que a esa hora puede ser otro dominio.)
     }
 
     // 3. Save to historial
@@ -12578,11 +12659,24 @@ async function validateProspect(card, data, doSendEmail) {
 
   } catch (err) {
     console.error("[Prospects validate]", err.message);
-    if (mailSalio) {
-      // (2026-09-13) El envío ya quedó registrado (agent_actions + sendtrack) y la fila del pool se
-      // marcó contactada: lo que falta es la ficha. Se dice qué hacer y el botón de enviar queda
-      // apagado; el resto de la card sigue usable.
-      setResult(`✅ Mail enviado · ❌ la carga al CRM falló (${err.message}). NO lo vuelvas a mandar: cargalo desde Analysis.`, false);
+    if (crmCargado) {
+      // (2026-09-13) El mail salió y la ficha entró: lo que falló es de después (el historial). El
+      // cartel decía "la carga al CRM falló" y el MB iba a cargar otra vez algo que ya estaba. La
+      // marca de contactado se encola y se reintenta sola, como cuando falla validateReviewItem.
+      await queuePendingMark(data.id, state.loginEmail);
+      setResult(`✅ Mail enviado y cargado en ADEQ · ⚠️ falló un paso posterior (${err.message}). No lo vuelvas a mandar.`, false);
+      card.querySelectorAll("button").forEach(b => { b.disabled = b.classList.contains("pcard-validate-expanded"); });
+    } else if (mailSalio) {
+      // (2026-09-13) El envío quedó registrado (agent_actions + sendtrack) y la fila salió del pool:
+      // falta la ficha. Si se pudo, el sitio quedó en "Por enviar" (_tarjetaAPorEnviar) y se carga
+      // desde ahí sin repetir el mail. Va también como toast: el refresco de Prospects saca esta
+      // tarjeta en segundos, porque la fila ya no está pendiente, y el cartel no llegaba a leerse.
+      const msg = colaEmergencia?.ok
+        ? `✅ Mail enviado · ❌ la carga al CRM falló (${err.message}). NO lo vuelvas a mandar: quedó en Prospects › Por enviar, cargalo desde ahí (no repite el mail).`
+        : `✅ Mail enviado · ❌ la carga al CRM falló (${err.message}) y no pude dejarlo en Por enviar (${colaEmergencia?.error || "no se intentó"}). NO lo vuelvas a mandar: anotá ${data.domain} y cargalo desde Analysis con "Guardar para enviar después".`;
+      setResult(msg, false);
+      showToast(msg, "error", 20000);
+      if (colaEmergencia?.ok) window._colaRefrescarContador?.();
       card.querySelectorAll("button").forEach(b => { b.disabled = b.classList.contains("pcard-validate-expanded"); });
     } else {
       setResult("❌ " + err.message, false);

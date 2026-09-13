@@ -268,7 +268,10 @@ test("C45 y C52: los botones de la cola usan las reglas y ya no prometen lo que 
   ok(/dominiosConEnvioReciente\(/.test(sacar), "'Quitar' tiene que saber si el mail salió después de guardar");
   ok(/CONFIG\.MIN_TRAFFIC/.test(sacar), "el piso sale de CONFIG, no de un número copiado");
   ok(!/status:\s*"pending"/.test(sacar) && !/no se borran/i.test(sacar), "'Quitar' volvió a mandar todo a pending");
-  ok(/if \(!_env\.ok\)[\s\S]{0,300}?return;/.test(sacar), "sin la consulta a sendtrack, 'Quitar' no adivina");
+  // (2026-09-13, menor 3) Sin la consulta a sendtrack 'Quitar' sigue sin adivinar, pero ya no se
+  // apaga entero: lo que volvería al pool queda en la cola (planSacarDeCola con contactados null).
+  ok(/lecturaDeEnvios\(_env, filas\)/.test(sacar) && /contactados: _lectura\.conocida \? _lectura\.dominios : null/.test(sacar),
+     "sin la consulta a sendtrack, 'Quitar' no adivina");
   ok(!/no los borra de Prospects/.test(html), "el title del botón Quitar prometía algo falso");
 
   const guardar = texto(handlerDe("btn-guardar-cola"));
@@ -307,7 +310,9 @@ test("C46: el lote pregunta por cada sitio en el momento, corta si el CRM no con
   ok(enviar.indexOf("buscarEnCrm(") >= 0 && enviar.indexOf("buscarEnCrm(") < iCarga, "el lote no consulta la ficha antes de cargar");
   ok(!/_crmConsultar\(/.test(enviar), "_crmConsultar comparte la consulta en vuelo de Analysis: el lote usa buscarEnCrm");
   ok(/indeterminado\)[\s\S]{0,120}?break;/.test(enviar), "si el CRM no contesta se corta el lote (300 filas × 8 s)");
-  ok(/if \(!vc\.ok\)[\s\S]{0,120}?continue;/.test(enviar), "un NO o una duda del CRM se saltean con motivo");
+  // (2026-09-13, B1) El salteo lo decide decidirLoteCrm: un NO o una duda se saltean con motivo,
+  // salvo la ficha "Propuesta Vigente" que crea nuestro propio aviso de adicionales.
+  ok(/decidirLoteCrm\(\{[\s\S]{0,160}?\}\);\s*if \(!dec\.enviar\)[\s\S]{0,120}?continue;/.test(enviar), "un NO o una duda del CRM se saltean con motivo");
   ok(enviar.indexOf("isEmailBounced(") >= 0 && enviar.indexOf("isEmailBounced(") < iCarga, "un email rebotado nunca se reusa");
 });
 

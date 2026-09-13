@@ -1396,22 +1396,34 @@ export async function saveSendDate(domain, { sendDate, pitch, email, mbEmail }) 
 // flujo documentado es guardar y mandar el mail después. Con el dato viejo, "Quitar" devolvía a
 // Prospects un sitio ya contactado y "Enviar" le decía al CRM que mandara el inicial otra vez.
 // sendtrack es la prueba de envío que ya usa el candado de 30 días del agente.
-// ⚠️ Un fallo NO es "no hay envíos": devuelve ok:false y quien llama no sigue. "No pude
-// preguntar" tratado como "no le escribió nadie" es el error caro.
-export async function dominiosConEnvioReciente(accessToken, domains, { dias = 30, ahoraMs = Date.now() } = {}) {
+// ⚠️ Un fallo NO es "no hay envíos": devuelve ok:false (con el status HTTP) y quien llama no lo
+// trata como "nadie le escribió" — ver lecturaDeEnvios en modules/colaEstado.js, que además
+// desconfía de una lectura vacía. "No pude preguntar" tratado como "no le escribió nadie" es el
+// error caro.
+export async function dominiosConEnvioReciente(accessToken, domains, { dias = 30, ahoraMs = Date.now(), renovarToken = null } = {}) {
   const lista = [...new Set((domains || []).map(d => String(d || "").trim().toLowerCase()).filter(Boolean))];
   const dominios = new Set();
   if (!lista.length) return { ok: true, dominios };
   const corte = new Date(ahoraMs - dias * 86_400_000).toISOString().slice(0, 10);
+  let token = accessToken;
+  let renovado = false;
   try {
     for (let i = 0; i < lista.length; i += 100) {
       const lote = lista.slice(i, i + 100).map(d => `"${d.replace(/"/g, "")}"`).join(",");
-      const res = await fetch(
+      const pedir = (tk) => fetch(
         `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=in.(${encodeURIComponent(lote)})&send_date=gte.${corte}&select=domain`,
-        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken || CONFIG.SUPABASE_ANON_KEY}` },
+        { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${tk || CONFIG.SUPABASE_ANON_KEY}` },
           signal: AbortSignal.timeout(8000) },
       );
-      if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+      let res = await pedir(token);
+      // (2026-09-13) Un token vencido se renueva UNA vez por consulta, no una por lote de 100.
+      // Sin esto un 401 dejaba "Quitar" y "Enviar" sin poder usarse hasta cerrar la toolbar.
+      if ((res.status === 401 || res.status === 403) && !renovado && typeof renovarToken === "function") {
+        renovado = true;
+        const nuevo = await renovarToken().catch(() => null);
+        if (nuevo) { token = nuevo; res = await pedir(token); }
+      }
+      if (!res.ok) return { ok: false, status: res.status, error: `HTTP ${res.status}` };
       const filas = await res.json().catch(() => null);
       if (!Array.isArray(filas)) return { ok: false, error: "respuesta ilegible" };
       for (const f of filas) if (f?.domain) dominios.add(String(f.domain).toLowerCase());

@@ -121,6 +121,7 @@ export function avisoAlGuardarEnCola(prev, { loginEmail = "", ahoraMs = Date.now
 // Lo que el formulario eligió viaja entero en `monday_payload`, que es lo que lee el lote.
 export function filaColaDesdeFormulario(v, {
   prev = null, domain = "", loginEmail = "", esFormulario = false, geoLabel = {}, contactos = [], trafficTexto = "",
+  crmAlGuardar = null,
 } = {}) {
   const em = fusionarEmailsCola(prev, v.email, { loginEmail, esFormulario });
   const previo = statusPrevioAlGuardar(prev);
@@ -132,6 +133,8 @@ export function filaColaDesdeFormulario(v, {
     ...(em.contactoFormulario ? { contacto_formulario: em.contactoFormulario } : {}),
     ...(previo ? { status_previo: previo } : {}),
     contactos: Array.isArray(contactos) ? contactos : [],
+    // Lo que decía el CRM en el momento de guardar (ver fotoCrmAlGuardar y decidirLoteCrm).
+    ...(crmAlGuardar ? { crm_al_guardar: crmAlGuardar } : {}),
   };
   const fila = { domain, status: "por_enviar", monday_payload };
   if (!prev) {
@@ -167,6 +170,9 @@ export function filaColaDesdeFormulario(v, {
 //   5. Otro estado conocido → se restaura tal cual.
 //   6. Pending (o una fila de antes del arreglo) → pending; si su tráfico está por debajo del
 //      piso, cleanup_pool la va a borrar, y el MB lo tiene que saber ANTES de confirmar.
+// `contactado_sendtrack: null` = no se pudo saber (sendtrack no contestó o su respuesta no es
+// creíble, ver lecturaDeEnvios). Lo que no depende de eso (1-4) sale igual; lo que volvería al
+// pool (5-6) se queda en la cola, con status null y grupo "sin_confirmar" (2026-09-13).
 export function estadoAlSacarDeCola({ status_previo = null, source = "", mail_enviado = false,
   contactado_sendtrack = false, traffic = null, minTraffic = 350000 } = {}) {
   const previo = status_previo === "por_enviar" ? null : status_previo;
@@ -178,6 +184,9 @@ export function estadoAlSacarDeCola({ status_previo = null, source = "", mail_en
   if (!previo && source === "manual_cola") {
     return { status: "rejected", grupo: "sin_filtro", suspect_reject: true, suspect_reason: "mb: sacada_de_cola_sin_filtro" };
   }
+  // Devolverla al pool sin saber si ya se le escribió es justo lo que "Quitar" hacía mal: un
+  // contactado de otro MB volvía a Prospects como nuevo. "No sé" no se trata como "no".
+  if (contactado_sendtrack === null) return { status: null, grupo: "sin_confirmar" };
   if (previo && previo !== "pending") return { status: previo, grupo: "restaurado" };
   const t = Number(traffic);
   if (t > 0 && t < minTraffic) return { status: "pending", grupo: "bajo_piso" };
@@ -189,16 +198,20 @@ export function estadoAlSacarDeCola({ status_previo = null, source = "", mail_en
 // rejected_at de hoy (index.js, sección 4 de parteDelDia), y una fila que el MB saca de su cola
 // no es una purga del pool. `status_previo` tampoco se limpia: en cuanto la fila sale de
 // `por_enviar`, statusPrevioAlGuardar lo ignora, y limpiarlo obligaría a un PATCH por fila.
+// `contactados: null` = sendtrack no se pudo leer (o no es creíble): las filas que volverían al
+// pool quedan en `sinConfirmar` y no entran a ningún PATCH.
 export function planSacarDeCola(filas, { contactados = new Set(), minTraffic = 350000, loginEmail = "", ahoraIso = new Date().toISOString() } = {}) {
   const lotes = new Map();
   const grupoPorId = new Map();
+  const sinConfirmar = [];
   for (const f of filas || []) {
     if (!f || f.id == null) continue;
     const mp = f.monday_payload || {};
     const d = estadoAlSacarDeCola({
       status_previo: mp.status_previo ?? null, source: f.source || "", mail_enviado: mp.mail_enviado,
-      contactado_sendtrack: contactados.has(String(f.domain || "").toLowerCase()), traffic: f.traffic, minTraffic,
+      contactado_sendtrack: contactados ? contactados.has(String(f.domain || "").toLowerCase()) : null, traffic: f.traffic, minTraffic,
     });
+    if (d.status == null) { sinConfirmar.push(String(f.id)); grupoPorId.set(String(f.id), d.grupo); continue; }
     const body = { status: d.status };
     if (d.sello) Object.assign(body, { validated_by: loginEmail, validated_at: ahoraIso });
     if (d.suspect_reject) Object.assign(body, { suspect_reject: true, suspect_reason: d.suspect_reason });
@@ -207,7 +220,7 @@ export function planSacarDeCola(filas, { contactados = new Set(), minTraffic = 3
     lotes.get(clave).ids.push(String(f.id));
     grupoPorId.set(String(f.id), d.grupo);
   }
-  return { lotes: [...lotes.values()], grupoPorId };
+  return { lotes: [...lotes.values()], grupoPorId, sinConfirmar };
 }
 
 export function contarGrupos(ids, grupoPorId) {
@@ -227,10 +240,12 @@ const _partes = (c, minTraffic) => [
 
 // El confirm decía "Quedan en Prospects como pendientes, no se borran", y no era verdad ni
 // para los contactados ni para los de menos de 350K.
-export function textoConfirmarSacar(plan, { minTraffic = 350000 } = {}) {
+export function textoConfirmarSacar(plan, { minTraffic = 350000, motivoSinConfirmar = "" } = {}) {
   const ids = plan.lotes.flatMap(l => l.ids);
   const c = contarGrupos(ids, plan.grupoPorId);
-  return `¿Sacar ${ids.length} de la cola? Cada uno vuelve a su estado anterior: ${_partes(c, minTraffic).join("; ")}.`;
+  const quedan = (plan.sinConfirmar || []).length;
+  const nota = quedan ? ` ${quedan} se quedan en la cola: no pude confirmar si ya se les escribió${motivoSinConfirmar ? ` (${motivoSinConfirmar})` : ""}.` : "";
+  return `¿Sacar ${ids.length} de la cola? Cada uno vuelve a su estado anterior: ${_partes(c, minTraffic).join("; ")}.${nota}`;
 }
 
 export function textoResultadoSacar(hechos, total, grupoPorId, { minTraffic = 350000, fallas = [] } = {}) {
@@ -278,4 +293,91 @@ export function contactosDeAdicionales(filas, { programados = true } = {}) {
   return (filas || []).map((f, i) => ({
     email: f.future_email, tipo: "adicional", orden: i + 1, ...(programados ? { enviado_at: f.scheduled_for } : {}),
   }));
+}
+
+// ── EL LOTE Y LA FICHA QUE CREA NUESTRO PROPIO ENVÍO (2026-09-13) ─────────────────────────
+// El lote vuelve a preguntarle al CRM por cada sitio antes de cargarlo, y hace bien: lo guardado
+// puede tener días y el sitio pudo volverse cliente. Pero salteaba TODO lo que no fuera
+// prospectable, y en el flujo normal la ficha la crea el propio sistema: el MB manda el mail con
+// adicionales y guarda; a los pocos minutos el worker despacha los adicionales y le avisa al CRM
+// (`adicional_enviado`, sólo dominio + contactos). En un dominio que el CRM no tenía, ese aviso
+// crea la ficha con el estado por defecto de la tabla —"Propuesta Vigente"— y sin ejecutivo
+// (adeq-dashboard: sql-crm-board-2026-08.sql y api/crm/sync-toolbar). Días después el lote la
+// leía como "Propuesta en curso" y la fila quedaba salteada para siempre, sin llegar nunca al
+// CRM con los datos del MB.
+// Para distinguir esa ficha de una propuesta ajena hace falta saber qué decía el CRM AL GUARDAR.
+
+/** Foto del veredicto del CRM en el momento de guardar. null si todavía no había veredicto. */
+export function fotoCrmAlGuardar(veredicto, dup) {
+  if (!veredicto) return null;
+  return {
+    ok: veredicto.ok === true, duda: veredicto.duda === true, found: dup?.found === true,
+    estado: String(dup?.status || ""), ejecutivo: String(dup?.ejecutivo || "").trim().toLowerCase(),
+  };
+}
+
+// "Propuesta Vigente" es el único estado "en curso" que aparece solo, como default de la tabla.
+// En Negociación, Personalizado y Live los pone una persona. Mismo vocabulario que
+// _CRM_EN_CURSO_RE de popup.js (el test lo compara con el _veredictoCrm real).
+const _PROPUESTA_VIGENTE_RE = /propuesta\s*vigente/i;
+
+/**
+ * ¿El lote carga esta fila en el CRM? → { enviar, motivo, fichaPropia? }
+ *   dup        la ficha de hoy (buscarEnCrm). "El CRM no contesta" lo corta quien llama.
+ *   veredicto  _veredictoCrm(dup): la misma regla que el recuadro de Analysis.
+ *   alGuardar  monday_payload.crm_al_guardar (null en las filas guardadas antes del 13/09).
+ *   contactado el mail ya salió: anotado al guardar o visto en sendtrack.
+ * Se saltea: dominio bloqueado; Live / En Negociación / Personalizado; estado que no se reconoce;
+ * el CRM ya decía que no al guardar; una Propuesta Vigente con ejecutivo, o que ya existía al
+ * guardar, o sin un envío nuestro que la explique. Se manda: lo prospectable, y la Propuesta
+ * Vigente sin ejecutivo que apareció después de nuestro envío.
+ */
+export function decidirLoteCrm({ dup = null, veredicto = null, alGuardar = null, contactado = false } = {}) {
+  const v = veredicto || { ok: false, duda: true, titulo: "No pude consultar el CRM", detalle: "" };
+  if (v.ok === true) return { enviar: true, motivo: "" };
+  const motivo = `${v.titulo || "Web NO prospectable"}${v.detalle ? `: ${v.detalle}` : ""}`;
+  if (dup?.bloqueado || v.duda === true || !dup?.found) return { enviar: false, motivo };
+  if (alGuardar && alGuardar.ok === false && alGuardar.duda !== true) {
+    return { enviar: false, motivo: `${motivo} (el CRM ya decía que no al guardar)` };
+  }
+  if (!_PROPUESTA_VIGENTE_RE.test(String(dup.status || ""))) return { enviar: false, motivo };
+  const ejecutivo = String(dup.ejecutivo || "").trim();
+  if (ejecutivo) return { enviar: false, motivo: `${motivo} (a nombre de ${ejecutivo})` };
+  if (alGuardar?.found === true) return { enviar: false, motivo: `${motivo} (la ficha ya existía al guardar)` };
+  if (contactado !== true) return { enviar: false, motivo: `${motivo} (y no hay un envío nuestro que la explique)` };
+  return { enviar: true, motivo: "", fichaPropia: true };
+}
+
+// ── ¿SE PUEDE CREER LO QUE DIJO SENDTRACK? (2026-09-13) ──────────────────────────────────
+// "Quitar" y "Enviar" leen toolbar_sendtrack con el token del MB. Si la lectura falla, o si una
+// política de RLS le esconde al MB los envíos de otros (sql/rls_hardening.sql define una por
+// dueño; desde el repo no se puede saber si está aplicada en la base), "no hay envío" no es un
+// dato: con eso "Quitar" devolvía a Prospects un sitio contactado.
+// Sospechosa: una fila anotó al guardar que el mail salió, con fecha de contacto dentro de la
+// ventana, y sendtrack no la muestra. Si no ve ése, no se puede creer que no haya otros.
+export function lecturaDeEnvios(env, filas, { dias = 30, ahoraMs = Date.now() } = {}) {
+  if (!env || env.ok !== true) {
+    return { conocida: false, dominios: new Set(), motivo: `no pude leer los envíos (${env?.error || "sin respuesta"})` };
+  }
+  const dominios = env.dominios instanceof Set ? env.dominios : new Set();
+  const corte = new Date(ahoraMs - dias * 86_400_000).toISOString().slice(0, 10);
+  const faltan = [];
+  for (const f of filas || []) {
+    const mp = f?.monday_payload || {};
+    const fecha = String(mp.fecha || "");
+    const d = String(f?.domain || "").toLowerCase();
+    if (mp.mail_enviado === true && /^\d{4}-\d{2}-\d{2}$/.test(fecha) && fecha >= corte && d && !dominios.has(d)) faltan.push(d);
+  }
+  if (faltan.length) {
+    return { conocida: false, dominios,
+             motivo: `la base no muestra envíos que sí salieron (${faltan.slice(0, 3).join(", ")}): puede que no vea los de otros MB` };
+  }
+  return { conocida: true, dominios, motivo: "" };
+}
+
+/** ¿Ya se le escribió? true / false / null (no se puede saber). Lo anotado al guardar no depende de sendtrack. */
+export function contactadoDeCola(f, lectura) {
+  if (f?.monday_payload?.mail_enviado === true) return true;
+  if (!lectura || lectura.conocida !== true) return null;
+  return lectura.dominios.has(String(f?.domain || "").toLowerCase());
 }
