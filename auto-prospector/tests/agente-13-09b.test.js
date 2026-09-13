@@ -191,14 +191,109 @@ test("el motivo de un lead sin dirección enviable: el descarte más frecuente, 
 
 test("el lead sin dirección enviable queda marcado con la fecha de AHORA, nunca null, y sin tocar el orden de emails", () => {
   const sinDireccion = tramo('reason: "all_candidates_undeliverable"', "// 2. Decidir source");
-  ok(/email_ultimo_intento: new Date\(\)\.toISOString\(\), email_ultimo_motivo: _motivoSinDireccionEnviable\(_motivosDescarte\)/.test(sinDireccion),
+  ok(/await _marcarLeadSinDireccion\(token, lead\.id, _motivoSinDireccionEnviable\(_motivosDescarte\)\)/.test(sinDireccion),
      "antes sólo se marcaba la hipótesis de patrón");
   ok(!/email_ultimo_intento: null/.test(agente), "con null el lead queda PRIMERO en el pool del agente (email_ultimo_intento.asc.nullsfirst)");
   const red = tramo("const _mvEstado = await _verifyEmailMV(token, cfg, email)", "TECHO DE TIEMPO al envío completo");
-  ok(/email_ultimo_motivo: _motivoSinDireccionEnviable\(\["mv_dudoso"\]\)/.test(red), "el dudoso de la red final se marca igual");
+  ok(/await _marcarLeadSinDireccion\(token, lead\.id, _motivoSinDireccionEnviable\(\["mv_dudoso"\]\)\)/.test(red), "el dudoso de la red final se marca igual");
   for (const cuerpo of [...agente.matchAll(/JSON\.stringify\(\{ email_ultimo_intento:[^}]*\}\)/g)].map(m => m[0])) {
     ok(!/\bemails:/.test(cuerpo), `el orden de emails lo leen _rankIntento y la extensión: ${cuerpo}`);
   }
+});
+
+// ── 3b. La marca del agente no le devuelve el lead a Apollo ─────────────────────────────
+// Revisión del 13/09: la marca nueva pisaba `apollo_sin_contacto`, que es lo único que evita que
+// `apolloQuemarCiclo` vuelva a pagar reveals por un lead de sólo genéricos (su caché sólo guarda
+// los que dieron email). Se simula la base: un PATCH de PostgREST aplica el body a las filas que
+// cumplen TODOS los filtros de la URL; `neq` sobre NULL no es true (SQL), por eso el `is.null`.
+const condicion = (fila, expr) => {
+  const [campo, op, ...resto] = expr.split(".");
+  const valor = resto.join("."), actual = fila[campo];
+  if (op === "is" && valor === "null") return actual == null;
+  if (op === "eq") return actual != null && String(actual) === valor;
+  if (op === "neq") return actual != null && String(actual) !== valor;
+  throw new Error(`operador no simulado: ${expr}`);
+};
+const cumpleFiltros = (fila, query) => {
+  for (const [k, v] of new URLSearchParams(query)) {
+    if (k === "or") { if (!v.slice(1, -1).split(",").some(p => condicion(fila, p))) return false; }
+    else if (k !== "select" && k !== "order" && k !== "limit" && !condicion(fila, `${k}.${v}`)) return false;
+  }
+  return true;
+};
+const baseFalsa = (tabla, pedidos) => async (url, opts = {}) => {
+  const u = String(url);
+  pedidos.push({ url: u, opts });
+  const query = u.slice(u.indexOf("?") + 1);
+  if (opts.method === "PATCH") for (const f of tabla) if (cumpleFiltros(f, query)) Object.assign(f, JSON.parse(opts.body));
+  return respuesta(null, { status: 204 });
+};
+let _conBase = null;
+const cargarConBase = () => (_conBase ??= cargarWorker(
+  ["_pedidosMarcaSinDireccion", "_marcarLeadSinDireccion", "_FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR", "_motivoSinDireccionEnviable", "_elegirDireccion", "_isGenericLocalPart"],
+  { fetchFalso: true },
+));
+// El filtro con el que `apolloQuemarCiclo` elige a quién pedirle, sacado de su código.
+const filtroApollo = () => {
+  const m = cuerpoDe("async function apolloQuemarCiclo(").match(/const _base = `[^`]*?[?&](or=\([^)]*\))/);
+  ok(m, "no encontré el filtro de motivo en la consulta de apolloQuemarCiclo");
+  return m[1];
+};
+
+test("la marca del agente: la fecha va siempre y el motivo nunca pisa 'apollo_sin_contacto'", async () => {
+  const { _pedidosMarcaSinDireccion, _marcarLeadSinDireccion } = await cargarConBase();
+  const [fecha, motivo] = _pedidosMarcaSinDireccion(7, "sin_direccion_enviable:mv_dudoso", "2026-09-13T12:00:00.000Z");
+  deepStrictEqual(fecha.body, { email_ultimo_intento: "2026-09-13T12:00:00.000Z" }, "la fecha sola, sin condición: ordena el pool del agente");
+  deepStrictEqual(motivo.body, { email_ultimo_motivo: "sin_direccion_enviable:mv_dudoso" }, "ninguno toca emails: su orden lo leen _rankIntento y la extensión");
+  ok(!/email_ultimo_motivo/.test(fecha.ruta), "la fecha no depende del motivo que tenga el lead");
+
+  const tabla = [
+    { id: 1, email_ultimo_motivo: null, email_ultimo_intento: null },
+    { id: 2, email_ultimo_motivo: "sin_direccion_enviable:mv_no", email_ultimo_intento: "2026-09-01T00:00:00.000Z" },
+    { id: 3, email_ultimo_motivo: "apollo_sin_contacto", email_ultimo_intento: "2026-09-01T00:00:00.000Z" },
+    { id: 4, email_ultimo_motivo: "apollo_sin_contacto", email_ultimo_intento: "2026-09-01T00:00:00.000Z" },
+  ];
+  const pedidos = [];
+  globalThis.__fetchFalso = baseFalsa(tabla, pedidos);
+  for (const id of [1, 2, 3]) await _marcarLeadSinDireccion("t", id, "sin_direccion_enviable:mv_dudoso");
+  strictEqual(pedidos.length, 6, "dos PATCH por lead");
+  for (const p of pedidos) {
+    strictEqual(p.opts.method, "PATCH");
+    ok(p.url.includes("/rest/v1/toolbar_review_queue?id=eq."), p.url);
+    ok(p.opts.signal, "todo fetch con reloj");
+  }
+  for (const f of tabla.slice(0, 3)) ok(Date.parse(f.email_ultimo_intento) > Date.now() - 60_000, `lead ${f.id}: la fecha pasa a AHORA, también con apollo_sin_contacto`);
+  strictEqual(tabla[0].email_ultimo_motivo, "sin_direccion_enviable:mv_dudoso");
+  strictEqual(tabla[1].email_ultimo_motivo, "sin_direccion_enviable:mv_dudoso", "otro motivo del agente sí se actualiza");
+  strictEqual(tabla[2].email_ultimo_motivo, "apollo_sin_contacto", "Apollo ya dijo que no hay nadie: la marca queda");
+  deepStrictEqual(tabla[3], { id: 4, email_ultimo_motivo: "apollo_sin_contacto", email_ultimo_intento: "2026-09-01T00:00:00.000Z" }, "el PATCH es por id");
+});
+
+test("un lead de sólo genéricos que Apollo ya marcó sin contacto no vuelve a apolloQuemarCiclo después de que el agente lo saltea", async () => {
+  const w = await cargarConBase();
+  strictEqual(w._FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR, filtroApollo(),
+    "el agente sólo escribe el motivo en las filas que Apollo consultaría: si cambia uno, tiene que cambiar el otro");
+  // El caso del revisor: contacto@ e info@, los dos dudosos, y Apollo ya había dicho que no hay nadie.
+  const lead = { id: 99, emails: ["contacto@diario.com.ar", "info@diario.com.ar"], email_ultimo_motivo: "apollo_sin_contacto", email_ultimo_intento: null };
+  const entraAApollo = (l) => cumpleFiltros(l, filtroApollo()) && (l.emails.length === 0 || l.emails.every(e => w._isGenericLocalPart(String(e))));
+  strictEqual(entraAApollo(lead), false, "antes del agente, Apollo lo deja afuera");
+  const f = falsos({ "contacto@diario.com.ar": "dudoso", "info@diario.com.ar": "dudoso" });
+  const r = await w._elegirDireccion(lead.emails.map(e => cand(e)), f.opts);
+  strictEqual(r.chosen, null);
+  globalThis.__fetchFalso = baseFalsa([lead], []);
+  await w._marcarLeadSinDireccion("t", lead.id, w._motivoSinDireccionEnviable(r.motivos));
+  ok(lead.email_ultimo_intento, "el agente igual anota que lo intentó");
+  strictEqual(entraAApollo(lead), false, "antes de este arreglo quedaba 'sin_direccion_enviable:mv_dudoso' y Apollo volvía a pagar cada semana");
+  // Y uno que Apollo nunca miró sí le queda disponible: la marca del agente es la señal para buscarle otra dirección.
+  const nuevo = { id: 100, emails: ["contacto@otro.com.ar"], email_ultimo_motivo: null, email_ultimo_intento: null };
+  globalThis.__fetchFalso = baseFalsa([nuevo], []);
+  await w._marcarLeadSinDireccion("t", nuevo.id, "sin_direccion_enviable:mv_dudoso");
+  strictEqual(entraAApollo(nuevo), true);
+});
+
+test("runAgentCycle no escribe el motivo del lead por fuera de _marcarLeadSinDireccion", () => {
+  ok(!/email_ultimo_motivo\s*:/.test(agente), "un PATCH directo con email_ultimo_motivo pisaría 'apollo_sin_contacto'");
+  ok((agente.match(/await _marcarLeadSinDireccion\(token, lead\.id, /g) || []).length >= 2, "los dos lugares: sin dirección enviable y el dudoso de la red final");
 });
 
 // ── 4. Bloqueado = sale de Prospects ────────────────────────────────────────────────────

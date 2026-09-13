@@ -20425,6 +20425,32 @@ function _motivoSinDireccionEnviable(motivos) {
   return top ? `sin_direccion_enviable:${top}` : "sin_direccion_enviable";
 }
 
+// ── LA MARCA DEL AGENTE NO PISA "apollo_sin_contacto" (2026-09-13, revisión) ─────────────────
+// `apolloQuemarCiclo` deja afuera a los leads marcados `apollo_sin_contacto`: Apollo ya dijo que no
+// tiene a nadie, cada reveal cuesta un crédito haya email o no, y su caché sólo guarda los que sí
+// dieron email. Si el agente pisaba esa marca con `sin_direccion_enviable:…`, un lead con sólo
+// genéricos (contacto@, info@ dudosos) volvía a ser candidato: Apollo pagaba otra vez por nada, lo
+// volvía a marcar, y a los 7 días el agente lo soltaba y se repetía, ocupando los 30 lugares
+// diarios del job que son para leads nuevos.
+// Por eso son DOS PATCH: la fecha va siempre (ordena el pool del agente y nunca puede quedar null);
+// el motivo sólo en la fila que NO tiene esa marca. El filtro es el MISMO de la consulta de
+// `apolloQuemarCiclo` (el test lo compara) y va en la URL, no en memoria: lo resuelve la base aunque
+// Apollo escriba entre la lectura del pool y este PATCH.
+const _FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR = "or=(email_ultimo_motivo.is.null,email_ultimo_motivo.neq.apollo_sin_contacto)";
+function _pedidosMarcaSinDireccion(leadId, motivo, ahora = new Date().toISOString()) {
+  const ruta = `/rest/v1/toolbar_review_queue?id=eq.${encodeURIComponent(String(leadId))}`;
+  return [
+    { ruta, body: { email_ultimo_intento: ahora } },
+    { ruta: `${ruta}&${_FILTRO_MOTIVO_QUE_EL_AGENTE_PUEDE_PISAR}`, body: { email_ultimo_motivo: motivo } },
+  ];
+}
+async function _marcarLeadSinDireccion(token, leadId, motivo) {
+  const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" };
+  await Promise.all(_pedidosMarcaSinDireccion(leadId, motivo).map(p =>
+    fetch(`${SUPABASE_URL}${p.ruta}`, { method: "PATCH", headers, body: JSON.stringify(p.body), signal: AbortSignal.timeout(10000) }).catch(() => {})
+  ));
+}
+
 // ── EL 2º EMAIL PASA POR LAS MISMAS PUERTAS QUE EL PRIMERO (2026-09-13) ──────────────────────
 // Salía con score ≥ 40, sin rebote y con que MillionVerifier no dijera "no". O sea que un dudoso,
 // un catch-all, una dirección de otra marca o una hipótesis de patrón en un proveedor que acepta
@@ -23755,13 +23781,9 @@ async function runAgentCycle(token, allFlags) {
             // sólo la hipótesis de patrón, y la fecha de intento pasa a AHORA en vez de null. Con
             // null el lead quedaba PRIMERO en el pool del agente (`email_ultimo_intento.asc.nullsfirst`)
             // y le comía la ventana de 300 a los que sí se pueden mandar. El orden de `emails` NO se
-            // toca: lo leen `_rankIntento` y la extensión.
-            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-              method: "PATCH",
-              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify({ email_ultimo_intento: new Date().toISOString(), email_ultimo_motivo: _motivoSinDireccionEnviable(_motivosDescarte) }),
-              signal: AbortSignal.timeout(10000),
-            }).catch(() => {});
+            // toca: lo leen `_rankIntento` y la extensión. El motivo no pisa `apollo_sin_contacto`
+            // (ver _marcarLeadSinDireccion): si no, Apollo vuelve a pagar por este lead.
+            await _marcarLeadSinDireccion(token, lead.id, _motivoSinDireccionEnviable(_motivosDescarte));
             continue; // próximo lead
           }
         }
@@ -23960,12 +23982,7 @@ async function runAgentCycle(token, allFlags) {
             // mandar. Antes el comentario prometía "el re-enrich le buscará otro email" y ningún
             // job lo hacía: el lead no quedaba marcado de ninguna forma.
             _saltadosSinDireccion7d.add(String(domain || "").toLowerCase());
-            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-              method: "PATCH",
-              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify({ email_ultimo_intento: new Date().toISOString(), email_ultimo_motivo: _motivoSinDireccionEnviable(["mv_dudoso"]) }),
-              signal: AbortSignal.timeout(10000),
-            }).catch(() => {});
+            await _marcarLeadSinDireccion(token, lead.id, _motivoSinDireccionEnviable(["mv_dudoso"]));
           }
           continue; // próximo lead
         }
