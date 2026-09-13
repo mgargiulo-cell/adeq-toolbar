@@ -2,6 +2,7 @@
 import { esEmailPlausible } from "../auto-prospector/lib/email.js";
 // Los vetos duros del worker (2026-09-13): lo que el agente nunca usaría, la extensión tampoco lo muestra.
 import { vetoDuroEmail } from "../auto-prospector/lib/email.js";
+import { CONFIG } from "../config.js";
 // ============================================================
 // ADEQ TOOLBAR — Verificación de Emails v2
 // Capas de verificación (sin SMTP, que no es posible desde browser):
@@ -181,6 +182,40 @@ export function isGarbageEmail(email, siteDomain = "") {
   if (/[-_.]abuse(\d|$)/.test(local)) return true;
 
   return false;
+}
+
+// ── LA LISTA DE REBOTADOS, ENTERA (2026-09-13) ──────────────────────────────────────────────────
+// Para que la extensión ordene con la misma lista que el worker (ver _rebotesExtension en popup.js).
+// Mismo filtro de evidencia que EVIDENCIA_BLOQUEA en el worker: una autorespuesta o un 4xx no es un
+// rebote. PostgREST devuelve 1.000 filas por pedido: se pagina con Range, cada página con reloj, y si
+// una falla devuelve null — nunca una lista parcial que parezca entera. La fuente se guarda como texto
+// ("rol_mx", no {source, url}) para que la caché local ocupe poco.
+export const EVIDENCIA_BLOQUEA_EXTENSION = "evidencia=in.(rebote_smtp,verificador,sin_clasificar)";
+export async function traerRebotados(accessToken, { max = 50000, pagina = 1000, fetchImpl = fetch } = {}) {
+  if (!accessToken) return null;
+  const url = `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA_EXTENSION}`;
+  const out = [];
+  for (let desde = 0; desde < max; desde += pagina) {
+    let r;
+    try {
+      r = await fetchImpl(url, {
+        headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}`, "Range-Unit": "items", "Range": `${desde}-${desde + pagina - 1}` },
+        signal: AbortSignal.timeout(8000),
+      });
+    } catch { return null; }
+    if (r.status === 416) break;                       // más allá del final
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    if (!Array.isArray(j)) return null;
+    for (const f of j) {
+      const email = String(f?.email || "").toLowerCase().trim();
+      if (!email) continue;
+      const fuente = typeof f.fuente === "string" ? f.fuente : String(f?.fuente?.source || "");
+      out.push({ email, evidencia: f.evidencia || "", fuente });
+    }
+    if (j.length < pagina) break;
+  }
+  return out;
 }
 
 export async function verifyEmail(email) {

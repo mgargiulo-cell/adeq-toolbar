@@ -104,6 +104,10 @@ import {
   _bouncedCache,
   _rebotesPorDominio,
   generarHipotesisDePatron,
+  cargarRebotados,
+  recontarRebotesPorDominio,
+  cuentaParaElDominio,
+  motivoNoEscribirDominio,
 } from "./lib/email.js";
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -17289,7 +17293,11 @@ const BOUNCED_CACHE_TTL = 5 * 60 * 1000;
 async function loadBouncedEmails(token) {
   if (Date.now() - _bouncedCache.ts < BOUNCED_CACHE_TTL) return _bouncedCache.set;
   try {
-    const res = await fetch(
+    // ⚠️ TODA LA TABLA, DE A PÁGINAS (2026-09-13). Pedía `limit=10000` y PostgREST devuelve 1.000
+    // como máximo, sin orden: el worker vetaba 1.000 rebotados cualesquiera y dejaba pasar el resto,
+    // y la memoria por dominio salía de esa muestra. _traerTodo pagina y, si una página falla,
+    // devuelve null: la caché no se toca y el ts queda viejo para reintentar, nunca una lista parcial.
+    const rows = await _traerTodo(
       // ⚠️ Sólo lo que JUSTIFICA no volver a escribir nunca más:
       //   rebote_smtp  = el correo volvió, la dirección no existe o nos bloquea
       //   verificador  = MillionVerifier la dio por no entregable antes de mandar
@@ -17301,15 +17309,14 @@ async function loadBouncedEmails(token) {
       //                     caído. Había 5 direcciones sanas bloqueadas de por vida por eso.
       // Se filtra por COLUMNA y no por regex sobre el texto del motivo: un `reason` nuevo que
       // nadie previó volvía a colarse como rebote sin que se notara.
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA}&limit=10000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA}`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 50000 }
     );
-    if (res.ok) {
-      const rows = await res.json();
-      _bouncedCache.set = new Set((rows || []).map(r => (r.email || "").toLowerCase()));
-      _recontarRebotesPorDominio(rows);   // memoria de rebote a nivel DOMINIO (auditoría 2026-08-04); las adivinanzas rechazadas por MV no cuentan (13/09)
-      _bouncedCache.ts = Date.now();
-    }
+    // Direcciones exactas + memoria de rebote a nivel DOMINIO (auditoría 2026-08-04). La regla vive en
+    // lib/email.js: las adivinanzas rechazadas por MV y los proveedores de casillas (gmail, hotmail…)
+    // no queman el dominio (13/09).
+    if (rows) cargarRebotados(rows);
   } catch {}
   return _bouncedCache.set;
 }
@@ -17330,12 +17337,12 @@ let _dominiosRechazoAt = 0;
 async function _cargarDominiosQueRechazan(token) {
   if (Date.now() - _dominiosRechazoAt < 30 * 60 * 1000) return;   // refresco cada 30 min
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo,evidencia,fuente&${EVIDENCIA_BLOQUEA}&limit=5000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
-    if (!r.ok) return;                      // no pude leer ≠ nadie rechaza
-    const filas = await r.json();
-    if (!Array.isArray(filas)) return;
+    // De a páginas (2026-09-13): con `limit=5000` PostgREST devolvía 1.000 filas cualesquiera.
+    const filas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo,evidencia,fuente&${EVIDENCIA_BLOQUEA}`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 50000 });
+    if (!Array.isArray(filas)) return;      // no pude leer ≠ nadie rechaza
     _DOMINIOS_QUE_RECHAZAN.clear();
     for (const f of filas) {
       const dom = String(f.email || "").split("@")[1]?.toLowerCase();
@@ -17350,14 +17357,14 @@ async function _cargarDominiosQueRechazan(token) {
   } catch {}
 }
 // Devuelve el motivo por el que NO conviene escribir a este dominio, o "" si se puede.
+// La decisión es pura y vive en lib/email.js (motivoNoEscribirDominio, 2026-09-13): un proveedor de
+// casillas (gmail, hotmail…) nunca "rechaza direcciones". Con dos gmail invalidados por MillionVerifier
+// —que llegan sin tipo y cuentan como usuario inexistente— el agente descartaba a toda persona@gmail
+// como "dominio_ya_rechazo".
 function _porQueNoEscribirA(email) {
   const dom = String(email || "").split("@")[1]?.toLowerCase();
   if (!dom) return "";
-  const acc = _DOMINIOS_QUE_RECHAZAN.get(dom);
-  if (!acc) return "";
-  if (acc.dominioMuerto) return "el dominio no existe (rebotó por DNS)";
-  if (acc.usuarios >= 2) return `ya rechazó ${acc.usuarios} direcciones distintas por usuario inexistente`;
-  return "";
+  return motivoNoEscribirDominio(dom, _DOMINIOS_QUE_RECHAZAN.get(dom));
 }
 
 
@@ -17396,9 +17403,10 @@ const EVIDENCIA_BLOQUEA = "evidencia=in.(rebote_smtp,verificador,sin_clasificar)
 // Apollo) daba -1 en rankEmail y la auditoría del pool lo borraba. La dirección adivinada sigue
 // quemada para siempre; lo único que cambia es que no cuenta como rechazo del dominio. Un rebote
 // SMTP real, o un "no" sobre una dirección publicada, siguen contando igual.
-const _FUENTE_HIPOTESIS = /^(rol_mx|pattern|guess|apollo_pattern)$/i;
+// La regla se mudó a lib/email.js (cuentaParaElDominio, 2026-09-13) para que la extensión cuente los
+// rebotes por dominio igual que el worker. Este nombre queda como pasamanos.
 function _cuentaParaElDominio(fila) {
-  return !(fila?.evidencia === "verificador" && _FUENTE_HIPOTESIS.test(String(_normSrc(fila?.fuente) || "")));
+  return cuentaParaElDominio(fila);
 }
 
 // ── EL CASTIGO PROGRESIVO DE LOS CONGELADOS POR FALTA DE TRÁFICO (2026-09-13) ───────────────
@@ -20557,18 +20565,11 @@ async function _hasMxRecords(domain) {
 }
 
 function _recontarRebotesPorDominio(filas = null) {
-  _rebotesPorDominio.clear();
   // Con las filas (email, evidencia, fuente) se saltean las adivinanzas que MV rechazó: siguen en
   // `_bouncedCache.set` (nunca se les escribe) pero no bloquean al dominio. Sin filas, como antes.
-  const _emails = Array.isArray(filas)
-    ? filas.filter(_cuentaParaElDominio).map(f => String(f?.email || "").toLowerCase()).filter(Boolean)
-    : (_bouncedCache.set || new Set());
-  for (const em of _emails) {
-    const d = String(em).split("@")[1];
-    if (!d) continue;
-    if (!_rebotesPorDominio.has(d)) _rebotesPorDominio.set(d, new Set());
-    _rebotesPorDominio.get(d).add(em);
-  }
+  // Y desde el 13/09 tampoco cuentan los proveedores de casillas (gmail, hotmail…). La regla vive en
+  // lib/email.js (recontarRebotesPorDominio), la misma que usa la extensión.
+  recontarRebotesPorDominio(Array.isArray(filas) ? filas : [...(_bouncedCache.set || [])]);
 }
 
 async function scoreEmail(email) {

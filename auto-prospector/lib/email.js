@@ -733,6 +733,26 @@ export const _TLD_ALTO_RIESGO = /\.(tk|ml|ga|cf|gq|top|xyz|click|link|work|loan|
 
 export const _MARCAS_SUPLANTADAS = /(paypal|apple|micros0ft|microsofl|goog1e|gooogle|faceb00k|arnazon|amaz0n|netfIix|whatsapp|binance|coinbase|metamask|bancolombia|santander|bbva|mercadopago|correos|dhl|fedex)/i;
 
+// Artículos que un medio pone delante de su marca en el dominio (el/la/il/the/die/o/a…). Se prueban
+// todos: "los" y "lo", "as" y "a" pueden empezar la misma palabra. Sólo se saca el artículo si queda
+// una marca de 5 letras o más, así "elpais" no se compara como "pais". Dos marcas son la misma si
+// alguna de sus variantes coincide.
+const _ARTICULOS_DE_MARCA = ["el", "la", "los", "las", "le", "les", "il", "lo", "the", "die", "der", "das", "de", "os", "as", "o", "a"];
+function _variantesSinArticulo(marca) {
+  const out = new Set([marca]);
+  for (const art of _ARTICULOS_DE_MARCA) {
+    if (!marca.startsWith(art)) continue;
+    const resto = marca.slice(art.length).replace(/^[-_]/, "");
+    if (resto.length >= 5) out.add(resto);
+  }
+  return out;
+}
+export function _mismaMarcaSinArticulo(a, b) {
+  const va = _variantesSinArticulo(String(a || "").toLowerCase());
+  for (const x of _variantesSinArticulo(String(b || "").toLowerCase())) if (va.has(x)) return true;
+  return false;
+}
+
 export function detectarEmailSospechoso(email, siteDomain = "") {
   const lower = String(email || "").toLowerCase().trim();
   const [local, dom] = lower.split("@");
@@ -770,7 +790,12 @@ export function detectarEmailSospechoso(email, siteDomain = "") {
   if (site && dom !== site && !dom.endsWith("." + site) && !site.endsWith("." + dom)) {
     const marcaSitio = (site.split(".")[0] || "");
     const marcaMail  = (dom.split(".")[0] || "");
-    if (marcaSitio.length >= 5 && marcaMail.length >= 5 && marcaSitio !== marcaMail) {
+    // El ARTÍCULO no es una imitación (2026-09-13): "elcomercio" contra "comercio" da distancia 2 y
+    // se vetaba como lookalike. Pero elcomercio.pe publica 9 direcciones @comercio.com.pe
+    // (roger.zuzunaga@, piero.hatto@…), eluniversal.com.mx usa @universal.com.mx y eldiario.es
+    // @diario.es: es el mismo medio con o sin el artículo. Desde que la extensión esconde lo que este
+    // veto marca (vetoDuroEmail en isGarbageEmail), esas direcciones reales desaparecían de la lista.
+    if (marcaSitio.length >= 5 && marcaMail.length >= 5 && marcaSitio !== marcaMail && !_mismaMarcaSinArticulo(marcaSitio, marcaMail)) {
       // Distancia de edición chica entre las marcas = imitación, no otra empresa.
       const dist = (a, b) => {
         const m = Array.from({ length: b.length + 1 }, (_, i) => [i, ...Array(a.length).fill(0)]);
@@ -818,11 +843,12 @@ export function vetoDuroEmail(email, siteDomain = "") {
   if (!email || typeof email !== "string" || !email.includes("@")) return "no_es_email";
   const lower = email.toLowerCase();
   if (GARBAGE_LOCAL.test(lower) || GARBAGE_DOMAIN_PATTERN.test(lower)) return "basura";
-  if (isBouncedSync(lower)) return "ya_reboto"; // hard reject: ya bounceó antes
-  // Dominio quemado: 2+ rebotes distintos ahí. El rebote casi nunca es de la casilla sino del
-  // dominio, así que insistir con otro buzón del mismo lugar es tirar reputación (2026-08-04).
-  const _rd = riesgoRebotePorDominio(lower.split("@")[1] || "");
-  if (_rd.bloquear) return "dominio_quemado";
+  // Ya rebotó ("ya_reboto") o dominio quemado: 2+ rebotes distintos ahí ("dominio_quemado"). El rebote
+  // casi nunca es de la casilla sino del dominio, así que insistir con otro buzón del mismo lugar es
+  // tirar reputación (2026-08-04). La regla vive en motivoRebote para que la extensión la pueda
+  // consultar con su propia lista sin esconder nada (2026-09-13).
+  const _reb = motivoRebote(lower);
+  if (_reb) return _reb;
   const [local, dom] = lower.split("@");
   if (!local || !dom) return "no_es_email";
   if (GARBAGE_LOCAL_CONTAINS.test(local)) return "basura";
@@ -868,7 +894,10 @@ export function vetoDuroEmail(email, siteDomain = "") {
   const _vocales = (local.match(/[aeiou]/g) || []).length;
   const _ratioVocal = local.length ? _vocales / local.length : 0;
   if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.22 && _soloLetras.length < local.length * 0.8) return "hash";
-  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocal < 0.15) return "hash";   // solo letras pero sin vocales = hash
+  // Sólo letras pero sin vocales = hash. Acá la `y` cuenta como vocal (2026-09-13): en polaco, checo
+  // o galés hace de vocal, y krzysztof@onet.pl (1 "o" en 9 letras) caía como hash siendo un nombre.
+  const _ratioVocalY = local.length ? (local.match(/[aeiouy]/g) || []).length / local.length : 0;
+  if (/^[a-z0-9]{8,}$/.test(local) && _ratioVocalY < 0.15) return "hash";
 
   // Maxi 2026-07-13 (auditoría 48h): rechazo DURO SOLO de lo que NUNCA es un contacto real:
   //  a) PLACEHOLDERS/FALSOS que se colaban como "persona" (vorname.name@/firstname.lastname@/
@@ -1271,11 +1300,108 @@ export const GARBAGE_DOMAIN_PATTERN = new RegExp([
 
 export const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
 
-export function riesgoRebotePorDominio(dominioEmail) {
-  const n = _rebotesPorDominio.get(String(dominioEmail || "").toLowerCase())?.size || 0;
+// ── PROVEEDORES DE CASILLAS: EL REBOTE ES DE LA CASILLA, NO DEL DOMINIO (2026-09-13) ───────────
+// La memoria por dominio (auditoría 04/08) supone que el rebote es del SERVIDOR de la empresa. En
+// gmail.com eso es falso: con dos gmail cualesquiera rebotados (un rebote SMTP o un "no" de
+// MillionVerifier, que pasa todos los días) TODA persona con gmail daba -1 en el worker, y con uno
+// solo perdía 40 puntos. adrianofrazao@gmail.com, el único contacto de significados.com.br, quedaba
+// rechazado por ranking mientras la extensión (que no carga los rebotes) lo mostraba con 65: Prospects
+// y Análisis no coincidían. La dirección exacta que rebotó sigue vetada para siempre (isBouncedSync).
+// Lista explícita, sin reusar WEBMAIL_RE (su "mail\." atrapa dominios corporativos como mail.diario.com)
+// ni la de rankEmail (no tiene msn ni googlemail), y con los proveedores de los países que prospectamos.
+// Las marcas van con cualquier TLD pero sólo como dominio entero: gmail.com, yahoo.com.ar, gmx.de sí;
+// live.diario.com no.
+const _MARCAS_BUZON_COMPARTIDO = /^(?:gmail|googlemail|hotmail|outlook|live|msn|yahoo|ymail|rocketmail|aol|icloud|proton|protonmail|gmx|yandex)\.[a-z]{2,3}(?:\.[a-z]{2})?$/i;
+export const BUZONES_COMPARTIDOS = new Set([
+  "me.com", "mac.com", "pm.me", "web.de", "t-online.de", "mail.ru", "bk.ru", "inbox.ru", "list.ru", "rambler.ru", "ukr.net",
+  "abv.bg", "seznam.cz", "wp.pl", "o2.pl", "onet.pl", "interia.pl", "libero.it", "virgilio.it", "tiscali.it", "orange.fr",
+  "free.fr", "laposte.net", "uol.com.br", "bol.com.br", "terra.com.br", "naver.com", "daum.net", "hanmail.net", "qq.com",
+  "163.com", "126.com", "rediffmail.com", "mail.com", "zoho.com", "tutanota.com",
+]);
+export function esBuzonCompartido(dominio) {
+  const d = String(dominio || "").toLowerCase().trim().replace(/\.$/, "");
+  return !!d && (_MARCAS_BUZON_COMPARTIDO.test(d) || BUZONES_COMPARTIDOS.has(d));
+}
+
+// `porDominio` por parámetro (2026-09-13): la extensión consulta la misma regla con su propia lista.
+export function riesgoRebotePorDominio(dominioEmail, porDominio = _rebotesPorDominio) {
+  const dom = String(dominioEmail || "").toLowerCase();
+  if (esBuzonCompartido(dom)) return { bloquear: false, penalidad: 0 };
+  const n = porDominio.get(dom)?.size || 0;
   if (n >= 2) return { bloquear: true, motivo: `${n} rebotes previos en ese dominio` };
   if (n === 1) return { bloquear: false, penalidad: -40 };
   return { bloquear: false, penalidad: 0 };
+}
+
+// "ya_reboto", "dominio_quemado" o "". Por defecto lee la lista del worker (la que llena
+// cargarRebotados); la extensión le pasa la suya para ORDENAR sin esconder (ver popup.js).
+export function motivoRebote(email, { cache = _bouncedCache, porDominio = _rebotesPorDominio } = {}) {
+  const lower = String(email || "").toLowerCase();
+  if (cache.set.has(lower)) return "ya_reboto";
+  if (riesgoRebotePorDominio(lower.split("@")[1] || "", porDominio).bloquear) return "dominio_quemado";
+  return "";
+}
+
+// ── UNA ADIVINANZA QUE MV RECHAZÓ NO PRUEBA QUE EL DOMINIO RECHACE (movida de index.js el 2026-09-13) ──
+// polishPool guarda direcciones de rol ADIVINADAS (rol_mx) y el patrón genera hipótesis. Cuando
+// MillionVerifier les da "no", la dirección queda quemada, pero no cuenta como rechazo del dominio:
+// si contara, cualquier email REAL que apareciera después daba -1. Un rebote SMTP real, o un "no"
+// sobre una dirección publicada, siguen contando igual. Vive acá para que el worker y la extensión
+// cuenten los rebotes por dominio con la misma regla.
+const _FUENTE_HIPOTESIS = /^(rol_mx|pattern|guess|apollo_pattern)$/i;
+export function cuentaParaElDominio(fila) {
+  const f = fila?.fuente;
+  const src = typeof f === "string" ? f : (f && f.source) || "";
+  return !(fila?.evidencia === "verificador" && _FUENTE_HIPOTESIS.test(String(src)));
+}
+
+// Recalcula la memoria de rebote por dominio desde las filas de toolbar_bounced_emails
+// ({email, evidencia, fuente}) o desde direcciones sueltas. Saltea las hipótesis rechazadas y los
+// proveedores de casillas: ninguna de las dos cosas dice que el dominio rechace.
+export function recontarRebotesPorDominio(filas, porDominio = _rebotesPorDominio) {
+  porDominio.clear();
+  for (const x of (filas || [])) {
+    const fila = typeof x === "string" ? { email: x } : x;
+    if (!fila || !cuentaParaElDominio(fila)) continue;
+    const em = String(fila.email || "").toLowerCase().trim();
+    const d = em.split("@")[1];
+    if (!d || esBuzonCompartido(d)) continue;
+    if (!porDominio.has(d)) porDominio.set(d, new Set());
+    porDominio.get(d).add(em);
+  }
+  return porDominio;
+}
+
+// Carga la lista completa de rebotados: las direcciones exactas y la memoria por dominio. El worker
+// la usa con su estado compartido; la extensión le pasa el suyo.
+export function cargarRebotados(filas, { cache = _bouncedCache, porDominio = _rebotesPorDominio } = {}) {
+  const lista = Array.isArray(filas) ? filas : [];
+  cache.set = new Set(lista.map(f => String((typeof f === "string" ? f : f?.email) || "").toLowerCase().trim()).filter(Boolean));
+  cache.ts = Date.now();
+  recontarRebotesPorDominio(lista, porDominio);
+  return cache.set.size;
+}
+
+// El motivo para no escribirle a un dominio que ya rechazó direcciones al ENVIAR (_porQueNoEscribirA
+// en index.js), o "". `acc` = { usuarios, dominioMuerto }. Un proveedor de casillas nunca: que dos
+// gmail no existan no dice nada del resto de gmail (2026-09-13, misma causa que riesgoRebotePorDominio).
+export function motivoNoEscribirDominio(dominio, acc) {
+  const dom = String(dominio || "").toLowerCase();
+  if (!dom || !acc || esBuzonCompartido(dom)) return "";
+  if (acc.dominioMuerto) return "el dominio no existe (rebotó por DNS)";
+  if ((acc.usuarios || 0) >= 2) return `ya rechazó ${acc.usuarios} direcciones distintas por usuario inexistente`;
+  return "";
+}
+
+// ── EL GMAIL DEL REGISTRANTE (regla del 2026-07-14, compartida el 2026-09-13) ─────────────────────
+// website.informer devuelve el WHOIS: un freemail ahí es el dueño que registró el dominio, no el
+// contacto comercial (rudnypc@gmail.com de baladag4.com.br). Nunca sirve y suele rebotar. Vivía como
+// regex sólo en el agente; la extensión lo mostraba como candidato. Un gmail SCRAPEADO del sitio sí
+// puede ser real: esto aplica sólo a la fuente informer. Misma lista que usaba el agente.
+export const FREEMAIL_REGISTRANTE_RE = /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\.|@mail\.ru\b/i;
+export function esRegistranteWebmail(email, fuente) {
+  const src = String((typeof fuente === "string" ? fuente : fuente?.source) || "").toLowerCase().trim();
+  return src === "informer" && FREEMAIL_REGISTRANTE_RE.test(String(email || ""));
 }
 
 // ── EL LINTER DE ENTREGABILIDAD ──────────────────────────────────────────────

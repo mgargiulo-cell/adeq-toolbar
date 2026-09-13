@@ -180,5 +180,9 @@ test("la tarjeta de Prospects marca las direcciones adivinadas y preselecciona u
   const popup = fs.readFileSync(path.join(RAIZ, "..", "popup", "popup.js"), "utf8");
   ok(/rol_mx:\s+\{ txt: "adivinado \(no publicado\)"/.test(popup), "el detalle del chip mostraba el texto crudo 'rol_mx'");
   ok(/adivinado · no publicado<\/span>/.test(popup), "la lista de radios no distinguía la dirección adivinada de la publicada");
-  ok(/const _idxPreseleccion = Math\.max\(0, emails\.findIndex\(e => _fuenteDeEmail\(e\) !== "rol_mx"\)\);/.test(popup), "si hay una publicada, la adivinada no queda preseleccionada");
+  // Desde ranking_extension-13-09b la preselección de la tarjeta sale de la regla compartida con Análisis
+  // (_elegirPreseleccionClient): la misma preferencia por la publicada, sobre el orden compartido y sin
+  // dejar puesta nunca una dirección de tier -1. El caso se prueba con el código real en ese archivo.
+  ok(/const _idxPreseleccion = emails\.indexOf\(_preseleccion\);/.test(popup), "la tarjeta preselecciona con la regla compartida");
+  ok(/elegibles\.find\(e => _fuenteTextoClient\(ctx\.fuente\(e\)\) !== "rol_mx"\) \|\| elegibles\[0\]/.test(popup), "si hay una publicada, la adivinada no queda preseleccionada");
 });

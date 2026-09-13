@@ -74,7 +74,8 @@ test("la extensión no muestra lo que el worker nunca usaría, y sí muestra los
 test("la extensión usa los vetos y el criterio de buzón funcional del módulo compartido, y pasa el dominio siempre", () => {
   ok(/import \{[^}]*\bvetoDuroEmail\b[^}]*\besBuzonFuncional\b[^}]*\} from "\.\.\/auto-prospector\/lib\/email\.js"/.test(popup), "popup.js importa vetoDuroEmail y esBuzonFuncional");
   const tier = popup.slice(popup.indexOf("function _emailPickTierClient"), popup.indexOf("function _ordenarEmailsClient"));
-  ok(/if \(vetoDuroEmail\(email, state\.domain \|\| ""\)\) return -1;/.test(tier), "el tier -1 sale del veto, no del puntaje");
+  // `ctx.domain` desde el 13/09 (ranking_extension-13-09b): la tarjeta de Prospects pasa su propio dominio.
+  ok(/if \(vetoDuroEmail\(email, (?:state|ctx)\.domain \|\| ""\)\) return -1;/.test(tier), "el tier -1 sale del veto, no del puntaje");
   ok(!/_rankClient\(email\) < 0/.test(tier), "un puntaje negativo hundía a los buzones del grupo editor");
   ok(/!_isGenericEmailLocal\(email\) && !esBuzonFuncional\(email\)\) return 2;/.test(tier), "un buzón funcional va con los genéricos");
   const llamadas = popup.match(/isGarbageEmail\([^)]*\)/g) || [];

@@ -27,7 +27,7 @@ const ESTILO_PITCH = Object.freeze({ tone: "informal", length: "short", focus: "
 // `prensa@` valía 115 en el worker y era genérico acá; `dpo@`/`privacy@` eran "persona" acá y
 // basura allá; y los nueve cambios de la Fase 1 no llegaban al media buyer. Desde ahora el
 // popup importa el MISMO archivo que el worker. El zip lo incluye (scripts/empaquetar.sh).
-import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esBuzonFuncional } from "../auto-prospector/lib/email.js";
+import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esBuzonFuncional, esRegistranteWebmail, motivoRebote, cargarRebotados } from "../auto-prospector/lib/email.js";
 // La lista de dominios bloqueados existía en modules/blocklist.js y la usaba traffic.js para
 // no gastar API… pero NINGÚN botón del popup la consultaba (verificado el 08/09: cero llamadas
 // a checkDomainBlocked en este archivo). Un MB parado en mail.google.com cargó `mail.google.com`
@@ -38,7 +38,7 @@ import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrape
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch }                                                                     from "../modules/gemini.js";
 // (geminiSearch.searchEmailsWithGemini removido — no se usa en popup, solo en scraper.js)
-import { verifyEmail, verifyEmailDeep, isGarbageEmail }                                         from "../modules/emailVerifier.js";
+import { verifyEmail, verifyEmailDeep, isGarbageEmail, traerRebotados }                                         from "../modules/emailVerifier.js";
 import { runCascade }                                                                          from "../modules/cascade.js";
 import { detectBanners }                                                                       from "../modules/bannerDetector.js";
 import { saveHistory, loadHistory, clearHistory, saveSendDate,
@@ -3931,16 +3931,97 @@ function _isGenericEmailLocal(email) {
   return _isGenericLocalPart(String(email || ""));
 }
 const _AD_SALES_LOCAL_RE = AD_SALES_LOCAL;
-function _rankClient(email) {
-  try { return rankEmail(String(email || ""), state.domain || "", state.category || ""); } catch { return 0; }
+// ── EL CONTEXTO DEL ORDEN: Análisis o una tarjeta de Prospects (2026-09-13) ─────────────────────
+// Estas funciones leían `state.domain`, `state.category` y `state.emailSources`, que son de la pestaña
+// de Análisis. La tarjeta de Prospects no las usaba: ordenaba por la nota A-E (que le resta 25 a
+// publicidad@/ventas@/comercial@) y con las fuentes de OTRO dominio, así que elegía un email distinto
+// del que muestra Análisis y del que usa el agente (rol comercial > persona > genérico). Ahora las dos
+// pantallas ordenan con estas funciones y cada una pasa su contexto: dominio, categoría y fuentes.
+function _ctxEmailsAnalisis() {
+  return { domain: state.domain || "", category: state.category || "", fuente: (e) => state.emailSources.get(e) };
 }
-function _emailPickTierClient(email) {
-  const src = (state.emailSources.get(email) || "").toLowerCase();
+function _ctxEmailsProspecto(r) {
+  const fuentes = (r && r.email_sources) || {};
+  return { domain: (r && r.domain) || "", category: (r && r.category) || "", fuente: (e) => fuentes[String(e || "").toLowerCase()] };
+}
+// email_sources guarda "scrape" o {source, url}; state.emailSources guarda "Page", "Informer"…
+function _fuenteTextoClient(v) {
+  return String(typeof v === "string" ? v : (v && v.source) || "").toLowerCase();
+}
+function _rankClient(email, ctx = _ctxEmailsAnalisis()) {
+  try { return rankEmail(String(email || ""), ctx.domain || "", ctx.category || ""); } catch { return 0; }
+}
+
+// ── LOS REBOTADOS EN LA EXTENSIÓN: SÓLO PARA ORDENAR (2026-09-13) ─────────────────────────────────
+// El worker carga toolbar_bounced_emails en lib/email.js y da -1 a una dirección que ya rebotó o a un
+// dominio quemado; la extensión nunca la cargaba, así que Análisis y la tarjeta podían poner primera
+// (y preseleccionar) una dirección que el agente descarta. Se carga con la MISMA regla
+// (cargarRebotados / motivoRebote: las hipótesis rechazadas por MV y los gmail/hotmail no queman el
+// dominio), pero en una lista PROPIA y no en la compartida del módulo: la compartida la lee
+// isGarbageEmail, y ahí la dirección desaparecería de la pantalla. Esconder o bloquear rebotados en la
+// tarjeta lo decide el dueño; acá sólo van al final y nunca quedan puestos solos.
+const _rebotesExtension = { cache: { set: new Set(), ts: 0 }, porDominio: new Map() };
+const _REBOTES_TTL_MS = 30 * 60 * 1000;
+const _alCargarRebotes = new Set();
+let _rebotesEnCurso = null;
+let _rebotesUltimoFallo = 0;
+function _motivoReboteClient(email) {
+  try { return motivoRebote(email, _rebotesExtension); } catch { return ""; }
+}
+// Pide la lista si no está o venció. `alCargar` corre sólo si la carga salió bien. Si falla, la
+// extensión se comporta como antes (sin rebotados) y reintenta a los 5 minutos.
+function _asegurarRebotesExtension(alCargar) {
+  if (Date.now() - _rebotesExtension.cache.ts < _REBOTES_TTL_MS) return;
+  if (!state.accessToken || Date.now() - _rebotesUltimoFallo < 5 * 60 * 1000) return;
+  if (typeof alCargar === "function") _alCargarRebotes.add(alCargar);
+  if (_rebotesEnCurso) return;
+  _rebotesEnCurso = (async () => {
+    let filas = null, tsFilas = 0;
+    try {
+      const guardado = (await chrome.storage.local.get("rebotados_cache"))?.rebotados_cache;
+      if (guardado && Array.isArray(guardado.filas) && Date.now() - (guardado.ts || 0) < _REBOTES_TTL_MS) { filas = guardado.filas; tsFilas = guardado.ts; }
+    } catch {}
+    if (!filas) {
+      filas = await traerRebotados(state.accessToken).catch(() => null);
+      if (filas) { try { await chrome.storage.local.set({ rebotados_cache: { ts: Date.now(), filas } }); } catch {} }
+    }
+    const cbs = [..._alCargarRebotes];
+    _alCargarRebotes.clear();
+    if (!Array.isArray(filas)) { _rebotesUltimoFallo = Date.now(); return; }
+    cargarRebotados(filas, _rebotesExtension);
+    if (tsFilas) _rebotesExtension.cache.ts = tsFilas;
+    for (const cb of cbs) { try { cb(); } catch (e) { console.warn("[rebotados]", e); } }
+  })().catch(() => {}).finally(() => { _rebotesEnCurso = null; });
+}
+// Cuando llega la lista, Análisis se redibuja sólo si alguna de sus direcciones cambió de lugar, y
+// conserva la dirección elegida mientras se pueda elegir.
+function _reordenarAnalisisTrasRebotes() {
+  const listEl = document.getElementById("email-list");
+  if (!listEl || listEl.style.display === "none") return;
+  if (!(state.emails || []).some(e => _motivoReboteClient(e))) return;
+  const formEl = document.getElementById("form-email");
+  const antes = formEl ? formEl.value : "";
+  renderEmailList(state.emails);
+  if (!formEl || !antes || formEl.value === antes || _emailPickTierClient(antes) < 0) return;
+  const chip = [...listEl.querySelectorAll(".email-chip:not(.slot-future)")].find(c => c.dataset.email === antes);
+  if (!chip) return;
+  listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
+  chip.classList.add("selected");
+  formEl.value = antes;
+}
+
+function _emailPickTierClient(email, ctx = _ctxEmailsAnalisis()) {
+  const src = _fuenteTextoClient(ctx.fuente(email));
   const local = String(email || "").toLowerCase().split("@")[0];
   // Basura según los vetos compartidos con el worker (dpo@, privacy@, dmarc@, copyright@, owner@…):
   // último de todo. Veto y NO `rankEmail < 0` (2026-09-13): un buzón del grupo editor sin la casa
   // editora cargada vale -35 y es legítimo; con el puntaje se hundía debajo de los genéricos.
-  if (vetoDuroEmail(email, state.domain || "")) return -1;
+  if (vetoDuroEmail(email, ctx.domain || "")) return -1;
+  // Ya rebotó o su dominio está quemado, según la lista de rebotados de la extensión (2026-09-13): al
+  // final, como en el agente, pero visible (ver _rebotesExtension).
+  if (_motivoReboteClient(email)) return -1;
+  // El gmail del registrante que devuelve website.informer: el agente nunca le escribe (2026-09-13).
+  if (esRegistranteWebmail(email, src)) return -1;
   // Maxi 2026-07-15 (D1 sync worker _pickTier): informer (WHOIS/registrar) NO es top-tier — baja a 1
   // (o 3 si el local es rol comercial). Antes estaba en 4 junto a apollo → el popup mostraba como
   // "mejor contacto" un domainmanagement@ que el worker rankea ÚLTIMO. Ahora coincide con el envío real.
@@ -3957,13 +4038,20 @@ function _emailPickTierClient(email) {
   return 0;                                                   // genérico
 }
 // Orden: tier de fuente primero, y dentro del tier el puntaje del ranking compartido.
-function _ordenarEmailsClient(list) {
-  return [...list].sort((a, b) => (_emailPickTierClient(b) - _emailPickTierClient(a)) || (_rankClient(b) - _rankClient(a)));
+function _ordenarEmailsClient(list, ctx = _ctxEmailsAnalisis()) {
+  return [...list].sort((a, b) => (_emailPickTierClient(b, ctx) - _emailPickTierClient(a, ctx)) || (_rankClient(b, ctx) - _rankClient(a, ctx)));
 }
-function _bestEmailByTier(emails) {
+// La dirección que queda puesta sola (2026-09-13): la primera del orden que se puede elegir. Nunca una
+// de tier -1 (vetada, rebotada, dominio quemado, registrante): se ve y se puede elegir a mano, pero no
+// queda preseleccionada. Una ADIVINADA (rol_mx) sólo si no hay ninguna publicada (36fb125). "" si nada.
+function _elegirPreseleccionClient(ordenados, ctx = _ctxEmailsAnalisis()) {
+  const elegibles = (ordenados || []).filter(e => _emailPickTierClient(e, ctx) >= 0);
+  return elegibles.find(e => _fuenteTextoClient(ctx.fuente(e)) !== "rol_mx") || elegibles[0] || "";
+}
+function _bestEmailByTier(emails, ctx = _ctxEmailsAnalisis()) {
   const list = (emails || []).filter(Boolean);
   if (!list.length) return "";
-  return _ordenarEmailsClient(list)[0];
+  return _elegirPreseleccionClient(_ordenarEmailsClient(list, ctx), ctx);
 }
 async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
   try {
@@ -4286,6 +4374,9 @@ function _emailGrade(email, result, source) {
 //   ▸ SIN verify: baseline 40, max teorico = B (necesitás verify para A)
 function _emailGradeCompute(email, result, source) {
   if (!email || !email.includes("@")) return { grade: "E", label: "Inválido — formato malo" };
+  // El gmail del registrante (WHOIS de website.informer) nunca es el contacto: E, como en el orden.
+  // Antes sumaba "informer+15" y podía verse como B (2026-09-13).
+  if (esRegistranteWebmail(email, source)) return { grade: "E", label: "WHOIS/registrante — webmail" };
   const reasons = [];
   let score = 40; // baseline: prospect sin verify queda en "C bueno potencial"
   const tags = result?.tags || [];
@@ -4375,7 +4466,9 @@ async function autoVerifyEmailChips(listEl) {
     chip.classList.add(cls);
     chip.title = _verifyTooltip(result);
     // Refrescar grade A-E ahora que tenemos verify result
-    const src = state.emailSources.get(email) || "";
+    // La fuente sale del propio chip (2026-09-13): en una tarjeta de Prospects son las fuentes de SU
+    // lead, no las de la pestaña de Análisis. Un chip sin data-src, como antes.
+    const src = chip.dataset.src !== undefined ? chip.dataset.src : (state.emailSources.get(email) || "");
     const g = _emailGrade(email, result, src);
     const oldBadge = chip.querySelector(".email-grade");
     if (oldBadge) {
@@ -4423,6 +4516,9 @@ function renderEmailList(emails) {
 
   const isDup       = state.duplicate?.found;
   const mondayEmail = isDup ? (state.duplicate.email || "").trim() : "";
+
+  // La lista de rebotados de la extensión (sólo ordena): si no está, se pide y al llegar se reordena.
+  _asegurarRebotesExtension(_reordenarAnalisisTrasRebotes);
 
   // 1. Dedupe + excluir el email de Monday + DESCARTAR garbage (whois/proxy/abuse).
   //    Estos emails nunca deberían aparecer en la UI — son inservibles.
@@ -4483,7 +4579,7 @@ function renderEmailList(emails) {
       ? `Asignado como Adicional ${curSlot} — click para quitar`
       : "Click para agregar como Contacto Adicional (envío paralelo día 0)";
     const futureBtn = `<button type="button" class="email-future-btn ${curSlot ? "assigned" : ""}" data-email-future="${esc(email)}" title="${esc(btnTitle)}">${btnLabel}</button>`;
-    return `<div class="email-chip ${extraClass} ${verCls} ${curSlot ? "slot-future" : ""}" data-email="${esc(email)}" title="Click = enviar ahora. + (derecha) = agregar como adicional">${gradeBadge}${esc(email)}${srcBadge}${futureBtn}</div>`;
+    return `<div class="email-chip ${extraClass} ${verCls} ${curSlot ? "slot-future" : ""}" data-email="${esc(email)}" data-src="${esc(src)}" title="Click = enviar ahora. + (derecha) = agregar como adicional">${gradeBadge}${esc(email)}${srcBadge}${futureBtn}</div>`;
   };
 
   if (mondayEmail) {
@@ -4552,12 +4648,20 @@ function renderEmailList(emails) {
   // (que ya viene rankeado: ad ops > publicidad > marketing > online > dev).
   // Si no hay ninguno fresco, recién ahí caemos al de Monday como fallback.
   // Maxi 2026-06-18: excluir slot-future del auto-select del principal
-  const preferredChip = listEl.querySelector(".email-chip:not(.monday):not(.slot-future)")
-                     || listEl.querySelector(".email-chip:not(.slot-future)")
-                     || listEl.querySelector(".email-chip");
+  // 2026-09-13: nunca una dirección de tier -1 (vetada, rebotada, registrante). Si ese es el único
+  // chip se ve igual y se puede elegir a mano, pero no queda puesto solo en el campo de envío.
+  const _ctxLista = _ctxEmailsAnalisis();
+  const _elegible = (c) => !!c && _emailPickTierClient(c.dataset.email, _ctxLista) >= 0;
+  const _frescos = [...listEl.querySelectorAll(".email-chip:not(.monday):not(.slot-future)")];
+  const _porDefecto = _elegirPreseleccionClient(_frescos.map(c => c.dataset.email), _ctxLista);
+  const preferredChip = _frescos.find(c => _porDefecto && c.dataset.email === _porDefecto)
+                     || [...listEl.querySelectorAll(".email-chip:not(.slot-future)")].find(_elegible)
+                     || [...listEl.querySelectorAll(".email-chip")].find(_elegible);
   if (preferredChip) {
     preferredChip.classList.add("selected");
     formEl.value = preferredChip.dataset.email;
+  } else if (formEl.value && [...listEl.querySelectorAll(".email-chip")].some(c => c.dataset.email === formEl.value)) {
+    formEl.value = "";   // quedaba puesta de un render anterior y ya no se puede elegir sola
   }
 
   // Click para seleccionar (slot 1 = email principal, envío ahora)
@@ -4609,7 +4713,8 @@ function renderEmailList(emails) {
         // Si el email estaba en slot principal, liberarlo
         if (formEl.value === email) {
           formEl.value = "";
-          const next = listEl.querySelector(".email-chip:not(.slot-future):not(.monday)") || listEl.querySelector(".email-chip:not(.slot-future)");
+          const next = [...listEl.querySelectorAll(".email-chip:not(.slot-future):not(.monday)")].find(_elegible)
+                    || [...listEl.querySelectorAll(".email-chip:not(.slot-future)")].find(_elegible);
           if (next) {
             listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
             next.classList.add("selected");
@@ -10899,7 +11004,13 @@ function renderProspectCard(r) {
     const v = (r.email_sources || {})[String(e || "").toLowerCase()];
     return String(typeof v === "string" ? v : (v && v.source) || "").toLowerCase();
   };
-  const _idxPreseleccion = Math.max(0, emails.findIndex(e => _fuenteDeEmail(e) !== "rol_mx"));
+  // La preselección de la tarjeta es la MISMA que la de Análisis (2026-09-13): el orden compartido y
+  // la primera que se puede elegir. Antes era el [0] del array guardado —el campo "Email" de abajo, que
+  // es lo que se envía, arrancaba con él— y podía ser una dirección vetada o de tier -1. Sin ninguna
+  // elegible, no queda nada puesto.
+  const _ctxTarjeta = _ctxEmailsProspecto(r);
+  const _preseleccion = _elegirPreseleccionClient(_ordenarEmailsClient(emails, _ctxTarjeta), _ctxTarjeta);
+  const _idxPreseleccion = emails.indexOf(_preseleccion);
   const emailOptions = emails.map((e, i) => `
     <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
       <input type="radio" name="email_${r.id}" value="${esc(e)}" ${i === _idxPreseleccion ? "checked" : ""} class="pcard-email-radio" />
@@ -11112,7 +11223,7 @@ function renderProspectCard(r) {
         <label class="form-label">GEO</label>
         <input type="text" class="form-input pcard-geo" value="${esc(r.geo || "")}" placeholder="e.g. Mexico" style="font-size:11px;padding:4px 7px" />
         <label class="form-label">Email</label>
-        <input type="text" class="form-input pcard-email-monday" value="${esc(emails[0] || "")}" placeholder="Email a ADEQ" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
+        <input type="text" class="form-input pcard-email-monday" value="${esc(_preseleccion)}" placeholder="Email a ADEQ" style="font-size:11px;padding:4px 7px" title="Auto-completado con el email seleccionado arriba — editable" />
         <label class="form-label">Date</label>
         <input type="text" class="form-input pcard-date" value="${toDisplayDate(new Date().toISOString().split("T")[0])}" placeholder="DD/MM/YYYY" maxlength="10" style="font-size:11px;padding:4px 7px" title="Auto-completada con hoy — editable" />
         <label class="form-label">Traffic</label>
@@ -11235,19 +11346,20 @@ function initProspectCard(card, data) {
   const renderProspectEmailList = () => {
     const listEl = card.querySelector(".pcard-email-list");
     if (!listEl || emails.length === 0) return;
+    const _ctxCard = _ctxEmailsProspecto(data);
+    // La lista de rebotados de la extensión: si no está, se pide; cuando llega, esta tarjeta se
+    // redibuja sólo si alguna de sus direcciones cambió de lugar.
+    _asegurarRebotesExtension(() => { if (card.isConnected && emails.some(e => _motivoReboteClient(e))) renderProspectEmailList(); });
 
-    // Orden por grade (A > B > C > D > E) — el mejor queda arriba y auto-selecto.
-    // Backend prioriza Apollo en el array pero el ranking real es por grade.
-    const _gradeRank = { A: 5, B: 4, C: 3, D: 2, E: 1 };
-    const sorted = [...emails].sort((a, b) => {
-      const cA = _emailVerifyCache.get(a);
-      const cB = _emailVerifyCache.get(b);
-      const sA = state.emailSources.get(a) || "";
-      const sB = state.emailSources.get(b) || "";
-      const gA = _gradeRank[_emailGrade(a, cA, sA).grade] || 0;
-      const gB = _gradeRank[_emailGrade(b, cB, sB).grade] || 0;
-      return gB - gA;
-    });
+    // ── EL ORDEN ES EL DE ANÁLISIS (2026-09-13) ─────────────────────────────────────────────
+    // Antes ordenaba por la nota A-E, que le resta 25 a publicidad@/ventas@/comercial@, y con las
+    // fuentes de la pestaña de Análisis (otro dominio): publicidad@ quedaba debajo de juan.perez@ y la
+    // tarjeta elegía otro email que Análisis y que el agente (rol comercial > persona > genérico). La
+    // nota queda como badge informativo y no ordena, así que verificar tampoco reordena la lista.
+    const sorted = _ordenarEmailsClient(emails, _ctxCard);
+    // Lo que estaba elegido antes de redibujar (tras verificar, tras el botón +/N, o cuando llegan los
+    // rebotados), para no pisarlo.
+    const _selAntes = listEl.querySelector(".email-chip.selected")?.dataset.email || "";
 
     const VISIBLE = 5;
     const visible = sorted.slice(0, VISIBLE);
@@ -11307,7 +11419,7 @@ function initProspectCard(card, data) {
         ? `Asignado como Adicional ${curSlot} — click para quitar`
         : "Click para agregar como Contacto Adicional (envío paralelo día 0)";
       const futureBtn = `<button type="button" class="pcard-future-btn ${curSlot ? "assigned" : ""}" data-email-future="${esc(e)}" title="${esc(btnTitle)}" style="margin-left:auto;background:${curSlot?'#dc2626':'#94a3b8'};color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:10px;cursor:pointer;font-weight:700">${btnLabel}</button>`;
-      return `<div class="email-chip ${cls} ${curSlot ? 'slot-future' : ''}" data-email="${esc(e)}" title="Click = email principal · botón +/N = contacto adicional" style="display:flex;align-items:center;gap:4px">${gb}<span style="flex:1">${esc(e)}${srcChip}</span>${futureBtn}</div>`;
+      return `<div class="email-chip ${cls} ${curSlot ? 'slot-future' : ''}" data-email="${esc(e)}" data-src="${esc(srcObj.source)}" title="Click = email principal · botón +/N = contacto adicional" style="display:flex;align-items:center;gap:4px">${gb}<span style="flex:1">${esc(e)}${srcChip}</span>${futureBtn}</div>`;
     };
 
     let html = visible.map(chipFor).join("");
@@ -11404,11 +11516,20 @@ function initProspectCard(card, data) {
         // Single-select: limpiar todos + seleccionar este
         listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
         chip.classList.add("selected");
+        listEl.dataset.eleccionMb = chip.dataset.email || "";   // la elección a mano sobrevive a los redibujos
         _syncSelectedToInput();
       });
     });
-    const first = listEl.querySelector(".email-chip:not(.slot-future)") || listEl.querySelector(".email-chip");
+    // Qué queda seleccionado (2026-09-13): lo que el MB eligió a mano si sigue en la lista; si no, lo que
+    // estaba elegido antes de redibujar mientras se pueda elegir; si no, la preselección compartida con
+    // Análisis. Nunca una dirección de tier -1 por defecto, y ninguna si no hay elegibles.
+    const _chipsPrincipales = [...listEl.querySelectorAll(".email-chip:not(.slot-future)")];
+    const _chipDe = (em) => (em ? _chipsPrincipales.find(c => c.dataset.email === em) : null) || null;
+    const first = _chipDe(listEl.dataset.eleccionMb || "")
+               || (_emailPickTierClient(_selAntes, _ctxCard) >= 0 ? _chipDe(_selAntes) : null)
+               || _chipDe(_elegirPreseleccionClient(_chipsPrincipales.map(c => c.dataset.email), _ctxCard));
     if (first) first.classList.add("selected");
+    else if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1" && emails.includes(mondayEmailEl.value)) mondayEmailEl.value = "";
     _syncSelectedToInput();
 
     // Maxi 2026-06-18: handler del botón "+/N" para slots adicionales.
@@ -11433,10 +11554,11 @@ function initProspectCard(card, data) {
           if (!freeSlot) slots[slots.length - 1].value = email;
           else freeSlot.value = email;
           // Si el email era el principal, liberarlo y elegir otro
+          if ((listEl.dataset.eleccionMb || "").toLowerCase() === lowerE) listEl.dataset.eleccionMb = "";
           if (mondayEmailEl && mondayEmailEl.value.toLowerCase() === lowerE) {
             mondayEmailEl.value = "";
             mondayEmailEl.dataset.userEdited = "";
-            const next = listEl.querySelector(".email-chip:not(.slot-future):not(.selected)");
+            const next = [...listEl.querySelectorAll(".email-chip:not(.slot-future):not(.selected)")].find(c => _emailPickTierClient(c.dataset.email, _ctxCard) >= 0);
             if (next) {
               listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
               next.classList.add("selected");
