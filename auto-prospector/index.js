@@ -11546,6 +11546,47 @@ async function barridoNoPublisher(token) {
 // pide la persona con forceUnlock. Lo que trae se guarda como en el pulido (fuente `apollo`).
 // El presupuesto por vuelta es lo que el ritmo diario deja (`getApolloUsageToday().limit`,
 // que crece solo a medida que se acerca el fin del ciclo), con un techo de 30 por vuelta.
+// ── EL INTENTO DE APOLLO SIN RESULTADO QUEDA ANOTADO APARTE (2026-09-13) ─────────────────────
+// La quema del ciclo marcaba `email_ultimo_motivo = "apollo_sin_contacto"` y excluía por ese texto.
+// Pero esa columna es UNA sola: el pulido la pisa con el motivo del crawl apenas vuelve a fallar
+// (waf_nos_bloqueo, …). Se perdía el diagnóstico del crawl y, con la marca pisada, la vuelta
+// siguiente volvía a pagar los mismos desbloqueos. Ahora el intento va a toolbar_diag_sin_email
+// (fase "apollo"), la tabla que ya guarda la historia de cada búsqueda, y la columna queda para el
+// crawl. Vigencia: la misma que la caché de Apollo (APOLLO_CACHE_TTL_DAYS).
+// NO se escribe en toolbar_apollo_cache: la extensión toma cualquier fila de ahí como "ya consultado"
+// y le mostraría al MB "No Apollo data" sin el botón de revelar durante días.
+// Límite conocido: findBestApolloEmail devuelve null tanto si reveló personas sin email como si no
+// pudo preguntar (401/429, tope). Hoy pasaba lo mismo con la marca de la columna, que encima no vencía.
+async function _dominiosConApolloSinEmail(token, dominios) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const desde = new Date(Date.now() - APOLLO_CACHE_TTL_DAYS * 86_400_000).toISOString();
+  const doms = [...new Set((Array.isArray(dominios) ? dominios : []).map(d => String(d || "").toLowerCase().replace(/^www\./, "")).filter(Boolean))];
+  const out = new Set();
+  for (let i = 0; i < doms.length; i += 150) {    // de a 150: una URL con cientos de dominios se pasa de largo
+    try {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?fase=eq.apollo&created_at=gte.${desde}&domain=in.(${doms.slice(i, i + 150).map(encodeURIComponent).join(",")})&select=domain`,
+        { headers: auth, signal: AbortSignal.timeout(10000) });
+      if (!r.ok) return null;                        // "no pude leer" ≠ "nadie intentado"
+      const j = await r.json().catch(() => null);
+      if (!Array.isArray(j)) return null;
+      j.forEach(x => out.add(String(x?.domain || "").toLowerCase().replace(/^www\./, "")));
+    } catch { return null; }
+  }
+  return out;
+}
+
+async function _registrarApolloSinEmail(token, domain, comentario) {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+      body: JSON.stringify({ domain, intento: 1, fase: "apollo", emails_crudos: 0, candidatos_rechazados: null, motivo: "apollo_sin_contacto", comentario, paginas_leidas: null, bloqueado_por_waf: false }),
+      signal: AbortSignal.timeout(10000),
+    });
+    return !!(r && r.ok);
+  } catch { return false; }
+}
+
 async function apolloQuemarCiclo(token) {
   const cfg = await getConfig(token).catch(() => ({}));
   if (String(cfg.apollo_quemar_ciclo ?? "true") === "false") {
@@ -11614,9 +11655,19 @@ async function apolloQuemarCiclo(token) {
       if (rc.ok) (await rc.json()).forEach(x => recientes.add(String(x.domain).toLowerCase()));
     }
   } catch {}
-  const candidatos = sinPersona.filter(l => !recientes.has(String(l.domain).toLowerCase().replace(/^www\./, ""))).slice(0, presupuesto);
+  // Los que Apollo ya revisó sin devolver email en los últimos 45 días no se vuelven a pagar. Si no se
+  // puede leer, no se gasta a ciegas: esta es la única exclusión de esos leads (2026-09-13).
+  const _yaIntentados = await _dominiosConApolloSinEmail(token, sinPersona.map(l => l.domain));
+  if (_yaIntentados === null) {
+    await saludPing(token, "apollo_quemar_ciclo", { status: "fail", cadenciaMin: 240, detalle: `no pude leer los intentos previos de Apollo — no gasto a ciegas · ${estado}` }).catch(() => {});
+    return;
+  }
+  const candidatos = sinPersona.filter(l => {
+    const d = String(l.domain).toLowerCase().replace(/^www\./, "");
+    return !recientes.has(d) && !_yaIntentados.has(d);
+  }).slice(0, presupuesto);
   const t0 = Date.now();
-  let intentos = 0, conEmail = 0, sinContacto = 0;
+  let intentos = 0, conEmail = 0, sinContacto = 0, rescates = 0, mejoras = 0, descartadosValidacion = 0;
   for (const lead of candidatos) {
     if (Date.now() - t0 > 90_000) break;
     const domain = String(lead.domain).toLowerCase().replace(/^www\./, "");
@@ -11626,28 +11677,44 @@ async function apolloQuemarCiclo(token) {
     const patch = {};
     if (ap?.email) {
       const cur = (Array.isArray(lead.emails) ? lead.emails : []).map(String);
-      const merged = [ap.email, ...cur.filter(e => e.toLowerCase() !== ap.email.toLowerCase())];
-      patch.emails = await validateEmailsBatch(merged);
-      patch.email_sources = { ...(lead.email_sources || {}), [ap.email.toLowerCase()]: "apollo" };
-      if (!lead.contact_name && ap.contact_name) patch.contact_name = ap.contact_name;
-      // RESCATE = el lead no tenía NINGÚN email (misma regla que polishPool). Sumar una persona sobre
-      // un info@ es una mejora de contacto, no un rescate: sin esta condición inflaba "emails
-      // encontrados a leads que no tenían" y metricas_diarias.emails_hallados (2026-09-13).
-      if (!cur.length) patch.email_found_at = new Date().toISOString();
-      conEmail++;
-      log(`  💎 apollo quemar: ${domain} → ${ap.email}${ap.title ? ` (${ap.title})` : ""}`);
+      const apLower = String(ap.email).toLowerCase().trim();
+      const merged = [ap.email, ...cur.filter(e => e.toLowerCase() !== apLower)];
+      const validados = await validateEmailsBatch(merged);
+      // La clave "apollo" se escribe siempre, sobreviva o no: es la guarda que saca al lead de esta
+      // lista (sinPersona) y evita volver a pagarlo.
+      patch.email_sources = { ...(lead.email_sources || {}), [apLower]: "apollo" };
+      if (validados.includes(apLower)) {
+        patch.emails = validados;
+        if (!lead.contact_name && ap.contact_name) patch.contact_name = ap.contact_name;
+        // RESCATE = el lead no tenía NINGÚN email y el de Apollo quedó en la lista (misma regla que
+        // polishPool, en _marcarRescate). Sumar una persona sobre un info@ es una MEJORA de contacto:
+        // se cuenta aparte, no infla "emails encontrados a leads que no tenían" (2026-09-13).
+        _marcarRescate(patch, cur);
+        if (cur.length) mejoras++; else rescates++;
+        conEmail++;
+        log(`  💎 apollo quemar: ${domain} → ${ap.email}${ap.title ? ` (${ap.title})` : ""}`);
+      } else {
+        // Rebotado, basura o dominio sin MX: no se agrega a la lista, ni nombre, ni fecha de rescate.
+        descartadosValidacion++;
+        log(`  ✂️ apollo quemar: ${domain} → ${ap.email} no pasó la validación (rebotado, basura o sin MX) — no se agrega`);
+      }
     } else {
-      patch.email_ultimo_motivo = "apollo_sin_contacto";
       sinContacto++;
+      const _anotado = await _registrarApolloSinEmail(token, domain,
+        "Apollo no devolvió ningún email con el desbloqueo forzado (quema del ciclo): o no tiene a nadie del área, o las personas reveladas no tienen email, o no se pudo preguntar. No se le vuelve a pagar por 45 días.");
+      // Si no se pudo dejar el rastro, la marca vieja en la columna evita pagarlo de nuevo en la próxima vuelta.
+      if (!_anotado) patch.email_ultimo_motivo = "apollo_sin_contacto";
     }
-    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-      method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" }, body: JSON.stringify(patch),
-    }).catch(() => {});
+    if (Object.keys(patch).length) {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+        method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" }, body: JSON.stringify(patch),
+      }).catch(() => {});
+    }
   }
   // "Estoy atrasado y no encontré a quién pedirle" también hay que verlo: el pool se quedó sin
   // candidatos, no el presupuesto.
   const status = (candidatos.length === 0) ? "warn" : "ok";
-  const detalle = `${atrasado ? "ATRASADO" : "fin de ciclo"} · ${estado} · candidatos ${sinPersona.length} (${recientes.size} recientes) · intentos ${intentos} → ${conEmail} con email, ${sinContacto} sin contacto · presupuesto ${presupuesto}`;
+  const detalle = `${atrasado ? "ATRASADO" : "fin de ciclo"} · ${estado} · candidatos ${sinPersona.length} (${recientes.size} recientes, ${_yaIntentados.size} ya revisados sin email) · intentos ${intentos} → ${conEmail} con email (${rescates} rescates, ${mejoras} mejoras de genérico a persona), ${descartadosValidacion} descartados por validación, ${sinContacto} sin contacto · presupuesto ${presupuesto}`;
   // real/esperado = "¿gastó lo que podía gastar?", que es el propósito del job (2026-09-13).
   // Medía con-email sobre intentos: con UN intento sin contacto salía "rindiendo por debajo",
   // y que Apollo no tenga a alguien no es una falla del job.
@@ -12054,6 +12121,104 @@ function _esEmailDeUltima(email, fuente) {
   return _isGenericLocalPart(email);
 }
 
+// Import al lado de quien lo usa (como createSign más abajo): la lista de imports de arriba la
+// tocan varios arreglos a la vez.
+import { esBuzonFuncional } from "./lib/email.js";
+
+// ── ¿LA LISTA DE REBOTES ESTÁ LEÍDA DE VERDAD? (2026-09-13) ─────────────────────────────────
+// loadBouncedEmails falla abierto: si la consulta falla deja la lista como estaba, que en un
+// proceso recién arrancado es VACÍA, y nadie se entera. Para el agente no importa (recarga en cada
+// ciclo); para la auditoría del pool y el pulido sí: juzgan y ESCRIBEN con esa lista. Acá la señal
+// es "hubo al menos una lectura buena en este proceso" — no `ts === 0` ni `set.size`, porque el
+// escaneo de rebotes pone ts=0 para forzar la recarga y deja la lista vieja, que sigue sirviendo, y
+// markEmailBounced agrega direcciones aunque la lista nunca se haya leído.
+let _rebotesLeidosOk = false;
+async function _rebotesListosParaJuzgar(token) {
+  await loadBouncedEmails(token).catch(() => {});
+  if (_bouncedCache.ts > 0 && Date.now() - _bouncedCache.ts < BOUNCED_CACHE_TTL) _rebotesLeidosOk = true;
+  return _rebotesLeidosOk;
+}
+
+// ── ¿ESTE EMAIL NUEVO MEJORA EL CONTACTO? (revisión del 13/09) ──────────────────────────────
+// La búsqueda de uno mejor anteponía cualquier dirección con puntaje > 0 que no fuera "de última":
+// rrhh@, empleos@, store@, events@, reservas@, tienda@ (48) o informatique@ (45) quedaban PRIMERAS
+// delante de info@ (55), se logueaban como "mejorados", y la cola del popup toma emails[0].
+// Una mejora tiene que ganarle a dos cosas:
+//   · a un info@ del mismo sitio (el piso del "de última"), así ningún departamento, buzón de
+//     infraestructura o área equivocada cuenta como mejora, puntúe rankEmail lo que puntúe mañana;
+//   · a la mejor dirección PUBLICADA que ya tiene el lead. Las adivinadas por rol_mx no fijan la
+//     vara: son hipótesis, y una persona publicada vale más que una suposición.
+// Y nunca es un buzón funcional ni de infraestructura, aunque el puntaje cambie.
+function _esMejoraDeContacto(email, score, base, fuentes, dominio, categoria = "") {
+  if (!(score > 0) || _esEmailDeUltima(email, "scrape")) return false;
+  const local = String(email || "").toLowerCase().split("@")[0];
+  if (!local || esBuzonFuncional(local)) return false;
+  if (local.split(/[._-]+/).some(seg => IT_INFRA_SEGMENT.has(seg))) return false;
+  const dom = String(dominio || "").toLowerCase().replace(/^www\./, "");
+  const piso = rankEmail(`info@${dom}`, dom, categoria);
+  const src = fuentes || {};
+  const publicados = (Array.isArray(base) ? base : [])
+    .filter(e => typeof e === "string" && e)
+    .filter(e => String(_normSrc(src[e.toLowerCase()]) || "").toLowerCase() !== "rol_mx");
+  const mejorPublicado = Math.max(-1, ...publicados.map(e => rankEmail(e, dom, categoria)));
+  return score > Math.max(piso, mejorPublicado);
+}
+
+// La lista que queda después de una mejora se ordena con el MISMO criterio que la primera pasada
+// de la auditoría (puntaje, de mayor a menor, orden estable). Si se antepusiera, la auditoría
+// siguiente la vería "desordenada" y la volvería a escribir: dos reglas peleándose cada 84 h.
+function _ordenarPorPuntaje(emails, dominio, categoria = "") {
+  const vistos = new Set();
+  return (Array.isArray(emails) ? emails : [])
+    .filter(e => typeof e === "string" && e && !vistos.has(e.toLowerCase()) && vistos.add(e.toLowerCase()))
+    .map(e => ({ e, s: rankEmail(e, dominio, categoria) }))
+    .sort((a, b) => b.s - a.s)
+    .map(x => x.e);
+}
+
+// ── PRIMERA PASADA DE LA AUDITORÍA, POR LEAD (2026-09-13) ───────────────────────────────────
+// Qué emails quedan, cuáles salen y por qué. Pura: se prueba sin base.
+// Una fila `por_enviar` es un prospecto que un media buyer YA trabajó: le escribió a esa dirección
+// y la guardó para mandarla al CRM. La auditoría le agregaba o le sacaba direcciones, y "Enviar"
+// carga al CRM emails[0] con mail_ya_enviado=true: la ficha podía quedar con un contacto al que
+// nadie le escribió (los follow-ups salen a otro buzón) o con el email vacío. En esas filas no se
+// toca la lista: si la dirección que se va a mandar está muerta, se AVISA (el rebote se informa,
+// no se decide por el MB).
+function _planAuditoriaLead(lead) {
+  const originales = (Array.isArray(lead?.emails) ? lead.emails : []).filter(e => typeof e === "string" && e);
+  const vacio = { plan: null, malos: [], cambioOrden: false, aviso: null };
+  if (!originales.length) return vacio;
+  const fuentes = lead.email_sources || {};
+  const evaluados = originales.map(e => {
+    const score  = rankEmail(e, lead.domain, lead.category || "");
+    const marca  = _brandMatches(e, lead.domain, _normSrc(fuentes[e.toLowerCase()]));
+    let motivo = "";
+    if (isBouncedSync(e))      motivo = "ya_reboto";
+    else if (score < 0)        motivo = "basura_o_departamento";
+    else if (!marca)           motivo = "otra_marca";
+    return { email: e, score, ok: !motivo, motivo };
+  });
+  const buenos = evaluados.filter(x => x.ok).sort((a, b) => b.score - a.score).map(x => x.email);
+  const malos  = evaluados.filter(x => !x.ok);
+  if (lead.status === "por_enviar") {
+    const muerto = malos.find(m => m.email === originales[0]);
+    return { ...vacio, aviso: muerto ? { email: muerto.email, motivo: muerto.motivo } : null };
+  }
+  const cambioContenido = buenos.length !== originales.length;
+  const cambioOrden = !cambioContenido && buenos.some((e, i) => e !== originales[i]);
+  const plan = (cambioContenido || cambioOrden)
+    ? { id: lead.id, domain: lead.domain, buenos, vaciaria: buenos.length === 0, malos }
+    : null;
+  return { plan, malos, cambioOrden, aviso: null };
+}
+
+// monday_payload es jsonb y un PATCH lo reemplaza ENTERO: el aviso se fusiona con lo que hay.
+// Perder mail_enviado haría que el CRM mande un inicial duplicado.
+function _payloadConAviso(payload, aviso, fecha) {
+  const mp = (payload && typeof payload === "object" && !Array.isArray(payload)) ? payload : {};
+  return { ...mp, aviso_email: { email: aviso.email, motivo: aviso.motivo, fecha } };
+}
+
 async function auditarEmailsDelPool(token) {
   try {
     const cfg = await getConfig(token).catch(() => null);
@@ -12076,6 +12241,17 @@ async function auditarEmailsDelPool(token) {
     // muerto en el pool no manda nada, solo infla la cuenta de contactables.
     if (!(await _tocaCorrer(token, "auditoria_emails", 84 * 60))) return;   // ~2×/semana
 
+    // Sin la lista de rebotes, "ya rebotó" da siempre falso y el lote de 750 se da por auditado
+    // (2026-09-13). No se audita ni se mueve el cursor, y se devuelve el turno: _tocaCorrer ya lo
+    // había anotado, y sin esto el reintento esperaba 84 horas en vez de la vuelta siguiente.
+    if (!(await _rebotesListosParaJuzgar(token))) {
+      _CADENCIA_MEM.delete("auditoria_emails");
+      await setConfigValue(token, "cadencia_auditoria_emails", "").catch(() => {});
+      await saludPing(token, "auditoria_emails", { status: "fail", cadenciaMin: 84 * 60, detalle: "no pude leer la lista de rebotes — no audito ni muevo el cursor" });
+      log(`⚠️ auditoría de emails: no pude leer la lista de rebotes — reintento en la próxima vuelta sin perder el lugar`);
+      return;
+    }
+
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const cursor = cfg.auditoria_emails_cursor || "";
     const clausula = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
@@ -12091,7 +12267,7 @@ async function auditarEmailsDelPool(token) {
         // abrir el sitio, el formulario se la autocompletaba desde el pool y volvía a entrar.
         // `por_enviar` va también y es lo más urgente de los tres: ahí un email muerto no
         // ensucia una ficha, se manda.
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=in.(pending,validated,por_enviar)&emails=neq.%5B%5D${clausula}&select=id,domain,emails,email_sources,category,created_at&order=created_at.asc&limit=${AUDITORIA_EMAILS_LOTE}`,
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=in.(pending,validated,por_enviar)&emails=neq.%5B%5D${clausula}&select=id,domain,emails,email_sources,category,created_at,status,monday_payload&order=created_at.asc&limit=${AUDITORIA_EMAILS_LOTE}`,
         { headers: auth });
       if (r.ok) { const j = await r.json(); if (Array.isArray(j)) leads = j; }
     } catch {}
@@ -12109,35 +12285,22 @@ async function auditarEmailsDelPool(token) {
     }
 
     // ── PRIMERA PASADA: decidir sin escribir nada ─────────────────────────────
+    // La decisión por lead vive en _planAuditoriaLead (pura, con tests). Las filas `por_enviar` no
+    // entran en `planes`: no cuentan para el freno del 30% ni para real/esperado, y sólo avisan.
     const planes = [];
+    const avisos = [];
     let _tirados = 0, _reordenados = 0, _rebotados = 0, _otraMarca = 0, _basura = 0;
     for (const lead of leads) {
-      const originales = (Array.isArray(lead.emails) ? lead.emails : []).filter(e => typeof e === "string" && e);
-      if (!originales.length) continue;
-      const fuentes = lead.email_sources || {};
-      const evaluados = originales.map(e => {
-        const score  = rankEmail(e, lead.domain, lead.category || "");
-        const marca  = _brandMatches(e, lead.domain, _normSrc(fuentes[e.toLowerCase()]));
-        let motivo = "";
-        if (isBouncedSync(e))      motivo = "ya_reboto";
-        else if (score < 0)        motivo = "basura_o_departamento";
-        else if (!marca)           motivo = "otra_marca";
-        return { email: e, score, ok: !motivo, motivo };
-      });
-      const buenos = evaluados.filter(x => x.ok).sort((a, b) => b.score - a.score).map(x => x.email);
-      const malos  = evaluados.filter(x => !x.ok);
+      const { plan, malos, cambioOrden, aviso } = _planAuditoriaLead(lead);
+      if (aviso) avisos.push({ lead, ...aviso });
       malos.forEach(m => {
         _tirados++;
         if (m.motivo === "ya_reboto") _rebotados++;
         else if (m.motivo === "otra_marca") _otraMarca++;
         else _basura++;
       });
-      const cambioContenido = buenos.length !== originales.length;
-      const cambioOrden = !cambioContenido && buenos.some((e, i) => e !== originales[i]);
       if (cambioOrden) _reordenados++;
-      if (cambioContenido || cambioOrden) {
-        planes.push({ id: lead.id, domain: lead.domain, buenos, vaciaria: buenos.length === 0, malos });
-      }
+      if (plan) planes.push(plan);
     }
 
     // ── FRENO DE SEGURIDAD ────────────────────────────────────────────────────
@@ -12178,6 +12341,34 @@ async function auditarEmailsDelPool(token) {
       }
     }
 
+    // ── LA COLA "POR ENVIAR" SE AVISA, NO SE REESCRIBE (2026-09-13) ───────────────────────
+    // Se relee la fila justo antes de escribir: el MB pudo haberla guardado de nuevo, mandado o
+    // sacado de la cola entre la lectura del lote y este momento, y monday_payload se reemplaza
+    // entero. Si ya no está en por_enviar o la dirección cambió, no se toca.
+    let _avisadosPorEnviar = 0;
+    for (const av of avisos) {
+      const prev = av.lead.monday_payload?.aviso_email;
+      if (prev && String(prev.email || "").toLowerCase() === av.email.toLowerCase() && prev.motivo === av.motivo) continue;
+      try {
+        const _urlFila = `${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${av.lead.id}&status=eq.por_enviar`;
+        const rf = await fetch(`${_urlFila}&select=emails,monday_payload`, { headers: auth, signal: AbortSignal.timeout(10000) });
+        if (!rf.ok) continue;
+        const fila = (await rf.json().catch(() => []))?.[0];
+        const primero = Array.isArray(fila?.emails) ? String(fila.emails[0] || "") : "";
+        if (!fila || primero.toLowerCase() !== av.email.toLowerCase()) continue;
+        const rw = await fetch(_urlFila, {
+          method: "PATCH",
+          headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ monday_payload: _payloadConAviso(fila.monday_payload, av, _madridDateStr()) }),
+          signal: AbortSignal.timeout(10000),
+        }).catch(() => null);
+        if (rw && rw.ok) {
+          _avisadosPorEnviar++;
+          log(`  ⚠️ ${av.lead.domain}: en la cola por enviar, ${av.email} (${av.motivo}) — aviso al MB, no toco la dirección`);
+        }
+      } catch {}
+    }
+
     const ultimo = leads[leads.length - 1]?.created_at || cursor;
     await setConfigValue(token, "auditoria_emails_cursor", ultimo).catch(() => {});
 
@@ -12206,6 +12397,7 @@ async function auditarEmailsDelPool(token) {
         return (p ? p.buenos : (Array.isArray(l.emails) ? l.emails : [])).filter(e => typeof e === "string" && e);
       };
       const _soloGenerico = leads.filter(l => {
+        if (l.status === "por_enviar") return false;              // la dirección la eligió el MB (13/09)
         if (_planPorId.get(l.id)?.vaciaria) return false;          // los vaciados los toma polishPool
         const ms = _emailsHoy(l);
         if (!ms.length) return false;
@@ -12226,9 +12418,10 @@ async function auditarEmailsDelPool(token) {
             .filter(e => _brandMatches(e, lead.domain, "scrape"))
             .map(e => ({ e, s: rankEmail(e, lead.domain, lead.category || "") }))
             .filter(x => x.s > 0 && !_esEmailDeUltima(x.e, "scrape"))   // sólo si es MEJOR que el de última
+            .filter(x => _esMejoraDeContacto(x.e, x.s, base, fuentes, lead.domain, lead.category || ""))   // y mejor que lo que ya hay (13/09)
             .sort((a, b) => b.s - a.s);
           if (mejores.length) {
-            const _nuevos = [...mejores.map(x => x.e), ...base];
+            const _nuevos = _ordenarPorPuntaje([...mejores.map(x => x.e), ...base], lead.domain, lead.category || "");
             const _srcs = { ...fuentes };
             mejores.forEach(x => { _srcs[x.e.toLowerCase()] = { source: "scrape", url: `https://${lead.domain}` }; });
             const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
@@ -12248,11 +12441,11 @@ async function auditarEmailsDelPool(token) {
     await setConfigValue(token, "auditoria_emails_ultimo", JSON.stringify({
       fecha: _madridDateStr(), lote: leads.length, tirados: _tirados, rebotados: _rebotados,
       otraMarca: _otraMarca, basura: _basura, reordenados: _reordenados, sinEmail: _dejadosSinEmail,
-      buscadosMejor: _buscados, mejorados: _mejorados,
+      buscadosMejor: _buscados, mejorados: _mejorados, avisosPorEnviar: _avisadosPorEnviar,
     })).catch(() => {});
     await saludPing(token, "auditoria_emails", {
       status: "ok", cadenciaMin: 84 * 60,
-      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_mejorados}/${_buscados} mejorados desde genérico · ${_dejadosSinEmail} sin contacto`,
+      detalle: `${leads.length} leads · ${_tirados} emails malos fuera (${_rebotados} rebotados, ${_otraMarca} otra marca, ${_basura} basura) · ${_reordenados} reordenados · ${_mejorados}/${_buscados} mejorados desde genérico · ${_dejadosSinEmail} sin contacto${avisos.length ? ` · ${_avisadosPorEnviar}/${avisos.length} avisos en la cola por enviar` : ""}`,
       real: _aplicados, esperado: planes.length,
     });
     log(`📧 auditoría de emails: ${leads.length} leads revisados · ${_tirados} direcciones malas eliminadas · ${_dejadosSinEmail} leads quedaron sin email (polishPool les buscará otro)`);
@@ -12289,10 +12482,78 @@ function _motivoSinEmail(diag, stats) {
   return "la_web_no_publica_ningun_email";
 }
 
+// ── "NO PUDE VERIFICAR", UNA SOLA DEFINICIÓN (2026-09-13) ─────────────────────────────────────
+// ads.txt ilegible (403/429/5xx, WAF, timeout) Y la home tampoco se pudo leer o es un muro: no hay
+// un solo dato para juzgar. La regla del dueño es "ilegible = reintento, nunca descarte", y es la
+// misma condición que scoreProspectable llama `sinDatos` → retry. El pulido la ignoraba y purgaba
+// el lead de Prospects con "sin_evidencia_monetizacion (ads.txt unknown)", un rechazo que ningún
+// job vuelve a mirar. Un test fija que las dos puertas dicen lo mismo.
+function _sinDatosParaJuzgar(adsTxt, pageContent) {
+  return adsTxt?.state === "unknown" && (!pageContent || pageContent.bloqueado === true);
+}
+
+// ── LA MARCA DE RESCATE, EN UN SOLO LUGAR (2026-09-13) ───────────────────────────────────────
+// email_found_at = "cuándo se le encontró el PRIMER email a un lead que no tenía ninguno". Cada
+// camino la escribía a mano, con su propia condición: Apollo la ponía sobre leads que ya tenían
+// info@, y el pulido la ponía aunque la validación hubiera tirado el email encontrado (el lead
+// seguía vacío y contaba como rescatado). Nunca pone null: borrarla es cosa de la auditoría.
+function _marcarRescate(patch, emailsPrevios, ahoraISO = new Date().toISOString()) {
+  const antes = (Array.isArray(emailsPrevios) ? emailsPrevios : []).filter(Boolean);
+  const despues = Array.isArray(patch?.emails) ? patch.emails.filter(Boolean) : [];
+  if (antes.length === 0 && despues.length > 0) patch.email_found_at = ahoraISO;
+  return patch;
+}
+
+// ── LO QUE SE GUARDA CUANDO EL PULIDO ENCUENTRA ALGO (2026-09-13) ───────────────────────────
+// La ficha se armaba con `foundEmail` y no con lo que dejaba validateEmailsBatch. Si la validación
+// lo tiraba (rebotado, basura, dominio sin MX), igual se escribía contact_name, email_intentos=0,
+// motivo=null y email_found_at, y enriched sumaba: el parte contaba un rescate que no existía y el
+// lead, con intentos en 0, se saltaba la espera y volvía a gastar búsqueda enseguida.
+// Si el principal cae y sobrevive la reserva de rol_mx, se usa la reserva.
+// resultado: "rescatado" | "enriquecido" | "descartado" | "telefono" | "nada".
+function _armarPatchDeRescate({ lead, curEmails = [], foundEmail, foundSource, foundName = "", extraRol = [], validados = [], foundPhone = "", ahoraISO = new Date().toISOString() }) {
+  const patch = {};
+  const low = (e) => String(e || "").toLowerCase().trim();
+  if (foundPhone && !String(lead?.contact_phone || "").trim()) patch.contact_phone = foundPhone;
+  if (!foundEmail) return { patch, resultado: patch.contact_phone ? "telefono" : "nada", elegido: "" };
+  const vivos = [...new Set((Array.isArray(validados) ? validados : []).map(low).filter(Boolean))];
+  const vivosSet = new Set(vivos);
+  const candidatos = [low(foundEmail), ...(Array.isArray(extraRol) ? extraRol : []).map(low)];
+  const elegido = candidatos.find(e => vivosSet.has(e)) || "";
+  const previos = (Array.isArray(curEmails) ? curEmails : []).filter(Boolean);
+  patch.emails = vivos;                     // la validación también limpia lo que ya tenía
+  if (elegido) {
+    const fuentes = { ...(lead?.email_sources || {}) };
+    for (const e of candidatos) if (vivosSet.has(e)) fuentes[e] = foundSource;
+    patch.email_sources = fuentes;
+    patch.contact_name = foundName || lead?.contact_name || "";
+    patch.email_intentos = 0;
+    patch.email_ultimo_motivo = null;
+    _marcarRescate(patch, previos, ahoraISO);
+    return { patch, resultado: previos.length ? "enriquecido" : "rescatado", elegido };
+  }
+  // Nada de lo encontrado sobrevivió: ni fuente, ni nombre, ni fecha de rescate. Si además el lead
+  // sigue sin ningún email, cuenta como un intento fallido, con su espera y su motivo.
+  if (vivos.length === 0 && previos.length === 0) {
+    patch.email_intentos = (Number(lead?.email_intentos) || 0) + 1;
+    patch.email_ultimo_intento = ahoraISO;
+    patch.email_ultimo_motivo = `validacion_descarto:${foundSource || "?"}`;
+  }
+  return { patch, resultado: "descartado", elegido: "" };
+}
+
 async function polishPool(token) {
   const cfg = await getConfig(token);
   if (String(cfg.polish_pool || "") !== "true") return;
   if (Date.now() - _lastPolishRunAt < POLISH_COOLDOWN_MS) return;
+  // Sin la lista de rebotes, rankEmail no ve el dominio quemado ni la dirección rebotada y un rol_mx
+  // de un dominio quemado se guarda (validateEmailsBatch no mira el dominio). No se pule a ciegas:
+  // se reintenta en la vuelta siguiente (2026-09-13).
+  if (!(await _rebotesListosParaJuzgar(token))) {
+    await saludPing(token, "polish_pool", { status: "fail", cadenciaMin: 30, detalle: "no pude leer la lista de rebotes — no pulo sin ella" }).catch(() => {});
+    log(`⚠️ polish: no pude leer la lista de rebotes — no escribo nada, reintento la próxima vuelta`);
+    return;
+  }
   _lastPolishRunAt = Date.now();
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   // Apollo capado, opcional (off si polish_use_apollo='false'). NUNCA RapidAPI.
@@ -12399,7 +12660,17 @@ async function polishPool(token) {
     log(`✨ polish: pool completo repasado → vuelvo a los que no tienen email`);
     return;
   }
-  let blocked = 0, enriched = 0, sinEmail = 0;
+  let blocked = 0, enriched = 0, sinEmail = 0, sinDatosPolish = 0;
+  // ── APOLLO NO SE VUELVE A PAGAR DONDE YA NO DEVOLVIÓ NADA (2026-09-13) ──────────────────────
+  // El pulido pagaba el desbloqueo forzado en cada vuelta de la espera (3, 10, 30 días) sobre los
+  // mismos leads sin email, sin rastro de que Apollo ya no había traído nada. Los dominios que la
+  // quema del ciclo anotó sin resultado en los últimos 45 días (la misma vigencia que la caché de
+  // Apollo) se consultan sólo gratis. Si la lectura falla se sigue como antes: pagar.
+  let _apolloSinEmail = new Set();
+  if (apolloAvailable) {
+    const _s = await _dominiosConApolloSinEmail(token, leads.map(l => l.domain));
+    if (_s) _apolloSinEmail = _s;
+  }
   let _committedTs = cursor;
   const _polishInicio = Date.now();
   for (let i = 0; i < leads.length; i += POLISH_CONC) {
@@ -12429,7 +12700,11 @@ async function polishPool(token) {
         // El filtro de calidad corre para todos; el atajo real está más abajo, después de
         // clasificar (`if (hasGood) { _savePhone(); return; }`), que es donde corresponde.
         // 2) clasificar por HTML — UN fetch (detector estructural con veto publisher-ads)
-        const pc = await fetchPageContent(domain).catch(() => null);
+        const _pcCrudo = await fetchPageContent(domain).catch(() => null);
+        // EAI_AGAIN es una falla TEMPORAL de DNS (el resolver no contestó), no "el dominio no existe"
+        // como ENOTFOUND. fetchPageContent la devuelve como muerta; acá cuenta como "no pude leer la
+        // home" y el lead no se purga por un tropiezo de Railway (2026-09-13).
+        const pc = (_pcCrudo?.dead && /EAI_AGAIN/i.test(String(_pcCrudo.deadReason || ""))) ? null : _pcCrudo;
         if (pc?.dead) { await _softRejectLead(auth, lead.id, `unreachable:${pc.deadReason || "dead"}`); blocked++; return; }  // Maxi 2026-07-16: sitio muerto/SSL/cert → fuera
         if (pc?.nonPublisherType) { await _softRejectLead(auth, lead.id, `nonpub_${pc.nonPublisherType}`); blocked++; return; }
         // ── LA PÁGINA DE BLOQUEO NO ES LA PÁGINA (Maxi 2026-08-10) ───────────────────────
@@ -12459,12 +12734,19 @@ async function polishPool(token) {
         // ahora también si es legible pero no tiene NADA (ni ads display, ni ad-tech, ni ads.txt).
         // Es el caso de santanderx.com, enciclopedia.banrepcultural.org y compañía: páginas
         // perfectamente vivas que simplemente no venden inventario.
-        // El motivo es reversible a propósito: recheckAdsTxtUnknowns lo reintenta a diario y, si
-        // el ads.txt aparece, el dominio vuelve solo a la cola.
+        // ⚠️ "Reversible" era falso para este camino (2026-09-13): el pulido no escribe en la auditoría
+        // de ads.txt, así que recheckAdsTxtUnknowns nunca se enteraba, y ningún job vuelve a leer un
+        // rechazo "purge:". Por eso el caso "no pude leer NADA" (ads.txt ilegible + home ilegible o
+        // muro) ya no se rechaza: el lead pasó la puerta al entrar y queda en Prospects hasta la
+        // próxima pasada, igual que en la entrada (scoreProspectable → retry). Lo que sí se sigue
+        // rechazando es "ads.txt ilegible + home legible sin ninguna señal de publicidad".
         const _sinSenalDeAds = !_pcUtil || (!_pcUtil.hasDisplayAds && !_pcUtil.hasProgrammatic
                                             && !(_pcUtil.adNetworks || []).length);
-        if (_ads.state !== "yes" && _sinSenalDeAds) {
-          await _softRejectLead(auth, lead.id, `sin_evidencia_monetizacion (ads.txt ${_ads.state}${_esMuroDeBloqueo ? ", muro de bloqueo" : ""})`);
+        if (_sinDatosParaJuzgar(_ads, _esMuroDeBloqueo ? { bloqueado: true } : pc)) {
+          sinDatosPolish++;
+          log(`  ⏳ polish ${domain}: ads.txt ${_ads.why || "ilegible"}${_esMuroDeBloqueo ? " + muro" : " + home ilegible"} → queda en Prospects, se reintenta en la próxima pasada`);
+        } else if (_ads.state !== "yes" && _sinSenalDeAds) {
+          await _softRejectLead(auth, lead.id, `sin_evidencia_monetizacion (ads.txt ${_ads.state})`);
           blocked++; return;
         }
         // Maxi 2026-07-16: teléfono/WhatsApp del home (ya fetcheamos pc → gratis). "wa:" marca WhatsApp.
@@ -12537,7 +12819,8 @@ async function polishPool(token) {
           && curEmails.every(e => _isGenericLocalPart(e))
           && (!foundEmail || _isGenericLocalPart(foundEmail));
         if ((!foundEmail || _soloGenericos) && apolloAvailable) {
-          const ap = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true }).catch(() => null);
+          const _pagarApollo = !_apolloSinEmail.has(String(domain).toLowerCase().replace(/^www\./, ""));
+          const ap = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: lead.traffic || 0, allowUnlock: _pagarApollo, forceUnlock: _pagarApollo }).catch(() => null);
           if (ap?.email) {
             foundEmail = ap.email; foundSource = "apollo"; foundName = ap.contact_name || "";
             if (_soloGenericos) log(`  ⬆️ ${domain}: Apollo mejoró un genérico → ${ap.email}${ap.contact_name ? ` (${ap.contact_name})` : ""}`);
@@ -12661,31 +12944,24 @@ async function polishPool(token) {
         }
         // Guardar email (si hay) y/o teléfono (si es nuevo) en UN solo PATCH.
         if (foundEmail || (foundPhone && !_curPhone)) {
-          const _patch = {};
-          if (foundEmail) {
-            const merged = [foundEmail, ..._extraRol, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
-            _patch.emails = await validateEmailsBatch(merged);
-            const newSources = { ...(lead.email_sources || {}) };
-            newSources[foundEmail.toLowerCase()] = foundSource;
-            for (const _e of _extraRol) newSources[_e.toLowerCase()] = foundSource;
-            _patch.email_sources = newSources;
-            _patch.contact_name = foundName || lead.contact_name || "";
+          // RESCATE: la fecha se marca SOLO si el lead no tenía ningún email y el encontrado quedó
+          // en la lista validada. Es la métrica que pidió el user —"a cuántas URLs que entraron sin
+          // contacto se les encontró uno"— y mide el trabajo del BARRIDO, no el del descubrimiento.
+          // La ficha sale de lo que sobrevivió a la validación, no de lo que se encontró (13/09).
+          const merged = foundEmail ? [foundEmail, ..._extraRol, ...curEmails.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())] : [];
+          const validados = foundEmail ? await validateEmailsBatch(merged) : [];
+          const { patch: _patch, resultado } = _armarPatchDeRescate({ lead, curEmails, foundEmail, foundSource, foundName, extraRol: _extraRol, validados, foundPhone });
+          if (Object.keys(_patch).length) {
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify(_patch),
+            });
           }
-          if (foundPhone && !_curPhone) _patch.contact_phone = foundPhone;
-          if (foundEmail) {
-            _patch.email_intentos = 0;
-            _patch.email_ultimo_motivo = null;
-            // RESCATE: la fecha se marca SOLO si el lead no tenía ningún email. Es la
-            // métrica que pidió el user —"a cuántas URLs que entraron sin contacto se
-            // les encontró uno"— y mide el trabajo del BARRIDO, no el del descubrimiento.
-            // Si el lead ya venía con email, sumar uno más no es un rescate.
-            if (!curEmails.length) _patch.email_found_at = new Date().toISOString();
+          if (resultado === "rescatado" || resultado === "enriquecido") enriched++;
+          else if (resultado === "descartado") {
+            if (_patch.email_ultimo_motivo) sinEmail++;
+            log(`  ✂️ polish ${domain}: ${foundEmail} (${foundSource}) no pasó la validación (rebotado, basura o dominio sin MX) → no cuenta como encontrado`);
           }
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH", headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify(_patch),
-          });
-          if (foundEmail) enriched++;
         } else if (!curEmails.length) {
           // Buscamos y no encontramos. ANTES esto no dejaba rastro: el cursor pasaba y
           // el lead quedaba indistinguible de uno ya resuelto, para siempre. Es la causa
@@ -12741,7 +13017,7 @@ async function polishPool(token) {
       break;
     }
   }
-  log(`✨ polish${soloSinEmail ? " (solo sin email)" : ""}: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} sin_email=${sinEmail} cursor→${_committedTs}`);
+  log(`✨ polish${soloSinEmail ? " (solo sin email)" : ""}: batch=${leads.length} bloqueados=${blocked} enriquecidos=${enriched} sin_email=${sinEmail} sin_datos=${sinDatosPolish} cursor→${_committedTs}`);
 
   // Maxi 2026-08-18: acumulador diario de "URLs que NO tenían email y ahora sí".
   // Es una de las 6 métricas base que el user quiere ver todos los días, y la única que no
@@ -12760,7 +13036,7 @@ async function polishPool(token) {
   // Si cae por debajo, el vigilante avisa en vez de que lo descubramos dentro de un mes.
   await saludPing(token, "polish_pool", {
     status: "ok", cadenciaMin: 30,
-    detalle: `batch ${leads.length}: ${enriched} con email nuevo, ${blocked} descartados, ${sinEmail} sin suerte`,
+    detalle: `batch ${leads.length}: ${enriched} con email nuevo, ${blocked} descartados, ${sinEmail} sin suerte${sinDatosPolish ? `, ${sinDatosPolish} sin poder leer el sitio (quedan)` : ""}`,
     real: enriched, esperado: Math.max(1, Math.round((enriched + sinEmail) / 4)),
   });
 }
@@ -28188,6 +28464,15 @@ async function main() {
       const _LIMITE_MANTENIMIENTO = Date.now() + _techoMant * 60 * 1000;
 
       const _hayTiempo = () => Date.now() < _LIMITE_MANTENIMIENTO;
+      // ── LA LISTA DE REBOTES SE LEE ANTES DE JUZGAR EMAILS (2026-09-13) ─────────────────
+      // El pulido, la auditoría del pool y la quema de Apollo deciden con isBouncedSync y
+      // rankEmail, que leen la lista EN MEMORIA. En un proceso nuevo (Railway reinicia cada ~7 min)
+      // esa lista arranca vacía y sólo la llenaba el agente, que corre DESPUÉS de esta cadena y
+      // sólo en sus slots. La auditoría juzgaba entonces con la lista vacía: un ventas@ ya
+      // rebotado quedaba en el pool, el cursor avanzaba 750 leads y el informe decía "0 rebotados".
+      // Una lectura acá cubre las dos llamadas de más abajo (caché de 5 min). Si falla, cada job
+      // lo vuelve a intentar y se niega a escribir sin la lista (_rebotesListosParaJuzgar).
+      await loadBouncedEmails(token).catch(() => {});
       // ── EL PULIDO VA PRIMERO CUANDO HAY COLA (Maxi 2026-09-02) ────────────────────────
       // ⚠️ Va DESPUÉS de `_hayTiempo` y del techo: los dos se declaran con const y usarlos
       // antes tira "Cannot access before initialization". Me pasó dos veces seguidas hoy

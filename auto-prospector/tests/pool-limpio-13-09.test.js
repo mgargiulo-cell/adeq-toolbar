@@ -147,7 +147,10 @@ test("el tope diario se siembra desde la config y no vuelve a cero con cada rein
 // ── 7. Los números del informe ──────────────────────────────────────────────────────────
 test("Apollo sólo marca rescate si el lead no tenía ningún email", () => {
   const fn = cuerpoDe("apolloQuemarCiclo");
-  ok(/if \(!cur\.length\) patch\.email_found_at = new Date\(\)\.toISOString\(\);/.test(fn), "un info@ más una persona de Apollo es una mejora, no un rescate");
+  // Revisión del 13/09: la condición se mudó a _marcarRescate (una sola regla para el pulido y Apollo,
+  // que además exige que el email haya sobrevivido a la validación). Lo que este test protege no
+  // cambia: se marca con los emails que el lead tenía ANTES, y nunca sin condición.
+  ok(/_marcarRescate\(patch, cur\);/.test(fn), "un info@ más una persona de Apollo es una mejora, no un rescate");
   ok(!/^\s*patch\.email_found_at = new Date/m.test(fn), "no puede quedar una escritura sin condición");
 });
 
