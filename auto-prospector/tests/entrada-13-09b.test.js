@@ -47,7 +47,7 @@ globalThis.__fetchFalso = async () => resp([]);
 const W = await cargarWorker([
   "_conMarcaFreeze", "_vaABlocklistInoperativo", "_estadoTrasGuardar", "_guardadoFallidoPorRed",
   "_estadoTrasFreezeFallido", "_estadoTrasTimeout", "_marcarCsvSiSigueProcesando", "_backoffCongelado",
-  "processCsvItem",
+  "processCsvItem", "_agruparRechazosCola",
 ], { fetchFalso: true });
 
 // Un ads.txt de 25 líneas, una home con nota y título, y el CRM que dice "no está".
@@ -159,9 +159,13 @@ test("guardar en Prospects: los veredictos se descartan, la falla pasajera vuelv
     "el retry_15 del tráfico no es el contador de la inserción");
   const conTexto = f('http_503:{"hint":"retry_5 attempt_2 freeze_3"}').error_message;
   strictEqual(conTexto.match(/retry_(\d+)|attempt_(\d+)|\bfreeze_\d+/), null, "el texto de la base no se copia: confundiría a los otros contadores");
-  // El parte cuenta como "vuelven mañana" los next_day que matchean esto (parteDelDia).
-  match(worker, /if \(\/reintentar\|no_verificable\|sin_cuota\/i\.test\(m\)\) _reintentables\+\+/);
-  match(f("http_502:x").error_message, /reintentar|no_verificable|sin_cuota/i);
+  // El parte y el boletín cuentan como "vuelven mañana" todo next_day (_agruparRechazosCola, informe
+  // del 13/09; antes era un regex sobre el texto). La falla pasajera al guardar tiene que caer ahí y no
+  // entre los descartes: se prueba con la regla de verdad, no con el texto del código.
+  const pasajera = f("http_502:x");
+  const agrupado = W._agruparRechazosCola([{ status: pasajera.status, error_message: pasajera.error_message, domain: "diario.pe" }]);
+  deepStrictEqual([agrupado.reintentables, agrupado.totalDescartes, agrupado.errores], [1, 0, 0]);
+  match(pasajera.error_message, /reintentar|no_verificable|sin_cuota/i);
 });
 
 test("un corte de red al guardar vuelve mañana como un 503; un bug sigue yendo a error", () => {
