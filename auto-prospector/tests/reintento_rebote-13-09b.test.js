@@ -346,7 +346,8 @@ test("C40: el rescate suma cada dirección con su vía y la ficha final conserva
 
 test("C40: el rescate anota la vía real, no escribe a id=null, y la ficha final se arma sobre la fila releída", () => {
   const fn = cuerpoDe("queueBounceRetry");
-  ok(/scrapeEmailsForDomain\(domain, \{ informerOut: _informer, socialOut: _redes \}\)/.test(fn), "sin separar informer y redes, un WHOIS pasa a 'persona'");
+  // `(?:, [^}]*)?`: desde el 13/09 la llamada suma googleOut (tests/entrada_sueltos-13-09d.test.js); la regla sigue siendo separar informer y redes.
+  ok(/scrapeEmailsForDomain\(domain, \{ informerOut: _informer, socialOut: _redes(?:, [^}]*)? \}\)/.test(fn), "sin separar informer y redes, un WHOIS pasa a 'persona'");
   ok(/_anotar\(apolloRes\.email, "apollo"\)/.test(fn) && /_anotar\(e, "google_contact"\)/.test(fn));
   ok(!/= "rescue"/.test(fn), "ninguna dirección rescatada se etiqueta 'rescue'");
   ok(/if \(lead\.id\) \{\s*const _patchRescate/.test(fn), "el lead armado desde el CRM no tiene fila");

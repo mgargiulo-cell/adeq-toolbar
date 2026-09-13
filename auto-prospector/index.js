@@ -6513,8 +6513,8 @@ async function _scrapeTrafficFallback(domain) {
 // Esta función arma la fila con el MISMO estimador que processCsvItem usa para el piso: páginas
 // vistas directas si vinieron; si no, visitas × páginas por visita reales; si tampoco, visitas ×
 // PPV_ESTIMADO, marcado como estimado para que la extensión lo pinte "~X (est.)". Nunca lleva noData.
-// ⚠️ PPV_ESTIMADO tiene que valer lo mismo que PPV_FALLBACK de processCsvItem y el ppvSafe del
-// autopilot (tests/trafico_paridad-13-09b.test.js los compara): si uno cambia solo, vuelve la falla.
+// ⚠️ PPV_FALLBACK de processCsvItem y el ppvSafe del autopilot USAN esta constante desde el 13/09: antes
+// cada uno tenía su 2.0 escrito a mano (tests/entrada_sueltos-13-09d.test.js impide otro literal).
 const PPV_ESTIMADO = 2.0;
 function _filaCacheTrafico(visits, { pageViews = null, pagesPerVisit = null, topCountry = null, category = "", source = "" } = {}) {
   const v         = Number(visits) || 0;
@@ -7718,10 +7718,18 @@ function extractEmailsFromHtml(html) {
   // dirección pasa por el filtro de bloques ocultos, _stripScrapePrefix y detectarTrampaEmail
   // como cualquier otra. "usuario @dominio" con espacio queda afuera a propósito: la extensión
   // tampoco lo toma y daría falsos ("Seguinos en Instagram @medio.com.ar").
+  // ── TODOS LOS CAMINOS LEEN LO VISIBLE Y PASAN POR EL FILTRO DE TRAMPAS (2026-09-13) ──────────
+  // Sólo el paso 1 leía el HTML sin bloques ocultos y con detectarTrampaEmail. Los pasos 2 a 5
+  // (Cloudflare, JSON-LD, data-* y el mailto) leían el HTML CRUDO sin ese filtro: un
+  // `<div style="display:none"><a href="mailto:ventas@medio.com">` o un `mailto:spamtrap@` a la vista
+  // entraban por el paso 5 aunque el paso 1 los hubiera descartado, y el crawl los guardaba. Ahora
+  // todos leen `visible` y el filtro final aplica las dos reglas a todo lo recolectado.
+  // La extensión no comparte este código: lee el DOM con su propio extractor (modules/scraper.js).
+  const visible = _quitarBloquesOcultos(html);
   const clean = _deobfuscateEmails(
     _deobfAtWords(
       _decodeEntitiesAll(
-        _deobfJsConcat(_quitarMediaDelHtml(_quitarBloquesOcultos(html)))
+        _deobfJsConcat(_quitarMediaDelHtml(visible))
       ).replace(/mailto:[^"'\s<>]+/gi, m => m.replace(/%40/gi, "@").replace(/%2e/gi, "."))
     )
   );
@@ -7732,28 +7740,29 @@ function extractEmailsFromHtml(html) {
   // 2) Cloudflare data-cfemail decoder — gap común en sitios con CF Pro
   // Cloudflare emite el hex TAMBIÉN en el fragmento del href, con otra clave XOR, y hay
   // plantillas donde SOLO aparece esa forma (auditoría 2026-08-04).
-  for (const m of html.matchAll(/email-protection#([a-f0-9]{6,})/gi)) {
+  for (const m of visible.matchAll(/email-protection#([a-f0-9]{6,})/gi)) {
     const d = _decodeCfEmail(m[1]);
     if (d && d.includes("@") && !_esPseudoEmailDeAsset(d)) collected.add(d.toLowerCase());
   }
-  for (const m of html.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi)) {
+  for (const m of visible.matchAll(/data-cfemail=["']([a-f0-9]+)["']/gi)) {
     const decoded = _decodeCfEmail(m[1]);
     if (decoded && decoded.includes("@")) collected.add(decoded.toLowerCase());
   }
   // 3) JSON-LD schema.org "email": "x@y"
-  for (const m of html.matchAll(/"email"\s*:\s*"([^"]+@[^"]+)"/gi)) collected.add(m[1].toLowerCase());
+  for (const m of visible.matchAll(/"email"\s*:\s*"([^"]+@[^"]+)"/gi)) collected.add(m[1].toLowerCase());
   // 4) Atributos data-* donde los sitios esconden el mail (paridad popup: + courriel,
   //    email-address, mailtolink). Si el valor parece hex CF, se intenta decodificar.
-  for (const m of html.matchAll(/data-(?:email|mail|contact|correo|courriel|emailaddress|email-address|mailtolink)\s*=\s*["']([^"']+)["']/gi)) {
+  for (const m of visible.matchAll(/data-(?:email|mail|contact|correo|courriel|emailaddress|email-address|mailtolink)\s*=\s*["']([^"']+)["']/gi)) {
     const v = m[1];
     if (v.includes("@")) _deobfuscateEmails(v).match(EMAIL_REGEX)?.forEach(e => collected.add(e.toLowerCase()));
     else if (/^[a-f0-9]{6,}$/i.test(v)) { const d = _decodeCfEmail(v); if (d && d.includes("@")) collected.add(d.toLowerCase()); }
   }
   // 5) mailto: hrefs (a veces el único lugar con el mail real)
-  for (const m of html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi)) collected.add(m[1].split("?")[0].toLowerCase());
+  for (const m of visible.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi)) collected.add(m[1].split("?")[0].toLowerCase());
   return [...collected].filter(e => {
     const lower = e.toLowerCase();
     if (IGNORE_EMAIL.some(p => lower.includes(p))) return false;
+    if (_esPseudoEmailDeAsset(lower) || detectarTrampaEmail(lower)) return false;
     const parts = e.split("@");
     if (parts.length !== 2) return false;
     const tld = parts[1].split(".").pop();
@@ -7804,16 +7813,15 @@ async function scrapeInformerOnly(domain) {
       const html = await r.text();
       const found = new Set();
       extractEmailsFromHtml(html).forEach(e => found.add(e));
-      // Mailto links explícitos
-      const mailtoMatches = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
-      for (const m of mailtoMatches) {
-        const clean = m[1].toLowerCase().split("?")[0];
-        if (clean.includes("@")) found.add(clean);
-      }
+      // (2026-09-13) Acá había otro barrido de mailto sobre el HTML crudo: volvía a sumar el escondido
+      // en un bloque invisible y el de cara de trampa que el extractor acababa de descartar. El
+      // extractor ya lee los mailto con los mismos filtros que el texto. Medido en website.informer.com
+      // (baladag4.com.br): el dato del WHOIS está a la vista, no en un bloque oculto.
       // Maxi 2026-06-18: Informer a veces presenta el email con espacios o
       // entities raras. Hacemos un segundo pass después de deobfuscar más
-      // patrones (espacios, [at], (at), &amp;, &#x40;).
-      const deobfuscated = html
+      // patrones (espacios, [at], (at), &amp;, &#x40;). Desde el 13/09 sobre el HTML sin bloques
+      // ocultos y con el filtro de trampas, igual que el primero.
+      const deobfuscated = _quitarBloquesOcultos(html)
         .replace(/&amp;#?64;/gi, "@").replace(/&#?64;|&#x40;/gi, "@")
         .replace(/&#?46;|&#x2e;/gi, ".").replace(/&commat;/gi, "@").replace(/&period;/gi, ".")
         .replace(/\s*\[\s*at\s*\]\s*/gi, "@").replace(/\s*\(\s*at\s*\)\s*/gi, "@")
@@ -7825,6 +7833,7 @@ async function scrapeInformerOnly(domain) {
         const low = e.toLowerCase();
         // Filtrar basura típica de WHOIS (proxies y registrar emails)
         if (/abuse|whoisguard|domainsbyproxy|privacy|protection|registrar|noreply/.test(low)) return;
+        if (_esPseudoEmailDeAsset(low) || detectarTrampaEmail(low)) return;
         found.add(low);
       });
       found.forEach(e => {
@@ -7953,6 +7962,10 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // opts.urlByEmail: Map opcional — recibe email→URL de origen para tracking UI
   // (user 2026-06-17: poder mostrar de qué URL salió cada scraped email).
   const informerOut = opts.informerOut || null;
+  // opts.googleOut (2026-09-13): Set que recibe los emails que aparecieron gracias a la búsqueda en
+  // Google (Serper) de este scrape: los del snippet y los de las páginas de contacto que Google indexó.
+  // Sin esto el que llama los guardaba como "scrape" y el parte subestimaba google_contact.
+  const googleOut = opts.googleOut || null;
   // ── LA REGLA DE PROCEDENCIA ESTABA MUERTA EN EL PULIDO (Maxi 2026-09-01) ────────────
   // `_cleanScrapedEmails` tiene desde el 04/08 la regla más importante para los grupos
   // editores: un email impreso en la página de contacto DEL PROPIO SITIO es su contacto,
@@ -8086,14 +8099,11 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       }
       const html = await r.text();
       const found = new Set();
-      // 1) regex emails en HTML general
+      // 1) regex emails en HTML general, mailto: incluidos (paso 5 del extractor).
+      // (2026-09-13) Acá había un segundo barrido de mailto sobre el HTML CRUDO: volvía a sumar el mailto
+      // escondido en un bloque invisible o con cara de trampa que el extractor acababa de descartar, y
+      // eso se guardaba. El extractor ya lee los mailto con los mismos filtros que el texto.
       extractEmailsFromHtml(html).forEach(e => found.add(e));
-      // 2) explicit mailto: hrefs (raramente missed pero a veces hay solo ahí)
-      const mailtoMatches = html.matchAll(/mailto:([^"'\s<>?]+@[^"'\s<>?]+)/gi);
-      for (const m of mailtoMatches) {
-        const clean = m[1].toLowerCase().split("?")[0];
-        if (clean.includes("@")) found.add(clean);
-      }
       found.forEach(e => {
         const lower = e.toLowerCase();
         emails.add(e);
@@ -8421,6 +8431,8 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // que polishPool y el agente volvían a pagar el mismo dominio minutos después.
   // `opts.sinSerper`: la mejora de contacto de la auditoría del pool promete ser gratis (13/09).
   if (_hayTiempo() && !_hasReal && SERPER_API_KEY && !opts.sinSerper) {
+    // Lo que ya había antes de preguntarle a Google no es de Google (googleOut, 2026-09-13).
+    const _antesDeGoogle = new Set([...emails].map(e => String(e).toLowerCase()));
     try {
       const _cfgSerper = await getConfig(_workerToken).catch(() => null);
       const g = _serperContactoPermitido(_cfgSerper, _workerToken, cleanDomain) ? await _serperContactSearch(domain).catch(() => null) : null;
@@ -8445,6 +8457,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
       }
       _hasReal = _tenemosContactoBueno(emails, cleanDomain);
     } catch {}
+    if (googleOut) for (const e of emails) { const l = String(e).toLowerCase(); if (!_antesDeGoogle.has(l)) googleOut.add(l); }
   }
 
   // ── ads.txt COMO FUENTE DE CONTACTO (auditoría 2026-08-04) ─────────────────────────────
@@ -8649,7 +8662,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
 // Se cuentan y se avisan UNA vez por mensaje por arranque. Existe porque entre el 02/09 y el
 // 04/09 un ReferenceError se disfrazó de "no pude bajar la página" en todos los sitios.
 const _fetchPageErrInternos = { n: 0, avisados: new Set() };
-async function fetchPageContent(domain, _yaReintentado = false) {
+async function fetchPageContent(domain, _yaReintentado = false, _reintentoDns = false) {
   try {
     const res = await fetch(`https://${domain}`, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" },
@@ -9015,7 +9028,23 @@ async function fetchPageContent(domain, _yaReintentado = false) {
     // DNS que no resuelve es un hecho sobre el dominio. Un handshake TLS que falla es un hecho
     // sobre nuestro cliente. Solo el primero mata al lead.
     if (/ENOTFOUND|EAI_AGAIN|ERR_NAME_NOT_RESOLVED|getaddrinfo/i.test(code)) {
-      return { dead: true, deadReason: code.slice(0, 60) };
+      // ── UN DNS QUE NO CONTESTÓ NO ES UN DOMINIO QUE NO EXISTE (2026-09-13) ─────────────────
+      // EAI_AGAIN es "el resolver no respondió a tiempo" (un tropiezo de Railway o del DNS del sitio),
+      // no "el nombre no existe" como ENOTFOUND. Acá los dos eran dead:true: la entrada lo tiraba como
+      // dead_domain_dns_fail y el barrido lo borraba como unreachable, y la regla del dueño es "DNS
+      // temporal = reintento, nunca descarte". Se reintenta UNA vez tras un segundo; si sigue sin
+      // contestar vuelve null ("no pude leer"), que las puertas ya tratan como reintento.
+      // Además el código se buscaba en `code.slice(0, 60)`: cuando node-fetch lo trae sólo en el mensaje
+      // ("request to https://… failed, reason: getaddrinfo EAI_AGAIN …"), el corte se comía el código y
+      // el pulido, que mira /EAI_AGAIN/ en deadReason, purgaba igual. Ahora sale de todo el error.
+      const _todo = [e?.cause?.code, e?.code, e?.message, e?.cause?.message].filter(Boolean).join(" ");
+      if (/EAI_AGAIN/i.test(_todo)) {
+        if (_reintentoDns) return null;
+        await sleep(1000);
+        return fetchPageContent(domain, _yaReintentado, true).catch(() => null);
+      }
+      const _codigoDns = (_todo.match(/ENOTFOUND|ERR_NAME_NOT_RESOLVED|EAI_[A-Z]+/i) || [])[0];
+      return { dead: true, deadReason: (_codigoDns || code).slice(0, 60) };
     }
     // TLS/conexión: antes de rendirse, probar con y sin www. Es un dominio distinto para el
     // handshake y suele tener otro certificado — con sport.es alcanza para recuperarlo entero.
@@ -12454,6 +12483,23 @@ function _ordenarPorPuntaje(emails, dominio, categoria = "") {
     .map(x => x.e);
 }
 
+// ── EL WEBMAIL DEL REGISTRANTE NO ES CONTACTO, TAMBIÉN AL ENTRAR (2026-09-13) ───────────────────
+// Regla del 14/07: un gmail/hotmail que vino de informer (el WHOIS) es el dueño que registró el
+// dominio, no el contacto comercial, y suele rebotar. Sólo lo filtraba el agente al elegir: la cola y el
+// autopilot lo guardaban (rudnypc@gmail.com puntúa 65 y pasa la regla de marca), el pool lo contaba como
+// contactable y la auditoría no lo sacaba nunca. La regla es esRegistranteWebmail de lib/email.js, la
+// misma de la extensión, leída con la fuente que se guarda. Un gmail publicado en el sitio (scrape,
+// redes) queda: esto sólo mira informer.
+import { esRegistranteWebmail } from "./lib/email.js";
+function _quitarRegistranteWebmail(emails, fuentes) {
+  const src = fuentes || {};
+  const quedan = [], fuera = [];
+  for (const e of (Array.isArray(emails) ? emails : [])) {
+    (esRegistranteWebmail(e, src[String(e || "").toLowerCase()]) ? fuera : quedan).push(e);
+  }
+  return { quedan, fuera };
+}
+
 // ── PRIMERA PASADA DE LA AUDITORÍA, POR LEAD (2026-09-13) ───────────────────────────────────
 // Qué emails quedan, cuáles salen y por qué. Pura: se prueba sin base.
 // Una fila `por_enviar` es un prospecto que un media buyer YA trabajó: le escribió a esa dirección
@@ -12472,6 +12518,8 @@ function _planAuditoriaLead(lead) {
     const marca  = _brandMatches(e, lead.domain, _normSrc(fuentes[e.toLowerCase()]));
     let motivo = "";
     if (isBouncedSync(e))      motivo = "ya_reboto";
+    // El gmail del WHOIS no es contacto (regla del 14/07): sale con motivo propio (2026-09-13).
+    else if (esRegistranteWebmail(e, fuentes[e.toLowerCase()])) motivo = "registrante_webmail";
     else if (score < 0)        motivo = "basura_o_departamento";
     else if (!marca)           motivo = "otra_marca";
     return { email: e, score, ok: !motivo, motivo };
@@ -13095,11 +13143,11 @@ async function polishPool(token) {
         //    + website-informer/WHOIS — todo adentro de scrapeEmailsForDomain — y Apollo capado si vacío.
         let foundEmail = null, foundSource = null, foundName = "";
         let _diagEmail = null;      // qué se encontró y qué se descartó, para el motivo real
-        const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set();
+        const _informerOut = new Set(), _socialOut = new Map(), _casasOut = new Set(), _googleOut = new Set();
         const _crawlStats = { ok: 0, fail: 0, timeouts: 0, waf: false };
         const _urlPorEmail = new Map();   // dónde se encontró cada dirección
         const _nombresOut = new Set();   // personas publicadas por el sitio, para la inferencia por patrón (5c)
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats, urlByEmail: _urlPorEmail, nombresOut: _nombresOut }).catch(() => []);
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informerOut, socialOut: _socialOut, casasEditorasOut: _casasOut, statsOut: _crawlStats, urlByEmail: _urlPorEmail, nombresOut: _nombresOut, googleOut: _googleOut }).catch(() => []);
         // ── LO QUE EL SITIO IMPRIME ES SU CONTACTO, VALGA EL DOMINIO QUE VALGA (2026-09-04) ──
         // `lamoto@motorpress.com.ar` está en todas las páginas de lamoto.com.ar y el ranking le
         // daba -50 por "otra empresa": el lead quedaba en cero teniendo el contacto a la vista.
@@ -13130,7 +13178,8 @@ async function polishPool(token) {
           if (_elegidoCrawl) {
             foundEmail = _elegidoCrawl;
             const _le = foundEmail.toLowerCase();
-            foundSource = _socialOut.has(_le) ? "social" : (_informerOut.has(_le) ? "informer" : "scrape");
+            // Lo que trajo la búsqueda en Google del scrape es google_contact, como el respaldo de abajo (13/09).
+            foundSource = _googleOut.has(_le) ? "google_contact" : _socialOut.has(_le) ? "social" : (_informerOut.has(_le) ? "informer" : "scrape");
           }
         }
         // ── APOLLO TAMBIÉN PARA MEJORAR UN GENÉRICO (Maxi 2026-08-24) ──────────
@@ -15480,7 +15529,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // pageViews reales (visits × pagesPerVisit). Si no (3%), estimar como
   // visits × 2.0 (conservador vs el promedio observado 2.75 — no queremos
   // dejar entrar sitios de bajo tráfico por overshoot del estimador).
-  const PPV_FALLBACK = 2.0;
+  const PPV_FALLBACK = PPV_ESTIMADO;   // la misma constante que la caché y el autopilot (2026-09-13)
   const ppvForThreshold = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : PPV_FALLBACK;
   // Maxi 2026-06-19: si el 2º chequeo (Hypestat scrape) trajo PÁGINAS VISTAS
   // directas, usarlas (más preciso que el estimado visits×ppv).
@@ -15818,6 +15867,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const informerSet = new Set();
   const urlByEmail  = new Map();
   const contactForms = new Set();
+  const googleSet    = new Set();   // lo que trajo Google dentro del scrape → google_contact (2026-09-13)
   let _socialOutCsvScope = null;
   // ── WATERFALL de captación (user 2026-07-08) ──────────────────────────────────
   // 1) INFORMER completo → 2) si vacío, SCRAPE → 3) si vacío, APOLLO pago (último recurso,
@@ -15834,7 +15884,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   } else {
     // TIER 2: Scraping del sitio (gratis) — solo si el informer no encontró NADA.
     const socialOut = new Map();
-    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms }).catch(() => []);
+    scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSet, urlByEmail, socialOut, contactFormsOut: contactForms, googleOut: googleSet }).catch(() => []);
     _socialOutCsvScope = socialOut;
     if (scraperEmails.length > 0) log(`  ✅ Tier 2 SCRAPE ${domain} → ${scraperEmails.length} email(s)`);
     else log(`  ○ ${domain}: informer + scrape SIN emails → Apollo (último recurso)`);
@@ -15864,6 +15914,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     if (!emailSources[lower]) {
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = GENERIC_LOCAL_RE; // unified — audit #2
+      // Lo que encontró la búsqueda en Google del scrape es google_contact, como en el pulido y el agente
+      // (2026-09-13). Un genérico sigue "generic", igual que el de informer: el agente decide si buscar
+      // uno mejor mirando esa etiqueta, y eso no cambia. Google corre antes que redes: la primera vía gana.
+      if (googleSet.has(lower) && !IS_GENERIC.test(local)) {
+        emailSources[lower] = { source: "google_contact", url: urlByEmail.get(lower) || "" };
+        return;
+      }
       // Maxi 2026-06-17 v4: si el email vino de una red social, source = "Facebook"/"YouTube"/"Twitter"
       const socialSrc = _socialOutCsvScope?.get(lower);
       if (socialSrc) {
@@ -15894,6 +15951,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   let emails = await validateEmailsBatch(rawEmails);
   if (rawEmails.length !== emails.length) {
     log(`  📧 ${domain}: ${rawEmails.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
+  }
+  // El webmail del registrante (informer + gmail) no es contacto: regla del 14/07, en la entrada desde el 13/09.
+  {
+    const { quedan, fuera } = _quitarRegistranteWebmail(emails, emailSources);
+    if (fuera.length) { emails = quedan; log(`  📧 ${domain}: fuera ${fuera.join(", ")} — webmail del registrante (WHOIS), no es contacto`); }
   }
 
   // ── EL MISMO CRITERIO QUE AL ENVIAR, TAMBIÉN EN LA ENTRADA (Maxi 2026-08-25) ─────────
@@ -16909,7 +16971,7 @@ async function runSession(token, cfg, sessionStart) {
     // Threshold REAL del negocio: visits × pagesPerVisit (= pageViews mensuales).
     // Si pagesPerVisit no vino en la respuesta (3% de los hits), asumimos 2.0
     // (conservador vs el promedio observado 2.75, política user 2026-05-19).
-    const ppvSafe   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : 2.0;
+    const ppvSafe   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : PPV_ESTIMADO;   // una sola constante (2026-09-13)
     // Maxi 2026-06-19: usar pageviews directos del 2º chequeo (Hypestat) si vinieron.
     const pageViews = (typeof trafficData.pageViews === "number" && trafficData.pageViews > 0) ? trafficData.pageViews : Math.round(visits * ppvSafe);
     if (pageViews < sessionMinTraffic) {
@@ -17047,6 +17109,7 @@ async function runSession(token, cfg, sessionStart) {
     const informerSetAuto = new Set();
     const urlByEmailAuto  = new Map();
     const contactFormsAuto = new Set();
+    const googleSetAuto    = new Set();   // lo que trajo Google dentro del scrape → google_contact (2026-09-13)
     const infResAuto = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
     const infAutoNonGeneric = infResAuto.emails.find(e => !_isGenericLocalPart(e));
     if (infAutoNonGeneric) {
@@ -17062,9 +17125,9 @@ async function runSession(token, cfg, sessionStart) {
         apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
           .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
           .catch(() => null);
-        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto, contactFormsOut: contactFormsAuto }).catch(() => []);
+        if (!apolloRes?.email) scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto, contactFormsOut: contactFormsAuto, googleOut: googleSetAuto }).catch(() => []);
       } else {
-        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto, contactFormsOut: contactFormsAuto }).catch(() => []);
+        scraperEmails = await scrapeEmailsForDomain(domain, { informerOut: informerSetAuto, urlByEmail: urlByEmailAuto, socialOut: socialOutAuto, contactFormsOut: contactFormsAuto, googleOut: googleSetAuto }).catch(() => []);
         if (scraperEmails.length === 0 && canUseApollo) {
           apolloRes = await findBestApolloEmail(domain, apollo_api_key, token, { traffic: visits, allowUnlock: true })
             .then(r => { if (r?.source === "unlocked") apolloCallsThisSession += 1; return r; })
@@ -17085,6 +17148,11 @@ async function runSession(token, cfg, sessionStart) {
       if (emailSourcesAuto[lower]) return;
       const local = (lower.split("@")[0] || "");
       const IS_GENERIC = GENERIC_LOCAL_RE; // unified — audit #2
+      // Google dentro del scrape → google_contact; un genérico sigue "generic" (misma regla que la cola, 13/09).
+      if (googleSetAuto.has(lower) && !IS_GENERIC.test(local)) {
+        emailSourcesAuto[lower] = { source: "google_contact", url: urlByEmailAuto.get(lower) || "" };
+        return;
+      }
       // Maxi 2026-06-17 v4: redes sociales primero (Facebook/YouTube/Twitter)
       const socialSrcA = (typeof socialOutAuto !== "undefined") ? socialOutAuto.get(lower) : null;
       if (socialSrcA) {
@@ -17112,6 +17180,11 @@ async function runSession(token, cfg, sessionStart) {
     let emails = await validateEmailsBatch(rawEmailsAuto);
     if (rawEmailsAuto.length !== emails.length) {
       log(`  📧 ${domain}: ${rawEmailsAuto.length} → ${emails.length} emails (apollo:${apolloRes?.source||"none"})`);
+    }
+    // El webmail del registrante no es contacto, igual que en processCsvItem (regla del 14/07, entrada desde el 13/09).
+    {
+      const { quedan, fuera } = _quitarRegistranteWebmail(emails, emailSourcesAuto);
+      if (fuera.length) { emails = quedan; log(`  📧 ${domain}: fuera ${fuera.join(", ")} — webmail del registrante (WHOIS), no es contacto`); }
     }
     // Mismo criterio que en processCsvItem: el autopilot es la OTRA puerta de entrada a
     // Prospects y tenía el mismo hueco. (Maxi 2026-08-25.)
@@ -19742,11 +19815,12 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       };
       try {
         // Las mismas vías que polishPool: redes, informer (WHOIS) o el propio sitio.
-        const _informer = new Set(), _redes = new Map();
-        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informer, socialOut: _redes });
+        // Lo que trajo la búsqueda en Google del scrape es google_contact (2026-09-13).
+        const _informer = new Set(), _redes = new Map(), _google = new Set();
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informer, socialOut: _redes, googleOut: _google });
         scraped.forEach(e => {
           const l = String(e || "").toLowerCase();
-          _anotar(l, _redes.has(l) ? "social" : (_informer.has(l) ? "informer" : "scrape"));
+          _anotar(l, _google.has(l) ? "google_contact" : _redes.has(l) ? "social" : (_informer.has(l) ? "informer" : "scrape"));
         });
       } catch {}
       const cfg2 = await getConfig(token).catch(() => ({}));
@@ -24158,7 +24232,8 @@ async function runAgentCycle(token, allFlags) {
           try {
             // PASO 1: Scraping primero (gratis). Si encuentra email decente
             // (rank score >= 50), saltar Apollo unlock para ahorrar credits.
-            const scraped = await scrapeEmailsForDomain(domain).catch(() => []);
+            const _googleScrape = new Set();   // lo que trajo Google dentro del scrape → google_contact (2026-09-13)
+            const scraped = await scrapeEmailsForDomain(domain, { googleOut: _googleScrape }).catch(() => []);
             const scrapedScores = scraped.map(e => rankEmail(e, domain, lead.category));
             const bestScraped = Math.max(...scrapedScores, -100);
             const skipApollo = bestScraped >= 50; // hay email scraped commercial-grade
@@ -24223,9 +24298,13 @@ async function runAgentCycle(token, allFlags) {
               if (apolloRes?.contact_name && !lead.contact_name) patch.contact_name = apolloRes.contact_name;
               if (serperPhone && !lead.contact_phone) patch.contact_phone = serperPhone;
               // Registrar la fuente de los emails de Serper para el ranking/atribución.
-              if (serperEmails.length) {
+              // También lo que encontró la búsqueda en Google DENTRO del scrape (2026-09-13). De ahí sólo los
+              // no genéricos: esos antes quedaban sin fuente, y un genérico sin fuente es el que hace que
+              // el agente busque uno mejor (allGeneric). Esa decisión no cambia.
+              const _deGoogle = [...serperEmails, ...scraped.filter(e => _googleScrape.has(String(e).toLowerCase()) && !_isGenericLocalPart(e))];
+              if (_deGoogle.length) {
                 const _es = { ...(lead.email_sources || {}) };
-                for (const e of serperEmails) if (!_es[e.toLowerCase()]) _es[e.toLowerCase()] = "google_contact";
+                for (const e of _deGoogle) if (!_es[e.toLowerCase()]) _es[e.toLowerCase()] = "google_contact";
                 patch.email_sources = _es;
               }
               // ── EL RESCATE DEL AGENTE CUENTA IGUAL QUE EL DEL PULIDO (2026-09-13) ─────────────
