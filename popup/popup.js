@@ -11402,25 +11402,18 @@ function renderProspectCard(r) {
     // abrir SimilarWeb del dominio (chequear visual si la web vale la pena).
     : `<span title="Sin emails" style="font-size:11px;font-weight:700;color:#fff;background:#dc2626;border-radius:4px;padding:1px 6px;flex-shrink:0">✉️ —</span><a href="https://hypestat.com/info/${esc(r.domain || "")}" target="_blank" rel="noopener" title="Ver tráfico de ${esc(r.domain || "")} (Hypestat — sin límite de sesión)" style="font-size:10px;font-weight:700;color:#fff;background:#10b981;border-radius:4px;padding:1px 6px;flex-shrink:0;text-decoration:none">📊</a>`;
 
-  // Las direcciones ADIVINADAS (fuente rol_mx) se marcan en la lista y no quedan preseleccionadas si
-  // hay alguna publicada (2026-09-13). Antes eran radios iguales a las reales: el 10/09 un MB mandó a
-  // redazione@galluraoggi.it, que el sitio no publica. No cambia qué se guarda ni qué se envía.
-  const _fuenteDeEmail = (e) => {
-    const v = (r.email_sources || {})[String(e || "").toLowerCase()];
-    return String(typeof v === "string" ? v : (v && v.source) || "").toLowerCase();
-  };
+  // Las direcciones ADIVINADAS (fuente rol_mx) se marcan en los chips de la lista, con SOURCE_LABEL.rol_mx
+  // ("adivinado (no publicado)"), y no quedan preseleccionadas si hay alguna publicada (2026-09-13). El 10/09 un
+  // MB mandó a redazione@galluraoggi.it, que el sitio no publica. No cambia qué se guarda ni qué se envía.
   // La preselección de la tarjeta es la MISMA que la de Análisis (2026-09-13): el orden compartido y
   // la primera que se puede elegir. Antes era el [0] del array guardado —el campo "Email" de abajo, que
   // es lo que se envía, arrancaba con él— y podía ser una dirección vetada o de tier -1. Sin ninguna
   // elegible, no queda nada puesto.
+  // (2026-09-13, revisión final) Acá había además una lista de radios con su propia preselección y su marca de
+  // "adivinado", que no se dibujaba desde que la reemplazaron los chips: los arreglos del 13/09 fueron a parar a
+  // esa copia y en pantalla no cambiaba nada. Se borró; lo que se ve y se elige son los chips.
   const _ctxTarjeta = _ctxEmailsProspecto(r);
   const _preseleccion = _elegirPreseleccionClient(_ordenarEmailsClient(emails, _ctxTarjeta), _ctxTarjeta);
-  const _idxPreseleccion = emails.indexOf(_preseleccion);
-  const emailOptions = emails.map((e, i) => `
-    <label style="display:flex;align-items:center;gap:5px;font-size:11px;cursor:pointer;margin-bottom:3px">
-      <input type="radio" name="email_${r.id}" value="${esc(e)}" ${i === _idxPreseleccion ? "checked" : ""} class="pcard-email-radio" />
-      ${esc(e)}${_fuenteDeEmail(e) === "rol_mx" ? ` <span title="Dirección de rol adivinada: el sitio no publica email y el dominio tiene servidor de correo. No está verificada." style="font-size:9px;font-weight:600;color:#b45309;background:#fef3c7;border-radius:3px;padding:0 4px">adivinado · no publicado</span>` : ""}
-    </label>`).join("");
 
   const ownerOptions = ["Agus", "Diego", "Max"].map(o =>
     `<option value="${o}" ${o === owner ? "selected" : ""}>${o}</option>`).join("");
@@ -12437,15 +12430,15 @@ function initProspectCard(card, data) {
 function getSelectedEmail(card) {
   // Prioridad: el INPUT MANUAL siempre gana — es el override explícito del user.
   // Después: el campo Monday (que se sincroniza con el chip seleccionado),
-  // después chip seleccionado, después radio.
+  // después chip seleccionado; si no hay ninguno, nada. (2026-09-13, revisión final) El último recurso buscaba
+  // los radios de una lista que la tarjeta ya no dibuja: siempre daba null.
   const manual  = card.querySelector(".pcard-email-manual")?.value?.trim();
   if (manual && manual.includes("@")) return manual;
   const monday  = card.querySelector(".pcard-email-monday")?.value?.trim();
   if (monday && monday.includes("@")) return monday;
   const selected = card.querySelector(".pcard-email-list .email-chip.selected");
   if (selected?.dataset.email) return selected.dataset.email;
-  const radio   = card.querySelector(".pcard-email-radio:checked");
-  return radio?.value || "";
+  return "";
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════

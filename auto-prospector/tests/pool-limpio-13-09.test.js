@@ -192,10 +192,15 @@ test("la caché negativa vence antes del primer congelado, y la blocklist 'inope
 test("la tarjeta de Prospects marca las direcciones adivinadas y preselecciona una publicada", () => {
   const popup = fs.readFileSync(path.join(RAIZ, "..", "popup", "popup.js"), "utf8");
   ok(/rol_mx:\s+\{ txt: "adivinado \(no publicado\)"/.test(popup), "el detalle del chip mostraba el texto crudo 'rol_mx'");
-  ok(/adivinado · no publicado<\/span>/.test(popup), "la lista de radios no distinguía la dirección adivinada de la publicada");
+  // (2026-09-13, revisión final) Acá se exigía el badge y la preselección de una lista de radios (emailOptions,
+  // _idxPreseleccion) que la tarjeta no dibujaba desde que la reemplazaron los chips: el test fijaba la copia
+  // muerta y no la pantalla. Se borró con ella (tests/extension_final-13-09e, A4). Lo que se ve es el chip, que
+  // toma su marca de SOURCE_LABEL (rol_mx, arriba).
+  ok(/const meta = SOURCE_LABEL\[srcObj\.source\]/.test(popup), "el chip de cada email toma su marca de SOURCE_LABEL (rol_mx incluido)");
+  ok(!/pcard-email-radio|const emailOptions/.test(popup), "no puede volver una segunda lista de emails que no se dibuja");
   // Desde ranking_extension-13-09b la preselección de la tarjeta sale de la regla compartida con Análisis
   // (_elegirPreseleccionClient): la misma preferencia por la publicada, sobre el orden compartido y sin
   // dejar puesta nunca una dirección de tier -1. El caso se prueba con el código real en ese archivo.
-  ok(/const _idxPreseleccion = emails\.indexOf\(_preseleccion\);/.test(popup), "la tarjeta preselecciona con la regla compartida");
+  ok(/_chipDe\(_elegirPreseleccionClient\(_chipsPrincipales\.map\(c => c\.dataset\.email\), _ctxCard\)\)/.test(popup), "los chips de la tarjeta preseleccionan con la regla compartida");
   ok(/elegibles\.find\(e => _fuenteTextoClient\(ctx\.fuente\(e\)\) !== "rol_mx"\) \|\| elegibles\[0\]/.test(popup), "si hay una publicada, la adivinada no queda preseleccionada");
 });

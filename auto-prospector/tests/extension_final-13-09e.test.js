@@ -9,6 +9,8 @@
 //   A3  El mail desde Analysis leía los slots de adicionales, el idioma y la fuente del principal después de las
 //       esperas (firma, envío, rebote de cada adicional). Si el MB cambiaba de pestaña mientras salía, el adicional
 //       de A se encolaba a nombre de B (o no se programaba) y la ficha de B se llevaba el contacto de A.
+//   A4  Código muerto en la tarjeta: una lista de radios (emailOptions, _idxPreseleccion, _fuenteDeEmail) que no se
+//       dibujaba, y getSelectedEmail buscaba esos radios. Los arreglos del 13/09 habían ido a parar a esa copia.
 //
 // Cada test corre el código REAL de popup/popup.js (extraído con acorn) con dobles de lo que toca afuera.
 //
@@ -412,4 +414,30 @@ test("A3: si el MB cambia de pestaña mientras sale el mail, los adicionales se 
     if (cambiarEn) deepStrictEqual(t.contactosAdicionales(), [], `${cuando}: con el panel en B, la ficha de B se llevaría el contacto de A`);
     else deepStrictEqual(t.contactosAdicionales().map(c => c.email), [JUAN, MARIA], "en el mismo sitio, el push lleva los adicionales con su hora");
   }
+});
+
+// ═══ A4 — una sola lista de emails en la tarjeta: los chips ═══════════════════════════════════════
+test("A4: la tarjeta no arma una segunda lista de emails que no se dibuja, y conserva lo que sí se usa", () => {
+  const tarjeta = funcion("renderProspectCard");
+  const declaradas = [];
+  walk.full(tarjeta, (n) => { if (n.type === "VariableDeclarator" && n.id.type === "Identifier") declaradas.push(n.id.name); });
+  for (const muerta of ["emailOptions", "_idxPreseleccion", "_fuenteDeEmail"]) {
+    ok(!declaradas.includes(muerta), `renderProspectCard declara ${muerta}: es de la lista de radios que no se dibuja, y un arreglo puede volver a ir a parar ahí`);
+  }
+  ok(!/pcard-email-radio/.test(popup), "no puede volver la lista de radios");
+  // Lo que sí se usa: la preselección arranca el campo Email (lo que se envía), y los chips marcan la adivinada.
+  ok(declaradas.includes("_ctxTarjeta") && declaradas.includes("_preseleccion"), "se borró la preselección que usa el campo Email");
+  ok(/pcard-email-monday" value="\$\{esc\(_preseleccion\)\}"/.test(texto(tarjeta)), "el campo Email tiene que arrancar con la preselección");
+  ok(/rol_mx:\s+\{ txt: "adivinado \(no publicado\)"/.test(popup), "los chips tienen que marcar la dirección adivinada");
+});
+
+test("A4: getSelectedEmail elige campo manual > campo Email > chip elegido, y no busca radios que no existen", () => {
+  const getSelectedEmail = ejecutar({}, `${texto(funcion("getSelectedEmail"))}\nreturn getSelectedEmail;`);
+  const buscados = [];
+  const tarjeta = (els) => ({ querySelector: (sel) => { buscados.push(sel); return els[sel] ?? null; } });
+  strictEqual(getSelectedEmail(tarjeta({ ".pcard-email-manual": { value: " a@diario.com " }, ".pcard-email-monday": { value: "b@diario.com" } })), "a@diario.com");
+  strictEqual(getSelectedEmail(tarjeta({ ".pcard-email-manual": { value: "sin arroba" }, ".pcard-email-monday": { value: "b@diario.com" } })), "b@diario.com");
+  strictEqual(getSelectedEmail(tarjeta({ ".pcard-email-list .email-chip.selected": { dataset: { email: "chip@diario.com" } } })), "chip@diario.com");
+  strictEqual(getSelectedEmail(tarjeta({})), "", "sin nada elegido no hay email (y validateProspect lo dice)");
+  deepStrictEqual(buscados.filter(s => /radio/.test(s)), [], "getSelectedEmail busca radios que la tarjeta no dibuja");
 });
