@@ -2797,6 +2797,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       pagesPerVisit: state.pagesPerVisit,
       category:    state.category,
       emails:      state.emails,
+      // (2026-09-13) Con la fuente de cada email: sin ella, al volver a abrir el sitio todo era "Cache" y el
+      // gmail del registrante que trajo website.informer subía a persona y quedaba preseleccionado (ver
+      // runEmailScraper). Un Map no sobrevive a chrome.storage.session: va como objeto.
+      emailSources: Object.fromEntries(state.emailSources || []),
     });
     // Contabilizar +400K separando nuevos de duplicados
     if (state.traffic >= CONFIG.MIN_TRAFFIC) {
@@ -4192,6 +4196,18 @@ async function runEmailScraper() {
     const _dom = state.domain; // domain guard para descartar promesas tardías
     state.emails = []; state.emailSources = new Map();
     addEmailsWithSource((sess?.emails || []).filter(quickValidateEmail), "Cache", _dom);
+    // ── LA FUENTE DE CADA EMAIL VUELVE CON LA CACHÉ (2026-09-13) ─────────────────────────────────────
+    // Al volver a abrir el sitio en la misma sesión todo quedaba como "Cache", y addEmailsWithSource no pisa
+    // una fuente: la de website.informer ya no volvía. tierDeEmail y esRegistranteWebmail reconocen el WHOIS
+    // sólo con fuente "informer", así que el gmail del registrante subía a persona y quedaba preseleccionado,
+    // cuando la primera apertura y la tarjeta de Prospects del mismo lead lo descartan (regla del 14/07).
+    // Sólo se devuelve la fuente a una dirección que entró recién como "Cache": nunca se pisa otra ya
+    // conocida. Una caché escrita antes de este arreglo (sin emailSources) sigue como "Cache".
+    if (state.domain === _dom) {
+      for (const [em, src] of Object.entries(sess?.emailSources || {})) {
+        if (src && typeof src === "string" && state.emailSources.get(em) === "Cache") state.emailSources.set(em, src);
+      }
+    }
 
     // Fuentes externas (contacto/directorio + website informer) — solo la primera
     // vez por dominio en la sesión; después vienen cacheadas como "Cache".
@@ -5972,6 +5988,7 @@ async function bindButtons() {
           pagesPerVisit: state.pagesPerVisit,
           category:      state.category,
           emails:        state.emails,
+          emailSources:  Object.fromEntries(state.emailSources || []),   // (2026-09-13) ver el arranque
         });
       }
       // ── CERRAR LA COPIA QUE QUEDA EN PROSPECTS (2026-09-07, hallazgo del user) ──────────

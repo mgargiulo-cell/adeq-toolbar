@@ -3,6 +3,9 @@
 //   A1  La tarjeta de Prospects mandaba al email principal sin mirar la lista de rebotados: sólo preguntaba por
 //       los adicionales. Analysis y el lote sí frenan. Un rebotado nunca se reusa, y "no pude preguntar" nunca
 //       es "no rebotó".
+//   A2  La caché de sesión de Analysis guardaba los emails sin su fuente. Al volver a abrir el sitio todo era
+//       "Cache", el gmail del registrante que trajo website.informer subía a persona y quedaba preseleccionado,
+//       cuando la primera apertura y la tarjeta del mismo lead lo descartan.
 //
 // Cada test corre el código REAL de popup/popup.js (extraído con acorn) con dobles de lo que toca afuera.
 //
@@ -15,6 +18,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as acorn from "acorn";
 import * as walk from "acorn-walk";
+import * as E from "../lib/email.js";
+import { isGarbageEmail } from "../../modules/emailVerifier.js";
 import {
   adicionalesDeLaTarjeta, contactosDeAdicionales, filaColaDesdeFormulario, fotoCrmAlGuardar, anotarEnvioDeSesion,
 } from "../../modules/colaEstado.js";
@@ -24,6 +29,7 @@ const RAIZ = path.join(aqui, "..", "..");
 const popup = fs.readFileSync(path.join(RAIZ, "popup", "popup.js"), "utf8");
 const ast = acorn.parse(popup, { ecmaVersion: "latest", sourceType: "module" });
 const texto = (n) => popup.slice(n.start, n.end);
+const linea = (n) => popup.slice(0, n.start).split("\n").length;
 
 function funcion(nombre) {
   let hallado = null;
@@ -168,4 +174,112 @@ test("A1: las cuatro puertas del mail (Analysis, sus adicionales, el lote y la t
   const principal = consultas.find(c => c.start < envio.start);
   ok(principal, "la tarjeta manda el principal sin consultar la lista de rebotados");
   strictEqual(texto(principal.arguments[1]), "email", "lo que se consulta tiene que ser el principal que se manda");
+});
+
+// ═══ A2 — al volver a abrir un sitio, Analysis conserva la fuente de cada email ═══════════════════
+const DOM_REG = "baladag4.com.br";
+const REGISTRANTE = "rudnypc@gmail.com";
+const INFO = `info@${DOM_REG}`;
+
+function fuenteTop(nombre) {
+  const n = ast.body.find(s => s.type === "FunctionDeclaration" && s.id?.name === nombre);
+  ok(n, `popup.js no tiene la función top-level ${nombre}`);
+  return texto(n);
+}
+// Las escrituras de la caché de sesión que guardan emails, con su objeto tal cual está en popup.js.
+function escriturasDeCacheConEmails() {
+  const out = [];
+  walk.full(ast, (n) => {
+    if (n.type !== "CallExpression" || n.callee.type !== "Identifier" || n.callee.name !== "setSessionCache") return;
+    const obj = n.arguments[1];
+    if (obj?.type !== "ObjectExpression") return;
+    const claves = obj.properties.filter(p => p.type === "Property").map(p => p.key?.name ?? p.key?.value);
+    if (claves.includes("emails")) out.push({ obj, claves, linea: linea(n) });
+  });
+  return out;
+}
+// Una apertura del panel: runEmailScraper, addEmailsWithSource, la caché de sesión y el ranking REALES, con
+// chrome.storage.session en memoria. La página publica info@; website.informer devuelve el gmail del registrante.
+function abrirAnalisis(almacen, { informer = [REGISTRANTE] } = {}) {
+  const state = { domain: DOM_REG, category: "", emails: [], emailSources: new Map(), tabId: 1, duplicate: null, traffic: 0 };
+  const cuenta = { informer: 0 };
+  const copia = (v) => JSON.parse(JSON.stringify(v));
+  const chrome = {
+    storage: {
+      session: {
+        get: async (k) => (k in almacen ? { [k]: copia(almacen[k]) } : {}),
+        set: async (o) => { for (const [k, v] of Object.entries(o)) almacen[k] = copia(v); },
+      },
+      local: { get: async () => ({}), set: async () => {} },
+    },
+  };
+  const nombres = ["getSessionCache", "setSessionCache", "addEmailsWithSource", "runEmailScraper", "_ctxEmailsAnalisis", "_fuenteTextoClient",
+                   "_rankClient", "_motivoReboteClient", "_emailPickTierClient", "_ordenarEmailsClient", "_elegirPreseleccionClient", "_emailGradeCompute"];
+  const deps = {
+    state, chrome, rankEmail: E.rankEmail, vetoDuroEmail: E.vetoDuroEmail, esRegistranteWebmail: E.esRegistranteWebmail, motivoRebote: E.motivoRebote,
+    _rebotesExtension: { cache: { set: new Set(), ts: 0 }, porDominio: new Map() }, tierDeEmail: E.tierDeEmail,
+    compararCandidatosEmail: E.compararCandidatosEmail, _ordenTiersExtension: { orden: null }, _cleanScrapedEmails: E._cleanScrapedEmails, isGarbageEmail,
+    quickValidateEmail: (e) => /^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(e),
+    scrapeEmailsFromPage: async () => ({ emails: [INFO], socialLinks: [] }),
+    scrapeContactPages: async () => [],
+    scrapeWebsiteInformer: async () => { cuenta.informer++; return informer; },
+    findDecisionMakerViaApollo: async () => null, scrapeEmailsFromSocialLinks: async () => new Map(),
+    showLinkedIn() {}, renderApolloPeople() {}, _apolloAutoPaceReveal: async () => {},
+    renderEmailList() {}, autoPushReady: {}, checkAutoPush() {}, updateScore() {}, saveHistory: async () => {},
+    detectGeo: () => "", userKey: (k) => k, loadHistoryTab: async () => {},
+    document: { getElementById: () => null }, console: { warn() {}, log() {}, error() {} },
+  };
+  const fns = ejecutar(deps, `${nombres.map(fuenteTop).join("\n")}\nreturn { ${nombres.join(", ")} };`);
+  // Lo que deja puesto renderEmailList: sin basura, el orden compartido y la primera elegible.
+  const preseleccion = () => fns._elegirPreseleccionClient(fns._ordenarEmailsClient([...new Set(state.emails)].filter(e => !isGarbageEmail(e, state.domain))));
+  return { state, fns, cuenta, preseleccion };
+}
+
+test("A2: al volver a abrir el sitio en la misma sesión, el gmail del registrante sigue descartado y queda puesto el info@", async () => {
+  const escrituras = escriturasDeCacheConEmails();
+  strictEqual(escrituras.length, 2, `esperaba dos escrituras de la caché con emails (arranque y push nuevo), hay ${escrituras.length}`);
+  for (const esc of escrituras) {
+    ok(esc.claves.includes("emailSources"), `popup.js:${esc.linea} guarda los emails en la caché de sesión sin su fuente`);
+    const almacen = {};
+    const a = abrirAnalisis(almacen);
+    await a.fns.runEmailScraper();
+    strictEqual(a.state.emailSources.get(REGISTRANTE), "Informer");
+    strictEqual(a.fns._emailPickTierClient(REGISTRANTE), -1, "primera apertura: el gmail del registrante no es contacto");
+    strictEqual(a.preseleccion(), INFO, "primera apertura");
+
+    // La escritura real, con el objeto tal cual está en popup.js.
+    await a.fns.setSessionCache(DOM_REG, new Function("state", `return (${texto(esc.obj)});`)(a.state));
+
+    const b = abrirAnalisis(almacen);
+    await b.fns.runEmailScraper();
+    strictEqual(b.state.emailSources.get(REGISTRANTE), "Informer", `popup.js:${esc.linea}: al volver a abrir, la fuente del registrante quedó "${b.state.emailSources.get(REGISTRANTE)}"`);
+    strictEqual(b.state.emailSources.get(INFO), "Page");
+    strictEqual(b.fns._emailPickTierClient(REGISTRANTE), -1, "al volver a abrir, el registrante subía a persona");
+    strictEqual(b.fns._emailGradeCompute(REGISTRANTE, null, b.state.emailSources.get(REGISTRANTE)).grade, "E", "la nota A-E mira la misma fuente");
+    strictEqual(b.preseleccion(), INFO, "al volver a abrir quedaba preseleccionado el gmail del registrante");
+
+    // Navegar dentro del sitio con la caché ya marcada (contactScraped): informer no se vuelve a pedir, y la fuente sigue.
+    const c = abrirAnalisis(almacen);
+    await c.fns.runEmailScraper();
+    strictEqual(c.cuenta.informer, 0, "con la caché marcada, website.informer no se vuelve a pedir");
+    strictEqual(c.state.emailSources.get(REGISTRANTE), "Informer", "navegando dentro del sitio, la fuente se perdía");
+    strictEqual(c.preseleccion(), INFO);
+  }
+});
+
+test("A2: la fuente guardada sólo vuelve a una dirección que entró desde la caché; sin fuentes guardadas queda 'Cache'", async () => {
+  const clave = `sess_${DOM_REG}`;
+  // Una caché de antes del arreglo (sin emailSources): se comporta como siempre.
+  const vieja = { [clave]: { emails: [INFO, REGISTRANTE], contactScraped: true } };
+  const v = abrirAnalisis(vieja);
+  await v.fns.runEmailScraper();
+  deepStrictEqual([v.state.emailSources.get(INFO), v.state.emailSources.get(REGISTRANTE)], ["Cache", "Cache"]);
+
+  // Fuentes de direcciones que no entraron (o que no son texto) no se inventan ni ensucian el Map.
+  const rara = { [clave]: { emails: [INFO], emailSources: { [INFO]: "Page", "fantasma@otro-sitio.com": "Informer", [REGISTRANTE]: { source: "informer" } }, contactScraped: true } };
+  const r = abrirAnalisis(rara);
+  await r.fns.runEmailScraper();
+  strictEqual(r.state.emailSources.get(INFO), "Page");
+  ok(!r.state.emailSources.has("fantasma@otro-sitio.com") && !r.state.emails.includes("fantasma@otro-sitio.com"), "una fuente guardada no agrega direcciones");
+  ok(!r.state.emailSources.has(REGISTRANTE), "una dirección que no está en la caché no aparece por su fuente");
 });
