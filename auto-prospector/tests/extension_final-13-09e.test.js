@@ -6,6 +6,9 @@
 //   A2  La caché de sesión de Analysis guardaba los emails sin su fuente. Al volver a abrir el sitio todo era
 //       "Cache", el gmail del registrante que trajo website.informer subía a persona y quedaba preseleccionado,
 //       cuando la primera apertura y la tarjeta del mismo lead lo descartan.
+//   A3  El mail desde Analysis leía los slots de adicionales, el idioma y la fuente del principal después de las
+//       esperas (firma, envío, rebote de cada adicional). Si el MB cambiaba de pestaña mientras salía, el adicional
+//       de A se encolaba a nombre de B (o no se programaba) y la ficha de B se llevaba el contacto de A.
 //
 // Cada test corre el código REAL de popup/popup.js (extraído con acorn) con dobles de lo que toca afuera.
 //
@@ -282,4 +285,131 @@ test("A2: la fuente guardada sólo vuelve a una dirección que entró desde la c
   strictEqual(r.state.emailSources.get(INFO), "Page");
   ok(!r.state.emailSources.has("fantasma@otro-sitio.com") && !r.state.emails.includes("fantasma@otro-sitio.com"), "una fuente guardada no agrega direcciones");
   ok(!r.state.emailSources.has(REGISTRANTE), "una dirección que no está en la caché no aparece por su fuente");
+});
+
+// ═══ A3 — el mail desde Analysis anota los adicionales a nombre del sitio del mail ═════════════════
+const SITIO_A = "sitio-a.com";
+const SITIO_B = "sitio-b.com";
+const VENTAS_A = `ventas@${SITIO_A}`;
+const JUAN = `juan@${SITIO_A}`;
+const MARIA = `maria@${SITIO_A}`;
+
+function handlerGmail() {
+  let hallado = null;
+  walk.full(ast, (n) => {
+    if (hallado || n.type !== "CallExpression") return;
+    const c = n.callee;
+    if (c.type !== "MemberExpression" || c.property?.name !== "addEventListener" || n.arguments[0]?.value !== "click") return;
+    const obj = c.object.type === "ChainExpression" ? c.object.expression : c.object;
+    if (obj.type === "CallExpression" && obj.arguments[0]?.value === "btn-send-gmail") hallado = n.arguments[1];
+  });
+  ok(hallado, "no encontré el handler de click de #btn-send-gmail");
+  return hallado;
+}
+
+test("A3: después de la primera espera, el botón de Gmail no vuelve a leer del panel el sitio, el idioma, las fuentes ni los slots", () => {
+  const h = handlerGmail();
+  let primera = null;
+  walk.full(h.body, (n) => { if (n.type === "AwaitExpression" && (!primera || n.start < primera.start)) primera = n; });
+  ok(primera, "no encontré ninguna espera en el botón de Gmail");
+  const tardias = [];
+  walk.full(h.body, (n) => {
+    if (n.start <= primera.start) return;
+    if (n.type === "MemberExpression" && n.object.type === "Identifier" && n.object.name === "state"
+        && ["domain", "siteLanguage", "monday", "emailSources"].includes(n.property?.name)) tardias.push(`state.${n.property.name} (popup.js:${linea(n)})`);
+    if (n.type === "CallExpression" && n.callee.type === "MemberExpression" && n.callee.property?.name === "getElementById") {
+      const a = n.arguments[0];
+      if (a?.type !== "Literal" || /^form-email-futuro/.test(String(a.value))) tardias.push(`getElementById(${texto(a)}) (popup.js:${linea(n)})`);
+    }
+  });
+  deepStrictEqual(tardias, [], "mientras sale el mail el panel puede pasar a otro sitio (scheduleRecheck + resetAnalysisUI): lo que se anota se lee al hacer click");
+});
+
+// Todo lo que el doble no simula se resuelve a un objeto neutro que acepta cualquier uso.
+const NEUTRO = new Proxy(function () {}, {
+  get: (_t, k) => (k === "then" ? undefined : k === Symbol.toPrimitive ? () => "" : NEUTRO),
+  apply: () => NEUTRO, construct: () => NEUTRO, set: () => true,
+});
+
+// El handler REAL de #btn-send-gmail junto con setupAutoRefreshOnUrlChange (su scheduleRecheck, disparado por
+// onActivated), resetAnalysisUI y _contactosAdicionales reales. Lo simulado: Chrome, la red y los módulos.
+async function mandarDesdeAnalisis({ cambiarEn = null } = {}) {
+  const els = {};
+  const mk = (id, props = {}) => (els[id] = new Proxy({ id, value: "", textContent: "", className: "x", disabled: false, style: {}, ...props },
+    { get: (t, k) => (k in t ? t[k] : NEUTRO), set: (t, k, v) => { t[k] = v; return true; } }));
+  const document = { getElementById: (id) => els[id] || mk(id), querySelector: () => null, querySelectorAll: () => [] };
+  mk("form-email", { value: VENTAS_A }); mk("pitch-text", { value: "Olá, somos a ADEQ" }); mk("form-subject", { value: "Proposta" });
+  mk("form-email-futuro", { value: JUAN }); mk("form-email-futuro-2", { value: MARIA });
+
+  const state = {
+    domain: SITIO_A, url: `https://${SITIO_A}/`, tabId: 1, accessToken: "tk", loginEmail: "mb@adeqmedia.com",
+    crmVeredicto: { ok: true }, duplicate: null, pitch: "", siteLanguage: "pt", emailSources: new Map([[VENTAS_A, "Page"]]), adicionalesEncolados: null,
+  };
+  const r = { anotado: [], tracking: [], cierres: [], filas: null };
+  const listeners = {};
+  const pendientes = [];
+  const chrome = {
+    tabs: {
+      onUpdated: { addListener: (f) => { listeners.onUpdated = f; } },
+      onActivated: { addListener: (f) => { listeners.onActivated = f; } },
+      get: async (id) => ({ id, url: id === 2 ? `https://${SITIO_B}/nota` : `https://${SITIO_A}/` }),
+      query: async () => [{ id: 2, url: `https://${SITIO_B}/nota` }],
+    },
+  };
+  // El MB pasa a la pestaña del sitio B: Chrome dispara onActivated, el listener real corre scheduleRecheck
+  // (state.domain = B y resetAnalysisUI en el momento) y, a los 800 ms, arranca la pipeline de B.
+  const cambiarDePestana = async () => { await listeners.onActivated({ tabId: 2 }); await Promise.all(pendientes); };
+  const vars = {
+    document, state, chrome, console: { warn() {}, log() {}, error() {} },
+    _autoRefreshWired: false, _autoRefreshLastDomain: null, _autoRefreshTimer: null,
+    setTimeout: (fn) => { pendientes.push(Promise.resolve().then(fn)); return 0; }, clearTimeout: () => {},
+    extractDomain: (u) => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } },
+    runAnalysisPipeline: () => { state.emailSources = new Map([[`contacto@${SITIO_B}`, "Page"]]); state.siteLanguage = "en"; },
+    _motivoBloqueoCrm: () => "", fotoCrmAlGuardar: () => null, _esFormularioUrl: () => false, isValidEmail: () => true,
+    ensureFreshToken: async () => "tk",
+    isEmailBounced: async (_tk, e) => { if (cambiarEn === "el rebote del 1er adicional" && e === JUAN) await cambiarDePestana(); return { bounced: false }; },
+    checkUserCanDo: async () => ({ allowed: true }), _rateLimiter: { check: () => true },
+    getGmailSignature: async () => { if (cambiarEn === "la firma") await cambiarDePestana(); return ""; },
+    appendClosingIfMissing: (b, lang) => { r.cierres.push(lang); return b; },
+    createManualSendTracking: async (_tk, o) => { r.tracking.push(o); return { ok: true, id: 77 }; },
+    CONFIG: { SUPABASE_URL: "https://sb", SUPABASE_ANON_KEY: "anon" },
+    sendEmail: async () => { if (cambiarEn === "el envío") await cambiarDePestana(); return { ok: true }; },
+    markManualSendFailed: async () => ({}), incrementUserDailyCounter: async () => ({}),
+    saveSendDate: async (d) => { r.anotado.push(`sendtrack:${d}`); return { ok: true }; },
+    anotarEnvioDeSesion: (_m, d) => { r.anotado.push(`sesion:${d}`); }, _enviosDeLaSesion: new Map(),
+    markReviewQueueAsContacted: async (_tk, d) => { r.anotado.push(`contactado:${d}`); return { ok: true }; },
+    fetch: async (url, opts) => { if (String(url).includes("toolbar_reengagement_queue")) r.filas = JSON.parse(opts.body); return { ok: true, status: 201 }; },
+  };
+  const scope = new Proxy(vars, {
+    has: () => true,
+    get: (t, k) => (k === Symbol.unscopables ? undefined : k in t ? t[k] : k in globalThis ? globalThis[k] : NEUTRO),
+    set: (t, k, v) => { t[k] = v; return true; },
+  });
+  const api = new Function("scope", `with (scope) {
+    ${fuenteTop("setupAutoRefreshOnUrlChange")}
+    ${fuenteTop("resetAnalysisUI")}
+    ${fuenteTop("_contactosAdicionales")}
+    return { setupAutoRefreshOnUrlChange, _contactosAdicionales, handler: (${texto(handlerGmail())}) };
+  }`)(scope);
+  api.setupAutoRefreshOnUrlChange();
+  await api.handler();
+  return { ...r, state, contactosAdicionales: () => api._contactosAdicionales(), estado: () => els["email-futuro-status"]?.textContent || "" };
+}
+
+test("A3: si el MB cambia de pestaña mientras sale el mail, los adicionales se programan y se anotan a nombre del sitio del mail", async () => {
+  for (const cambiarEn of [null, "la firma", "el envío", "el rebote del 1er adicional"]) {
+    const t = await mandarDesdeAnalisis({ cambiarEn });
+    const cuando = cambiarEn ? `cambio de pestaña durante ${cambiarEn}` : "sin cambio de pestaña";
+    strictEqual(t.state.domain, cambiarEn ? SITIO_B : SITIO_A, `${cuando}: el doble no dejó el panel donde correspondía`);
+    deepStrictEqual(t.anotado, [`sendtrack:${SITIO_A}`, `sesion:${SITIO_A}`, `contactado:${SITIO_A}`], cuando);
+    ok(Array.isArray(t.filas), `${cuando}: no se programó ningún adicional (resetAnalysisUI vació los slots) → "${t.estado()}"`);
+    deepStrictEqual(t.filas.map(f => [f.domain, f.future_email, f.original_email]), [[SITIO_A, JUAN, VENTAS_A], [SITIO_A, MARIA, VENTAS_A]],
+      `${cuando}: el worker avisaría al CRM del adicional a nombre de otro sitio, o se perdió uno`);
+    strictEqual(t.state.adicionalesEncolados?.domain, SITIO_A, `${cuando}: los adicionales encolados quedaron a nombre de ${t.state.adicionalesEncolados?.domain}`);
+    deepStrictEqual(t.state.adicionalesEncolados.lista.map(c => c.email), [JUAN, MARIA]);
+    deepStrictEqual(t.tracking.map(x => [x.domain, x.language, x.email_source]), [[SITIO_A, "pt", "page"]], `${cuando}: el tracking del envío mezcla datos de otro sitio`);
+    deepStrictEqual(t.cierres, ["pt"], `${cuando}: el cierre del mail salió en el idioma de otro sitio`);
+    if (cambiarEn) deepStrictEqual(t.contactosAdicionales(), [], `${cuando}: con el panel en B, la ficha de B se llevaría el contacto de A`);
+    else deepStrictEqual(t.contactosAdicionales().map(c => c.email), [JUAN, MARIA], "en el mismo sitio, el push lleva los adicionales con su hora");
+  }
 });

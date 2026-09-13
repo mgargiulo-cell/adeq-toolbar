@@ -6067,6 +6067,16 @@ async function bindButtons() {
     // abrir el login, y mientras tanto el panel cambia de dominio solo (scheduleRecheck). El mail sale
     // con el email y el pitch que ya se leyeron; lo que se anota después tiene que ser de este sitio.
     const dominioDelMail = state.domain;
+    // (2026-09-13) Lo demás que se anota de ESTE mail, leído en el mismo momento: los tres slots de adicionales,
+    // el idioma (cierre del cuerpo y tracking) y la fuente del principal. Se leían después de la firma, del envío
+    // y del chequeo de rebote de cada adicional. Si mientras tanto el MB cambiaba de pestaña, resetAnalysisUI
+    // vaciaba los slots (los adicionales de A no se programaban, sin aviso) o el panel ya era de B: el adicional
+    // de A se encolaba con el dominio de B, su aviso al CRM creaba en B una "Propuesta Vigente" sin ejecutivo en
+    // un sitio al que nadie le escribió, y la ficha de B se llevaba el contacto de A (_contactosAdicionales).
+    const slotsDelMail  = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"]
+      .map(id => (document.getElementById(id)?.value || "").trim().toLowerCase());
+    const langDelMail   = state.siteLanguage || state.monday?.idioma || "es";
+    const fuenteDelMail = (state.emailSources?.get(email) || "").toLowerCase() || "manual";
     // (2026-09-13) Y lo que decía el CRM de ese sitio ANTES de mandar, tomado en el mismo momento. Si el
     // aviso de los adicionales crea la ficha, al volver a abrir el sitio Analysis la reconoce como nuestra
     // (veredictoConEnvioPropio) y el lote no la toma por una propuesta ajena.
@@ -6121,7 +6131,7 @@ async function bindButtons() {
     // ── Fetch Gmail signature (will trigger OAuth window if no cached token) ──
     btn.textContent = "⏳ Preparing...";
     const gmailSig = await getGmailSignature();
-    const lang     = state.siteLanguage || state.monday?.idioma || "es";
+    const lang     = langDelMail;
 
     // Stripping de cualquier cierre viejo en CUALQUIER idioma (Gemini puede meter "Best regards,"
     // aunque el pitch sea en español). Luego agregamos el cierre localizado correcto.
@@ -6147,7 +6157,7 @@ async function bindButtons() {
         // Attribution para toolbar_source_performance: si el email vino de los
         // candidates detectados (apollo/informer/scrape/generic), pasamos ese
         // source. Si el MB lo tipeó a mano, queda "manual" por default.
-        email_source:  (state.emailSources?.get(email) || "").toLowerCase() || "manual",
+        email_source:  fuenteDelMail,
       });
       if (tr.ok && tr.id) {
         trackingActionId = tr.id;
@@ -6199,13 +6209,11 @@ async function bindButtons() {
       //   - bounce check antes de cada send (lista global de bounces)
       //   - registro en response_tracking para tracking de conversión
       const futStatusEl = document.getElementById("email-futuro-status");
-      const futureSlots = ["form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"];
       const sentMsgs  = [];
       const failMsgs  = [];
       const _yaEnviados = new Set([email.toLowerCase()]);   // dedupe: principal + entre slots
       const _colaAdicionales = [];                          // se encolan y los manda el worker, 1 por minuto
-      for (const slotId of futureSlots) {
-        const futureEmail = document.getElementById(slotId)?.value?.trim()?.toLowerCase();
+      for (const futureEmail of slotsDelMail) {   // (2026-09-13) los slots del click, no los que muestra el panel ahora
         if (!futureEmail || !futureEmail.includes("@")) continue;
         // Dedupe contra el principal Y entre los propios slots: el mismo email tipeado en
         // dos slots salía DOS veces — dos mails idénticos al mismo buzón en el mismo minuto,
@@ -6228,7 +6236,7 @@ async function bindButtons() {
         // despacho en `processManualReengagementQueue`. `tracking_action_id: null` a propósito:
         // con él, el worker saltea el envío si el original ya se abrió, y acá los queremos todos.
         _colaAdicionales.push({
-          domain:           state.domain,
+          domain:           dominioDelMail,   // (2026-09-13) el sitio del mail: con él el worker avisa al CRM
           mb_email:         state.loginEmail.toLowerCase(),
           original_email:   email.toLowerCase(),
           future_email:     futureEmail,
@@ -6248,7 +6256,9 @@ async function bindButtons() {
       // nuestro envío tarde 3 minutos, para evitar errores"*. Depender de que el worker los
       // informe uno por uno significa que, si el worker está caído, el CRM no se entera nunca.
       state.adicionalesEncolados = {
-        domain: state.domain,
+        // (2026-09-13) El sitio del mail. Si el panel ya pasó a otro, _contactosAdicionales compara con state.domain
+        // y ahí no se usa; antes quedaba con el dominio de B y la ficha de B se llevaba el contacto de A.
+        domain: dominioDelMail,
         lista: _colaAdicionales.map((c, i) => ({ email: c.future_email, tipo: "adicional", orden: i + 1, enviado_at: c.scheduled_for })),
       };
       if (_colaAdicionales.length) {
