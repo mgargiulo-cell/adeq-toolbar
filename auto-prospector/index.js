@@ -18670,6 +18670,10 @@ async function processManualReengagementQueue(token) {
     for (const row of rows) {
       const { id, domain, monday_item_id, mb_email, original_email, future_email,
               original_subject, original_body, tracking_action_id, reason: reason_row } = row;
+      // Un adicional que ya falló una vez vuelve como "adicional_manual | <motivo> (intento N...)" (revisión
+      // final, 2026-09-13): la marca no se puede perder en el primer reintento, o el envío que al fin sale
+      // no escribe su fila de medición.
+      const _esAdicional = String(reason_row || "").startsWith("adicional_manual");
       let newStatus = "sent";
       let reason = null;
 
@@ -18762,7 +18766,7 @@ async function processManualReengagementQueue(token) {
               contactos: [{ email: future_email, tipo: "adicional", enviado_at: new Date().toISOString() }],
             }], "adicional_enviado").catch(e => log(`  ⚠️ ${domain}: adicional enviado pero el CRM no lo registró (${e.message})`));
 
-            if (reason_row === "adicional_manual") {
+            if (_esAdicional) {
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking`, {
                 method: "POST",
                 headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
@@ -18799,10 +18803,13 @@ async function processManualReengagementQueue(token) {
       // puede". Ahora un fallo de ENVÍO vuelve a la cola con 6 horas de espera, hasta 3
       // intentos; recién ahí se da por perdido. Los fallos de DATOS (sin email futuro, sin
       // asunto o cuerpo original) sí son definitivos y siguen yendo a 'failed'.
-      const _esFalloDeEnvio = newStatus === "failed" && /gmail send failed|timeout|network|fetch|ECONN|socket/i.test(String(reason || ""));
-      const _intentoPrevio = parseInt(String(reason || "").match(/intento (\d+)/)?.[1] || "0", 10) || 0;
+      // El contador sale de la fila (reason_row), no del motivo de ESTA vuelta (revisión final, 2026-09-13):
+      // leído de `reason` siempre daba 0 y el tope de 3 no se alcanzaba nunca. Un AbortError del reloj queda
+      // afuera a propósito: si Gmail aceptó el mensaje antes del corte, reintentar lo duplicaría.
+      const _esFalloDeEnvio = newStatus === "failed" && /gmail[ _]send[ _]failed|timeout|network|fetch|ECONN|socket/i.test(String(reason || ""));
+      const _intentoPrevio = parseInt(String(reason_row || "").match(/intento (\d+)/)?.[1] || "0", 10) || 0;
       const _cuerpoPatch = (_esFalloDeEnvio && _intentoPrevio + 1 < 3)
-        ? { status: "pending", reason: `${reason} (intento ${_intentoPrevio + 1}, reintenta en 6h)`,
+        ? { status: "pending", reason: `${_esAdicional ? "adicional_manual | " : ""}${reason} (intento ${_intentoPrevio + 1}, reintenta en 6h)`,
             scheduled_for: new Date(Date.now() + 6 * 3600_000).toISOString(),
             updated_at: new Date().toISOString() }
         : { status: newStatus, reason, updated_at: new Date().toISOString() };
@@ -28633,23 +28640,32 @@ async function _boletinPorSeccion(token, { compartido = null } = {}) {
       // Sólo envíos del AGENTE (regla del user: estas métricas son del agente); sin tope de filas.
       // Con su 2º email (ACCION_ENVIO_PARA_REBOTE, 2026-09-13): sale del mismo buzón y rebota igual.
       // De a páginas con orden estable: sin orden, dos páginas pueden repetir o saltear filas.
-      const _envs = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&details->>ui_origin=is.null&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to&order=id`, auth)) || [];
-      const _reb  = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email&order=email`, auth)) || [];
-      const _setReb = new Set((_reb || []).map(x => String(x.email || "").toLowerCase()));
-      const _porMb = {};
-      for (const e of (_envs || [])) {
-        const u = String(e.user_email || "").toLowerCase(); if (!u) continue;
-        _porMb[u] = _porMb[u] || { n: 0, r: 0 };
-        _porMb[u].n++;
-        if (_setReb.has(String(e.email_to || "").toLowerCase())) _porMb[u].r++;
-      }
-      const _filas = Object.entries(_porMb).map(([u, v]) => ({ u: u.split("@")[0], n: v.n, r: v.r, pct: v.n ? (100 * v.r / v.n) : 0 }))
-        .sort((a, b) => b.pct - a.pct);
-      if (_filas.length) {
-        const _peor = _filas[0].pct;
-        _nota("REBOTES (7d, envíos del agente)", _peor >= 5 ? "🔴" : _peor >= 3 ? "🟡" : "✅",
-          [_filas.map(f => `${f.u} ${f.pct.toFixed(1)}% (${f.r}/${f.n})`).join(" · "),
-           _peor >= 3 ? "Un buzón muy por encima del resto suele ser la fuente de sus leads, no el buzón. El rebote NO frena el envío (regla del 02/09): sólo se informa." : "Todos por debajo del 3%."]);
+      // Enteras o nada (revisión final, 2026-09-13): con `|| []` una lectura caída (400, 5xx, reloj) se
+      // convertía en "0 rebotes" y el mail decía "Todos por debajo del 3%" justo el día que no se sabía.
+      // Un glitch no es un cero, la misma regla que `_cnt`. Es la única señal de rebote por buzón que ve Maxi.
+      const _desdeReb = new Date(Date.now() - 7 * 86_400_000).toISOString();
+      const _envs = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&details->>ui_origin=is.null&created_at=gte.${_desdeReb}&select=user_email,email_to&order=id`, auth, { max: 100000, entero: true });
+      const _reb  = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${_desdeReb}&select=email&order=email`, auth, { max: 100000, entero: true });
+      if (!Array.isArray(_envs) || !Array.isArray(_reb)) {
+        _nota("REBOTES (7d, envíos del agente)", "🟡",
+          [`No se pudo medir: falló la lectura de ${!Array.isArray(_envs) ? "envíos" : "rebotes"}. No es un 0%.`]);
+      } else {
+        const _setReb = new Set(_reb.map(x => String(x.email || "").toLowerCase()));
+        const _porMb = {};
+        for (const e of _envs) {
+          const u = String(e.user_email || "").toLowerCase(); if (!u) continue;
+          _porMb[u] = _porMb[u] || { n: 0, r: 0 };
+          _porMb[u].n++;
+          if (_setReb.has(String(e.email_to || "").toLowerCase())) _porMb[u].r++;
+        }
+        const _filas = Object.entries(_porMb).map(([u, v]) => ({ u: u.split("@")[0], n: v.n, r: v.r, pct: v.n ? (100 * v.r / v.n) : 0 }))
+          .sort((a, b) => b.pct - a.pct);
+        if (_filas.length) {
+          const _peor = _filas[0].pct;
+          _nota("REBOTES (7d, envíos del agente)", _peor >= 5 ? "🔴" : _peor >= 3 ? "🟡" : "✅",
+            [_filas.map(f => `${f.u} ${f.pct.toFixed(1)}% (${f.r}/${f.n})`).join(" · "),
+             _peor >= 3 ? "Un buzón muy por encima del resto suele ser la fuente de sus leads, no el buzón. El rebote NO frena el envío (regla del 02/09): sólo se informa." : "Todos por debajo del 3%."]);
+        }
       }
     } catch {}
 

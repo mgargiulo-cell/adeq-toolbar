@@ -308,6 +308,32 @@ test("I19: processCsvItem de verdad: un sitio de apuestas guardado con la API ca
   match(patchesDeCola(pedidos, 402)[0]?.error_message || "", /^ya_estaba_en_prospects/);
 });
 
+// Revisión final (13/09): con el chequeo previo usando la misma URL, la guarda de getTrafficData
+// (`puedeCompletarCategoria`) sólo decide cuando ese chequeo NO pudo leer. Sin este caso, cambiarla por
+// `async () => true` dejaba todos los tests en verde, y un timeout de la primera consulta volvía a pagar
+// tráfico de un lead de Prospects.
+test("I19: si el chequeo previo de Prospects falla, la guarda de la categoría igual ve el lead en el pool y no paga RapidAPI", async () => {
+  const w = await cargarWorker(["processCsvItem"], { fetchFalso: true });
+  const cache = [{ data: { rawVisits: 600_000, visits: 600_000, pageViews: 1_500_000, pagesPerVisit: 2.5, ppvSource: "hypestat", topCountries: [], category: "", source: "hypestat_scrape", sinRespuestaApi: true }, fetched_at: new Date().toISOString() }];
+  const cfg = { rapidapi_key: "k", worker_discovery_config: JSON.stringify({ geos_excluded: ["PE"] }) };
+  const pedidos = [];
+  let consultasPool = 0;
+  globalThis.__fetchFalso = enrutar(pedidos, [
+    [(u) => u.includes("/api/crm/ficha?domain="), () => resp({ found: false })],
+    [(u) => /\/app-ads\.txt$/.test(u), () => resp("", { status: 404 })],
+    [(u) => /\/ads\.txt$/.test(u), () => resp(ADS_TXT)],
+    [(u, m) => m === "GET" && u.includes("toolbar_traffic_cache?domain=eq."), () => resp(cache)],
+    [(u) => u.includes("toolbar_review_queue?domain=eq.") && u.includes("status=in.(pending,por_enviar)"),
+      () => (++consultasPool === 1 ? resp({ message: "boom" }, { status: 500 }) : resp([{ id: 9 }]))],
+    [(u) => u.includes("rapidapi.com"), () => APUESTAS()],
+    [(u) => /^https?:\/\/[^/]+\/?$/.test(u), () => resp(HOME)],
+  ]);
+  await w.processCsvItem("t", { id: 403, domain: "portaldeprueba.com.pe", source: "auto_feeder_sellers", uploaded_by: "worker@autofeeder", error_message: "unfrozen_retry_attempt_2" }, cfg, USO_APOLLO, { count: 0 });
+  strictEqual(pedidos.filter(p => p.u.includes("rapidapi.com")).length, 0, "un lead de Prospects no se vuelve a pagar aunque el primer chequeo haya fallado");
+  ok(consultasPool >= 2, `la guarda tiene que haber preguntado al pool (${consultasPool} consultas)`);
+  ok(!/^ya_estaba_en_prospects/.test(patchesDeCola(pedidos, 403)[0]?.error_message || ""), "el chequeo previo falló: la que decide es la guarda");
+});
+
 // ── Pendientes de la revisión del feeder ───────────────────────────────────────────────────
 test("AutoGoogle: sin poder leer las frases retiradas la exploración no sale (Serper es pago); con la lista, sí", async () => {
   // El slot entero primero: la línea del log dice cuántas frases de exploración salieron.
