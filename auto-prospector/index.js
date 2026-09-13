@@ -18232,7 +18232,32 @@ async function scanAutoRepliesForUser(token, userEmail) {
       return 0;
     }
     const list = await listRes.json();
-    const ids = (list.messages || []).map(m => m.id);
+    const allIds = (list.messages || []).map(m => m.id).filter(Boolean);
+    if (!allIds.length) return 0;
+
+    // ── UNA AUSENCIA SE PROCESA UNA VEZ (2026-09-13) ──────────────────────────────────────────
+    // ⚠️ Este scan no marcaba nada como visto: con `newer_than:1d`, un fuera de oficina que llegaba a
+    // la tarde se volvía a procesar al día siguiente a las 13, con el freno de 6 h ya vencido, y salía
+    // el mismo pitch otra vez. Es el bug que el scan de rebotes arregló el 17/07 con el dedup por id.
+    // La clave lleva prefijo `ar:` para no esconderle mensajes al scan de rebotes, que usa la misma
+    // tabla en paralelo. Se pregunta sólo por los ids de esta tanda (a lo sumo 15), no las 20.000
+    // filas sin orden que carga loadSeenBounceMsgs. Si no se puede saber, no se procesa: sin el
+    // dedup, cada pasada podía volver a mandar.
+    const _clave = (id) => `ar:${id}`;
+    let _vistos;
+    try {
+      const _rv = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_bounce_seen?msg_id=in.(${allIds.map(id => encodeURIComponent(_clave(id))).join(",")})&select=msg_id`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      );
+      const _fv = _rv.ok ? await _rv.json() : null;
+      if (!Array.isArray(_fv)) { log(`⚠️ scanAutoReplies ${userEmail}: no pude leer qué ausencias ya se procesaron (HTTP ${_rv.status}) — no proceso esta tanda`); return 0; }
+      _vistos = new Set(_fv.map(r => r.msg_id));
+    } catch (e) {
+      log(`⚠️ scanAutoReplies ${userEmail}: no pude leer qué ausencias ya se procesaron (${e.message}) — no proceso esta tanda`);
+      return 0;
+    }
+    const ids = allIds.filter(id => !_vistos.has(_clave(id)));
     if (!ids.length) return 0;
 
     let detected = 0;
@@ -18242,15 +18267,26 @@ async function scanAutoRepliesForUser(token, userEmail) {
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Auto-Submitted&metadataHeaders=X-Auto-Response-Suppress`,
           { headers: { "Authorization": `Bearer ${accessToken}` } }
         );
-        if (!msgRes.ok) continue;
+        if (!msgRes.ok) continue;   // sin marcar: un fallo de red deja el mensaje para la próxima pasada
         const msg = await msgRes.json();
         const headers = msg.payload?.headers || [];
         const fromH = headers.find(h => h.name?.toLowerCase() === "from")?.value || "";
         // Extraer email del FROM (esa fue la dirección que respondió auto)
         const fromMatch = fromH.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
-        if (!fromMatch) continue;
+        if (!fromMatch) { await markBounceMsgSeen(token, _clave(id)); continue; }
         const respondedFrom = fromMatch[0].toLowerCase();
-        if (respondedFrom === userEmail.toLowerCase()) continue;
+        if (respondedFrom === userEmail.toLowerCase()) { await markBounceMsgSeen(token, _clave(id)); continue; }
+        // ── SÓLO SE REINTENTA A QUIEN LE ESCRIBIMOS (2026-09-13) ─────────────────────────────
+        // La búsqueda es por ASUNTO sobre todo el buzón del MB: cualquier mail que diga vacation,
+        // absence o urlaub disparaba un reintento, aunque nunca le hubiéramos escrito a esa
+        // dirección. Mismo principio que el scan de rebotes (25/08).
+        const _leEscribimos = await _leEscribimosA(token, userEmail, respondedFrom);
+        if (_leEscribimos === null) continue;   // no se pudo saber: queda para la próxima pasada
+        if (!_leEscribimos) {
+          log(`  ↩️ ausencia de ${respondedFrom}: nunca le escribimos desde ${userEmail} — no se reintenta`);
+          await markBounceMsgSeen(token, _clave(id));
+          continue;
+        }
         // Verificar header Auto-Submitted si está presente (más confiable que subject)
         const autoSub = headers.find(h => h.name?.toLowerCase() === "auto-submitted")?.value || "";
         const isAutoSubmitted = /auto-replied|auto-generated/i.test(autoSub);
@@ -18269,6 +18305,8 @@ async function scanAutoRepliesForUser(token, userEmail) {
           reason: isAutoSubmitted ? "header_auto_submitted" : "subject_match",
           details: { responded_from: respondedFrom, scan_source: "gmail_inbox_spam_trash" },
         }).catch(() => {});
+        // Procesada → no se vuelve a abrir. Va DESPUÉS del reintento, como en el scan de rebotes.
+        await markBounceMsgSeen(token, _clave(id));
       } catch {}
     }
     if (detected) {
@@ -18401,6 +18439,217 @@ async function scanRealResponsesForUser(token, userEmail) {
 //   6. Si no: freeze 60d
 // ════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════
+// LAS REGLAS DEL REINTENTO, SUELTAS Y PROBADAS (2026-09-13)
+// ────────────────────────────────────────────────────────────────
+// El reintento elegía y mandaba con reglas más flojas que el primer contacto, y justo en el
+// dominio que acababa de rebotar: sin MillionVerifier, sin la ficha fresca del CRM, en castellano
+// a cualquier sitio, y reescribiendo la ficha de Prospects con la lista vieja. Ninguna de estas
+// reglas es nueva: son las del agente, sacadas a funciones para que el reintento no tenga una
+// copia propia que se quede atrás. Tests: tests/reintento_rebote-13-09b.test.js.
+// ════════════════════════════════════════════════════════════════
+
+// Informer (WHOIS) + freemail = el email del REGISTRANTE del dominio, no el contacto comercial
+// (regla del agente del 14/07: nunca sirve y suele rebotar). Es la misma expresión del filtro de
+// runAgentCycle; el test compara las dos para que no se desalineen.
+const _WEBMAIL_DE_REGISTRANTE = /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\.|@mail\.ru\b/i;
+
+/**
+ * Qué hacer con UN candidato, con los hechos ya averiguados. Pura.
+ * @param hechos.rebotado    isBouncedSync de la dirección
+ * @param hechos.noEscribir  _porQueNoEscribirA (el dominio del correo ya rechazó direcciones)
+ * @param hechos.marcaOk     _brandMatches
+ * @param hechos.ruta        decidirVerificacionMV (null = todavía no se preguntó)
+ * @param hechos.mv          _verifyEmailMV (undefined = no se verificó)
+ * @returns "elegir" | "reserva" | "saltear:<motivo>"
+ *
+ * Es la regla del agente (el loop de "salto instantáneo" más su última puerta de MV) con UNA
+ * diferencia pedida por la regla del dueño "dudoso nunca como primer contacto": un `dudoso` no se
+ * elige y se prueba la siguiente dirección, en vez de perder el turno del lead. Un `dudoso` no se
+ * quema; sólo un "no" de MV.
+ */
+function _decidirCandidato(cand, { rebotado = false, noEscribir = "", marcaOk = true, ruta = null, mv } = {}) {
+  const email = String(cand?.email || "");
+  const fuente = _normSrc(cand?.source);
+  if (rebotado) return "saltear:ya_reboto";
+  // La dirección que el MB cargó a mano (future_email) es SU elección: la única que la frena es
+  // un "no existe" de MillionVerifier.
+  if (fuente === "manual") return mv === "no" ? "saltear:mv_no" : "elegir";
+  if (fuente === "informer" && _WEBMAIL_DE_REGISTRANTE.test(email)) return "saltear:informer_webmail";
+  if (noEscribir) return "saltear:dominio_ya_rechazo";
+  if (!marcaOk) return "saltear:otra_marca";
+  if (ruta && ruta.enviar === false) return "saltear:catch_all_y_patron";
+  if (mv === "no") return "saltear:mv_no";
+  if (mv === "dudoso") return "saltear:mv_dudoso";
+  // `riesgo` (catch-all, o MV sin cupo): si la ruta ya decía que MV no puede saber nada (Microsoft
+  // 365, gateways, rol publicado en proveedor confiable), el agente lo manda igual; si la consulta
+  // debía decidir, queda de reserva y se busca uno limpio.
+  if (mv === "riesgo") return ruta && ruta.verificar === false ? "elegir" : "reserva";
+  return "elegir";
+}
+
+/**
+ * Recorre los candidatos YA ORDENADOS y devuelve el primero que se puede mandar.
+ * Hasta `maxMv` consultas a MillionVerifier por reintento (cada una lee toolbar_mv_results antes
+ * de pagar). Un candidato que necesitaría otra consulta con el cupo gastado se saltea: sin
+ * verificar no sale, justo en el dominio que acaba de rebotar.
+ * `rutaMV` / `verificarMV` / `quemar` existen para los tests (sin DNS ni red); en producción son
+ * decidirVerificacionMV, _verifyEmailMV y markEmailBounced.
+ * @returns {{ chosen: object|null, motivos: string[], mvUsados: number, deReserva: boolean }}
+ */
+async function _elegirEnviable(token, cfg, domain, ranked, opts = {}) {
+  const { maxMv = 3, rutaMV = decidirVerificacionMV, verificarMV = _verifyEmailMV, quemar = markEmailBounced } = opts;
+  let mvUsados = 0, reserva = null;
+  const motivos = [];
+  for (const cand of (ranked || [])) {
+    const email = String(cand?.email || "").trim().toLowerCase();
+    if (!email.includes("@")) continue;
+    const fuente = _normSrc(cand.source);
+    const hechos = { rebotado: isBouncedSync(email), noEscribir: _porQueNoEscribirA(email), marcaOk: _brandMatches(email, domain, fuente) };
+    let dec = _decidirCandidato(cand, hechos);
+    if (dec.startsWith("saltear:")) { motivos.push(dec.slice(8)); continue; }
+    const ruta = fuente === "manual" ? null
+      : await Promise.resolve(rutaMV(email, fuente)).catch(() => ({ verificar: true, enviar: true }));
+    dec = _decidirCandidato(cand, { ...hechos, ruta });
+    if (dec.startsWith("saltear:")) { motivos.push(dec.slice(8)); continue; }
+    if (mvUsados >= maxMv) { motivos.push("tope_mv"); continue; }
+    mvUsados++;
+    const mv = await Promise.resolve(verificarMV(token, cfg, email)).catch(() => "riesgo");
+    dec = _decidirCandidato(cand, { ...hechos, ruta, mv });
+    if (mv === "no") {
+      // Igual que el agente: la dirección no existe → se quema para que nadie la vuelva a elegir.
+      Promise.resolve(quemar(token, { email, reason: "mv_undeliverable", evidencia: "verificador", fuente: fuente || null, originalDomain: domain })).catch(() => {});
+    }
+    if (dec === "elegir") return { chosen: cand, motivos, mvUsados, deReserva: false };
+    if (dec === "reserva") { if (!reserva) reserva = cand; continue; }
+    motivos.push(dec.slice(8));
+  }
+  return { chosen: reserva, motivos, mvUsados, deReserva: !!reserva };
+}
+
+// La misma puerta que el agente consulta justo antes de mandar. Pura: `ficha` es lo que devuelve
+// _fichaDelCrm. null = se puede mandar.
+function _motivoNoMandarPorCrm(ficha) {
+  if (ficha?.indeterminado) return "crm:no_verificable";   // ante la duda, NO
+  if (ficha?.enNegociacion) return "crm:en_negociacion";
+  if (ficha?.descansando)   return "crm:descansando";
+  return null;
+}
+
+// Suma a la ficha las direcciones que trajo el rescate, cada una con la VÍA REAL que la encontró
+// (scrape / informer / social / apollo / google_contact), sin duplicar por mayúsculas y sin pisar
+// una fuente que ya estaba. Antes todas quedaban como "rescue" en la base y como "" en memoria,
+// así que una persona de Apollo competía como genérico y su rebote se contaba a "scrape". Pura.
+function _fusionarRescate({ emails = [], sources = {}, vias = new Map() } = {}) {
+  const lista = [], vistos = new Set();
+  for (const e of [...(emails || []), ...vias.keys()]) {
+    const l = String(e || "").trim().toLowerCase();
+    if (!l || vistos.has(l)) continue;
+    vistos.add(l);
+    lista.push(String(e).trim());
+  }
+  const fuentes = { ...(sources || {}) };
+  for (const [e, via] of vias) {
+    const l = String(e || "").trim().toLowerCase();
+    if (l && !fuentes[l]) fuentes[l] = via;
+  }
+  return { emails: lista, email_sources: fuentes };
+}
+
+/**
+ * Cómo queda la ficha de Prospects después de un reintento que salió. Pura.
+ * La dirección nueva va primera y el resto se CONSERVA (incluidos los rescatados que no se
+ * usaron). La que rebotó se saca, salvo que haya sido una ausencia: un fuera de oficina prueba que
+ * la casilla existe (regla del 29/05, "el original queda usable").
+ */
+function _fichaTrasReintento({ emails = [], sources = {}, bouncedEmail = "", retryEmail = "", retrySource = "", conservarRebotado = false } = {}) {
+  const low = (s) => String(s || "").trim().toLowerCase();
+  const rebotado = low(bouncedEmail), nuevo = low(retryEmail);
+  const resto = [], vistos = new Set(nuevo ? [nuevo] : []);
+  for (const e of (emails || [])) {
+    const l = low(e);
+    if (!l || vistos.has(l)) continue;
+    vistos.add(l);
+    if (!conservarRebotado && l === rebotado) continue;
+    resto.push(String(e).trim());
+  }
+  const email_sources = { ...(sources || {}) };
+  if (!conservarRebotado && rebotado) delete email_sources[rebotado];
+  if (nuevo && !email_sources[nuevo]) email_sources[nuevo] = retrySource || "rescue";
+  return { emails: nuevo ? [String(retryEmail).trim(), ...resto] : resto, email_sources };
+}
+
+// ── EL IDIOMA DEL ENVÍO, UNA SOLA REGLA (2026-09-13) ─────────────────────────────────────────
+// El reintento pedía `pickRandomTemplate(lead.language || "es")` sin traer `language` en el select:
+// todo reintento sin pitch guardado —o sea casi todos, las altas del worker guardan pitch ""— salía
+// con la plantilla en CASTELLANO. Acá está la detección del agente (runAgentCycle, "DETECCIÓN
+// ROBUSTA DE IDIOMA"), paso por paso igual: normaliza lo guardado, lo cruza con TLD+GEO, mira la
+// página si falta, discrepa o el país no lo respalda, y fuera de es/en/it/pt/ar va en inglés
+// (decisión del user del 13/07).
+function _hayQueMirarLaPagina(guardado, hintLang) {
+  const g = String(guardado || "").toLowerCase().split("-")[0];
+  const hintDiscrepa = hintLang !== "en" && hintLang !== g && SUPPORTED_AGENT_LANGS.has(hintLang);
+  const guardadoSinRespaldo = !!g && g !== "en" && SUPPORTED_AGENT_LANGS.has(g) && hintLang !== g;
+  return !g || !SUPPORTED_AGENT_LANGS.has(g) || hintDiscrepa || guardadoSinRespaldo;
+}
+function _idiomaEnviable(lang) {
+  const l = String(lang || "").toLowerCase().split("-")[0];
+  return SUPPORTED_AGENT_LANGS.has(l) ? l : "en";
+}
+async function _idiomaParaEnvio({ lead, domain, token }) {
+  const geo = lead?.geo || "";
+  let lang = String(lead?.language || "").toLowerCase().split("-")[0];
+  const hint = await detectLanguageRobust({ geo, domain }, { allowClaudeArbiter: false });
+  if (_hayQueMirarLaPagina(lang, hint.lang)) {
+    const pagina = await fetchPageContent(domain).catch(() => null);
+    if (pagina) {
+      const det = await detectLanguageRobust({
+        htmlLang: pagina.htmlLang, ogLocale: pagina.ogLocale, hreflang: pagina.hreflang,
+        jsonLdLang: pagina.jsonLdLang, pathLang: pagina.pathLang, textSample: pagina.textSample,
+        geo, domain,
+      }, { token });
+      lang = det.lang;
+      log(`  🌐 ${domain}: lang=${det.lang} (${det.source}/${det.confidence}) [${det.reasons?.join(",") || ""}]`);
+      // Se persiste en el mismo caso que el agente (resultado leído de la página), y sólo si el
+      // lead existe en la cola: el lead armado desde el CRM no tiene fila.
+      if (lead?.id) {
+        fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+          method: "PATCH",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({ language: lang }),
+        }).catch(() => {});
+      }
+    } else {
+      const det = await detectLanguageRobust({ geo, domain }, { allowClaudeArbiter: false });
+      lang = det.lang;
+      if (token && (det.confidence === "low" || det.lang === "en") && !geo) {
+        const adivinado = await _claudeLangByContext(token, domain, geo);
+        if (adivinado && adivinado !== lang) lang = adivinado;
+      }
+      log(`  🌐 ${domain}: lang=${lang} (${det.source}/${det.confidence}, sin html)`);
+    }
+  }
+  return _idiomaEnviable(lang);
+}
+
+// ¿Le escribimos alguna vez a esta dirección desde este buzón? true / false / null (no se pudo
+// saber). Mismo criterio que scanBouncesForUser ("solo puede rebotar algo a lo que le escribimos",
+// 25/08): el registro de envíos por dirección, o las acciones del MB de los últimos 90 días.
+async function _leEscribimosA(token, userEmail, email) {
+  const e = String(email || "").trim().toLowerCase();
+  if (!e.includes("@")) return false;
+  if (await _sitioDeLaDireccion(token, e)) return true;
+  try {
+    const desde = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&email_to=eq.${encodeURIComponent(e)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${desde}&select=id&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
+    if (!r.ok) return null;
+    const f = await r.json();
+    return Array.isArray(f) ? f.length > 0 : null;
+  } catch { return null; }
+}
+
 async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
   try {
     // ⚠️ El dominio es el del SITIO al que le escribimos, no el de la dirección que rebotó.
@@ -18415,6 +18664,18 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     if (!domain) return;
     if (!_sitioReal) log(`  ⚠️ bounceRetry ${bouncedEmail}: no sé a qué sitio se le escribió — uso el dominio del correo`);
     log(`🔄 bounceRetry: procesando bounce ${bouncedEmail} (${bounceType}) para ${domain}`);
+    // Un fuera de oficina NO es un rebote: la casilla existe (2026-09-13). Varias reglas de abajo
+    // (sacar la dirección de la ficha, contar para el tope, congelar, "contacto agotado") sólo
+    // tienen sentido cuando algo rebotó de verdad.
+    const _esAusencia = bounceType === "auto_reply";
+    // Todo reintento que NO sale deja rastro (2026-09-13). Con una acción PROPIA, no "skipped": el
+    // parte cuenta los "skipped" como descartes del agente y esto no es del agente.
+    const _registrarSalto = (motivo, extra = {}) => {
+      logAgentAction(token, mbEmail, {
+        domain, action: "bounce_retry_skipped", reason: String(motivo || "").slice(0, 200),
+        details: { bounced: bouncedEmail, bounce_type: bounceType, ...extra },
+      }).catch(() => {});
+    };
 
     // 0. Maxi 2026-06-17 (audit #3): si el DOMINIO está en blocklist global
     // (inoperativo / dead / NSFW), NO intentar retry — es esfuerzo perdido y
@@ -18514,13 +18775,45 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       }
     }
 
+    // 1b. AUSENCIAS: un reintento por dominio y MB cada 7 días (2026-09-13).
+    // El freno de 6 h por dirección no alcanza para un fuera de oficina: el scan de ausencias busca
+    // `newer_than:1d`, así que el mismo mensaje se volvía a ver al día siguiente con las 6 h vencidas
+    // y salía el MISMO pitch a la misma alternativa. Encima la fila de toolbar_bounce_retries de una
+    // ausencia no se graba (el CHECK de bounce_type sólo acepta hard/soft/unknown), así que ni el
+    // freno de 6 h ni el tope la veían. Esto lee el registro de envíos, que sí existe. Ante la duda, no.
+    if (_esAusencia) {
+      const _desde7d = new Date(Date.now() - 7 * 86400_000).toISOString();
+      const _rAus = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mbEmail)}&domain=eq.${encodeURIComponent(domain)}&action=eq.bounce_retry_sent&created_at=gte.${_desde7d}&select=id&limit=1`,
+        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+      ).catch(() => null);
+      const _filasAus = _rAus?.ok ? await _rAus.json().catch(() => null) : null;
+      if (!Array.isArray(_filasAus)) {
+        log(`  ⏸️ ${domain}: no pude ver si ya hubo un reintento por ausencia (HTTP ${_rAus?.status || "red"}) — no reintento`);
+        return;
+      }
+      if (_filasAus.length > 0) {
+        log(`  ⏭️ ${domain}: ya hubo un reintento de ${mbEmail} en los últimos 7 días — una ausencia no dispara otro`);
+        return;
+      }
+    }
+
     // 2. Max attempts global por domain (lifetime): 2 attempts
+    // Las ausencias no cuentan para el tope (2026-09-13): no son rebotes. `or` con `is.null` porque
+    // un `neq` solo de PostgREST dejaría afuera las filas sin bounce_type.
     const allAttemptsRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?domain=eq.${encodeURIComponent(domain)}&select=id&limit=10`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?domain=eq.${encodeURIComponent(domain)}&or=(bounce_type.is.null,bounce_type.neq.auto_reply)&select=id&limit=10`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-9" } }
     );
     const rangeHdr = allAttemptsRes.headers.get("content-range") || "";
     const totalAttempts = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
+    if (totalAttempts >= 2 && _esAusencia) {
+      // Congelar 60 días y vaciar el Email del CRM por un fuera de oficina era perder un contacto
+      // VIVO. Con el tope lleno no se reintenta, y nada más.
+      log(`  ⏭️ ${domain}: ya ${totalAttempts} reintentos por rebote — una ausencia no reintenta ni congela`);
+      _registrarSalto("tope_reintentos", { intentos: totalAttempts });
+      return;
+    }
     if (totalAttempts >= 2) {
       log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d`);
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
@@ -18551,9 +18844,28 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       return;
     }
 
+    // 2b. LA FICHA FRESCA DEL CRM, PARA TODO LEAD Y ANTES DE GASTAR (2026-09-13).
+    // ⚠️ Se pedía sólo cuando el dominio NO estaba en review_queue, que es el caso raro: estar en la
+    // cola es lo normal (el agente no borra la fila al mandar). Para todos los demás el único freno
+    // era el snapshot de bloqueados de hasta 24 h, y el CRM mueve a "En Negociacion" a los 3 minutos
+    // de que alguien contesta: quien contestó a la mañana recibía un reintento en frío a la tarde,
+    // con rescate pago incluido y con la fecha de contacto del CRM pisada. Es la misma puerta que el
+    // agente consulta justo antes de mandar. Una consulta gratis por rebote.
+    // Pedir la respuesta y no mirarla es peor que no preguntar — cuesta lo mismo y da falsa
+    // tranquilidad.
+    const ficha = await _fichaDelCrm(domain, { contarFallo: false });
+    const _motivoCrm = _motivoNoMandarPorCrm(ficha);
+    if (_motivoCrm) {
+      log(`  ⛔ ${domain}: ${_motivoCrm === "crm:no_verificable" ? "no pude consultar el CRM" : _motivoCrm === "crm:en_negociacion" ? `el CRM lo tiene en negociación (${ficha.board})` : `está descansando, faltan ${ficha.diasParaReintentar} días`} — no reintento`);
+      _registrarSalto(_motivoCrm, { board: ficha?.board || null, dias: ficha?.diasParaReintentar || null });
+      return;
+    }
+
     // 3. Encontrar lead en review_queue
+    // `language,geo,geos_all` (2026-09-13): sin ellos la plantilla del reintento salía siempre en
+    // castellano, porque `lead.language` llegaba vacío.
     const leadRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,monday_item_id,emails,email_sources,category,traffic,pitch,pitch_subject,pitch_subjects&order=created_at.desc&limit=1`, // Maxi 2026-07-03 perf: select=* → solo columnas usadas en el flujo de bounce
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,monday_item_id,emails,email_sources,category,traffic,pitch,pitch_subject,pitch_subjects,language,geo,geos_all&order=created_at.desc&limit=1`, // Maxi 2026-07-03 perf: select=* → solo columnas usadas en el flujo de bounce
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!leadRes.ok) { log(`  ⚠️ ${domain}: query lead failed HTTP ${leadRes.status}`); return; }
@@ -18569,25 +18881,8 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       // reintentos de rebote (60 de 594) entraban por acá — leads viejos que existían en el
       // CRM pero nunca pasaron por review_queue. Sin reemplazo, esos rebotes se descartaban
       // con una línea de log y CERO alerta: direcciones muertas que nadie vuelve a intentar.
-      // Ahora se pregunta a la ficha del CRM, que es donde vive ese registro hoy.
-      const ficha = await _fichaDelCrm(domain);
-      if (ficha?.indeterminado) {
-        log(`  ⏭️ ${domain}: no pude consultar el CRM — no reintento ahora`);
-        return;
-      }
-      // ⚠️ Acá se le pedía la ficha FRESCA al CRM y se tiraba su veredicto: sólo se usaba para
-      // armar un lead sintético y seguir mandando. El único freno era el snapshot de hasta 24 h.
-      // Y el CRM mueve a "En Negociacion" a los 3 minutos de que alguien contesta: alguien que
-      // contestó a la mañana podía recibir un reintento a la tarde. Pedir la respuesta y no
-      // mirarla es peor que no preguntar — cuesta lo mismo y da falsa tranquilidad.
-      if (ficha?.enNegociacion) {
-        log(`  ⛔ ${domain}: el CRM lo tiene en negociación (${ficha.board}) — no reintento`);
-        return;
-      }
-      if (ficha?.descansando) {
-        log(`  ⛔ ${domain}: está descansando, faltan ${ficha.diasParaReintentar} días — no reintento`);
-        return;
-      }
+      // Ahora se usa la ficha del CRM (ya consultada y ya revisada arriba), que es donde vive ese
+      // registro hoy.
       if (ficha) {
         log(`  🔎 ${domain}: no estaba en review_queue pero sí en el CRM (${ficha.estado}) — uso lead sintético`);
         lead = {
@@ -18601,6 +18896,8 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           pitch: null,
           pitch_subject: null,
           pitch_subjects: null,
+          language: "",         // la ficha del CRM no trae idioma: se detecta desde la página
+          geo: "",
         };
       }
     }
@@ -18643,10 +18940,22 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     // Si encuentra algo válido lo agregamos al lead y al pool de candidates.
     if (candidates.length === 0) {
       log(`  🔍 ${domain}: 0 alternativas — intentando rescate (scrape + Apollo)...`);
-      const newEmails = new Set();
+      // Cada dirección con la VÍA REAL que la trajo; la primera vía gana (2026-09-13). Antes era un
+      // Set sin origen y todo quedaba "rescue": ver `_fusionarRescate`.
+      const _rebotadaLow = bouncedEmail.toLowerCase();
+      const viaDe = new Map();
+      const _anotar = (e, via) => {
+        const l = String(e || "").trim().toLowerCase();
+        if (l && l !== _rebotadaLow && !viaDe.has(l)) viaDe.set(l, via);
+      };
       try {
-        const scraped = await scrapeEmailsForDomain(domain);
-        scraped.forEach(e => { if (e && e.toLowerCase() !== bouncedEmail.toLowerCase()) newEmails.add(e.toLowerCase()); });
+        // Las mismas vías que polishPool: redes, informer (WHOIS) o el propio sitio.
+        const _informer = new Set(), _redes = new Map();
+        const scraped = await scrapeEmailsForDomain(domain, { informerOut: _informer, socialOut: _redes });
+        scraped.forEach(e => {
+          const l = String(e || "").toLowerCase();
+          _anotar(l, _redes.has(l) ? "social" : (_informer.has(l) ? "informer" : "scrape"));
+        });
       } catch {}
       const cfg2 = await getConfig(token).catch(() => ({}));
       const apolloKey = cfg2.apollo_api_key;
@@ -18656,35 +18965,49 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           // así que vale pagar Apollo para conseguir un decision-maker nuevo aunque el tráfico
           // esté bajo el umbral. Sigue capado por APOLLO_MONTHLY_HARD_CAP (2400/mes).
           const apolloRes = await findBestApolloEmail(domain, apolloKey, token, { traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true });
-          if (apolloRes?.email && apolloRes.email.toLowerCase() !== bouncedEmail.toLowerCase()) {
-            newEmails.add(apolloRes.email.toLowerCase());
-          }
+          if (apolloRes?.email) _anotar(apolloRes.email, "apollo");
         } catch {}
       }
       // Maxi 2026-07-21: FALLBACK Serper/Google contact también en el rescate del REBOTE. Es tu
       // mejor fuente de email (google_contact 32.6%) y acá faltaba — si scrape+apollo no dieron un
       // alternativo, Serper suele encontrarlo. Mismo cap diario (250) y dedup compartido.
-      if (newEmails.size === 0) {
+      if (viaDe.size === 0) {
         const _mDay = _madridNowParts().dateISO;
         if (_serperContactoPermitido(cfg2, token, domain)) {   // en esta función la config se llama cfg2
           const g = await _serperContactSearch(domain).catch(() => null);
-          if (g?.emails?.length) g.emails.forEach(e => { if (e && e.toLowerCase() !== bouncedEmail.toLowerCase()) newEmails.add(e.toLowerCase()); });
+          if (g?.emails?.length) g.emails.forEach(e => _anotar(e, "google_contact"));
         }
       }
       // Filtrar lo que ya bounced o garbage
-      const rescued = [...newEmails].filter(e => !isBouncedSync(e) && rankEmail(e, domain, lead.category || "") >= 0);
+      const rescued = [...viaDe.keys()].filter(e => !isBouncedSync(e) && rankEmail(e, domain, lead.category || "") >= 0);
       if (rescued.length > 0) {
-        log(`  💊 ${domain}: rescate encontró ${rescued.length} email(s) nuevos: ${rescued.join(", ")}`);
+        log(`  💊 ${domain}: rescate encontró ${rescued.length} email(s) nuevos: ${rescued.map(e => `${e} (${viaDe.get(e)})`).join(", ")}`);
         // Persist al lead para que próximas vueltas y otros MBs los vean
-        const mergedEmails = [...(lead.emails || []), ...rescued].filter((e, i, arr) => e && arr.indexOf(e) === i);
-        const mergedSources = { ...(lead.email_sources || {}) };
-        rescued.forEach(e => { if (!mergedSources[e]) mergedSources[e] = "rescue"; });
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-          method: "PATCH",
-          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ emails: mergedEmails, email_sources: mergedSources }),
-        }).catch(() => {});
+        const _fusion = _fusionarRescate({
+          emails: lead.emails || [], sources: lead.email_sources || {},
+          vias: new Map(rescued.map(e => [e, viaDe.get(e)])),
+        });
+        // ⚠️ El lead armado desde el CRM no tiene fila: el PATCH iba a `id=eq.null` y fallaba mudo.
+        if (lead.id) {
+          const _patchRescate = { emails: _fusion.emails, email_sources: _fusion.email_sources };
+          // Misma regla que apolloQuemarCiclo y polishPool: sólo es "encontrado" si no tenía ninguno.
+          if (!(lead.emails || []).length) _patchRescate.email_found_at = new Date().toISOString();
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify(_patchRescate),
+          }).catch(() => {});
+        }
+        // Y en memoria también: el orden de abajo y la ficha final tienen que ver la vía real.
+        lead.emails = _fusion.emails;
+        lead.email_sources = _fusion.email_sources;
         candidates = rescued;
+      } else if (_esAusencia) {
+        // La dirección que mandó el fuera de oficina está VIVA: no hay "contacto agotado", ni
+        // fila que cuente para el tope, ni congelado.
+        log(`  ⏭️ ${domain}: el rescate no trajo otra dirección y ${bouncedEmail} sigue viva (ausencia) — no se congela`);
+        _registrarSalto("sin_alternativa");
+        return;
       } else {
         log(`  ⏭️ ${domain}: rescate sin resultados — marcando failed_all_bounced + freeze 30d`);
         // Marcar bounce retry como skipped
@@ -18750,14 +19073,44 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       });
     if (ranked.length === 0) {
       log(`  ⏭️ ${domain}: candidatos existen pero todos con score negativo — skip`);
+      _registrarSalto("candidatos_score_negativo");
       return;
     }
-    const retryEmail  = ranked[0].email;
-    const retrySource = ranked[0].source || "scrape";
-    log(`  🎯 ${domain}: retry → ${retryEmail} (source=${retrySource}, score=${ranked[0].score})`);
 
-    // 5. Cargar config + send
+    // 4b. A QUIÉN SE LE MANDA: con las reglas del agente, no con `ranked[0]` (2026-09-13).
+    // ⚠️ Salía el primero del orden sin MillionVerifier, sin el veto de informer+webmail, sin la
+    // regla de marca y sin la de "patrón en un proveedor que acepta todo". O sea que, justo en el
+    // dominio que acababa de rebotar, se mandaba a la dirección menos confiable: un rol_mx sin
+    // verificar, el gmail del registrante o un `dudoso` que el agente había salteado.
     const cfg = await getConfig(token);
+    const _eleccion = await _elegirEnviable(token, cfg, domain, ranked, { maxMv: 3 });
+    if (!_eleccion.chosen) {
+      const _resumen = Object.entries(_eleccion.motivos.reduce((a, m) => { a[m] = (a[m] || 0) + 1; return a; }, {}))
+        .map(([m, n]) => `${m}×${n}`).join(",") || "sin_candidatos";
+      log(`  ⏭️ ${domain}: ninguna alternativa se puede mandar (${_resumen}) — no se reintenta`);
+      _registrarSalto(`sin_candidato_enviable:${_resumen}`, { motivos: _eleccion.motivos });
+      // Un rebote real deja la fila (status que la tabla ya acepta) para el freno de 6 h y el tope.
+      // Sin congelar ni avisar "contacto agotado": un `dudoso` no está quemado. Una ausencia no
+      // deja fila: no es un rebote.
+      if (!_esAusencia) {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounce_retries`, {
+          method: "POST",
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+          body: JSON.stringify({
+            domain, mb_email: mbEmail, original_email: bouncedEmail, retry_email: "",
+            bounce_type: bounceType, attempt_number: totalAttempts + 1,
+            status: "skipped_no_alt", reason: `sin_candidato_enviable:${_resumen}`.slice(0, 200),
+          }),
+        }).catch(() => {});
+      }
+      return;
+    }
+    const retryEmail  = _eleccion.chosen.email;
+    const retrySource = _eleccion.chosen.source || "scrape";
+    const _elegido = ranked.find(x => x.email === retryEmail) || _eleccion.chosen;
+    log(`  🎯 ${domain}: retry → ${retryEmail} (source=${retrySource}, score=${_elegido.score}${_eleccion.deReserva ? ", reserva: catch-all o sin verificar" : ""}${_eleccion.motivos.length ? `, salteados: ${_eleccion.motivos.join(",")}` : ""})`);
+
+    // 5. Config ya cargada arriba + send
     const mondayApiKey = (cfg[`monday_api_key_${mbEmail.toLowerCase()}`] || cfg.monday_api_key || "").trim();
 
     // Reusar el pitch del lead (snapshot) o regenerar — preferimos reusar
@@ -18771,8 +19124,17 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     // de verdad, en el idioma del sitio, igual que el primer contacto.
     let subject = lead.pitch_subject || (lead.pitch_subjects?.[0]) || "";
     let body    = lead.pitch || "";
+    let _idiomaEnvio = null, _templateId = null;
     if (!body) {
-      const _tpl = pickRandomTemplate(lead.language || "es");
+      // ⚠️ `pickRandomTemplate(lead.language || "es")` sin `language` en el select = castellano para
+      // todos (2026-09-13). Ahora: el idioma con la regla del agente (`_idiomaParaEnvio`: fuera de
+      // los 5 soportados, inglés — nunca "no reintentar") y la plantilla del MISMO pool que usa el
+      // agente, los borradores que el MB ve en Análisis. Las plantillas del código quedan de
+      // último recurso, como en el agente.
+      _idiomaEnvio = await _idiomaParaEnvio({ lead, domain, token });
+      const _picked = await pickAnyTemplate(token, mbEmail, _idiomaEnvio).catch(() => null);
+      const _tpl = _picked?.template || pickRandomTemplate(_idiomaEnvio);
+      _templateId = _picked?.template ? _picked.templateId : (_tpl?.ref || null);
       if (_tpl) {
         // fillTemplate recibe el template ENTERO y devuelve {body, subjects}.
         // fillTemplate lee `senderName` en camelCase; con `sender_name` el nombre de quien
@@ -18782,15 +19144,19 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           senderName: getSenderName(mbEmail),
           geo: lead.geo || "",
           traffic: lead.traffic || 0,
-          contactName: lead.contact_name || "",
+          // Sin nombre (2026-09-13): el `contact_name` guardado suele ser el de la persona que
+          // acaba de rebotar, y el saludo iría dirigido a ella en otra casilla.
+          contactName: "",
         });
         body    = _lleno.body || "";
-        subject = subject || _lleno.subjects?.[0] || "";
+        // El asunto va con el cuerpo que se eligió; el guardado era de otro pitch.
+        subject = _lleno.subjects?.[0] || subject;
       }
     }
     if (!subject) subject = `Sobre ${domain}`;
     if (!body) {
-      log(`  ⏭️ ${domain}: sin pitch guardado y sin plantilla para "${lead.language || "?"}" — no se reintenta con un texto inventado`);
+      log(`  ⏭️ ${domain}: sin pitch guardado y sin plantilla para "${_idiomaEnvio || "?"}" — no se reintenta con un texto inventado`);
+      _registrarSalto("sin_plantilla", { language: _idiomaEnvio });
       return;
     }
 
@@ -18840,7 +19206,9 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
           body: JSON.stringify({
             user_email: mbEmail, domain, action: "bounce_retry_sent",
             email_to: retryEmail, pitch_subject: subject,
-            details: { original_email: bouncedEmail, bounce_type: bounceType, retry_source: retrySource, source: retrySource },
+            // template_id va en details y NO en la columna: el ranking de plantillas lee la columna,
+            // y un reintento no es un primer contacto.
+            details: { original_email: bouncedEmail, bounce_type: bounceType, retry_source: retrySource, source: retrySource, template_id: _templateId, language: _idiomaEnvio },
           }),
         });
         if (resAct.ok) {
@@ -18851,17 +19219,27 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
 
       // 6a. Update Prospect (review_queue): sacar el email rebotado y poner el
       // nuevo PRIMERO, para que la cola refleje el contacto válido (user 2026-05-29).
+      // ⚠️ Se escribía con la lista leída al principio (2026-09-13): se perdían los rescatados que no
+      // se usaron y cualquier cambio que otro job (auditoría del pool, polish) hubiera hecho mientras
+      // se mandaba. Ahora se relee la fila (GET gratis) y se arma con `_fichaTrasReintento`; si la
+      // relectura falla, se usa lo que hay en memoria, que ya incluye el rescate.
       try {
-        const baseEmails = (lead.emails || []).filter(e => e && e.toLowerCase() !== bouncedEmail.toLowerCase());
-        const newEmails  = [retryEmail, ...baseEmails.filter(e => e.toLowerCase() !== retryEmail.toLowerCase())];
-        const newSources = { ...(lead.email_sources || {}) };
-        delete newSources[bouncedEmail.toLowerCase()];
-        if (!newSources[retryEmail.toLowerCase()]) newSources[retryEmail.toLowerCase()] = retrySource || "rescue";
         if (lead.id) {
+          let _base = { emails: lead.emails || [], sources: lead.email_sources || {} };
+          const _rFila = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}&select=emails,email_sources`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          ).catch(() => null);
+          const _fila = _rFila?.ok ? (await _rFila.json().catch(() => null))?.[0] : null;
+          if (_fila) _base = { emails: Array.isArray(_fila.emails) ? _fila.emails : [], sources: _fila.email_sources || {} };
+          const _nueva = _fichaTrasReintento({
+            emails: _base.emails, sources: _base.sources, bouncedEmail, retryEmail, retrySource,
+            conservarRebotado: _esAusencia,
+          });
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ emails: newEmails, email_sources: newSources }),
+            body: JSON.stringify({ emails: _nueva.emails, email_sources: _nueva.email_sources }),
           }).catch(() => {});
         }
       } catch (e) { log(`  ⚠️ ${domain}: review_queue update FAIL: ${e.message}`); }
@@ -21765,7 +22143,13 @@ let _fichaFallos = 0;
  * En Negociacion a las 10:00 podía recibir un pitch en frío esa misma tarde si el endpoint
  * tenía un hipo. "No sé" tratado como "no" es el patrón que más caro salió en este proyecto.
  */
-async function _fichaDelCrm(domain) {
+// `contarFallo: false` (2026-09-13): `_fichaFallos` es el contador de la IMPORTACIÓN — la corrida
+// lo pone en cero al arrancar y al terminar alerta "N prospectos entraron sin chequear contra el
+// CRM". El reintento por rebote corre en paralelo con la importación, así que un hipo del CRM
+// durante un reintento salía en esa alerta como si hubiera entrado un prospecto sin chequear. Es
+// la misma clase de falso que se limpió hoy en el vigilante. Sin la opción, todo queda igual.
+async function _fichaDelCrm(domain, opts = {}) {
+  const _contarFallo = opts?.contarFallo !== false;
   if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) {
     log(`  ⚠️ ficha: falta CRM_SYNC_SECRET — no puedo verificar ${domain}`);
     return { indeterminado: true };
@@ -21775,7 +22159,7 @@ async function _fichaDelCrm(domain) {
       { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(15000) });
     if (!r.ok) {
       log(`  ⚠️ ficha HTTP ${r.status} para ${domain} — NO se puede dar por libre`);
-      _fichaFallos++;
+      if (_contarFallo) _fichaFallos++;
       return { indeterminado: true };
     }
     const j = await r.json();
@@ -21785,7 +22169,7 @@ async function _fichaDelCrm(domain) {
              descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0 };
   } catch (e) {
     log(`  ⚠️ ficha ${domain}: ${e.message} — NO se puede dar por libre`);
-    _fichaFallos++;
+    if (_contarFallo) _fichaFallos++;
     return { indeterminado: true };
   }
 }
