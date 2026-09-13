@@ -18752,7 +18752,7 @@ async function loadBouncedEmails(token) {
       //                     caído. Había 5 direcciones sanas bloqueadas de por vida por eso.
       // Se filtra por COLUMNA y no por regex sobre el texto del motivo: un `reason` nuevo que
       // nadie previó volvía a colarse como rebote sin que se notara.
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA}&order=email`,
       { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
       { max: 50000 }
     );
@@ -18782,7 +18782,7 @@ async function _cargarDominiosQueRechazan(token) {
   try {
     // De a páginas (2026-09-13): con `limit=5000` PostgREST devolvía 1.000 filas cualesquiera.
     const filas = await _traerTodo(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo,evidencia,fuente&${EVIDENCIA_BLOQUEA}`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo,evidencia,fuente&${EVIDENCIA_BLOQUEA}&order=email`,
       { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
       { max: 50000 });
     if (!Array.isArray(filas)) return;      // no pude leer ≠ nadie rechaza
@@ -27052,7 +27052,9 @@ async function vigilarReputacion(token) {
     // volvieron.
     let rebotados = new Set();
     try {
-      const f = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle,evidencia&order=id`, auth, { max: 100000, entero: true });
+      // Por `email`, su clave (13/09): la tabla no tiene `id`, PostgREST contestaba 400 a `order=id` y esto
+      // se cortaba acá, sin alerta de rebote ni latido. La regla está en tests/lecturas_1000-13-09c.test.js.
+      const f = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle,evidencia&order=email`, auth, { max: 100000, entero: true });
       if (!f) return;
       if (Array.isArray(f)) {
         rebotados = new Set(f
@@ -28261,8 +28263,9 @@ async function _boletinPorSeccion(token, { compartido = null } = {}) {
     try {
       // Sólo envíos del AGENTE (regla del user: estas métricas son del agente); sin tope de filas.
       // Con su 2º email (ACCION_ENVIO_PARA_REBOTE, 2026-09-13): sale del mismo buzón y rebota igual.
-      const _envs = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&details->>ui_origin=is.null&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to`, auth)) || [];
-      const _reb  = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email`, auth)) || [];
+      // De a páginas con orden estable: sin orden, dos páginas pueden repetir o saltear filas.
+      const _envs = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&details->>ui_origin=is.null&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to&order=id`, auth)) || [];
+      const _reb  = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email&order=email`, auth)) || [];
       const _setReb = new Set((_reb || []).map(x => String(x.email || "").toLowerCase()));
       const _porMb = {};
       for (const e of (_envs || [])) {

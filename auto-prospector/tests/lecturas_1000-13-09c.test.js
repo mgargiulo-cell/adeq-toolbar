@@ -350,3 +350,126 @@ test("ningún pedido a la base pide más de 1.000 filas en un solo pedido (worke
   deepStrictEqual(fuera, [], "PostgREST corta en 1.000: el pedido cree que leyó todo y leyó un pedazo. Usar _traerTodo / traerTodo con orden");
   deepStrictEqual(Object.keys(DINAMICOS).filter(k => !vistos.has(k)), [], "una entrada de la lista ya no existe en el código: sacarla para que la lista siga siendo la verdad");
 });
+
+// ── 9. Una columna que la tabla no tiene es una lectura caída ─────────────────────────────────────
+// Toda lectura de a páginas lleva `order=` para que las páginas no repitan ni salteen filas. Pero la
+// columna tiene que existir: PostgREST contesta 400 (42703) a una desconocida, `_traerTodo` devuelve null
+// y lo que dependía de la lista no corre. vigilarReputacion ordenaba toolbar_bounced_emails por `id`, que
+// esa tabla no tiene (su clave es `email`, sql/2026-05-12_bounced_emails.sql): se cortaba antes de la
+// alerta de rebote y del latido 'reputacion', y el parte lo mostraba como job atrasado. npm test daba
+// verde porque ningún test corría la función y la regla de arriba sólo mira `limit=`.
+const esquemaSql = () => {
+  const creadas = new Set();
+  const columnas = new Map();
+  const agregar = (t, c) => { if (!columnas.has(t)) columnas.set(t, new Set()); columnas.get(t).add(c); };
+  const dirSql = path.join(RAIZ, "sql");
+  for (const f of fs.readdirSync(dirSql).filter(f => f.endsWith(".sql"))) {
+    const sql = fs.readFileSync(path.join(dirSql, f), "utf8").replace(/--[^\n]*/g, "");
+    for (const m of sql.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?(?:public\.)?"?(\w+)"?\s*\(/gi)) {
+      const tabla = m[1].toLowerCase();
+      creadas.add(tabla);
+      if (!columnas.has(tabla)) columnas.set(tabla, new Set());
+      const items = [];
+      let prof = 1, item = "";
+      for (let j = m.index + m[0].length; j < sql.length && prof; j++) {
+        const ch = sql[j];
+        if (ch === "(") prof++;
+        if (ch === ")") prof--;
+        if (!prof || (ch === "," && prof === 1)) { items.push(item); item = ""; } else item += ch;
+      }
+      for (const it of items) {
+        const nombre = /^\s*"?(\w+)"?/.exec(it)?.[1]?.toLowerCase();
+        if (nombre && !/^(constraint|primary|unique|foreign|check|exclude|like)$/.test(nombre)) agregar(tabla, nombre);
+      }
+    }
+    for (const m of sql.matchAll(/alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(?:public\.)?"?(\w+)"?([^;]*);/gi)) {
+      const tabla = m[1].toLowerCase();
+      for (const a of m[2].matchAll(/\badd\s+(?:column\s+)?(?:if\s+not\s+exists\s+)?"?(\w+)"?/gi)) {
+        if (!/^(constraint|primary|unique|foreign|check)$/i.test(a[1])) agregar(tabla, a[1].toLowerCase());
+      }
+      for (const a of m[2].matchAll(/\brename\s+column\s+"?\w+"?\s+to\s+"?(\w+)"?/gi)) agregar(tabla, a[1].toLowerCase());
+    }
+  }
+  return { creadas, columnas };
+};
+const columnasDeOrden = (valor) => String(valor).split(",").map(x => x.split(/->|\./)[0].trim().toLowerCase()).filter(Boolean);
+// Las columnas que nombra un pedido: select, order y los filtros (`col=op.valor`).
+const columnasPedidas = (u) => {
+  const out = [];
+  for (const par of String(u).slice(String(u).indexOf("?") + 1).split("&")) {
+    const i = par.indexOf("=");
+    if (i < 0) continue;
+    const k = par.slice(0, i), v = decodeURIComponent(par.slice(i + 1));
+    if (k === "select") out.push(...v.split(",").map(c => c.split("->")[0].trim().toLowerCase()));
+    else if (k === "order") out.push(...columnasDeOrden(v));
+    else if (!/^(limit|offset|and|or|on_conflict|columns)$/.test(k)) out.push(k.split("->")[0].toLowerCase());
+  }
+  return out.filter(Boolean);
+};
+
+test("vigilarReputacion avisa el rebote y late aunque los rebotes de verdad estén pasando la fila 1.000", async () => {
+  const { columnas } = esquemaSql();
+  // Las columnas de la tabla según sql/ más `detalle`, que se agregó desde el panel (GET a la base, 13/09).
+  const cols = new Set([...columnas.get("toolbar_bounced_emails"), "detalle"]);
+  const w = await cargarWorker(["vigilarReputacion"], { fetchFalso: true });
+  const envios = Array.from({ length: 1500 }, (_, i) => ({ user_email: "sales@adeqmedia.com", email_to: `c${i}@medio${i}.com` }));
+  // 1.050 veredictos de MillionVerifier (envíos evitados, no rebotes) y detrás 150 rebotes del SMTP.
+  const tabla = [
+    ...Array.from({ length: 1050 }, (_, i) => ({ email: `mv${i}@otro${i}.com`, reason: "mv_undeliverable", detalle: "", evidencia: "verificador" })),
+    ...Array.from({ length: 150 }, (_, i) => ({ email: `c${i}@medio${i}.com`, reason: "550 No such user", detalle: "", evidencia: "rebote_smtp" })),
+  ];
+  const pedidos = [];
+  globalThis.__fetchFalso = base(pedidos, [
+    [(u, m) => m === "GET" && u.includes("toolbar_agent_actions?action=eq.sent"), (_u, _m, o) => pagina(envios, o)],
+    [(u, m) => m === "GET" && u.includes("toolbar_bounced_emails?"), (u, _m, o) => {
+      const falta = columnasPedidas(u).find(c => !cols.has(c));
+      if (falta) return resp({ code: "42703", message: `column toolbar_bounced_emails.${falta} does not exist` }, { status: 400 });
+      return pagina(tabla, o);
+    }],
+  ]);
+  await w.vigilarReputacion("t");
+
+  const lecturas = pedidos.filter(p => p.u.includes("toolbar_bounced_emails"));
+  ok(lecturas.length >= 2 && lecturas.every(p => /[?&]order=email\b/.test(p.u) && !/limit=/.test(p.u)), `los rebotes, de a páginas y por su clave: ${lecturas[0]?.u}`);
+  const alerta = pedidos.filter(p => p.m === "POST" && p.u.includes("toolbar_notifications")).map(p => JSON.parse(p.b)).find(b => /reputacion-dominio/.test(b.dedup_key || ""));
+  ok(alerta && /Rebote del 10\.0% en 7 días/.test(alerta.title), `con order=id la base contestaba 400 y el rebote del 10% no se avisaba: ${JSON.stringify(alerta)}`);
+  const l = latidoDe(pedidos, "reputacion");
+  deepStrictEqual([l?.last_status, /rebote 10\.00% sobre 1500 envíos/.test(l?.last_detail || "")], ["ok", true], `sin latido el parte lo muestra atrasado: ${JSON.stringify(l)}`);
+});
+
+test("ninguna lectura ordena por una columna que su tabla no tiene, y los rebotes de a páginas van por su clave", () => {
+  const { creadas, columnas } = esquemaSql();
+  const reb = columnas.get("toolbar_bounced_emails");
+  ok(reb?.has("email") && reb.has("evidencia") && reb.has("bounced_at") && !reb.has("id"), `sql/ no se leyó como se esperaba: ${[...(reb || [])]}`);
+  const dir = (rel) => fs.readdirSync(path.join(RAIZ, rel)).filter(f => f.endsWith(".js")).map(f => `${rel}/${f}`);
+  const archivos = ["auto-prospector/index.js", "auto-prospector/discovery.js", "auto-prospector/templates.js",
+    ...dir("auto-prospector/lib"), ...dir("modules"), "popup/popup.js", ...dir("background")];
+  const fuera = [];
+  let revisadas = 0;
+  for (const rel of archivos) {
+    const ast = acorn.parse(leer(rel), { ecmaVersion: "latest", sourceType: "module", locations: true });
+    walk.fullAncestor(ast, (node, _s, anc) => {
+      let txt;
+      if (node.type === "Literal" && typeof node.value === "string") txt = node.value;
+      else if (node.type === "TemplateLiteral") txt = node.quasis.map(q => q.value.cooked ?? q.value.raw).join(" ");
+      else return;
+      const m = /\/rest\/v1\/(\w+)\?([\s\S]*)$/.exec(txt);
+      if (!m) return;
+      const donde = `${rel}:${node.loc.start.line}`;
+      const tablaUrl = m[1].toLowerCase();
+      const orden = /(?:^|&)order=([^& \s#]+)/.exec(m[2])?.[1];
+      const padre = anc[anc.length - 2];
+      const deAPaginas = padre?.type === "CallExpression" && padre.arguments[0] === node
+        && /^_?traerTodo$/.test(padre.callee.name || padre.callee.property?.name || "");
+      if (tablaUrl === "toolbar_bounced_emails" && deAPaginas && !(orden && columnasDeOrden(orden)[0] === "email")) {
+        fuera.push(`${donde} toolbar_bounced_emails de a páginas sin order=email (la tabla no tiene id: su clave es email)`);
+      }
+      if (!orden || !creadas.has(tablaUrl)) return;
+      revisadas++;
+      const faltan = columnasDeOrden(orden).filter(c => !columnas.get(tablaUrl).has(c));
+      if (faltan.length) fuera.push(`${donde} ${tablaUrl} order=${orden}: la tabla no tiene ${faltan.join(", ")}`);
+    });
+  }
+  ok(revisadas >= 20, `se revisaron ${revisadas} lecturas con orden a tablas de sql/: el scan dejó de ver el código`);
+  deepStrictEqual(fuera, [], "PostgREST contesta 400 a una columna que no existe: _traerTodo devuelve null y lo que dependía de la lista no corre. Si la columna se agregó desde el panel, dejar su ALTER en sql/");
+});
