@@ -60,9 +60,14 @@ test("los dos reciclados cruzan contra Prospects con la misma función, y un fal
   deepStrictEqual([...await _dominiosPendientesEnProspects("t", ["diario.com.ar", "otro.pe"])], ["diario.com.ar"]);
   globalThis.__fetchFalso = async () => respuesta({ message: "boom" }, { status: 500 });
   strictEqual(await _dominiosPendientesEnProspects("t", ["diario.com.ar"]), null);
-  ok(/_dominiosPendientesEnProspects\(token, pool\)/.test(cuerpoDe("_feederPullMonday")) && /!_yaEnProspects\.has\(d\)/.test(cuerpoDe("_feederPullMonday")),
+  // Desde la tarde del 13/09 los cuatro filtros de los reciclables viven en `_filtrarReciclables`,
+  // que llaman el barrido y el slot (tests/feeder-13-09b.test.js): el cruce contra Prospects se
+  // verifica adentro de esa regla, y que los dos caminos la usen, acá.
+  const regla = cuerpoDe("_filtrarReciclables");
+  ok(/_dominiosPendientesEnProspects\(token, lista\)/.test(regla) && /!_yaEnProspects\.has\(d\)/.test(regla),
      "el feeder por slot no miraba Prospects: el reciclable volvía a la cola");
-  ok(/_dominiosPendientesEnProspects\(token, todos\)/.test(cuerpoDe("sincronizarFinalizadosDeMonday")), "el barrido diario usa la misma función");
+  ok(/_filtrarReciclables\(token, pool, /.test(cuerpoDe("_feederPullMonday")), "el feeder por slot usa la regla compartida");
+  ok(/_filtrarReciclables\(token, todos, /.test(cuerpoDe("sincronizarFinalizadosDeMonday")), "el barrido diario usa la misma función");
 });
 
 test("borrar la marca de búsqueda de email nunca toca a un lead que ya está pendiente en Prospects", async () => {

@@ -1996,6 +1996,37 @@ async function _countActiveCsvBySource(token, sourceTag) {
   } catch { return 0; }
 }
 
+// ── EL LUGAR EN EL CARRIL SE MIRA CON EL MISMO NÚMERO QUE USA LA INYECCIÓN (2026-09-13) ─────────
+// AutoGoogle y similar decidían si GASTAR (Serper, RapidAPI) mirando el carril FIJO de la tabla
+// (`PER_SOURCE_ACTIVE_CAP.autogoogle`), pero `_injectIntoCsvQueue` corta con el DINÁMICO de
+// `_capDeFuente`, que se ajusta por rendimiento desde el 27/08. AutoGoogle pasa 5-9% y su carril
+// real baja hacia 72: el pre-chequeo veía 180 − 100 = 80 de lugar, pagaba las búsquedas y la
+// inyección decía "carril lleno" → todo al pre-listado, y el slot siguiente lo mismo. Es el "14
+// búsquedas, 54 frescos y CERO encolados" del 10/09: ese día se arregló el aviso, no el gasto.
+// Similar, la que mejor convierte, al revés: se frenaba en 250 con un carril asignado de ~500.
+// Los dos pre-chequeos pasan por acá, y la cuenta falla CERRADO: `_countActiveCsvBySource` da 0
+// si Supabase contesta 401/500, o sea "carril vacío, gastá". Ese contador queda como está para la
+// inyección, sellers y el barrido de Monday, que no pagan nada por descubrir.
+async function _contarActivosCarril(token, sourceTag) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool)&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    if (!res.ok && res.status !== 416) return null;   // 416 = rango vacío: el total igual viene en content-range
+    const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
+    return m ? parseInt(m[1], 10) : null;              // sin total no hay cuenta: no es "cero"
+  } catch { return null; }
+}
+
+async function _lugarEnCarril(token, sourceTag) {
+  const cap = _capDeFuente(sourceTag);
+  const usados = await _contarActivosCarril(token, sourceTag);
+  return usados == null
+    ? { cap, usados: null, lugar: 0, error: true }
+    : { cap, usados, lugar: Math.max(0, cap - usados), error: false };
+}
+
 // ── PRE-LISTADO DE DESCUBRIMIENTO (Maxi 2026-07-17, pedido del user) ─────────────────
 // Estaciona dominios frescos que NO entraron al carril (cupo lleno) en vez de tirarlos.
 // Solo para fuentes que CUESTAN PLATA (autogoogle=Serper, similar=RapidAPI): recuperarlos
@@ -2106,7 +2137,14 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
     const _tirados = _antesVal - domains.length;
     if (_tirados > 0) log(`  🧹 ${sourceTag}: ${_tirados} dominio(s) descartado(s) o unificado(s) antes de encolar`);
   }
-  if (!domains || domains.length === 0) return 0;
+  // opts.returnDomains → devuelve la LISTA de dominios que entraron (no el count). Lo usan
+  // _drainBacklog (borra del pre-listado solo lo que realmente se inyectó) y los dos reciclados
+  // (borran la marca de email solo en lo que entró).
+  // `_empty` va ANTES de la primera salida (2026-09-13): con un lote que quedaba vacío después de
+  // limpiar, esta función devolvía el número 0 aunque le hubieran pedido la lista, y el llamador
+  // leía `.length` de un número → undefined.
+  const _empty = () => (opts.returnDomains ? [] : 0);
+  if (!domains || domains.length === 0) return _empty();
   // CARRIL de la fuente: si ya llenó su cupo activo, no inyectar más.
   const laneCap  = _capDeFuente(sourceTag);   // dinámico por rendimiento; cae al fijo si aún no se calculó
   const laneUsed = await _countActiveCsvBySource(token, sourceTag);
@@ -2115,9 +2153,6 @@ async function _injectIntoCsvQueue(token, domains, sourceTag, opts = {}) {
   // en silencio (`domains.slice(0, laneRoom)`) — dominios frescos ya PAGADOS con créditos de Serper
   // que se tiraban a la basura. Ahora, si la fuente cuesta plata (opts.parkOverflow), el excedente
   // se estaciona en toolbar_discovery_backlog y lo drena un slot posterior GRATIS.
-  // opts.returnDomains → devuelve la LISTA de dominios que entraron (no el count). Lo usa
-  // _drainBacklog para borrar del pre-listado solo lo que realmente se inyectó.
-  const _empty = () => (opts.returnDomains ? [] : 0);
   // opts.resumen → el llamador recibe QUÉ pasó con lo que no entró (2026-09-11). "Encolé 0"
   // tiene tres causas que no se parecen en nada: el carril estaba lleno y el lote quedó
   // estacionado (no se perdió nada), ningún dominio tenía ads.txt (se descartó bien) o la cola
@@ -3230,15 +3265,33 @@ async function _runAutoGoogleSlot(token, slotLabel) {
     }
   } catch {}
   const remaining = Math.max(0, monthlyCap - used);
-  if (remaining <= 0) { log(`🔎 AutoGoogle: cap mensual ${monthlyCap} alcanzado (${used}) — skip`); return; }
+  if (remaining <= 0) {
+    log(`🔎 AutoGoogle: cap mensual ${monthlyCap} alcanzado (${used}) — skip`);
+    // Mismo criterio que el tope diario de abajo (2026-09-13): apagado por tope, no caído. Sin
+    // latido, el vigilante lo daba "atrasado" al día siguiente de agotar el mes.
+    await saludPing(token, "autogoogle", { status: "off", cadenciaMin: 240, detalle: `tope mensual ${used}/${monthlyCap}` }).catch(() => {});
+    return;
+  }
   // Maxi 2026-07-15: PRE-CHECK del carril ANTES de gastar Serper. Bug en logs: se hacían las 200
   // búsquedas (200 créditos) y RECIÉN al inyectar aparecía "carril lleno (180/180) → 0 encolados"
   // = créditos quemados al pedo. Ahora: si el carril autogoogle ya está lleno, NO gasto ni una
   // búsqueda; si queda poco lugar, capo N abajo para no buscar más de lo que puedo inyectar.
-  const _laneCap  = PER_SOURCE_ACTIVE_CAP.autogoogle ?? DEFAULT_SOURCE_CAP;
-  let   _laneUsed = await _countActiveCsvBySource(token, "autogoogle");
-  let   _laneRoom = Math.max(0, _laneCap - _laneUsed);
-  if (_laneRoom <= 0) { log(`🔎 AutoGoogle: carril lleno (${_laneUsed}/${_laneCap}) — NO gasto créditos Serper este slot`); return; }
+  // 2026-09-13: con el carril DINÁMICO, el mismo que usa la inyección, y contando fail-closed
+  // (ver `_lugarEnCarril`). Con el fijo, este chequeo veía lugar que la inyección no daba.
+  const _carril = await _lugarEnCarril(token, "autogoogle");
+  if (_carril.error) {
+    log(`🔎 AutoGoogle: no pude contar el carril — NO gasto créditos Serper este slot`);
+    await saludPing(token, "autogoogle", { status: "fail", cadenciaMin: 240, detalle: "no pude contar el carril: no gasto Serper" }).catch(() => {});
+    return;
+  }
+  let _laneRoom = _carril.lugar;
+  if (_laneRoom <= 0) {
+    log(`🔎 AutoGoogle: carril lleno (${_carril.usados}/${_carril.cap}) — NO gasto créditos Serper este slot`);
+    // Con el carril real (~80), "lleno" pasa a ser lo normal: callarse lo hacía parecer caído
+    // (mismo arreglo que sellers_google y similar_expansion).
+    await saludPing(token, "autogoogle", { status: "ok", cadenciaMin: 240, detalle: `carril lleno (${_carril.usados}/${_carril.cap}): 0 créditos Serper, no hacía falta buscar` }).catch(() => {});
+    return;
+  }
   // ── TURNO HISPANO (Maxi 2026-07-17) ──────────────────────────────────────────────
   // ~50% de los slots del día son hispanos (es-only + países hispanos); el otro ~50%
   // sigue random como venía. Ver _isHispanicSlot: alterna y rota por día.
@@ -3249,10 +3302,16 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   if (!_hispanicSlot) {
     const _recovered = await _drainBacklog(token, "autogoogle", _laneRoom);
     if (_recovered > 0) {
-      _laneUsed = await _countActiveCsvBySource(token, "autogoogle");
-      _laneRoom = Math.max(0, _laneCap - _laneUsed);
+      const _despues = await _lugarEnCarril(token, "autogoogle");
+      if (_despues.error) {
+        log(`🔎 AutoGoogle: recuperé ${_recovered} del pre-listado y no pude volver a contar el carril — NO gasto créditos Serper`);
+        await saludPing(token, "autogoogle", { status: "fail", cadenciaMin: 240, detalle: "no pude contar el carril: no gasto Serper" }).catch(() => {});
+        return;
+      }
+      _laneRoom = _despues.lugar;
       if (_laneRoom <= 0) {
         log(`🔎 AutoGoogle: carril llenado con el pre-listado (${_recovered} recuperados) — 0 créditos gastados este slot 💰`);
+        await saludPing(token, "autogoogle", { status: "ok", cadenciaMin: 240, detalle: `carril llenado con ${_recovered} del pre-listado: 0 créditos Serper` }).catch(() => {});
         return;
       }
     }
@@ -4079,46 +4138,22 @@ async function sincronizarFinalizadosDeMonday(token) {
     }
 
     const dias = parseInt(cfg.monday_reprospect_days || "90", 10) || 90;
-    const recientes = await _dominiosContactadosDesde(token, dias);
-    if (recientes === null) {
+    // Los cuatro filtros —contactados, ya en cola, esperando en Prospects y sin ads.txt en 30
+    // días— viven en `_filtrarReciclables` desde el 13/09, y el feeder por slot usa la MISMA
+    // función: cada filtro que se agregaba acá (Prospects el 25/08, ads.txt el 13/09) quedaba
+    // afuera del otro camino. La historia de cada uno está en la función.
+    const _filtro = await _filtrarReciclables(token, todos, dias);
+    if (_filtro === null) {
       await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "no pude leer los contactados recientes" });
       return 0;   // nunca re-prospectar a ciegas: alguien podría haber recibido el mail ayer
     }
-    const enCola = await _dominiosActivosEnCola(token, todos);
-    // ⚠️ FALTABA MIRAR PROSPECTS (Maxi 2026-08-25). `_dominiosActivosEnCola` solo mira la
-    // COLA. Un dominio que ya pasó la cola y está esperando en Prospects como `pending` no
-    // figuraba en ningún lado, así que el reciclado lo volvía a encolar: 88 dominios
-    // duplicando trabajo y gastando de nuevo el hit de RapidAPI para llegar al mismo lead
-    // que ya teníamos listo para contactar.
-    const _pendProspects = await _dominiosPendientesEnProspects(token, todos);
-    if (_pendProspects === null) log(`  ⚠️ monday: no pude cruzar contra Prospects — sigo sin ese filtro`);
-    const _yaEnProspects = _pendProspects || new Set();
+    const { recientes, enCola, yaEnProspects: _yaEnProspects, sinAds30d: _sinAdsReciente, elegibles: _elegibles } = _filtro;
     if (_yaEnProspects.size) log(`  ℹ️ monday: ${_yaEnProspects.size} ya están esperando en Prospects — no se re-encolan`);
     // ⚠️ EL CORTE Y EL CONTEO ERAN LA MISMA VARIABLE (Maxi 2026-08-25). `reprospectables`
     // guardaba `candidatos.length`, que ya venía cortado por el techo diario, así que el
     // parte comparaba el techo contra sí mismo y siempre concluía "entró todo lo que se
     // podía". Con 5.790 elegibles y un techo de 400, decía que el board quedaba al día.
-    // ── LO QUE YA SE DESCARTÓ SIN ADS.TXT NO SE VUELVE A PROBAR CADA DÍA (2026-09-13) ──────
-    // El 11/09 el carril tenía 695 lugares y entraron 602: la puerta de entrada descartó 93 sin
-    // ads.txt. El CRM los devuelve en el mismo orden, así que al día siguiente volvían a estar
-    // primeros, se volvían a descartar y el resumen pintaba 🟡 por algo ya decidido. Cada "no"
-    // queda en `toolbar_adstxt_audit`; lo descartado en los últimos 30 días no se elige.
-    // Si no se puede leer, se sigue sin este filtro: la puerta de entrada chequea igual.
-    const _sinAdsReciente = new Set();
-    try {
-      const _corte30 = encodeURIComponent(new Date(Date.now() - 30 * 86_400_000).toISOString());
-      const _h = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
-      for (let i = 0; i < todos.length; i += 150) {
-        const lote = todos.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
-        const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?verdict=eq.no&last_checked_at=gte.${_corte30}&domain=in.(${encodeURIComponent(lote)})&select=domain`,
-          { headers: _h, signal: AbortSignal.timeout(10000) });
-        if (!r.ok) continue;
-        const f = await r.json();
-        if (Array.isArray(f)) f.forEach(x => x.domain && _sinAdsReciente.add(String(x.domain).toLowerCase()));
-      }
-    } catch (e) { log(`  ⚠️ reciclables: no pude leer la auditoría de ads.txt (${e.message}) — sigo sin ese filtro`); }
     const _resRec = {};
-    const _elegibles = todos.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d) && !_sinAdsReciente.has(d));
     // El carril `auto_feeder_monday` lo comparte con el feeder por slot. Si ya está lleno,
     // encolar 0 es lo esperado y no una falla: sin mirar el cupo, `_injectIntoCsvQueue`
     // devolvería 0 y el aviso de abajo gritaría por nada (2026-09-11).
@@ -4127,8 +4162,11 @@ async function sincronizarFinalizadosDeMonday(token) {
 
     let encolados = 0;
     if (candidatos.length) {
-      encolados = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true, resumen: _resRec });   // `reactivar` ya es el comportamiento por defecto (on_conflict+merge); se deja como documentación de la intención
-      await _limpiarMarcaDeEmail(token, candidatos).catch(() => {});
+      // `returnDomains` (2026-09-13): la marca de email se borra sólo en los que ENTRARON. Antes se
+      // borraba en todos los candidatos, también en los que la puerta descartó sin ads.txt.
+      const _entraron = await _injectIntoCsvQueue(token, candidatos, "auto_feeder_monday", { reactivar: true, resumen: _resRec, returnDomains: true });   // `reactivar` ya es el comportamiento por defecto (on_conflict+merge); se deja como documentación de la intención
+      encolados = _entraron.length;
+      await _limpiarMarcaDeEmail(token, _entraron).catch(() => {});
     }
     log(`🔁 Reciclables del CRM: ${todos.length} · ${recientes.size ? `${todos.filter(d => recientes.has(d)).length} contactados hace <${dias}d` : "0 recientes"} · ${enCola.size} ya en cola · ${_elegibles.length} elegibles · carril libre ${_libre} → ${encolados} encolados (techo ${_techoDia}/día)`);
     await saludPing(token, "monday_sync", {
@@ -4231,6 +4269,49 @@ async function _dominiosPendientesEnProspects(token, candidatos) {
   return out;
 }
 
+// ── QUÉ RECICLABLE SE PUEDE VOLVER A ENCOLAR: UNA SOLA REGLA PARA LOS DOS CAMINOS (2026-09-13) ──
+// El barrido diario (`sincronizarFinalizadosDeMonday`) y el feeder por slot (`_feederPullMonday`)
+// leen la misma lista del CRM y encolan en el mismo carril, pero cada uno filtraba con su copia.
+// Dos veces pasó lo mismo: un filtro nuevo entraba en el barrido y el slot seguía re-encolando.
+//  · ⚠️ FALTABA MIRAR PROSPECTS (Maxi 2026-08-25). `_dominiosActivosEnCola` solo mira la COLA. Un
+//    dominio que ya pasó la cola y está esperando en Prospects como `pending` no figuraba en
+//    ningún lado, así que el reciclado lo volvía a encolar: 88 dominios duplicando trabajo. El
+//    slot recién lo aprendió la mañana del 13/09.
+//  · LO QUE YA SE DESCARTÓ SIN ADS.TXT NO SE VUELVE A PROBAR CADA DÍA (2026-09-13). El 11/09 el
+//    carril tenía 695 lugares y entraron 602: la puerta de entrada descartó 93 sin ads.txt. El CRM
+//    los devuelve en el mismo orden, así que al día siguiente volvían a estar primeros, se volvían
+//    a descartar y el resumen pintaba 🟡 por algo ya decidido. Cada "no" queda en
+//    `toolbar_adstxt_audit`; lo descartado en los últimos 30 días no se elige. Sólo verdict=no: lo
+//    ilegible (unknown) se sigue reintentando. El slot no tenía este filtro.
+// Contactados sin leer → `null`: nunca re-prospectar a ciegas. Las otras tres lecturas fallan
+// ABIERTO (se sigue sin ese filtro): la puerta de entrada y processCsvItem vuelven a chequear, y
+// la marca de email ya no se borra en leads pending. El orden de entrada se conserva (el slot
+// mezcla la lista antes de filtrar).
+async function _filtrarReciclables(token, dominios, dias) {
+  const lista = Array.isArray(dominios) ? dominios : [];
+  const recientes = await _dominiosContactadosDesde(token, dias).catch(() => null);
+  if (recientes === null) return null;
+  const enCola = await _dominiosActivosEnCola(token, lista).catch(() => new Set());
+  const _pendProspects = await _dominiosPendientesEnProspects(token, lista);
+  if (_pendProspects === null) log(`  ⚠️ reciclables: no pude cruzar contra Prospects — sigo sin ese filtro`);
+  const _yaEnProspects = _pendProspects || new Set();
+  const _sinAdsReciente = new Set();
+  try {
+    const _corte30 = encodeURIComponent(new Date(Date.now() - 30 * 86_400_000).toISOString());
+    const _h = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    for (let i = 0; i < lista.length; i += 150) {
+      const lote = lista.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_adstxt_audit?verdict=eq.no&last_checked_at=gte.${_corte30}&domain=in.(${encodeURIComponent(lote)})&select=domain`,
+        { headers: _h, signal: AbortSignal.timeout(10000) });
+      if (!r.ok) continue;
+      const f = await r.json();
+      if (Array.isArray(f)) f.forEach(x => x.domain && _sinAdsReciente.add(String(x.domain).toLowerCase()));
+    }
+  } catch (e) { log(`  ⚠️ reciclables: no pude leer la auditoría de ads.txt (${e.message}) — sigo sin ese filtro`); }
+  const elegibles = lista.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d) && !_sinAdsReciente.has(d));
+  return { elegibles, recientes, enCola, yaEnProspects: _yaEnProspects, sinAds30d: _sinAdsReciente };
+}
+
 // Borra la marca de "ya le busqué email y no encontré" para que la caza vuelva sobre
 // estos dominios. Al re-prospectar un cliente que cerró ciclo queremos un contacto
 // NUEVO, no el mismo de hace seis meses que quizás ya no trabaja ahí.
@@ -4260,6 +4341,14 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // board de Monday no sabía: los que están en un tablero de negociación, los clientes que
     // facturan y los que están en sus 60 días de descanso.
     const POOL_SIZE = 1000;
+    // Sin lugar en el carril no se pide la lista (2026-09-13). Desde que el slot le da a monday lo
+    // que falta para llenar su carril (ver _runFeederSlot), "lleno" es un caso normal: se late igual,
+    // para que no hacer falta no se lea como estar caído.
+    if (!(targetCount > 0)) {
+      log(`  🌱 reciclables: carril auto_feeder_monday lleno — no hace falta pedirle la lista al CRM este slot`);
+      await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: "carril lleno: no hacía falta reciclar este slot" }).catch(() => {});
+      return 0;
+    }
     if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`); return 0; }
     let pool = [];
     try {
@@ -4292,29 +4381,35 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // regla del negocio es que el re-trabajo no tiene tope. Lo único que hay que
     // respetar es no volver a escribirle demasiado pronto al mismo dominio.
     const _diasReprospect = parseInt((await getConfig(token).catch(() => ({})))?.monday_reprospect_days || "90", 10) || 90;
-    const _recientes = await _dominiosContactadosDesde(token, _diasReprospect).catch(() => null);
-    if (_recientes === null) { log(`  ⚠️ reciclables: no pude leer los contactados recientes — no re-prospecto a ciegas`); return 0; }
-    const _enCola = await _dominiosActivosEnCola(token, pool).catch(() => new Set());
-    // Faltaba mirar Prospects también acá (2026-09-13): ver _dominiosPendientesEnProspects. Si no se
-    // puede leer, se sigue: processCsvItem frena el duplicado gratis y la espera de email ya no se borra.
-    const _pendProspects = await _dominiosPendientesEnProspects(token, pool);
-    if (_pendProspects === null) log(`  ⚠️ reciclables: no pude cruzar contra Prospects — sigo sin ese filtro`);
-    const _yaEnProspects = _pendProspects || new Set();
-    const fresh = pool.filter(d => !_recientes.has(d) && !_enCola.has(d) && !_yaEnProspects.has(d) && !sessionKnown.has(d));
-    if (fresh.length === 0) { log(`  🌱 reciclables: ${pool.length} del CRM, ninguno re-prospectable (todos contactados en los últimos ${_diasReprospect}d o ya en cola)`); return 0; }
+    // Los mismos cuatro filtros que el barrido diario, con la misma función (2026-09-13): el slot no
+    // miraba lo descartado sin ads.txt en 30 días y lo re-bajaba y re-auditaba en cada slot.
+    const _filtro = await _filtrarReciclables(token, pool, _diasReprospect);
+    if (_filtro === null) { log(`  ⚠️ reciclables: no pude leer los contactados recientes — no re-prospecto a ciegas`); return 0; }
+    const fresh = _filtro.elegibles.filter(d => !sessionKnown.has(d));
+    const _fuera = `${_filtro.yaEnProspects.size} ya en Prospects, ${_filtro.sinAds30d.size} sin ads.txt en 30d`;
+    if (fresh.length === 0) {
+      log(`  🌱 reciclables: ${pool.length} del CRM, ninguno re-prospectable (contactados en los últimos ${_diasReprospect}d, ya en cola, ${_fuera})`);
+      await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: `${pool.length} finalizados, ninguno re-prospectable (${_fuera})` }).catch(() => {});
+      return 0;
+    }
     const slice = fresh.slice(0, targetCount);
     slice.forEach(d => sessionKnown.add(d));
     // merge-duplicates: si el dominio ya tiene fila vieja en la cola, se REACTIVA a
     // pending en vez de que el insert se ignore en silencio.
-    const inserted = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday", { reactivar: true });   // idem: la reactivación es el default desde 2026-08-25
+    const _res = {};
+    const _entraron = await _injectIntoCsvQueue(token, slice, "auto_feeder_monday", { reactivar: true, resumen: _res, returnDomains: true });   // idem: la reactivación es el default desde 2026-08-25
+    const inserted = _entraron.length;
     // Y se borra la marca de "ya le busqué email": queremos buscarle uno NUEVO, que es
-    // justo el sentido de volver sobre un cliente que ya cerró ciclo.
-    await _limpiarMarcaDeEmail(token, slice).catch(() => {});
-    log(`  🌱 reciclables: ${pool.length} del CRM, ${fresh.length} re-prospectables (>${_diasReprospect}d sin contacto) → insertados=${inserted}`);
+    // justo el sentido de volver sobre un cliente que ya cerró ciclo. Sólo en los que ENTRARON
+    // (2026-09-13): antes era todo el lote, aunque el carril estuviera lleno o no tuvieran ads.txt.
+    await _limpiarMarcaDeEmail(token, _entraron).catch(() => {});
+    log(`  🌱 reciclables: ${pool.length} del CRM, ${fresh.length} re-prospectables (>${_diasReprospect}d sin contacto; fuera ${_fuera}) → insertados=${inserted}${_res.sinAds ? ` · ${_res.sinAds} sin ads.txt hoy` : ""}`);
     await saludPing(token, "feeder_monday", {
       status: "ok", cadenciaMin: 24 * 60,
-      detalle: `${pool.length} finalizados, ${fresh.length} re-prospectables, ${inserted} encolados`,
-      real: inserted, esperado: Math.min(targetCount, fresh.length),
+      detalle: `${pool.length} finalizados, ${fresh.length} re-prospectables, ${inserted} encolados${_res.sinAds ? `, ${_res.sinAds} sin ads.txt` : ""}`,
+      // Un descarte correcto por ads.txt es trabajo hecho, no rendimiento bajo (mismo criterio
+      // que el barrido: 602 encolados + 93 sin ads.txt = 695 procesados).
+      real: inserted + (_res.sinAds || 0), esperado: Math.min(targetCount, fresh.length),
     });
     return inserted;
   } catch (e) {
@@ -4828,17 +4923,23 @@ async function _feederPullGeo(token, maxInject, sessionKnown) {
   return out;
 }
 
+// Qué etiqueta de la cola es cada fuente del slot. Desde el 13/09 el reparto por rendimiento no la
+// recorre (sólo sellers y majestic compiten, ver _pesosFeeder); queda como referencia.
 const FEEDER_SOURCE_KEYS = [
   { key: "sellers",  tag: "auto_feeder_sellers"  },
   { key: "monday",   tag: "auto_feeder_monday"   },
   { key: "majestic", tag: "auto_feeder_majestic" },
 ];
-const FEEDER_EXPLORE_FLOOR     = 0.15; // cada fuente recibe ≥15% del split (exploración)
-const FEEDER_WEIGHTS_MIN_GROSS = 30;   // bajo este total de brutos en 7d → 1/3 fijo (cold start)
+const FEEDER_EXPLORE_FLOOR     = 0.15; // cada fuente del reparto recibe ≥15% (exploración)
+const FEEDER_PESOS_MIN_MUESTRA = 50;   // procesadas por fuente en 14 días; con menos, mitad y mitad
+// La parte del bruto del slot que va a sellers + majestic. Es la que tenían: con monday clavado en
+// el techo del reparto (70%), a las dos juntas les quedaba 15 + 15. Darles más volumen es otra
+// decisión; acá sólo cambia cómo se reparte esa parte entre ellas.
+const FEEDER_PARTE_SELLERS_MAJESTIC = 0.30;
 
 // Sube las fuentes por debajo del piso y baja proporcionalmente las de arriba.
-function _applyExploreFloor(w, floor) {
-  const keys = ["sellers", "monday", "majestic"];
+// `keys` (2026-09-13): el reparto por rendimiento ahora es de dos fuentes, no de tres.
+function _applyExploreFloor(w, floor, keys = ["sellers", "monday", "majestic"]) {
   const out = { ...w };
   let deficit = 0;
   const above = [];
@@ -4851,52 +4952,54 @@ function _applyExploreFloor(w, floor) {
     for (const k of above) out[k] = Math.max(floor, out[k] - deficit * (out[k] / aboveSum));
   }
   // re-normalizar por si el reparto dejó suma != 1
-  const s = out.sellers + out.monday + out.majestic;
-  return { sellers: out.sellers / s, monday: out.monday / s, majestic: out.majestic / s };
+  const s = keys.reduce((a, k) => a + out[k], 0) || 1;
+  return Object.fromEntries(keys.map(k => [k, out[k] / s]));
+}
+
+// ── EL RENDIMIENTO SE MIDE SOBRE LAS MISMAS FILAS ARRIBA Y ABAJO (2026-09-13) ──────────────────
+// El "efectivo" de monday contaba TODAS las done de `auto_feeder_monday` de 7 días —incluidas las
+// del barrido diario, ~600 por día con la misma etiqueta— y el bruto sólo lo que había metido el
+// slot. El rendimiento daba más de 1 y el reparto quedaba clavado en 70/15/15 para siempre, rinda
+// lo que rinda cada fuente. Y si el barrido había llenado el carril, el slot insertaba 0, el bruto
+// quedaba en 0 y el peso subía todavía más: el 70% del slot se iba a un pull que no metía nada.
+// Ahora, función pura: por etiqueta, `n` = procesadas en la ventana y `ok` = las que llegaron a
+// Prospects (status done), de la misma tabla, así que ok ≤ n siempre. "Ya estaba en Prospects"
+// no cuenta en `n` (mismo criterio que el embudo del 11/09: es el mismo dominio llegando por dos
+// fuentes, no un rechazo). Monday sale del reparto (carril fijo, ver _runFeederSlot).
+function _pesosFeeder(filas, piso = FEEDER_EXPLORE_FLOOR) {
+  const porTag = { auto_feeder_sellers: "sellers", auto_feeder_majestic: "majestic" };
+  const st = { sellers: { n: 0, ok: 0 }, majestic: { n: 0, ok: 0 } };
+  for (const f of Array.isArray(filas) ? filas : []) {
+    const k = porTag[String(f?.source || "")];
+    if (!k) continue;
+    if (f.status === "skipped" && /^ya_estaba_en_prospects/.test(String(f.error_message || ""))) continue;
+    st[k].n++;
+    if (f.status === "done") st[k].ok++;
+  }
+  const debug = `sellers ${st.sellers.ok}/${st.sellers.n} · majestic ${st.majestic.ok}/${st.majestic.n} (14d)`;
+  if (st.sellers.n < FEEDER_PESOS_MIN_MUESTRA || st.majestic.n < FEEDER_PESOS_MIN_MUESTRA) {
+    return { sellers: 0.5, majestic: 0.5, debug: `${debug} · muestra chica: mitad y mitad` };
+  }
+  // Suavizado Beta(1,1): (ok+1)/(n+2), el mismo de antes.
+  const y = { sellers: (st.sellers.ok + 1) / (st.sellers.n + 2), majestic: (st.majestic.ok + 1) / (st.majestic.n + 2) };
+  const suma = y.sellers + y.majestic;
+  const w = _applyExploreFloor({ sellers: y.sellers / suma, majestic: y.majestic / suma }, piso, ["sellers", "majestic"]);
+  return { sellers: w.sellers, majestic: w.majestic, debug };
 }
 
 async function _getFeederSourceWeights(token) {
-  const equal = { sellers: 1 / 3, monday: 1 / 3, majestic: 1 / 3, debug: "equal(coldstart)" };
+  const parejo = (por) => ({ sellers: 0.5, majestic: 0.5, debug: `sin datos (${por}): mitad y mitad` });
   try {
-    const sinceISO = new Date(Date.now() - 7 * 86400_000).toISOString();
+    const desde = new Date(Date.now() - 14 * 86400_000).toISOString();
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
-    // Brutos por fuente (suma de columnas existentes en runs ok últimos 7 días)
-    const runsRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&cron_at=gte.${sinceISO}&select=gross_sellers,gross_monday,gross_majestic`,
-      { headers: auth }
-    );
-    if (!runsRes.ok) return equal;
-    const runs = await runsRes.json();
-    const gross = { sellers: 0, monday: 0, majestic: 0 };
-    for (const r of (runs || [])) {
-      gross.sellers  += parseInt(r.gross_sellers, 10)  || 0;
-      gross.monday   += parseInt(r.gross_monday, 10)   || 0;
-      gross.majestic += parseInt(r.gross_majestic, 10) || 0;
-    }
-    const totalGross = gross.sellers + gross.monday + gross.majestic;
-    if (totalGross < FEEDER_WEIGHTS_MIN_GROSS) return equal; // poca data → arrancar parejo
-    // Efectivos por fuente: rows que llegaron a status='done' con ese source en la ventana
-    const eff = { sellers: 0, monday: 0, majestic: 0 };
-    for (const s of FEEDER_SOURCE_KEYS) {
-      const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&source=eq.${s.tag}&uploaded_at=gte.${sinceISO}&select=id`,
-        { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } }
-      );
-      eff[s.key] = parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
-    }
-    // Yield con suavizado Beta(1,1): (eff+1)/(gross+2)
-    const yld = {
-      sellers:  (eff.sellers  + 1) / (gross.sellers  + 2),
-      monday:   (eff.monday   + 1) / (gross.monday   + 2),
-      majestic: (eff.majestic + 1) / (gross.majestic + 2),
-    };
-    const sum = yld.sellers + yld.monday + yld.majestic;
-    if (!(sum > 0)) return equal;
-    let w = { sellers: yld.sellers / sum, monday: yld.monday / sum, majestic: yld.majestic / sum };
-    w = _applyExploreFloor(w, FEEDER_EXPLORE_FLOOR);
-    w.debug = `eff s/m/j=${eff.sellers}/${eff.monday}/${eff.majestic} gross=${gross.sellers}/${gross.monday}/${gross.majestic}`;
-    return w;
-  } catch { return equal; }
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde}&source=in.(auto_feeder_sellers,auto_feeder_majestic)&select=source,status,error_message&limit=20000`,
+      { headers: auth });
+    if (!r.ok) return parejo(`HTTP ${r.status}`);
+    const filas = await r.json();
+    if (!Array.isArray(filas)) return parejo("respuesta inesperada");
+    return _pesosFeeder(filas, FEEDER_EXPLORE_FLOOR);
+  } catch (e) { return parejo(e.message); }
 }
 
 // ORQUESTADOR: chequea si estamos en slot y si no disparó, dispara
@@ -5016,11 +5119,25 @@ async function _runFeederSlot(token, slotLabel) {
   // Maxi 2026-06-17 (audit #9): sessionKnown ya deduplica entre fuentes — un
   // domain insertado por Sellers no se reinserta por Monday/Majestic. Verificado.
   // El sessionKnown.size final = total únicos insertados en este slot.
+  // ── MONDAY FUERA DEL REPARTO POR RENDIMIENTO (2026-09-13) ─────────────────────────────────
+  // El reparto de tres no medía nada (ver _pesosFeeder): monday quedaba siempre en el 70%. Y
+  // monday ya tenía carril FIJO por la misma razón (27/08): es re-trabajo con un objetivo operativo
+  // —el board de finalizados en cero—, no una fuente que compite por rendimiento.
+  //   · monday: lo que le falta a su carril para llenarse, con el techo diario del barrido;
+  //   · sellers + majestic: la misma parte conjunta que tenían, repartida entre ellas por lo que
+  //     rinde cada una sobre las mismas filas;
+  //   · adstxt y GEO siguen ENCIMA del reparto, con el mismo cupo que tenían (antes salía de
+  //     allocSellers/allocMajestic, que en la práctica eran el 15% del bruto).
   const w = await _getFeederSourceWeights(token);
-  const allocSellers  = Math.max(1, Math.round(targetGross * w.sellers));
-  const allocMonday   = Math.max(1, Math.round(targetGross * w.monday));
-  const allocMajestic = Math.max(1, Math.round(targetGross * w.majestic));
-  log(`  ⚖️ feeder weights: sellers=${(w.sellers * 100).toFixed(0)}% monday=${(w.monday * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
+  const _cfgSlot = await getConfig(token).catch(() => ({}));
+  const _techoMonday = parseInt(_cfgSlot?.monday_sync_techo_dia || "", 10) || MONDAY_SYNC_MAX_POR_DIA;
+  const _libreMonday = Math.max(0, _capDeFuente("auto_feeder_monday") - await _countActiveCsvBySource(token, "auto_feeder_monday"));
+  const allocMonday   = Math.min(_libreMonday, _techoMonday);
+  const _parteSM      = Math.round(targetGross * FEEDER_PARTE_SELLERS_MAJESTIC);
+  const allocSellers  = Math.max(1, Math.round(_parteSM * w.sellers));
+  const allocMajestic = Math.max(1, Math.round(_parteSM * w.majestic));
+  const _cupoEncima   = Math.min(40, Math.max(15, Math.round(targetGross * FEEDER_EXPLORE_FLOOR)));
+  log(`  ⚖️ feeder: sellers=${(w.sellers * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% de ${_parteSM} (por rendimiento) · monday fijo ${allocMonday} (carril libre ${_libreMonday}, techo ${_techoMonday}) — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
   const sessionKnown = new Set();
   const fromSellers  = await _feederPullSellers(token, allocSellers, sessionKnown);
   const fromMonday   = await _feederPullMonday(token, allocMonday, sessionKnown);
@@ -5028,11 +5145,11 @@ async function _runFeederSlot(token, slotLabel) {
   // BONUS renovable: ads.txt → sellers.json (descubre redes/publishers nuevos, $0).
   // Va ENCIMA del split de las 3 (no compite por el yield) — supply extra que
   // crece sola con el tiempo. Cap modesto por slot para acotar el HTTP.
-  const fromAdsTxt = await _feederPullAdsTxtGraph(token, Math.min(40, Math.max(15, allocSellers)), sessionKnown).catch(() => 0);
+  const fromAdsTxt = await _feederPullAdsTxtGraph(token, _cupoEncima, sessionKnown).catch(() => 0);
   // BONUS GEO (2026-09-08): CrUX por país + Wikidata. Un país por slot, rotando. También va
   // ENCIMA del split: la única forma de descubrir por GEO omitiendo a USA es una fuente que
   // nazca por país, y esto es eso. Se mide aparte en el parte (crux / wikidata).
-  const fromGeo = await _feederPullGeo(token, Math.min(40, Math.max(15, allocMajestic)), sessionKnown).catch((e) => { log(`  ⚠️ feeder geo: ${e.message}`); return { crux: 0, wikidata: 0, directorio: 0, pais: "" }; });
+  const fromGeo = await _feederPullGeo(token, _cupoEncima, sessionKnown).catch((e) => { log(`  ⚠️ feeder geo: ${e.message}`); return { crux: 0, wikidata: 0, directorio: 0, pais: "" }; });
   const fromGeoTotal = (fromGeo.crux || 0) + (fromGeo.wikidata || 0) + (fromGeo.directorio || 0);
   log(`  🔎 sessionKnown size: ${sessionKnown.size} dominios únicos insertados (sellers=${fromSellers}+monday=${fromMonday}+majestic=${fromMajestic}+adstxt=${fromAdsTxt}+crux=${fromGeo.crux}+wikidata=${fromGeo.wikidata}+directorio=${fromGeo.directorio || 0})`);
   const grossTotal = fromSellers + fromMonday + fromMajestic + fromAdsTxt + fromGeoTotal;
@@ -5044,7 +5161,7 @@ async function _runFeederSlot(token, slotLabel) {
     gross_sellers: fromSellers, gross_monday: fromMonday, gross_majestic: fromMajestic,
     rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
     rq_valid_before: rqValid,
-    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/${(w.monday * 100).toFixed(0)}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt} geo=${fromGeo.pais}:crux${fromGeo.crux}/wd${fromGeo.wikidata}/dir${fromGeo.directorio || 0}`,
+    notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/fijo${allocMonday}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt} geo=${fromGeo.pais}:crux${fromGeo.crux}/wd${fromGeo.wikidata}/dir${fromGeo.directorio || 0}`,
   });
 }
 
@@ -13072,8 +13189,15 @@ async function runProspectSimilarExpansion(token) {
   // PRE-LISTADO primero: recuperar similares ya PAGADOS que no entraron al carril antes de
   // gastar RapidAPI nuevo. Si llenan el carril, esta corrida no cuesta un hit. Maxi 2026-07-17.
   try {
-    const _cap  = PER_SOURCE_ACTIVE_CAP.auto_feeder_similar ?? DEFAULT_SOURCE_CAP;
-    const _room = Math.max(0, _cap - await _countActiveCsvBySource(token, "auto_feeder_similar"));
+    // Con el carril DINÁMICO y contando fail-closed (2026-09-13, ver `_lugarEnCarril`): con el fijo
+    // de 250, la fuente que mejor convierte se frenaba aunque el reparto le diera ~500.
+    const _carril = await _lugarEnCarril(token, "auto_feeder_similar");
+    if (_carril.error) {
+      log("🔗 similar-exp SKIP: no pude contar el carril — 0 hits RapidAPI");
+      await saludPing(token, "similar_expansion", { status: "fail", cadenciaMin: 60, detalle: "no pude contar el carril: no gasto RapidAPI" }).catch(() => {});
+      return;
+    }
+    const _room = _carril.lugar;
     if (_room <= 0) {
       // Saltear por carril lleno es la decisión CORRECTA —no gasta créditos de RapidAPI—,
       // pero callarse la hacía indistinguible de estar muerto. Se late igual.
@@ -13083,6 +13207,8 @@ async function runProspectSimilarExpansion(token) {
     }
     if (await _drainBacklog(token, "auto_feeder_similar", _room) >= _room) {
       log("🔗 similar-exp: carril llenado con el pre-listado — 0 hits RapidAPI gastados 💰");
+      // Llenar el carril con lo ya pagado es una corrida buena, no una ausencia (2026-09-13).
+      await saludPing(token, "similar_expansion", { status: "ok", cadenciaMin: 60, detalle: "carril llenado con el pre-listado: 0 hits RapidAPI" }).catch(() => {});
       return;
     }
   } catch {}

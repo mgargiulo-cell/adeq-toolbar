@@ -241,8 +241,12 @@ test("email_en_imagen tiene su propia explicación", async () => {
 
 test("los reciclables sin ads.txt no se re-eligen cada día, y cuentan como procesados", () => {
   const fn = entre("async function sincronizarFinalizadosDeMonday(", "async function _dominiosContactadosDesde(");
-  ok(/toolbar_adstxt_audit\?verdict=eq\.no&last_checked_at=gte\./.test(fn), "se lee la auditoría de ads.txt");
-  ok(/!_sinAdsReciente\.has\(d\)/.test(fn), "y lo descartado en 30 días no se elige");
+  // Desde la tarde del 13/09 el filtro vive en `_filtrarReciclables`, que usan el barrido y el feeder
+  // por slot (el slot no lo tenía y re-bajaba lo descartado en cada slot): se busca en la regla.
+  const regla = entre("async function _filtrarReciclables(", "async function _limpiarMarcaDeEmail(");
+  ok(/_filtrarReciclables\(token, todos, dias\)/.test(fn), "el barrido usa la regla compartida");
+  ok(/toolbar_adstxt_audit\?verdict=eq\.no&last_checked_at=gte\./.test(regla), "se lee la auditoría de ads.txt");
+  ok(/!_sinAdsReciente\.has\(d\)/.test(regla), "y lo descartado en 30 días no se elige");
   ok(/resumen: _resRec/.test(fn) && /sin_ads: _resRec\.sinAds/.test(fn), "los descartados de hoy quedan guardados");
   const salud = entre("// ── MONDAY (reciclado hacia cero)", "// ── RE-TRABAJO");
   ok(/_procesados = \(_mSync\.encolados \|\| 0\) \+ _sinAdsHoy/.test(salud), "602 encolados + 93 sin ads.txt = 695 de 695: cumplió");
