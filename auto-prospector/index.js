@@ -965,7 +965,10 @@ async function getDailyGlobalCounters(token) {
         // que hay reserva; que suba día tras día significa que entra más de lo que sale.
         // Se compara contra ayer y se exige, además, que pase de tres rellenos de fondo.
         let _ayer = 0;
-        try { _ayer = parseInt(cfg.next_day_ayer || "0", 10) || 0; } catch {}
+        // `cfg` no existía en esta función (2026-09-13): el ReferenceError lo tragaba el catch y
+        // `_ayer` quedaba siempre en 0, así que "crece contra ayer" era siempre cierto y la alerta
+        // saltaba por tamaño, que es justo lo que se decidió evitar el 02/09.
+        try { const _cfgAyer = await getConfig(token).catch(() => null); _ayer = parseInt(_cfgAyer?.next_day_ayer || "0", 10) || 0; } catch {}
         await setConfigValue(token, "next_day_ayer", String(_atascados)).catch(() => {});
         const _techoCola = WAITING_POOL_CAP * 3;
         if (_atascados > _techoCola && _atascados > _ayer) {
@@ -1853,8 +1856,11 @@ async function _getRecentConversionRate(token) {
     if (vals.length === 0) return null;
     return (vals.reduce((a, b) => a + b, 0) / vals.length) / 100;
   } catch (e) {
-    log(`  ⚠️ ficha: ${e.message} para ${domain} — pasa SIN verificar`);
-    _fichaFallos++;
+    // Este catch era una copia del de la ficha del CRM (2026-09-13): usaba `domain`, que acá no
+    // existe, así que ante un error de red tiraba ReferenceError y cortaba el slot del feeder en
+    // vez de devolver null. Y sumaba a `_fichaFallos`, que alimenta la alerta "entraron sin
+    // chequear contra el CRM". El llamador ya cae en la conversión por defecto con null.
+    log(`  ⚠️ conversión reciente del feeder: ${e.message}`);
     return null;
   }
 }
@@ -3017,7 +3023,18 @@ async function _serperSearch(query, num = 20, gl = "", opts = {}) {
 // email/teléfono/WhatsApp en los snippets. Cuando el scraping normal NO encontró email, gastamos 1
 // búsqueda Serper "<dominio> contato/publicidade/email/telefone" y extraemos email (mismo dominio) +
 // teléfono + WhatsApp de los organic/knowledgeGraph/answerBox. Cost-control: SOLO se llama si no hay email.
-async function _serperContactSearch(domain) {
+// Palabras que delatan una página institucional (contacto, publicidad, legales, equipo…) en
+// cualquiera de los idiomas del pool. A NIVEL DE MÓDULO desde el 13/09: vivía adentro de
+// scrapeEmailsForDomain y `_serperContactSearch` la usaba desde afuera, así que tiraba
+// ReferenceError, el catch lo tragaba y `urlsContacto` salía vacío siempre (desde el 04/08).
+// Sin /g a propósito: la comparten varias funciones y `.test` con /g guarda estado.
+const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impres+z?um|imprint|colofon|colophon|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|inzerc|inzer[aá]t|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|mediaajanlat|media-?ajanlat|advertis|adverteren|advertentie|anunci|diafimisi|diafhmish|oglas|\bmarketing\b|\bcomercial\b|\bcommercial\b|tarifas|rate-?card|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|za-?nas|poioi|despre|tentang|om-?oss|rolunk|equipe?|\bteam\b|\bstaff\b|redac|redaz|ueber-?uns|über-?uns|impronta|zakelijk|\bservice\b|servicio|escrib|escrivan|escreva|contattaci|contacte-?nos|contactez|schreib|ecrivez|écrivez|napis|napiste|napisz|yaz[ıi]n|get-?in-?touch|reach-?us|mail-?us|write-?(?:to-?)?us|drop-?us|talk-?to-?us|anunciate|anuncie|anunciar|advertise-?with|work-?with|colabora|partner|kooperation|samarbete|wspolprac|prensa|presse|stampa|imprensa|basin|sajto|tisk|dossier|brochure/i;
+
+// `geo = ""` (2026-09-13): desde 30c0dae (02/09) la función llamaba extractPhonesFromHtml(text, geo)
+// sin tener `geo`. ReferenceError DESPUÉS de pagarle a Serper → catch → emails vacíos. Por eso
+// "google_contact 0" en todos los mails, siendo la vía que el código describe como la mejor. Con ""
+// el teléfono se trata igual que antes del 02/09; el país se aplica al guardar el lead.
+async function _serperContactSearch(domain, geo = "") {
   if (!SERPER_API_KEY) return { emails: [], phones: [], whatsapps: [] };
   const clean = String(domain || "").replace(/^www\./, "").toLowerCase();
   const base = clean.split(".")[0];
@@ -5410,12 +5427,7 @@ async function runReenrichBadLeads(token) {
         // 4 vías que buscan email ya usan las mismas 3 fuentes.
         if (!foundEmail) {
           const _mDay = _madridNowParts().dateISO;
-          _sembrarTopeSerperContacto(cfg, _mDay);
-          const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
-          if (_serperContactCount < _ccap && !_serperContactTried.has(lead.domain)) {
-            _serperContactTried.add(lead.domain);
-            _serperContactCount++;
-            setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
+          if (_serperContactoPermitido(cfg, token, lead.domain)) {
             const g = await _serperContactSearch(lead.domain).catch(() => null);
             if (g?.emails?.length) {
               const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, lead.domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
@@ -7314,7 +7326,14 @@ function _deobfuscateEmails(text) {
   if (!text) return "";
   // Espacio dentro del dominio — aparece en atributos meta partidos por el CMS.
   // Real en crnobelo.com/impresum: content="… (igor@crnobelo. com) … (emi@crnobelo. com) …"
-  text = String(text).replace(/([a-z0-9._%+\-]{2,})@([a-z0-9.\-]+)\.\s+([a-z]{2,10})\b/gi, "$1@$2.$3");
+  // ⚠️ PEGABA LA ORACIÓN SIGUIENTE AL EMAIL (2026-09-13). El dominio aceptaba puntos y la regla
+  // ignoraba mayúsculas, así que todo email que cierra una oración se comía la palabra que sigue:
+  // "info@psycho-test.org. The methodology" → info@psycho-test.org.the (el ranking lo tiró y el
+  // lead quedó sin email, parte del 10/09), y "publicidad@site.es. De lunes" → publicidad@site.es.de,
+  // que puntúa 50 y entraba a Prospects como contacto. Ahora sólo se une un dominio SIN punto (al
+  // que le falta el TLD, que es el caso crnobelo) con un TLD en minúscula: una oración que empieza
+  // con mayúscula nunca se pega. La extensión no tiene este paso y ya extraía bien.
+  text = String(text).replace(/([a-zA-Z0-9._%+\-]{2,})@([a-zA-Z0-9\-]+)\.\s+([a-z]{2,10})\b/g, "$1@$2.$3");
   text = text
     .replace(/&#0*64;|&#x0*40;/gi, "@").replace(/&#0*46;|&#x0*2e;/gi, ".")
     .replace(/&commat;/gi, "@").replace(/&period;/gi, ".");
@@ -7854,7 +7873,7 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // fale-conosco), TR (iletisim/reklam/hakkimizda), HU (kapcsolat/hirdet), ID (kontak/hubungi/iklan),
   // VN (lien-he/quang-cao), FI (yhtey/maino), GR (epikoin), SE/NO (annons/om-oss), IS (auglys), PL/CZ/RU
   // (kontak/kontakty/reklam/o-nas), RO (despre). Caso testigo: sorteador.com.br → /contato.
-  const CONTACT_HINT = /contact|contacto|contato|contatt|fale[-_ ]?conosco|kontak|kontakty|iletis|kapcsolat|hubungi|lien[-_ ]?he|yhtey|epikoin|impres+z?um|imprint|colofon|colophon|mentions?-?l[eé]gal|aviso-?legal|note-?legal|\blegal\b|publicidad|publicidade|publicit[eé]|pubblicit|werbung|reklam|inzerc|inzer[aá]t|hirdet|iklan|quang[-_ ]?cao|annons|auglys|maino|mediadaten|media-?kit|mediaajanlat|media-?ajanlat|advertis|adverteren|advertentie|anunci|diafimisi|diafhmish|oglas|\bmarketing\b|\bcomercial\b|\bcommercial\b|tarifas|rate-?card|about|sobre|qui[eé]n|quem-?somos|chi-?siamo|nosotros|hakkimizda|o-?nas|za-?nas|poioi|despre|tentang|om-?oss|rolunk|equipe?|\bteam\b|\bstaff\b|redac|redaz|ueber-?uns|über-?uns|impronta|zakelijk|\bservice\b|servicio|escrib|escrivan|escreva|contattaci|contacte-?nos|contactez|schreib|ecrivez|écrivez|napis|napiste|napisz|yaz[ıi]n|get-?in-?touch|reach-?us|mail-?us|write-?(?:to-?)?us|drop-?us|talk-?to-?us|anunciate|anuncie|anunciar|advertise-?with|work-?with|colabora|partner|kooperation|samarbete|wspolprac|prensa|presse|stampa|imprensa|basin|sajto|tisk|dossier|brochure/i;
+  // CONTACT_HINT vive a nivel de módulo (2026-09-13): la usa también _serperContactSearch.
   const base   = `https://${domain}`;
 
   // ── ANTI SLUG-DE-NOTA (auditoría empírica 2026-08-04) ───────────────────────────────────
@@ -8246,10 +8265,13 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
   // práctica que hacen." Exacto: Google ya indexó la página de contacto del sitio, así que en
   // vez de adivinar rutas le preguntamos. Sirve sobre todo cuando el home no linkea el contacto
   // o cuando el sitio nos bloquea el crawl pero Google sí tiene el contenido cacheado.
-  // Capeado por el mismo contador diario de Serper que ya existe.
+  // Capeado por el mismo contador diario de Serper que las otras cuatro vías (2026-09-13). Antes el
+  // comentario lo decía y el código no lo hacía: sin tope, sin contador y sin anotar el dominio, así
+  // que polishPool y el agente volvían a pagar el mismo dominio minutos después.
   if (_hayTiempo() && !_hasReal && SERPER_API_KEY) {
     try {
-      const g = await _serperContactSearch(domain).catch(() => null);
+      const _cfgSerper = await getConfig(_workerToken).catch(() => null);
+      const g = _serperContactoPermitido(_cfgSerper, _workerToken, cleanDomain) ? await _serperContactSearch(domain).catch(() => null) : null;
       for (const em of (g?.emails || [])) {
         const lo = String(em).toLowerCase();
         if (!_esPseudoEmailDeAsset(lo) && !detectarTrampaEmail(lo)) {
@@ -8257,13 +8279,16 @@ async function scrapeEmailsForDomain(domain, opts = {}) {
           if (urlByEmail && !urlByEmail.has(lo)) urlByEmail.set(lo, `https://${cleanDomain}`);
         }
       }
-      const urlsG = (g?.urlsContacto || []).filter(u => !seenUrl.has(u)).slice(0, 4);
+      // Mismo filtro institucional que la fase 2 (2026-09-13): con CONTACT_HINT funcionando,
+      // "/noticias/…-sobre-la-publicidad-oficial" también matchea, y sin esto el cupo de 4 páginas
+      // se iba en notas. Y el bucle respeta el reloj, como el salto a la casa editora.
+      const urlsG = (g?.urlsContacto || []).filter(u => !seenUrl.has(u)).filter(_esRutaInstitucional).slice(0, 4);
       if (urlsG.length) {
         log(`  🔍 ${domain}: Google indexó ${urlsG.length} página(s) de contacto → las bajo`);
         for (const u of urlsG) seenUrl.add(u);
         for (const u of urlsG) {
           await tryFetch(u, 6000);
-          if (_tenemosContactoBueno(emails, cleanDomain)) break;
+          if (_tenemosContactoBueno(emails, cleanDomain) || !_hayTiempo()) break;
         }
       }
       _hasReal = _tenemosContactoBueno(emails, cleanDomain);
@@ -11905,6 +11930,24 @@ function _sembrarTopeSerperContacto(cfg, dia) {
   _serperContactCount = persistido.startsWith(dia + ":") ? (parseInt(persistido.split(":")[1], 10) || 0) : 0;
   _serperContactTried.clear();
 }
+
+// ── UN SOLO GUARDIÁN PARA EL TOPE DE SERPER CONTACTO (2026-09-13) ─────────────────────────
+// El control (sembrar, mirar tope, no repetir dominio, contar, persistir) estaba copiado en cuatro
+// vías, y una quinta —dentro de scrapeEmailsForDomain— decía "capeado por el mismo contador" sin
+// hacer nada de eso: no contaba ni anotaba el dominio, así que polishPool y el agente pagaban dos
+// veces el mismo dominio en la misma vuelta. Ahora las cinco pasan por acá. Sin config, no se gasta.
+function _serperContactoPermitido(cfg, token, domain) {
+  if (!cfg) return false;
+  const dia = _madridNowParts().dateISO;
+  _sembrarTopeSerperContacto(cfg, dia);
+  const cap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
+  const d = String(domain || "").replace(/^www\./, "").toLowerCase();
+  if (!d || _serperContactCount >= cap || _serperContactTried.has(d)) return false;
+  _serperContactTried.add(d);
+  _serperContactCount++;
+  setConfigValue(token, "serper_contact_used", `${dia}:${_serperContactCount}`).catch(() => {});  // SIEMPRE: un restart perdía la cuenta
+  return true;
+}
 // Maxi 2026-07-15: ritmo subido para pulir el pool grande (1133 pendientes) en horas, no días.
 // Seguro ahora que (a) el cursor commitea por wave (sobrevive restarts) y (b) se arregló el OOM.
 // Es red-bound (fetch+scrape), no memoria → más concurrencia impacta poco en RSS.
@@ -12475,12 +12518,7 @@ async function polishPool(token) {
         //    AutoGoogle (que sigue buscando DOMINIOS nuevos para el cascade).
         if (!foundEmail && curEmails.length === 0) {
           const _mDay = _madridNowParts().dateISO;
-          _sembrarTopeSerperContacto(cfg, _mDay);
-          const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
-          if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
-            _serperContactTried.add(domain);
-            _serperContactCount++;
-            setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
+          if (_serperContactoPermitido(cfg, token, domain)) {
             const g = await _serperContactSearch(domain).catch(() => null);
             if (g) {
               if (g.emails.length) {
@@ -18300,12 +18338,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       // alternativo, Serper suele encontrarlo. Mismo cap diario (250) y dedup compartido.
       if (newEmails.size === 0) {
         const _mDay = _madridNowParts().dateISO;
-        _sembrarTopeSerperContacto(cfg2, _mDay);   // en esta función la config se llama cfg2
-        const _ccap = parseInt((cfg2.serper_contact_daily_cap) || "250", 10) || 250;
-        if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
-          _serperContactTried.add(domain);
-          _serperContactCount++;
-          setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
+        if (_serperContactoPermitido(cfg2, token, domain)) {   // en esta función la config se llama cfg2
           const g = await _serperContactSearch(domain).catch(() => null);
           if (g?.emails?.length) g.emails.forEach(e => { if (e && e.toLowerCase() !== bouncedEmail.toLowerCase()) newEmails.add(e.toLowerCase()); });
         }
@@ -22505,12 +22538,7 @@ async function runAgentCycle(token, allFlags) {
               // ~200 veces por día. Medido: ~1500 llamadas reales contra un cap de 250.
               // Mismo patrón que ya usa _verifyEmailMV: al cambiar de día O tras un restart
               // (_serperContactDay arranca vacío), re-sembrar desde el valor persistido.
-              _sembrarTopeSerperContacto(cfg, _mDay);
-              const _ccap = parseInt(cfg.serper_contact_daily_cap || "250", 10) || 250;
-              if (_serperContactCount < _ccap && !_serperContactTried.has(domain)) {
-                _serperContactTried.add(domain);
-                _serperContactCount++;
-                setConfigValue(token, "serper_contact_used", `${_mDay}:${_serperContactCount}`).catch(() => {});  // SIEMPRE, no cada 10: un restart perdía la cuenta
+              if (_serperContactoPermitido(cfg, token, domain)) {
                 const g = await _serperContactSearch(domain).catch(() => null);
                 if (g?.emails?.length) serperEmails = g.emails;
                 if (g && !serperPhone) {

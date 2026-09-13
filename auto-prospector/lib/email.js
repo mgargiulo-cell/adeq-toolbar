@@ -1228,7 +1228,13 @@ export const GARBAGE_DOMAIN_PATTERN = new RegExp([
   // Mailing list managers
   "list-server|listserv\\.|mailman\\.|maillists?\\.",
   // Test / fake / local
-  "example\\.(?:com|org|net)|test\\.(?:com|org|net)|localhost|invalid|local",
+  // ⚠️ ESTA LÍNEA NO ESTABA ANCLADA (2026-09-13). "local" y "test\.(com|org|net)" pegaban en
+// cualquier parte del email: diariolocal.com, localnews.com.ar, psycho-test.org, speedtest.net,
+// latest.com y hasta publicidadlocal@clarin.com daban -1, y la auditoría del pool los BORRABA
+// de Prospects como basura. Ahora sólo cuentan los dominios reservados de verdad: example.com,
+// test.com, localhost y los TLD .local/.invalid/.test/.example. Lookahead y no `$`: rankEmail no
+// hace trim, y un "x@example.com." con punto final tiene que seguir siendo basura.
+"(^|[.@])(?:example|test)\\.(?:com|org|net)(?![a-z0-9-])|(^|[.@])localhost(?![a-z0-9-])|\\.(?:local|invalid|test|example|localhost)(?![a-z0-9-])",
 ].join("|"), "i");
 
 export const GENERIC_LOCAL = /^(info|contact|hello|hi|sales|support|ventas|comercial|prensa|press|editor|editorial|redaccion|redacción|mail|email)@/i;
