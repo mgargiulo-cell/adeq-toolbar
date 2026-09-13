@@ -25,6 +25,7 @@ import * as acorn from "acorn";
 import { cargarWorker } from "./_worker-exportado.mjs";
 import * as E from "../lib/email.js";
 import { emailDeCola, avisoDeCola } from "../../modules/colaEstado.js";
+import { isGarbageEmail } from "../../modules/emailVerifier.js";
 
 const aqui = path.dirname(fileURLToPath(import.meta.url));
 const popup = fs.readFileSync(path.join(aqui, "..", "..", "popup", "popup.js"), "utf8");
@@ -299,6 +300,149 @@ test("I12: el orden semanal de tipos llega a la extensión y se aplica igual que
   ok(/_asegurarOrdenTiersExtension\(_reordenarAnalisisTrasOrden\)/.test(fuenteDe("renderEmailList")), "Análisis lo pide y se reordena si cambia");
   ok(/_asegurarOrdenTiersExtension\(\(\) => \{ if \(card\.isConnected\) renderProspectEmailList\(\); \}\)/.test(popup), "la tarjeta también");
   ok(/const orden = ordenDeTiersValido\(g\?\.orden\);/.test(cuerpoWorker("async function _cargarTierOrden(")), "el worker valida igual");
+});
+
+// ── I12 (ronda final): el orden semanal llega a TODAS las tarjetas y cambia la preselección ─────────
+// La revisión integrada lo reprodujo con el código real: la lectura del orden guardaba un solo aviso (el de
+// la primera tarjeta; la página dibuja 50 de un tirón) y, aun en esa tarjeta, el redibujo conservaba la
+// preselección AUTOMÁTICA hecha con el orden por defecto. El test de arriba ponía el orden a mano antes de
+// ordenar y buscaba el aviso con una regex: no lo veía. Acá corre el código EXACTO de las dos listas
+// (renderEmailList y la de la tarjeta) sobre un DOM mínimo, con la lectura en curso mientras se dibujan.
+function _coincideSelector(el, sel) {
+  const m = /^((?:\.[\w-]+)+)((?::not\(\.[\w-]+\))*)$/.exec(String(sel).trim());
+  if (!m) throw new Error(`selector no soportado por el DOM de prueba: ${sel}`);
+  const si = m[1].split(".").filter(Boolean), no = [...m[2].matchAll(/:not\(\.([\w-]+)\)/g)].map(x => x[1]);
+  return si.every(c => el._clases.has(c)) && !no.some(c => el._clases.has(c));
+}
+function elementoFalso(clases = "", datos = {}) {
+  const el = { isConnected: true, style: {}, value: "", textContent: "", title: "", dataset: { ...datos }, _hijos: [], _oyentes: {},
+               _clases: new Set(String(clases).split(/\s+/).filter(Boolean)) };
+  el.classList = { add: (...c) => c.forEach(x => el._clases.add(x)), remove: (...c) => c.forEach(x => el._clases.delete(x)), contains: (c) => el._clases.has(c) };
+  el.addEventListener = (tipo, fn) => { (el._oyentes[tipo] ||= []).push(fn); };
+  el.querySelectorAll = (sel) => el._hijos.filter(h => _coincideSelector(h, sel));
+  el.querySelector = (sel) => el.querySelectorAll(sel)[0] || null;
+  el.closest = (sel) => (_coincideSelector(el, sel) ? el : null);
+  el.remove = () => {};
+  Object.defineProperty(el, "className", { get: () => [...el._clases].join(" "), set: (v) => { el._clases = new Set(String(v).split(/\s+/).filter(Boolean)); } });
+  // innerHTML: cada etiqueta de apertura es un hijo con sus clases y sus data-* (los selectores del popup son todos por clase).
+  Object.defineProperty(el, "innerHTML", { get: () => "", set: (html) => {
+    el._hijos = [...String(html).matchAll(/<[a-z]+\b([^>]*)>/gi)].map(([, attrs]) => elementoFalso(/\bclass="([^"]*)"/.exec(attrs)?.[1] || "",
+      Object.fromEntries([...attrs.matchAll(/\bdata-([\w-]+)="([^"]*)"/g)].map(([, k, v]) => [k.replace(/-(\w)/g, (_, l) => l.toUpperCase()), v]))));
+  } });
+  return el;
+}
+const clickFalso = (el) => (el._oyentes.click || []).forEach(fn => fn({ target: el, preventDefault() {}, stopPropagation() {} }));
+const seleccionada = (listEl) => listEl.querySelector(".email-chip.selected")?.dataset.email || "";
+
+function declaracionDe(nombre) {
+  const n = _arbolPopup.body.find(s => s.type === "VariableDeclaration" && s.declarations.some(d => d.id?.name === nombre));
+  ok(n, `popup.js no tiene la declaración top-level ${nombre}`);
+  return popup.slice(n.start, n.end);
+}
+function trozoDelPopup(desde, hasta) {
+  const i = popup.indexOf(desde);
+  ok(i >= 0, `no encontré "${desde}"`);
+  const j = popup.indexOf(hasta, i);
+  ok(j > i, `no encontré "${hasta}" después de "${desde}"`);
+  return popup.slice(i, j);
+}
+// Las dos listas con su código exacto. La lectura de toolbar_config queda colgada hasta `soltarOrden()`.
+function listasDelPopup({ orden, state }) {
+  let soltar = null;
+  const lecturas = [];
+  const fetchFalso = (url) => { lecturas.push(url); return new Promise(r => { soltar = () => r(resp([{ value: JSON.stringify({ orden, medido: {}, fecha: "2026-09-13" }) }])); }); };
+  const ids = Object.fromEntries(["email-result", "email-list", "email-verify-badge", "form-email", "form-email-futuro", "form-email-futuro-2", "form-email-futuro-3"].map(id => [id, elementoFalso(id)]));
+  const document = { getElementById: (id) => ids[id] || null };
+  const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  const nombres = ["_ctxEmailsAnalisis", "_ctxEmailsProspecto", "_fuenteTextoClient", "_rankClient", "_motivoReboteClient", "_emailPickTierClient",
+                   "_ordenarEmailsClient", "_elegirPreseleccionClient", "_asegurarOrdenTiersExtension", "_ordenCambioDesdeElDibujo",
+                   "_reordenarAnalisisTrasOrden", "_redibujarAnalisisConservandoEleccion", "renderEmailList"];
+  const codigo = [declaracionDe("_ordenTiersExtension"), declaracionDe("_alCambiarOrdenTiers"), ...nombres.map(fuenteDe)].join("\n");
+  // renderProspectEmailList es un const adentro de initProspectCard: se arma con su card, sus emails y su lead.
+  const tarjeta = trozoDelPopup("const renderProspectEmailList = () => {", "renderProspectEmailList();\n\n");
+  const fabrica = new Function("state", "document", "fetch", "CONFIG", "rankEmail", "vetoDuroEmail", "esRegistranteWebmail", "motivoRebote", "_rebotesExtension",
+    "tierDeEmail", "compararCandidatosEmail", "ordenDeTiersValido", "isGarbageEmail", "esc", "_emailVerifyCache", "_verifyClass", "_emailGrade",
+    "_renderVerifyBadge", "autoVerifyEmailChips", "chrome", "_asegurarRebotesExtension", "_reordenarAnalisisTrasRebotes",
+    `${codigo}\nfunction crearTarjeta(card, data) { const emails = data.emails; ${tarjeta} return renderProspectEmailList; }\nreturn { ${nombres.join(", ")}, _ordenTiersExtension, crearTarjeta };`);
+  const p = fabrica(state, document, fetchFalso, { SUPABASE_URL: "https://x.supabase.co", SUPABASE_ANON_KEY: "anon" }, E.rankEmail, E.vetoDuroEmail, E.esRegistranteWebmail,
+    E.motivoRebote, { cache: { set: new Set(), ts: 0 }, porDominio: new Map() }, E.tierDeEmail, E.compararCandidatosEmail, E.ordenDeTiersValido, isGarbageEmail, esc,
+    new Map(), () => "verify-pending", () => ({ grade: "B", label: "" }), () => {}, async () => {}, { tabs: { create() {} } }, () => {}, () => {});
+  // Una tarjeta de Prospects: el campo "Email" arranca con la preselección de renderProspectCard (mismo orden que el primer dibujo).
+  const tarjetaFalsa = (lead) => {
+    const partes = Object.fromEntries([".pcard-email-list", ".pcard-email-monday", ".pcard-email-manual", ".pcard-future-1", ".pcard-future-2", ".pcard-future-3"]
+      .map(s => [s, elementoFalso(s.slice(1))]));
+    const card = { isConnected: true, querySelector: (s) => partes[s] || null };
+    const ctx = p._ctxEmailsProspecto(lead);
+    partes[".pcard-email-monday"].value = p._elegirPreseleccionClient(p._ordenarEmailsClient(lead.emails, ctx), ctx);
+    return { lista: partes[".pcard-email-list"], campo: partes[".pcard-email-monday"], dibujar: p.crearTarjeta(card, lead) };
+  };
+  return { p, ids, lecturas, tarjetaFalsa, soltarOrden: async () => { ok(soltar, "la lectura del orden no arrancó"); soltar(); await new Promise(r => setTimeout(r, 10)); } };
+}
+const ORDEN_GUARDADO = ["persona", "rol", "apollo", "generico"];
+const agenteConOrden = (lista, fuentes, orden) => lista
+  .map(e => ({ email: e, source: fuentes[e] || "", score: E.rankEmail(e, D, "") }))
+  .filter(x => x.score >= 0).filter(x => !E.esRegistranteWebmail(x.email, x.source))
+  .sort((a, b) => E.compararCandidatosEmail(a, b, { sourceRank: E.SOURCE_RANK_DEFAULT, orden }))[0]?.email || "";
+const leadDe = (id, locales) => {
+  const emails = locales.map(l => `${l}@${D}`);
+  return { id, domain: D, category: "", emails, email_sources: Object.fromEntries(emails.map(e => [e, "scrape"])) };
+};
+
+test("I12: las tarjetas dibujadas con la lectura del orden en curso terminan con la dirección del agente; la elección a mano se conserva", async () => {
+  const { lecturas, tarjetaFalsa, soltarOrden } = listasDelPopup({ orden: ORDEN_GUARDADO, state: { accessToken: "tok" } });
+  const L1 = leadDe(1, ["publicidad", "juan.perez", "info"]), L2 = leadDe(2, ["ventas", "maria.lopez"]);
+  const t1 = tarjetaFalsa(L1), t2 = tarjetaFalsa(L2), t3 = tarjetaFalsa(L1), t4 = tarjetaFalsa(L1), t5 = tarjetaFalsa(L1);
+  for (const t of [t1, t2, t3, t4, t5]) t.dibujar();   // renderProspectsPage: un forEach sincrónico
+  strictEqual(lecturas.length, 1, "una sola lectura para toda la página");
+  for (const [t, lead] of [[t1, L1], [t2, L2]]) {
+    const porDefecto = agenteConOrden(lead.emails, lead.email_sources, null), delAgente = agenteConOrden(lead.emails, lead.email_sources, ORDEN_GUARDADO);
+    strictEqual(seleccionada(t.lista), porDefecto, "el primer dibujo sale con el orden por defecto");
+    ok(porDefecto !== delAgente, `el caso tiene que distinguir: ${porDefecto} vs ${delAgente}`);
+  }
+  // t3: el MB elige a mano otra dirección; t4: elige a mano justo la preseleccionada; t5: edita el campo "Email".
+  clickFalso(t3.lista.querySelectorAll(".email-chip").find(c => c.dataset.email === `info@${D}`));
+  clickFalso(t4.lista.querySelector(".email-chip.selected"));
+  t5.campo.dataset.userEdited = "1"; t5.campo.value = `otra.persona@${D}`;
+
+  await soltarOrden();
+
+  for (const [nombre, t, lead] of [["tarjeta 1", t1, L1], ["tarjeta 2", t2, L2]]) {
+    const delAgente = agenteConOrden(lead.emails, lead.email_sources, ORDEN_GUARDADO);
+    strictEqual(seleccionada(t.lista), delAgente, `${nombre}: la preselección es la del agente con el orden guardado`);
+    strictEqual(t.campo.value, delAgente, `${nombre}: y el campo "Email" (lo que se envía) la sigue`);
+  }
+  strictEqual(seleccionada(t3.lista), `info@${D}`, "la elección a mano sobrevive al cambio de orden");
+  strictEqual(t3.campo.value, `info@${D}`);
+  strictEqual(seleccionada(t4.lista), `publicidad@${D}`, "aunque coincida con la preselección vieja, la eligió el MB");
+  strictEqual(t4.campo.value, `publicidad@${D}`);
+  strictEqual(t5.campo.value, `otra.persona@${D}`, "lo que el MB escribió en el campo no se pisa");
+
+  // Un redibujo sin cambio de orden (verificar, el botón +/N) conserva lo elegido, como antes.
+  t1.dibujar();
+  strictEqual(seleccionada(t1.lista), agenteConOrden(L1.emails, L1.email_sources, ORDEN_GUARDADO));
+});
+
+test("I12: Análisis cambia a la dirección del agente cuando llega el orden, salvo que el MB haya tocado un chip", async () => {
+  for (const tocaElMb of [false, true]) {
+    const emails = ["publicidad", "juan.perez", "info"].map(l => `${l}@${D}`);
+    const state = { accessToken: "tok", domain: D, category: "", emails: [...emails], emailSources: new Map(emails.map(e => [e, "Scrape"])), duplicate: null, pageSocialLinks: [] };
+    const { p, ids, soltarOrden } = listasDelPopup({ orden: ORDEN_GUARDADO, state });
+    p.renderEmailList(state.emails);
+    const fuentes = Object.fromEntries(emails.map(e => [e, "scrape"]));
+    strictEqual(ids["form-email"].value, agenteConOrden(emails, fuentes, null), "primer dibujo con el orden por defecto");
+    if (tocaElMb) clickFalso(ids["email-list"].querySelector(".email-chip.selected"));
+    await soltarOrden();
+    const esperado = tocaElMb ? `publicidad@${D}` : agenteConOrden(emails, fuentes, ORDEN_GUARDADO);
+    strictEqual(ids["form-email"].value, esperado, tocaElMb ? "la eligió el MB: se conserva" : "la había puesto el dibujo: se recalcula con el orden nuevo");
+    strictEqual(seleccionada(ids["email-list"]), esperado);
+    // La marca del MB es de ESTE dominio: si otra web tuviera la misma dirección puesta, no la hereda.
+    if (tocaElMb) {
+      state.domain = "otro-diario.com";
+      ids["email-list"].dataset.ordenDelDibujo = "null";   // como si el orden hubiera cambiado desde el último dibujo
+      p._redibujarAnalisisConservandoEleccion();
+      strictEqual(ids["form-email"].value, agenteConOrden(emails, fuentes, ORDEN_GUARDADO), "otra web no hereda la elección a mano");
+    }
+  }
 });
 
 test("I12: el agente y el reintento ordenan con el comparador compartido, sin copias", () => {

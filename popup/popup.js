@@ -4039,10 +4039,16 @@ function _reordenarAnalisisTrasRebotes() {
 // orden, la tarjeta y Análisis seguían con el de por defecto y preseleccionaban otra dirección que la que
 // manda el agente. Se lee una vez por hora, con reloj; si no contesta, queda el de por defecto (lo mismo
 // que hace el worker cuando nunca se midió) y se reintenta a los 5 minutos.
+// Los avisos se JUNTAN (2026-09-13, cierre): la primera página de Prospects dibuja sus 50 tarjetas de un tirón
+// mientras la lectura está en curso, y antes sólo quedaba el aviso de la primera; las otras 49 seguían con el
+// orden por defecto. Mismo patrón que _asegurarRebotesExtension.
 const _ordenTiersExtension = { orden: null, ts: 0, enCurso: null, fallo: 0 };
+const _alCambiarOrdenTiers = new Set();
 function _asegurarOrdenTiersExtension(alCambiar) {
   if (Date.now() - _ordenTiersExtension.ts < 60 * 60 * 1000) return;
-  if (!state.accessToken || _ordenTiersExtension.enCurso || Date.now() - _ordenTiersExtension.fallo < 5 * 60 * 1000) return;
+  if (!state.accessToken || Date.now() - _ordenTiersExtension.fallo < 5 * 60 * 1000) return;
+  if (typeof alCambiar === "function") _alCambiarOrdenTiers.add(alCambiar);
+  if (_ordenTiersExtension.enCurso) return;
   _ordenTiersExtension.enCurso = (async () => {
     const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.email_tier_ranking&select=value`,
       { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` }, signal: AbortSignal.timeout(6000) });
@@ -4053,8 +4059,20 @@ function _asegurarOrdenTiersExtension(alCambiar) {
     const cambio = JSON.stringify(orden) !== JSON.stringify(_ordenTiersExtension.orden);
     _ordenTiersExtension.orden = orden;
     _ordenTiersExtension.ts = Date.now();
-    if (cambio && typeof alCambiar === "function") alCambiar();
-  })().catch(() => { _ordenTiersExtension.fallo = Date.now(); }).finally(() => { _ordenTiersExtension.enCurso = null; });
+    const cbs = [..._alCambiarOrdenTiers];
+    _alCambiarOrdenTiers.clear();
+    if (cambio) for (const cb of cbs) { try { cb(); } catch (e) { console.warn("[orden de tipos]", e); } }
+  })().catch(() => { _alCambiarOrdenTiers.clear(); _ordenTiersExtension.fallo = Date.now(); }).finally(() => { _ordenTiersExtension.enCurso = null; });
+}
+// ── LO QUE PUSO EL DIBUJO SE RECALCULA SI CAMBIÓ EL ORDEN (2026-09-13, cierre) ──────────────────────
+// El primer dibujo de Análisis y de cada tarjeta sale siempre con el orden por defecto: la lectura del orden
+// arranca en ese mismo dibujo. Los redibujos conservaban lo que estuviera elegido mientras se pudiera elegir,
+// y eso incluía la preselección AUTOMÁTICA del dibujo anterior: llegaba el orden del reajuste y la pantalla se
+// quedaba con la dirección vieja, no con la que manda el agente. Cada lista anota con qué orden eligió
+// (dataset.ordenDelDibujo); si el orden cambió desde entonces, sólo sobrevive lo que eligió el MB.
+function _ordenCambioDesdeElDibujo(listEl) {
+  const antes = listEl?.dataset?.ordenDelDibujo;
+  return antes !== undefined && antes !== JSON.stringify(_ordenTiersExtension.orden || null);
 }
 function _reordenarAnalisisTrasOrden() {
   const listEl = document.getElementById("email-list");
@@ -4062,14 +4080,19 @@ function _reordenarAnalisisTrasOrden() {
   _redibujarAnalisisConservandoEleccion();
 }
 
-// Redibuja Análisis y conserva la dirección elegida mientras se pueda elegir.
+// Redibuja Análisis y conserva la dirección elegida mientras se pueda elegir. Si el orden de tipos cambió desde
+// el dibujo anterior, conserva sólo la que tocó el MB (el chip que clickeó, en este mismo dominio): la que
+// había puesto el dibujo se vuelve a calcular con el orden nuevo (ver _ordenCambioDesdeElDibujo).
 function _redibujarAnalisisConservandoEleccion() {
   const listEl = document.getElementById("email-list");
   if (!listEl) return;
   const formEl = document.getElementById("form-email");
   const antes = formEl ? formEl.value : "";
+  const ordenCambio = _ordenCambioDesdeElDibujo(listEl);
+  const elegidaPorMb = !!antes && listEl.dataset.eleccionMb === antes && listEl.dataset.eleccionMbDominio === (state.domain || "");
   renderEmailList(state.emails);
   if (!formEl || !antes || formEl.value === antes || _emailPickTierClient(antes) < 0) return;
+  if (ordenCambio && !elegidaPorMb) return;
   const chip = [...listEl.querySelectorAll(".email-chip:not(.slot-future)")].find(c => c.dataset.email === antes);
   if (!chip) return;
   listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
@@ -4721,6 +4744,7 @@ function renderEmailList(emails) {
   // 2026-09-13: nunca una dirección de tier -1 (vetada, rebotada, registrante). Si ese es el único
   // chip se ve igual y se puede elegir a mano, pero no queda puesto solo en el campo de envío.
   const _ctxLista = _ctxEmailsAnalisis();
+  listEl.dataset.ordenDelDibujo = JSON.stringify(_ctxLista.ordenTiers || null);   // ver _ordenCambioDesdeElDibujo
   const _elegible = (c) => !!c && _emailPickTierClient(c.dataset.email, _ctxLista) >= 0;
   const _frescos = [...listEl.querySelectorAll(".email-chip:not(.monday):not(.slot-future)")];
   const _porDefecto = _elegirPreseleccionClient(_frescos.map(c => c.dataset.email), _ctxLista);
@@ -4742,6 +4766,9 @@ function renderEmailList(emails) {
       listEl.querySelectorAll(".email-chip").forEach(c => c.classList.remove("selected"));
       chip.classList.add("selected");
       formEl.value = chip.dataset.email;
+      // La elección a mano, atada al dominio: sobrevive al redibujo por el orden de tipos (2026-09-13, cierre).
+      listEl.dataset.eleccionMb = chip.dataset.email || "";
+      listEl.dataset.eleccionMbDominio = state.domain || "";
       const cached = _emailVerifyCache.get(chip.dataset.email);
       _renderVerifyBadge(badge, cached);
       // Si el mismo email estaba en slot 2, limpiar slot 2 (no puede estar en ambos)
@@ -11710,6 +11737,9 @@ function initProspectCard(card, data) {
     // Lo que estaba elegido antes de redibujar (tras verificar, tras el botón +/N, o cuando llegan los
     // rebotados), para no pisarlo.
     const _selAntes = listEl.querySelector(".email-chip.selected")?.dataset.email || "";
+    // Si el orden de tipos cambió desde el dibujo anterior, lo elegido sin el MB se recalcula (2026-09-13, cierre).
+    const _ordenCambio = _ordenCambioDesdeElDibujo(listEl);
+    listEl.dataset.ordenDelDibujo = JSON.stringify(_ctxCard.ordenTiers || null);
 
     const VISIBLE = 5;
     const visible = sorted.slice(0, VISIBLE);
@@ -11871,12 +11901,14 @@ function initProspectCard(card, data) {
       });
     });
     // Qué queda seleccionado (2026-09-13): lo que el MB eligió a mano si sigue en la lista; si no, lo que
-    // estaba elegido antes de redibujar mientras se pueda elegir; si no, la preselección compartida con
-    // Análisis. Nunca una dirección de tier -1 por defecto, y ninguna si no hay elegibles.
+    // estaba elegido antes de redibujar mientras se pueda elegir Y el orden de tipos no haya cambiado (si
+    // cambió, eso lo había puesto el dibujo con el orden viejo); si no, la preselección compartida con
+    // Análisis. Nunca una dirección de tier -1 por defecto, y ninguna si no hay elegibles. El campo "Email"
+    // de abajo sigue a la selección salvo que el MB lo haya editado (_syncSelectedToInput).
     const _chipsPrincipales = [...listEl.querySelectorAll(".email-chip:not(.slot-future)")];
     const _chipDe = (em) => (em ? _chipsPrincipales.find(c => c.dataset.email === em) : null) || null;
     const first = _chipDe(listEl.dataset.eleccionMb || "")
-               || (_emailPickTierClient(_selAntes, _ctxCard) >= 0 ? _chipDe(_selAntes) : null)
+               || (!_ordenCambio && _emailPickTierClient(_selAntes, _ctxCard) >= 0 ? _chipDe(_selAntes) : null)
                || _chipDe(_elegirPreseleccionClient(_chipsPrincipales.map(c => c.dataset.email), _ctxCard));
     if (first) first.classList.add("selected");
     else if (mondayEmailEl && mondayEmailEl.dataset.userEdited !== "1" && emails.includes(mondayEmailEl.value)) mondayEmailEl.value = "";
