@@ -47,7 +47,7 @@ globalThis.__fetchFalso = async () => resp([]);
 const W = await cargarWorker([
   "_conMarcaFreeze", "_vaABlocklistInoperativo", "_estadoTrasGuardar", "_guardadoFallidoPorRed",
   "_estadoTrasFreezeFallido", "_estadoTrasTimeout", "_marcarCsvSiSigueProcesando", "_backoffCongelado",
-  "processCsvItem", "_agruparRechazosCola", "_crmCaidoCortaLaTanda", "getNextCsvItem",
+  "processCsvItem", "_agruparRechazosCola", "getNextCsvItem",
 ], { fetchFalso: true });
 
 // Un ads.txt de 25 líneas, una home con nota y título, y el CRM que dice "no está".
@@ -98,7 +98,7 @@ function marcasDeCola(nombre) {
 // ── 1. La marca freeze_N ────────────────────────────────────────────────────────────────
 test("la marca freeze_N del descongelador sobrevive a las tres reescrituras por falta de tráfico", () => {
   const { _conMarcaFreeze, _backoffCongelado } = W;
-  strictEqual(_conMarcaFreeze("no_traffic_data — attempt_2/3", "unfrozen_retry_attempt_1 freeze_1"), "no_traffic_data — attempt_2/3 freeze_1");
+  strictEqual(_conMarcaFreeze("no_traffic_data — attempt_2/3", "unfrozen_retry_attempt_2 freeze_1"), "no_traffic_data — attempt_2/3 freeze_1");
   strictEqual(_conMarcaFreeze("x", ""), "x", "sin marca previa no inventa nada");
   strictEqual(_conMarcaFreeze("x freeze_2", "unfrozen_retry_attempt_2 freeze_1"), "x freeze_2", "no duplica ni pisa");
   strictEqual(_conMarcaFreeze("y", "no_traffic_data — attempt_2/3 freeze_fail_1"), "y", "freeze_fail_N es otro contador, no el ciclo");
@@ -107,7 +107,7 @@ test("la marca freeze_N del descongelador sobrevive a las tres reescrituras por 
   strictEqual(_backoffCongelado({ attemptFila: 0, errorMessage: msg }).dias, 30, "con la marca, el segundo congelado es de 30 días");
   strictEqual(parseInt(msg.match(/retry_(\d+)/)?.[1] || "0", 10), 1, "el contador de reintentos se lee igual");
   strictEqual(msg.match(/attempt_(\d+)/), null, "y no se confunde con un intento");
-  const m2 = _conMarcaFreeze("no_traffic_data — attempt_2/3", "unfrozen_retry_attempt_1 freeze_1");
+  const m2 = _conMarcaFreeze("no_traffic_data — attempt_2/3", "unfrozen_retry_attempt_2 freeze_1");
   strictEqual(parseInt(m2.match(/attempt_(\d+)/)?.[1] || "0", 10), 2, "el contador de intentos se lee igual");
 
   const salidas = marcasDeCola("processCsvItem");
@@ -118,10 +118,39 @@ test("la marca freeze_N del descongelador sobrevive a las tres reescrituras por 
   }
 });
 
-test("processCsvItem de verdad: un descongelado sin datos vuelve a la cola con attempt_2 y su freeze_1", async () => {
+// El fixture decía "unfrozen_retry_attempt_1 freeze_1", un mensaje que el descongelador no escribe nunca
+// (ronda final, 2026-09-13): escribe attempt_count + 1, así que tras el primer congelado es
+// "unfrozen_retry_attempt_2 freeze_1". Con ese mensaje `/attempt_(\d+)/` lee 2 y el primer "sin datos"
+// re-congela en el acto, ya con 30 días. La reescritura "attempt_N/3" que protege _conMarcaFreeze se da
+// cuando antes hubo una salida transitoria o sin cuota, que no copia el attempt_2: ése es el recorrido de
+// la segunda mitad, encadenando los mensajes que deja cada salida de verdad. El mensaje del descongelador
+// se lee de index.js, no se escribe a mano.
+const mensajeDelDescongelador = (row) => {
+  const i = worker.indexOf("error_message: `unfrozen_retry_attempt_");
+  ok(i >= 0, "no encontré el mensaje del descongelador");
+  const expr = worker.slice(i + "error_message: ".length, worker.indexOf("`,\n", i) + 1);
+  return new Function("row", `return ${expr};`)(row);
+};
+test("processCsvItem de verdad: un descongelado sin datos se re-congela con su freeze_1; tras una salida transitoria vuelve con attempt_2 y su freeze_1", async () => {
+  const msg = mensajeDelDescongelador({ attempt_count: 1, last_error: "no_traffic_data_after_3_attempts" });
+  strictEqual(msg, "unfrozen_retry_attempt_2 freeze_1", "lo que escribe el descongelador tras el primer congelado");
+
   const reg = ruteador({ cache: sinDatosEnCache() });
-  await W.processCsvItem("t", itemDe(101, "elnoticierodeprueba.com.pe", "unfrozen_retry_attempt_1 freeze_1"), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
-  deepStrictEqual(patchesDeCola(reg, 101).map(x => [x.status, x.error_message]), [["pending", "no_traffic_data — attempt_2/3 freeze_1"]]);
+  await W.processCsvItem("t", itemDe(101, "elnoticierodeprueba.com.pe", msg), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
+  const p = patchesDeCola(reg, 101);
+  deepStrictEqual(p.map(x => x.status), ["frozen"], JSON.stringify(p));
+  match(p[0].error_message, /\(30d backoff\)$/, "el segundo congelado es de 30 días: la marca freeze_1 llegó");
+  strictEqual(JSON.parse(reg.find(r => r.m === "POST" && r.u.includes("toolbar_frozen_leads")).b).attempt_count, 2);
+
+  // Descongelado → API de tráfico transitoria → sin datos → sin datos.
+  const trasTransitorio = W._conMarcaFreeze("traffic_api_transient retry_1 (reintento sin penalizar): timeout", msg);
+  const reg2 = ruteador({ cache: sinDatosEnCache() });
+  await W.processCsvItem("t", itemDe(108, "elnoticierodeprueba.com.pe", trasTransitorio), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
+  const p2 = patchesDeCola(reg2, 108);
+  deepStrictEqual(p2.map(x => [x.status, x.error_message]), [["pending", "no_traffic_data — attempt_1/3 freeze_1"]]);
+  const reg3 = ruteador({ cache: sinDatosEnCache() });
+  await W.processCsvItem("t", itemDe(108, "elnoticierodeprueba.com.pe", p2[0].error_message), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
+  deepStrictEqual(patchesDeCola(reg3, 108).map(x => [x.status, x.error_message]), [["pending", "no_traffic_data — attempt_2/3 freeze_1"]]);
 });
 
 // ── 2. El CRM y la blocklist permanente ─────────────────────────────────────────────────
@@ -241,11 +270,11 @@ test("processCsvItem de verdad: el CRM que no contesta devuelve la fila a pendin
 // próxima vuelta la trae PRIMERA. Si la tanda se cortaba al primer "no pude consultar", un solo
 // dominio que el CRM nunca contesta (15 s de timeout fijo, un 4xx/5xx para ese nombre) dejaba la
 // cola en cero para siempre, como cachalot.k.
-test("un dominio que el CRM no contesta queda afuera de la tanda y se prueba el siguiente; sólo dos seguidos cortan", async () => {
-  strictEqual(W._crmCaidoCortaLaTanda(1), false, "uno solo puede ser ese dominio: se prueba el siguiente");
-  strictEqual(W._crmCaidoCortaLaTanda(2), true, "dos dominios distintos seguidos: el caído es el CRM");
-  strictEqual(W._crmCaidoCortaLaTanda(0), false);
-
+// Ronda final (2026-09-13): la regla que se probaba acá, "dos seguidos cortan", frenaba igual la cola con
+// dos dominios así al frente. Ahora decide un dominio de prueba (_estadoTrasCrmSinRespuesta) y la fila
+// espera fuera de la cola (_filasEnEspera). runCsvQueue corriendo de verdad con dos dominios malos al
+// frente está en tests/entrada_cola-13-09c.test.js; acá queda el cableado.
+test("un dominio que el CRM no contesta queda afuera y se prueba el siguiente; sólo el CRM caído corta la tanda", async () => {
   // getNextCsvItem de verdad: los excluidos no vuelven a salir en la misma tanda.
   const reg = ruteador();
   const r = await W.getNextCsvItem("t", new Set(), new Set([7, 9]));
@@ -258,19 +287,21 @@ test("un dominio que el CRM no contesta queda afuera de la tanda y se prueba el 
   ok(reg2.filter(x => x.m === "GET").every(x => !x.u.includes("id=not.in")), "sin excluidos no agrega el filtro");
 
   const cuerpo = cuerpoDe("runCsvQueue");
-  match(cuerpo, /const item = await getNextCsvItem\(token, blockedUsers, _idsSinCrm\);/, "la tanda tiene que pasarle los excluidos");
-  const i = cuerpo.indexOf('if (_resultadoItem === "crm_indeterminado") {');
-  ok(i >= 0);
-  const bloque = cuerpo.slice(i, cuerpo.indexOf("\n    }\n", i));
-  match(bloque, /_idsSinCrm\.add\(item\.id\);/);
-  match(bloque, /if \(_crmCaidoCortaLaTanda\(_crmFallosSeguidos\)\) \{[\s\S]*?break;\s*\}/, "el corte depende de la regla, no del primer fallo");
-  match(bloque, /continue;/, "con un solo fallo sigue con el próximo");
-  doesNotMatch(bloque.replace(/if \(_crmCaidoCortaLaTanda\(_crmFallosSeguidos\)\) \{[\s\S]*?break;\s*\}/, ""), /break;/, "no queda un break incondicional");
-  match(cuerpo, /_crmFallosSeguidos = 0;/, "un dominio que sí se procesó reinicia la cuenta");
-  // Si lo único pendiente es lo excluido, no es "cola vacía": no se apaga la cola.
+  match(cuerpo, /const _enEspera = _filasEnEspera\(\);\s+const item = await getNextCsvItem\(token, blockedUsers, _enEspera\);/, "la tanda tiene que pasarle las filas que esperan");
+  const iDom = cuerpo.indexOf('if (_resultadoItem === "crm_dominio" || _resultadoItem === "crm_dominio_agotado") {');
+  ok(iDom >= 0, "falta la salida del dominio que el CRM no contesta");
+  const bloqueDom = cuerpo.slice(iDom, cuerpo.indexOf("\n    }\n", iDom));
+  match(bloqueDom, /continue;/, "un dominio que el CRM no contesta no corta: sigue con el próximo");
+  doesNotMatch(bloqueDom, /break;/);
+  const iCaido = cuerpo.indexOf('if (_resultadoItem === "crm_indeterminado") {');
+  ok(iCaido > iDom);
+  match(cuerpo.slice(iCaido, cuerpo.indexOf("\n    }\n", iCaido)), /_tandaCortadaPorCrm = true;[\s\S]*break;/, "el CRM caído sí corta");
+  match(cuerpoDe("processCsvItem"), /_estadoTrasCrmSinRespuesta\(\{ mensajePrevio: item\.error_message, crmContesta: await _crmContestaAlgo\(\) \}\)/,
+    "de quién es la culpa lo decide el dominio de prueba, no la fila que viene detrás");
+  // Si lo único pendiente es lo que espera, no es "cola vacía": no se apaga la cola.
   const iVacia = cuerpo.indexOf("if (!item) {");
   ok(iVacia >= 0);
-  match(cuerpo.slice(0, iVacia), /if \(!item && _idsSinCrm\.size > 0\) \{[\s\S]*?break;/);
+  match(cuerpo.slice(0, iVacia), /if \(!item && _enEspera\.size > 0\) \{[\s\S]*?break;/);
 });
 
 // ── 7. El orden de las puertas ──────────────────────────────────────────────────────────
@@ -357,6 +388,9 @@ test("inventario: toda salida 'skipped' de processCsvItem tiene un prefijo conoc
   const desconocidas = skipped.filter(s => !s.prefijo || !PREFIJOS.some(p => s.prefijo.startsWith(p)));
   deepStrictEqual(desconocidas.map(s => s.fuente.slice(0, 140)), [], "salida 'skipped' nueva o sin prefijo literal");
   ok(!skipped.some(s => /^(review_queue_insert_fail|freeze_failed)/.test(s.prefijo || "")), "una falla nuestra no puede quedar 'skipped' escrita a mano");
-  deepStrictEqual(salidas.filter(s => !s.literal).map(s => s.status).sort(), ["_est.status", "_ff.status"],
-    "un estado calculado tiene que salir de _estadoTrasGuardar o _estadoTrasFreezeFallido, que tienen test");
+  // `_crm.status` (ronda final, 2026-09-13): el dominio que el CRM no contesta sale 'pending' o 'next_day'
+  // según su contador crm_N, calculado por _estadoTrasCrmSinRespuesta (su tabla está en
+  // tests/entrada_cola-13-09c.test.js). Nunca 'skipped': no es un veredicto sobre el lead.
+  deepStrictEqual(salidas.filter(s => !s.literal).map(s => s.status).sort(), ["_crm.status", "_est.status", "_ff.status"],
+    "un estado calculado tiene que salir de _estadoTrasGuardar, _estadoTrasFreezeFallido o _estadoTrasCrmSinRespuesta, que tienen test");
 });

@@ -14849,8 +14849,8 @@ async function getNextCsvItem(token, blockedUsers = new Set(), excluirIds = new 
       const list = [...blockedUsers].map(u => `"${u}"`).join(",");
       filter = `&uploaded_by=not.in.(${list})`;
     }
-    // Filas que ya volvieron a 'pending' en ESTA tanda porque el CRM no contestó para ese dominio: sin
-    // esto la próxima pedida las trae otra vez primeras. Ver _crmCaidoCortaLaTanda. (2026-09-13)
+    // Filas que volvieron a 'pending' y esperan unos minutos (el CRM no contestó para ese dominio, no se
+    // pudo congelar): sin esto la próxima pedida las trae otra vez primeras. Ver _filasEnEspera. (2026-09-13)
     if (excluirIds && excluirIds.size > 0) {
       filter += `&id=not.in.(${[...excluirIds].join(",")})`;
     }
@@ -15390,7 +15390,8 @@ function _guardadoFallidoPorRed(err) {
 // Congelar también puede fallar (la base no contesta). Quedaba 'skipped' con freeze_failed, final,
 // y sin el contador de intentos. Ahora vuelve a la cola con attempt_2 (la próxima vuelta llega
 // directo al congelado, con el "sin datos" de la caché negativa, sin pagar) y un contador propio
-// `freeze_fail_N`; a la cuarta, 'error'. La marca freeze_N viaja con él.
+// `freeze_fail_N`; a la cuarta, 'error'. La marca freeze_N viaja con él. Entre intento e intento la
+// fila espera unos minutos fuera de la cola (processCsvItem la pone en _filasEnEspera, 2026-09-13).
 function _estadoTrasFreezeFallido({ mensajePrevio = "", prevAttempts = 0, error = "" } = {}) {
   const k = parseInt(String(mensajePrevio || "").match(/\bfreeze_fail_(\d+)\b/)?.[1] || "0", 10) || 0;
   if (k >= 3) {
@@ -15425,17 +15426,58 @@ async function _marcarCsvSiSigueProcesando(token, id, status, fields = {}) {
   } catch {}
 }
 
-// ── UN DOMINIO QUE EL CRM NO CONTESTA NO FRENA LA COLA (2026-09-13, revisión de la entrada) ──────
+// ── UN DOMINIO QUE EL CRM NO CONTESTA NO FRENA LA COLA, NI DOS SEGUIDOS (2026-09-13) ─────────────
 // processCsvItem devuelve esa fila a 'pending' con su uploaded_at, y getNextCsvItem pide
-// `order=uploaded_at.asc`: la próxima vuelta la trae PRIMERA. Si runCsvQueue cortaba la tanda al
-// primer "no pude consultar", un solo dominio que el CRM nunca contesta (el timeout fijo de 15 s, un
-// 4xx/5xx para ese nombre) dejaba la cola en cero para siempre: cada vuelta lo reclamaba, cortaba y
-// volvía a empezar. Es la clase de cachalot.k, que paró el descubrimiento tres semanas. Ahora ese
-// dominio queda afuera de la tanda y se prueba el siguiente: si también falla, el caído es el CRM y
-// se corta; si contesta, el problema era ese dominio y la cola sigue.
-const CRM_FALLOS_SEGUIDOS_PARA_CORTAR = 2;
-function _crmCaidoCortaLaTanda(fallosSeguidos) {
-  return (Number(fallosSeguidos) || 0) >= CRM_FALLOS_SEGUIDOS_PARA_CORTAR;
+// `order=uploaded_at.asc`: la próxima vuelta la trae PRIMERA. Es la clase de cachalot.k, que paró el
+// descubrimiento tres semanas. La revisión de la entrada dejaba afuera de la tanda al dominio sin
+// respuesta y cortaba con dos seguidos. Pero "dos seguidos" no distingue un CRM caído de dos nombres
+// malos seguidos: dos dominios así al frente de la cola cortaban TODAS las tandas, con la alerta "el
+// CRM no respondió" aunque el CRM contestaba para el resto (ronda final, reproducido con runCsvQueue
+// de verdad). Y la fila no guardaba cuántas veces había fallado.
+// Ahora decide una pregunta al CRM por un dominio de prueba, no la fila que viene detrás:
+//   · Si tampoco contesta, el caído es el CRM: la fila vuelve a 'pending' SIN sumar intentos (un corte
+//     de 10 minutos no puede mandar a mañana los imports de los MB) y se corta la tanda.
+//   · Si contesta, el problema es ese dominio: la fila suma su contador `crm_N`, espera unos minutos
+//     fuera de la cola (_filasEnEspera) y la tanda sigue. Al tercero va a next_day y se avisa con el
+//     nombre del dominio.
+// El mensaje que ya traía la fila se conserva entero (freeze_N, attempt_N, retry_N, el país del cupo
+// anglo): la consulta al CRM corre antes que todo eso y no tiene por qué borrarle la memoria.
+const CRM_INTENTOS_POR_DOMINIO = 3;
+const CRM_DOMINIO_DE_PRUEBA = "example.com";
+function _estadoTrasCrmSinRespuesta({ mensajePrevio = "", crmContesta = false } = {}) {
+  const previo = String(mensajePrevio || "");
+  if (!crmContesta) return { status: "pending", error_message: null, cortarTanda: true, intento: 0 };
+  const intento = (parseInt(previo.match(/\bcrm_(\d+)\b/)?.[1] || "0", 10) || 0) + 1;
+  const resto = previo.replace(/\bcrm_sin_respuesta\b|\bcrm_\d+\b/g, " ").replace(/\s+/g, " ").trim();
+  return {
+    status: intento < CRM_INTENTOS_POR_DOMINIO ? "pending" : "next_day",
+    error_message: `${resto || "crm_sin_respuesta"} crm_${intento}`,
+    cortarTanda: false,
+    intento,
+  };
+}
+
+// ¿El CRM contesta para algo? Un "no encontrado" también es una respuesta: sólo la falta de respuesta
+// (timeout, 4xx/5xx, la clave sin configurar) dice que el caído es el CRM.
+async function _crmContestaAlgo() {
+  const r = await _fichaDelCrm(CRM_DOMINIO_DE_PRUEBA);
+  return !r?.indeterminado;
+}
+
+// ── UNA FILA QUE VUELVE A 'PENDING' POR UNA FALLA QUE NO SE ARREGLA EN SEGUNDOS ESPERA (2026-09-13) ──
+// El CRM que no contesta para ese dominio, o la base que no deja congelar: getNextCsvItem es FIFO y la
+// traía otra vez PRIMERA en la misma tanda, así que los tres intentos se gastaban en segundos y un
+// corte de la base de 20 s terminaba en 'error'. Ahora esperan unos minutos fuera de la cola. No se
+// paga nada de nuevo por esperar: al volver, el tráfico sale de la caché. Vive en memoria: un reinicio
+// del worker la borra y la fila vuelve antes, que es lo que pasaba siempre.
+const ESPERA_FILA_COLA_MS = 3 * 60 * 1000;
+const _filasColaEnEspera = new Map();   // id de toolbar_csv_queue → hasta cuándo (ms)
+function _ponerFilaEnEspera(id, ahora = Date.now()) {
+  if (id != null) _filasColaEnEspera.set(id, ahora + ESPERA_FILA_COLA_MS);
+}
+function _filasEnEspera(ahora = Date.now()) {
+  for (const [id, hasta] of _filasColaEnEspera) if (hasta <= ahora) _filasColaEnEspera.delete(id);
+  return new Set(_filasColaEnEspera.keys());
 }
 
 // ¿El dominio está en el pool de Prospects (pending o en la tanda 'Por enviar')? true / false, y null
@@ -15574,12 +15616,19 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // ── EL CRM QUE NO CONTESTA NO DEJA LA FILA COLGADA (2026-09-13) ─────────────────────────
     // Era un `return` sin tocar la fila: quedaba en 'processing' hasta el próximo reinicio del
     // worker, ocupando su carril, y cada dominio siguiente esperaba otros 15 s a un CRM caído.
-    // Ahora vuelve a 'pending' y se le avisa a runCsvQueue, que corta la tanda: la próxima corrida
-    // reintenta. No va a next_day: un corte de 10 minutos del CRM no puede mandar a mañana los
-    // imports de los MB. Esto corre antes de ads.txt y del tráfico: no se gastó nada.
-    await revertCsvItemToPending(token, item.id);
-    log(`  ⏭️ ${domain}: no pude consultar el CRM — vuelve a la cola sin importarse`);
-    return "crm_indeterminado";   // el único return con valor: runCsvQueue lo lee para cortar
+    // Ahora vuelve a la cola, y quién tiene la culpa lo decide el dominio de prueba, no la fila que
+    // viene detrás: ver _estadoTrasCrmSinRespuesta. Esto corre antes de ads.txt y del tráfico: no se
+    // gastó nada.
+    const _crm = _estadoTrasCrmSinRespuesta({ mensajePrevio: item.error_message, crmContesta: await _crmContestaAlgo() });
+    if (_crm.cortarTanda) {
+      await revertCsvItemToPending(token, item.id);
+      log(`  ⏭️ ${domain}: no pude consultar el CRM, ni para ${CRM_DOMINIO_DE_PRUEBA} — vuelve a la cola sin sumar intentos`);
+      return "crm_indeterminado";   // runCsvQueue corta la tanda: el caído es el CRM
+    }
+    await markCsvItem(token, item.id, _crm.status, { error_message: _crm.error_message });
+    if (_crm.status === "pending") _ponerFilaEnEspera(item.id);
+    log(`  ⏭️ ${domain}: el CRM contesta, pero no para este dominio (intento ${_crm.intento}/${CRM_INTENTOS_POR_DOMINIO}) — ${_crm.status === "pending" ? "espera unos minutos fuera de la cola" : "pasa a next_day"}`);
+    return _crm.status === "pending" ? "crm_dominio" : "crm_dominio_agotado";   // runCsvQueue sigue con el próximo
   }
   if (match) {
     {
@@ -15855,6 +15904,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         // Antes: 'skipped' con freeze_failed, final. Ver _estadoTrasFreezeFallido. (2026-09-13)
         const _ff = _estadoTrasFreezeFallido({ mensajePrevio: item.error_message, prevAttempts, error: e.message });
         await markCsvItem(token, item.id, _ff.status, { error_message: _ff.error_message });
+        // Vuelve a la cola, pero no en el acto: los tres reintentos se gastaban en segundos, antes de
+        // que la base volviera. Ver _filasEnEspera. (2026-09-13)
+        if (_ff.status === "pending") _ponerFilaEnEspera(item.id);
         log(`  ⚠️ ${domain} freeze err: ${e.message} → ${_ff.status === "pending" ? "vuelve a la cola a reintentar el congelado" : "tres veces seguidas: queda en error"}`);
       }
       return;
@@ -16423,16 +16475,14 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // con 200 pendientes y cero errores: todas sus salidas tempranas eran un `return 0` mudo
   // que solo dejaba una línea en los logs de Railway, a los que no siempre hay acceso.
   // Ahora cada motivo de no-arranque queda en toolbar_health, consultable desde SQL.
-  // Dominios de ESTA tanda que no se importaron porque el CRM no contestó (vuelven a la cola). El
-  // aviso del final cuenta éstos y no `_fichaFallos`, que también suman los otros jobs que consultan
-  // la ficha en paralelo; incluye el caso de la clave del CRM sin configurar. (2026-09-13)
-  let _crmSinRespuesta = 0;
-  let _dominioCrmSinRespuesta = "";
-  // Ids que ya volvieron a 'pending' por el CRM, para no volver a pedirlos en esta tanda, y cuántos
-  // seguidos fallaron: uno puede ser ese dominio, dos seguidos es el CRM. Ver _crmCaidoCortaLaTanda.
-  const _idsSinCrm = new Set();
-  let _crmFallosSeguidos = 0;
+  // Lo que el CRM no dejó importar en ESTA tanda (2026-09-13). El aviso del final cuenta éstos, que son
+  // de la cola y de nadie más; incluye el caso de la clave del CRM sin configurar. Ver
+  // _estadoTrasCrmSinRespuesta: el CRM caído corta la tanda; un dominio que no contesta espera y la
+  // tanda sigue.
   let _tandaCortadaPorCrm = false;
+  let _dominioCrmCaido = "";
+  const _crmDominiosEsperan = [];   // el CRM contesta, pero no para éstos: esperan unos minutos
+  const _crmDominiosAgotados = [];  // tercer intento sin respuesta: pasaron a next_day
   await saludPing(token, "csv_queue", {
     status: "ok", cadenciaMin: 30,
     detalle: `arranca · rapidapi ${rapidUsage.usedToday}/${rapidUsage.limit} día, ${rapidMonth.usedThisMonth}/${rapidMonth.limit} mes · csv ${dailyGlobal.csvCount}/${dailyGlobal.csvCap}`,
@@ -16501,7 +16551,10 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     // No hay pre-check de cap acá — el cap (200) se aplica al SUBIR items
     // (popup pre-check + promoteWaitlist en main loop). Si llegamos acá,
     // hay items para procesar normalmente.
-    const item = await getNextCsvItem(token, blockedUsers, _idsSinCrm);
+    // Las filas que esperan unos minutos (el CRM no contestó para ese dominio, no se pudo congelar)
+    // quedan afuera: ver _filasEnEspera. (2026-09-13)
+    const _enEspera = _filasEnEspera();
+    const item = await getNextCsvItem(token, blockedUsers, _enEspera);
     // OJO: getNextCsvItem devuelve null por DOS motivos distintos — que no quede nada, o que
     // todo lo que queda sea de un usuario que llegó a su cupo diario. Solo el primero es "cola
     // vacía"; tratar el segundo igual apagaría la cola teniendo trabajo pendiente.
@@ -16509,10 +16562,10 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
       log(`  ⏸ CSV queue: lo que queda es de usuarios en su cupo diario — sigo mañana (no apago la cola)`);
       break;
     }
-    // Lo mismo si lo único que queda es lo que esta tanda dejó afuera porque el CRM no contestó:
-    // siguen en 'pending', así que la cola no está vacía y no se apaga. (2026-09-13)
-    if (!item && _idsSinCrm.size > 0) {
-      log(`  ⏸ CSV queue: lo que queda volvió a la cola porque el CRM no contestó — sigo en la próxima vuelta (no apago la cola)`);
+    // Lo mismo si lo único que queda son filas que esperan: siguen en 'pending', así que la cola no
+    // está vacía y no se apaga. (2026-09-13)
+    if (!item && _enEspera.size > 0) {
+      log(`  ⏸ CSV queue: lo que queda (${_enEspera.size}) espera unos minutos fuera de la cola — sigo en la próxima vuelta (no apago la cola)`);
       break;
     }
     if (!item) {
@@ -16593,26 +16646,29 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
       log(`  ❌ ${item.domain} — uncaught: ${e.message}`);
     }
 
-    // El CRM no contestó: la fila ya volvió a 'pending' y NO se procesó. Queda afuera de esta tanda
-    // y se prueba el siguiente; si también falla, el caído es el CRM y se corta (seguir sería hacer
-    // esperar 15 s a cada dominio). Cortar al primero dejaba la cola frenada para siempre detrás de
-    // un solo dominio que el CRM nunca contesta: ver _crmCaidoCortaLaTanda. (2026-09-13)
+    // El CRM no contestó para este dominio: la fila NO se procesó, así que no cuenta. De quién es la
+    // culpa lo decidió processCsvItem con el dominio de prueba (_estadoTrasCrmSinRespuesta):
+    //   · "crm_dominio" / "crm_dominio_agotado": el CRM contesta y el problema es ese nombre. La fila
+    //     espera (o pasó a next_day) y se sigue con el próximo.
+    //   · "crm_indeterminado": tampoco contestó el dominio de prueba, el caído es el CRM. Se corta la
+    //     tanda (seguir sería hacer esperar 15 s a cada dominio) y la próxima vuelta del worker, unos
+    //     30 s después, vuelve a probar.
+    // Antes decidía "dos fallos seguidos", y dos dominios malos al frente de la cola la frenaban para
+    // siempre. (2026-09-13)
+    if (_resultadoItem === "crm_dominio" || _resultadoItem === "crm_dominio_agotado") {
+      processed--;
+      userCounts.set(userEmail, Math.max(0, (userCounts.get(userEmail) || 1) - 1));
+      (_resultadoItem === "crm_dominio" ? _crmDominiosEsperan : _crmDominiosAgotados).push(item.domain);
+      continue;
+    }
     if (_resultadoItem === "crm_indeterminado") {
       processed--;
       userCounts.set(userEmail, Math.max(0, (userCounts.get(userEmail) || 1) - 1));
-      _crmSinRespuesta++;
-      _dominioCrmSinRespuesta = item.domain;
-      _idsSinCrm.add(item.id);
-      _crmFallosSeguidos++;
-      if (_crmCaidoCortaLaTanda(_crmFallosSeguidos)) {
-        _tandaCortadaPorCrm = true;
-        log(`⏸ CSV queue: el CRM no respondió para ${_crmFallosSeguidos} dominios seguidos (último ${item.domain}) — vuelven a la cola y corto la tanda; la próxima vuelta reintenta (procesados: ${processed})`);
-        break;
-      }
-      log(`  ⏭ CSV queue: el CRM no respondió para ${item.domain} — vuelve a la cola, queda afuera de esta tanda y pruebo el siguiente`);
-      continue;
+      _tandaCortadaPorCrm = true;
+      _dominioCrmCaido = item.domain;
+      log(`⏸ CSV queue: el CRM no respondió para ${item.domain} ni para ${CRM_DOMINIO_DE_PRUEBA} — vuelve a la cola sin sumar intentos y corto la tanda (procesados: ${processed})`);
+      break;
     }
-    _crmFallosSeguidos = 0;
 
     // Hard cap MENSUAL mid-queue
     const rapidMonthUsedNow = _rapidMonthStart + _rapidGlobalCounter;
@@ -16640,27 +16696,38 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // ⚠️ Si el CRM no contestó, se avisa. El texto decía que esos dominios "entraron sin
   // verificar", pero nunca entraron: processCsvItem los frena antes de gastar nada. Un aviso que
   // describe otra cosa manda a buscar el problema donde no está. (2026-09-13)
-  if (_crmSinRespuesta > 0) {
-    log(`⚠️ el CRM no respondió: ${_crmSinRespuesta} dominio(s) volvieron a la cola sin importarse${_tandaCortadaPorCrm ? " y se cortó la tanda" : "; el resto siguió"}`);
+  // Dos claves, porque son dos problemas con dos severidades (2026-09-13, ronda final): el aviso del día
+  // se guarda por clave (salud-<clave>-<día>, merge-duplicates), y con una sola un dominio puntual a la
+  // tarde dejaba como warning el "CRM caído" de la mañana.
+  if (_tandaCortadaPorCrm) {
+    log(`⚠️ el CRM no respondió: ${_dominioCrmCaido} volvió a la cola sin importarse y se cortó la tanda`);
     await saludPing(token, "csv_queue", {
       status: "warn", cadenciaMin: 30,
-      detalle: `${processed} procesados · ⚠️ el CRM no respondió: ${_crmSinRespuesta} dominio(s) vuelven a la cola sin importarse`,
-      real: processed, esperado: processed + _crmSinRespuesta,
+      detalle: `${processed} procesados · ⚠️ el CRM no respondió (tampoco para el dominio de prueba): se cortó la tanda`,
+      real: processed, esperado: processed + 1,
     }).catch(() => {});
-    // Dos textos, porque son dos problemas distintos: el CRM caído (se cortó la tanda) o un dominio
-    // puntual que el CRM no contesta mientras los demás pasan. (2026-09-13)
     await saludAlerta(token, {
-      clave: "ficha-crm-no-responde", severidad: _tandaCortadaPorCrm ? "error" : "warning",
-      titulo: _tandaCortadaPorCrm ? `La cola se frenó: el CRM no respondió` : `El CRM no respondió para ${_crmSinRespuesta} dominio(s); la cola siguió`,
-      cuerpo: _tandaCortadaPorCrm
-        ? `No se pudo consultar /api/crm/ficha para ${CRM_FALLOS_SEGUIDOS_PARA_CORTAR} dominios seguidos (último: ${_dominioCrmSinRespuesta}). Esos dominios NO se importaron: volvieron a la cola, y la tanda se cortó para no dejar a cada dominio esperando 15 s. La próxima vuelta (30 min) reintenta. Si se repite, revisar console.adeqmedia.com o la clave CRM_SYNC_SECRET del worker.`
-        : `No se pudo consultar /api/crm/ficha para ${_dominioCrmSinRespuesta}${_crmSinRespuesta > 1 ? ` y ${_crmSinRespuesta - 1} más` : ""}, pero sí para los dominios que siguieron. Esos dominios NO se importaron: vuelven a la cola y se reintentan en la próxima vuelta, sin frenar al resto. Si el mismo dominio aparece todos los días, el CRM falla con ese nombre: revisarlo en console.adeqmedia.com.`,
+      clave: "ficha-crm-no-responde", severidad: "error",
+      titulo: `La cola se frenó: el CRM no respondió`,
+      cuerpo: `No se pudo consultar /api/crm/ficha para ${_dominioCrmCaido} ni para el dominio de prueba ${CRM_DOMINIO_DE_PRUEBA}: el caído es el CRM, no ese dominio. Ese dominio NO se importó: volvió a la cola sin sumar intentos, y la tanda se cortó para no dejar a cada dominio esperando 15 s. La cola vuelve a probar en la próxima vuelta del worker (unos 30 segundos). Si se repite, revisar console.adeqmedia.com o la clave CRM_SYNC_SECRET del worker.`,
     }).catch(() => {});
   } else {
+    // Un dominio que el CRM no contesta no es la cola rindiendo poco: procesó todo lo que podía. El
+    // latido queda en ok, así el vigilante no lee "rinde poco" por un nombre. (2026-09-13)
+    const _nSinCrm = _crmDominiosEsperan.length + _crmDominiosAgotados.length;
     await saludPing(token, "csv_queue", {
       status: "ok", cadenciaMin: 30,
-      detalle: `${processed} procesados · todos verificados contra el CRM`,
+      detalle: `${processed} procesados · ${_nSinCrm ? `el CRM no contestó para ${_nSinCrm} dominio(s): esperan y se reintentan` : "todos verificados contra el CRM"}`,
       real: processed, esperado: processed,
+    }).catch(() => {});
+  }
+  if (_crmDominiosAgotados.length) {
+    const _lista = _crmDominiosAgotados.slice(0, 5).join(", ") + (_crmDominiosAgotados.length > 5 ? ` y ${_crmDominiosAgotados.length - 5} más` : "");
+    log(`⚠️ el CRM no contesta para ${_lista} (${CRM_INTENTOS_POR_DOMINIO} intentos) — pasan a next_day`);
+    await saludAlerta(token, {
+      clave: "ficha-crm-no-responde-dominio", severidad: "warning",
+      titulo: `El CRM no contesta para ${_crmDominiosAgotados.length} dominio(s); la cola siguió`,
+      cuerpo: `El CRM contestó para el dominio de prueba, pero no para ${_lista}: ${CRM_INTENTOS_POR_DOMINIO} intentos, con unos minutos de espera entre uno y otro. Esos dominios NO se importaron: pasaron a next_day y vuelven a la cola cuando haya lugar, sin frenar al resto. Si el mismo dominio aparece todos los días, el CRM falla con ese nombre: revisarlo en console.adeqmedia.com.`,
     }).catch(() => {});
   }
   return processed;
@@ -23461,11 +23528,6 @@ function _crmTelefono(tel) {
  * "está libre": acá se usa sólo para BLOQUEAR, así que un null deja pasar, que es el
  * comportamiento que ya tenía cuando Monday no respondía.
  */
-// Cuántas veces no se pudo verificar un dominio contra el CRM (para el log). Desde el 13/09 el aviso
-// de la cola ya no lo lee: un "no pude consultar" nunca deja entrar al dominio (vuelve a la cola), y
-// runCsvQueue cuenta sus propios dominios, porque este contador lo suman también otros jobs.
-let _fichaFallos = 0;
-
 /**
  * La ficha del dominio en el CRM.
  * @returns `null` = NO está en el CRM (o sea, libre) · un objeto con datos = está
@@ -23476,13 +23538,12 @@ let _fichaFallos = 0;
  * En Negociacion a las 10:00 podía recibir un pitch en frío esa misma tarde si el endpoint
  * tenía un hipo. "No sé" tratado como "no" es el patrón que más caro salió en este proyecto.
  */
-// `contarFallo: false` (2026-09-13): `_fichaFallos` es el contador de la IMPORTACIÓN — la corrida
-// lo pone en cero al arrancar y al terminar alerta "N prospectos entraron sin chequear contra el
-// CRM". El reintento por rebote corre en paralelo con la importación, así que un hipo del CRM
-// durante un reintento salía en esa alerta como si hubiera entrado un prospecto sin chequear. Es
-// la misma clase de falso que se limpió hoy en el vigilante. Sin la opción, todo queda igual.
-async function _fichaDelCrm(domain, opts = {}) {
-  const _contarFallo = opts?.contarFallo !== false;
+// Sin contador de fallas (2026-09-13, ronda final). `_fichaFallos` alimentaba la alerta "N prospectos
+// entraron sin chequear contra el CRM", y `contarFallo: false` lo apagaba para el reintento por rebote,
+// que corre en paralelo con la importación. Desde la revisión de la entrada ya nadie lo leía (runCsvQueue
+// cuenta sus propios dominios) y se borró: un contador que sólo se suma invita a volver a leerlo mal.
+// El reintento todavía pasa `{ contarFallo: false }`: ya no cambia nada.
+async function _fichaDelCrm(domain) {
   if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) {
     log(`  ⚠️ ficha: falta CRM_SYNC_SECRET — no puedo verificar ${domain}`);
     return { indeterminado: true };
@@ -23492,7 +23553,6 @@ async function _fichaDelCrm(domain, opts = {}) {
       { headers: { "x-toolbar-secret": CRM_SYNC_SECRET }, signal: AbortSignal.timeout(15000) });
     if (!r.ok) {
       log(`  ⚠️ ficha HTTP ${r.status} para ${domain} — NO se puede dar por libre`);
-      if (_contarFallo) _fichaFallos++;
       return { indeterminado: true };
     }
     const j = await r.json();
@@ -23502,7 +23562,6 @@ async function _fichaDelCrm(domain, opts = {}) {
              descansando: !!j.descansando, diasParaReintentar: j.diasParaReintentar || 0 };
   } catch (e) {
     log(`  ⚠️ ficha ${domain}: ${e.message} — NO se puede dar por libre`);
-    if (_contarFallo) _fichaFallos++;
     return { indeterminado: true };
   }
 }
@@ -27504,16 +27563,21 @@ function _embudoColaInforme(cola, { altas = [], prospects = [] } = {}) {
   return out;
 }
 
-function _lineasEmbudoCola(emb) {
+// `altasLeidas: false` (2026-09-13, ronda final): sin las altas no se sabe cuáles son nuevas, y el
+// embudo las daba a todas por reactivadas. Se dice eso en vez de un número inventado.
+function _lineasEmbudoCola(emb, { altasLeidas = true } = {}) {
   const TITULO = { feeder: "feeders", import_mb: "imports de MBs", retrabajo: "re-trabajo (congelados que vuelven, ads.txt re-chequeado, revividos de Prospects)", envio: "del agente (re-encolados para envío o rebote)" };
-  const lineas = [`La cola procesó ${emb.procesadas} (sin contar ${emb.pospuestas} pospuestas, que vuelven a la cola, ni ${emb.congeladas} congeladas) · llegaron a Prospects ${emb.llegaron} (${emb.nuevas} nuevas, ${emb.reactivadas} ya estaban y se reactivaron):`];
+  const _llegaron = altasLeidas
+    ? `(${emb.nuevas} nuevas, ${emb.reactivadas} ya estaban y se reactivaron)`
+    : "(no se pudieron leer las altas: no se sabe cuántas son nuevas)";
+  const lineas = [`La cola procesó ${emb.procesadas} (sin contar ${emb.pospuestas} pospuestas, que vuelven a la cola, ni ${emb.congeladas} congeladas) · llegaron a Prospects ${emb.llegaron} ${_llegaron}:`];
   for (const grupo of ["feeder", "import_mb", "retrabajo", "envio"]) {
     const g = emb.grupos[grupo];
     if (!g) continue;
     const partes = Object.entries(g).sort((a, b) => (b[1].procesadas + b[1].pospuestas + b[1].congeladas) - (a[1].procesadas + a[1].pospuestas + a[1].congeladas))
       .map(([f, v]) => {
         const extra = [
-          v.llegaron && v.nuevas !== v.llegaron ? `${v.nuevas} nuevas` : "",
+          altasLeidas && v.llegaron && v.nuevas !== v.llegaron ? `${v.nuevas} nuevas` : "",
           v.pospuestas ? `${v.pospuestas} pospuestas` : "",
           v.congeladas ? `${v.congeladas} congeladas` : "",
         ].filter(Boolean).join("; ");
@@ -27564,8 +27628,10 @@ function _lineaEmailsPorVia(porFuente) {
 // Orden importa: la primera regla que matchea gana. Lo que no conoce: prefijo, dígitos → N.
 const _MOTIVOS_COLA = [
   [/^ya_estaba_en_prospects/, () => "ya_estaba_en_prospects"],
-  [/^pageviews \d+ .*below min/, () => "trafico_bajo_piso"],
-  [/^pageviews \d+ above max/, () => "gigante_sobre_techo"],
+  // `(?:\.\d+)?` (2026-09-13, ronda final): el respaldo por scrape no redondea las páginas vistas, y
+  // "pageviews 212345.5 (…) below min" caía en la clave genérica "pageviews", que junta piso y techo.
+  [/^pageviews \d+(?:\.\d+)? .*below min/, () => "trafico_bajo_piso"],
+  [/^pageviews \d+(?:\.\d+)? above max/, () => "gigante_sobre_techo"],
   [/^deprio-geo:\s*([^(]+?)\s*\(/, (m) => `deprio-geo:${m[1]}`],
   [/^worker_geo_excluded:\s*(.+)$/, (m) => `geo_excluida:${m[1].trim()}`],
   [/^en descanso/, () => "crm_en_descanso"],
@@ -27579,8 +27645,10 @@ const _MOTIVOS_COLA = [
   [/^worker_cat_not_priority/, () => "categoria_no_prioritaria_worker"],
   [/^review_queue_insert_fail:\s*([a-z_]+)/i, (m) => `insert_fail:${m[1].replace(/_+$/, "")}`],
   [/^blocked:\s*([a-z-]+)/i, (m) => `blocklist:${m[1]}`],
-  [/^(?:not_publisher|reintentar):\s*(bajo_trafico|gigante)/, (m) => m[1]],
-  [/^(?:not_publisher|reintentar):\s*([a-z_]+)/i, (m) => m[1].replace(/_+$/, "")],
+  // Las dos con /i y la clave en minúscula (2026-09-13, ronda final): "not_publisher: Gigante_120M" no
+  // entraba en la primera y la genérica devolvía "Gigante", otra fila para el mismo motivo.
+  [/^(?:not_publisher|reintentar):\s*(bajo_trafico|gigante)/i, (m) => m[1].toLowerCase()],
+  [/^(?:not_publisher|reintentar):\s*([a-z_]+)/i, (m) => m[1].replace(/_+$/, "").toLowerCase()],
   [/^dead_domain_dns_fail/, () => "dead_domain_dns_fail"],
   [/^geo_saturated_in_pool/, () => "geo_saturado_en_pool"],
   [/^anglo_daily_quota/, () => "cupo_anglo_del_dia"],
@@ -27729,6 +27797,12 @@ function _viasDeEmailInforme({ cohorte = [], respaldo = [], enviados = [], malos
   };
   const viaDe = new Map();
   for (const a of [...(respaldo || []), ...(cohorte || [])]) for (const [em, s] of fuentesDe(a)) viaDe.set(em, s);
+  // MillionVerifier se mide SÓLO sobre la cohorte (2026-09-13, ronda final). "MV descartó X de Y
+  // verificados" usaba el mapa de respaldo, con las altas de 30 días, mientras "N email(s)" cuenta los
+  // 7 días: una alta de hace 20 días verificada esta semana salía "0 email(s) … MV descartó 1 de 1".
+  // El respaldo queda sólo para atribuir rebotes a la vía del envío.
+  const viaCohorte = new Map();
+  for (const a of (cohorte || [])) for (const [em, s] of fuentesDe(a)) viaCohorte.set(em, s);
   const via = {};
   const fila = (v) => (via[v] = via[v] || { n: 0, rebotes: 0, env: 0, ver: 0, mvNo: 0 });
   let formularios = 0;
@@ -27751,7 +27825,7 @@ function _viasDeEmailInforme({ cohorte = [], respaldo = [], enviados = [], malos
     fila(v).env++;
   }
   const verSet = new Set((verificados || []).map(m => lower(m?.email)).filter(Boolean));
-  for (const em of verSet) { const v = viaDe.get(em); if (v) fila(v).ver++; }
+  for (const em of verSet) { const v = viaCohorte.get(em); if (v) fila(v).ver++; }
   let rebotesSinVia = 0;
   const malosVistos = new Set();
   for (const f of (malos || [])) {
@@ -27762,7 +27836,7 @@ function _viasDeEmailInforme({ cohorte = [], respaldo = [], enviados = [], malos
       const v = viaEnvio.get(em);
       if (v) via[v].rebotes++; else rebotesSinVia++;
     } else if (f.evidencia === "verificador") {
-      const v = viaDe.get(em);
+      const v = viaCohorte.get(em);
       if (v && verSet.has(em)) via[v].mvNo++;
     }
   }
@@ -27831,7 +27905,7 @@ async function _acumularCuracion(token, texto) {
 // `compartido`: el resumen de salud recibe acá las filas de la cola que leyó el boletín, para que
 // DESCARTES DE LA COLA cuente exactamente la misma población que "La cola procesó" (2026-09-13).
 async function _boletinPorSeccion(token, { compartido = null } = {}) {
-  const auth ={ "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   // ── LA MISMA VENTANA QUE EL CUPO (Maxi 2026-08-31) ──────────────────────────────────
   // El bloque de ENVÍO usaba 24h CORRIDAS mientras la alerta de "no llegó a su cupo" usa el
   // día calendario. Resultado: el MISMO mail decía "72 de 60, 24 cada uno" arriba y "16 de
@@ -27923,9 +27997,13 @@ async function _boletinPorSeccion(token, { compartido = null } = {}) {
     const _proc = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=domain,source,status,uploaded_by,error_message&order=id`, auth);
     if (compartido) compartido.cola = _proc;
     const _procFilas = Array.isArray(_proc) ? _proc : [];
-    const _altasFilas = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=source,domain&order=id`, auth)) || [];
+    // Una lectura fallida no es un cero (2026-09-13, ronda final). Con la cola sin leer, el embudo igual
+    // decía "La cola procesó 0 … llegaron 0" debajo del aviso; y con las altas sin leer (`|| []`), todos
+    // los done salían "ya estaban y se reactivaron" y se buscaban por lotes en Prospects.
+    const _altasLeidas = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=source,domain&order=id`, auth);
+    const _altasFilas = Array.isArray(_altasLeidas) ? _altasLeidas : [];
     const _nuevosDom = new Set(_altasFilas.map(a => String(a.domain || "").trim().toLowerCase()));
-    const _reactivDom = [...new Set(_procFilas.filter(f => f.status === "done")
+    const _reactivDom = _altasLeidas == null ? [] : [...new Set(_procFilas.filter(f => f.status === "done")
       .map(f => String(f.domain || "").trim().toLowerCase()).filter(d => d && !_nuevosDom.has(d)))];
     const _prosReact = [];
     for (let i = 0; i < _reactivDom.length; i += 80) {
@@ -27937,12 +28015,14 @@ async function _boletinPorSeccion(token, { compartido = null } = {}) {
     const _altas = _altasFilas.length;
     const _altasPor = {};
     for (const a of _altasFilas) { const k = _nombreFuenteInforme(a.source); _altasPor[k] = (_altasPor[k] || 0) + 1; }
-    _nota("DESCUBRIMIENTO (24h)", _altas >= 15 ? "✅" : _altas >= 5 ? "🟡" : "🔴", [
-      `${_altas} alta(s) en Prospects: ${Object.entries(_altasPor).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(" · ") || "ninguna"}`,
-      ...(_proc == null ? ["No se pudo leer la cola: el embudo de abajo no es un cero."] : []),
-      ..._lineasEmbudoCola(_emb),
-      ...(_emb.reactivadas ? ["Las altas cuentan sólo filas nuevas: una reactivada ya estaba en la base (congelada, rechazada o reciclada del CRM), vuelve al pool y conserva su fecha de alta."] : []),
-      ...(_altas < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en DESCARTES DE LA COLA, abajo."] : []),
+    const _altasOk = _altasLeidas != null;
+    _nota("DESCUBRIMIENTO (24h)", !_altasOk ? "🟡" : _altas >= 15 ? "✅" : _altas >= 5 ? "🟡" : "🔴", [
+      _altasOk
+        ? `${_altas} alta(s) en Prospects: ${Object.entries(_altasPor).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(" · ") || "ninguna"}`
+        : "? alta(s) en Prospects: no se pudieron leer (el \"?\" no es un cero).",
+      ...(_proc == null ? ["No se pudo leer la cola: el embudo de la cola no se muestra (no es un cero)."] : _lineasEmbudoCola(_emb, { altasLeidas: _altasOk })),
+      ...(_proc != null && _altasOk && _emb.reactivadas ? ["Las altas cuentan sólo filas nuevas: una reactivada ya estaba en la base (congelada, rechazada o reciclada del CRM), vuelve al pool y conserva su fecha de alta."] : []),
+      ...(_altasOk && _altas < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en DESCARTES DE LA COLA, abajo."] : []),
     ]);
 
     // ── BÚSQUEDA DE EMAILS ────────────────────────────────────────────────

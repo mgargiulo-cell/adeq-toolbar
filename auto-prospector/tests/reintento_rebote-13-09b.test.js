@@ -193,13 +193,18 @@ test("C37: con el lead en Prospects y la ficha En Negociacion, el reintento no b
   ok(!reg.some(r => r.m === "POST" && r.u.includes("toolbar_bounce_retries")), "un salto por el CRM no cuenta para el tope de intentos");
 });
 
+// `_fichaFallos` se borró (ronda final de la entrada, 2026-09-13): nadie lo leía desde que runCsvQueue
+// cuenta sus propios dominios, y un contador que sólo se suma invita a volver a leerlo mal. Lo que este
+// test cuidaba queda en pie por construcción: la alerta de la importación cuenta sólo lo que pasó en su
+// tanda, y la ficha del CRM no tiene un contador compartido que un reintento pueda ensuciar.
 test("C37: consultar el CRM desde el reintento no suma a la alerta de la importación", async () => {
-  const w = await cargarWorker(["_fichaDelCrm", "_fichaFallos"], { fetchFalso: true });
+  const w = await cargarWorker(["_fichaDelCrm"], { fetchFalso: true });
   globalThis.__fetchFalso = async () => resp({ message: "caído" }, { status: 503 });
   deepStrictEqual(await w._fichaDelCrm("a.com", { contarFallo: false }), { indeterminado: true });
-  strictEqual(w._fichaFallos, 0, "saldría 'N prospectos entraron sin chequear contra el CRM' por un reintento");
   deepStrictEqual(await w._fichaDelCrm("a.com"), { indeterminado: true });
-  strictEqual(w._fichaFallos, 1, "los demás llamadores cuentan igual que antes");
+  ok(!/\+\+/.test(cuerpoDe("_fichaDelCrm")), "la ficha del CRM no puede sumar a un contador compartido");
+  ok(!/let _fichaFallos\b|_fichaFallos\+\+/.test(worker), "el contador de la importación no puede volver");
+  ok(cuerpoDe("runCsvQueue").includes('clave: "ficha-crm-no-responde"'), "la alerta de la importación vive en runCsvQueue");
 });
 
 test("C37: una sola consulta al CRM, para todo lead y antes de cualquier gasto o envío", () => {
