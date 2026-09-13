@@ -52,9 +52,13 @@ test("sincronizarFinalizadosDeMonday ya no le pide nada a Monday: lee /api/crm/r
 
 test("el barrido respeta el carril que comparte con el feeder, y lo deja escrito", () => {
   const fn = entre("async function sincronizarFinalizadosDeMonday(", "async function _dominiosContactadosDesde(");
-  ok(/_capDeFuente\("auto_feeder_monday"\)/.test(fn) && /_countActiveCsvBySource\(token, "auto_feeder_monday"\)/.test(fn),
+  // Desde el 13/09 el lugar se cuenta con `_lugarEnCarril` (el mismo `_capDeFuente` que la inyección,
+  // fallando cerrado) y el corte es `_asignacionMonday`, la misma regla que usa el feeder por slot.
+  ok(/_lugarEnCarril\(token, "auto_feeder_monday"\)/.test(fn) && /const cap = _capDeFuente\(sourceTag\)/.test(entre("async function _lugarEnCarril(", "\n}\n")),
      "si el carril está lleno, encolar 0 es lo esperado y no una falla");
-  ok(/Math\.min\(_techoDia, _libre\)/.test(fn), "los candidatos se cortan por el techo Y por el cupo libre");
+  ok(/_asignacionMonday\(\{ lugar: _carril\.error \? null : _carril\.lugar, techo: _techoDia \}\)/.test(fn) && /_elegibles\.slice\(0, _asig\.alloc\)/.test(fn)
+     && /Math\.min\(lugar, techo\)/.test(entre("function _asignacionMonday(", "\n}\n")),
+     "los candidatos se cortan por el techo Y por el cupo libre");
   ok(/libre: _libre/.test(fn), "el cupo libre queda en monday_sync_ultimo para que el resumen de salud no pinte amarillo por diseño");
   const salud = entre("// ── MONDAY (reciclado hacia cero)", "// ── RE-TRABAJO");
   ok(/_mSync\.libre/.test(salud), "el resumen de salud tiene que mirar `libre` al decidir si el barrido cumplió");

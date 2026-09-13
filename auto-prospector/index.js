@@ -2028,14 +2028,26 @@ function _capDeFuente(sourceTag) {
   return PER_SOURCE_ACTIVE_CAP[sourceTag] ?? DEFAULT_SOURCE_CAP;
 }
 
+// ── QUÉ ESTADOS OCUPAN EL CARRIL (2026-09-13) ─────────────────────────────────────────────────
+// `next_day` NO ocupa carril: son filas que ESPERAN, no trabajo en curso. Con 117 en next_day y
+// cap 150, similar-expansion —la fuente que mejor convierte— se quedaba con 33 lugares y cortaba
+// antes de gastar nada. El mismo bug se arregló el 01/07 para el gate global.
+// EXCEPCIÓN: `auto_feeder_monday`. Su carril de 700 existe para que el board de finalizados no se
+// vuelque entero a la cola (agosto: 1.716 dominios trabados), y lo llenan DOS pasadas: el barrido
+// diario y cada uno de los 5 slots, con hasta el techo (400) por pasada. Lo que no entra en pending
+// ni en waiting_pool cae en `next_day`; si eso no contara, el carril nunca se veía lleno y los slots
+// apilaban reciclados afuera de él. Para monday, la espera ocupa el carril. Una sola definición
+// para la inyección y para los pre-chequeos, así nunca dan números distintos.
+const _ESTADOS_CARRIL_MONDAY = "pending,processing,waiting_pool,next_day";
+function _estadosDelCarril(sourceTag) {
+  return sourceTag === "auto_feeder_monday" ? _ESTADOS_CARRIL_MONDAY : "pending,processing,waiting_pool";
+}
+
 async function _countActiveCsvBySource(token, sourceTag) {
   try {
     const res = await fetch(
-      // `next_day` NO ocupa carril: son filas que ESPERAN, no trabajo en curso. Con 117 en
-      // next_day y cap 150, similar-expansion —la fuente que mejor convierte— se quedaba con
-      // 33 lugares y cortaba antes de gastar nada. El mismo bug se arregló el 01/07 para el
-      // gate global y nunca se portó a este contador.
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool)&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
+      // Qué estados cuentan: ver `_estadosDelCarril` (next_day sólo ocupa el carril de monday).
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(${_estadosDelCarril(sourceTag)})&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     return parseInt((res.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
@@ -2052,11 +2064,12 @@ async function _countActiveCsvBySource(token, sourceTag) {
 // Similar, la que mejor convierte, al revés: se frenaba en 250 con un carril asignado de ~500.
 // Los dos pre-chequeos pasan por acá, y la cuenta falla CERRADO: `_countActiveCsvBySource` da 0
 // si Supabase contesta 401/500, o sea "carril vacío, gastá". Ese contador queda como está para la
-// inyección, sellers y el barrido de Monday, que no pagan nada por descubrir.
+// inyección y sellers, que no pagan nada por descubrir. Los dos reciclados de monday (barrido y
+// slot) también pasan por acá desde el 13/09: 400 chequeos de ads.txt con la base caída no son gratis.
 async function _contarActivosCarril(token, sourceTag) {
   try {
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(pending,processing,waiting_pool)&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(${_estadosDelCarril(sourceTag)})&source=eq.${encodeURIComponent(sourceTag)}&select=id`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
     );
     if (!res.ok && res.status !== 416) return null;   // 416 = rango vacío: el total igual viene en content-range
@@ -2071,22 +2084,6 @@ async function _lugarEnCarril(token, sourceTag) {
   return usados == null
     ? { cap, usados: null, lugar: 0, error: true }
     : { cap, usados, lugar: Math.max(0, cap - usados), error: false };
-}
-
-// Cuántas filas de la fuente se encolaron HOY (medianoche de Madrid), por cualquier camino y en
-// cualquier estado: `uploaded_at` lo pone `_injectIntoCsvQueue` al insertar y al reactivar. Cuenta
-// también las que cayeron en `next_day`, que no ocupan carril. Falla CERRADO como
-// `_contarActivosCarril`: null = no pude contar, nunca "cero" (2026-09-13).
-async function _contarEncoladosHoy(token, sourceTag) {
-  try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?source=eq.${encodeURIComponent(sourceTag)}&uploaded_at=gte.${encodeURIComponent(_madridMidnightUtcISO())}&select=id`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
-    );
-    if (!res.ok && res.status !== 416) return null;
-    const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
-    return m ? parseInt(m[1], 10) : null;
-  } catch { return null; }
 }
 
 // ── PRE-LISTADO DE DESCUBRIMIENTO (Maxi 2026-07-17, pedido del user) ─────────────────
@@ -4221,8 +4218,17 @@ async function sincronizarFinalizadosDeMonday(token) {
     // El carril `auto_feeder_monday` lo comparte con el feeder por slot. Si ya está lleno,
     // encolar 0 es lo esperado y no una falla: sin mirar el cupo, `_injectIntoCsvQueue`
     // devolvería 0 y el aviso de abajo gritaría por nada (2026-09-11).
-    const _libre = Math.max(0, _capDeFuente("auto_feeder_monday") - await _countActiveCsvBySource(token, "auto_feeder_monday"));
-    const candidatos = _elegibles.slice(0, Math.min(_techoDia, _libre));
+    // La MISMA regla que el slot, con la cuenta que falla cerrado (2026-09-13, ver `_asignacionMonday`):
+    // antes un error de la base daba 0 activos → 700 libres → 400 candidatos a ciegas.
+    const _carril = await _lugarEnCarril(token, "auto_feeder_monday");
+    const _asig = _asignacionMonday({ lugar: _carril.error ? null : _carril.lugar, techo: _techoDia });
+    if (_asig.error) {
+      log(`⚠️ Reciclables del CRM: no pude contar el carril de auto_feeder_monday — no reciclo a ciegas`);
+      await saludPing(token, "monday_sync", { status: "fail", cadenciaMin: 24 * 60, detalle: "no pude contar el carril de auto_feeder_monday: no reciclo a ciegas" });
+      return 0;
+    }
+    const _libre = _carril.lugar;
+    const candidatos = _elegibles.slice(0, _asig.alloc);
 
     let encolados = 0;
     if (candidatos.length) {
@@ -4413,8 +4419,8 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // que falta para llenar su carril (ver _runFeederSlot), "lleno" es un caso normal: se late igual,
     // para que no hacer falta no se lea como estar caído.
     if (!(targetCount > 0)) {
-      log(`  🌱 reciclables: carril auto_feeder_monday lleno o techo del día cumplido — no hace falta pedirle la lista al CRM este slot`);
-      await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: "carril lleno o techo del día cumplido: no hacía falta reciclar este slot" }).catch(() => {});
+      log(`  🌱 reciclables: carril auto_feeder_monday lleno — no hace falta pedirle la lista al CRM este slot`);
+      await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: "carril lleno: no hacía falta reciclar este slot" }).catch(() => {});
       return 0;
     }
     if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`); return 0; }
@@ -5006,20 +5012,21 @@ const FEEDER_PESOS_MAX_FILAS = 20_000; // sellers + majestic en 14 días (~2.200
 // decisión; acá sólo cambia cómo se reparte esa parte entre ellas.
 const FEEDER_PARTE_SELLERS_MAJESTIC = 0.30;
 
-// ── CUÁNTO RECICLA MONDAY EN UN SLOT (2026-09-13) ──────────────────────────────────────────────
-// Desde que monday salió del reparto, el slot le daba `min(lugar libre, techo)`. Pero el techo es
-// DIARIO (`monday_sync_techo_dia`, 400 por default) y hay 5 slots: cada uno podía encolar el techo
-// entero, y lo que no entraba en pending ni en waiting_pool caía en `next_day`, que no ocupa carril, así
-// que el lugar libre no bajaba. Y el lugar salía de `_countActiveCsvBySource`, que ante un error de la
-// base da 0 → carril vacío → asignación de 400 y 400 chequeos de ads.txt.
-// Regla: lo que queda del techo de HOY —contando lo que ya encolaron el slot y el barrido— y nunca más
-// que el lugar del carril. Sin poder contar cualquiera de las dos cosas, 0: no se recicla a ciegas.
-function _asignacionMondaySlot({ lugar, techo, encoladosHoy }) {
-  if (lugar == null || encoladosHoy == null || !Number.isFinite(lugar) || !Number.isFinite(encoladosHoy)) {
-    return { alloc: 0, restante: null, error: true };
-  }
-  const restante = Math.max(0, (Number(techo) || 0) - encoladosHoy);
-  return { alloc: Math.max(0, Math.min(lugar, restante)), restante, error: false };
+// ── CUÁNTO RECICLA MONDAY EN CADA PASADA: UNA REGLA PARA EL SLOT Y EL BARRIDO (2026-09-13) ─────────
+// Lo que falta del carril, con el techo del barrido (`monday_sync_techo_dia`, 400) como tope de cada
+// pasada, y nunca más que el lugar. Sin poder contar el carril, 0: no se recicla a ciegas (antes el
+// lugar salía de `_countActiveCsvBySource`, que ante un error de la base da 0 → carril vacío → 400
+// chequeos de ads.txt).
+// ⚠️ NO resta "lo encolado hoy". Una corrección de la mañana del 13/09 lo restaba sólo en el slot: el
+// barrido corre cada 24 h sin hora fija y no mira lo del slot. Si el barrido corría primero y llenaba
+// el techo, los 5 slots reciclaban 0; si corrían antes los slots, el barrido sumaba otro techo entero:
+// el volumen del día iba de 1× a 2× el techo según qué job arrancara primero, y bajaba el reciclado
+// del "board en cero" sin que el dueño lo decidiera. Lo que sí hacía falta —que 5 slots × 400 no
+// se apilen en `next_day` afuera del carril— lo resuelve el carril: para monday la espera cuenta
+// (ver `_estadosDelCarril`). Un techo DIARIO compartido por los dos caminos es decisión del dueño.
+function _asignacionMonday({ lugar, techo }) {
+  if (lugar == null || !Number.isFinite(lugar)) return { alloc: 0, error: true };
+  return { alloc: Math.max(0, Math.min(lugar, techo)), error: false };
 }
 
 // Sube las fuentes por debajo del piso y baja proporcionalmente las de arriba.
@@ -5215,7 +5222,8 @@ async function _runFeederSlot(token, slotLabel) {
   // El reparto de tres no medía nada (ver _pesosFeeder): monday quedaba siempre en el 70%. Y
   // monday ya tenía carril FIJO por la misma razón (27/08): es re-trabajo con un objetivo operativo
   // —el board de finalizados en cero—, no una fuente que compite por rendimiento.
-  //   · monday: lo que le falta a su carril para llenarse, con el techo diario del barrido;
+  //   · monday: lo que le falta a su carril para llenarse, con el techo del barrido como tope de la
+  //     pasada: la misma regla que el barrido (`_asignacionMonday`);
   //   · sellers + majestic: la misma parte conjunta que tenían, repartida entre ellas por lo que
   //     rinde cada una sobre las mismas filas;
   //   · adstxt y GEO siguen ENCIMA del reparto, con el mismo cupo que tenían (antes salía de
@@ -5223,22 +5231,22 @@ async function _runFeederSlot(token, slotLabel) {
   const w = await _getFeederSourceWeights(token);
   const _cfgSlot = await getConfig(token).catch(() => ({}));
   const _techoMonday = parseInt(_cfgSlot?.monday_sync_techo_dia || "", 10) || MONDAY_SYNC_MAX_POR_DIA;
-  // Lugar del carril y lo encolado hoy, las dos cuentas fallando CERRADO (ver _asignacionMondaySlot).
+  // Lugar del carril (con la espera adentro, fallando CERRADO) y la misma regla que el barrido: ver
+  // _asignacionMonday, que explica por qué no se resta lo encolado hoy.
   const _carrilMonday = await _lugarEnCarril(token, "auto_feeder_monday");
-  const _mondayHoy    = await _contarEncoladosHoy(token, "auto_feeder_monday");
-  const _asigMonday   = _asignacionMondaySlot({ lugar: _carrilMonday.error ? null : _carrilMonday.lugar, techo: _techoMonday, encoladosHoy: _mondayHoy });
+  const _asigMonday   = _asignacionMonday({ lugar: _carrilMonday.error ? null : _carrilMonday.lugar, techo: _techoMonday });
   const allocMonday   = _asigMonday.alloc;
   const _parteSM      = Math.round(targetGross * FEEDER_PARTE_SELLERS_MAJESTIC);
   const allocSellers  = Math.max(1, Math.round(_parteSM * w.sellers));
   const allocMajestic = Math.max(1, Math.round(_parteSM * w.majestic));
   const _cupoEncima   = Math.min(40, Math.max(15, Math.round(targetGross * FEEDER_EXPLORE_FLOOR)));
-  log(`  ⚖️ feeder: sellers=${(w.sellers * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% de ${_parteSM} (por rendimiento) · monday fijo ${allocMonday} (${_asigMonday.error ? "no pude contar carril u hoy" : `carril libre ${_carrilMonday.lugar}, techo ${_techoMonday}/día con ${_mondayHoy} ya encolados hoy`}) — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
+  log(`  ⚖️ feeder: sellers=${(w.sellers * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% de ${_parteSM} (por rendimiento) · monday fijo ${allocMonday} (${_asigMonday.error ? "no pude contar el carril" : `carril libre ${_carrilMonday.lugar} con la espera adentro, techo ${_techoMonday} por pasada`}) — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
   const sessionKnown = new Set();
   const fromSellers  = await _feederPullSellers(token, allocSellers, sessionKnown);
   let fromMonday = 0;
   if (_asigMonday.error) {
-    log(`  ⚠️ reciclables: no pude contar el carril de auto_feeder_monday o lo encolado hoy — no reciclo este slot`);
-    await saludPing(token, "feeder_monday", { status: "fail", cadenciaMin: 24 * 60, detalle: "no pude contar el carril o lo encolado hoy: no reciclo este slot" }).catch(() => {});
+    log(`  ⚠️ reciclables: no pude contar el carril de auto_feeder_monday — no reciclo este slot`);
+    await saludPing(token, "feeder_monday", { status: "fail", cadenciaMin: 24 * 60, detalle: "no pude contar el carril: no reciclo este slot" }).catch(() => {});
   } else {
     fromMonday = await _feederPullMonday(token, allocMonday, sessionKnown);
   }

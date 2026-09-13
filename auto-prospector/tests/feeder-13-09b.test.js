@@ -13,9 +13,10 @@
 //   4. Tres lecturas del feeder pedían 14 o 90 días en un solo pedido con `limit=20000` y PostgREST
 //      corta en 1.000: el reparto y los carriles se medían con un pedazo sin orden de la ventana, y
 //      los contactados que caían fuera de esas 1.000 se re-prospectaban.
-//   5. Monday por slot usaba el techo DIARIO como tope de cada slot y contaba su carril fallando abierto;
-//      la fila del slot se escribía al final (un reinicio a mitad lo re-disparaba); y sus 0-400 filas
-//      entraban en la conversión que decide cuánto traen sellers y majestic.
+//   5. Monday contaba su carril fallando abierto y sin la espera (next_day), así que los 5 slots
+//      apilaban reciclados afuera del carril; un techo "del día" que restaba sólo el slot hacía depender
+//      el volumen del orden de los jobs; la fila del slot se escribía al final (un reinicio a mitad lo
+//      re-disparaba); y sus 0-400 filas entraban en la conversión que decide cuánto traen sellers y majestic.
 //
 // Run: npm test
 import { test } from "node:test";
@@ -249,10 +250,14 @@ test("el slot le da a monday lo que falta de su carril, a sellers+majestic la mi
   const slot = worker.slice(worker.indexOf("async function _runFeederSlot("), worker.indexOf("async function _measureFeederRuns("));
   ok(!/w\.monday/.test(slot), "monday ya no sale de un peso por rendimiento");
   // Desde la corrección del 13/09 el lugar se cuenta con _lugarEnCarril (el mismo _capDeFuente que usa la
-  // inyección, fallando cerrado) y el techo es lo que QUEDA del día (ver la sección 5).
+  // inyección, fallando cerrado) y el tope de cada pasada es el techo del barrido, con la MISMA regla que
+  // el barrido (ver la sección 5): lo que encoló hoy el otro camino no entra en la cuenta.
   ok(/const allocMonday\s+= _asigMonday\.alloc/.test(slot) && /_lugarEnCarril\(token, "auto_feeder_monday"\)/.test(slot)
-    && /_contarEncoladosHoy\(token, "auto_feeder_monday"\)/.test(slot) && /return _capDeFuente|const cap = _capDeFuente\(sourceTag\)/.test(cuerpoDe("_lugarEnCarril")),
-    "monday: el lugar libre de su carril (el mismo cap que usa la inyección), con el techo diario del barrido");
+    && /_asignacionMonday\(\{ lugar: _carrilMonday\.error \? null : _carrilMonday\.lugar, techo: _techoMonday \}\)/.test(slot)
+    && /return _capDeFuente|const cap = _capDeFuente\(sourceTag\)/.test(cuerpoDe("_lugarEnCarril")),
+    "monday: el lugar libre de su carril (el mismo cap que usa la inyección), con el techo del barrido como tope");
+  ok(!/_contarEncoladosHoy|uploaded_at=gte/.test(slot),
+    "el slot no puede depender de si el barrido ya corrió hoy: con el techo compartido de un solo lado, los slots reciclaban 0 o el día sumaba 2 techos según el orden");
   ok(/_parteSM\s+= Math\.round\(targetGross \* FEEDER_PARTE_SELLERS_MAJESTIC\)/.test(slot));
   strictEqual(worker.match(/const FEEDER_PARTE_SELLERS_MAJESTIC = ([\d.]+);/)?.[1], "0.30", "la parte conjunta de sellers + majestic es la que tenían (15 + 15): subirla es decisión del dueño");
   ok(!/_feederPullAdsTxtGraph\(token, [^)]*alloc/.test(slot) && !/_feederPullGeo\(token, [^)]*alloc/.test(slot),
@@ -364,50 +369,117 @@ test("ninguna lectura del feeder que mide o filtra una ventana pide más de 1.00
   deepStrictEqual(fuera, [], "PostgREST corta en 1.000: el pedido cree que leyó todo y leyó un pedazo. Usar _traerTodo con orden");
 });
 
-// ── 5. Monday por slot: techo del DÍA, cuentas que fallan cerrado, slot anotado al empezar ──────────
-test("monday recicla en un slot lo que QUEDA del techo del día, nunca más que su carril, y sin poder contar no recicla", async () => {
-  const { _asignacionMondaySlot: a } = await cargarWorker(["_asignacionMondaySlot"]);
-  strictEqual(a({ lugar: 700, techo: 400, encoladosHoy: 0 }).alloc, 400);
-  strictEqual(a({ lugar: 700, techo: 400, encoladosHoy: 360 }).alloc, 40, "el techo es del día: con 360 ya encolados quedan 40, no otros 400");
-  strictEqual(a({ lugar: 30, techo: 400, encoladosHoy: 0 }).alloc, 30, "y nunca más que el lugar del carril");
-  strictEqual(a({ lugar: 700, techo: 400, encoladosHoy: 520 }).alloc, 0);
-  for (const roto of [{ lugar: null, techo: 400, encoladosHoy: 0 }, { lugar: 700, techo: 400, encoladosHoy: null }]) {
+// ── 5. Monday: una regla para las dos pasadas, la espera dentro del carril, slot anotado al empezar ──
+test("monday recicla en cada pasada min(lugar, techo), sin restar lo que encoló el otro camino, y sin poder contar no recicla", async () => {
+  const { _asignacionMonday: a } = await cargarWorker(["_asignacionMonday"]);
+  strictEqual(a({ lugar: 700, techo: 400 }).alloc, 400);
+  strictEqual(a({ lugar: 300, techo: 400 }).alloc, 300, "nunca más que el lugar del carril");
+  strictEqual(a({ lugar: 0, techo: 400 }).alloc, 0);
+  // El 13/09 a la mañana la regla restaba "lo encolado hoy" y sólo la aplicaba el slot: con el barrido
+  // corriendo primero, los 5 slots del día reciclaban 0. Lo que ya está en la cola lo cuenta el carril.
+  strictEqual(a({ lugar: 300, techo: 400, encoladosHoy: 400 }).alloc, 300, "lo que encoló hoy el barrido no le resta al slot");
+  for (const roto of [{ lugar: null, techo: 400 }, { lugar: NaN, techo: 400 }]) {
     const r = a(roto);
     ok(r.error && r.alloc === 0, `una cuenta ilegible es 'no reciclo', no 'carril vacío': ${JSON.stringify(roto)} → ${JSON.stringify(r)}`);
   }
 });
 
+// La cuenta del carril como la base: suma las filas de los estados que pide la URL (`status=in.(…)`).
+const estadosDe = (u) => (/status=in\.\(([^)]*)\)/.exec(u)?.[1] || "").split(",").filter(Boolean);
+const carrilPorEstado = (porEstado) => (u) => resp([], { total: estadosDe(u).reduce((s, e) => s + (porEstado[e] || 0), 0) });
+const esCuentaDeMonday = (u) => u.includes("toolbar_csv_queue?status=in.(") && u.includes("&source=eq.auto_feeder_monday");
+const reciclables = (n) => () => resp({ domains: Array.from({ length: n }, (_, i) => `reciclado${i}.com`) });
+const reciclablesDelCrm = reciclables(100);
+const chequeadosDe = (pedidos) => new Set(pedidos.filter(p => /\/(app-)?ads\.txt$/.test(p.u) && /reciclado\d+\.com/.test(p.u)).map(p => p.u.match(/reciclado\d+\.com/)[0]));
+
 // El slot entero, con la base, el CRM y los ads.txt falsos. `crm` decide qué contesta /reciclables.
-const correrSlot = async ({ crm, carril = () => resp([], { total: 100 }), hoy = () => resp([], { total: 360 }), cerrar = () => resp(null, { status: 204 }), anotar = () => resp([{ id: 77 }], { status: 201 }) }) => {
+// `hoy` contesta cuántas filas de monday se encolaron hoy: la corrección de la mañana del 13/09 lo
+// preguntaba en el slot; hoy nadie lo pregunta, y el test verifica que siga así.
+const correrSlot = async ({ crm, carril = carrilPorEstado({ pending: 100 }), hoy = () => resp([], { total: 360 }), cerrar = () => resp(null, { status: 204 }), anotar = () => resp([{ id: 77 }], { status: 201 }) }) => {
   const { _runFeederSlot } = await cargarWorker(["_runFeederSlot"], { fetchFalso: true });
   const pedidos = [];
   globalThis.__fetchFalso = enrutar(pedidos, [
     [(u, m) => m === "POST" && /\/rest\/v1\/toolbar_feeder_runs$/.test(u), () => anotar()],
     [(u, m) => m === "PATCH" && u.includes("/rest/v1/toolbar_feeder_runs?id=eq."), () => cerrar()],
-    [(u) => u.includes("toolbar_csv_queue?status=in.(pending,processing,waiting_pool)&source=eq.auto_feeder_monday"), () => carril()],
+    [esCuentaDeMonday, (u) => carril(u)],
     [(u) => u.includes("toolbar_csv_queue?source=eq.auto_feeder_monday&uploaded_at=gte."), () => hoy()],
     [(u) => u.includes("/reciclables"), () => crm()],
     [(u) => /^https?:\/\/[a-z0-9.-]+\/(app-)?ads\.txt$/.test(u), () => resp("", { status: 404 })],
   ]);
   return { corrida: _runFeederSlot("t", "2026-09-14-09:00"), pedidos };
 };
-const reciclablesDelCrm = () => resp({ domains: Array.from({ length: 100 }, (_, i) => `reciclado${i}.com`) });
 
-test("el slot le da a monday lo que queda del techo de hoy (40 de 400 con 360 encolados), no el techo entero", async () => {
-  const { corrida, pedidos } = await correrSlot({ crm: reciclablesDelCrm });
+// El barrido diario entero, con la base, el CRM y los ads.txt falsos.
+const correrBarrido = async ({ carril, crm = reciclables(400) }) => {
+  const { sincronizarFinalizadosDeMonday } = await cargarWorker(["sincronizarFinalizadosDeMonday"], { fetchFalso: true });
+  const pedidos = [];
+  globalThis.__fetchFalso = enrutar(pedidos, [
+    [esCuentaDeMonday, (u) => carril(u)],
+    [(u) => u.includes("/reciclables"), () => crm()],
+    [(u) => /^https?:\/\/[a-z0-9.-]+\/(app-)?ads\.txt$/.test(u), () => resp("", { status: 404 })],
+  ]);
+  const encolados = await sincronizarFinalizadosDeMonday("t");
+  return { encolados, pedidos };
+};
+
+test("con 400 encolados hoy por el barrido y 300 de lugar, el slot recicla 300: no depende de qué job corrió primero", async () => {
+  const { corrida, pedidos } = await correrSlot({
+    crm: reciclables(400), carril: carrilPorEstado({ pending: 150, waiting_pool: 250 }), hoy: () => resp([], { total: 400 }),
+  });
   await corrida;
   const latido = latidoDe(pedidos, "feeder_monday");
   ok(latido, "tiene que latir");
-  strictEqual(latido.esperado_ultimo, 40, `con el techo diario como tope por slot pedía 100 de 100 (5 slots × 400 por día): ${JSON.stringify(latido)}`);
-  const chequeados = new Set(pedidos.filter(p => /\/(app-)?ads\.txt$/.test(p.u) && /reciclado\d+\.com/.test(p.u)).map(p => p.u.match(/reciclado\d+\.com/)[0]));
-  ok(chequeados.size <= 40, `chequeó el ads.txt de ${chequeados.size} reciclados`);
+  strictEqual(latido.esperado_ultimo, 300,
+    `restando el techo del día sólo en el slot, un barrido temprano de 400 dejaba los 5 slots en 0: ${JSON.stringify(latido)}`);
+  ok(!pedidos.some(p => p.u.includes("uploaded_at=gte.")), "el slot no pregunta cuánto encoló hoy el barrido");
+  const chequeados = chequeadosDe(pedidos);
+  ok(chequeados.size > 0 && chequeados.size <= 300, `chequeó el ads.txt de ${chequeados.size} reciclados`);
 });
 
-test("sin poder contar el carril de monday o lo encolado hoy, el slot no le pide la lista al CRM y late 'fail'", async () => {
-  for (const caso of [{ carril: () => resp({ message: "caído" }, { status: 503 }) }, { hoy: () => resp({ message: "caído" }, { status: 503 }) }]) {
+test("para monday la espera ocupa el carril: con 500 en next_day y carril de 700 el lugar es 200 en la inyección, el slot y el barrido", async () => {
+  {
+    const w = await cargarWorker(["_lugarEnCarril", "_injectIntoCsvQueue"], { fetchFalso: true });
+    const pedidos = [];
+    globalThis.__fetchFalso = enrutar(pedidos, [
+      [(u) => u.includes("toolbar_csv_queue?status=in.("), carrilPorEstado({ next_day: 500 })],
+      [(u) => /^https?:\/\/[a-z0-9.-]+\/(app-)?ads\.txt$/.test(u), () => resp("", { status: 404 })],
+    ]);
+    deepStrictEqual(await w._lugarEnCarril("t", "auto_feeder_monday"), { cap: 700, usados: 500, lugar: 200, error: false },
+      "sin contar la espera daba 700 de lugar: 5 slots × 400 se apilaban en next_day afuera del carril");
+    deepStrictEqual(await w._lugarEnCarril("t", "auto_feeder_similar"), { cap: 250, usados: 0, lugar: 250, error: false },
+      "las demás fuentes no cambian: 117 en next_day frenaban a similar, la que mejor convierte");
+    await w._injectIntoCsvQueue("t", Array.from({ length: 300 }, (_, i) => `reciclado${i}.com`), "auto_feeder_monday", { returnDomains: true });
+    strictEqual(chequeadosDe(pedidos).size, 200, "la inyección corta con el mismo número que los pre-chequeos");
+  }
+  {
+    const { corrida, pedidos } = await correrSlot({ crm: reciclables(400), carril: carrilPorEstado({ next_day: 500 }), hoy: () => resp([], { total: 0 }) });
+    await corrida;
+    strictEqual(latidoDe(pedidos, "feeder_monday")?.esperado_ultimo, 200, "slot");
+  }
+  {
+    const { pedidos } = await correrBarrido({ carril: carrilPorEstado({ next_day: 500 }) });
+    const latido = latidoDe(pedidos, "monday_sync");
+    ok(latido && latido.esperado_ultimo === 200 && /carril libre 200/.test(latido.last_detail), `barrido: ${JSON.stringify(latido)}`);
+    strictEqual(chequeadosDe(pedidos).size, 200);
+  }
+});
+
+test("el barrido no recicla a ciegas: sin poder contar el carril no chequea ni encola, y late 'fail'", async () => {
+  for (const carril of [() => resp({ message: "caído" }, { status: 503 }), () => resp([])]) {
+    const { encolados, pedidos } = await correrBarrido({ carril });
+    strictEqual(encolados, 0);
+    strictEqual(chequeadosDe(pedidos).size, 0, "con la cuenta fallando abierta, un 503 era 0 activos → 700 libres → 400 chequeos de ads.txt");
+    ok(!pedidos.some(p => p.m === "POST" && p.u.includes("toolbar_csv_queue?on_conflict")), "no se encola nada");
+    const latido = latidoDe(pedidos, "monday_sync");
+    ok(latido && latido.last_status === "fail" && /no pude contar el carril/.test(latido.last_detail), JSON.stringify(latido));
+  }
+});
+
+test("sin poder contar el carril de monday, el slot no le pide la lista al CRM y late 'fail'", async () => {
+  for (const caso of [{ carril: () => resp({ message: "caído" }, { status: 503 }) }, { carril: () => resp([]) }]) {
     const { corrida, pedidos } = await correrSlot({ crm: reciclablesDelCrm, ...caso });
     await corrida;
-    ok(!pedidos.some(p => p.u.includes("/reciclables")), `un 503 contaba como carril vacío → 400 reciclados al CRM: ${Object.keys(caso)[0]}`);
+    ok(!pedidos.some(p => p.u.includes("/reciclables")), `un 503 contaba como carril vacío → 400 reciclados al CRM: ${caso.carril}`);
     const latido = latidoDe(pedidos, "feeder_monday");
     ok(latido && latido.last_status === "fail" && /no pude contar/.test(latido.last_detail), JSON.stringify(latido));
     ok(pedidos.some(p => p.m === "PATCH" && p.u.includes("toolbar_feeder_runs?id=eq.77")), "el resto del slot sigue y la fila se cierra");
