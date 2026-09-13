@@ -6536,6 +6536,57 @@ async function _scrapeTrafficFallback(domain) {
   return null;
 }
 
+// ── UNA FILA DE CACHÉ CON EL MISMO NÚMERO QUE DECIDE EL PISO (2026-09-13) ───────────────────
+// La auditoría del 13/09 encontró dos maneras de que un lead de Prospects tuviera dos números:
+//   1. Sin páginas por visita (~3% de las respuestas), el piso usaba visitas × 2.0 y eso quedaba en
+//      Prospects, pero la caché guardaba `pageViews: null`. Análisis mostraba las visitas crudas
+//      (200K) y "Bajo umbral 350K" sobre un lead que la tarjeta pintaba con 400K.
+//   2. Si el número salía del respaldo por scrape (Hypestat / siteworthtraffic), no se guardaba:
+//      el lead entraba con 900K y cada MB que lo abría pagaba RapidAPI otra vez y leía "Sin tráfico".
+// Esta función arma la fila con el MISMO estimador que processCsvItem usa para el piso: páginas
+// vistas directas si vinieron; si no, visitas × páginas por visita reales; si tampoco, visitas ×
+// PPV_ESTIMADO, marcado como estimado para que la extensión lo pinte "~X (est.)". Nunca lleva noData.
+// ⚠️ PPV_ESTIMADO tiene que valer lo mismo que PPV_FALLBACK de processCsvItem y el ppvSafe del
+// autopilot (tests/trafico_paridad-13-09b.test.js los compara): si uno cambia solo, vuelve la falla.
+const PPV_ESTIMADO = 2.0;
+function _filaCacheTrafico(visits, { pageViews = null, pagesPerVisit = null, topCountry = null, category = "", source = "" } = {}) {
+  const v         = Number(visits) || 0;
+  const pvDirecto = (typeof pageViews === "number" && pageViews > 0) ? Math.round(pageViews) : null;
+  const ppvReal   = (typeof pagesPerVisit === "number" && pagesPerVisit > 0) ? pagesPerVisit : null;
+  const ppvSource = pvDirecto != null ? (/hypestat/i.test(source || "") ? "hypestat" : "scrape")
+                  : ppvReal != null   ? "api" : "estimated";
+  const pv  = pvDirecto != null ? pvDirecto : Math.round(v * (ppvReal != null ? ppvReal : PPV_ESTIMADO));
+  const ppv = pvDirecto != null ? (v > 0 ? Math.round((pvDirecto / v) * 10) / 10 : null)
+            : (ppvReal != null ? ppvReal : PPV_ESTIMADO);
+  return {
+    rawVisits:      v,
+    visits:         v,
+    pagesPerVisit:  ppv,
+    pageViews:      pv,
+    monthly:        pv,
+    ppvSource,
+    estimatedPages: ppvSource === "estimated",
+    noPageViewData: false,
+    topCountries:   topCountry ? [{ code: Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === topCountry) || topCountry, name: topCountry, share: 0 }] : [],
+    category:       category || "",
+    ...(source ? { source } : {}),
+  };
+}
+// ¿Se guarda el número que rescató el scrape? Si RapidAPI CONTESTÓ (se pagó) y dijo 0, siempre:
+// volver a preguntar es gasto seguro. Si la API falló (sin cupo, 4xx, 5xx, excepción), sólo cuando
+// la estimación ya supera el piso, que es el caso que entra a Prospects: un número bajo de Hypestat
+// grabado 90 días impediría medir con SimilarWeb cuando vuelva el cupo.
+function _debeGuardarScrapeEnCache(fila, { apiContesto = false } = {}) {
+  if (apiContesto) return true;
+  return (Number(fila?.pageViews) || 0) >= REVIEW_QUEUE_MIN_TRAFFIC;
+}
+function _guardarScrapeEnCache(cleanD, fb, { apiContesto = false, pagesPerVisit = null, topCountry = null, category = "" } = {}) {
+  const fila = _filaCacheTrafico(fb.visits, { pageViews: fb.pageViews ?? null, pagesPerVisit, topCountry, category, source: fb.source });
+  if (!_debeGuardarScrapeEnCache(fila, { apiContesto })) return false;
+  saveTrafficCacheServer(cleanD, fila).catch(() => {});
+  return true;
+}
+
 async function getTrafficData(domain, rapidApiKey) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" };
 
@@ -6586,6 +6637,9 @@ async function getTrafficData(domain, rapidApiKey) {
       const fb = await _scrapeTrafficFallback(domain).catch(() => null);
       if (fb && fb.visits >= 1000) {
         log(`  ✅ getTrafficData ${domain}: ${reasonForLog} → scrape fallback OK (${fb.source})`);
+        // 2026-09-13: antes volvía sin guardar y el lead entraba a Prospects sin fila en la caché.
+        // La API falló: sólo se guarda si ya supera el piso (ver _debeGuardarScrapeEnCache).
+        _guardarScrapeEnCache(cleanD, fb, { apiContesto: false });
         return { visits: fb.visits, pageViews: fb.pageViews ?? null, topCountry: null, error: null, fromScrape: fb.source };
       }
       return null;
@@ -6697,14 +6751,13 @@ async function getTrafficData(domain, rapidApiKey) {
 
     // Guardar en cache compartida para próximas consultas (regla de oro 90 días)
     if (visits) {
-      saveTrafficCacheServer(cleanD, {
-        rawVisits:     visits,
-        visits,
+      // 2026-09-13: sin páginas por visita guardaba `pageViews: null` y el piso usaba visitas × 2.0.
+      // Ahora la fila lleva el mismo número que decide el piso, marcado como estimado.
+      saveTrafficCacheServer(cleanD, _filaCacheTrafico(visits, {
         pagesPerVisit,
-        pageViews:     pagesPerVisit ? Math.round(visits * pagesPerVisit) : null,
-        topCountries:  topCountry ? [{ code: Object.keys(COUNTRY_CODES).find(k => COUNTRY_CODES[k] === topCountry) || topCountry, name: topCountry, share: 0 }] : [],
-        category:      data?.WebsiteDetails?.Category || data?.Category || "",
-      }).catch(() => {});
+        topCountry,
+        category: data?.WebsiteDetails?.Category || data?.Category || "",
+      })).catch(() => {});
     }
     // FIX 2026-05-26: devolver también la categoría SimilarWeb para que el filtro
     // de categorías auto-bloqueadas (banking, gov, universidades, etc.) la use.
@@ -6715,6 +6768,9 @@ async function getTrafficData(domain, rapidApiKey) {
       const fb = await _scrapeTrafficFallback(domain).catch(() => null);
       if (fb && fb.visits >= 1000) {
         log(`  ✅ getTrafficData ${domain}: RapidAPI dijo 0 → scrape fallback rescató ${fb.visits} (${fb.source})`);
+        // 2026-09-13: la API contestó y se pagó; el número rescatado se guarda siempre, así ni el
+        // worker ni la extensión vuelven a pagar por este dominio.
+        _guardarScrapeEnCache(cleanD, fb, { apiContesto: true, pagesPerVisit, topCountry, category: swCategory });
         return { visits: fb.visits, pageViews: fb.pageViews ?? null, pagesPerVisit, topCountry, topCountries3, swCategory, error: null, fromScrape: fb.source };
       }
       // La API contestó bien y ni ella ni las tres fuentes públicas tienen datos: eso es un
@@ -6733,6 +6789,7 @@ async function getTrafficData(domain, rapidApiKey) {
     const fb = await _scrapeTrafficFallback(domain).catch(() => null);
     if (fb && fb.visits >= 1000) {
       log(`  ✅ getTrafficData ${domain}: exception rescatada por scrape fallback (${fb.source})`);
+      _guardarScrapeEnCache(cleanD, fb, { apiContesto: false });   // 2026-09-13: sólo si supera el piso
       return { visits: fb.visits, pageViews: fb.pageViews ?? null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: null, fromScrape: fb.source };
     }
     return { visits: null, pagesPerVisit: null, topCountry: null, topCountries3: [], swCategory: "", error: e.message };

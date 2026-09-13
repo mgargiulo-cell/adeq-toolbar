@@ -4,7 +4,7 @@
 // ============================================================
 
 import { CONFIG }                            from "../config.js";
-import { getTrafficCache, saveTrafficCache, getDomainGeo, setDomainGeo } from "./supabase.js";
+import { getTrafficCache, getTrafficCacheSinVencer, getFilaPoolTrafico, saveTrafficCache, getDomainGeo, setDomainGeo } from "./supabase.js";
 import { checkDomainBlocked } from "./blocklist.js";
 import { callProxy }                         from "./apiProxy.js";
 
@@ -295,6 +295,62 @@ function estimatePagesPerVisit(category) {
   return CATEGORY_PAGES_PER_VISIT.other;
 }
 
+// ── DE DÓNDE SALE EL TRÁFICO QUE VE EL MB (2026-09-13) ──────────────────────────────────────
+// Regla pura, la usan getTraffic y el refresco del chequeo del CRM (popup.js runDuplicateCheck).
+//   · Hay fila en Prospects (pending o por_enviar, con tráfico) → "pool": se muestra el número de
+//     la fila, el mismo de la tarjeta, y NUNCA se paga, ni con caché vencida ni con pedido de forzar.
+//     Regla del dueño del 18/08: el tráfico de un lead que ya está en Prospects no se vuelve a medir.
+//   · Si no hay fila, lo de siempre: se fuerza cuando lo pide el MB (Re-verificar) o cuando el CRM
+//     dice que se le puede volver a escribir y la caché tiene más de 30 días; se paga si se fuerza
+//     o si no hay caché.
+export function decidirFuenteTrafico({ filaPool = null, cache = null, veredictoOk = false, cachedDaysAgo = null, pedidoForzar = false } = {}) {
+  if ((Number(filaPool?.traffic) || 0) > 0) return { fuente: "pool", forzar: false, pagar: false };
+  const dias   = Number(cachedDaysAgo ?? cache?.cachedDaysAgo) || 0;
+  const forzar = !!pedidoForzar || !!(veredictoOk && cache?.fromCache && dias > 30);
+  const pagar  = forzar || !cache;
+  return { fuente: pagar ? "api" : "cache", forzar, pagar };
+}
+
+const _NAME_TO_CODE = Object.fromEntries(Object.entries(CODE_TO_NAME).map(([c, n]) => [n.toLowerCase(), c]));
+function _codigoDePaisDeGeo(geo) {
+  const g = String(geo || "").trim();
+  if (/^[A-Za-z]{2}$/.test(g)) return g.toUpperCase();
+  return _NAME_TO_CODE[g.toLowerCase()] || null;
+}
+
+// Arma lo que ve Análisis para un lead de Prospects. El número principal (pageViews, el que usa
+// el umbral) es `traffic` de la fila: el mismo que muestra la tarjeta. La caché, si la hay, sólo
+// aporta el desglose. Pura: no lee ni escribe nada.
+export function armarTraficoDePool(fila, cache, domain) {
+  const traffic = Math.round(Number(fila?.traffic) || 0);
+  const c = cache && !cache.noData ? cache : null;
+  let topCountries = Array.isArray(c?.topCountries) ? c.topCountries.filter(x => x && x.code) : [];
+  if (!topCountries.length) {
+    const deFila = _codigoDePaisDeGeo(fila?.geo);
+    const code   = deFila || inferCountryFromTLD(domain);
+    if (code) topCountries = [{ code, name: CODE_TO_NAME[code] || code, share: 0, source: deFila ? "prospects" : "tld" }];
+  }
+  const visits = Number(c?.rawVisits || c?.visits) || null;
+  return {
+    visits,
+    rawVisits:      visits,
+    pagesPerVisit:  Number(c?.pagesPerVisit) || null,
+    pageViews:      traffic,
+    monthly:        traffic,
+    noPageViewData: false,
+    ppvSource:      c?.ppvSource || null,
+    estimatedPages: false,
+    category:       c?.category || fila?.category || "",
+    categoryRank:   c?.categoryRank || null,
+    globalRank:     c?.globalRank || null,
+    tags:           Array.isArray(c?.tags) ? c.tags : [],
+    topCountries,
+    fromPool:       true,
+    fromCache:      false,
+    cachedDaysAgo:  c?.cachedDaysAgo ?? null,
+  };
+}
+
 // ── getTraffic ────────────────────────────────────────────────
 export async function getTraffic(domain, opts = {}) {
   const { forceRefresh = false } = opts;
@@ -310,8 +366,19 @@ export async function getTraffic(domain, opts = {}) {
     return { visits: 0, pagesPerVisit: null, pageViews: 0, monthly: 0, rawVisits: 0, noPageViewData: true, ppvSource: null, estimatedPages: false, category: "", topCountries: [], blocked: true, blockedReason: block.reason };
   }
 
+  // Prospects y caché en paralelo (2026-09-13): la consulta al pool no le suma espera al caso normal.
+  // Si hay fila en Prospects, el número sale de ahí y no se paga, ni con forceRefresh: la regla vive
+  // acá y no en quien llama, porque runDuplicateCheck y runTrafficCheck corren a la vez.
+  const [filaPool, cached] = await Promise.all([
+    getFilaPoolTrafico(cleanDomain).catch(() => null),
+    forceRefresh ? null : getTrafficCache(cleanDomain),
+  ]);
+  if (decidirFuenteTrafico({ filaPool, cache: cached, pedidoForzar: forceRefresh }).fuente === "pool") {
+    const desglose = cached || await getTrafficCacheSinVencer(cleanDomain).catch(() => null);
+    return armarTraficoDePool(filaPool, desglose, cleanDomain);
+  }
+
   // Caché primero (90 días) — salvo forceRefresh
-  const cached = forceRefresh ? null : await getTrafficCache(cleanDomain);
   if (cached) {
     // Si el caché no tiene geo, inferir por TLD (sin gastar API)
     if (!cached.topCountries?.length) {

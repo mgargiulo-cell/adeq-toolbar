@@ -1266,6 +1266,55 @@ export async function getTrafficCache(domain) {
   }
 }
 
+// ── EL TRÁFICO DE UN LEAD DE PROSPECTS SALE DE PROSPECTS (2026-09-13) ─────────────────────────
+// Regla del dueño (18/08): el tráfico se paga una sola vez; un lead que ya está en Prospects no se
+// vuelve a medir. Y la tarjeta de Prospects y Análisis tienen que decir lo mismo. La extensión no
+// miraba el pool: con la caché vencida, borrada o nunca escrita (el worker no guardaba el número de
+// Hypestat), abrir la web de un lead de Prospects pagaba RapidAPI y mostraba otro número.
+// Estas dos lecturas llevan reloj (el fetch sin timeout dejó mudo al sistema tres veces). Si fallan,
+// devuelven null y la toolbar sigue el camino de siempre.
+const _POOL_TRAFICO_TIMEOUT_MS = 6000;
+// Sólo `pending` (Prospects) y `por_enviar` (la cola del MB): un `validated` ya salió del pool, y si
+// el CRM lo recicla, el refresco de más de 30 días es a propósito.
+export async function getFilaPoolTrafico(domain) {
+  const { url, key } = await getConfig();
+  const d = String(domain || "").trim().toLowerCase();
+  if (!url || !key || !d) return null;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(d)}&status=in.(pending,por_enviar)&traffic=gte.1000&select=id,traffic,geo,category,status&limit=1`,
+      { headers: { "apikey": key, "Authorization": bearer(key) }, signal: AbortSignal.timeout(_POOL_TRAFICO_TIMEOUT_MS) }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return Array.isArray(rows) && rows[0] ? rows[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// La caché sin vencimiento, sólo para el desglose de un lead de Prospects (visitas, páginas por
+// visita, países, categoría): el número principal ya salió del pool, así que una fila vieja no
+// decide nada. Las filas `noData` se ignoran igual que en getTrafficCache.
+export async function getTrafficCacheSinVencer(domain) {
+  const { url, key } = await getConfig();
+  if (!url || !key || !domain) return null;
+  try {
+    const res = await fetch(
+      `${url}/rest/v1/toolbar_traffic_cache?domain=eq.${encodeURIComponent(domain)}&limit=1`,
+      { headers: { "apikey": key, "Authorization": bearer(key) }, signal: AbortSignal.timeout(_POOL_TRAFICO_TIMEOUT_MS) }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    if (!Array.isArray(rows) || !rows.length) return null;
+    if (rows[0]?.data?.noData) return null;
+    const daysAgo = Math.floor((Date.now() - new Date(rows[0].fetched_at)) / 86_400_000);
+    return { ...rows[0].data, fromCache: true, cachedDaysAgo: daysAgo };
+  } catch {
+    return null;
+  }
+}
+
 export async function saveTrafficCache(domain, data) {
   const { url, key } = await getConfig();
   if (!url || !key) return;

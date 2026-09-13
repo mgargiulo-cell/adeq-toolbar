@@ -33,7 +33,7 @@ import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, ve
 // a checkDomainBlocked en este archivo). Un MB parado en mail.google.com cargó `mail.google.com`
 // al CRM como si fuera una web. El veredicto la consulta primero, antes que al CRM.
 import { checkDomainBlocked } from "../modules/blocklist.js";
-import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken } from "../modules/traffic.js";
+import { getTraffic, ultimoErrorTrafico, formatTraffic, passesTrafficFilter, setTrafficAuthToken, decidirFuenteTrafico } from "../modules/traffic.js";
 import { scrapeEmailsFromPage, scrapeContactPages, scrapeWebsiteInformer, scrapeEmailsFromSocialLinks, findDecisionMakerViaApollo, quickValidateEmail, revealApolloEmail } from "../modules/scraper.js";
 import { runAudit }                                                                            from "../modules/audit.js";
 import { generatePitch }                                                                     from "../modules/gemini.js";
@@ -292,6 +292,7 @@ function resetAnalysisUI() {
   state.visits        = 0;
   state.pagesPerVisit = null;
   state.trafficData   = null;
+  state.filaPool      = null;
   state.category      = "";
   state.siteLanguage  = "";
   state.siteOgLocale  = "";
@@ -2429,7 +2430,7 @@ function renderRapidApiUsageBanner({ used, limit, period, scope } = {}) {
 // ---- Estado global ----
 const state = {
   domain: "", url: "", tabId: null,
-  traffic: 0, visits: 0, pagesPerVisit: null, trafficData: null,
+  traffic: 0, visits: 0, pagesPerVisit: null, trafficData: null, filaPool: null,
   emails: [], emailSources: new Map(), emailSentInSession: false, techStack: [], partners: [], banners: null,
   adsTxt: null, revenueGap: null,
   pitch: "", duplicate: null,
@@ -3245,8 +3246,12 @@ async function runDuplicateCheck() {
       if (reprospectable) {
         // Esperar a runTrafficCheck para ver si los datos vinieron de cache reciente.
         // Si cache > 30d, re-fetch con forceRefresh.
+        // 2026-09-13: la decisión sale de decidirFuenteTrafico (modules/traffic.js). Si el lead está en
+        // Prospects no se fuerza nunca: pagaba un hit y Análisis mostraba un número distinto al de la
+        // tarjeta. getTraffic aplica la misma regla por si este timer llega antes que la fila.
         setTimeout(() => {
-          if (state.trafficData?.fromCache && (state.trafficData?.cachedDaysAgo || 0) > 30) {
+          const fuente = decidirFuenteTrafico({ filaPool: state.filaPool, cache: state.trafficData, veredictoOk: veredicto.ok, cachedDaysAgo: state.trafficData?.cachedDaysAgo });
+          if (fuente.forzar) {
             console.log(`[Duplicate] reprospectable + cache >30d → forzando refresh`);
             runTrafficCheck({ forceRefresh: true }).catch(() => {});
           }
@@ -3483,6 +3488,8 @@ async function runTrafficCheck(opts = {}) {
     } else {
       data = await getTraffic(state.domain, { forceRefresh });
     }
+    // Lead de Prospects (2026-09-13): lo lee runDuplicateCheck para no forzar el refresco.
+    state.filaPool = data?.fromPool ? { traffic: data.pageViews } : null;
     if (!data) {
       metricEl.textContent = "No data"; metricEl.className = "metric";
       // Maxi 2026-08-27: decía SIEMPRE "Configure your RapidAPI key", aunque la key estuviera
@@ -3512,7 +3519,9 @@ async function runTrafficCheck(opts = {}) {
     // Maxi 2026-06-17 v2: si visits=0 mostrar botón explícito de "Re-verificar".
     // Antes solo mostraba "0" sin acción → MB perdía leads de millones de
     // visitas que la cache había guardado como 0 por un error transitorio.
-    if (!state.visits || state.visits === 0) {
+    // 2026-09-13: mira también state.traffic. Un lead de Prospects puede no tener visitas en la caché
+    // (entró por Hypestat) y sí páginas vistas en la fila: eso no es "Sin tráfico".
+    if (!state.traffic && !state.visits) {
       metricEl.innerHTML = `<span style="color:#f59e0b">⚠️ Sin tráfico detectado</span>${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "";
       // Maxi 2026-06-18: 3 acciones cuando no encuentra tráfico: re-verificar,
@@ -3532,6 +3541,13 @@ async function runTrafficCheck(opts = {}) {
           runTrafficCheck({ forceRefresh: true }).catch(() => {});
         });
       }, 0);
+    } else if (data.fromPool) {
+      // Lead de Prospects (2026-09-13): el número es el de la tarjeta (review_queue.traffic), sin
+      // pagar. Sin botón Re-verificar a propósito: pagaría y volvería a haber dos números.
+      metricEl.innerHTML = `${formatTraffic(state.traffic)}${mainFlagHtml}`;
+      if (unitEl) unitEl.textContent = "pages/mo";
+      const desglose = (state.visits && data.pagesPerVisit) ? `${formatTraffic(state.visits)} visits × ${data.pagesPerVisit} p/v · ` : "";
+      breakdownEl.innerHTML = `${desglose}<span class="cache-badge" title="Mismo número que la tarjeta de Prospects; no se vuelve a consultar SimilarWeb">📋 Dato de Prospects</span>`;
     } else if (data.noPageViewData) {
       metricEl.innerHTML = `${formatTraffic(state.visits)}${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "visits/mo";
@@ -3544,7 +3560,8 @@ async function runTrafficCheck(opts = {}) {
     } else {
       metricEl.innerHTML = `${formatTraffic(state.traffic)}${mainFlagHtml}`;
       if (unitEl) unitEl.textContent = "pages/mo";
-      const srcLabel = data.ppvSource === "engagement" ? ` <span class="pv-source">via /engagement</span>` : "";
+      const srcLabel = data.ppvSource === "engagement" ? ` <span class="pv-source">via /engagement</span>`
+                     : data.ppvSource === "hypestat"   ? ` <span class="pv-source">via Hypestat</span>` : "";
       breakdownEl.innerHTML = `${formatTraffic(state.visits)} visits × ${data.pagesPerVisit} p/v${srcLabel}${cacheStr}`;
     }
     metricEl.className = "metric";
