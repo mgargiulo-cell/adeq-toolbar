@@ -302,6 +302,12 @@ const DINAMICOS = {
   "auto-prospector/index.js|reconciliarHuerfanosFrozen|HUERFANOS_FROZEN_LOTE": ({ src }) => constante(src, "HUERFANOS_FROZEN_LOTE"),
   "auto-prospector/index.js|runAgentCycle|POOL_SIZE": ({ fn }) => capturado(fn, /const POOL_SIZE = (\d+);/, "runAgentCycle"),
   "auto-prospector/index.js|_cleanupPool|CLEANUP_LOTE": ({ src }) => constante(src, "CLEANUP_LOTE"),
+  // Integración (13/09, reintento_crm R5): pide los ids de a `lote` dominios con domain=in.(...), y domain es
+  // único en toolbar_review_queue, así que nunca vuelven más filas que `lote`. Cota: el valor por defecto y
+  // cualquier `lote:` que pase un llamador.
+  "auto-prospector/index.js|_sacarBloqueadosDeProspects|lote": ({ src, fn }) => Math.max(
+    capturado(fn, /lote = (\d+) \} = \{\}\)/, "_sacarBloqueadosDeProspects"),
+    ...[...src.matchAll(/_sacarBloqueadosDeProspects\([^\n]*\blote: (\d+)/g)].map(m => Number(m[1]))),
   "modules/auditLog.js|fetchAuditLog|limit": ({ fn }) => capturado(fn, /\{ limit = (\d+) \}/, "fetchAuditLog"),
   "modules/supabase.js|fetchNotifications|limit": ({ fn }) => Math.max(capturado(fn, /\{ limit = (\d+) \}/, "fetchNotifications"),
     ...[...leer("popup/popup.js").matchAll(/fetchNotifications\([^\n]*\{ limit: (\d+) \}/g)].map(m => Number(m[1]))),

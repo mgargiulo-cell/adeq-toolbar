@@ -539,7 +539,8 @@ test("R4: el re-engagement elige el idioma con la regla del agente, no `language
 });
 
 test("R4: el lead trae `geo` y el respaldo de plantillas usa el mismo idioma", () => {
-  ok(/select=id,emails,language,geo,/.test(cuerpoDe("pickNextEmailCandidate")), "`_idiomaParaEnvio` mira el GEO del lead");
+  // Integración (13/09): eleccion_paridad agregó `email_sources` al mismo select (el reenganche no pisa fuentes).
+  ok(/select=id,emails,(?:email_sources,)?language,geo,/.test(cuerpoDe("pickNextEmailCandidate")), "`_idiomaParaEnvio` mira el GEO del lead");
   const fn = cuerpoDe("runReengagementCycle");
   const codigo = fn.split("\n").filter(l => !l.trim().startsWith("//")).join("\n");
   ok(/_idioma = await _idiomaParaEnvio\(\{ lead, domain, token \}\)/.test(codigo));
