@@ -819,10 +819,18 @@ async function purgarColaVieja(token) {
     // las que el análisis por fuente y el recálculo de carriles necesitan para saber quién
     // convierte. El análisis daba 0% en todas las fuentes con 194 altas entrando por día.
     // Lo que envejece a una fila terminal es cuánto hace que TERMINÓ, no cuándo entró.
-    const cand = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&processed_at=lt.${corte}&select=id,domain&limit=2000`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(cand) || !cand.length) {
+    // ⚠️ DE A PÁGINAS Y CON ORDEN (2026-09-13). Era un solo pedido con `limit=2000` y sin orden:
+    // PostgREST devuelve 1.000, y los done sin respaldo en Prospects (1.780 el 28/08) no se borran
+    // nunca, así que podían ocupar esas 1.000 todos los días y la purga no avanzaba. Y un pedido
+    // caído se leía como "nada viejo para purgar" con latido verde.
+    const cand = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.done&processed_at=lt.${corte}&select=id,domain&order=id`,
+      auth, { max: 50000 });
+    if (cand === null) {
+      log(`⚠️ purga de la cola: no pude leer los candidatos — no purgo esta vuelta`);
+      return;
+    }
+    if (!cand.length) {
       // Mismo caso: hoy hay CERO filas de +30 días para purgar. Que no haya basura es una
       // buena noticia, y venía reportada como un job muerto desde el 27/08.
       await saludPing(token, "purga_cola", { status: "ok", cadenciaMin: 1440, detalle: "nada viejo para purgar" }).catch(() => {});
@@ -2960,13 +2968,23 @@ async function _muestraKeywordsDeLaBase(token, soloEspanol) {
       // Arranque al azar dentro de la tabla. Se deja margen para no pedir un offset que
       // caiga tan al final que devuelva menos filas que el cupo.
       const off = Math.max(0, Math.floor(Math.random() * Math.max(1, total - cupo)));
-      const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_keywords?lang=eq.${lang}&select=phrase&order=id.asc&offset=${off}&limit=${cupo}`,
-        { headers, signal: AbortSignal.timeout(15000) }
-      );
-      if (!r.ok) continue;
-      const filas = await r.json();
-      const frases = (Array.isArray(filas) ? filas : [])
+      // ⚠️ DE A TRAMOS DE 1.000 (2026-09-13). El español pide 1.200 y PostgREST devuelve 1.000 por
+      // pedido: la muestra salía con 200 frases menos sin que nadie lo notara. Una página caída después
+      // de la primera deja la muestra que ya se tenía (es una muestra, no una lista que proteja nada).
+      const filas = [];
+      for (let hecho = 0; hecho < cupo; hecho += 1000) {
+        const r = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_keywords?lang=eq.${lang}&select=phrase&order=id.asc&offset=${off + hecho}&limit=${Math.min(1000, cupo - hecho)}`,
+          { headers, signal: AbortSignal.timeout(15000) }
+        );
+        if (!r.ok) break;
+        const tramo = await r.json().catch(() => null);
+        if (!Array.isArray(tramo)) break;
+        filas.push(...tramo);
+        if (tramo.length < Math.min(1000, cupo - hecho)) break;
+      }
+      if (!filas.length) continue;
+      const frases = filas
         .map(f => String(f.phrase || "").trim())
         .filter(p => p.length >= 3 && p.length <= 80);
       // ── MEZCLAR FRASES CORTAS Y LARGAS (Maxi 2026-08-26) ────────────────────────────
@@ -3284,8 +3302,13 @@ async function _reconcileAutogoogleAttribution(token) {
     // ninguna se borraba, y la consulta giraba SIEMPRE sobre las 500 más viejas mientras
     // las otras 4.288 no se miraban nunca. Con el filtro arreglado las que califican se
     // borran y la ventana avanza sola, pero hace falta margen para drenar el atraso.
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?select=domain,phrase,injected_at&order=injected_at.asc&limit=2000`, { headers: auth });
-    if (r.ok) rows = await r.json();
+    // ⚠️ DE A PÁGINAS (2026-09-13). El `limit=2000` traía 1.000 (tope de PostgREST). Las de menos de
+    // 10 días que todavía no calificaron no se borran, así que con más de 1.000 en la tabla tapaban
+    // a las que sí calificaron detrás: su `qualified` llegaba hasta 10 días tarde y la frase podía
+    // contarse como muerta (searches ≥ 10 y qualified 0) mientras traía publishers.
+    rows = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_autogoogle_attribution?select=domain,phrase,injected_at&order=injected_at.asc,domain`,
+      auth, { max: 50000 })) || [];
   } catch {}
   if (!Array.isArray(rows) || rows.length === 0) return;
   const domains = rows.map(r => r.domain);
@@ -5674,13 +5697,14 @@ async function runFrozenWeeklyReport(token) {
   } catch {}
 
   // Pull frozen rows
-  const frozenRes = await fetch(
-    `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.frozen&select=domain,uploaded_at,uploaded_by,source,error_message,processed_at&order=uploaded_at.desc&limit=5000`,
-    { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-  );
-  if (!frozenRes.ok) return;
-  const rows = await frozenRes.json();
-  if (!Array.isArray(rows) || rows.length === 0) {
+  // De a páginas (2026-09-13): el `limit=5000` traía 1.000 y el mail decía "Total frozen: 1000" con
+  // más congelados en la base. Si una página falla no se manda un total inventado: se reintenta.
+  const rows = await _traerTodo(
+    `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.frozen&select=domain,uploaded_at,uploaded_by,source,error_message,processed_at&order=uploaded_at.desc,id`,
+    { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+    { max: 50000, entero: true });
+  if (rows === null) return;
+  if (rows.length === 0) {
     log("📊 frozen weekly: 0 rows, skip email");
     await setConfigValue(token, "last_frozen_report_at", today);
     return;
@@ -5836,12 +5860,13 @@ async function loadAutopilotFeedback(token, userEmail) {
   const likedGeos          = new Map();
   if (!userEmail) return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(liked,disliked)&select=domain,action,category,geo,created_at&order=created_at.desc&limit=2000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
-    const rows = await res.json();
+    // De a páginas (2026-09-13): con `limit=2000` PostgREST devolvía los 1.000 más recientes, y un
+    // dominio que el MB rechazó antes de esos 1.000 volvía a sugerirse.
+    const rows = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(liked,disliked)&select=domain,action,category,geo,created_at&order=created_at.desc,id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 50000 });
+    if (!rows) return { dislikedCategories, dislikedGeos, dislikedDomains, likedDomains, likedCategories, likedGeos };
     for (const r of rows) {
       if (r.action === "disliked") {
         if (r.domain)   dislikedDomains.add(r.domain.toLowerCase());
@@ -6142,13 +6167,13 @@ async function _isAngloOverDailyQuota(token, topCountryName, geosAll) {
   if (Date.now() - _angloCache.ts > _ANGLO_TTL) {
     try {
       const since = new Date(Date.now() - 86_400_000).toISOString();
-      const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&select=geo,geos_all&limit=3000`,
-        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-      );
-      if (!r.ok) return false;                      // falla suave: no bloquear por un error de red
-      const rows = await r.json();
-      if (!Array.isArray(rows)) return false;
+      // De a páginas (2026-09-13): con `limit=3000` la cuota se medía sobre 1.000 altas sin orden
+      // en un día de import grande.
+      const rows = await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${since}&select=geo,geos_all&order=id`,
+        { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+        { max: 50000 });
+      if (!Array.isArray(rows)) return false;       // falla suave: no bloquear por un error de red
       _angloCache.total = rows.length;
       _angloCache.anglo = rows.filter(x => _geoTier(_leadIso(x.geo, x.geos_all)) === 5).length;
       _angloCache.ts = Date.now();
@@ -9742,20 +9767,29 @@ async function _manualesDeMonday(token, dia) {
 // 1000" con 1.365, y la suma por fuente daba exactamente 1.000. Esto pagina con Range hasta
 // `max` o hasta que una página venga corta. Si una página falla devuelve null — nunca una
 // lista parcial que parezca entera, que es justo el error que arregla.
-async function _traerTodo(url, headers, { max = 20000, pagina = 1000 } = {}) {
+// (2026-09-13) Dos opciones para los lectores que protegen contra recontacto o reuso:
+//   · `entero: true` — si se llega a `max` sin ver el final de la tabla, null. Sin esto una ventana
+//     más grande que el tope volvía cortada y con cara de entera (el mismo error, un piso más arriba).
+//   · `reloj` (ms) — reloj por página, para los que corren dentro del turno del agente y no pueden
+//     esperar los 120 s del reloj por defecto en cada página.
+async function _traerTodo(url, headers, { max = 20000, pagina = 1000, entero = false, reloj = null } = {}) {
   const limpia = String(url).replace(/[&?]limit=\d+/g, "");
   const out = [];
+  let vioElFinal = false;
   for (let desde = 0; desde < max; desde += pagina) {
     let r;
-    try { r = await fetch(limpia, { headers: { ...headers, "Range-Unit": "items", "Range": `${desde}-${desde + pagina - 1}` } }); }
+    const opts = { headers: { ...headers, "Range-Unit": "items", "Range": `${desde}-${desde + pagina - 1}` } };
+    if (reloj) opts.signal = AbortSignal.timeout(reloj);
+    try { r = await fetch(limpia, opts); }
     catch { return null; }
-    if (r.status === 416) break;                       // más allá del final
+    if (r.status === 416) { vioElFinal = true; break; }  // más allá del final
     if (!r.ok) return null;
     const j = await r.json().catch(() => null);
     if (!Array.isArray(j)) return null;
     out.push(...j);
-    if (j.length < pagina) break;
+    if (j.length < pagina) { vioElFinal = true; break; }
   }
+  if (entero && !vioElFinal) return null;
   return out;
 }
 
@@ -10337,13 +10371,15 @@ async function parteDelDia(token, opts = {}) {
     timeZone: "America/Argentina/Buenos_Aires", hour: "2-digit", minute: "2-digit", hour12: false });
 
   // Los sitios que miraron (con geo). No todos terminan en un envío.
-  const _hist = await fetch(
+  const _hist = await _traerTodo(
     // `is_new` y `page_views` además de lo anterior: el user quiere saber, por MB, cuántas
     // URLs abrió y cómo se reparten — nuevas vs ya conocidas, y por encima o por debajo del
     // piso de tráfico. "Para saber si trabajó y de qué manera". (Maxi 2026-08-25.)
-    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo,is_new,page_views,created_at&limit=2000`,
-    { headers: auth }
-  ).then(r => r.ok ? r.json() : []).catch(() => []);
+    // De a páginas (2026-09-13): con `limit=2000` PostgREST cortaba en 1.000 filas, y una lectura
+    // caída se mostraba como "0 URLs abiertas". Ahora el parte dice que no se pudo leer.
+    `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=eq.${hoy}&select=domain,media_buyer,email,geo,is_new,page_views,created_at&order=id`,
+    auth, { max: 50000 });
+  if (_hist === null) problemas.push(`No se pudo leer el historial de URLs abiertas de hoy: los números por MB de abajo no son ceros, son una consulta que falló.`);
   // ── LO QUE NO ES UNA WEB NO CUENTA COMO "URL ABIERTA" (parte del 07/09) ─────────────
   // La toolbar analiza sola cada pestaña a la que se llega con el panel abierto: Gmail,
   // YouTube, claude.ai, la consola del CRM. Diego figuraba con 60 "URLs abiertas" y 26 "sin
@@ -10398,10 +10434,11 @@ async function parteDelDia(token, opts = {}) {
   // dispara nada. Por eso se reconstruye desde started_at/ended_at, que el latido de 60s sí
   // mantiene. Las sesiones de menos de un minuto no llegan a registrar fin: el número es un
   // PISO, no un total, y así se muestra. Mentir con un total exacto sería peor.
-  const _sesiones = await fetch(
-    `${SUPABASE_URL}/rest/v1/toolbar_usage_sessions?started_at=gte.${desdeHoy}&select=user_email,started_at,ended_at,duration_sec&limit=2000`,
-    { headers: auth }
-  ).then(r => r.ok ? r.json() : []).catch(() => []);
+  // De a páginas (2026-09-13), igual que el historial de arriba.
+  const _sesiones = await _traerTodo(
+    `${SUPABASE_URL}/rest/v1/toolbar_usage_sessions?started_at=gte.${desdeHoy}&select=user_email,started_at,ended_at,duration_sec&order=id`,
+    auth, { max: 50000 });
+  if (_sesiones === null) problemas.push(`No se pudieron leer las sesiones de la toolbar de hoy: el tiempo con la toolbar abierta no es cero, es una consulta que falló.`);
   for (const ses of (Array.isArray(_sesiones) ? _sesiones : [])) {
     const f = _fila(_quien(ses.user_email));
     f.sesiones = (f.sesiones || 0) + 1;
@@ -10512,9 +10549,11 @@ async function parteDelDia(token, opts = {}) {
   const _promedios = new Map();
   try {
     const _d14 = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
-    const _hist = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=gte.${_d14}&select=media_buyer,date&limit=5000`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    // De a páginas (2026-09-13): 14 días de historial pasan las 1.000 filas y el promedio salía de
+    // un pedazo sin orden. Si falla queda sin promedio (no se compara), nunca un promedio inventado.
+    const _hist = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_historial?source=eq.manual&date=gte.${_d14}&select=media_buyer,date&order=id`,
+      auth, { max: 100000, entero: true });
     const _acc = {};
     for (const h of (Array.isArray(_hist) ? _hist : [])) {
       const q = _quien(h.media_buyer);
@@ -10980,11 +11019,15 @@ async function revisarDescartesCondicionales(token) {
     // valores que llevan espacios necesita comillas dobles adentro, y esta base ya nos
     // mordió una vez con la sintaxis de los operadores lógicos. Traer un lote y filtrar
     // acá cuesta lo mismo y no depende de acertarle a un encoding.
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.skipped&uploaded_at=lt.${encodeURIComponent(corte)}&select=id,error_message&order=uploaded_at.asc&limit=1500`,
-      { headers: auth });
-    if (!r.ok) { log(`⚠️ revisarDescartesCondicionales: no pude leer (${r.status})`); return; }
-    const _todas = await r.json().catch(() => []);
+    // ⚠️ DE A PÁGINAS (2026-09-13). Era `limit=1500` sobre las más viejas, y PostgREST devuelve 1.000.
+    // Los descartes que NO merecen otra mirada (gobierno, e-commerce, sin ads.txt) se quedan en
+    // `skipped` para siempre y siguen siendo los más viejos: con 1.000 de ésos adelante, la revisión
+    // leía siempre las mismas y no liberaba nunca a los condicionales que venían detrás.
+    const _todas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=eq.skipped&uploaded_at=lt.${encodeURIComponent(corte)}&select=id,error_message&order=uploaded_at.asc,id`,
+      auth, { max: 100000 });
+    if (_todas === null) { log(`⚠️ revisarDescartesCondicionales: no pude leer los descartes viejos`); return; }
+    if (_todas.length >= 100000) log(`⚠️ revisarDescartesCondicionales: 100.000 descartes viejos leídos, el tope — los más nuevos quedan para la próxima`);
     // Solo los motivos que dependen de una condición que cambia. Un "gobierno", un
     // "e-commerce" o un "dominio muerto" NO entran acá: esos no cambian.
     // Y no todos los "tráfico bajo" merecen una segunda mirada: un sitio con 2.593 vistas
@@ -11714,10 +11757,12 @@ async function _loadProspectTrashContext(token) {
   let rules = "";
   try {
     const since = new Date(Date.now() - 90 * 86400_000).toISOString();
-    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?created_at=gte.${since}&select=category,action&limit=5000`, { headers: auth });
-    if (r.ok) {
+    // De a páginas (2026-09-13): con `limit=5000` las categorías "net-negativas" salían de 1.000 filas
+    // sin orden de los 90 días.
+    const _fb = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_autopilot_feedback?created_at=gte.${since}&select=category,action&order=id`, auth, { max: 100000, entero: true });
+    if (_fb) {
       const tally = new Map();
-      for (const x of (await r.json() || [])) {
+      for (const x of _fb) {
         const c = (x.category || "").toLowerCase().trim();
         if (!c) continue;
         const t = tally.get(c) || { dis: 0, lik: 0 };
@@ -15194,18 +15239,26 @@ async function reabrirLeadsRebotados(token) {
     if (!(await _tocaCorrer(token, "reabrir_rebotados", 6 * 60))) return;
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
-    const rebotados = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=5000`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(rebotados) || !rebotados.length) {
-      await saludPing(token, "reabrir_rebotados", { status: "ok", cadenciaMin: 360, detalle: "no hay rebotes registrados" }).catch(() => {});
-      return;
-    }
-    const muertos = new Set(rebotados.map(x => String(x.email || "").toLowerCase()).filter(Boolean));
+    // ⚠️ LAS DOS LISTAS, ENTERAS (2026-09-13). Leía `toolbar_bounced_emails` con `limit=5000` y los
+    // pendientes con `limit=1500` sin orden: PostgREST devuelve 1.000 de cada una. Un lead cuyo único
+    // email rebotó en la fila 1.003 de rebotes, o que caía en el puesto 1.100 del pool, no se reabría:
+    // seguía "con email" y el pulido no lo buscaba. Y una lectura caída se latía como "no hay rebotes
+    // registrados", en verde.
+    // Los rebotes salen de la misma lista paginada y cacheada que usan la auditoría y el pulido. Sin
+    // una lectura buena no se juzga, y se devuelve el turno para reintentar en la vuelta siguiente.
+    const _devolverTurno = async (detalle) => {
+      _CADENCIA_MEM.delete("reabrir_rebotados");
+      await setConfigValue(token, "cadencia_reabrir_rebotados", "").catch(() => {});
+      await saludPing(token, "reabrir_rebotados", { status: "fail", cadenciaMin: 360, detalle }).catch(() => {});
+      log(`⚠️ reabrir rebotados: ${detalle} — reintento en la próxima vuelta`);
+    };
+    if (!(await _rebotesListosParaJuzgar(token))) return _devolverTurno("no pude leer la lista de rebotes");
+    const muertos = { has: (e) => isBouncedSync(e) };
 
-    const leads = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id,domain,emails,email_sources&limit=1500`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    const leads = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id,domain,emails,email_sources&order=id`,
+      auth, { max: 50000 });
+    if (leads === null) return _devolverTurno("no pude leer el pool");
     // ── "NADA QUE HACER" NO ES "NO CORRÍ" (Maxi 2026-09-02) ──────────────────────────
     // Estos returns eran mudos: el job corría, no encontraba trabajo y se iba sin pingear.
     // El monitor entonces lo daba por ATRASADO. Medido hoy: `cadencia_reabrir_rebotados`
@@ -19013,19 +19066,30 @@ async function reportarReboteAlCrm(token, { email, originalDomain, tipo, detalle
 const _bounceSeenCache = { set: new Set(), ts: 0 };
 const BOUNCE_SEEN_TTL = 5 * 60_000;
 
+// ⚠️ ENTERA O NADA (2026-09-13). Pedía `limit=20000` sin orden y PostgREST devuelve 1.000: un
+// mensaje ya procesado que caía fuera de esas 1.000 se volvía a procesar, y queueBounceRetry
+// reenviaba — el bug del 17/07 otra vez, por la puerta del tope. Y si la lectura fallaba en un
+// proceso recién arrancado devolvía el conjunto VACÍO, con el mismo efecto sobre toda la ventana.
+// Ahora se leen sólo los vistos de 30 días (el scan mira `newer_than:7d` y un mensaje se marca
+// después de llegar, así que su seen_at nunca es anterior a la ventana; 30 días es el margen que
+// fija el SQL de la tabla), de a páginas y enteros. Si no se pudo, devuelve null y el scan no
+// procesa esa tanda: sin saber qué se procesó, cada pasada podía volver a mandar.
 async function loadSeenBounceMsgs(token) {
-  if (Date.now() - _bounceSeenCache.ts < BOUNCE_SEEN_TTL) return _bounceSeenCache.set;
+  if (_bounceSeenCache.ts && Date.now() - _bounceSeenCache.ts < BOUNCE_SEEN_TTL) return _bounceSeenCache.set;
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounce_seen?select=msg_id&limit=20000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (res.ok) {
-      _bounceSeenCache.set = new Set((await res.json() || []).map(r => r.msg_id));
-      _bounceSeenCache.ts = Date.now();
-    }
-  } catch {}
-  return _bounceSeenCache.set;
+    const desde = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const filas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_seen?seen_at=gte.${desde}&select=msg_id&order=msg_id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000, entero: true });
+    if (!filas) return null;
+    // Lo que se marcó en memoria mientras tanto se conserva: su POST pudo no haber llegado todavía.
+    const set = new Set(filas.map(r => r.msg_id).filter(Boolean));
+    for (const id of _bounceSeenCache.set) set.add(id);
+    _bounceSeenCache.set = set;
+    _bounceSeenCache.ts = Date.now();
+    return set;
+  } catch { return null; }
 }
 
 async function markBounceMsgSeen(token, msgId) {
@@ -19196,13 +19260,14 @@ async function scanBouncesForUser(token, userEmail) {
       // descarta entero. Ampliar la ventana no afloja el filtro: sigue exigiendo que la
       // dirección esté entre las que escribimos, solo que mirando más atrás.
       const _d30 = new Date(Date.now() - 90 * 86_400_000).toISOString();
-      const _r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=email_to&limit=20000`,
-        { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
-      if (_r.ok) {
-        const _f = await _r.json();
-        if (Array.isArray(_f)) _destinatariosReales = new Set(_f.map(x => String(x.email_to || "").toLowerCase()).filter(Boolean));
-      }
+      // De a páginas (2026-09-13): 90 días de un buzón son unos 1.800 envíos y el `limit=20000` traía
+      // 1.000. El rebote de un destinatario fuera de esas 1.000 no matcheaba y la dirección muerta
+      // quedaba libre para volver a usarse. Si una página falla, null: el fallback no marca a nadie.
+      const _f = await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=email_to&order=id`,
+        { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+        { max: 100000 });
+      if (Array.isArray(_f)) _destinatariosReales = new Set(_f.map(x => String(x.email_to || "").toLowerCase()).filter(Boolean));
     } catch {}
     // ── EL `AND` ENTRE DOS LISTAS DE PALABRAS ERA EL AGUJERO (Maxi 2026-08-31) ──────────
     // La consulta exigía `from:(daemons)` Y ADEMÁS `subject:(lista de frases)`. Alcanzaba con
@@ -19284,6 +19349,9 @@ async function scanBouncesForUser(token, userEmail) {
     // re-abría y re-procesaba cada rebote en CADA pasada del scan — ver loadSeenBounceMsgs.
     // Además ahorra una llamada ?format=full a Gmail por cada mensaje ya visto.
     const seen = await loadSeenBounceMsgs(token);
+    // (2026-09-13) Sin la lista entera de mensajes ya procesados no se procesa: un rebote visto dos
+    // veces dispara dos reenvíos. Mismo criterio que scanAutoReplies.
+    if (!seen) { log(`⚠️ scanBounces ${userEmail}: no pude leer qué rebotes ya se procesaron — no proceso esta tanda`); return 0; }
     const ids = allIds.filter(id => !seen.has(id));
     if (!ids.length) { log(`📬 scanBounces ${userEmail}: ${allIds.length} msgs Gmail · 0 nuevos (todos ya procesados)`); return 0; }
 
@@ -22746,12 +22814,17 @@ async function reajustarPlantillasPorRespuesta(token) {
     const desde = new Date(Date.now() - TPL_VENTANA_DIAS * 86400_000).toISOString();
 
     // El idioma vive en el lead, no en el tracking: se cruza por dominio.
+    // ⚠️ DE A PÁGINAS (2026-09-13). Los tres pedían 8.000-10.000 filas y PostgREST devuelve 1.000: la
+    // foto semanal medía 1.000 envíos y buscaba el idioma entre 1.000 leads cualesquiera, así que casi
+    // ningún envío tenía idioma. Si alguna lectura no se completa, esta semana no se escribe una foto
+    // hecha con pedazos.
     const [tr, acts, leads] = await Promise.all([
-      fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${desde}&select=agent_action_id,domain,responded_at,response_type&limit=8000`, { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []),
-      fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?template_id=not.is.null&created_at=gte.${desde}&select=id,template_id&limit=8000`, { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []),
-      fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=domain,language&limit=10000`, { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []),
+      _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${desde}&select=agent_action_id,domain,responded_at,response_type&order=id`, auth, { max: 100000, entero: true }),
+      _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?template_id=not.is.null&created_at=gte.${desde}&select=id,template_id&order=id`, auth, { max: 100000, entero: true }),
+      _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=domain,language&order=id`, auth, { max: 300000, entero: true }),
     ]);
-    if (!Array.isArray(tr) || tr.length < 50) return;
+    if (!tr || !acts || !leads) { log(`⚠️ reajuste de plantillas: no pude leer envíos, plantillas o idiomas enteros — no escribo la foto de esta semana`); return; }
+    if (tr.length < 50) return;
 
     const tplPorAccion = new Map((acts || []).map(a => [a.id, a.template_id]));
     const idiomaPorDom = new Map((leads || []).map(l => [String(l.domain || "").toLowerCase(), (l.language || "").toLowerCase()]));
@@ -23155,10 +23228,11 @@ async function securityWatchdog(token) {
   const _desdeMedianoche = _madridMidnightUtcISO();
   const _porBuzon = {};
   try {
-    const _filas = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_desdeMedianoche}&details->>ui_origin=is.null&select=user_email&limit=2000`,
-      { headers: auth }
-    ).then(r => r.ok ? r.json() : []).catch(() => []);
+    // De a páginas (2026-09-13): un loop que manda miles es justo lo que esta alarma busca, y con
+    // `limit=2000` el número que informaba se clavaba en 1.000.
+    const _filas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_desdeMedianoche}&details->>ui_origin=is.null&select=user_email&order=id`,
+      auth, { max: 100000 });
     for (const f of (Array.isArray(_filas) ? _filas : [])) {
       const u = String(f.user_email || "?").toLowerCase();
       _porBuzon[u] = (_porBuzon[u] || 0) + 1;
@@ -23855,13 +23929,16 @@ async function runAgentCycle(token, allFlags) {
   let _contactados30d = null;
   try {
     const _corte = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
-    const _r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${_corte}&select=domain&limit=20000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
-    if (_r.ok) {
-      const _f = await _r.json();
-      if (Array.isArray(_f)) _contactados30d = new Set(_f.map(x => String(x.domain || "").toLowerCase()));
-    }
+    // ⚠️ DE A PÁGINAS Y ENTERA (2026-09-13). Con `limit=20000` PostgREST devolvía 1.000 y el conjunto
+    // parecía completo: los contactados fuera de esas 1.000 no se filtraban acá y el ciclo gastaba
+    // idioma, scrape, pitch y MV en ellos hasta que el guard por dominio los frenaba. Orden por dominio
+    // (como _dominiosContactadosDesde). Si no se pudo leer entera queda null, como antes: no se filtra
+    // nada en memoria y decide el guard por dominio, que falla cerrado.
+    const _f = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${_corte}&select=domain&order=domain`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: CONTACTADOS_MAX_FILAS, entero: true, reloj: 10000 });
+    if (Array.isArray(_f)) _contactados30d = new Set(_f.map(x => String(x.domain || "").toLowerCase()));
   } catch {}
   // `null` = no se pudo cargar. En ese caso NO se filtra nada en memoria y decide el guard
   // por dominio, que falla cerrado. Nunca se manda de más por no haber podido leer.
@@ -23877,13 +23954,13 @@ async function runAgentCycle(token, allFlags) {
   let _saltadosSinDireccion7d = new Set();
   try {
     const _corte7 = new Date(Date.now() - 7 * 86400_000).toISOString();
-    const _r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=in.(mv_dudoso,all_candidates_undeliverable)&created_at=gte.${_corte7}&select=domain&limit=5000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) });
-    if (_r.ok) {
-      const _f = await _r.json();
-      if (Array.isArray(_f)) _saltadosSinDireccion7d = new Set(_f.map(x => String(x.domain || "").toLowerCase()).filter(Boolean));
-    }
+    // De a páginas (2026-09-13): 269 salteos por día son ~1.900 en la semana y el `limit=5000` traía
+    // 1.000, así que la mitad de los leads sin dirección enviable se volvían a recorrer cada turno.
+    const _f = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&reason=in.(mv_dudoso,all_candidates_undeliverable)&created_at=gte.${_corte7}&select=domain&order=id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000, reloj: 10000 });
+    if (Array.isArray(_f)) _saltadosSinDireccion7d = new Set(_f.map(x => String(x.domain || "").toLowerCase()).filter(Boolean));
   } catch {}
   if (_saltadosSinDireccion7d.size) log(`  📋 ${_saltadosSinDireccion7d.size} dominio(s) sin dirección enviable en 7 días (MV dudoso o todos no entregables) — se filtran antes del ciclo`);
   // ── LO QUE UN MB SALTEA, EL SIGUIENTE NO LO REPITE EN EL MISMO TURNO (2026-09-13) ──────────
@@ -23981,11 +24058,13 @@ async function runAgentCycle(token, allFlags) {
   // separado: se escanea a cualquiera que haya enviado en los últimos 30 días.
   try {
     const _d30 = new Date(Date.now() - 30 * 86_400_000).toISOString();
-    const _r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=user_email&limit=5000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } });
-    if (_r.ok) {
-      const _f = await _r.json();
+    // De a páginas (2026-09-13): 30 días de envíos pasan las 1.000 filas, y quien mandó a mano fuera
+    // de esas 1.000 no se escaneaba: sus rebotes no entraban a la lista compartida.
+    const _f = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${_d30}&select=user_email&order=id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000, reloj: 10000 });
+    if (Array.isArray(_f)) {
       const _delAgente = new Set(allFlags.agentUsers.map(u => String(u).toLowerCase()));
       const _extras = [...new Set((Array.isArray(_f) ? _f : [])
         .map(x => String(x.user_email || "").toLowerCase()).filter(Boolean))]
@@ -24056,16 +24135,17 @@ async function runAgentCycle(token, allFlags) {
         // rebotaron. Es exactamente lo que ya hacía bien vigilarReputacion.
         let _rebotes = 0;
         try {
-          const _rs = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${_desde7}&select=email_to&limit=3000`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
-          const _rb = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=5000`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
-          if (!_rs.ok || !_rb.ok) throw new Error("no pude medir");
-          const _dest = (await _rs.json()).map(x => String(x.email_to || "").toLowerCase()).filter(Boolean);
-          const _malos = new Set((await _rb.json()).map(x => String(x.email || "").toLowerCase()));
-          _rebotes = _dest.filter(e => _malos.has(e)).length;
+          // (2026-09-13) Los rebotes pedían `limit=5000` y PostgREST devuelve 1.000 filas sin orden: la
+          // cohorte se cruzaba contra un pedazo de la lista. Ahora es la lista entera, paginada y
+          // cacheada por loadBouncedEmails; sin una lectura buena, "no pude medir" (no frena a nadie).
+          // ACCION_ENVIO_PARA_REBOTE (2026-09-13): el 2º email también salió de este buzón y cuenta en la cohorte.
+          const _rs = await _traerTodo(
+            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${_desde7}&select=email_to&order=id`,
+            { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+            { max: 50000, entero: true, reloj: 8000 });
+          if (!_rs || !(await _rebotesListosParaJuzgar(token))) throw new Error("no pude medir");
+          const _dest = _rs.map(x => String(x.email_to || "").toLowerCase()).filter(Boolean);
+          _rebotes = _dest.filter(e => isBouncedSync(e)).length;
         } catch (e) {
           // "No pude medir" NO puede frenar a nadie: sería el patrón de siempre otra vez.
           log(`  ℹ️ ${userEmail}: no pude calcular el rebote de la cohorte (${e.message}) — no freno`);
@@ -25844,9 +25924,11 @@ async function reajustarPrioridadTiposEmail(token) {
     if (!(await _tocaCorrer(token, "reajuste_tipos_email", 7 * 24 * 60))) return;
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const d90 = new Date(Date.now() - 90 * 86400_000).toISOString();
-    const filas = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${d90}&select=email_sent_to,source,responded_at,response_type&limit=8000`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
+    // De a páginas (2026-09-13): el `limit=8000` traía 1.000 de los 90 días y el orden de tipos se
+    // reajustaba con un pedazo sin orden. Sin la ventana entera no se toca nada.
+    const filas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${d90}&select=email_sent_to,source,responded_at,response_type&order=id`,
+      auth, { max: 100000, entero: true });
     if (!Array.isArray(filas) || filas.length < 100) return;   // sin muestra no se toca nada
 
     const agg = {};
@@ -25923,12 +26005,11 @@ async function _fetchResponseRateRank(token, mbEmail) {
     const mb = (mbEmail || "").toLowerCase();
     const since = new Date(Date.now() - SOURCE_PERF_WINDOW_DAYS * 86400_000).toISOString();
     const filter = mb ? `&mb_email=eq.${encodeURIComponent(mb)}` : "";
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${since}${filter}&select=source,response_type&limit=5000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return null;
-    const rows = await res.json().catch(() => []);
+    // De a páginas (2026-09-13): con `limit=5000` el ranking por respuesta salía de 1.000 filas.
+    const rows = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${since}${filter}&select=source,response_type&order=id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000, entero: true });
     if (!Array.isArray(rows) || rows.length === 0) return null;
     // Contadores por source
     const counts = new Map(); // source → { sent, real }
@@ -26029,13 +26110,14 @@ async function aggregateSourcePerformance(token) {
     log(`📊 Source perf: aggregating window ${SOURCE_PERF_WINDOW_DAYS}d (since ${since.slice(0, 10)})`);
 
     // 1. Pull todos los sends del período con source poblado en details.
-    const sendsRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent)&created_at=gte.${since}&select=id,user_email,email_to,details,created_at&limit=10000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!sendsRes.ok) { log(`  ⚠️ sends fetch ${sendsRes.status}`); return; }
-    const sends = await sendsRes.json();
-    if (!Array.isArray(sends) || sends.length === 0) { log("  (sin sends en ventana)"); return; }
+    // De a páginas (2026-09-13): el `limit=10000` traía 1.000 envíos de la ventana y la tabla de
+    // rendimiento por fuente se escribía con esa muestra como si fuera el total.
+    const sends = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(sent,re_sent,bounce_retry_sent)&created_at=gte.${since}&select=id,user_email,email_to,details,created_at&order=id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000, entero: true });
+    if (!sends) { log(`  ⚠️ sends: no pude leer la ventana entera`); return; }
+    if (sends.length === 0) { log("  (sin sends en ventana)"); return; }
 
     // 2. Bulk pull de opens — todas las filas que matchean los action_ids.
     const sendIds = sends.map(s => s.id).filter(Boolean);
@@ -26055,14 +26137,14 @@ async function aggregateSourcePerformance(token) {
 
     // 3. Bulk pull de bounces — match por email_to (los rebotados son target del send).
     const bouncedEmails = new Set();
-    const bRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${since}&select=original_email`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (bRes.ok) {
-      const brows = await bRes.json().catch(() => []);
-      brows.forEach(b => { if (typeof b.original_email === "string") bouncedEmails.add(b.original_email.toLowerCase()); });
-    }
+    // Sin `limit=` también corta en 1.000 (2026-09-13): de a páginas, y sin la lista entera no se
+    // escribe una tasa de rebote en cero.
+    const brows = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${since}&select=original_email&order=id`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000, entero: true });
+    if (!brows) { log(`  ⚠️ bounce_retries: no pude leer la ventana entera`); return; }
+    brows.forEach(b => { if (typeof b.original_email === "string") bouncedEmails.add(b.original_email.toLowerCase()); });
 
     // 4. Agregar por (mb, source).
     const agg = new Map(); // key "mb|source" → {sent, opens, bounces}
@@ -26740,29 +26822,26 @@ async function guardarMetricasDelDia(token) {
     try {
       // Sin el filtro de ui_origin, el histórico guardaba los envíos manuales del MB como si
       // fueran del agente. Las métricas son del AGENTE, regla del user. (Maxi 2026-08-25.)
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_madridMidnightUtcISO()}&details->>ui_origin=is.null&select=user_email&limit=2000`, { headers: auth });
-      if (r.ok) {
-        const filas = await r.json();
-        if (Array.isArray(filas)) {
-          enviados = filas.length;
-          filas.forEach(f => { const u = f.user_email || "?"; porMb[u] = (porMb[u] || 0) + 1; });
-        }
-      }
-    } catch {}
+      // De a páginas (2026-09-13). Una lectura caída se guarda como null ("no se pudo medir"), no
+      // como un día con 0 envíos en la historia.
+      const filas = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${_madridMidnightUtcISO()}&details->>ui_origin=is.null&select=user_email&order=id`, auth, { max: 100000, entero: true });
+      if (Array.isArray(filas)) {
+        enviados = filas.length;
+        filas.forEach(f => { const u = f.user_email || "?"; porMb[u] = (porMb[u] || 0) + 1; });
+      } else { enviados = null; }
+    } catch { enviados = null; }
 
     // 2 · altas, cortadas por fuente
     const porFuente = {};
     let altas = 0;
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${_madridMidnightUtcISO()}&select=source&limit=5000`, { headers: auth });
-      if (r.ok) {
-        const filas = await r.json();
-        if (Array.isArray(filas)) {
-          altas = filas.length;
-          filas.forEach(f => { const s = f.source || "(sin fuente)"; porFuente[s] = (porFuente[s] || 0) + 1; });
-        }
-      }
-    } catch {}
+      // De a páginas (2026-09-13): un día de import grande pasa las 1.000 altas.
+      const filas = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${_madridMidnightUtcISO()}&select=source&order=id`, auth, { max: 100000, entero: true });
+      if (Array.isArray(filas)) {
+        altas = filas.length;
+        filas.forEach(f => { const s = f.source || "(sin fuente)"; porFuente[s] = (porFuente[s] || 0) + 1; });
+      } else { altas = null; }
+    } catch { altas = null; }
 
     // 3 y 4 · limpiados y emails hallados
     // Mismo bug de `updated_at` que en el parte diario: la columna no existe, las dos
@@ -26781,14 +26860,14 @@ async function guardarMetricasDelDia(token) {
       method: "POST",
       headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify({
-        dia: hoy, enviados, enviados_por_mb: porMb,
-        altas, altas_por_fuente: porFuente,
+        dia: hoy, enviados, enviados_por_mb: enviados == null ? null : porMb,
+        altas, altas_por_fuente: altas == null ? null : porFuente,
         limpiados, emails_hallados: hallados,
         pool_con_email: conEmail, pool_sin_email: sinEmail, congelados,
       }),
     });
-    log(`📊 métricas de ${hoy}: ${enviados} enviados · ${altas} altas · ${limpiados} limpiados · ${hallados} emails hallados · pool ${conEmail} con / ${sinEmail} sin`);
-    await saludPing(token, "metricas_diarias", { status: "ok", cadenciaMin: 24 * 60, detalle: `${enviados} env · ${altas} altas · ${hallados} emails` });
+    log(`📊 métricas de ${hoy}: ${enviados ?? "?"} enviados · ${altas ?? "?"} altas · ${limpiados} limpiados · ${hallados} emails hallados · pool ${conEmail} con / ${sinEmail} sin`);
+    await saludPing(token, "metricas_diarias", { status: "ok", cadenciaMin: 24 * 60, detalle: `${enviados ?? "?"} env · ${altas ?? "?"} altas · ${hallados} emails` });
   } catch (e) { log(`⚠️ guardarMetricasDelDia: ${e.message}`); }
 }
 
@@ -26947,12 +27026,14 @@ async function vigilarReputacion(token) {
     const cfg = await getConfig(token).catch(() => ({}));
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
+    // ⚠️ LAS TRES LECTURAS, DE A PÁGINAS (2026-09-13). Pedían `limit=3000` y PostgREST devuelve 1.000:
+    // los envíos de 7 días de todos los buzones (agente + a mano) pasan las 1.000, y la tasa se medía
+    // sobre un pedazo sin orden. Una lectura que no se completa sigue siendo "no pude medir".
     let envios = [];
     try {
       // ACCION_ENVIO_PARA_REBOTE (2026-09-13): el 2º email también salió de este dominio.
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${desde}&select=user_email,email_to&limit=3000`, { headers: auth });
-      if (!r.ok) return;                                   // no pude medir ≠ todo bien
-      envios = await r.json();
+      envios = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${desde}&select=user_email,email_to&order=id`, auth, { max: 100000, entero: true });
+      if (!envios) return;                                 // no pude medir ≠ todo bien
     } catch { return; }
     if (!Array.isArray(envios) || envios.length < REBOTE_MUESTRA_MINIMA) return;   // sin evidencia, no se concluye
 
@@ -26971,9 +27052,8 @@ async function vigilarReputacion(token) {
     // volvieron.
     let rebotados = new Set();
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle,evidencia&limit=3000`, { headers: auth });
-      if (!r.ok) return;
-      const f = await r.json();
+      const f = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${desde}&select=email,reason,detalle,evidencia&order=id`, auth, { max: 100000, entero: true });
+      if (!f) return;
       if (Array.isArray(f)) {
         rebotados = new Set(f
           .filter(x => {
@@ -27048,9 +27128,8 @@ async function vigilarReputacion(token) {
     // viendo. Es lo más parecido a un detector de "estamos en spam" que se puede
     // tener sin Postmaster Tools.
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${desde}&select=response_type&limit=3000`, { headers: auth });
-      if (r.ok) {
-        const f = await r.json();
+      const f = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_response_tracking?sent_at=gte.${desde}&select=response_type&order=id`, auth, { max: 100000, entero: true });
+      {
         if (Array.isArray(f) && f.length >= 80) {
           const reales = f.filter(x => x.response_type === "real").length;
           if (reales === 0) {
@@ -29330,28 +29409,24 @@ async function generateDailyDigestForMB(token, mbEmail, mbName) {
   const until = `${ydayMadridStr}T23:59:59`;
   const headers = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
 
-  let actionsRows = [];
-  try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mbEmail)}&action=in.(sent,re_sent,bounce_retry_sent,secondary_sent)&created_at=gte.${encodeURIComponent(since)}&created_at=lte.${encodeURIComponent(until)}&select=action,details&limit=2000`,
-      { headers }
-    );
-    actionsRows = r.ok ? await r.json() : [];
-  } catch {}
+  // ⚠️ DE A PÁGINAS Y SIN CEROS INVENTADOS (2026-09-13). Las dos lecturas pedían `limit=2000` (PostgREST
+  // da 1.000) y una lectura caída quedaba en [], así que el MB recibía "No enviaste emails ayer" o "No
+  // prospectaste websites ayer" por un error de red. Si no se pudo leer, ese MB no recibe un resumen
+  // falso: el error lo anota el llamador.
+  const actionsRows = await _traerTodo(
+    `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(mbEmail)}&action=in.(sent,re_sent,bounce_retry_sent,secondary_sent)&created_at=gte.${encodeURIComponent(since)}&created_at=lte.${encodeURIComponent(until)}&select=action,details&order=id`,
+    headers, { max: 50000, entero: true });
+  if (!actionsRows) throw new Error("no pude leer los envíos de ayer — no mando un resumen con ceros inventados");
   const isManual = (a) => (a.details?.ui_origin || "") === "toolbar_manual";
   const emailsManual = actionsRows.filter(isManual).length;
   const emailsAgent  = actionsRows.length - emailsManual;
   const emailsTotal  = actionsRows.length;
 
   // 2. Prospects PROCESADOS ayer = review_queue rows con validated_by=mb O created_by=mb del día
-  let queueRows = [];
-  try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(validated_by.eq.${encodeURIComponent(mbEmail)},created_by.eq.${encodeURIComponent(mbEmail)})&or=(validated_at.gte.${encodeURIComponent(since)},created_at.gte.${encodeURIComponent(since)})&validated_at=lte.${encodeURIComponent(until)}&select=geo,geos_all,created_by,validated_by,created_at,validated_at,domain&limit=2000`,
-      { headers }
-    );
-    queueRows = r.ok ? await r.json() : [];
-  } catch {}
+  const queueRows = await _traerTodo(
+    `${SUPABASE_URL}/rest/v1/toolbar_review_queue?or=(validated_by.eq.${encodeURIComponent(mbEmail)},created_by.eq.${encodeURIComponent(mbEmail)})&or=(validated_at.gte.${encodeURIComponent(since)},created_at.gte.${encodeURIComponent(since)})&validated_at=lte.${encodeURIComponent(until)}&select=geo,geos_all,created_by,validated_by,created_at,validated_at,domain&order=id`,
+    headers, { max: 50000, entero: true });
+  if (!queueRows) throw new Error("no pude leer los prospects de ayer — no mando un resumen con ceros inventados");
   // Dedup por domain (alguien puede ser create+validate del mismo)
   const seen = new Set();
   const myProspects = [];

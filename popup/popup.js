@@ -64,6 +64,8 @@ import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, planSacarDe
          anotarEnvioDeSesion, envioDeSesion, crmBloqueaCarga, veredictoConEnvioPropio, envioPropioGuardado,
          envioParaCargar } from "../modules/colaEstado.js";
 import { fetchNotifications, markNotificationRead, markAllNotificationsRead, createNotification } from "../modules/supabase.js";
+// Lecturas de más de 1.000 filas: de a páginas y con reloj, o null (2026-09-13).
+import { traerTodo } from "../modules/supabase.js";
 import { getKeywords, searchGoogleForDomain }                                                  from "../modules/keywords.js";
 import { scoreProspect }                                                                        from "../modules/scoring.js";
 import { CONFIG }                                                                               from "../config.js";
@@ -1721,13 +1723,17 @@ async function loadAdminActivity() {
   // web de 450k que el agente sí acepta.
   const PISO = 400000;   // el mismo gate que usa el agente (agent_threshold_traffic)
 
+  // ⚠️ DE A PÁGINAS (2026-09-13). Las tres pedían 5.000-40.000 filas y PostgREST devuelve 1.000: en
+  // una semana las URLs y los envíos se cortaban en 1.000, y con ~36.000 dominios en la caché casi todo
+  // figuraba "medido ahora" (mismo bug que el parte arregló el 04/09). Lo que no se pudo leer entero se
+  // muestra como "?", no como cero.
   const [hist, acciones, cacheVieja, monday] = await Promise.all([
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${desdeISO}&created_at=lte.${hastaISO}${histUser}&select=domain,media_buyer,page_views,is_new,geo,email,created_at&order=created_at.asc&limit=5000`,
-      { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${desdeISO}&created_at=lte.${hastaISO}&details->>ui_origin=is.null&select=user_email,domain,created_at&limit=5000`,
-      { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
-    fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeISO}&select=domain&limit=40000`,
-      { headers }).then(r => r.ok ? r.json() : []).catch(() => []),
+    traerTodo(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_historial?created_at=gte.${desdeISO}&created_at=lte.${hastaISO}${histUser}&select=domain,media_buyer,page_views,is_new,geo,email,created_at&order=created_at.asc,id`,
+      headers, { max: 100000, entero: true }),
+    traerTodo(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${desdeISO}&created_at=lte.${hastaISO}&details->>ui_origin=is.null&select=user_email,domain,created_at&order=id`,
+      headers, { max: 100000, entero: true }),
+    traerTodo(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_traffic_cache?fetched_at=lt.${desdeISO}&select=domain&order=domain`,
+      headers, { max: 200000, entero: true }),
     fetchManualSendsFromMonday({ desde: from, hasta: to }),
   ]);
 
@@ -1738,23 +1744,23 @@ async function loadAdminActivity() {
     } else elAviso.style.display = "none";
   }
 
-  const cacheAntes = new Set((cacheVieja || []).map(c => String(c.domain || "").toLowerCase()));
+  const cacheAntes = cacheVieja ? new Set(cacheVieja.map(c => String(c.domain || "").toLowerCase())) : null;
   const MBS = ["mgargiulo@adeqmedia.com", "sales@adeqmedia.com", "dhorovitz@adeqmedia.com"]
     .filter(m => !userFilter || m.toLowerCase() === userFilter.toLowerCase());
 
   // ── ENVÍOS: agente vs mano ──────────────────────────────────────────────────────────
   const filasEnvio = MBS.map(mb => {
-    const agente = acciones.filter(a => String(a.user_email || "").toLowerCase() === mb).length;
+    const agente = acciones ? acciones.filter(a => String(a.user_email || "").toLowerCase() === mb).length : null;
     const mano   = monday.ok ? monday.items.filter(i => _ownerEsMb(i.owner, mb)).length : null;
     return { mb, agente, mano };
   });
   if (elEnvios) {
-    const totA = filasEnvio.reduce((a, f) => a + f.agente, 0);
+    const totA = acciones ? filasEnvio.reduce((a, f) => a + f.agente, 0) : "?";
     const totM = monday.ok ? filasEnvio.reduce((a, f) => a + (f.mano || 0), 0) : null;
     elEnvios.innerHTML = filasEnvio.map(f => `
       <div style="display:flex;align-items:center;gap:8px">
         <span style="width:52px;font-weight:600">${esc(_nombreMb(f.mb))}</span>
-        <span style="color:#38bdf8">🤖 ${f.agente}</span>
+        <span style="color:#38bdf8">🤖 ${f.agente == null ? "?" : f.agente}</span>
         <span style="color:${f.mano ? "#fbbf24" : "#64748b"}">👤 ${f.mano == null ? "?" : f.mano} a mano</span>
       </div>`).join("") +
       `<div style="margin-top:4px;padding-top:4px;border-top:1px solid #334155;color:#94a3b8">
@@ -1762,14 +1768,16 @@ async function loadAdminActivity() {
   }
 
   // ── CÓMO TRABAJÓ CADA UNO ───────────────────────────────────────────────────────────
-  if (elTrabajo) {
+  if (elTrabajo && !hist) {
+    elTrabajo.innerHTML = `<div style="opacity:.7">No se pudo leer el historial del período entero: no son ceros, es una consulta que falló.</div>`;
+  } else if (elTrabajo) {
     const bloques = MBS.map(mb => {
       const nombre = _nombreMb(mb);
       const filas = hist.filter(h => _ownerEsMb(h.media_buyer, mb) || String(h.media_buyer || "").toLowerCase() === nombre.toLowerCase());
       if (!filas.length) return `<div style="opacity:.5">${esc(nombre)} — sin actividad registrada</div>`;
       const distintos = new Set(filas.map(h => String(h.domain || "").toLowerCase()));
-      const cacheadas = filas.filter(h => cacheAntes.has(String(h.domain || "").toLowerCase())).length;
-      const medidas   = filas.length - cacheadas;
+      const cacheadas = cacheAntes ? filas.filter(h => cacheAntes.has(String(h.domain || "").toLowerCase())).length : null;
+      const medidas   = cacheAntes ? filas.length - cacheadas : null;
       const arriba    = filas.filter(h => Number(h.page_views) >= PISO).length;
       const abajo     = filas.filter(h => { const v = Number(h.page_views) || 0; return v > 0 && v < PISO; }).length;
       const sinDato   = filas.filter(h => !Number(h.page_views)).length;
@@ -1787,7 +1795,7 @@ async function loadAdminActivity() {
           <div style="font-weight:600;color:#f1f5f9;margin-bottom:3px">${esc(nombre)}</div>
           <div>URLs abiertas: <b>${filas.length}</b> · distintas: <b style="color:${clavada ? "#f87171" : "#cbd5e1"}">${distintos.size}</b>${
             clavada ? ` <span style="color:#f87171">— la toolbar estuvo casi siempre en la misma web</span>` : ""}</div>
-          <div>Medidas ahora: <b>${medidas}</b>${pct(medidas)} · de caché: <b>${cacheadas}</b>${pct(cacheadas)}</div>
+          <div>Medidas ahora: <b>${medidas == null ? "?" : medidas}</b>${medidas == null ? "" : pct(medidas)} · de caché: <b>${cacheadas == null ? "?" : cacheadas}</b>${cacheadas == null ? "" : pct(cacheadas)}</div>
           <div>Prospectables (+${Math.round(PISO / 1000)}k): <b style="color:#34d399">${arriba}</b>${pct(arriba)} · por debajo: <b>${abajo}</b>${pct(abajo)} · sin dato: ${sinDato}</div>
           <div style="color:#94a3b8">Geo: ${topGeo}</div>
         </div>`;
@@ -1824,13 +1832,13 @@ async function renderAdminSourcePerformance() {
   if (!wrap) return;
   try {
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-    const [rqRes, stRes] = await Promise.all([
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?select=domain,source&limit=50000`, { headers }),
-      fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain&limit=50000`, { headers }),
+    // De a páginas (2026-09-13): el `limit=50000` traía 1.000 de cada tabla, así que el % por motor
+    // cruzaba 1.000 prospects cualesquiera con 1.000 envíos cualesquiera. Sin las dos enteras no hay %.
+    const [rq, st] = await Promise.all([
+      traerTodo(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_review_queue?select=domain,source&order=id`, headers, { max: 300000, entero: true, reloj: 15000 }),
+      traerTodo(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_sendtrack?select=domain&order=domain`, headers, { max: 200000, entero: true, reloj: 15000 }),
     ]);
-    if (!rqRes.ok) { wrap.innerHTML = '<div style="opacity:.6;font-style:italic">Sin data todavía.</div>'; return; }
-    const rq = await rqRes.json();
-    const st = stRes.ok ? await stRes.json() : [];
+    if (!rq || !st) { wrap.innerHTML = '<div style="opacity:.7;color:#dc2626">No se pudieron leer Prospects o los envíos enteros: sin % hasta que la base conteste.</div>'; return; }
     const norm = d => String(d || "").toLowerCase().replace(/^www\./, "");
     const sentSet = new Set((Array.isArray(st) ? st : []).map(r => norm(r.domain)));
     const CAT = (s) => {
@@ -8426,11 +8434,11 @@ async function initCsvQueue() {
     if (Date.now() - _skipBreakdownCache.ts < SKIP_BREAKDOWN_TTL) {
       skipBreakdownHtml = _skipBreakdownCache.html;
     } else try {
-      const r = await fetch(
-        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(skipped,error,frozen)&processed_at=gte.${todayStartIso}&select=error_message&limit=2000`,
-        { headers }
-      );
-      const rows = r.ok ? await r.json() : [];
+      // De a páginas (2026-09-13): los feeders descartan miles por día y el `limit=2000` traía 1.000, así
+      // que "Por qué se descartaron hoy (1000)" se clavaba y el reparto salía de un pedazo sin orden.
+      const rows = await traerTodo(
+        `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_csv_queue?status=in.(skipped,error,frozen)&processed_at=gte.${todayStartIso}&select=error_message&order=id`,
+        headers, { max: 100000, entero: true });
       if (Array.isArray(rows) && rows.length) {
         // Normaliza el error_message a una "razón" corta (el texto antes de ":" o "—").
         const bucket = {};

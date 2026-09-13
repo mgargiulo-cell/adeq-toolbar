@@ -632,6 +632,35 @@ export function trafficBucketLabel(traffic) {
   return "15M+";
 }
 
+// ── TRAER TODO, DE A PÁGINAS (extensión, 2026-09-13) ─────────────────────────────────────────────
+// PostgREST devuelve como máximo 1.000 filas por pedido, pida lo que pida el `limit=`. Es el mismo
+// criterio que `_traerTodo` del worker: pagina con Range, cada página con reloj, y si una falla o no
+// contesta a tiempo devuelve null — nunca una lista parcial que parezca entera. Con `entero: true`,
+// llegar a `max` sin ver el final de la tabla también es null. `fetchImpl` es para los tests.
+export async function traerTodo(url, headers, { max = 20000, pagina = 1000, entero = false, reloj = 8000, fetchImpl = null } = {}) {
+  const pedir = fetchImpl || ((u, o) => fetch(u, o));
+  const limpia = String(url).replace(/[&?]limit=\d+/g, "");
+  const out = [];
+  let vioElFinal = false;
+  for (let desde = 0; desde < max; desde += pagina) {
+    let r;
+    try {
+      r = await pedir(limpia, {
+        headers: { ...headers, "Range-Unit": "items", "Range": `${desde}-${desde + pagina - 1}` },
+        signal: AbortSignal.timeout(reloj),
+      });
+    } catch { return null; }
+    if (r.status === 416) { vioElFinal = true; break; }   // más allá del final
+    if (!r.ok) return null;
+    const j = await r.json().catch(() => null);
+    if (!Array.isArray(j)) return null;
+    out.push(...j);
+    if (j.length < pagina) { vioElFinal = true; break; }
+  }
+  if (entero && !vioElFinal) return null;
+  return out;
+}
+
 // Fetch signatures (categoria + traffic_bucket + geo) que el MB rechazó 3+ veces.
 // Worker usa esto para skipear leads que matchean. Sin RPC para simplicidad —
 // agregamos client-side.
@@ -643,12 +672,12 @@ export async function fetchRejectedSignatures(accessToken, userEmail, threshold 
     // Solo últimos 90 días — historial reciente, no perpetuo
     const since = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
     const u = userEmail ? `&user_email=eq.${encodeURIComponent(userEmail)}` : "";
-    const res = await fetch(
-      `${url}/rest/v1/toolbar_autopilot_feedback?action=eq.disliked&created_at=gte.${since}${u}&select=category,geo,traffic_bucket&limit=2000`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}` } }
-    );
-    if (!res.ok) return [];
-    const rows = await res.json();
+    // De a páginas (2026-09-13): con `limit=2000` las firmas rechazadas se contaban sobre 1.000 filas.
+    const rows = await traerTodo(
+      `${url}/rest/v1/toolbar_autopilot_feedback?action=eq.disliked&created_at=gte.${since}${u}&select=category,geo,traffic_bucket&order=id`,
+      { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+      { max: 100000, entero: true });
+    if (!rows) return [];
     // Cuenta por signatura
     const counts = new Map();
     for (const r of (Array.isArray(rows) ? rows : [])) {
@@ -805,22 +834,19 @@ export async function fetchReviewQueue(accessToken, { dateFilter = "", sourceFil
     // seleccionar URLs (solo rankEmail decide para emails). Cualquier lead con
     // traffic ≥ 400K + status=pending es válido. Orden FIFO por created_at desc
     // → primero los más frescos (mejor para que vean los recién agregados).
-    const res = await fetch(
-      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}${geoClause}&order=created_at.desc&limit=3000&select=${cols}`,
-      { headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Prefer": "count=exact" } }
-    );
-    if (!res.ok) return [];
-    const rows = await res.json();
-    const out = Array.isArray(rows) ? rows : [];
-    // Maxi 2026-07-16: total REAL desde Content-Range. El count=exact devuelve "0-999/1325" aunque el
-    // server cape las filas en 1000 → el contador de la pestaña usaba rows.length y se clavaba en 1000.
-    // Adjuntamos el total como propiedad para mostrar el número real (aunque solo se rendericen 1000/pág).
-    try {
-      const cr = res.headers.get("content-range") || res.headers.get("Content-Range") || "";
-      const t = parseInt((cr.match(/\/(\d+)$/) || [])[1] || "0", 10);
-      if (t > 0) out.total = t;
-    } catch {}
-    return out;
+    // ⚠️ DE A PÁGINAS (2026-09-13). Pedía `limit=3000` y PostgREST devuelve 1.000: con más de 1.000
+    // pendientes, los MBs veían los 1.000 más nuevos y el resto del pool no aparecía nunca en Prospects.
+    // El contador sí mostraba el total real (Content-Range, 16/07), por eso no se notaba: "1.325" arriba
+    // y 1.000 filas abajo, y los filtros de GEO/tráfico/nombre filtraban sólo esas 1.000. Ahora se trae
+    // la lista entera con orden estable (id desempata created_at entre páginas). Si no se pudo leer
+    // entera, lista vacía como antes de un fallo — nunca media lista con cara de pool.
+    const rows = await traerTodo(
+      `${url}/rest/v1/toolbar_review_queue?status=eq.pending${dateClause}${sourceClause}${userClause}${geoClause}&order=created_at.desc,id.desc&select=${cols}`,
+      { "apikey": key, "Authorization": `Bearer ${accessToken}` },
+      { max: 50000, entero: true, reloj: 15000 });
+    if (!rows) return [];
+    rows.total = rows.length;
+    return rows;
   } catch { return []; }
 }
 
@@ -1104,7 +1130,10 @@ export async function loadKeywordsFromDB() {
   if (!url || !key) return [];
   try {
     const res = await fetch(
-      `${url}/rest/v1/toolbar_keywords?select=phrase,lang&order=id.asc&limit=5000`,
+      // MUESTRA para la rotación en pantalla (la búsqueda va a la base con ilike): pedía 5.000 y PostgREST
+      // da 1.000, así que ahora pide lo que recibe. La tabla tiene ~85.000 frases; traerlas todas al
+      // popup no tiene sentido para una muestra. (2026-09-13)
+      `${url}/rest/v1/toolbar_keywords?select=phrase,lang&order=id.asc&limit=1000`,
       { headers: { "apikey": key, "Authorization": bearer(key) } }
     );
     if (!res.ok) return [];
