@@ -12814,6 +12814,9 @@ function _esEmailDeUltima(email, fuente) {
 let _rebotesLeidosOk = false;
 async function _rebotesListosParaJuzgar(token) {
   await loadBouncedEmails(token).catch(() => {});
+  // (2026-09-13) Una lectura que llegó al tope sin ver el final tampoco es "leída de verdad": tiene lo
+  // que entró hasta ahí, y la auditoría, el pulido y reabrirLeadsRebotados escribirían con media lista.
+  if (_rebotesIncompletos) return false;
   if (_bouncedCache.ts > 0 && Date.now() - _bouncedCache.ts < BOUNCED_CACHE_TTL) _rebotesLeidosOk = true;
   return _rebotesLeidosOk;
 }
@@ -18857,6 +18860,15 @@ async function logAgentAction(token, userEmail, payload) {
 }
 
 const BOUNCED_CACHE_TTL = 5 * 60 * 1000;
+// ⚠️ EL TOPE NO ES EL FINAL (2026-09-13). Las dos lecturas de la lista pedían `max: 50000` sin mirar si
+// llegaban: con más filas, _traerTodo devuelve las primeras 50.000 (por email) y la lista se cargaba como
+// si fuera entera — los rebotados que caían después quedaban libres y _rebotesListosParaJuzgar decía que
+// sí. El mismo error que `entero` arregló en las otras lecturas que protegen. Ahora, si se llega al tope,
+// lo leído se usa igual para frenar envíos (media lista frena más que ninguna, que es lo que tiene un
+// proceso recién arrancado), pero no cuenta como lectura entera: los jobs que ESCRIBEN con la lista no
+// juzgan y lo dicen en su latido, y el log pide subir el tope.
+const REBOTES_MAX_FILAS = 200_000;
+let _rebotesIncompletos = false;
 
 async function loadBouncedEmails(token) {
   if (Date.now() - _bouncedCache.ts < BOUNCED_CACHE_TTL) return _bouncedCache.set;
@@ -18879,12 +18891,16 @@ async function loadBouncedEmails(token) {
       // nadie previó volvía a colarse como rebote sin que se notara.
       `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,evidencia,fuente&${EVIDENCIA_BLOQUEA}&order=email`,
       { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
-      { max: 50000 }
+      { max: REBOTES_MAX_FILAS }
     );
     // Direcciones exactas + memoria de rebote a nivel DOMINIO (auditoría 2026-08-04). La regla vive en
     // lib/email.js: las adivinanzas rechazadas por MV y los proveedores de casillas (gmail, hotmail…)
     // no queman el dominio (13/09).
-    if (rows) cargarRebotados(rows);
+    if (rows) {
+      cargarRebotados(rows);
+      _rebotesIncompletos = rows.length >= REBOTES_MAX_FILAS;
+      if (_rebotesIncompletos) log(`⚠️ lista de rebotes: ${rows.length} filas, el tope (REBOTES_MAX_FILAS) — frena envíos con lo leído, pero la auditoría, el pulido y reabrir no juzgan hasta subir el tope`);
+    }
   } catch {}
   return _bouncedCache.set;
 }
@@ -18909,8 +18925,10 @@ async function _cargarDominiosQueRechazan(token) {
     const filas = await _traerTodo(
       `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email,tipo,evidencia,fuente&${EVIDENCIA_BLOQUEA}&order=email`,
       { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
-      { max: 50000 });
+      { max: REBOTES_MAX_FILAS });
     if (!Array.isArray(filas)) return;      // no pude leer ≠ nadie rechaza
+    // En el tope se cuenta igual con lo leído (un mapa vacío frenaría menos), pero se avisa: puede quedar corto.
+    if (filas.length >= REBOTES_MAX_FILAS) log(`⚠️ dominios que rechazan: ${filas.length} rebotes leídos, el tope (REBOTES_MAX_FILAS) — el conteo por dominio puede quedar corto`);
     _DOMINIOS_QUE_RECHAZAN.clear();
     for (const f of filas) {
       const dom = String(f.email || "").split("@")[1]?.toLowerCase();

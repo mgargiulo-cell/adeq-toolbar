@@ -722,3 +722,26 @@ test("tarjeta: un adicional cuya consulta de rebote falló no se programa y el a
   deepStrictEqual(filas.map(f => f.future_email), ["b@diario.com"], "ni el rebotado ni el que no se pudo confirmar se programan");
   ok(avisos.some(a => /d@diario\.com: no pude confirmar que no rebotó \(la base contestó HTTP 503\)/.test(a)), avisos.join(" | "));
 });
+
+// ── 11. La lista de rebotes más larga que el tope ──────────────────────────────────────────────────
+// loadBouncedEmails y _cargarDominiosQueRechazan leían con `max: 50000` sin mirar si llegaban al final:
+// con más filas cargaban las primeras 50.000 como si fueran la lista entera, y _rebotesListosParaJuzgar
+// daba luz verde. Es el mismo error que `entero` arregló en las demás lecturas que protegen.
+test("una lista de rebotes que llega al tope no se da por entera: reabrir no juzga y late en rojo, y lo leído sigue frenando", async () => {
+  const m = /const REBOTES_MAX_FILAS\s*=\s*([\d_]+);/.exec(worker);
+  const tope = Number(String(m?.[1] || "50000").replace(/_/g, ""));   // antes del arreglo, el 50.000 fijo
+  const direccion = (i) => `p${i}@medio${i % 50}.com`;
+  const lista = Array.from({ length: tope + 5 }, (_, i) => ({ email: direccion(i), evidencia: "rebote_smtp", fuente: "scrape" }));
+  const { w, pedidos } = await correrReabrir({
+    listaRebotes: lista,
+    leads: [{ id: 9, domain: "lead9.com", emails: [direccion(tope + 3)], email_sources: {} }],
+  });
+  const l = latidoDe(pedidos, "reabrir_rebotados");
+  deepStrictEqual([l?.last_status, /rebotes/.test(l?.last_detail || "")], ["fail", true],
+    `con más filas que el tope se juzgaba con las primeras como si fueran todas: ${JSON.stringify(l)}`);
+  ok(!pedidos.some(p => p.m === "PATCH" && p.u.includes("toolbar_review_queue?id=eq.")), "con media lista no se escribe nada");
+  strictEqual(w._CADENCIA_MEM.has("reabrir_rebotados"), false, "el turno se devuelve");
+  ok(w._bouncedCache.set.has(direccion(tope - 1)), "lo que sí se leyó se sigue usando para frenar envíos");
+  ok(/toolbar_bounced_emails\?select=email,tipo,evidencia,fuente&\$\{EVIDENCIA_BLOQUEA\}&order=email`,[^\n]*\n[^\n]*\n\s*\{ max: REBOTES_MAX_FILAS \}\);/.test(worker),
+    "_cargarDominiosQueRechazan usa el mismo tope");
+});
