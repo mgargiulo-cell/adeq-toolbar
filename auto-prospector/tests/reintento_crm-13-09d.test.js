@@ -548,6 +548,47 @@ test("R4: el lead trae `geo` y el respaldo de plantillas usa el mismo idioma", (
   ok(!/lead\.language \|\| "en"/.test(codigo), "el inglés por defecto no puede volver");
 });
 
+// R4b. La regla de idioma de R4 puede bajar la página y preguntarle a Claude (api-proxy). Corría ANTES del freno
+// de 30 días, y un lead que ese freno saltea no queda atendido: vuelve cada ciclo y se pagaba otra vez. Con R1c
+// ese freno es además el que evita repetirle el pitch a la dirección de un reintento, así que falla cerrado.
+test("R4b: el re-engagement mira el freno de 30 días antes de elegir idioma; salteado o sin poder leerlo, no baja la página ni le paga a Claude", async (t) => {
+  const DOM = "ejemplo-costo-r4b.com";
+  const correr = async (sendtrack) => {
+    const w = await cargarWorker(["runReengagementCycle"], { fetchFalso: true });
+    const reg = [];
+    globalThis.__fetchFalso = async (url, opts = {}) => {
+      const u = String(url), m = (opts.method || "GET").toUpperCase();
+      reg.push({ u, m, b: String(opts.body || "") });
+      if (!u.includes("/rest/v1/")) return resp({ message: "sin red" }, { status: 500 });   // la página del sitio, api-proxy (Claude)
+      if (u.includes("toolbar_config?select=key,value")) return resp([
+        { key: "agent_reengagement_enabled", value: "true" },
+        { key: "agent_active_hours_start", value: "0" }, { key: "agent_active_hours_end", value: "24" },
+      ]);
+      if (u.includes("toolbar_agent_actions?action=eq.sent&created_at=lt.")) {
+        return resp([{ id: 7, domain: DOM, user_email: MB, details: { email: `info@${DOM}` }, created_at: "2026-09-01T10:00:00Z" }]);
+      }
+      if (u.includes("toolbar_agent_actions?domain=eq.") && u.includes("action=in.(sent,re_sent)")) return resp([], { total: 1 });
+      // Sin idioma ni GEO: la regla tiene que mirar la página y, sin página, preguntarle a Claude.
+      if (u.includes("toolbar_review_queue?domain=eq.")) return resp([{ id: 5, emails: [`info@${DOM}`, `ventas@${DOM}`], language: "", geo: "", category: "" }]);
+      if (u.includes("toolbar_sendtrack?domain=eq.")) return sendtrack === "falla" ? resp({ message: "boom" }, { status: 500 }) : resp(sendtrack);
+      if (u.includes("toolbar_agent_actions") && m === "POST") return resp([{ id: 99 }], { status: 201 });
+      return resp([]);
+    };
+    t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-09-15T10:00:00Z") });   // un martes
+    try { await w.runReengagementCycle("t"); } finally { t.mock.timers.reset(); }
+    return reg;
+  };
+  for (const [nombre, st] of [["ya recibió mail en 30 días", [{ email: `ventas@${DOM}` }]], ["sendtrack no se pudo leer", "falla"]]) {
+    const reg = await correr(st);
+    ok(reg.some(r => r.u.includes("toolbar_sendtrack?domain=eq.")), `${nombre}: tiene que mirar el freno`);
+    deepStrictEqual(reg.filter(r => !r.u.includes("/rest/v1/")).map(r => r.u.slice(0, 60)), [], `${nombre}: ni la página ni api-proxy`);
+    ok(!reg.some(r => r.m === "POST" && r.u.includes("toolbar_agent_actions")), `${nombre}: ni siquiera reserva el envío`);
+  }
+  const libre = await correr([]);
+  ok(libre.some(r => r.m === "POST" && r.u.includes("toolbar_agent_actions") && r.b.includes("reserved_rework")),
+    "con el freno libre sigue el camino de siempre: elige idioma y plantilla y reserva (el MV de prueba lo corta)");
+});
+
 // ── R5. Los bloqueados del CRM salen de Prospects ──────────────────────────────────────────
 const bloqueados = (n) => Array.from({ length: n }, (_, i) => `bloq${i}.com`);
 function enrutadorCrm(reg, o = {}) {

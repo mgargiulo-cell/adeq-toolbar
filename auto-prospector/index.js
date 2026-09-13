@@ -18473,6 +18473,32 @@ async function runReengagementCycle(token) {
       }
       const { email: newEmail, lead } = next;
 
+      // Pre-flight: sendtrack 30d. ANTES de elegir idioma y plantilla (2026-09-13): `_idiomaParaEnvio` puede
+      // bajar la página del sitio y preguntarle a Claude (api-proxy), y un lead salteado acá no queda marcado
+      // como atendido, así que vuelve en CADA ciclo: se pagaba la consulta una y otra vez por un mail que nunca
+      // iba a salir. Y desde que el reintento por un adicional o un 2º email vuelve a quedar en sendtrack, este
+      // es el freno que evita repetirle el pitch a esa dirección: falla CERRADO, como el guard del agente. Si
+      // no se puede leer no se manda; el lead vuelve en el próximo ciclo, no se pierde nada.
+      try {
+        const cutoff30 = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+        const stRes = await fetch(
+          `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff30}&select=email&limit=10`,
+          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+        );
+        const sentRows = stRes.ok ? await stRes.json() : null;
+        if (!Array.isArray(sentRows)) {
+          log(`  ⏸️ ${domain}: no pude ver si ${newEmail} ya recibió mail en 30d (HTTP ${stRes.status}) — no se manda`);
+          continue;
+        }
+        if (sentRows.map(r => (r.email || "").toLowerCase()).includes(newEmail.toLowerCase())) {
+          log(`  ⏭ ${domain}: ${newEmail} ya recibió mail en 30d — skip`);
+          continue;
+        }
+      } catch (e) {
+        log(`  ⏸️ ${domain}: no pude ver si ${newEmail} ya recibió mail en 30d (${e.message}) — no se manda`);
+        continue;
+      }
+
       // Pickear template del pool combinado (baked + DB drafts), ponderado
       // por open rate. Misma lógica que el envío normal del Agent.
       // ⚠️ EL IDIOMA, CON LA REGLA DEL AGENTE (2026-09-13). Era `lead.language || "en"`: un sitio
@@ -18497,21 +18523,6 @@ async function runReengagementCycle(token) {
         continue;
       }
       const subject = pitch.subjects?.[0] || `Pregunta sobre ${domain}`;
-
-      // Pre-flight: bounced + sendtrack 30d
-      try {
-        const cutoff30 = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
-        const stRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff30}&select=email&limit=10`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-        );
-        const sentRows = await stRes.json();
-        const sentEmails = (Array.isArray(sentRows) ? sentRows : []).map(r => (r.email || "").toLowerCase());
-        if (sentEmails.includes(newEmail.toLowerCase())) {
-          log(`  ⏭ ${domain}: ${newEmail} ya recibió mail en 30d — skip`);
-          continue;
-        }
-      } catch {}
 
       // Reservar slot agent_actions ANTES del send (anti-crash)
       let reservedId = null;
