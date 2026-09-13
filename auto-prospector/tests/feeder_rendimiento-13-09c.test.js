@@ -302,7 +302,10 @@ test("I19: processCsvItem de verdad: un sitio de apuestas guardado con la API ca
   pedidos = ruteadorCola({ cache, insights: APUESTAS, enPool: true });
   await w.processCsvItem("t", item(402), cfg, USO_APOLLO, { count: 0 });
   strictEqual(pedidos.filter(p => p.u.includes("rapidapi.com")).length, 0);
-  match(patchesDeCola(pedidos, 402)[0]?.error_message || "", /^worker_geo_excluded:/);
+  // Integración (13/09): desde estados_cola el chequeo previo de processCsvItem también ve `por_enviar`,
+  // así que el lead ni llega al tráfico ni a la GEO: sale antes, sin pagar nada. Lo que este test cuida
+  // (cero RapidAPI para un lead de Prospects) sigue igual; cambia sólo en qué puerta se detiene.
+  match(patchesDeCola(pedidos, 402)[0]?.error_message || "", /^ya_estaba_en_prospects/);
 });
 
 // ── Pendientes de la revisión del feeder ───────────────────────────────────────────────────

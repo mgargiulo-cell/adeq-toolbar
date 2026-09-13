@@ -420,7 +420,9 @@ test("vigilarReputacion avisa el rebote y late aunque los rebotes de verdad est�
   ];
   const pedidos = [];
   globalThis.__fetchFalso = base(pedidos, [
-    [(u, m) => m === "GET" && u.includes("toolbar_agent_actions?action=eq.sent"), (_u, _m, o) => pagina(envios, o)],
+    // Integración (13/09): desde agente_sueltos los envíos que miden el rebote incluyen el 2º email
+    // (ACCION_ENVIO_PARA_REBOTE = in.(sent,secondary_sent)); el ruteador acepta las dos formas.
+    [(u, m) => m === "GET" && /toolbar_agent_actions\?action=(eq\.sent|in\.\(sent,secondary_sent\))/.test(u), (_u, _m, o) => pagina(envios, o)],
     [(u, m) => m === "GET" && u.includes("toolbar_bounced_emails?"), (u, _m, o) => {
       const falta = columnasPedidas(u).find(c => !cols.has(c));
       if (falta) return resp({ code: "42703", message: `column toolbar_bounced_emails.${falta} does not exist` }, { status: 400 });
