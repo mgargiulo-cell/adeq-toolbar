@@ -101,7 +101,9 @@ const WHOIS_PROXY_LOCALS = new Set([
 const GARBAGE_LOCAL_PREFIXES = [
   "abuse","abuse-",
   "postmaster","mailer-daemon","mailer_daemon","mail-daemon","daemon",
-  "hostmaster","dns-admin","dnsadmin","webmaster",
+  // `webmaster` salió de acá (decisión del dueño, 13/09): es un contacto válido de puntaje bajo, y la
+  // extensión lo muestra como el worker lo usa (rankEmail en lib/email.js, debajo de info@).
+  "hostmaster","dns-admin","dnsadmin",
   "noreply","no-reply","no_reply","donotreply","do-not-reply","do_not_reply",
   "bounce","bounces","bounced","mailer","mailerbot",
   "registrar","registrarcontact","registrar-contact",

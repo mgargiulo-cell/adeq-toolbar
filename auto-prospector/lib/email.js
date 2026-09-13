@@ -93,7 +93,11 @@ const _GL_LOCAL_PARTS = [
   // (multipasko.pl, bangla-kobita.com, forebet.com), y el crawler lo veía y lo tiraba con -1.
   // Queda como "de última" (ver el castigo en rankEmail), no como basura: pierde contra
   // cualquier persona o rol, pero no deja al lead sin ningún email.
-  "abuse","administrator","root","sudo","webmaster","hostmaster","postmaster","nobody","null",
+  // ⚠️ `webmaster` SALIÓ de acá (decisión del dueño, 13/09: "webmaster@ SÍ, office@ NO"). Es el buzón
+  // técnico del sitio y lo lee una persona del medio: se le puede escribir, pero de última. Vale lo
+  // mismo que informatique@ (IT_INFRA, ver rankEmail), debajo de info@, y es "generico" al elegir.
+  // office@, oficina@, secretaria@, secretariat@, reception@ y sistemas@ siguen acá, vetados.
+  "abuse","administrator","root","sudo","hostmaster","postmaster","nobody","null",
   // Roles que no responden / no son decision-makers (cazados 2026-05-14)
   "feedback","feedbacks","reclamo","reclamos","reclamacao","reclamacoes","quejas","sugerencias","sugestoes",
   "circulation","subscriptions","subs","newsletter","alerts","alerta","alertas",
@@ -529,7 +533,7 @@ export function _cleanScrapedEmails(list, leadDomain, opts = {}) {
     // (publicidade@/comercial@/info@/prensa@...). Los GRUPOS de medios centralizan el contacto
     // de publicidad en el dominio de la editora — ej. publicidade@caras.com.br para
     // aventurasnahistoria.com.br (misma Editora Caras). Antes se descartaba → quedaba SIN email.
-    // El junk (noreply/webmaster/registro) ya se filtró arriba; rankEmail después lo puntúa.
+    // El junk (noreply/registro) ya se filtró arriba; rankEmail después lo puntúa.
     // Maxi 2026-08-04: faltaba AD_SALES_LOCAL. Solo se miraba GENERIC_LOCAL_RE, así que un
     // `inzercia@` (publicidad en eslovaco) o `hirdetes@` (húngaro) cross-domain se descartaba
     // — justo el buzón de venta de pauta que buscamos.
@@ -694,7 +698,8 @@ export function classifyEmail(email, leadDomain = "") {
   }
 
   // Genéricos: pasa pero baja calidad — solo pickear si no hay opción mejor
-  const GENERIC_RE = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hey|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|bonjour|news|press|prensa|imprensa|stampa|presse|noticias|reception|recepcion|recepcao|general|sales|ventas|marketing|publicidade|publicidad|comercial|editor|editorial|redaccion|redacao|jurídico|juridico|juridique)$/i;
+  // `webmaster` (13/09): dejó de ser basura (decisión del dueño) y acá queda como un genérico más.
+  const GENERIC_RE = /^(info|contact|contacto|contato|contatto|kontakt|hello|hi|hey|hola|ola|olá|support|soporte|suporte|atendimento|mail|email|inbox|bonjour|news|press|prensa|imprensa|stampa|presse|noticias|reception|recepcion|recepcao|general|sales|ventas|marketing|publicidade|publicidad|comercial|editor|editorial|redaccion|redacao|jurídico|juridico|juridique|webmaster)$/i;
   if (GENERIC_RE.test(local)) return { verdict: "low_quality", reason: "generic_role", score: 20 };
 
   // OK → score guidance basado en shape
@@ -1071,17 +1076,27 @@ function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) 
   //  contacto, o algún nombre como juan@aliados.com."
   // O sea: primero el rol que NOMBRA el espacio, y recién después el genérico o la persona.
   // EDITORIAL sube de 60 a 75 para quedar por encima de PERSON (70): un `editor@` es un rol
-  // nombrado, `juan.perez@` es la alternativa. Y WEBMASTER sale de la bolsa de genéricos,
-  // donde valía 15 — el MB lo nombra como objetivo principal y el código lo trataba como
-  // `info@`. (Hoy no hay ninguno en el pool, así que esto no cambia nada de inmediato: es
-  // para que cuando aparezca uno, se lo trate como lo que es.)
+  // nombrado, `juan.perez@` es la alternativa.
   else if (EDITORIAL.test(local))  { score += 75; matchedRole = "EDITORIAL"; }
   // Redacción/prensa con un prefijo de región o idioma: `lat.press@motorsport.com`,
   // `fr.press@`, `es.redaccion@`. La regla de arriba está anclada al principio y estos caían
   // como "persona" (lat + press) hasta que se dejó de aceptar un genérico como apellido; sin
   // esto quedaban sin rol, en 35. Mismo criterio que el comercial por segmento. (2026-09-04)
   else if (/[._-]/.test(local) && local.split(/[._-]+/).some(seg => seg.length >= 4 && EDITORIAL.test(seg))) { score += 75; matchedRole = "EDITORIAL"; }
-  else if (/^webmaster([._-]|$)/i.test(local)) { score += 72; matchedRole = "WEBMASTER"; }
+  // ── WEBMASTER: CONTACTO VÁLIDO, DE ÚLTIMA (decisión del dueño, 13/09) ─────────────────────────
+  // "webmaster@ SÍ, office@ NO". Hasta el 13/09 `webmaster@` era veto duro (estaba en la lista de
+  // basura) y esta rama le daba +72 a sus variantes (`webmaster.diario@` valía 112 y era "persona",
+  // arriba de info@), mientras la extensión las escondía. Ahora es el buzón técnico del sitio: el
+  // mismo puntaje que informatique@ (IT_INFRA, +5 → 45 en el dominio propio), debajo de info@ (55) y
+  // de cualquier rol comercial, editorial o persona, y "generico" al elegir (ROLES_DE_BUZON). Sirve
+  // si no hay nada mejor. Cubre las variantes que el código ya trataba como webmaster: con separador
+  // (`webmaster.diario@`, `webmaster-es@`, `webmaster_es@`) y con número (`webmaster2@`, que la
+  // extensión escondía como webmaster). `webmaster.es@` no llega acá: un local que termina en TLD es
+  // artefacto de scrape (local_con_tld), como cualquier otro. `webmasters@`, `web.master@` o
+  // `webmasterteam@` no son estas variantes y no cambian. Un trozo comercial o editorial le sigue
+  // ganando: `webmaster.comercial@` lo agarra AD_SALES arriba. De otro dominio o en un webmail sigue
+  // las reglas generales (webmaster@gmail.com es freemail genérico, vetado como info@gmail.com).
+  else if (/^webmaster(?:[._-]|\d*$)/i.test(local)) { score += 5; matchedRole = "IT_INFRA"; }
   // Maxi 2026-07-24 (auditoría respuestas 22-24): direcciones de DEPARTAMENTO / atención al
   // cliente que NO son contacto de venta de pauta y ni rebotan ni responden a un pitch de
   // inventario (denuncias@, soporte.epaper@, bok@, cskh@, rrhh@, cobranzas@…). Antes caían en

@@ -30,7 +30,10 @@ const ANTES = [
   ["publicidad@"+D, D, 135], ["ventas@"+D, D, 135], ["comercial@"+D, D, 135], ["marketing@"+D, D, 135], ["sales@"+D, D, 135], ["advertising@"+D, D, 135],
   ["info@"+D, D, 55], ["contacto@"+D, D, 55], ["contact@"+D, D, 55], ["press@"+D, D, 115], ["prensa@"+D, D, 115], ["redaccion@"+D, D, 115], ["editor@"+D, D, 115],
   ["juan.perez@"+D, D, 110], ["jperez@"+D, D, 95], ["guillermo@"+D, D, 95], ["ayesha@"+D, D, 95],
-  ["support@"+D, D, 20], ["admin@"+D, D, 25], ["webmaster@"+D, D, -1], ["noreply@"+D, D, -1], ["dpo@"+D, D, -1], ["privacy@"+D, D, -1],
+  // webmaster@ valía -1 (veto duro) cuando se midió esta tabla. Decisión del dueño del 13/09 ("webmaster@
+  // SÍ, office@ NO"): es un contacto válido de puntaje bajo, 45 como informatique@, debajo de info@ (55).
+  // Ver tests/webmaster-13-09f.test.js. Los demás valores de la tabla no cambian.
+  ["support@"+D, D, 20], ["admin@"+D, D, 25], ["webmaster@"+D, D, 45], ["noreply@"+D, D, -1], ["dpo@"+D, D, -1], ["privacy@"+D, D, -1],
   ["copyright@pokecommunity.com", "pokecommunity.com", -1], ["owner@pokexperto.net", "pokexperto.net", -1], ["jobs@"+D, D, -1], ["careers@"+D, D, -1], ["billing@"+D, D, -1], ["customer@"+D, D, -1],
   ["info@gmail.com", D, -1], ["juanperez@gmail.com", D, 65], ["cuenta@gmail.com", D, -1],
   ["a@"+D, D, -1], ["66@"+D, D, -1], ["hi@thevocket.com", "thevocket.com", -15], ["x7k9m2p4@"+D, D, -1], ["u003eenquiry@mytvsuper.com", "mytvsuper.com", -1], ["dmarcreport@"+D, D, -1],
