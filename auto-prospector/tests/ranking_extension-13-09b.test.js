@@ -12,6 +12,8 @@
 //   C26 La lista de rebotados se leía cortada en 1.000 filas, y la extensión no la cargaba nunca.
 //   C27 (ya arreglado en d4881a1) El agente y la extensión clasifican igual info@ venga de donde venga.
 //   C28 El gmail del registrante (informer) sólo lo vetaba el agente.
+//   T1  rrhh@, empleos@ e informatique@ eran "persona" en el agente y en la extensión y le ganaban a
+//       info@ aunque puntuaran menos: la clase salía de listas propias y no del rol de rankEmail.
 //
 // Run: npm test
 import { test } from "node:test";
@@ -57,9 +59,9 @@ function rankingDelPopup(state = { domain: "", category: "", emailSources: new M
                    "_emailPickTierClient", "_ordenarEmailsClient", "_elegirPreseleccionClient", "_bestEmailByTier", "_emailGradeCompute"];
   const codigo = nombres.map(fuenteDe).join("\n");
   const rebotes = { cache: { set: new Set(), ts: 0 }, porDominio: new Map() };
-  const fabrica = new Function("state", "rankEmail", "vetoDuroEmail", "esBuzonFuncional", "esRegistranteWebmail", "motivoRebote", "_isGenericLocalPart", "AD_SALES_LOCAL", "_rebotesExtension",
+  const fabrica = new Function("state", "rankEmail", "vetoDuroEmail", "claseDeEmail", "esRegistranteWebmail", "motivoRebote", "_isGenericLocalPart", "AD_SALES_LOCAL", "_rebotesExtension",
     `const _AD_SALES_LOCAL_RE = AD_SALES_LOCAL;\n${codigo}\nreturn { ${nombres.join(", ")} };`);
-  return { ...fabrica(state, E.rankEmail, E.vetoDuroEmail, E.esBuzonFuncional, E.esRegistranteWebmail, E.motivoRebote, E._isGenericLocalPart, E.AD_SALES_LOCAL, rebotes), rebotes };
+  return { ...fabrica(state, E.rankEmail, E.vetoDuroEmail, E.claseDeEmail, E.esRegistranteWebmail, E.motivoRebote, E._isGenericLocalPart, E.AD_SALES_LOCAL, rebotes), rebotes };
 }
 
 // ── R1. La extensión no puede esconder direcciones reales ───────────────────────────────────────
@@ -313,4 +315,106 @@ test("C28: el gmail del registrante (informer) es una regla compartida, y la ext
   strictEqual(p._emailPickTierClient("rudnypc@gmail.com"), -1);
   strictEqual(p._bestEmailByTier(["rudnypc@gmail.com"]), "", "no queda puesto en el campo de envío");
   strictEqual(p._emailGradeCompute("rudnypc@gmail.com", null, "informer").grade, "E");
+});
+
+// ── T1. El tier sale del rol que rankEmail ya calcula ──────────────────────────────────────────────
+// rrhh@, empleos@, trabajo@ (48) e informatique@ (45) eran "persona" y quedaban por ENCIMA de info@ (55),
+// en el agente y en la extensión, porque la clase salía de listas propias y no del rol de rankEmail.
+// Puntajes medidos con lib/email.js en 3d45840, ANTES de exponer el rol: ninguno puede moverse.
+const DT = "diario.com.ar";
+const PUNTAJES_ANTES_T1 = [
+  // es
+  ["publicidad", 140], ["ventas", 140], ["comercial", 140], ["marketing", 135], ["gerente", 120], ["director", 120], ["redaccion", 115], ["prensa", 115], ["periodista", 115], ["juan.perez", 110], ["maria", 95], ["info", 55], ["contacto", 55], ["hola", 55], ["rrhh", 48], ["recursoshumanos", 48], ["empleos", 48], ["empleo", 48], ["trabajo", 48], ["trabaja", 48], ["informatica", -10], ["tecnico", 45], ["redes", 45], ["sistemas", -1], ["soporte", 20], ["atencion", 25], ["denuncias", 20], ["reclamos", -1], ["suscripciones", 20], ["servicio", 20], ["noticias", 30], ["finanzas", 30], ["contabilidad", 30], ["administracion", 30], ["tesoreria", 30], ["pagos", 30], ["tienda", 48], ["eventos", 48], ["admin", 25],
+  // pt
+  ["publicidade", 140], ["vendas", 135], ["redacao", 115], ["imprensa", 115], ["joao.silva", 110], ["contato", 55], ["geral", 55], ["suporte", 20], ["ajuda", 20], ["atendimento", 20], ["ouvidoria", -25], ["assinaturas", 20], ["faturamento", 20], ["financeiro", 30], ["loja", 48], ["seguranca", 0],
+  // it
+  ["pubblicita", 135], ["redazione", 115], ["stampa", 115], ["giulia.rossi", 110], ["contatto", 55], ["eventi", 48], ["direttore", 95], ["segreteria", 95],
+  // fr
+  ["publicite", 135], ["vente", 135], ["regie", 135], ["redaction", 115], ["presse", 115], ["pierre.dupont", 110], ["contact", 55], ["informatique", 45], ["abonnements", 20], ["recrutement", 95], ["emploi", 95], ["boutique", 48], ["directeur", 95],
+  // de
+  ["werbung", 135], ["anzeigen", 135], ["verkauf", 135], ["vertrieb", 135], ["redaktion", 115], ["hans.mueller", 110], ["kontakt", 55], ["informatik", 45], ["technik", -10], ["security", 0], ["geschaeftsfuehrer", 40],
+  // pl
+  ["reklama", 135], ["redakcja", 115], ["anna.kowalska", 110], ["krzysztof", 95], ["wsparcie", 45], ["kadry", 95], ["praca", 95], ["biuro", 95],
+  // locales de 2-3 letras
+  ["gp", -30], ["tld", 0], ["it", -25], ["rh", -30], ["pr", 10], ["ads", 135],
+];
+
+test("T1: exponer el rol de rankEmail no movió ningún puntaje (batería es/pt/it/fr/de/pl medida antes)", () => {
+  const distintos = PUNTAJES_ANTES_T1.filter(([l, antes]) => E.rankEmail(`${l}@${DT}`, DT, "") !== antes)
+    .map(([l, antes]) => `${l}@: antes ${antes}, ahora ${E.rankEmail(`${l}@${DT}`, DT, "")}`);
+  strictEqual(distintos.length, 0, distintos.join("\n"));
+  ok(typeof E.rolDeEmail === "function", "lib/email.js expone el rol de rankEmail");
+  for (const [l, rol] of [["rrhh", "DEPARTMENT"], ["empleos", "DEPARTMENT"], ["informatique", "IT_INFRA"], ["ajuda", "MESA_DE_AYUDA"], ["noticias", "AREA_EQUIVOCADA"],
+                          ["tld", "INICIALES_SOSPECHOSAS"], ["publicidad", "AD_SALES"], ["ceo", "EXEC"], ["gerente", "COMMERCIAL"], ["redaccion", "EDITORIAL"],
+                          ["juan.perez", "PERSON"], ["krzysztof", "PERSON_LIKELY"], ["download", "DEPARTMENT"]]) {
+    strictEqual(E.rolDeEmail(`${l}@${DT}`), rol, `${l}@`);
+  }
+  // sistemas@ es la decisión D4 del dueño: sigue vetado. El rol no depende del veto.
+  strictEqual(E.rankEmail(`sistemas@${DT}`, DT, ""), -1);
+  strictEqual(E.rolDeEmail(`sistemas@${DT}`), "IT_INFRA");
+});
+
+test("T1: el agente no elige rrhh@, empleos@, trabajo@ ni informatique@ antes que info@", async () => {
+  const w = await worker();
+  ok(/const ta = _pickTier\(a\.email, a\.source\);\s*const tb = _pickTier\(b\.email, b\.source\);\s*if \(ta !== tb\) return tb - ta;/.test(indexJs), "el agente ordena primero por _pickTier");
+  // El comparador de runAgentCycle con una sola fuente (SOURCE_RANK empata): tier y después rankEmail.
+  const ordenAgente = (emails, src) => emails.map(e => ({ e, t: w._pickTier(e, src), s: w.rankEmail(e, DT, "") }))
+    .filter(x => x.s >= 0).sort((a, b) => (b.t - a.t) || (b.s - a.s)).map(x => x.e);
+  const info = `info@${DT}`;
+  for (const l of ["rrhh", "empleos", "trabajo", "informatique", "informatik", "tecnico", "wsparcie", "ajuda", "denuncias", "suscripciones", "noticias", "finanzas", "tld"]) {
+    const e = `${l}@${DT}`;
+    for (const src of ["scrape", "apollo", "Facebook", "rol_mx"]) {
+      strictEqual(E._tipoDeEmailParaRanking(e, src), "generico", `${l}@ con fuente ${src}`);
+      strictEqual(ordenAgente([e, info], src)[0], info, `${l}@ (${w.rankEmail(e, DT, "")}) no puede quedar arriba de info@ (55) con fuente ${src}`);
+    }
+  }
+  deepStrictEqual(ordenAgente([`rrhh@${DT}`, info, `juan.perez@${DT}`, `publicidad@${DT}`, `informatique@${DT}`], "scrape"),
+    [`publicidad@${DT}`, `juan.perez@${DT}`, info, `rrhh@${DT}`, `informatique@${DT}`], "rol comercial > persona > genérico, y entre los genéricos manda el puntaje");
+});
+
+test("T1: la extensión tampoco: Análisis y la tarjeta ponen info@ arriba de rrhh@ e informatique@, y lo dejan puesto", () => {
+  const emails = [`rrhh@${DT}`, `informatique@${DT}`, `empleos@${DT}`, `info@${DT}`];
+  const p = rankingDelPopup();
+  const ctx = p._ctxEmailsProspecto({ domain: DT, category: "", email_sources: Object.fromEntries(emails.map(e => [e, "scrape"])) });
+  const enTarjeta = p._ordenarEmailsClient(emails, ctx);
+  strictEqual(enTarjeta[0], `info@${DT}`, `la tarjeta ordenó ${enTarjeta.join(", ")}`);
+  strictEqual(p._elegirPreseleccionClient(enTarjeta, ctx), `info@${DT}`, "la tarjeta deja puesto info@");
+  const analisis = rankingDelPopup({ domain: DT, category: "", emailSources: new Map(emails.map(e => [e, "Page"])), accessToken: "" });
+  deepStrictEqual(analisis._ordenarEmailsClient(emails), enTarjeta, "Análisis y la tarjeta, el mismo orden");
+  strictEqual(analisis._bestEmailByTier(emails), `info@${DT}`, "Análisis deja puesto info@");
+  // Un contacto real sigue ganando: el rol comercial arriba de todo y la persona arriba de info@.
+  deepStrictEqual(analisis._ordenarEmailsClient([`rrhh@${DT}`, `info@${DT}`, `juan.perez@${DT}`, `ventas@${DT}`]), [`ventas@${DT}`, `juan.perez@${DT}`, `info@${DT}`, `rrhh@${DT}`]);
+});
+
+test("T1: el agente y la extensión clasifican con la MISMA función (claseDeEmail), sin listas propias", () => {
+  ok(/claseDeEmail\(email\)/.test(E._tipoDeEmailParaRanking.toString()), "el agente usa claseDeEmail");
+  const tier = fuenteDe("_emailPickTierClient");
+  ok(/\[claseDeEmail\(email\)\]/.test(tier), "la extensión usa claseDeEmail");
+  ok(!/_isGenericEmailLocal\(|esBuzonFuncional\(|ROLES_DE_BUZON/.test(tier), "la extensión no puede volver a tener su propia copia de la clase");
+  const p = rankingDelPopup();
+  const aClase = { 3: "rol", 2: "persona", 0: "generico" };
+  const distintos = [];
+  for (const [l] of PUNTAJES_ANTES_T1) for (const src of ["scrape", "apollo", "Facebook", "rol_mx"]) {
+    const e = `${l}@${DT}`;
+    const tp = p._emailPickTierClient(e, p._ctxEmailsProspecto({ domain: DT, email_sources: { [e]: src } }));
+    if (tp < 0) continue;
+    const clase = E.claseDeEmail(e), tipo = E._tipoDeEmailParaRanking(e, src);
+    if (aClase[tp] !== clase) distintos.push(`${e} (${src}): extensión ${aClase[tp]}, claseDeEmail ${clase}`);
+    if (tipo !== clase) distintos.push(`${e} (${src}): agente ${tipo}, claseDeEmail ${clase}`);
+  }
+  strictEqual(distintos.length, 0, distintos.join("\n"));
+});
+
+test("T1: los demás roles no cambian de clase, y press@ y los buzones funcionales siguen genéricos", () => {
+  const esperado = {
+    rol: ["publicidad", "ventas", "werbung", "reklama", "vendas", "regie", "ads"],
+    persona: ["ceo", "gerente", "director", "direttore", "redaccion", "redakcja", "newsroom", "juan.perez", "j.perez", "krzysztof", "maria",
+              "eventos.comercial", "events.partner", "pr", "geschaeftsfuehrer"],
+    generico: ["info", "contacto", "contato", "kontakt", "press", "presse", "stampa", "download", "store", "eventos", "admin", "support", "soporte", "news"],
+  };
+  for (const [clase, locales] of Object.entries(esperado)) for (const l of locales) strictEqual(E.claseDeEmail(`${l}@${DT}`), clase, `${l}@`);
+  // Webmail: la persona sigue siendo persona; un buzón de departamento o funcional en gmail, genérico.
+  strictEqual(E.claseDeEmail("juanperez@gmail.com"), "persona");
+  strictEqual(E.claseDeEmail("rrhh.diario@gmail.com"), "generico");
+  strictEqual(E.claseDeEmail("download@gmail.com"), "generico");
 });

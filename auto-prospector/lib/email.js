@@ -938,9 +938,25 @@ export function vetoDuroEmail(email, siteDomain = "") {
 }
 
 export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = null) {
-  if (!email || typeof email !== "string" || !email.includes("@")) return -1;
+  return _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, true).puntaje;
+}
+
+// ── EL ROL QUE RANKEMAIL YA CALCULA, PARA EL TIER (2026-09-13) ─────────────────────────────────────
+// El tier con que el agente y la extensión eligen dirección (rol / persona / genérico) se armaba con
+// listas propias (_isGenericLocalPart, esBuzonFuncional, AD_SALES_LOCAL) y no con el rol de abajo.
+// Así rrhh@, empleos@, trabajo@ (DEPARTMENT, 48) e informatique@ (IT_INFRA, 45) eran "persona" y
+// quedaban por ENCIMA de info@ (55): el agente elegía rrhh@diario.com.ar antes que info@ aunque
+// puntuara menos. Esto devuelve el MISMO `matchedRole` de rankEmail, sin tocar ningún puntaje:
+// rankEmail y rolDeEmail corren el mismo código. Sin el veto duro: la clase de una dirección no
+// depende de si hoy está vetada o rebotada (eso ya lo decide el tier -1 y el puntaje).
+export function rolDeEmail(email, siteDomain = "") {
+  return _puntuarEmail(email, siteDomain, "", null, false).rol;
+}
+
+function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) {
+  if (!email || typeof email !== "string" || !email.includes("@")) return { puntaje: -1, rol: "" };
   // Todo lo que NUNCA es un contacto se decide en vetoDuroEmail (arriba). Desde acá, se puntúa.
-  if (vetoDuroEmail(email, siteDomain)) return -1;
+  if (conVeto && vetoDuroEmail(email, siteDomain)) return { puntaje: -1, rol: "" };
   const lower = email.toLowerCase();
   const [local, dom] = lower.split("@");
   // Se usan más abajo: la penalidad de UN rebote previo en el dominio (-40) y el chequeo de locales
@@ -1255,7 +1271,7 @@ export function rankEmail(email, siteDomain, leadCategory = "", casasEditoras = 
   if ((tld === "br" || tld === "pt") && /(vendas|comercial|publicidade|atendimento)/.test(local)) score += 5;
   if (/^(ar|es|mx|cl|co|pe|uy)$/.test(tld) && /(ventas|comercial|publicidad|atencion)/.test(local)) score += 5;
 
-  return score;
+  return { puntaje: score, rol: matchedRole };
 }
 
 export const GARBAGE_DOMAIN_PATTERN = new RegExp([
@@ -1571,25 +1587,47 @@ export function esBuzonFuncional(emailOLocal) {
   return !segs.some(seg => AD_SALES_LOCAL.test(seg) || _SEGMENTO_DECISOR.test(seg));
 }
 
+// ── LA CLASE DE UNA DIRECCIÓN: rol / persona / genérico (2026-09-13) ─────────────────────────────────
+// Una sola función para el agente (_tipoDeEmailParaRanking) y la extensión (_emailPickTierClient).
+// Mira sólo la dirección, no la fuente ni el sitio. Los roles de rankEmail que son un BUZÓN y no
+// alguien que compra pauta van con los genéricos, igual que info@: si no, el tier los ponía arriba de
+// info@ aunque rankEmail los puntúe menos. Medido sobre una batería es/pt/it/fr/de/pl (dominio propio,
+// info@ = 55): rrhh@/empleos@/trabajo@ 48, informatique@/tecnico@/wsparcie@ 45, ajuda@/denuncias@/
+// suscripciones@/service@ 20, noticias@/finanzas@/contabilidad@/pagos@ 30, tld@ 0 — todos "persona".
+//   DEPARTMENT            rrhh@, empleos@, trabajo@, careers@ y los buzones funcionales de rankEmail
+//   IT_INFRA              informatique@, tecnico@, redes@, wsparcie@, security@
+//   MESA_DE_AYUDA         ajuda@, apoyo@, denuncias@, suscripciones@, service@, helpdesk@
+//   AREA_EQUIVOCADA       noticias@, finanzas@, contabilidad@, administracion@, pagos@
+//   INICIALES_SOSPECHOSAS tld@, gp@: rankEmail les resta 40 por el 19% de rebote ("último recurso");
+//                         como "persona" eran lo primero y la extensión los dejaba puestos.
+// No cambia la clase de los demás: EXEC, COMMERCIAL, EDITORIAL, PERSON, PERSON_LIKELY, SINGLE_NAME y
+// los locales sin rol (pr@, geschaeftsfuehrer@) siguen "persona"; press@ y webmaster@ ya eran genéricos.
+export const ROLES_DE_BUZON = new Set(["DEPARTMENT", "IT_INFRA", "MESA_DE_AYUDA", "AREA_EQUIVOCADA", "INICIALES_SOSPECHOSAS"]);
+export function claseDeEmail(email) {
+  const e = String(email || "");
+  const local = e.toLowerCase().split("@")[0];
+  if (AD_SALES_LOCAL.test(local)) return "rol";
+  // Un genérico (info@, press@) o un buzón funcional (download@, store@) es "generico" venga de donde
+  // venga (2026-09-13). esBuzonFuncional se mira aparte porque rankEmail no lo marca en un webmail.
+  if (_isGenericLocalPart(e) || esBuzonFuncional(e)) return "generico";
+  if (ROLES_DE_BUZON.has(rolDeEmail(e))) return "generico";
+  return "persona";
+}
+
 export function _tipoDeEmailParaRanking(email, source) {
   const src = String(source || "").toLowerCase();
-  const local = String(email || "").toLowerCase().split("@")[0];
   // El que eligió una persona a mano sigue arriba de todo.
   if (src === "manual") return "apollo";
+  const clase = claseDeEmail(email);
   // ── APOLLO COMPITE POR RESULTADO (decisión 2 del user, 04/09) ───────────────────────
   // Medido en 90 días: 169 envíos a emails de Apollo → 3 respuestas reales (1,8%), contra
   // 6,6% de los que el MB agregó a mano y 3,1% del scrape. Ser de Apollo ya no vale por sí
   // solo: una persona de Apollo es una persona, un rol comercial es un rol, y un info@ que
   // Apollo devolvió es un genérico — y se ordena con los de su clase.
-  if (src === "apollo") {
-    if (AD_SALES_LOCAL.test(local)) return "rol";
-    return (_isGenericLocalPart(email) || esBuzonFuncional(email)) ? "generico" : "persona";
-  }
-  if (AD_SALES_LOCAL.test(local)) return "rol";
-  // Un genérico (info@, press@) o un buzón funcional (download@, store@) es "generico" venga de donde
-  // venga (2026-09-13). Antes decidía la fuente: un info@ de redes, de caché o sin fuente caía en
-  // "persona", y el agente lo ordenaba distinto que la extensión, que mira la dirección.
-  if (_isGenericLocalPart(email) || esBuzonFuncional(email)) return "generico";
+  if (src === "apollo") return clase;
+  // Un rol o un genérico lo son venga de donde vengan. Antes decidía la fuente: un info@ de redes,
+  // de caché o sin fuente caía en "persona", y el agente lo ordenaba distinto que la extensión.
+  if (clase !== "persona") return clase;
   if (_sourceHardTier(source) === 1) return "persona";
   return "generico";
 }

@@ -27,7 +27,7 @@ const ESTILO_PITCH = Object.freeze({ tone: "informal", length: "short", focus: "
 // `prensa@` valía 115 en el worker y era genérico acá; `dpo@`/`privacy@` eran "persona" acá y
 // basura allá; y los nueve cambios de la Fase 1 no llegaban al media buyer. Desde ahora el
 // popup importa el MISMO archivo que el worker. El zip lo incluye (scripts/empaquetar.sh).
-import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esBuzonFuncional, esRegistranteWebmail, motivoRebote, cargarRebotados } from "../auto-prospector/lib/email.js";
+import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esRegistranteWebmail, motivoRebote, cargarRebotados, claseDeEmail } from "../auto-prospector/lib/email.js";
 // La lista de dominios bloqueados existía en modules/blocklist.js y la usaba traffic.js para
 // no gastar API… pero NINGÚN botón del popup la consultaba (verificado el 08/09: cero llamadas
 // a checkDomainBlocked en este archivo). Un MB parado en mail.google.com cargó `mail.google.com`
@@ -4042,13 +4042,11 @@ function _emailPickTierClient(email, ctx = _ctxEmailsAnalisis()) {
   if (src === "manual") return 4;                            // lo eligió el MB a mano
   // Apollo compite por resultado (decisión del user, 04/09; paridad con _tipoDeEmailParaRanking
   // del worker): su email vale lo que es — rol comercial, persona o genérico — no por venir de Apollo.
-  if (src === "apollo") return _AD_SALES_LOCAL_RE.test(local) ? 3 : ((_isGenericEmailLocal(email) || esBuzonFuncional(email)) ? 0 : 2);
-  if (_AD_SALES_LOCAL_RE.test(local)) return 3;              // rol comercial/publicidad
-  // Un buzón funcional (download@, rewards@, advent@, store@) va con los genéricos, igual que en el
-  // agente (_tipoDeEmailParaRanking). Antes era "persona" y quedaba preseleccionado sobre info@ y
-  // press@: el 10/09 una MB escribió a download@pixelmonmod.com y advent@bisafans.de. (2026-09-13)
-  if (!_isGenericEmailLocal(email) && !esBuzonFuncional(email)) return 2;   // persona / rol no-genérico
-  return 0;                                                   // genérico
+  // La clase sale de claseDeEmail (lib/email.js), la MISMA función que usa el agente (2026-09-13).
+  // Antes estaba copiada acá con las listas de genéricos y buzones funcionales, y rrhh@, empleos@ o
+  // informatique@ quedaban como "persona", arriba de info@ y preseleccionados aunque puntuaran menos.
+  // Un buzón funcional (download@, advent@) sigue con los genéricos: claseDeEmail lo incluye.
+  return ({ rol: 3, persona: 2, generico: 0 })[claseDeEmail(email)] ?? 0;
 }
 // Orden: tier de fuente primero, y dentro del tier el puntaje del ranking compartido.
 function _ordenarEmailsClient(list, ctx = _ctxEmailsAnalisis()) {

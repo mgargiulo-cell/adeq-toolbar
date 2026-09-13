@@ -72,12 +72,16 @@ test("la extensión no muestra lo que el worker nunca usaría, y sí muestra los
 });
 
 test("la extensión usa los vetos y el criterio de buzón funcional del módulo compartido, y pasa el dominio siempre", () => {
-  ok(/import \{[^}]*\bvetoDuroEmail\b[^}]*\besBuzonFuncional\b[^}]*\} from "\.\.\/auto-prospector\/lib\/email\.js"/.test(popup), "popup.js importa vetoDuroEmail y esBuzonFuncional");
+  // Desde el 13/09 (T1 de ranking_extension-13-09b) el criterio de buzón funcional le llega al popup
+  // adentro de claseDeEmail, la misma función que usa el agente, y no importa esBuzonFuncional suelto.
+  ok(/import \{[^}]*\bvetoDuroEmail\b[^}]*\bclaseDeEmail\b[^}]*\} from "\.\.\/auto-prospector\/lib\/email\.js"/.test(popup), "popup.js importa vetoDuroEmail y claseDeEmail");
   const tier = popup.slice(popup.indexOf("function _emailPickTierClient"), popup.indexOf("function _ordenarEmailsClient"));
   // `ctx.domain` desde el 13/09 (ranking_extension-13-09b): la tarjeta de Prospects pasa su propio dominio.
   ok(/if \(vetoDuroEmail\(email, (?:state|ctx)\.domain \|\| ""\)\) return -1;/.test(tier), "el tier -1 sale del veto, no del puntaje");
   ok(!/_rankClient\(email\) < 0/.test(tier), "un puntaje negativo hundía a los buzones del grupo editor");
-  ok(/!_isGenericEmailLocal\(email\) && !esBuzonFuncional\(email\)\) return 2;/.test(tier), "un buzón funcional va con los genéricos");
+  // Un buzón funcional va con los genéricos: lo decide claseDeEmail (que incluye esBuzonFuncional), la
+  // misma función del agente; la paridad de comportamiento la fija el test T1 de ranking_extension-13-09b.
+  ok(/\[claseDeEmail\(email\)\]/.test(tier) && !/esBuzonFuncional\(|_isGenericEmailLocal\(/.test(tier), "un buzón funcional va con los genéricos");
   const llamadas = popup.match(/isGarbageEmail\([^)]*\)/g) || [];
   ok(llamadas.length >= 5, `esperaba al menos 5 llamadas, hay ${llamadas.length}`);
   for (const c of llamadas) ok(c.includes(","), `${c} tiene que pasar el dominio del sitio`);
