@@ -20350,6 +20350,109 @@ async function _verifyEmailMV(token, cfg, email) {
   } catch { return "riesgo"; }                             // timeout/red → fail-open, pero como reserva
 }
 
+// ── QUÉ SE HACE CON CADA VEREDICTO, EN UNA SOLA TABLA (2026-09-13) ──────────────────────────
+// El 01/09 `dudoso` se separó de `riesgo` en `_mvEstadoDe`, pero el bucle que elige la dirección
+// del agente sólo sabía de "no" y "riesgo": un dudoso caía en `chosen = cand; break` como si
+// fuera limpio, la red final lo leía del caché y salteaba el LEAD ENTERO sin probar la dirección
+// siguiente. Así [contacto@ dudoso, redaccion@ ok] no salía nunca (195 `mv_dudoso` el 12/09).
+// Las reglas del dueño ya estaban escritas; faltaba que el código las tuviera en un solo lugar:
+//   ok (o `true`, MV dormido sin clave) → se elige
+//   riesgo (catch-all, o NUESTRO tope/error) → de reserva, sale sólo si no hay uno limpio
+//   dudoso → se salta la dirección SIN quemarla: no va como primer contacto
+//   no → se quema y se salta
+function _accionPorVeredictoMV(estado) {
+  if (estado === "no") return "quemar";
+  if (estado === "dudoso") return "saltar";
+  if (estado === "riesgo") return "reserva";
+  return "elegir";
+}
+
+// La elección de la dirección del agente, sin red adentro: todo lo que consulta llega inyectado,
+// así los tests la corren con verificadores falsos. Recorre en orden y verifica DE A UNO — corta
+// en el primero elegible, así que [ok, dudoso] cuesta una sola consulta y no dos.
+//
+// ⚠️ Se verifica en el bucle también lo que `decidirVerificacionMV` marca `verificar:false`
+// (M365, gateways, rol común en Google). Antes esos se elegían sin mirar y la red final, que no
+// consulta la ruta, les pagaba MillionVerifier igual: si daba dudoso, el lead entero se perdía.
+// Verificando acá, la consulta es LA MISMA que ya se hacía (la red final la lee del caché) y un
+// dudoso salta a la dirección siguiente. En esos proveedores un catch-all es lo esperable y hoy
+// sale igual, así que `riesgo` se elige como antes en vez de ir a reserva: la política de qué se
+// manda no cambia y no se gasta una consulta de más buscando un "ok" que ahí no significa nada.
+async function _elegirDireccion(orden, { rebotado, noEscribir, marcaOk, ruta, verificar, quemar = () => {}, avisar = () => {}, maxMv = 3 }) {
+  let mvUsed = 0, chosen = null, reserva = null, descartados = 0;
+  const motivos = [];                 // POR QUÉ se cayó cada candidato, no sólo cuántos
+  const noEnviables = new Set();      // lo que ya se probó que no sale: el 2º email no puede reusarlo
+  const veredictos = new Map();
+  for (const cand of (Array.isArray(orden) ? orden : [])) {
+    const em = String(cand?.email || "").toLowerCase();
+    if (!em) continue;
+    const fuera = (motivo) => { descartados++; motivos.push(motivo); noEnviables.add(em); };
+    if (rebotado(cand.email)) { fuera("ya_reboto"); continue; }
+    const _no = noEscribir(cand.email);
+    if (_no) { avisar(`🧠 no escribo a ${cand.email} — ${_no}`); fuera("dominio_ya_rechazo"); continue; }
+    if (!marcaOk(cand)) { avisar(`🚫 ${cand.email} es de otra marca — se descarta el email, NO el lead`); fuera("otra_marca"); continue; }
+    const _ruta = (await ruta(cand)) || { verificar: true, enviar: true };
+    if (!_ruta.enviar) { avisar(`⏭️ ${cand.email} descartado — ${_ruta.motivo || "hipótesis en un proveedor que acepta todo"}`); fuera("catch_all_y_patron"); continue; }
+    if (mvUsed < maxMv) {
+      mvUsed++;
+      const v = await verificar(cand.email);
+      veredictos.set(em, v);
+      const accion = _accionPorVeredictoMV(v);
+      if (accion === "quemar") { quemar(cand); fuera("mv_no"); continue; }
+      if (accion === "saltar") { fuera("mv_dudoso"); continue; }
+      if (accion === "reserva" && _ruta.verificar !== false) { if (!reserva) reserva = cand; continue; }
+    }
+    chosen = cand;
+    break;
+  }
+  const deReserva = !chosen && !!reserva;
+  if (deReserva) chosen = reserva;
+  return { chosen, deReserva, descartados, motivos, noEnviables, veredictos, mvUsed };
+}
+
+// Qué motivo queda escrito en el lead cuando ninguna dirección se pudo mandar. Es la señal para
+// ir a buscarle OTRA dirección: hasta el 13/09 el lead no quedaba marcado de ninguna forma,
+// parecía contactable en Prospects y el agente lo volvía a recorrer cada semana. ⚠️ Que el pulido
+// lea esta marca es un cambio aparte de `polishPool` (hoy sólo mira leads sin email). Se conserva
+// el motivo que ya existía para las hipótesis de patrón; el resto va con el descarte más frecuente.
+function _motivoSinDireccionEnviable(motivos) {
+  const lista = Array.isArray(motivos) ? motivos.filter(Boolean) : [];
+  if (lista.includes("catch_all_y_patron")) return "solo_hipotesis_de_patron";
+  const cuenta = new Map();
+  for (const m of lista) cuenta.set(m, (cuenta.get(m) || 0) + 1);
+  let top = "", n = 0;
+  for (const [m, c] of cuenta) if (c > n) { top = m; n = c; }   // empate: gana el primero que apareció
+  return top ? `sin_direccion_enviable:${top}` : "sin_direccion_enviable";
+}
+
+// ── EL 2º EMAIL PASA POR LAS MISMAS PUERTAS QUE EL PRIMERO (2026-09-13) ──────────────────────
+// Salía con score ≥ 40, sin rebote y con que MillionVerifier no dijera "no". O sea que un dudoso,
+// un catch-all, una dirección de otra marca o una hipótesis de patrón en un proveedor que acepta
+// todo se mandaban como primer contacto por esta vía, 14 a 25 por día. El principal ya pasó por
+// el bucle de elección; el 2º nunca es "reserva" (el principal ya salió), así que necesita "ok".
+// `true` (MV sin clave), `riesgo` (catch-all, tope o error), `dudoso` y `no`: no sale.
+function _motivoNoSegundoGratis({ email, primario, score, rebotado, noEnviable, noEscribir, marcaOk }) {
+  const em = String(email || "").toLowerCase();
+  if (!em || em === String(primario || "").toLowerCase()) return "igual_al_primario";
+  if (!(Number(score) >= 40)) return "score_bajo";
+  if (rebotado) return "ya_reboto";
+  if (noEnviable) return "descartado_al_elegir";
+  if (noEscribir) return "dominio_ya_rechazo";
+  if (!marcaOk) return "otra_marca";
+  return null;
+}
+function _segundoEmailEnviable(datos) {
+  const gratis = _motivoNoSegundoGratis(datos);
+  if (gratis) return { ok: false, motivo: gratis };
+  if (!datos.ruta) return { ok: false, motivo: "sin_ruta" };
+  if (datos.ruta.enviar === false) return { ok: false, motivo: "catch_all_y_patron" };
+  if (datos.veredictoMV !== "ok") {
+    const v = datos.veredictoMV;
+    return { ok: false, motivo: v === true ? "mv_sin_verificar" : `mv_${v || "sin_veredicto"}` };
+  }
+  return { ok: true, motivo: "ok" };
+}
+
 
 
 
@@ -22370,6 +22473,14 @@ async function runAgentCycle(token, allFlags) {
     }
   } catch {}
   if (_saltadosSinDireccion7d.size) log(`  📋 ${_saltadosSinDireccion7d.size} dominio(s) sin dirección enviable en 7 días (MV dudoso o todos no entregables) — se filtran antes del ciclo`);
+  // ── LO QUE UN MB SALTEA, EL SIGUIENTE NO LO REPITE EN EL MISMO TURNO (2026-09-13) ──────────
+  // El set de arriba se lee UNA vez, antes del bucle de buzones, y nadie le agregaba nada: el 2º
+  // MB pide el mismo pool 90-150 s después y volvía a correr idioma, scrape, pitch y MV sobre los
+  // leads que el 1º acababa de saltear (soutimao.com.br dos veces por slot). Cada salteo sin
+  // dirección enviable se suma al set en el momento. `no_email_after_enrichment` va a un set
+  // aparte que vive sólo este ciclo: meterlo en la ventana de 7 días cambiaría cada cuánto se
+  // reintenta y se pisaría con el congelado de 3 fallas, que sigue igual.
+  const _sinEmailEsteCiclo = new Set();
 
   const _DIAS_STOCK_OBJETIVO = parseInt(cfg.agent_dias_stock_objetivo || "10", 10) || 10;
   let _recorteStock = null;
@@ -22930,9 +23041,19 @@ async function runAgentCycle(token, allFlags) {
       const _sacados = _antes - fresh.length;
       if (_sacados) log(`  🧹 ${_sacados} candidato(s) sin dirección enviable esta semana, fuera del ciclo (vuelven en 7 días)`);
     }
+    if (_sinEmailEsteCiclo.size) {
+      const _antes = fresh.length;
+      fresh = fresh.filter(l => !_sinEmailEsteCiclo.has(String(l.domain || "").toLowerCase()));
+      const _sacados = _antes - fresh.length;
+      if (_sacados) log(`  🧹 ${_sacados} candidato(s) que otro buzón ya probó sin email en este ciclo, fuera`);
+    }
     const _conEmail = fresh.filter(_tieneEmail).length;
     log(`🤖 Agent ${userEmail}: pool de ${fresh.length} candidatos, ${_conEmail} ya con email (se prueban primero)`);
 
+    // Credenciales para los rechazos suaves del agente (2026-09-13). ⚠️ No `auth`: ese nombre no
+    // existe en runAgentCycle, y la puerta de blocklist corre FUERA del try de cada lead — un
+    // ReferenceError ahí tiraría el ciclo de envío entero, y el slot se reintentaría igual.
+    const _authRq = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     let processed = 0;
     for (const lead of fresh) {
       if (processed >= batchSize) break;
@@ -22942,7 +23063,14 @@ async function runAgentCycle(token, allFlags) {
       // ANTES de blocklistearse y el ciclo no re-chequeaba. Ahora ningún dominio blocklisteado sale.
       const _blockReason = await isDomainBlockedFull(domain, token);
       if (_blockReason) {
-        log(`  ⛔ ${domain}: blocklist (${_blockReason}) — no se envía`);
+        log(`  ⛔ ${domain}: blocklist (${_blockReason}) — no se envía y sale de Prospects`);
+        // ── Y SALE DEL POOL, NO SÓLO DEL ENVÍO (2026-09-13) ─────────────────────────────────
+        // Se salteaba con `continue` sin tocar el lead: rd1.com.br pasó a la lista del CRM después
+        // de entrar, el agente lo tomó 3 veces en 24 h y el MB lo seguía viendo en Prospects hasta
+        // apretar enviar. El pulido y el barrido de bloqueados ya hacen este mismo rechazo suave
+        // (reversible), pero el pulido sólo mira leads sin email y el barrido se rearma cada 10
+        // días. Una sola regla: bloqueado = rechazo suave, lo encuentre quien lo encuentre.
+        await _softRejectLead(_authRq, lead.id, `blocklist:${_blockReason}`);
         // Con registro: un `continue` mudo deja al parte diciendo "no llegó a intentarlo".
         await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `blocklist:${_blockReason}` }).catch(() => {});
         continue;
@@ -23291,6 +23419,7 @@ async function runAgentCycle(token, allFlags) {
         }
         if (!email) {
           log(`  ⏭ ${domain}: SKIP — no_email_after_enrichment (emails encontrados: ${emails.length})`);
+          _sinEmailEsteCiclo.add(String(domain || "").toLowerCase());   // el buzón siguiente no lo repite (13/09)
           await logAgentAction(token, userEmail, {
             domain, action: "skipped", reason: "no_email_after_enrichment",
             details: { traffic: leadTraffic, geo: leadGeo, emails_count: emails.length },
@@ -23402,6 +23531,244 @@ async function runAgentCycle(token, allFlags) {
         }
         log(`  📧 ${domain}: email_score=${emailScore.color} → ${email}`);
 
+        // ── ORDEN DEL TRAMO FINAL (2026-09-13): primero lo gratis, después lo que se paga ─────────
+        // El pitch (Claude en el 20%, con su autocontrol) y la ficha del CRM corrían ANTES de elegir
+        // la dirección, y MillionVerifier llegaba al final: cada lead que terminaba salteado por no
+        // tener a quién escribirle ya había pagado todo eso. Ahora el orden es: URL → cupo de la
+        // casilla → CRM → blocklist → contactado en 30 días → dirección (MV) → pitch → reserva.
+        // Lo gratis NO va después de MV: se pagaría MV por leads que después frena un chequeo gratis.
+        // tests/agente-13-09b.test.js fija este orden.
+        // ── RED DE SEGURIDAD GRATIS (Maxi 2026-08-18) ────────────────────────────────────
+        // El agente ya no juzga la calidad del lead: manda lo que está en Prospects con email.
+        // Eso está bien —el filtro corre al entrar y el agente de revisión repasa el pool a
+        // diario— pero deja una ventana: una URL mala que entra hoy se manda antes de que la
+        // revisión pase. Este chequeo la cierra y no cuesta NADA: mira solo el nombre del
+        // dominio, sin red, sin API, sin IA. Caza bancos, gobiernos, universidades y acortadores
+        // por el patrón de la URL. No reemplaza al filtro de entrada: es el último cinturón.
+        const _urlChk = classifyByUrlOnly(domain, lead.category || "", lead.traffic || 0);
+        if (!_urlChk.ok) {
+          log(`  🛑 ${domain}: NO se envía — la URL no debería estar en Prospects (${_urlChk.reason})`);
+          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `envio: ${_urlChk.reason}`.slice(0, 200), rejected_at: new Date().toISOString() }),
+          }).catch(() => {});
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `url_no_prospectable:${_urlChk.reason}` });
+          continue; // próximo lead
+        }
+
+        // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──
+        // Si el send falla, NO ensuciamos Monday con items "Mail No Enviado".
+
+        // 3. Config de Monday. ⚠️ La falta de key SÓLO frena si Monday sigue prendido.
+        //    Antes cortaba con `continue` sin importar nada: con Monday apagado, el agente
+        //    habría dejado de MANDAR MAILS por una credencial que ya no se usa. Es el mismo
+        //    patrón de siempre — "no pude registrar" tratado como "no mando" —, y acá el
+        //    costo era el envío del día entero.
+        const mondayEnabled = String(cfg.monday_enabled ?? "true").toLowerCase() === "true";
+        const mondayUserId = (cfg[`monday_user_id_${userEmail.toLowerCase()}`] || "").trim();
+        const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || monday_api_key_default).trim();
+        if (mondayEnabled && !mondayApiKey) {
+          await logAgentAction(token, userEmail, { domain, action: "failed", reason: "no_monday_api_key" });
+          continue;
+        }
+
+        // ── CUPO COMPARTIDO DE LA CASILLA ─────────────────────────────────────────
+        // Cuenta lo que salió de este buzón en la última hora, del worker Y del CRM.
+        // Es un `break` y no un `continue`: si la casilla llegó al tope, no sirve probar
+        // con el lead siguiente — el límite es del buzón, no del destinatario.
+        const _cupo = await cupoDisponibleCasilla(userEmail);
+        if (!_cupo.hay) {
+          log(`  ⏸️ ${userEmail}: ${_cupo.usados}/${_cupo.tope} mails en la última hora (${_cupo.motivo === "freno_propio" ? "freno propio de la toolbar" : "red compartida con el CRM"}) — corto el turno`);
+          // ⚠️ SE ANOTA (parte del 07/09). Este `break` era mudo: el 07/09 el CRM mandó 25/h por
+          // buzón de 13 a 17 —exactamente el techo— en las mismas horas que los cinco turnos del
+          // agente, y cada turno cortó acá con "0 de 8" sin dejar rastro. El parte concluyó "no
+          // hay descartes registrados — el agente no llegó a intentarlo. Revisar si el worker
+          // corrió", que es lo contrario de lo que pasó: corrió cinco veces y cinco veces
+          // encontró la casilla llena por el otro sistema.
+          await logAgentAction(token, userEmail, {
+            domain: "_cycle_", action: "cycle_cupo_casilla",
+            reason: `casilla_llena:${_cupo.usados}/${_cupo.tope}:${_cupo.motivo}`,
+            details: { usados: _cupo.usados, tope: _cupo.tope, propios: _cupo.propios, motivo: _cupo.motivo, hora_es: _spainHour() },
+          }).catch(() => {});
+          break;
+        }
+
+        // ── ÚLTIMA PUERTA ANTES DE ALGO IRREVERSIBLE ──────────────────────────────
+        // El snapshot de bloqueados se refresca 1×/día, y el CRM mueve a "En Negociacion"
+        // TRES MINUTOS después de que alguien contesta. Con sólo el snapshot, quien contestó
+        // a las 10 podía recibir un pitch en frío a las 13. Así salieron los 22 pitches a
+        // clientes que nos facturan.
+        //
+        // Regla: el snapshot filtra barato sobre miles de dominios del pool; la ficha FRESCA
+        // decide justo antes de mandar. Son ~60-100 consultas por día —una por mail que sale—
+        // y es el único momento en que el costo de equivocarse no se puede deshacer.
+        const _fichaAhora = await _fichaDelCrm(domain);
+        // Ante la duda, NO. Si el CRM no contesta, este dominio queda para el turno
+        // siguiente: no se rechaza el lead ni se lo marca, sólo no sale hoy. Es el mismo
+        // criterio con el que el CRM devuelve 503 en vez de una lista incompleta.
+        if (_fichaAhora?.indeterminado) {
+          log(`  ⏭️ ${domain}: no pude consultar el CRM — lo dejo para el turno siguiente`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:no_verificable" });
+          continue;
+        }
+        if (_fichaAhora?.enNegociacion) {
+          log(`  ⊘ ${domain}: ABORT send — el CRM lo tiene en negociación (${_fichaAhora.board})`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:en_negociacion" });
+          continue;
+        }
+        if (_fichaAhora?.descansando) {
+          log(`  ⊘ ${domain}: ABORT send — descansando, faltan ${_fichaAhora.diasParaReintentar} días`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:descansando" });
+          continue;
+        }
+
+        // BLOCKLIST GUARD (defense-in-depth) — admin pudo agregar el dominio
+        // entre intake y send. Recheck antes de mandar.
+        const _blockGuard = await isDomainBlockedFull(domain, token).catch(() => null);
+        if (_blockGuard) {
+          log(`  ⊘ ${domain}: ABORT send — admin blocklist (${_blockGuard})`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `blocklist:${_blockGuard}` });
+          // El mismo rechazo suave que la puerta del principio del lead (2026-09-13). Acá había un
+          // PATCH propio con `validated_by: admin_blocklist` —que nadie lee— y sin suspect_reason:
+          // dos formas de rechazar lo mismo terminan discrepando.
+          await _softRejectLead(_authRq, lead.id, `blocklist:${_blockGuard}`);
+          continue;
+        }
+
+        // reservedId ya está declarado al inicio del loop (scope del for) para que catch lo vea
+        // ── SENDTRACK 30d GUARD (último filtro antes del send) ──
+        // Aunque upstream filtre, defense-in-depth: chequeamos si el dominio
+        // recibió mail en los últimos 30 días por CUALQUIER MB (humano o agente).
+        // Cero costo (1 query Supabase con índice). Evita re-contactar.
+        try {
+          const cutoff = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
+          const stRes = await fetch(
+            `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff}&select=send_date,email&limit=1`,
+            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
+          );
+          // ⚠️ FALLA CERRADO (Maxi 2026-08-25). Si la consulta se caía, el guard se salteaba
+          // y el mail salía igual: es la única protección contra re-contactar a alguien al
+          // que ya le escribimos hace menos de 30 días, y escribirle dos veces en un mes es
+          // de las formas más rápidas de que nos marquen como spam. Ante la duda, no se manda:
+          // el lead sigue en el pool y se reintenta en el próximo ciclo, no se pierde nada.
+          if (!stRes.ok) {
+            log(`  ⏸️ ${domain}: no pude verificar si ya lo contactamos (HTTP ${stRes.status}) — NO se manda, se reintenta`);
+            await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `sendtrack_guard_error:HTTP ${stRes.status}` }).catch(() => {});
+            continue;
+          }
+          const sentRows = await stRes.json();
+          if (Array.isArray(sentRows) && sentRows.length > 0) {
+            log(`  ⏭ ${domain}: skip — ya contactado ${sentRows[0].send_date} (sendtrack 30d guard)`);
+            await logAgentAction(token, userEmail, {
+              domain, action: "skipped", reason: "sendtrack_30d",
+              details: { last_send: sentRows[0].send_date, last_email: sentRows[0].email },
+            });
+            continue;
+          }
+        } catch (e) {
+          log(`  ⏸️ sendtrack guard ${domain}: ${e.message} — NO se manda, se reintenta`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `sendtrack_guard_error:${String(e.message || e).slice(0, 80)}` }).catch(() => {});
+          continue;
+        }
+
+        // ── SALTO INSTANTÁNEO A LA SIGUIENTE DIRECCIÓN (Maxi 2026-07-27, regla del user) ──
+        // Regla: "envío instantáneo a un nuevo email si el primero se detecta rechazado o inválido".
+        // Antes NO era así: si MillionVerifier marcaba el #1 como invalid, o si ya estaba en la
+        // lista de bounced, el código hacía `continue` y ABANDONABA EL LEAD ENTERO hasta el próximo
+        // ciclo — teniendo 2, 3 o 4 direcciones más ya rankeadas y listas en `ranked`.
+        // Ahora recorremos los candidatos en orden y nos quedamos con el primero entregable.
+        // Tope de 3 verificaciones MV por lead: MV se paga por consulta y un lead con 6 direcciones
+        // basura no debe vaciar el cupo diario.
+        // ── LA REGLA VIVE EN UNA FUNCIÓN PROBADA (2026-09-13) ──────────────────────────────────
+        // `_elegirDireccion` + `_accionPorVeredictoMV` (tests/agente-13-09b.test.js). Lo que cambió:
+        // un `dudoso` ya no se elige como si fuera limpio —salta a la dirección siguiente sin
+        // quemarse—, y todo lo descartado queda en `_noEnviables` para que el 2º email no lo reuse.
+        // El candidato elegido ya pasó por MillionVerifier acá, así que la red final de más abajo lo
+        // lee del caché gratis; sólo paga si el lead agotó las 3 consultas antes de llegar a él.
+        const _noEnviables = new Set();
+        if (email && ranked.length > 0) {
+          // Arrancar por el email YA elegido (puede no ser ranked[0]: el 2do pass de Claude lo
+          // pudo haber cambiado). Sin esto el loop volvía a empezar por ranked[0] y pisaba
+          // silenciosamente la elección de Claude.
+          const _orden = [
+            ...ranked.filter(c => c.email === email),
+            ...ranked.filter(c => c.email !== email),
+          ];
+          const _eleccion = await _elegirDireccion(_orden, {
+            rebotado: (e) => isBouncedSync(e),
+            // Lo aprendido de rebotes anteriores en ESE dominio: no es que esta dirección haya
+            // rebotado, es que el dominio ya demostró que rechaza direcciones nuevas. (Maxi 2026-08-25.)
+            noEscribir: (e) => _porQueNoEscribirA(e),
+            // Marca distinta → se descarta ESTE candidato, no el lead (Maxi 2026-07-28: el
+            // info@domain-contact.org de pixiv.net y de los subdominios de globo.com es el WHOIS proxy).
+            marcaOk: (c) => _brandMatches(c.email, domain, c.source),
+            // Enrutamiento del gasto (auditoría 2026-08-04): una hipótesis de patrón en un proveedor
+            // que acepta cualquier destinatario es la combinación letal — esa no se manda.
+            ruta: (c) => decidirVerificacionMV(c.email, c.source).catch(() => ({ verificar: true, enviar: true })),
+            verificar: (e) => _verifyEmailMV(token, cfg, e),
+            // No entregable → marcar para que no se re-elija y seguir con el siguiente.
+            quemar: (c) => {
+              markEmailBounced(token, {
+                email: c.email, reason: "mv_undeliverable", evidencia: "verificador", fuente: _normSrc(c.source) || null,
+                originalDomain: c.email.split("@")[1] || "",
+              }).catch(() => {});
+            },
+            avisar: (m) => log(`  ${domain}: ${m}`),
+          });
+          const chosen = _eleccion.chosen, descartados = _eleccion.descartados, _motivosDescarte = _eleccion.motivos;
+          for (const e of _eleccion.noEnviables) _noEnviables.add(e);
+          if (_eleccion.deReserva) {
+            log(`  ⚠️ ${domain}: ninguno verificó limpio → mando a ${chosen.email} (catch-all o sin verificar; puede rebotar)`);
+          }
+          if (chosen && chosen.email !== email) {
+            log(`  ↪️ ${domain}: ${email} no entregable → salto instantáneo a ${chosen.email} (descartados: ${descartados})`);
+          }
+          if (!chosen && descartados > 0) {
+            log(`  ⏭ ${domain}: los ${descartados} candidatos son no entregables — sin dirección válida`);
+          }
+          email = chosen?.email || null;
+          if (chosen) pickedSource = chosen.source || "";
+          // Si NINGÚN candidato resultó entregable, no hay a quién escribirle. El chequeo
+          // genérico de `!email` ya quedó más arriba (antes del guard de 30d), así que hace
+          // falta cortar acá o seguiríamos hasta la reserva con email=null.
+          if (!email) {
+            log(`  ⏭ ${domain}: SKIP — todos los candidatos no entregables (${descartados} descartados)`);
+            await logAgentAction(token, userEmail, {
+              domain, action: "skipped", reason: "all_candidates_undeliverable",
+              // ⚠️ ANTES SOLO SE GUARDABA EL NÚMERO (Maxi 2026-08-24). Con 327 descartes en
+              // 7 días —el mayor freno de envíos que queda— no había forma de saber la causa
+              // sin leer el código. Ahora el motivo de cada candidato queda en la fila.
+              details: {
+                traffic: leadTraffic, geo: leadGeo, emails_count: emails.length, descartados,
+                motivos: _motivosDescarte.reduce((a, m) => { a[m] = (a[m] || 0) + 1; return a; }, {}),
+              },
+            });
+            // El buzón siguiente de ESTE turno tampoco lo recorre (2026-09-13): la fila de arriba la
+            // lee el filtro de 7 días, pero ese set se cargó al empezar el ciclo.
+            _saltadosSinDireccion7d.add(String(domain || "").toLowerCase());
+            // ── NO ES UN CALLEJÓN SIN SALIDA (Maxi 2026-08-24) ──────────────────
+            // Estos leads quedaban atascados: el agente los elegía y los descartaba en
+            // CADA ciclo, para siempre. La salida correcta no es descartarlo: es ir a buscarle
+            // un email REAL. Para eso queda escrito en el lead POR QUÉ no salió.
+            // ⚠️ 2026-09-13: la marca ahora cubre todos los motivos (dudoso, no, otra marca...), no
+            // sólo la hipótesis de patrón, y la fecha de intento pasa a AHORA en vez de null. Con
+            // null el lead quedaba PRIMERO en el pool del agente (`email_ultimo_intento.asc.nullsfirst`)
+            // y le comía la ventana de 300 a los que sí se pueden mandar. El orden de `emails` NO se
+            // toca: lo leen `_rankIntento` y la extensión.
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ email_ultimo_intento: new Date().toISOString(), email_ultimo_motivo: _motivoSinDireccionEnviable(_motivosDescarte) }),
+              signal: AbortSignal.timeout(10000),
+            }).catch(() => {});
+            continue; // próximo lead
+          }
+        }
+
+        // El pitch se arma recién ahora que hay a quién mandárselo (2026-09-13): antes corría antes
+        // del CRM y de MillionVerifier, y en cada lead que terminaba salteado se tiraba una llamada
+        // a Claude y su autocontrol.
         // 2. Decidir source: 80% template, 20% Claude (configurable via agent_claude_percent)
         const claudePercent = parseInt(cfg.agent_claude_percent || "20", 10);
         const source = pickPitchSource(claudePercent);
@@ -23462,22 +23829,6 @@ async function runAgentCycle(token, allFlags) {
           pitch._templateId = templateId;
         }
 
-        // ── ORDEN: Gmail PRIMERO, Monday DESPUÉS (igual que MB humano) ──
-        // Si el send falla, NO ensuciamos Monday con items "Mail No Enviado".
-
-        // 3. Config de Monday. ⚠️ La falta de key SÓLO frena si Monday sigue prendido.
-        //    Antes cortaba con `continue` sin importar nada: con Monday apagado, el agente
-        //    habría dejado de MANDAR MAILS por una credencial que ya no se usa. Es el mismo
-        //    patrón de siempre — "no pude registrar" tratado como "no mando" —, y acá el
-        //    costo era el envío del día entero.
-        const mondayEnabled = String(cfg.monday_enabled ?? "true").toLowerCase() === "true";
-        const mondayUserId = (cfg[`monday_user_id_${userEmail.toLowerCase()}`] || "").trim();
-        const mondayApiKey = (cfg[`monday_api_key_${userEmail.toLowerCase()}`] || monday_api_key_default).trim();
-        if (mondayEnabled && !mondayApiKey) {
-          await logAgentAction(token, userEmail, { domain, action: "failed", reason: "no_monday_api_key" });
-          continue;
-        }
-
         // 4. Send Gmail PRIMERO — si falla, no toca Monday
         // Rotar el asunto en vez de usar siempre el primero. Cada template trae 3
         // variantes y las otras 2 eran código muerto: cientos de mails salían con el
@@ -23487,250 +23838,6 @@ async function runAgentCycle(token, allFlags) {
         const _subjs = (pitch.subjects || []).filter(Boolean);
         const _hashDom = [...domain].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
         const subject = _subjs.length ? _subjs[_hashDom % _subjs.length] : `Sobre ${domain}`;
-
-        // ── CUPO COMPARTIDO DE LA CASILLA ─────────────────────────────────────────
-        // Cuenta lo que salió de este buzón en la última hora, del worker Y del CRM.
-        // Es un `break` y no un `continue`: si la casilla llegó al tope, no sirve probar
-        // con el lead siguiente — el límite es del buzón, no del destinatario.
-        const _cupo = await cupoDisponibleCasilla(userEmail);
-        if (!_cupo.hay) {
-          log(`  ⏸️ ${userEmail}: ${_cupo.usados}/${_cupo.tope} mails en la última hora (${_cupo.motivo === "freno_propio" ? "freno propio de la toolbar" : "red compartida con el CRM"}) — corto el turno`);
-          // ⚠️ SE ANOTA (parte del 07/09). Este `break` era mudo: el 07/09 el CRM mandó 25/h por
-          // buzón de 13 a 17 —exactamente el techo— en las mismas horas que los cinco turnos del
-          // agente, y cada turno cortó acá con "0 de 8" sin dejar rastro. El parte concluyó "no
-          // hay descartes registrados — el agente no llegó a intentarlo. Revisar si el worker
-          // corrió", que es lo contrario de lo que pasó: corrió cinco veces y cinco veces
-          // encontró la casilla llena por el otro sistema.
-          await logAgentAction(token, userEmail, {
-            domain: "_cycle_", action: "cycle_cupo_casilla",
-            reason: `casilla_llena:${_cupo.usados}/${_cupo.tope}:${_cupo.motivo}`,
-            details: { usados: _cupo.usados, tope: _cupo.tope, propios: _cupo.propios, motivo: _cupo.motivo, hora_es: _spainHour() },
-          }).catch(() => {});
-          break;
-        }
-
-        // ── ÚLTIMA PUERTA ANTES DE ALGO IRREVERSIBLE ──────────────────────────────
-        // El snapshot de bloqueados se refresca 1×/día, y el CRM mueve a "En Negociacion"
-        // TRES MINUTOS después de que alguien contesta. Con sólo el snapshot, quien contestó
-        // a las 10 podía recibir un pitch en frío a las 13. Así salieron los 22 pitches a
-        // clientes que nos facturan.
-        //
-        // Regla: el snapshot filtra barato sobre miles de dominios del pool; la ficha FRESCA
-        // decide justo antes de mandar. Son ~60-100 consultas por día —una por mail que sale—
-        // y es el único momento en que el costo de equivocarse no se puede deshacer.
-        const _fichaAhora = await _fichaDelCrm(domain);
-        // Ante la duda, NO. Si el CRM no contesta, este dominio queda para el turno
-        // siguiente: no se rechaza el lead ni se lo marca, sólo no sale hoy. Es el mismo
-        // criterio con el que el CRM devuelve 503 en vez de una lista incompleta.
-        if (_fichaAhora?.indeterminado) {
-          log(`  ⏭️ ${domain}: no pude consultar el CRM — lo dejo para el turno siguiente`);
-          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:no_verificable" });
-          continue;
-        }
-        if (_fichaAhora?.enNegociacion) {
-          log(`  ⊘ ${domain}: ABORT send — el CRM lo tiene en negociación (${_fichaAhora.board})`);
-          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:en_negociacion" });
-          continue;
-        }
-        if (_fichaAhora?.descansando) {
-          log(`  ⊘ ${domain}: ABORT send — descansando, faltan ${_fichaAhora.diasParaReintentar} días`);
-          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: "crm:descansando" });
-          continue;
-        }
-
-        // BLOCKLIST GUARD (defense-in-depth) — admin pudo agregar el dominio
-        // entre intake y send. Recheck antes de mandar.
-        const _blockGuard = await isDomainBlockedFull(domain, token).catch(() => null);
-        if (_blockGuard) {
-          log(`  ⊘ ${domain}: ABORT send — admin blocklist (${_blockGuard})`);
-          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `blocklist:${_blockGuard}` });
-          // Marcar review_queue como rejected para no re-considerar
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ status: "rejected", validated_by: `admin_blocklist`, validated_at: new Date().toISOString(), rejected_at: new Date().toISOString() }),
-          }).catch(() => {});
-          continue;
-        }
-
-        // reservedId ya está declarado al inicio del loop (scope del for) para que catch lo vea
-        // ── SENDTRACK 30d GUARD (último filtro antes del send) ──
-        // Aunque upstream filtre, defense-in-depth: chequeamos si el dominio
-        // recibió mail en los últimos 30 días por CUALQUIER MB (humano o agente).
-        // Cero costo (1 query Supabase con índice). Evita re-contactar.
-        try {
-          const cutoff = new Date(Date.now() - 30 * 86400_000).toISOString().split("T")[0];
-          const stRes = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?domain=eq.${encodeURIComponent(domain)}&send_date=gte.${cutoff}&select=send_date,email&limit=1`,
-            { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-          );
-          // ⚠️ FALLA CERRADO (Maxi 2026-08-25). Si la consulta se caía, el guard se salteaba
-          // y el mail salía igual: es la única protección contra re-contactar a alguien al
-          // que ya le escribimos hace menos de 30 días, y escribirle dos veces en un mes es
-          // de las formas más rápidas de que nos marquen como spam. Ante la duda, no se manda:
-          // el lead sigue en el pool y se reintenta en el próximo ciclo, no se pierde nada.
-          if (!stRes.ok) {
-            log(`  ⏸️ ${domain}: no pude verificar si ya lo contactamos (HTTP ${stRes.status}) — NO se manda, se reintenta`);
-            await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `sendtrack_guard_error:HTTP ${stRes.status}` }).catch(() => {});
-            continue;
-          }
-          const sentRows = await stRes.json();
-          if (Array.isArray(sentRows) && sentRows.length > 0) {
-            log(`  ⏭ ${domain}: skip — ya contactado ${sentRows[0].send_date} (sendtrack 30d guard)`);
-            await logAgentAction(token, userEmail, {
-              domain, action: "skipped", reason: "sendtrack_30d",
-              details: { last_send: sentRows[0].send_date, last_email: sentRows[0].email },
-            });
-            continue;
-          }
-        } catch (e) {
-          log(`  ⏸️ sendtrack guard ${domain}: ${e.message} — NO se manda, se reintenta`);
-          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `sendtrack_guard_error:${String(e.message || e).slice(0, 80)}` }).catch(() => {});
-          continue;
-        }
-
-        // ── SALTO INSTANTÁNEO A LA SIGUIENTE DIRECCIÓN (Maxi 2026-07-27, regla del user) ──
-        // Regla: "envío instantáneo a un nuevo email si el primero se detecta rechazado o inválido".
-        // Antes NO era así: si MillionVerifier marcaba el #1 como invalid, o si ya estaba en la
-        // lista de bounced, el código hacía `continue` y ABANDONABA EL LEAD ENTERO hasta el próximo
-        // ciclo — teniendo 2, 3 o 4 direcciones más ya rankeadas y listas en `ranked`.
-        // Ahora recorremos los candidatos en orden y nos quedamos con el primero entregable.
-        // Tope de 3 verificaciones MV por lead: MV se paga por consulta y un lead con 6 direcciones
-        // basura no debe vaciar el cupo diario. Las respuestas de MV van a _mvCache, así que los
-        // chequeos que vienen más abajo (defensa en profundidad) no vuelven a gastar crédito.
-        if (email && ranked.length > 0) {
-          const MAX_MV_PER_LEAD = 3;
-          let mvUsed = 0, chosen = null, descartados = 0;
-          const _motivosDescarte = [];   // POR QUÉ se cayó cada candidato, no solo cuántos
-          // Reserva: el mejor candidato "riesgo" (catch-all, o que no se pudo verificar). No se
-          // descarta —perderíamos publishers corporativos enteros, que suelen ser catch-all— pero
-          // se usa solo si ningún candidato verifica limpio. Como _orden ya viene por ranking, el
-          // primero que caiga acá es el mejor de los dudosos.
-          let reserva = null;
-          // Arrancar por el email YA elegido (puede no ser ranked[0]: el 2do pass de Claude lo
-          // pudo haber cambiado). Sin esto el loop volvía a empezar por ranked[0] y pisaba
-          // silenciosamente la elección de Claude.
-          const _orden = [
-            ...ranked.filter(c => c.email === email),
-            ...ranked.filter(c => c.email !== email),
-          ];
-          for (const cand of _orden) {
-            if (isBouncedSync(cand.email)) { descartados++; _motivosDescarte.push("ya_reboto"); continue; }
-            // Maxi 2026-07-28: marca distinta → descartar ESTE candidato, no el lead.
-            // Antes el chequeo vivía después de la reserva y hacía `continue` del lead entero,
-            // marcándolo 'rejected' PARA SIEMPRE aunque tuviera otras direcciones buenas. Casos
-            // reales del pool: info@domain-contact.org como email #1 de pixiv.net y de los 4
-            // subdominios de globo.com (es el WHOIS proxy, no el publisher).
-            // Lo aprendido de rebotes anteriores en ESE dominio. No es que esta dirección
-            // haya rebotado —eso lo cubre isBouncedSync—: es que el dominio ya demostró que
-            // rechaza direcciones nuevas, así que probar otra es quemar reputación para
-            // nada. Medido: 73 leads del pool apuntan a un dominio así. (Maxi 2026-08-25.)
-            const _noEscribir = _porQueNoEscribirA(cand.email);
-            if (_noEscribir) {
-              log(`  🧠 ${domain}: no escribo a ${cand.email} — ${_noEscribir}`);
-              descartados++; _motivosDescarte.push("dominio_ya_rechazo");
-              continue;
-            }
-            if (!_brandMatches(cand.email, domain, cand.source)) {
-              log(`  🚫 ${domain}: ${cand.email} es de otra marca — se descarta el email, NO el lead`);
-              descartados++; _motivosDescarte.push("otra_marca");
-              continue;
-            }
-            // Enrutamiento del gasto (auditoría 2026-08-04): en Microsoft 365 y en los gateways
-            // antispam la verificación es estructuralmente ciega —aceptan cualquier destinatario
-            // a nivel RCPT— así que la consulta paga no aporta nada y encima devuelve un "ok"
-            // falso. Es el ~41% de los publishers. Ahí no gastamos, salvo que el email además
-            // sea una hipótesis de patrón: no verificable + hipótesis es la combinación letal.
-            const _ruta = await decidirVerificacionMV(cand.email, cand.source).catch(() => ({ verificar: true, enviar: true }));
-            if (!_ruta.enviar) {
-              log(`  ⏭️ ${domain}: ${cand.email} descartado — ${_ruta.motivo}`);
-              descartados++; _motivosDescarte.push("catch_all_y_patron");
-              continue;
-            }
-            if (_ruta.verificar && mvUsed < MAX_MV_PER_LEAD) {
-              mvUsed++;
-              const _mv = await _verifyEmailMV(token, cfg, cand.email);
-              if (_mv === "no") {
-                // No entregable → marcar para que no se re-elija y seguir con el siguiente
-                markEmailBounced(token, {
-                  email: cand.email, reason: "mv_undeliverable", evidencia: "verificador", fuente: _normSrc(cand.source) || null,
-                  originalDomain: cand.email.split("@")[1] || "",
-                }).catch(() => {});
-                descartados++;
-                continue;
-              }
-              if (_mv === "riesgo") {
-                if (!reserva) reserva = cand;   // guardo el mejor dudoso y sigo buscando uno limpio
-                continue;
-              }
-            }
-            chosen = cand;
-            break;
-          }
-          // Ningún candidato verificó limpio: antes de dejar el lead sin enviar, va la reserva.
-          if (!chosen && reserva) {
-            chosen = reserva;
-            log(`  ⚠️ ${domain}: ninguno verificó limpio → mando a ${reserva.email} (catch-all o sin verificar; puede rebotar)`);
-          }
-          if (chosen && chosen.email !== email) {
-            log(`  ↪️ ${domain}: ${email} no entregable → salto instantáneo a ${chosen.email} (descartados: ${descartados})`);
-          }
-          if (!chosen && descartados > 0) {
-            log(`  ⏭ ${domain}: los ${descartados} candidatos son no entregables — sin dirección válida`);
-          }
-          email = chosen?.email || null;
-          if (chosen) pickedSource = chosen.source || "";
-          // Si NINGÚN candidato resultó entregable, no hay a quién escribirle. El chequeo
-          // genérico de `!email` ya quedó más arriba (antes del guard de 30d), así que hace
-          // falta cortar acá o seguiríamos hasta la reserva con email=null.
-          if (!email) {
-            log(`  ⏭ ${domain}: SKIP — todos los candidatos no entregables (${descartados} descartados)`);
-            await logAgentAction(token, userEmail, {
-              domain, action: "skipped", reason: "all_candidates_undeliverable",
-              // ⚠️ ANTES SOLO SE GUARDABA EL NÚMERO (Maxi 2026-08-24). Con 327 descartes en
-              // 7 días —el mayor freno de envíos que queda— no había forma de saber la causa
-              // sin leer el código. Ahora el motivo de cada candidato queda en la fila.
-              details: {
-                traffic: leadTraffic, geo: leadGeo, emails_count: emails.length, descartados,
-                motivos: _motivosDescarte.reduce((a, m) => { a[m] = (a[m] || 0) + 1; return a; }, {}),
-              },
-            });
-            // ── NO ES UN CALLEJÓN SIN SALIDA (Maxi 2026-08-24) ──────────────────
-            // Estos leads quedaban atascados: el agente los elegía y los descartaba en
-            // CADA ciclo, para siempre. El motivo dominante es "el proveedor acepta
-            // cualquier destinatario y el email es una hipótesis de patrón" — o sea que
-            // el problema no es el lead, es que solo tenemos direcciones inventadas.
-            // La salida correcta no es descartarlo: es ir a buscarle un email REAL.
-            // Se limpia la marca de intento para que la caza de emails lo tome primero.
-            if (_motivosDescarte.includes("catch_all_y_patron")) {
-              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-                method: "PATCH",
-                headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-                body: JSON.stringify({ email_ultimo_intento: null, email_ultimo_motivo: "solo_hipotesis_de_patron" }),
-              }).catch(() => {});
-            }
-            continue; // próximo lead
-          }
-        }
-
-        // ── RED DE SEGURIDAD GRATIS (Maxi 2026-08-18) ────────────────────────────────────
-        // El agente ya no juzga la calidad del lead: manda lo que está en Prospects con email.
-        // Eso está bien —el filtro corre al entrar y el agente de revisión repasa el pool a
-        // diario— pero deja una ventana: una URL mala que entra hoy se manda antes de que la
-        // revisión pase. Este chequeo la cierra y no cuesta NADA: mira solo el nombre del
-        // dominio, sin red, sin API, sin IA. Caza bancos, gobiernos, universidades y acortadores
-        // por el patrón de la URL. No reemplaza al filtro de entrada: es el último cinturón.
-        const _urlChk = classifyByUrlOnly(domain, lead.category || "", lead.traffic || 0);
-        if (!_urlChk.ok) {
-          log(`  🛑 ${domain}: NO se envía — la URL no debería estar en Prospects (${_urlChk.reason})`);
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `envio: ${_urlChk.reason}`.slice(0, 200), rejected_at: new Date().toISOString() }),
-          }).catch(() => {});
-          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `url_no_prospectable:${_urlChk.reason}` });
-          continue; // próximo lead
-        }
 
         // RESERVA en counter ANTES del send. Si Railway crashea entre send y log,
         // el counter ya tiene el slot reservado → próximo arranque no over-sends.
@@ -23813,18 +23920,32 @@ async function runAgentCycle(token, allFlags) {
         // Maxi 2026-07-24: verificación de entregabilidad (MillionVerifier). DORMIDA hasta que
         // el user cargue millionverifier_api_key → sin key devuelve true y NO cambia nada. Con
         // key: si el buzón es invalid/disposable, NO enviamos (evita el rebote) y marcamos el
-        // email como bounced local para que NO se re-elija y el re-enrich busque otro contacto.
-        // `dudoso` se frena igual que `no` (Maxi 2026-09-01): el lead NO se pierde, sale por
-        // el mismo camino que ya existe —se marca y el re-enrich le busca otra dirección—.
-        // Cuesta ~6 envíos por día y evita ~8 rebotes cada 14; el catch-all sigue pasando.
+        // email como bounced local para que NO se re-elija.
+        // `dudoso` se frena igual que `no` (Maxi 2026-09-01). Cuesta ~6 envíos por día y evita ~8
+        // rebotes cada 14; el catch-all sigue pasando.
+        // ⚠️ DESDE EL 13/09 ESTO ES LA RED FINAL, NO LA DECISIÓN: el bucle de elección ya verificó
+        // el candidato y saltó los dudosos a la dirección siguiente. Acá casi siempre se lee del
+        // caché; queda para el candidato que llegó después de las 3 consultas del lead.
         const _mvEstado = await _verifyEmailMV(token, cfg, email);
         if (_mvEstado === "no" || _mvEstado === "dudoso") {
+          const _motivoMv = _mvEstado === "dudoso" ? "mv_dudoso" : "mv_undeliverable";
+          // ⚠️ CON AWAIT Y CON RESPALDO (2026-09-13). Era un PATCH sin await con `.catch` vacío: si la
+          // base contestaba un error, la reserva quedaba colgada, a los 5 minutos pasaba a
+          // `reserve_expired` —que el filtro de 7 días no lee— y el lead volvía el turno siguiente.
+          // El salteo se anota aparte SÓLO si el PATCH no se confirmó: anotarlo siempre lo
+          // duplicaría en el parte.
+          let _anotado = false;
           if (reservedId) {
-            fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+            const _rp = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
               method: "PATCH",
               headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-              body: JSON.stringify({ action: "skipped", reason: _mvEstado === "dudoso" ? "mv_dudoso" : "mv_undeliverable" }),
-            }).catch(() => {});
+              body: JSON.stringify({ action: "skipped", reason: _motivoMv }),
+              signal: AbortSignal.timeout(10000),
+            }).catch(() => null);
+            _anotado = !!_rp?.ok;
+          }
+          if (!_anotado) {
+            await logAgentAction(token, userEmail, { domain, action: "skipped", reason: _motivoMv, details: { email, reserva_no_actualizada: true } }).catch(() => {});
           }
           // ⚠️ SOLO se quema la dirección cuando MV dice que NO EXISTE. Un `dudoso` es una
           // casilla que no se pudo confirmar, no una probada mala: blacklistearla sería
@@ -23833,8 +23954,20 @@ async function runAgentCycle(token, allFlags) {
           // más adelante no aparece ninguna mejor, sigue disponible.
           if (_mvEstado === "no") {
             markEmailBounced(token, { email, reason: "mv_undeliverable", evidencia: "verificador", originalDomain: email.split("@")[1] || "" }).catch(() => {});
+          } else {
+            // El dudoso: fuera del ciclo una semana (también para el buzón siguiente de este turno)
+            // y con la marca en el lead, igual que cuando ninguna dirección del bucle se pudo
+            // mandar. Antes el comentario prometía "el re-enrich le buscará otro email" y ningún
+            // job lo hacía: el lead no quedaba marcado de ninguna forma.
+            _saltadosSinDireccion7d.add(String(domain || "").toLowerCase());
+            await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+              method: "PATCH",
+              headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ email_ultimo_intento: new Date().toISOString(), email_ultimo_motivo: _motivoSinDireccionEnviable(["mv_dudoso"]) }),
+              signal: AbortSignal.timeout(10000),
+            }).catch(() => {});
           }
-          continue; // próximo lead — el re-enrich le buscará otro email
+          continue; // próximo lead
         }
         // Maxi 2026-08-18: TECHO DE TIEMPO al envío completo. La lección del apagón del 12 al 18
         // de agosto: un solo fetch sin timeout adentro de sendGmailServer congeló el agente seis
@@ -23905,13 +24038,43 @@ async function runAgentCycle(token, allFlags) {
         // Maxi 2026-06-18: AGENTE TAMBIÉN manda al 2do mejor email del lead
         // (si existe y tiene rank decente). Ganamos el que responda primero.
         // El bounce handler después auto-promueve Monday al que respondió.
-        // Reglas: 2do email debe tener score >= 40, NO bounced, diferente del 1ro.
+        // ── LAS MISMAS PUERTAS QUE EL PRINCIPAL, Y "OK" DE MILLIONVERIFIER (2026-09-13) ──────────
+        // Las reglas eran score >= 40, sin rebote y distinto del 1ro, y sólo frenaba un "no" de MV:
+        // un dudoso, un catch-all, otra marca o una hipótesis en un proveedor que acepta todo salían
+        // como primer contacto por acá, 14 a 25 por día. Ahora decide `_segundoEmailEnviable`
+        // (tests/agente-13-09b): lo que el bucle de elección ya descartó no se reusa, y hace falta
+        // veredicto "ok" — el 2º nunca es reserva, porque el principal ya salió. Se prueba UN
+        // candidato por lead, el primero que pasa los chequeos gratis: no se recorre la lista
+        // pagando MillionVerifier.
         try {
-          const secondCandidate = ranked.find(r =>
-            r.email && r.email.toLowerCase() !== email.toLowerCase() &&
-            r.score >= 40 && !isBouncedSync(r.email)
-          );
-          if (secondCandidate) {
+          const _datos2 = (r) => ({
+            email: r.email, primario: email, score: r.score,
+            rebotado: isBouncedSync(r.email),
+            noEnviable: _noEnviables.has(String(r.email || "").toLowerCase()),
+            noEscribir: _porQueNoEscribirA(r.email),
+            marcaOk: _brandMatches(r.email, domain, r.source),
+          });
+          const secondCandidate = ranked.find(r => r.email && !_motivoNoSegundoGratis(_datos2(r)));
+          // Verificar también acá: esta ruta mandaba sin preguntar.
+          // Mismo bug que en el re-engagement: faltaba `cfg`. Acá el efecto era que el
+          // segundo email de un lead NUNCA se mandaba (siempre "riesgo" → throw).
+          const _ruta2 = secondCandidate
+            ? await decidirVerificacionMV(secondCandidate.email, secondCandidate.source).catch(() => ({ verificar: true, enviar: true }))
+            : null;
+          const _v2 = _ruta2?.enviar ? await _verifyEmailMV(token, cfg, secondCandidate.email).catch(() => "riesgo") : null;
+          const _dec2 = secondCandidate
+            ? _segundoEmailEnviable({ ..._datos2(secondCandidate), ruta: _ruta2, veredictoMV: _v2 })
+            : { ok: false, motivo: "sin_candidato" };
+          if (secondCandidate && !_dec2.ok) {
+            log(`  ⛔ ${domain}: el 2º email ${secondCandidate.email} no sale (${_dec2.motivo}) — va sólo el principal`);
+            if (_v2 === "no") {
+              markEmailBounced(token, {
+                email: secondCandidate.email, reason: "mv_undeliverable", evidencia: "verificador", fuente: _normSrc(secondCandidate.source) || null,
+                originalDomain: secondCandidate.email.split("@")[1] || "",
+              }).catch(() => {});
+            }
+          }
+          if (_dec2.ok) {
             // ⚠️ NO MANDAR EL MISMO MAIL DOS VECES AL MISMO DOMINIO EN EL MISMO MINUTO.
             // Antes iban el mismo asunto y el mismo cuerpo, byte por byte, a dos personas
             // de la misma empresa a la vez. Si se cruzan, se termina la poca credibilidad
@@ -23919,11 +24082,6 @@ async function runAgentCycle(token, allFlags) {
             // recibe una variante corta que reconoce explícitamente el doble contacto.
             const _cuerpo2do = `${pitch.body}\n\n---\nPD: escribí también a ${email.split("@")[0]}@${domain} por las dudas — si no sos vos quien lleva esto, ignoralo sin problema.`;
             log(`  ➕ ${domain}: agente envía AL 2DO email ${secondCandidate.email} (score=${secondCandidate.score}, source=${secondCandidate.source})`);
-            // Verificar también acá: esta ruta mandaba sin preguntar.
-            // Mismo bug que en el re-engagement: faltaba `cfg`. Acá el efecto era que el
-            // segundo email de un lead NUNCA se mandaba (siempre "riesgo" → throw).
-            const _v2 = await _verifyEmailMV(token, cfg, secondCandidate.email).catch(() => "riesgo");
-            if (_v2 === "no") { log(`  ⛔ ${domain}: el 2º email no verifica — no se manda`); throw new Error("segundo_no_verifica"); }
             // Y separarlo en el tiempo: salían dos mensajes al MISMO dominio con el
             // MISMO asunto en menos de un segundo. Eso se ve desde afuera como un
             // disparo automático. Se espera y se rota el asunto.
