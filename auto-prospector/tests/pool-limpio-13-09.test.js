@@ -173,7 +173,12 @@ test("la caché negativa vence antes del primer congelado, y la blocklist 'inope
   const primerCongelado = parseInt(cuerpoDe("_backoffCongelado").match(/prevFreeze === 0 \? (\d+)/)?.[1] || "0", 10);
   ok(ttl > 0 && primerCongelado > 0, "no encontré los dos plazos");
   ok(ttl < primerCongelado, `el negativo (${ttl}d) tiene que vencer antes del descongelado (${primerCongelado}d): cada vuelta se decide con un "no" recién preguntado`);
-  ok(/if \(prevFreeze >= 2 && !trafficData\.fromCache\) \{/.test(worker), "con el castigo progresivo funcionando, el tercer congelado es permanente: no puede salir de un dato guardado");
+  // Desde el 13/09 (segunda revisión) la condición vive en una regla pura, que además deja afuera a los
+  // dominios del CRM (tests/entrada-13-09b.test.js). Lo que se exige acá no cambia: con un dato de
+  // caché, nunca.
+  ok(/if \(_vaABlocklistInoperativo\(\{ prevFreeze, deCache: !!trafficData\.fromCache, source \}\)\) \{/.test(worker)
+     && /if \(deCache\) return false;/.test(cuerpoDe("_vaABlocklistInoperativo")),
+     "con el castigo progresivo funcionando, el tercer congelado es permanente: no puede salir de un dato guardado");
 });
 
 test("la tarjeta de Prospects marca las direcciones adivinadas y preselecciona una publicada", () => {

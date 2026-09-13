@@ -10574,10 +10574,11 @@ async function revisarDescartesCondicionales(token) {
     const p = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=in.(${ids.join(",")})`, {
       method: "PATCH",
       headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
-      body: JSON.stringify({ status: "expired", error_message: "revisión periódica: el motivo del descarte era condicional (tráfico/GEO) y ya pasaron 90 días" }),
+      // Decía "90 días" fijo con el corte en 45 (REVISAR_CONDICIONALES_ANTIGUEDAD). (2026-09-13)
+      body: JSON.stringify({ status: "expired", error_message: `revisión periódica: el motivo del descarte era condicional (tráfico/GEO) y ya pasaron ${REVISAR_CONDICIONALES_ANTIGUEDAD} días` }),
     });
     if (!p.ok) { log(`⚠️ revisarDescartesCondicionales: el PATCH falló (${p.status})`); return; }
-    log(`♻️ ${ids.length} descartes condicionales liberados para re-descubrimiento (tráfico/GEO, +90 días)`);
+    log(`♻️ ${ids.length} descartes condicionales liberados para re-descubrimiento (tráfico/GEO, +${REVISAR_CONDICIONALES_ANTIGUEDAD} días)`);
     await saludPing(token, "revisar_condicionales", {
       status: "ok", cadenciaMin: REVISAR_CONDICIONALES_CADA_DIAS * 24 * 60,
       detalle: `${ids.length} liberados`, real: ids.length, esperado: ids.length,
@@ -14025,6 +14026,9 @@ async function updateMondayItem(itemId, columnValues, mondayApiKey) {
 //
 // Se aparca con TODO lo que ya sabemos. `revivirProspectsOffline` la devuelve sola cuando la
 // GEO deja de estar excluida.
+// Desde el 13/09 se aparca ANTES del detector de no-publisher, para no pagar Haiku por un país que
+// hoy no se quiere: lo aparcado está PRE-validado (ads.txt, tráfico, URL y categoría). Al revivir
+// vuelve a la cola y pasa todas las puertas, detector incluido.
 async function aparcarProspectOffline(token, d) {
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_prospects_offline?on_conflict=domain`, {
@@ -14281,6 +14285,112 @@ async function revivirProspectsOffline(token) {
   } catch (e) { log(`⚠️ revivirProspectsOffline: ${e.message}`); }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// LAS SALIDAS DE LA COLA QUE NO SON UN VEREDICTO (2026-09-13, revisión de la entrada)
+// ══════════════════════════════════════════════════════════════════════════════════════════
+// Reglas puras de processCsvItem y runCsvQueue, probadas en tests/entrada-13-09b.test.js. Todas
+// cierran la misma clase: una falla NUESTRA (la base, la red, el reloj, el CRM) que terminaba en
+// un estado que nadie vuelve a mirar, o un reintento que le borraba la memoria al lead.
+
+// La marca `freeze_N` que deja el descongelador dice cuántas veces ya se congeló el dominio por
+// falta de tráfico. Tres salidas reescribían el error_message ANTES del re-congelado (sin cuota de
+// API, API transitoria, "sin datos intento N/3") y la borraban: _backoffCongelado leía 0 y el
+// castigo volvía a 15 días. Se agrega AL FINAL, así el prefijo que agrupan los informes y los
+// contadores `retry_N` / `attempt_N` se leen igual que antes.
+function _conMarcaFreeze(mensaje, mensajePrevio) {
+  const m = String(mensaje || "");
+  const marca = String(mensajePrevio || "").match(/\bfreeze_\d+\b/)?.[0] || "";
+  if (!marca || /\bfreeze_\d+\b/.test(m)) return m;
+  return `${m} ${marca}`;
+}
+
+// El tercer congelado por falta de tráfico manda el dominio a la blocklist permanente
+// 'inoperativo', que la extensión muestra como bloqueado por admin. Un dominio que viene del CRM
+// (ex cliente reciclado: processCsvItem le pone `monday_refresh` a todo lo que tiene ficha y a lo
+// que llega por auto_feeder_monday) no puede terminar ahí: que SimilarWeb no tenga datos de un ex
+// cliente no lo vuelve inoperativo, y el MB no podría ni abrirlo. El congelado de 60 días se
+// escribe igual, así que RapidAPI no se paga más seguido. Tampoco con un "sin datos" de la caché.
+function _vaABlocklistInoperativo({ prevFreeze = 0, deCache = false, source = "" } = {}) {
+  if (!(Number(prevFreeze) >= 2)) return false;
+  if (deCache) return false;
+  if (String(source || "") === "monday_refresh") return false;
+  return true;
+}
+
+// Qué hacer con la fila de la cola según lo que devolvió saveToReviewQueue. Todo lo que no era "ok"
+// quedaba 'skipped' con review_queue_insert_fail, un estado final: un 503 de la base al guardar
+// tiraba un lead que ya había pagado tráfico, scrape y quizá un crédito de Apollo.
+//   · dup / floor / contactado_hace_poco → son veredictos: 'skipped', como siempre.
+//   · 5xx, 408, 429 o corte de red (http_net) → falla pasajera: vuelve mañana, hasta 3 veces, con
+//     un contador propio `ins_N` (el `retry_N` es del tráfico y no se pueden pisar). Después, error.
+//   · 4xx, http_max_retries (columnas que la base no tiene) o cualquier otra cosa → la base está
+//     rota y reintentar no la arregla: 'error' (redescubrible, no enterrado) y aviso.
+// El mensaje de la vuelta empieza con "reintentar:" para que el parte lo cuente entre los que
+// vuelven. Se guarda sólo el código HTTP y no el texto de la base: un "retry_5" o "attempt_2"
+// dentro de ese texto confundiría a los contadores de las otras salidas.
+function _estadoTrasGuardar(saved, mensajePrevio = "") {
+  const s = String(saved ?? "");
+  if (s === "ok") return { status: "done", error_message: null, alerta: false };
+  if (s === "dup" || s === "floor" || s === "contactado_hace_poco") {
+    return { status: "skipped", error_message: `review_queue_insert_fail:${s}`, alerta: false };
+  }
+  const codigo = s.match(/^http_[a-z0-9]+/i)?.[0] || "";
+  if (/^http_(5\d\d|408|429|net)$/i.test(codigo)) {
+    const n = parseInt(String(mensajePrevio || "").match(/\bins_(\d+)\b/)?.[1] || "0", 10) || 0;
+    if (n < 3) return { status: "next_day", error_message: `reintentar: insercion ${codigo} ins_${n + 1}`, alerta: false };
+    return { status: "error", error_message: `insercion_fallida_tras_3_reintentos: ${s.slice(0, 200)}`, alerta: true };
+  }
+  return { status: "error", error_message: `review_queue_insert_fail:${s.slice(0, 200)}`, alerta: true };
+}
+
+// Un corte de red o de reloj mientras se guarda no es un veredicto sobre el lead: se traduce a
+// `http_net:` para que _estadoTrasGuardar lo trate como un 503. Cualquier otra excepción (un bug)
+// devuelve null y sigue su camino de siempre, a 'error'.
+const _RE_FALLA_DE_RED = /timeout|timed out|network|fetch failed|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up|aborted/i;
+function _guardadoFallidoPorRed(err) {
+  const msg = String(err?.message || err || "");
+  const nombre = String(err?.name || "");
+  return (_RE_FALLA_DE_RED.test(msg) || /AbortError|TimeoutError/.test(nombre)) ? `http_net:${msg.slice(0, 60)}` : null;
+}
+
+// Congelar también puede fallar (la base no contesta). Quedaba 'skipped' con freeze_failed, final,
+// y sin el contador de intentos. Ahora vuelve a la cola con attempt_2 (la próxima vuelta llega
+// directo al congelado, con el "sin datos" de la caché negativa, sin pagar) y un contador propio
+// `freeze_fail_N`; a la cuarta, 'error'. La marca freeze_N viaja con él.
+function _estadoTrasFreezeFallido({ mensajePrevio = "", prevAttempts = 0, error = "" } = {}) {
+  const k = parseInt(String(mensajePrevio || "").match(/\bfreeze_fail_(\d+)\b/)?.[1] || "0", 10) || 0;
+  if (k >= 3) {
+    return { status: "error", error_message: _conMarcaFreeze(`freeze_failed: ${k} reintentos sin poder congelar (${String(error).slice(0, 80)})`, mensajePrevio) };
+  }
+  const intentos = Math.max(2, Number(prevAttempts) || 0);
+  return { status: "pending", error_message: _conMarcaFreeze(`no_traffic_data — attempt_${intentos}/3 freeze_fail_${k + 1}`, mensajePrevio) };
+}
+
+// El techo de 4 minutos por dominio marcaba 'error' al primer desborde. Un worker que reinicia en
+// medio de un scrape lento es falla nuestra: la primera vez vuelve mañana (`tmo_1`), la segunda sí
+// queda en 'error', como antes.
+function _estadoTrasTimeout(mensajePrevio = "") {
+  const n = parseInt(String(mensajePrevio || "").match(/\btmo_(\d+)\b/)?.[1] || "0", 10) || 0;
+  if (n < 1) return { status: "next_day", error_message: _conMarcaFreeze("reintentar: item_timeout_4min tmo_1", mensajePrevio) };
+  return { status: "error", error_message: "item_timeout_4min: tardó más que la vida del worker (dos veces)" };
+}
+
+// markCsvItem con una condición: sólo si la fila sigue en 'processing'. La carrera del techo de 4
+// minutos no cancela processCsvItem, que sigue de fondo; si terminó y ya escribió 'done' o su
+// descarte, el aviso de timeout no lo pisa.
+async function _marcarCsvSiSigueProcesando(token, id, status, fields = {}) {
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?id=eq.${id}&status=eq.processing`, {
+      method: "PATCH",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ status, processed_at: new Date().toISOString(), ...fields }),
+    });
+  } catch {}
+}
+
 async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSessionRef) {
   const { rapidapi_key, apollo_api_key } = cfg;
   const domain = item.domain;
@@ -14395,8 +14505,15 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // El sentinel de "no pude consultar" NO es una ficha: no tiene estado ni board, así que
   // dejarlo entrar acá lo leería como una ficha vacía y lo daría por libre.
   if (match?.indeterminado) {
-    log(`  ⏭️ ${domain}: no pude consultar el CRM — no lo importo ahora`);
-    return;   // como los otros 27 returns de esta función: no devuelve valor
+    // ── EL CRM QUE NO CONTESTA NO DEJA LA FILA COLGADA (2026-09-13) ─────────────────────────
+    // Era un `return` sin tocar la fila: quedaba en 'processing' hasta el próximo reinicio del
+    // worker, ocupando su carril, y cada dominio siguiente esperaba otros 15 s a un CRM caído.
+    // Ahora vuelve a 'pending' y se le avisa a runCsvQueue, que corta la tanda: la próxima corrida
+    // reintenta. No va a next_day: un corte de 10 minutos del CRM no puede mandar a mañana los
+    // imports de los MB. Esto corre antes de ads.txt y del tráfico: no se gastó nada.
+    await revertCsvItemToPending(token, item.id);
+    log(`  ⏭️ ${domain}: no pude consultar el CRM — vuelve a la cola sin importarse`);
+    return "crm_indeterminado";   // el único return con valor: runCsvQueue lo lee para cortar
   }
   if (match) {
     {
@@ -14467,7 +14584,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: sin_ads_txt` });
       registrarDiagDescarte(token, {
         domain, etapa: "puerta_0_ads_txt", motivo: "sin_ads_txt", adsTxt: false,
-        comentario: "No publica /ads.txt, que es la prueba de que vende display. Regla del user: sin ads.txt no entra. Si el sitio SÍ monetiza, puede ser que el archivo esté detrás de Cloudflare — eso lo reintenta recheckAdsTxtUnknowns.",
+        // El comentario decía que "lo reintenta recheckAdsTxtUnknowns", pero ese job sólo toma los
+        // ilegibles (verdict unknown), nunca este "no". El resumen de salud copia el texto tal
+        // cual, así que mandaba a esperar un reintento que no existe. (2026-09-13)
+        comentario: "No publica /ads.txt (respondió 404 o una página que no es un ads.txt), que es la prueba de que vende display. Regla del user: sin ads.txt no entra. Si el archivo estuviera bloqueado por Cloudflare, un 403 o un timeout no llegaría acá: eso queda como ilegible y se reintenta. Este 'no' queda en la auditoría de ads.txt y no se reintenta solo.",
       }).catch(() => {});
       await _auditAdsTxt(token, domain, "no", "sin ads.txt", source, "proceso");
       log(`  📄 ${domain} — SIN ads.txt → no monetiza, descartado (0 API gastada)`);
@@ -14484,6 +14604,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       log(`  📄❓ ${domain} — ads.txt bloqueado → sigue a SimilarWeb para juzgarlo por datos`);
     } else {
       log(`  📄✅ ${domain} — ads.txt OK (${_ads.lines} sellers, vía ${_ads.checked})`);
+    }
+  }
+
+  // ── LOS VETOS ESTRUCTURALES NO NECESITAN EL TRÁFICO (2026-09-13) ───────────────────────────
+  // Gobierno, universidad, acortador, CDN, wiki, hosting gratuito: la URL sola lo dice, y se
+  // evaluaban recién después de pagarle a RapidAPI. classifyByUrlOnly no usa la categoría, y con
+  // tráfico 0 sólo aplica las reglas por dominio, así que el veredicto es el mismo que daría más
+  // abajo. Los vetos por RUBRO se quedan donde estaban: ésos sí dependen de la puerta grande.
+  {
+    const _urlE = classifyByUrlOnly(domain, "", 0);
+    if (!_urlE.ok && _VETO_ESTRUCTURAL.test(String(_urlE.reason || ""))) {
+      await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${_urlE.reason}` });
+      log(`  🚯 ${domain} — veto estructural por URL (${_urlE.reason}) → sin gastar RapidAPI`);
+      return;
     }
   }
 
@@ -14551,8 +14685,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // Estos van a `next_day`: vuelven mañana, sin gastar un intento.
     const _sinCuotaNuestra = /daily_cap_reached|per_minute_fuse_tripped|HTTP 40[123]|quota|exceeded|not subscribed/i.test(_errStr);
     if (_sinCuotaNuestra) {
+      // `_conMarcaFreeze`: las tres reescrituras de este bloque conservan el ciclo de congelado
+      // que dejó el descongelador (ver arriba de processCsvItem). (2026-09-13)
       await markCsvItem(token, item.id, "next_day", {
-        error_message: `sin_cuota_de_api (no cuenta como intento): ${_errStr.slice(0, 40)}`,
+        error_message: _conMarcaFreeze(`sin_cuota_de_api (no cuenta como intento): ${_errStr.slice(0, 40)}`, item.error_message),
       });
       log(`  ⏸️ ${domain} — nos quedamos sin cuota de API, vuelve mañana SIN gastar un intento`);
       return;
@@ -14560,7 +14696,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
 
     if (_transient && _reintentos < 20) {
       await markCsvItem(token, item.id, "pending", {
-        error_message: `traffic_api_transient retry_${_reintentos + 1} (reintento sin penalizar): ${_errStr.slice(0, 40)}`,
+        error_message: _conMarcaFreeze(`traffic_api_transient retry_${_reintentos + 1} (reintento sin penalizar): ${_errStr.slice(0, 40)}`, item.error_message),
       });
       log(`  🔁 ${domain} — API tráfico transitorio (${_errStr.slice(0, 40)}) → reintento ${_reintentos + 1}/20`);
       return;
@@ -14593,7 +14729,8 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
         // Nunca a la blocklist permanente por una respuesta sacada de la caché (2026-09-13): con el
         // castigo progresivo funcionando, el tercer congelado es definitivo, y tiene que decidirse con
         // un "sin datos" recién consultado, no con uno guardado hace semanas.
-        if (prevFreeze >= 2 && !trafficData.fromCache) {
+        // Y nunca para un dominio que viene del CRM: ver _vaABlocklistInoperativo. (2026-09-13)
+        if (_vaABlocklistInoperativo({ prevFreeze, deCache: !!trafficData.fromCache, source })) {
           try {
             await fetch(`${SUPABASE_URL}/rest/v1/toolbar_url_blocklist`, {
               method: "POST",
@@ -14616,8 +14753,11 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
             log(`  🚫 ${domain} → AUTO-BLOCKLIST 'inoperativo' (3 freeze cycles)`);
           } catch (e) { log(`  ⚠️ auto-blocklist err: ${e.message}`); }
         }
+        if (prevFreeze >= 2 && source === "monday_refresh") {
+          log(`  🧊 ${domain} — tercer congelado, pero viene del CRM: 60 días sin blocklist permanente`);
+        }
         const frozenUntil = new Date(Date.now() + days * 86400_000).toISOString();
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+        const _resFreeze = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
           method: "POST",
           headers: {
             "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
@@ -14631,19 +14771,25 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
             updated_at: new Date().toISOString(),
           }),
         });
+        // Un 5xx de la base no tira excepción: sin mirar `ok`, la fila quedaba 'frozen' en la cola
+        // sin fila de congelado, y el descongelador (que lee toolbar_frozen_leads) no la liberaba
+        // nunca. Se trata igual que un corte de red. (2026-09-13)
+        if (!_resFreeze.ok) throw new Error(`toolbar_frozen_leads HTTP ${_resFreeze.status}`);
         await markCsvItem(token, item.id, "frozen", {
           error_message: `frozen_until_${frozenUntil} (${days}d backoff)`,
         });
         log(`  🧊 ${domain} — FREEZE ${days}d después de 3 intentos. unfreeze: ${frozenUntil.split("T")[0]}`);
       } catch (e) {
-        await markCsvItem(token, item.id, "skipped", { error_message: `freeze_failed: ${e.message}` });
-        log(`  ⚠️ ${domain} freeze err: ${e.message}`);
+        // Antes: 'skipped' con freeze_failed, final. Ver _estadoTrasFreezeFallido. (2026-09-13)
+        const _ff = _estadoTrasFreezeFallido({ mensajePrevio: item.error_message, prevAttempts, error: e.message });
+        await markCsvItem(token, item.id, _ff.status, { error_message: _ff.error_message });
+        log(`  ⚠️ ${domain} freeze err: ${e.message} → ${_ff.status === "pending" ? "vuelve a la cola a reintentar el congelado" : "tres veces seguidas: queda en error"}`);
       }
       return;
     }
     // Aún hay intentos — marcar pending con counter incrementado
     await markCsvItem(token, item.id, "pending", {
-      error_message: `no_traffic_data — attempt_${newAttempt}/3`,
+      error_message: _conMarcaFreeze(`no_traffic_data — attempt_${newAttempt}/3`, item.error_message),
     });
     log(`  ⏸ ${domain} — sin traffic (intento ${newAttempt}/3). Retry próximo iter.`);
     return;
@@ -14748,6 +14894,15 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     log(`  💀 ${domain} — dominio no resuelve (DNS) → skip, no es prospect`);
     return;
   }
+  // Suben acá (2026-09-13) porque el filtro de GEO/categoría de la config, que las usa para aparcar
+  // en Prospects-2, ahora corre antes de classifyPublisher. Con `const` más abajo, cada lead de un
+  // país excluido habría muerto con "Cannot access 'category' before initialization" (la misma
+  // clase que el `pub is not defined` del 25/08).
+  const category = pageContent?.category || swCategory || "";
+  // La marca visible que pidió el user para la excepción de AdSense: va en ad_networks, que la
+  // ficha ya muestra, así el MB sabe que ese sitio entró sin ads.txt.
+  const adNetworks = [...(pageContent?.adNetworks || []), ...(_ads?.state === "adsense" ? ["⚠️ sin ads.txt · AdSense activo"] : [])];
+  const pageTitle = pageContent?.title || "";
   // FIX 2026-05-26: filtro por categoría SimilarWeb — bloquea marcas/instituciones
   // que pasaron por traffic pero no son publishers. Política user: no quiero ver
   // bancos, universidades, gobierno, marcas de autos, telcos, etc. en Prospects.
@@ -14792,8 +14947,75 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     await markCsvItem(token, item.id, "skipped", {
       error_message: `category-blocked: "${swCategory}" matchea "${blockedCat}"`,
     });
+    // Comentario de ejemplo para el resumen de salud, como los demás descartes. A esta altura el
+    // tráfico ya pasó el piso, así que si la puerta grande no lo perdonó es porque el ads.txt no
+    // está confirmado. Mismos campos de siempre, ninguna columna nueva. (2026-09-13)
+    registrarDiagDescarte(token, {
+      domain, etapa: "categoria_bloqueada", motivo: `categoria_bloqueada:${blockedCat}`,
+      categoria: swCategory, geo: topCountry || "", traffic: effectivePageViews, adsTxt: _adsTxtDiag,
+      comentario: `${_adsFrase}. SimilarWeb lo categoriza "${swCategory}", que está bloqueada en la config ("${blockedCat}"). La puerta grande perdona el rubro sólo con ads.txt confirmado, y este sitio no lo tiene confirmado.`,
+    }).catch(() => {});
     log(`  ⊘ ${domain} — categoría "${swCategory}" bloqueada (matchea "${blockedCat}")`);
     return;
+  }
+
+  // Maxi 2026-06-19: filtro de DESCUBRIMIENTO configurable por el admin
+  // (worker_discovery_config, editable desde el toggle 🏭 Worker). VACÍO = no filtra
+  // (default: solo el bajo tráfico descarta). Si el admin setea prioridades/exclusiones
+  // de GEO o categoría, el worker las respeta para lo que TRAE a Prospects.
+  // monday_refresh se exceptúa (re-prospect explícito del MB).
+  // ── VA ANTES DE LAS CUOTAS Y DEL DETECTOR DE NO-PUBLISHER (2026-09-13) ──────────────────────
+  // Estaba después de classifyPublisher: cada lead de un país excluido pagaba Haiku (hasta 12 s de
+  // espera) para después aparcarse igual, y si caía en la saturación o en la cuota Anglo daba
+  // vueltas a next_day un día por vez. Un país excluido a propósito se aparca antes que cualquier
+  // cuota. Al revivir, el lead vuelve a la cola y pasa todas las puertas, detector incluido.
+  if (!bypassGeoPrefs) {
+    let wd = {};
+    try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
+    const geoPri = (wd.geos_priority || []).map(s => String(s).toUpperCase());
+    const geoExc = (wd.geos_excluded || []).map(s => String(s).toUpperCase());
+    const catPri = (wd.categories_priority || []).map(s => String(s).toLowerCase());
+    const iso = String(geosAllIso[0] || "").toUpperCase();
+    const nm  = String(topCountry || "").toUpperCase();
+    const geoMatches = (set) => set.length && set.some(v => v === iso || v === nm);
+    if (geoExc.length && geoMatches(geoExc)) {
+      // ── NO SE TIRA LO QUE YA SE PAGÓ (Maxi 2026-08-27, pedido del user) ──────────────
+      // Para llegar hasta acá ya gastamos el crédito de RapidAPI, resolvimos el tráfico, la
+      // GEO y la categoría. La web pasó ads.txt, tráfico, URL y categoría; lo único que falla
+      // es que su país está destildado HOY (el detector de no-publisher corre al revivirla).
+      // Tirarla es quemar plata dos veces: la de ahora, y la de volver
+      // a descubrirla desde cero si mañana el user destilda ese país.
+      //
+      // Va a un buzón oculto. Si la GEO deja de estar excluida, `revivirProspectsOffline`
+      // la devuelve a Prospects sin gastar un crédito más.
+      await aparcarProspectOffline(token, {
+        domain, traffic: visits, pageViews: effectivePageViews ?? null,
+        geo: topCountry || iso, geosAll: geosAllIso, category,
+        pageTitle, adNetworks, source: item.source || "",
+        motivo: `geo_excluida:${topCountry || iso}`,
+      });
+      await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
+      registrarDiagDescarte(token, {
+        domain, etapa: "geo_bloqueada", motivo: `geo_excluida:${topCountry || iso}`,
+        categoria: category, geo: topCountry || iso, traffic: effectivePageViews, adsTxt: _adsTxtDiag,
+        comentario: `${_adsFrase}; pasó la URL y la categoría, pero el país ${topCountry || iso} está destildado hoy. Quedó aparcado en Prospects-2 y vuelve solo si se vuelve a habilitar ese país; el detector de no-publisher corre recién cuando se reviva.`,
+      }).catch(() => {});
+      log(`  🅿️ ${domain} — GEO ${topCountry || iso} excluida hoy → aparcado en Prospects-2 (no se pierde)`);
+      return;
+    }
+    // Maxi 2026-07-24 BUG FIX: geos_priority YA NO es un filtro DURO acá. Estaba descartando TODO
+    // lo que no fuera LATAM+Europa (699 skips en 3 días, "worker_geo_not_priority") — incluyendo
+    // Asia/África/MENA, que son NIVEL 4 y el user SÍ los quiere (abajo de LATAM, arriba de Anglo).
+    // La prioridad ahora la maneja el sistema de niveles: la cuota nivel-5 (_isAngloOverDailyQuota,
+    // <10%) frena USA/Canadá/Oceanía, la cascada _geoTier ordena el ENVÍO (LATAM primero), y el
+    // turno hispano + el sesgo de Majestic empujan LATAM en el descubrimiento. geos_priority queda
+    // SOLO como sesgo blando del feeder Majestic (front-load), no como excluyente.
+    // (geoExcluded sigue vivo: si el user EXPLÍCITAMENTE excluye un GEO, se respeta arriba.)
+    if (catPri.length && category && !catPri.some(c => category.toLowerCase().includes(c))) {
+      await markCsvItem(token, item.id, "skipped", { error_message: `worker_cat_not_priority:${category}` });
+      log(`  🏭 ${domain} — categoría "${category}" no está en la prioridad del worker`);
+      return;
+    }
   }
   // Maxi 2026-06-17: GEO pre-filter. Si el sitio es de USA/Canadá/UK/AU/NZ/IE,
   // skipear ANTES de gastar Apollo + Claude. Hay demasiado USA y no nos sirve.
@@ -14866,68 +15088,20 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     }
     if (!pub.ok) {
       await markCsvItem(token, item.id, "skipped", { error_message: `not_publisher: ${pub.reason}` });
+      // El resumen de salud muestra un comentario de ejemplo sacado de toolbar_diag_descartes, y
+      // hasta hoy sólo lo tenían sin_ads_txt, el tipo de negocio y la GEO. Mismos campos de
+      // siempre: ninguna columna nueva, así que no hay insert que la base pueda rechazar. (2026-09-13)
+      registrarDiagDescarte(token, {
+        domain, etapa: "detector_no_publisher", motivo: String(pub.reason || "no_publisher").slice(0, 80),
+        categoria: category, geo: topCountry || "", traffic: effectivePageViews, adsTxt: _adsTxtDiag,
+        comentario: `${_adsFrase}, pero el detector de no-publisher dice que no es un medio (${pub.reason}).${Array.isArray(pub.señales) && pub.señales.length ? ` Señales: ${pub.señales.slice(0, 5).join(" · ")}.` : ""}`,
+      }).catch(() => {});
       log(`  🗑 ${domain} — no parece publisher (${pub.reason}) → skip`);
       return;
     }
   }
-  const category = pageContent?.category || swCategory || "";
-  // La marca visible que pidió el user para la excepción de AdSense: va en ad_networks, que la
-  // ficha ya muestra, así el MB sabe que ese sitio entró sin ads.txt.
-  const adNetworks = [...(pageContent?.adNetworks || []), ...(_ads?.state === "adsense" ? ["⚠️ sin ads.txt · AdSense activo"] : [])];
-  const pageTitle = pageContent?.title || "";
-
-  // Maxi 2026-06-19: filtro de DESCUBRIMIENTO configurable por el admin
-  // (worker_discovery_config, editable desde el toggle 🏭 Worker). VACÍO = no filtra
-  // (default: solo el bajo tráfico descarta). Si el admin setea prioridades/exclusiones
-  // de GEO o categoría, el worker las respeta para lo que TRAE a Prospects.
-  // monday_refresh se exceptúa (re-prospect explícito del MB).
-  if (!bypassGeoPrefs) {
-    let wd = {};
-    try { wd = JSON.parse(cfg.worker_discovery_config || "{}"); } catch {}
-    const geoPri = (wd.geos_priority || []).map(s => String(s).toUpperCase());
-    const geoExc = (wd.geos_excluded || []).map(s => String(s).toUpperCase());
-    const catPri = (wd.categories_priority || []).map(s => String(s).toLowerCase());
-    const iso = String(geosAllIso[0] || "").toUpperCase();
-    const nm  = String(topCountry || "").toUpperCase();
-    const geoMatches = (set) => set.length && set.some(v => v === iso || v === nm);
-    if (geoExc.length && geoMatches(geoExc)) {
-      // ── NO SE TIRA LO QUE YA SE PAGÓ (Maxi 2026-08-27, pedido del user) ──────────────
-      // Para llegar hasta acá ya gastamos el crédito de RapidAPI, resolvimos el tráfico, la
-      // GEO y la categoría. La web CUMPLE los requisitos; lo único que falla es que su país
-      // está destildado HOY. Tirarla es quemar plata dos veces: la de ahora, y la de volver
-      // a descubrirla desde cero si mañana el user destilda ese país.
-      //
-      // Va a un buzón oculto. Si la GEO deja de estar excluida, `revivirProspectsOffline`
-      // la devuelve a Prospects sin gastar un crédito más.
-      await aparcarProspectOffline(token, {
-        domain, traffic: visits, pageViews: effectivePageViews ?? null,
-        geo: topCountry || iso, geosAll: geosAllIso, category,
-        pageTitle, adNetworks, source: item.source || "",
-        motivo: `geo_excluida:${topCountry || iso}`,
-      });
-      await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
-      registrarDiagDescarte(token, {
-        domain, etapa: "geo_bloqueada", motivo: `geo_excluida:${topCountry || iso}`,
-        categoria: category, geo: topCountry || iso, traffic: effectivePageViews, adsTxt: _adsTxtDiag,
-        comentario: `${_adsFrase}; pasó los demás filtros salvo el país: ${topCountry || iso} está destildado hoy. NO se pierde — quedó aparcado en Prospects-2 y vuelve solo si se vuelve a habilitar ese país.`,
-      }).catch(() => {});
-      log(`  🅿️ ${domain} — GEO ${topCountry || iso} excluida hoy → aparcado en Prospects-2 (no se pierde)`);
-      return;
-    }
-    // Maxi 2026-07-24 BUG FIX: geos_priority YA NO es un filtro DURO acá. Estaba descartando TODO
-    // lo que no fuera LATAM+Europa (699 skips en 3 días, "worker_geo_not_priority") — incluyendo
-    // Asia/África/MENA, que son NIVEL 4 y el user SÍ los quiere (abajo de LATAM, arriba de Anglo).
-    // La prioridad ahora la maneja el sistema de niveles: la cuota nivel-5 (_isAngloOverDailyQuota,
-    // <10%) frena USA/Canadá/Oceanía, la cascada _geoTier ordena el ENVÍO (LATAM primero), y el
-    // turno hispano + el sesgo de Majestic empujan LATAM en el descubrimiento. geos_priority queda
-    // SOLO como sesgo blando del feeder Majestic (front-load), no como excluyente.
-    // (geoExcluded sigue vivo: si el user EXPLÍCITAMENTE excluye un GEO, se respeta arriba.)
-    if (catPri.length && category && !catPri.some(c => category.toLowerCase().includes(c))) {
-      await markCsvItem(token, item.id, "skipped", { error_message: `worker_cat_not_priority:${category}` });
-      log(`  🏭 ${domain} — categoría "${category}" no está en la prioridad del worker`);
-      return;
-    }
-  }
+  // (category, adNetworks y pageTitle se declaran más arriba, después del chequeo de dominio
+  // muerto, y el filtro de GEO/categoría de la config corre antes de classifyPublisher. 2026-09-13)
 
   // ── Detección de IDIOMA al insertar — robusta vía detectLanguageRobust ──
   const langDet = await detectLanguageRobust({
@@ -15111,7 +15285,9 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       createdBy:      (source === "monday_refresh" && (match?.ejecutivo || match?.ownerEmail)) ? (match.ejecutivo || match.ownerEmail) : (item.uploaded_by || ""),
       source,
       mondayItemId,
-    });
+    // Un corte de red o de reloj al guardar vuelve mañana como un 503 (ver _guardadoFallidoPorRed);
+    // cualquier otra excepción sigue yendo al catch de abajo, a 'error'. (2026-09-13)
+    }).catch((e) => { const _red = _guardadoFallidoPorRed(e); if (_red) return _red; throw e; });
     // Maxi 2026-06-19 (fix): respetar el resultado de saveToReviewQueue. Antes se
     // marcaba "done" SIEMPRE, aunque saveToReviewQueue devolviera false (rechazo
     // por dup o por el piso) → el item se contaba como "done" pero NUNCA llegaba
@@ -15126,11 +15302,21 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     } else {
       // Maxi 2026-06-19: motivo REAL del fallo (dup / floor / http_NNN) — antes se
       // mezclaba todo en "dup o piso" y ocultaba errores de INSERCIÓN reales.
-      await markCsvItem(token, item.id, "skipped", {
-        error_message: `review_queue_insert_fail:${saved}`,
+      // 2026-09-13: y el estado sale de _estadoTrasGuardar. Una falla de la base ya no entierra en
+      // 'skipped' un lead que pagó todo: la pasajera vuelve mañana, la rota queda en 'error' y avisa.
+      const _est = _estadoTrasGuardar(saved, item.error_message);
+      await markCsvItem(token, item.id, _est.status, {
+        error_message: _est.error_message,
         monday_item_id: mondayItemId,
       });
-      log(`  ⏭️ ${domain} — saveToReviewQueue: ${saved} (no llegó a Prospects)`);
+      log(`  ⏭️ ${domain} — saveToReviewQueue: ${saved} (no llegó a Prospects) → ${_est.status}`);
+      if (_est.alerta) {
+        await saludAlerta(token, {
+          clave: "prospects-insert-roto", severidad: "error",
+          titulo: "Un prospecto ya pagado no se pudo guardar en Prospects",
+          cuerpo: `${domain}: la base respondió ${String(saved).slice(0, 120)}. Ya se había pagado el tráfico y la búsqueda de email. Quedó en la cola como 'error' (se puede redescubrir). Si se repite con varios dominios, la tabla toolbar_review_queue está rechazando las altas: revisar columnas o permisos.`,
+        }).catch(() => {});
+      }
     }
   } catch (e) {
     await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500), monday_item_id: mondayItemId });
@@ -15156,6 +15342,10 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // prospectos sin poder chequearlos contra el CRM. Sin este reset, tras el primer fallo la
   // alerta quedaba encendida para siempre y dejaba de significar algo.
   _fichaFallos = 0;
+  // Dominios que no se importaron porque el CRM no contestó (vuelven a la cola). Cuenta también
+  // el caso de la clave del CRM sin configurar, que no suma a _fichaFallos. (2026-09-13)
+  let _crmSinRespuesta = 0;
+  let _dominioCrmSinRespuesta = "";
   await saludPing(token, "csv_queue", {
     status: "ok", cadenciaMin: 30,
     detalle: `arranca · rapidapi ${rapidUsage.usedToday}/${rapidUsage.limit} día, ${rapidMonth.usedThisMonth}/${rapidMonth.limit} mes · csv ${dailyGlobal.csvCount}/${dailyGlobal.csvCap}`,
@@ -15277,6 +15467,7 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     // actualizaba el heartbeat → la UI mostraba "worker muerto" mientras trabajaba.
     if (processed % 5 === 0) { try { await setConfigValue(token, "auto_heartbeat_at", new Date().toISOString()); } catch {} }
 
+    let _resultadoItem;
     try {
       // ⚠️ TECHO DE TIEMPO POR DOMINIO (Maxi 2026-08-25). Railway reinicia el worker cada
       // ~7 min por el tope de memoria, y al reiniciar los items en `processing` vuelven a
@@ -15289,14 +15480,17 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
       // el próximo: un dominio lento no puede bloquear a los 200 que tiene detrás.
       const _TECHO_ITEM_MS = 4 * 60 * 1000;
       try {
-        await Promise.race([
+        _resultadoItem = await Promise.race([
           processCsvItem(token, item, cfg, apolloUsage, callsRef),
           new Promise((_, rej) => setTimeout(() => rej(new Error("item_timeout_4min")), _TECHO_ITEM_MS)),
         ]);
       } catch (e) {
         if (String(e.message) === "item_timeout_4min") {
-          log(`  ⏱ ${item.domain}: pasó los 4 min — se marca y sigue el próximo (no bloquea la cola)`);
-          await markCsvItem(token, item.id, "error", { error_message: "item_timeout_4min: tardó más que la vida del worker" }).catch(() => {});
+          // La primera vez vuelve mañana, la segunda queda en 'error'; y sólo si la fila sigue en
+          // 'processing', porque processCsvItem sigue de fondo y puede haber terminado. (2026-09-13)
+          const _t = _estadoTrasTimeout(item.error_message);
+          log(`  ⏱ ${item.domain}: pasó los 4 min — ${_t.status === "next_day" ? "vuelve mañana (primera vez)" : "segunda vez: queda en error"}; sigue el próximo (no bloquea la cola)`);
+          await _marcarCsvSiSigueProcesando(token, item.id, _t.status, { error_message: _t.error_message });
         } else {
           throw e;
         }
@@ -15304,6 +15498,18 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
     } catch (e) {
       await markCsvItem(token, item.id, "error", { error_message: e.message.substring(0, 500) });
       log(`  ❌ ${item.domain} — uncaught: ${e.message}`);
+    }
+
+    // El CRM no contestó: la fila ya volvió a 'pending' y NO se procesó. Seguir sería hacer esperar
+    // 15 s a cada dominio contra un CRM caído; se corta la tanda y la próxima vuelta reintenta.
+    // (2026-09-13)
+    if (_resultadoItem === "crm_indeterminado") {
+      processed--;
+      userCounts.set(userEmail, Math.max(0, (userCounts.get(userEmail) || 1) - 1));
+      _crmSinRespuesta++;
+      _dominioCrmSinRespuesta = item.domain;
+      log(`⏸ CSV queue: el CRM no respondió (${item.domain}) — vuelve a la cola y corto la tanda; la próxima vuelta reintenta (procesados: ${processed})`);
+      break;
     }
 
     // Hard cap MENSUAL mid-queue
@@ -15329,20 +15535,20 @@ async function runCsvQueue(token, cfg, maxItems = 100) {
   // Maxi 2026-07-15 (Cost#1): RapidAPI ya NO se flushea acá (lo persiste el RPC atómico por hit) → evita doble-conteo.
   log(`◼ CSV queue end — procesados: ${processed}, apollo: ${callsRef.count}, rapidapi(session): ${_rapidGlobalCounter}`);
 
-  // ⚠️ Si algún dominio entró SIN poder verificarse contra el CRM, se avisa. El síntoma —
-  // prospectos que están en negociación recibiendo un pitch en frío — aparece días después
-  // y lejos de la causa. Acá es una línea; allá es una auditoría.
-  if (_fichaFallos > 0) {
-    log(`⚠️ ${_fichaFallos} dominios entraron SIN verificar contra el CRM (la ficha no respondió)`);
+  // ⚠️ Si el CRM no contestó, se avisa. El texto decía que esos dominios "entraron sin
+  // verificar", pero nunca entraron: processCsvItem los frena antes de gastar nada. Un aviso que
+  // describe otra cosa manda a buscar el problema donde no está. (2026-09-13)
+  if (_crmSinRespuesta > 0) {
+    log(`⚠️ el CRM no respondió: ${_crmSinRespuesta} dominio(s) volvieron a la cola sin importarse y se cortó la tanda`);
     await saludPing(token, "csv_queue", {
       status: "warn", cadenciaMin: 30,
-      detalle: `${processed} procesados · ⚠️ ${_fichaFallos} entraron sin verificar contra el CRM`,
-      real: processed - _fichaFallos, esperado: processed,
+      detalle: `${processed} procesados · ⚠️ el CRM no respondió: ${_crmSinRespuesta} dominio(s) vuelven a la cola sin importarse`,
+      real: processed, esperado: processed + _crmSinRespuesta,
     }).catch(() => {});
     await saludAlerta(token, {
       clave: "ficha-crm-no-responde", severidad: "error",
-      titulo: `${_fichaFallos} prospectos entraron sin chequear contra el CRM`,
-      cuerpo: `El endpoint /api/crm/ficha no respondió. Esos dominios pasaron sin saber si están en negociación o si ya son clientes, así que el agente les puede escribir. Revisar console.adeqmedia.com.`,
+      titulo: `La cola se frenó: el CRM no respondió`,
+      cuerpo: `No se pudo consultar /api/crm/ficha (último: ${_dominioCrmSinRespuesta}). Ese dominio NO se importó: volvió a la cola, y la tanda se cortó para no dejar a cada dominio esperando 15 s. La próxima vuelta (30 min) reintenta. Si se repite, revisar console.adeqmedia.com o la clave CRM_SYNC_SECRET del worker.`,
     }).catch(() => {});
   } else {
     await saludPing(token, "csv_queue", {
