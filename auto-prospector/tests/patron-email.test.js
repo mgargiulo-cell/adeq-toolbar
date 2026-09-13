@@ -77,7 +77,11 @@ test("Instagram, LinkedIn y Telegram se detectan; Instagram y Telegram se leen",
 test("el directorio de prensa es la tercera fuente GEO, con su etiqueta y su cupo", () => {
   ok(/async function _directorioMediosDelPais\(cc\)/.test(worker));
   ok(/onlinenewspapers\.com\/\$\{slug\}\.shtml/.test(worker));
-  const geo = worker.slice(worker.indexOf("async function _feederPullGeo("), worker.indexOf("const FEEDER_SOURCE_KEYS = ["));
+  // El corte era `const FEEDER_SOURCE_KEYS = [`, una constante sin uso que se borró el 13/09: sin ella
+  // indexOf daba -1 y el tramo llegaba hasta el final del archivo. La declaración que sigue ahora es ésta.
+  const _finGeo = worker.indexOf("const FEEDER_EXPLORE_FLOOR");
+  ok(_finGeo > worker.indexOf("async function _feederPullGeo("), "el tramo de _feederPullGeo tiene que cortar en la declaración siguiente");
+  const geo = worker.slice(worker.indexOf("async function _feederPullGeo("), _finGeo);
   ok(/"auto_feeder_directorio"\)/.test(geo), "inyecta con su propia etiqueta");
   ok(/out\.wikidata < Math\.ceil\(maxInject \/ 2\)/.test(geo), "sólo si Wikidata no llenó la mitad: es la fuente chica");
   ok(/case "auto_feeder_directorio":\s+source = "directorio"/.test(worker), "se traduce al source de Prospects");

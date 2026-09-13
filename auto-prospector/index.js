@@ -1094,6 +1094,30 @@ async function promoteWaitlist(token) {
 // conserva su fuente y su firma. `monday_refresh` y los imports de una persona NO están: ahí pisar es
 // a propósito (el ejecutivo de la ficha, o el MB que lo trajo a mano).
 const _ETIQUETAS_DE_REINTENTO = new Set(["agent", "frozen_retry", "prospects_offline", "origen_desconocido", "bounce_retry", "agent_reengagement"]);
+
+// ── EL RE-TRABAJO SE ENCOLA CON `retry:` Y NO CON LA ETIQUETA DEL CARRIL (2026-09-13) ─────────────
+// El descongelador, el revivir de Prospects-2 y el re-chequeo de ads.txt devolvían el dominio a la
+// cola con la etiqueta tal cual la tenían guardada: `autogoogle`, `auto_feeder_sellers`,
+// `auto_feeder_monday`. Esa etiqueta es la de un carril del feeder, así que un lead que YA había
+// pasado todas las puertas (y casi siempre terminaba `done`) se contaba como rendimiento de
+// AutoGoogle o de sellers en el parte, subía su carril dinámico, ocupaba su lugar (un "carril lleno"
+// sin haber buscado nada) y, en monday, gastaba el lugar del reciclado. `retry:<fuente>` lo separa:
+// `_claveFuenteCola` ya lo lee como re-trabajo y ningún carril del feeder lo cuenta. processCsvItem
+// quita el prefijo antes de traducir la etiqueta, así Prospects conserva la fuente real.
+// Pura. Las etiquetas de reintento (agent, bounce_retry…) quedan como están: son del grupo envío.
+// `uploadedBy`: el congelado de un import del MB vuelve firmado por él y el informe lo cuenta como
+// import del MB por la firma (nunca como feeder); se deja sin prefijo para no cambiar esa cuenta.
+function _fuenteSinRetrabajo(src) {
+  return String(src || "").trim().replace(/^retry:/i, "");
+}
+function _etiquetaRetrabajo(src, { uploadedBy = "" } = {}) {
+  const s = _fuenteSinRetrabajo(src);
+  if (!s) return "frozen_retry";
+  if (_ETIQUETAS_DE_REINTENTO.has(s.toLowerCase())) return s;
+  const firma = String(uploadedBy || "").trim();
+  if (firma && !/autofeeder/i.test(firma)) return s;   // la misma regla que isManualImport
+  return `retry:${s}`;
+}
 // Marcas del worker que rechazan en el mismo paso: el filtro de entrada de hoy ya volvió a juzgar la
 // web, así que se limpian. `barrido:` sólo marca, no rechaza: si la fila terminó `rejected`, la
 // rechazó una persona y la marca se queda. Todo lo demás también se queda, porque no se puede
@@ -3304,6 +3328,16 @@ async function _reconcileAutogoogleAttribution(token) {
   if (qualified.size) log(`🎯 autogoogle-attrib: ${qualified.size} calificaron a Prospects → +qualified · limpiados ${toDelete.length}`);
 }
 
+// Qué frases del pool puede usar la exploración de AutoGoogle. Pura. `muertas` = Set de las retiradas
+// (≥10 búsquedas y ningún lead); `null` = la lista no se pudo leer, y entonces no se explora: Serper es
+// pago, y sin la lista no hay forma de saber cuáles ya se retiraron. (2026-09-13)
+function _frasesDeExploracion(pool, { elegidas = new Set(), muertas = null } = {}) {
+  const _elegidas = elegidas instanceof Set ? elegidas : new Set();
+  const _muertas = muertas;
+  if (!(_muertas instanceof Set)) return [];
+  return (Array.isArray(pool) ? pool : []).filter(p => !_elegidas.has(p) && !_muertas.has(p));
+}
+
 async function _runAutoGoogleSlot(token, slotLabel) {
   await _reconcileAutogoogleAttribution(token).catch(() => {});  // Maxi 2026-07-16: bump qualified de slots previos
   const { hour, dateISO } = _madridNowParts();
@@ -3502,7 +3536,11 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   // búsquedas y CERO leads —"dropshipping guía", "congreso noticias", "salud mental consejos":
   // temas, no medios— se habían llevado 1.538 búsquedas de Serper. Ahora el top exige haber
   // calificado alguna vez, y una frase con 10 búsquedas y ningún lead no vuelve a salir.
-  const _muertas = new Set();
+  // `null` = la lista de retiradas NO se pudo leer (2026-09-13). Arrancaba como un Set vacío: una página
+  // caída de `_traerTodo` (o un 500) se leía como "no hay frases muertas" y la exploración volvía a
+  // pagar Serper por las 93 que ya se habían retirado. Sin la lista, la exploración de temas sueltos no
+  // sale este slot (ver _frasesDeExploracion); el top (calificó alguna vez) y las dirigidas siguen.
+  let _muertas = null;
   try {
     const _hdr = { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } };
     // Las muertas se leen DE A PÁGINAS (2026-09-13): con `limit=2000` en un solo pedido PostgREST
@@ -3516,14 +3554,15 @@ async function _runAutoGoogleSlot(token, slotLabel) {
       _topPhrases = _filas.map(r => r.phrase).filter(p => typeof p === "string");
       _filas.forEach(r => { if (r.phrase) _yieldPorFrase.set(r.phrase, r.searches || 0); });
     }
-    if (Array.isArray(_mfilas)) for (const r of _mfilas) if (r?.phrase) _muertas.add(r.phrase);
+    if (Array.isArray(_mfilas)) _muertas = new Set(_mfilas.map(r => r?.phrase).filter(Boolean));
   } catch {}
-  if (_muertas.size) log(`  🪦 AutoGoogle: ${_muertas.size} frase(s) retiradas por no calificar nunca en ≥10 búsquedas`);
+  if (_muertas === null) log(`  ⚠️ AutoGoogle: no pude leer las frases retiradas — este slot no explora temas sueltos (no pago Serper por frases que quizá ya se retiraron)`);
+  else if (_muertas.size) log(`  🪦 AutoGoogle: ${_muertas.size} frase(s) retiradas por no calificar nunca en ≥10 búsquedas`);
   const _poolSet = new Set(pool);
   const _topInPool = _topPhrases.filter(p => _poolSet.has(p));
   const _pickTop = [..._topInPool].sort(() => Math.random() - 0.5).slice(0, Math.round(N * 0.65));
   const _pickTopSet = new Set(_pickTop);
-  const _explore = pool.filter(p => !_pickTopSet.has(p) && !_muertas.has(p)).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
+  const _explore = _frasesDeExploracion(pool, { elegidas: _pickTopSet, muertas: _muertas }).sort(() => Math.random() - 0.5).slice(0, N - _pickTop.length);
   // ── HUELLA DE PUBLISHER, no tema (Maxi 2026-08-11) ────────────────────────
   // Las keywords del pool buscan TEMAS ("breaking news today", "recetas faciles").
   // Google responde a eso con la CNN y la BBC: sitios enormes, anglo y que ya
@@ -4428,6 +4467,14 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // board de Monday no sabía: los que están en un tablero de negociación, los clientes que
     // facturan y los que están en sus 60 días de descanso.
     const POOL_SIZE = 1000;
+    // El secreto se mira ANTES que el carril (2026-09-13). Con el carril lleno el slot latía "ok, no
+    // hacía falta" aunque sin CRM_SYNC_SECRET no pudiera reciclar nunca, y con lugar se iba sin latir:
+    // el vigilante veía sano o atrasado un job que estaba roto. Mismo latido que el barrido diario.
+    if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) {
+      log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`);
+      await saludPing(token, "feeder_monday", { status: "fail", cadenciaMin: 24 * 60, detalle: "falta CRM_SYNC_SECRET: no puedo leer /api/crm/reciclables" }).catch(() => {});
+      return 0;
+    }
     // Sin lugar en el carril no se pide la lista (2026-09-13). Desde que el slot le da a monday lo
     // que falta para llenar su carril (ver _runFeederSlot), "lleno" es un caso normal: se late igual,
     // para que no hacer falta no se lea como estar caído.
@@ -4436,7 +4483,6 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
       await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: "carril lleno: no hacía falta reciclar este slot" }).catch(() => {});
       return 0;
     }
-    if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`); return 0; }
     let pool = [];
     try {
       const r = await fetch(`${_urlCrm("/reciclables")}?limit=${POOL_SIZE}`,
@@ -5010,13 +5056,8 @@ async function _feederPullGeo(token, maxInject, sessionKnown) {
   return out;
 }
 
-// Qué etiqueta de la cola es cada fuente del slot. Desde el 13/09 el reparto por rendimiento no la
-// recorre (sólo sellers y majestic compiten, ver _pesosFeeder); queda como referencia.
-const FEEDER_SOURCE_KEYS = [
-  { key: "sellers",  tag: "auto_feeder_sellers"  },
-  { key: "monday",   tag: "auto_feeder_monday"   },
-  { key: "majestic", tag: "auto_feeder_majestic" },
-];
+// (2026-09-13) Se borró FEEDER_SOURCE_KEYS: nadie la leía desde que el reparto por rendimiento es de
+// sellers y majestic (ver _pesosFeeder, que tiene su propia tabla etiqueta → fuente).
 const FEEDER_EXPLORE_FLOOR     = 0.15; // cada fuente del reparto recibe ≥15% (exploración)
 const FEEDER_PESOS_MIN_MUESTRA = 50;   // procesadas por fuente en 14 días; con menos, mitad y mitad
 const FEEDER_PESOS_MAX_FILAS = 20_000; // sellers + majestic en 14 días (~2.200 medidas); llegar al tope = ventana cortada
@@ -5077,6 +5118,15 @@ function _pesosFeeder(filas, piso = FEEDER_EXPLORE_FLOOR) {
   for (const f of Array.isArray(filas) ? filas : []) {
     const k = porTag[String(f?.source || "")];
     if (!k) continue;
+    // POSPUESTAS AFUERA, CONGELADAS ADENTRO (2026-09-13). markCsvItem estampa processed_at también
+    // al posponer (next_day por cuota anglo o GEO saturada, pending por tráfico transitorio,
+    // waiting_pool): esas filas siguen en la cola sin veredicto y contaban como "no llegó". Majestic,
+    // que trae más anglo, perdía reparto por filas que todavía no se decidieron (el mismo día daba
+    // 71/29 contra el 50/50 real del informe). Misma regla que el informe (`_estadoColaInforme`).
+    // Las congeladas SÍ cuentan como procesadas que no llegaron: el descongelador reescribe la fila
+    // con la etiqueta de Prospects (o `retry:`), así que lo que pase después nunca vuelve a esta fuente,
+    // y sacarlas la libraría de sus dominios sin datos de tráfico, que son una señal real de calidad.
+    if (_estadoColaInforme(f.status) === "pospuesta") continue;
     if (f.status === "skipped" && /^ya_estaba_en_prospects/.test(String(f.error_message || ""))) continue;
     st[k].n++;
     if (f.status === "done") st[k].ok++;
@@ -5295,11 +5345,30 @@ async function _runFeederSlot(token, slotLabel) {
 // conversión y con ella cuánto traen sellers y majestic: 400 de monday bajaban la medida y el objetivo
 // subía hacia 800. Ahora se divide por lo que `targetGross` sí decide, sellers + majestic, llevado a la
 // misma escala de antes (÷ su parte del 30%): con la mezcla vieja da exactamente `gross_total`, y el
-// volumen de monday no la mueve. El numerador no cambia.
+// volumen de monday no la mueve en el DENOMINADOR.
+// ⚠️ EL NUMERADOR NO ES "LO DE ESTE SLOT" (corregido el 13/09; antes este comentario y el de
+// `_measureFeederRuns` decían lo contrario). Cuenta las done firmadas por worker@autofeeder subidas en los
+// 15 min que siguen a `cron_at`, y `cron_at` se escribe al CERRAR el slot: son las filas que otros caminos
+// (similar, AutoGoogle, el barrido de monday, re-trabajo) encolaron justo después, no las del slot, y monday
+// SÍ entra ahí. Por eso el número puede pasar el 100%. Medir las filas del propio slot cambia la conversión
+// y con ella cuánto traen sellers y majestic (consultas de tráfico pagas): decisión del dueño, no se tocó.
 function _conversionFeederRun(efectivos, run) {
   const sm = (parseInt(run?.gross_sellers, 10) || 0) + (parseInt(run?.gross_majestic, 10) || 0);
   const base = sm / FEEDER_PARTE_SELLERS_MAJESTIC;
   return base > 0 ? ((Number(efectivos) || 0) / base) * 100 : 0;
+}
+
+// ── LA CONVERSIÓN QUE NO ENTRA EN LA COLUMNA NO TRABA LA MEDICIÓN DEL DÍA (2026-09-13) ─────────────
+// `conversion_pct` es numeric(5,2) (sql/2026-05-18_auto_feeder_runs.sql): desde 1000 el PATCH falla con 400.
+// Nadie miraba la respuesta, la corrida quedaba con `conversion_pct` null y se volvía a medir en cada
+// vuelta del loop el resto del día; con cinco así (`limit=5`, sin orden) ninguna otra corrida del día se
+// medía. Pura: el texto que entra en la columna, o null si no entra. Con null la corrida queda afuera del
+// promedio de `_getRecentConversionRate`, igual que cuando el PATCH fallaba (no cambia cuánto traen sellers
+// y majestic), y sus `effective_added` > 0 la marcan como medida (la lectura pide `effective_added=eq.0`).
+function _conversionParaColumna(conv) {
+  const n = Number(conv);
+  if (!Number.isFinite(n) || n < 0 || n >= 1000) return null;
+  return n.toFixed(2);
 }
 
 // MEASUREMENT: post-mortem para calcular effective_added después de 30 min.
@@ -5310,7 +5379,9 @@ async function _measureFeederRuns(token) {
     const today = _madridNowParts().dateISO;
     const cutoffAgo = new Date(Date.now() - FEEDER_MEASURE_DELAY_MIN * 60_000).toISOString();
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&conversion_pct=is.null&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,gross_sellers,gross_majestic,rq_valid_before&limit=5`,
+      // `effective_added=eq.0` (2026-09-13): una corrida medida cuya conversión no entra en la columna
+      // queda con conversion_pct null y efectivos > 0; sin esto se re-medía en cada vuelta. Ver _conversionParaColumna.
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&conversion_pct=is.null&effective_added=eq.0&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,gross_sellers,gross_majestic,rq_valid_before&limit=5`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return;
@@ -5330,17 +5401,20 @@ async function _measureFeederRuns(token) {
       );
       const rangeHdr = doneRes.headers.get("content-range") || "";
       const eff = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
-      const conv = _conversionFeederRun(eff, run);   // sin monday arriba ni abajo del objetivo (2026-09-13)
+      // Monday no entra en el denominador; en el numerador sí (ver el comentario de _conversionFeederRun).
+      const conv = _conversionFeederRun(eff, run);
+      const _convCol = _conversionParaColumna(conv);
       const rqValidNow = await _getReviewQueueValidCount(token);
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?id=eq.${run.id}`, {
+      const _rPatch = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?id=eq.${run.id}`, {
         method: "PATCH",
         headers: {
           "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
           "Content-Type": "application/json", "Prefer": "return=minimal",
         },
-        body: JSON.stringify({ effective_added: eff, conversion_pct: conv.toFixed(2), rq_valid_after: rqValidNow }),
-      }).catch(() => {});
-      log(`📏 feeder run id=${run.id}: gross=${run.gross_total} → efectivos=${eff} (${conv.toFixed(1)}%) [csv_queue done count]`);
+        body: JSON.stringify({ effective_added: eff, conversion_pct: _convCol, rq_valid_after: rqValidNow }),
+      }).catch(() => null);
+      if (!_rPatch?.ok) log(`⚠️ feeder run id=${run.id}: no pude guardar la medición (HTTP ${_rPatch?.status ?? "sin respuesta"}) — se reintenta en la próxima vuelta`);
+      log(`📏 feeder run id=${run.id}: gross=${run.gross_total} → efectivos=${eff} (${conv.toFixed(1)}%${_convCol == null ? ", no entra en la columna: queda sin conversión y fuera del promedio" : ""}) [csv_queue done count]`);
     }
   } catch (e) { log(`⚠️ measure feeder runs: ${e.message}`); }
 }
@@ -6562,18 +6636,65 @@ function _debeGuardarScrapeEnCache(fila, { apiContesto = false } = {}) {
 function _guardarScrapeEnCache(cleanD, fb, { apiContesto = false, pagesPerVisit = null, topCountry = null, category = "" } = {}) {
   const fila = _filaCacheTrafico(fb.visits, { pageViews: fb.pageViews ?? null, pagesPerVisit, topCountry, category, source: fb.source });
   if (!_debeGuardarScrapeEnCache(fila, { apiContesto })) return false;
-  saveTrafficCacheServer(cleanD, fila).catch(() => {});
+  // `sinRespuestaApi` (2026-09-13): con la API caída la fila no tiene categoría ni país, y durante 90
+  // días se leía igual que una respuesta de SimilarWeb: un sitio de apuestas congelado que volvía a la
+  // cola pasaba el veto por tipo con categoría vacía. La marca permite completarla UNA vez (ver
+  // getTrafficData). Una fila en la que la API sí contestó (y se pagó) no la lleva.
+  saveTrafficCacheServer(cleanD, apiContesto ? fila : { ...fila, sinRespuestaApi: true }).catch(() => {});
   return true;
 }
 
-async function getTrafficData(domain, rapidApiKey) {
+// País y categoría de una respuesta de /all-insights. Es el mismo código que tenía getTrafficData en
+// línea (normaliza TopCountryShares/TopCountries en `data`, como antes); se separó el 13/09 para que la
+// completitud de la fila sin categoría lea la respuesta con la misma regla.
+function _paisesYCategoriaDeInsights(data) {
+  // TopCountries: convertir TopCountryShares {US: 0.7, ...} → array {CountryCode, Share}
+  // Buscamos en orden: data.Traffic.TopCountryShares, data.TopCountryShares,
+  // data.TopCountries (top-level shape v3 que ya viene como array OK).
+  const tcRaw = data.Traffic?.TopCountryShares || data.TopCountryShares;
+  if (tcRaw && typeof tcRaw === "object" && !Array.isArray(tcRaw)) {
+    data.TopCountries = Object.entries(tcRaw)
+      .map(([code, share]) => ({ CountryCode: code, Share: parseFloat(share) || 0 }))
+      .sort((a, b) => b.Share - a.Share);
+  }
+  // Si data.TopCountries ya viene como array (shape v3), normalizamos shape.
+  if (Array.isArray(data.TopCountries)) {
+    data.TopCountries = data.TopCountries.map(c => ({
+      CountryCode: c?.CountryCode || c?.countryCode || c?.Country || c?.country || c?.code || "",
+      Share:       parseFloat(c?.Share || c?.share || c?.value || 0) || 0,
+    })).filter(c => c.CountryCode);
+  }
+  // Category bajo WebsiteDetails
+  if (data.WebsiteDetails?.Category && !data.Category) data.Category = data.WebsiteDetails.Category;
+  // Extract top country del response. NO llamamos /countries fallback — desde
+  // el switch a website-insights, el GEO viene siempre inline en /all-insights.
+  // Si no viene → el caller usa fallback gratis (TLD + Cloudflare Radar hint).
+  let topCountry = null;
+  const topCountries3 = []; // ISO 2-letter codes top 3 (para filtro amplio del agente)
+  const inlineList = data?.TopCountries || data?.Countries || data?.countries
+                  || data?.topCountryShares || data?.CountryShares || [];
+  if (Array.isArray(inlineList) && inlineList.length) {
+    for (const c of inlineList.slice(0, 3)) {
+      const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
+      if (code) topCountries3.push(code);
+    }
+    if (topCountries3[0]) topCountry = COUNTRY_CODES[topCountries3[0]] || topCountries3[0];
+  }
+  return { topCountry, topCountries3, swCategory: data?.WebsiteDetails?.Category || data?.Category || "" };
+}
+
+// `puedeCompletarCategoria` (2026-09-13): función async que devuelve true SÓLO si se permite gastar el
+// hit que completa una fila guardada con RapidAPI caído (ver abajo). Sin ella no se completa nunca:
+// el agente y el autopilot llaman sin pasarla. processCsvItem la pasa con el chequeo de Prospects.
+async function getTrafficData(domain, rapidApiKey, { puedeCompletarCategoria = null } = {}) {
   const headers = { "x-rapidapi-key": rapidApiKey, "x-rapidapi-host": "website-insights.p.rapidapi.com" };
 
   // REGLA DE ORO: cache compartida en Supabase (90 días por defecto, ajustable con
   // `traffic_cache_dias`). Antes de gastar 1 hit a RapidAPI, chequeamos si ya tenemos
   // data fresca de este dominio. Un dato ya comprado no se vuelve a comprar.
   const cleanD = cleanDomain(domain);
-  const cached = await getTrafficCacheServer(cleanD);
+  const _filaCache = await getTrafficCacheServer(cleanD, { conFecha: true });
+  const cached = _filaCache?.data || null;
   if (cached) {
     log(`  💾 traffic cache HIT ${cleanD} (sin gastar hit)`);
     // Maxi 2026-06-22 FIX: el HIT devolvía solo visits/ppv/topCountry y PERDÍA
@@ -6581,7 +6702,7 @@ async function getTrafficData(domain, rapidApiKey) {
     // (categoría vacía → Haiku innecesario; pageViews null → estimación peor; GEO sin top3).
     const _cc = Array.isArray(cached.topCountries) ? cached.topCountries : [];
     const _top3 = _cc.map(c => String(c?.code || "").toUpperCase().slice(0, 2)).filter(Boolean).slice(0, 3);
-    return {
+    const desdeCache = {
       visits:        cached.rawVisits || cached.visits || 0,
       pagesPerVisit: cached.pagesPerVisit || null,
       pageViews:     cached.pageViews || null,
@@ -6590,6 +6711,41 @@ async function getTrafficData(domain, rapidApiKey) {
       swCategory:    cached.category || "",
       error:         null,
       fromCache:     true,
+    };
+    if (!cached.sinRespuestaApi) return desdeCache;
+    // ── LA FILA GUARDADA CON LA API CAÍDA SE COMPLETA UNA SOLA VEZ (2026-09-13) ──────────────────
+    // El número salió del scrape (Hypestat) el día que RapidAPI no contestó: no se compró nada, así que
+    // preguntar ahora no es pagar dos veces. Un hit a /all-insights, sólo si el llamador lo permite
+    // (processCsvItem, con el dominio fuera del pool de Prospects: el tráfico de un lead de Prospects
+    // nunca se vuelve a consultar). Se conserva el NÚMERO con el que entró y su fecha: sólo se agregan
+    // categoría y país, y la marca se quita. Si la API sigue sin contestar, sale la caché como antes,
+    // con `categoriaDesconocida`, sin volver a scrapear.
+    const _puede = typeof puedeCompletarCategoria === "function"
+      ? await Promise.resolve().then(puedeCompletarCategoria).catch(() => false)
+      : false;
+    if (_puede !== true) return { ...desdeCache, categoriaDesconocida: true };
+    const _resp = await rapidFetchWithRetry(
+      `https://website-insights.p.rapidapi.com/all-insights?domain=${encodeURIComponent(domain)}`,
+      headers
+    ).catch(() => null);
+    if (!_resp || typeof _resp !== "object" || _resp.__error || _resp.__error4xx) {
+      log(`  ⚠️ getTrafficData ${cleanD}: la fila sin categoría no se pudo completar (${_resp?.__error4xx || _resp?.__error || "sin respuesta"}) — sigo con la caché`);
+      return { ...desdeCache, categoriaDesconocida: true };
+    }
+    const _pyc = _paisesYCategoriaDeInsights(_resp);
+    const { sinRespuestaApi: _marca, ...resto } = cached;
+    const completa = {
+      ...resto,
+      category:     _pyc.swCategory || "",
+      topCountries: _pyc.topCountry ? _filaCacheTrafico(0, { topCountry: _pyc.topCountry }).topCountries : (resto.topCountries || []),
+    };
+    saveTrafficCacheServer(cleanD, completa, { fetchedAt: _filaCache.fetchedAt }).catch(() => {});
+    log(`  🧩 getTrafficData ${cleanD}: fila de caché sin categoría completada una vez ("${_pyc.swCategory || "sin categoría"}", ${_pyc.topCountry || "sin país"}) — el número no cambia`);
+    return {
+      ...desdeCache,
+      topCountry:    _pyc.topCountry || desdeCache.topCountry,
+      topCountries3: _pyc.topCountries3.length ? _pyc.topCountries3 : desdeCache.topCountries3,
+      swCategory:    _pyc.swCategory || "",
     };
   }
 
@@ -6678,24 +6834,8 @@ async function getTrafficData(domain, rapidApiKey) {
         if (dates.length) data.Visits = parseFloat(tv[dates[0]]) || 0;
       }
     }
-    // TopCountries: convertir TopCountryShares {US: 0.7, ...} → array {CountryCode, Share}
-    // Buscamos en orden: data.Traffic.TopCountryShares, data.TopCountryShares,
-    // data.TopCountries (top-level shape v3 que ya viene como array OK).
-    const tcRaw = data.Traffic?.TopCountryShares || data.TopCountryShares;
-    if (tcRaw && typeof tcRaw === "object" && !Array.isArray(tcRaw)) {
-      data.TopCountries = Object.entries(tcRaw)
-        .map(([code, share]) => ({ CountryCode: code, Share: parseFloat(share) || 0 }))
-        .sort((a, b) => b.Share - a.Share);
-    }
-    // Si data.TopCountries ya viene como array (shape v3), normalizamos shape.
-    if (Array.isArray(data.TopCountries)) {
-      data.TopCountries = data.TopCountries.map(c => ({
-        CountryCode: c?.CountryCode || c?.countryCode || c?.Country || c?.country || c?.code || "",
-        Share:       parseFloat(c?.Share || c?.share || c?.value || 0) || 0,
-      })).filter(c => c.CountryCode);
-    }
-    // Category bajo WebsiteDetails
-    if (data.WebsiteDetails?.Category && !data.Category) data.Category = data.WebsiteDetails.Category;
+    // País y categoría: misma regla que la completitud de la fila sin categoría (2026-09-13).
+    const { topCountry, topCountries3 } = _paisesYCategoriaDeInsights(data);
 
     const visits = data?.Visits || data?.visits || data?.pageViews || data?.PageViews || null;
 
@@ -6713,20 +6853,7 @@ async function getTrafficData(domain, rapidApiKey) {
                        || data?.PagePerVisit || data?.PagesPerVisit
                        || data?.pagesPerVisit || null;
 
-    // Extract top country del response. NO llamamos /countries fallback — desde
-    // el switch a website-insights, el GEO viene siempre inline en /all-insights.
-    // Si no viene → el caller usa fallback gratis (TLD + Cloudflare Radar hint).
-    let topCountry = null;
-    let topCountries3 = []; // ISO 2-letter codes top 3 (para filtro amplio del agente)
-    const inlineList = data?.TopCountries || data?.Countries || data?.countries
-                    || data?.topCountryShares || data?.CountryShares || [];
-    if (Array.isArray(inlineList) && inlineList.length) {
-      for (const c of inlineList.slice(0, 3)) {
-        const code = (c?.CountryCode || c?.countryCode || c?.Country || c?.country || "").toUpperCase().slice(0, 2);
-        if (code) topCountries3.push(code);
-      }
-      if (topCountries3[0]) topCountry = COUNTRY_CODES[topCountries3[0]] || topCountries3[0];
-    }
+    // topCountry / topCountries3 salen de _paisesYCategoriaDeInsights, arriba.
 
     // Guardar en cache compartida para próximas consultas (regla de oro 90 días)
     if (visits) {
@@ -6805,7 +6932,9 @@ let _trafficCacheDias = 90;
 // la toolbar decía sin tráfico aunque SimilarWeb tuviera el dato horas después"— sigue en pie
 // para el MB. Esto ahorra sólo en el worker, que es donde estaba el gasto.
 let _trafficNegCacheDias = 14;
-async function getTrafficCacheServer(domain) {
+// `conFecha` (2026-09-13): devuelve { data, fetchedAt }. La completitud de la fila sin categoría
+// re-guarda con la fecha original, así el número del scrape no vive otros 90 días.
+async function getTrafficCacheServer(domain, { conFecha = false } = {}) {
   if (!domain) return null;
   try {
     const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - _trafficCacheDias);
@@ -6821,11 +6950,11 @@ async function getTrafficCacheServer(domain) {
       const edadDias = (Date.now() - new Date(fetched_at).getTime()) / 86400_000;
       if (!(edadDias <= _trafficNegCacheDias)) return null;   // negativo vencido → se vuelve a preguntar
     }
-    return data;
+    return conFecha ? { data, fetchedAt: fetched_at || null } : data;
   } catch { return null; }
 }
 
-async function saveTrafficCacheServer(domain, data) {
+async function saveTrafficCacheServer(domain, data, { fetchedAt = null } = {}) {
   if (!domain) return;
   try {
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_traffic_cache`, {
@@ -6836,7 +6965,7 @@ async function saveTrafficCacheServer(domain, data) {
         "Authorization": `Bearer ${BACKEND_BEARER}`,
         "Prefer":        "resolution=merge-duplicates,return=minimal",
       },
-      body: JSON.stringify({ domain, data, fetched_at: new Date().toISOString() }),
+      body: JSON.stringify({ domain, data, fetched_at: fetchedAt || new Date().toISOString() }),
     });
   } catch {}
 }
@@ -11118,7 +11247,10 @@ async function recheckAdsTxtUnknowns(token) {
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?on_conflict=domain`, {
             method: "POST",
             headers: { ...auth, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
-            body: JSON.stringify([{ domain: f.domain, status: "pending", uploaded_by: AGENT_UPLOADER, source: f.source || "adstxt_recheck", uploaded_at: new Date().toISOString() }]),
+            // `retry:` (2026-09-13): la auditoría de la puerta de entrada guarda la etiqueta del carril
+            // (auto_feeder_monday…); con ella el recuperado contaba como feeder y ocupaba el lugar del
+            // reciclado de monday. Ver _etiquetaRetrabajo.
+            body: JSON.stringify([{ domain: f.domain, status: "pending", uploaded_by: AGENT_UPLOADER, source: _etiquetaRetrabajo(f.source || "adstxt_recheck"), uploaded_at: new Date().toISOString() }]),
           });
         } catch {}
       } else if (r.state === "no") {
@@ -15161,7 +15293,9 @@ async function revivirProspectsOffline(token) {
       // (ads.txt, idioma, detector de no-publisher) con las reglas de HOY, que pueden haber
       // cambiado desde que se aparcó. Lo que se ahorra es el crédito de RapidAPI, porque el
       // tráfico ya está en `toolbar_traffic_cache`.
-      const met = await _injectIntoCsvQueue(token, [f.domain], f.source || "prospects_offline",
+      // `retry:` (2026-09-13): con la etiqueta del carril (auto_feeder_sellers…) el revivido ocupaba el
+      // carril del feeder y se sumaba a su rendimiento. Ver _etiquetaRetrabajo.
+      const met = await _injectIntoCsvQueue(token, [f.domain], _etiquetaRetrabajo(f.source || "prospects_offline"),
         { reactivar: true }).catch(() => 0);
       if (met) {
         ok++;
@@ -15304,6 +15438,20 @@ function _crmCaidoCortaLaTanda(fallosSeguidos) {
   return (Number(fallosSeguidos) || 0) >= CRM_FALLOS_SEGUIDOS_PARA_CORTAR;
 }
 
+// ¿El dominio está en el pool de Prospects (pending o en la tanda 'Por enviar')? true / false, y null
+// si no se pudo leer. Lo usa processCsvItem para decidir si completa una fila de tráfico sin categoría
+// (ver getTrafficData): sin poder confirmarlo, no se paga. (2026-09-13)
+async function _estaEnPoolDeProspects(token, domain) {
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=in.(pending,por_enviar)&select=id&limit=1`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return Array.isArray(j) ? j.length > 0 : null;
+  } catch { return null; }
+}
+
 async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSessionRef) {
   const { rapidapi_key, apollo_api_key } = cfg;
   const domain = item.domain;
@@ -15374,7 +15522,10 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // El feeder inyecta con auto_feeder_sellers / auto_feeder_monday / auto_feeder_majestic.
   // Antes se hardcodeaba "csv" → todo el chip filter quedaba inútil.
   let source;
-  switch (item.source) {
+  // El re-trabajo llega como `retry:<etiqueta>` (2026-09-13, ver _etiquetaRetrabajo): se quita el
+  // prefijo ANTES de traducir, así `retry:auto_feeder_sellers` sigue guardándose como sellers_json.
+  const _srcCola = _fuenteSinRetrabajo(item.source);
+  switch (_srcCola) {
     // Alias del feeder automático → source de Prospects
     case "auto_feeder_sellers":  source = "sellers_json"; break;
     case "auto_feeder_majestic": source = "majestic";     break;  // Maxi 2026-07-16: era "autopilot" (lumped) → label propio para MEDIR por feeder
@@ -15393,7 +15544,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     case "majestic":
     case "adstxt":
     case "similar":
-    case "autopilot":           source = item.source; break;
+    case "autopilot":           source = _srcCola; break;
     // Maxi 2026-07-01: default HONESTO por ORIGEN. El worker NO importa CSV — sus fuentes son
     // discovery automático. "csv"/"manual" solo son válidos si uploaded_by es un MB humano
     // (isManualImport). Un source desconocido de un item del worker/autofeeder NUNCA debe quedar
@@ -15410,8 +15561,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     // no sabemos de dónde vino, se dice. Una etiqueta inventada es peor que una
     // desconocida, porque las métricas por fuente deciden dónde invertir.
     default:
-      source = (item.source && String(item.source).trim())
-        || (isManualImport ? "csv" : "origen_desconocido");
+      source = _srcCola || (isManualImport ? "csv" : "origen_desconocido");
   }
   let mondayItemId = null;
 
@@ -15537,7 +15687,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
     }
   }
 
-  const trafficData = await getTrafficData(domain, rapidapi_key);
+  // `puedeCompletarCategoria` (2026-09-13): una fila de caché guardada con RapidAPI caído no tiene
+  // categoría ni país, y con eso un sitio de apuestas o de e-commerce que vuelve a la cola (congelado,
+  // reciclado, revivido) pasaba el veto por tipo. Se completa una vez, sólo si el dominio NO está en el
+  // pool de Prospects (ahí el tráfico nunca se vuelve a consultar) y si se pudo confirmar.
+  const trafficData = await getTrafficData(domain, rapidapi_key, {
+    puedeCompletarCategoria: async () => (await _estaEnPoolDeProspects(token, domain)) === false,
+  });
   let { visits, pagesPerVisit, topCountry, topCountries3, swCategory } = trafficData;
   if (!topCountry) {
     const inferred = inferCountryFromTLD(domain);
@@ -15907,7 +16063,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
       await aparcarProspectOffline(token, {
         domain, traffic: visits, pageViews: effectivePageViews ?? null,
         geo: topCountry || iso, geosAll: geosAllIso, category,
-        pageTitle, adNetworks, source: item.source || "",
+        pageTitle, adNetworks, source: _srcCola,   // sin `retry:`: el revivir lo vuelve a poner una sola vez
         motivo: `geo_excluida:${topCountry || iso}`,
       });
       await markCsvItem(token, item.id, "skipped", { error_message: `worker_geo_excluded:${topCountry || iso}` });
@@ -27296,8 +27452,10 @@ function _estadoColaInforme(status) {
 // worker. El MB importa con esa misma etiqueta, firmada con su email. El agente re-encola con
 // agent / bounce_retry. El 12/09 el resumen decía "sellers 3→0 · sellers_json 105→0 · majestic
 // 53→0 · autopilot 29→0" y parecía que esas fuentes traían basura: una parte era re-trabajo
-// (congelados que vuelven) sumado al rendimiento del feeder. `retry:` queda previsto por si el
-// re-encolado empieza a marcarse explícito.
+// (congelados que vuelven) sumado al rendimiento del feeder. Desde el 13/09 el descongelador, el revivir
+// de Prospects-2 y el re-chequeo de ads.txt encolan con `retry:<fuente>` (ver _etiquetaRetrabajo): un
+// congelado de AutoGoogle volvía como `autogoogle` y un revivido como `auto_feeder_sellers`, y caían acá
+// como feeder.
 const _GRUPOS_COLA_ENVIO = new Set(["agent", "agent_reengagement", "bounce_retry"]);
 const _ETIQUETA_GRUPO_COLA = { feeder: "", import_mb: " (MB)", retrabajo: " (re-trabajo)", envio: " (envío)" };
 function _claveFuenteCola(fila) {
@@ -29494,7 +29652,9 @@ async function main() {
               },
               body: JSON.stringify({
                 domain: row.domain, status: "pending",
-                source: row.source || "frozen_retry",
+                // `retry:` (2026-09-13): un congelado de AutoGoogle volvía como `autogoogle` y sumaba al
+                // rendimiento y al carril del feeder. Ver _etiquetaRetrabajo.
+                source: _etiquetaRetrabajo(row.source, { uploadedBy: row.uploaded_by }),
                 uploaded_by: row.uploaded_by || "",
                 processed_at: null,
                 // `freeze_N` sólo en los congelados por falta de tráfico (2026-09-13): el re-congelado

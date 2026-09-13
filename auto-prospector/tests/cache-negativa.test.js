@@ -41,7 +41,10 @@ test("un negativo fresco se sirve de la caché; uno vencido se vuelve a pregunta
 });
 
 test("getTrafficData guarda el negativo SÓLO cuando la API contestó y nadie tenía datos", () => {
-  const ini = worker.indexOf("async function getTrafficData(domain, rapidApiKey) {");
+  // Se busca por el nombre y no por la firma entera (2026-09-13): getTrafficData sumó un tercer
+  // parámetro (`puedeCompletarCategoria`) y con la firma vieja indexOf daba -1. La regla es la misma.
+  const ini = worker.indexOf("async function getTrafficData(");
+  ok(ini >= 0, "no encontré getTrafficData");
   const fin = worker.indexOf("\n}\n", ini);
   const fn  = worker.slice(ini, fin);
   const iGuardaNeg = fn.indexOf("noData: true");
