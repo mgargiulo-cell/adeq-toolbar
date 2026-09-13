@@ -8,6 +8,7 @@
 
 import { CONFIG } from "../config.js";
 import { TOP_500_BLOCKED } from "./blockedDomainsTop500.js";
+import { traerTodo } from "./supabase.js";
 
 // ── 1. TLDs siempre bloqueados ──────────────────────────────
 // Política user 2026-05-26: rechazar gov / edu / mil / academic / int en TODOS sus variantes.
@@ -127,13 +128,14 @@ async function fetchAdminBlocklist(accessToken) {
     return _adminBlocklistCache;
   }
   try {
-    const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain`,
-      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` } }
-    );
-    if (!res.ok) return _adminBlocklistCache || new Set();
-    const rows = await res.json();
-    _adminBlocklistCache = new Set((rows || []).map(r => (r.domain || "").toLowerCase()));
+    // De a páginas (2026-09-13): sin `limit` PostgREST devuelve 1.000 igual, y un dominio bloqueado después
+    // de la fila 1.000 se analizaba y se podía prospectar. Mismo criterio que getAdminBlocklistWorker.
+    const rows = await traerTodo(
+      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain&order=domain`,
+      { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${accessToken}` },
+      { max: 100000 });
+    if (!rows) return _adminBlocklistCache || new Set();
+    _adminBlocklistCache = new Set(rows.map(r => (r.domain || "").toLowerCase()));
     _adminBlocklistFetchedAt = now;
     return _adminBlocklistCache;
   } catch {

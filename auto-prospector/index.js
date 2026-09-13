@@ -14743,13 +14743,16 @@ async function getAdminBlocklistWorker(token) {
     return _adminBlocklistCacheWorker;
   }
   try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return _adminBlocklistCacheWorker || new Set();
-    const rows = await res.json();
-    _adminBlocklistCacheWorker = new Set((rows || []).map(r => (r.domain || "").toLowerCase().replace(/^www\./, "")));
+    // ⚠️ DE A PÁGINAS (2026-09-13). Era un pedido sin `limit`, y PostgREST corta en 1.000 igual: con más
+    // dominios en la blocklist, los que caían después de la fila 1.000 no se filtraban en el autopilot,
+    // los CSV ni el envío del agente. Orden por dominio: quien lee usa el conjunto, así que un empate que
+    // cambia de página no saca a nadie. Si una página falla, la lista anterior, como antes.
+    const rows = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_url_blocklist?select=domain&order=domain`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: 100000 });
+    if (!rows) return _adminBlocklistCacheWorker || new Set();
+    _adminBlocklistCacheWorker = new Set(rows.map(r => (r.domain || "").toLowerCase().replace(/^www\./, "")));
     _adminBlocklistFetchedAtWorker = now;
     return _adminBlocklistCacheWorker;
   } catch { return _adminBlocklistCacheWorker || new Set(); }

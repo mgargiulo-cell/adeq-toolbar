@@ -512,6 +512,7 @@ const COLUMNAS_REALES = {
   toolbar_review_queue:           { cols: "id domain status source traffic geo geos_all language category page_title ad_networks score emails email_sources email_found_at email_intentos email_ultimo_intento email_ultimo_motivo contact_name contact_phone pitch pitch_subject pitch_subjects monday_item_id monday_payload created_at created_by validated_at validated_by rejected_at suspect_checked_at suspect_reason suspect_reject", fuente: "GET 13/09" },
   toolbar_sendtrack:              { cols: "domain email send_date", noTiene: "id", fuente: "GET 13/09" },
   toolbar_traffic_cache:          { cols: "domain data fetched_at", noTiene: "id", fuente: "GET 13/09" },
+  toolbar_url_blocklist:          { cols: "domain category reason added_by", fuente: "GET 13/09" },
   toolbar_usage_sessions:         { cols: "id user_email started_at ended_at duration_sec", fuente: "GET 13/09" },
 };
 const columnasDe = (tabla) => new Set(COLUMNAS_REALES[tabla].cols.split(/\s+/));
@@ -542,6 +543,7 @@ const ORDEN_DE_A_PAGINAS = {
   "toolbar_review_queue|created_at.desc,id.desc":     "id desempata created_at",
   "toolbar_sendtrack|domain":                         "sin id; se escribe con merge-duplicates (una fila por dominio) y quien lee usa el conjunto de dominios",
   "toolbar_traffic_cache|domain":                     "sin id; caché por dominio y quien lee usa el conjunto de dominios",
+  "toolbar_url_blocklist|domain":                     "quien lee usa el conjunto de dominios bloqueados",
   "toolbar_usage_sessions|id":                        "id: clave",
 };
 
@@ -744,4 +746,39 @@ test("una lista de rebotes que llega al tope no se da por entera: reabrir no juz
   ok(w._bouncedCache.set.has(direccion(tope - 1)), "lo que sí se leyó se sigue usando para frenar envíos");
   ok(/toolbar_bounced_emails\?select=email,tipo,evidencia,fuente&\$\{EVIDENCIA_BLOQUEA\}&order=email`,[^\n]*\n[^\n]*\n\s*\{ max: REBOTES_MAX_FILAS \}\);/.test(worker),
     "_cargarDominiosQueRechazan usa el mismo tope");
+});
+
+// ── 12. La blocklist de dominios, entera ───────────────────────────────────────────────────────────
+// No pedía `limit`, así que la regla de la sección 8 no la veía, pero PostgREST corta en 1.000 igual:
+// un dominio bloqueado después de la fila 1.000 pasaba el filtro del worker (autopilot, CSV, envío del
+// agente) y el de la extensión.
+const blocklist = Array.from({ length: 1200 }, (_, i) => ({ domain: `sitio${i}.net` }));
+
+test("worker: la blocklist se lee de a páginas y bloquea al dominio de la fila 1.100", async () => {
+  {
+    const w = await cargarWorker(["getAdminBlocklistWorker"], { fetchFalso: true });
+    const pedidos = [];
+    globalThis.__fetchFalso = base(pedidos, [[(u) => u.includes("toolbar_url_blocklist"), (_u, _m, o) => pagina(blocklist, o)]]);
+    const set = await w.getAdminBlocklistWorker("t");
+    ok(set.has("sitio1100.net"), "sin paginar la base devolvía 1.000 y este dominio no se filtraba");
+    ok(pedidos.every(p => /order=domain/.test(p.u) && p.rango), pedidos[0]?.u);
+  }
+  {
+    const w = await cargarWorker(["getAdminBlocklistWorker"], { fetchFalso: true });
+    globalThis.__fetchFalso = base([], [[(u) => u.includes("toolbar_url_blocklist"), (_u, _m, o) => pagina(blocklist, o, { romperDesde: 1000 })]]);
+    strictEqual((await w.getAdminBlocklistWorker("t")).size, 0, "una página caída no deja media lista con cara de entera");
+  }
+});
+
+test("extensión: la blocklist se lee de a páginas y checkDomainBlocked frena al dominio de la fila 1.100", async () => {
+  const B = await import("../../modules/blocklist.js");
+  const antes = globalThis.fetch;
+  const pedidos = [];
+  try {
+    globalThis.fetch = async (u, o) => { pedidos.push({ u: String(u), rango: String(o?.headers?.Range || "") }); return pagina(blocklist, o); };
+    B.invalidateBlocklistCache();
+    const r = await B.checkDomainBlocked("www.sitio1100.net", "tk");
+    strictEqual(r.blocked, true, `sin paginar la extensión veía 1.000 dominios: ${JSON.stringify(r)}`);
+    ok(pedidos.length > 1 && pedidos.every(p => /order=domain/.test(p.u) && p.rango), pedidos[0]?.u);
+  } finally { globalThis.fetch = antes; B.invalidateBlocklistCache(); }
 });
