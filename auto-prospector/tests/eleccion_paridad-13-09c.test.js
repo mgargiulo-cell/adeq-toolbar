@@ -466,7 +466,10 @@ test("I12: el enriquecimiento del agente anota la fuente de todo lo nuevo, sin p
   });
   deepStrictEqual(w._fuentesDelEnriquecimiento(null, {}), {});
   const agente = cuerpoWorker("async function runAgentCycle(");
-  const i = agente.indexOf("patch.email_sources = _fuentesDelEnriquecimiento(lead.email_sources, { apollo: apolloEmail, scrape: scraped, google_contact: serperEmails });");
+  // Integración (13/09): entrada_sueltos (E3) suma a google_contact lo que Google encontró DENTRO del scrape,
+  // así que los argumentos ya no son los literales de antes. Lo que se cuida sigue igual: Apollo, el raspado y
+  // Serper se anotan, el lead en memoria se actualiza, y recién después el ciclo ordena.
+  const i = agente.search(/patch\.email_sources = _fuentesDelEnriquecimiento\(lead\.email_sources, \{ apollo: apolloEmail, scrape: _raspado, google_contact: \[\.\.\.serperEmails, \.\.\._deGoogleScrape\] \}\);/);
   const j = agente.indexOf("lead.email_sources = patch.email_sources;");
   const k = agente.indexOf("const _sourcesMap = lead.email_sources || {};");
   ok(i > 0 && j > i && k > j, "la fuente se anota y el MISMO ciclo ordena con ella");

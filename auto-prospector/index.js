@@ -24879,14 +24879,12 @@ async function runAgentCycle(token, allFlags) {
               // (qualify): apollo, generic si el local es genérico, scrape si no. Nunca se pisa una fuente
               // que ya estaba, y el lead en memoria se actualiza para que ESTE ciclo ordene con ella.
               // También lo que encontró la búsqueda en Google DENTRO del scrape (2026-09-13): los no genéricos van
-              // como google_contact; los genéricos siguen como "generic", porque un genérico es el que hace que el
-              // agente busque uno mejor (allGeneric) y esa decisión no cambia.
-              const _deGoogleScrape = new Set(scraped.filter(e => _googleScrape.has(String(e).toLowerCase()) && !_isGenericLocalPart(e)).map(e => String(e).toLowerCase()));
-              patch.email_sources = _fuentesDelEnriquecimiento(lead.email_sources, {
-                apollo: apolloEmail,
-                scrape: scraped.filter(e => !_deGoogleScrape.has(String(e).toLowerCase())),
-                google_contact: [...serperEmails, ...scraped.filter(e => _deGoogleScrape.has(String(e).toLowerCase()))],
-              });
+              // como google_contact; los genéricos quedan en el raspado y salen "generic" con la MISMA
+              // GENERIC_LOCAL_RE de _fuentesDelEnriquecimiento, porque un genérico es el que hace que el agente
+              // busque uno mejor (allGeneric) y esa decisión no cambia.
+              const _deGoogleScrape = scraped.filter(e => _googleScrape.has(String(e).toLowerCase()) && !GENERIC_LOCAL_RE.test(String(e).toLowerCase().split("@")[0]));
+              const _raspado = scraped.filter(e => !_deGoogleScrape.includes(e));
+              patch.email_sources = _fuentesDelEnriquecimiento(lead.email_sources, { apollo: apolloEmail, scrape: _raspado, google_contact: [...serperEmails, ..._deGoogleScrape] });
               lead.email_sources = patch.email_sources;
               // ── EL RESCATE DEL AGENTE CUENTA IGUAL QUE EL DEL PULIDO (2026-09-13) ─────────────
               // El pool del agente también trae leads sin ningún email (van al final del orden). Si
