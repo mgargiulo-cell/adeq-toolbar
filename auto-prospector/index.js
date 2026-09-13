@@ -9524,7 +9524,7 @@ async function parteDelDia(token, opts = {}) {
 
   // 2. Prospects: lo que importa no es el total, es cuántos se pueden contactar.
   const conEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`);
-  const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
+  const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&${FILTRO_SIN_EMAIL_INFORME}&select=id`);
   const diasDeStock = (totalEnviado > 0 && conEmail != null) ? (conEmail / Math.max(1, objetivoTotal)).toFixed(1) : "?";
 
   // 3. ALTAS DE HOY, SEPARADAS POR MÉTODO.
@@ -9580,25 +9580,33 @@ async function parteDelDia(token, opts = {}) {
   const _sem = new Date(Date.now() - 7 * 86400_000).toISOString();
   const _porFuente = {};
   try {
-    const filas = await fetch(
-      // ⚠️ SE MEDÍA LA COHORTE EQUIVOCADA (Maxi 2026-08-25). Filtraba por `uploaded_at`
-      // —cuándo ENTRÓ a la cola— y contaba los `done`, que pasan días después. O sea que
-      // medía gente que todavía no terminó de correr: el parte mostraba TODAS las fuentes
-      // en 0%, lo cual es imposible porque los leads estaban entrando igual.
-      // Es el mismo error que el freno por rebotes de esta mañana: numerador y denominador
-      // de poblaciones distintas. Con `processed_at` la pregunta es la correcta: "de lo que
-      // PROCESÉ esta semana, cuánto pasó". Números reales al corregirlo: similar 29%,
-      // adstxt 23%, majestic 16%, monday 15%, sellers 5% y autopilot 0% — este último sí
-      // era verdad, y es el que hay que mirar.
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${_sem}&select=source,status`,
-      { headers: auth }
-    ).then(r => r.ok ? r.json() : []).catch(() => []);
-    for (const f of (Array.isArray(filas) ? filas : [])) {
+    // ⚠️ SE MEDÍA LA COHORTE EQUIVOCADA (Maxi 2026-08-25). Filtraba por `uploaded_at`
+    // —cuándo ENTRÓ a la cola— y contaba los `done`, que pasan días después. O sea que
+    // medía gente que todavía no terminó de correr: el parte mostraba TODAS las fuentes
+    // en 0%, lo cual es imposible porque los leads estaban entrando igual.
+    // Es el mismo error que el freno por rebotes de esta mañana: numerador y denominador
+    // de poblaciones distintas. Con `processed_at` la pregunta es la correcta: "de lo que
+    // PROCESÉ esta semana, cuánto pasó". Números reales al corregirlo: similar 29%,
+    // adstxt 23%, majestic 16%, monday 15%, sellers 5% y autopilot 0% — este último sí
+    // era verdad, y es el que hay que mirar.
+    // ⚠️ TRES COSAS MÁS (2026-09-13, segunda revisión). (1) El fetch suelto se cortaba en las 1.000
+    // filas de PostgREST y la semana tiene más: ahora pagina. (2) Una fila que vuelve a pending o a
+    // next_day también estampa processed_at y sumaba en "trajo" sin haber salido de la cola: va
+    // aparte como pospuesta. (3) El feeder, el import del MB y el re-trabajo (congelados que vuelven
+    // con la etiqueta de Prospects) sumaban en la misma fuente: se separan con _claveFuenteCola, la
+    // misma regla que el boletín del resumen de salud.
+    const filas = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${_sem}&select=source,status,uploaded_by&order=id`,
+      auth, { max: 50000 })) || [];
+    for (const f of filas) {
       // `monday` es el reciclado de ciclos finalizados del CRM (Monday está apagado desde el
-      // 02/09); se nombra por lo que es. `sellers`/`sellers_json` son la misma fuente.
-      const s = String(f.source || "?").replace(/^auto_feeder_/, "")
-        .replace(/^monday(_refresh)?$/, "crm_reciclado").replace(/^sellers_json$/, "sellers");
-      _porFuente[s] = _porFuente[s] || { trajo: 0, paso: 0, congelados: 0 };
+      // 02/09); se nombra por lo que es (_nombreFuenteInforme). `sellers`/`sellers_json` son la
+      // misma fuente; lo que las distingue es el grupo (feeder, MB, re-trabajo).
+      const { grupo, fuente } = _claveFuenteCola(f);
+      const s = fuente + (_ETIQUETA_GRUPO_COLA[grupo] || "");
+      _porFuente[s] = _porFuente[s] || { trajo: 0, paso: 0, congelados: 0, pospuestos: 0 };
+      const _est = _estadoColaInforme(f.status);
+      if (_est === "pospuesta") { _porFuente[s].pospuestos++; continue; }
       _porFuente[s].trajo++;
       if (f.status === "done") _porFuente[s].paso++;
       // ⚠️ CONGELADO NO ES PROCESADO (parte del 07/09). El barrido del 02-04/09 congeló 1.368
@@ -9606,16 +9614,16 @@ async function parteDelDia(token, opts = {}) {
       // una tocó `processed_at`: el parte las contaba como "trajo 1.411 · pasaron 0 (0%)" y
       // sentenciaba "esa fuente gasta créditos para nada". No gastó nada (RapidAPI: 9-49
       // llamadas por día esa semana) y la fuente ni siquiera existe ya. Se cuentan aparte.
-      else if (f.status === "frozen") _porFuente[s].congelados++;
+      else if (_est === "congelada") _porFuente[s].congelados++;
     }
   } catch {}
   const lineasFuente = Object.entries(_porFuente)
-    .sort((a, b) => b[1].trajo - a[1].trajo)
+    .sort((a, b) => (b[1].trajo + b[1].pospuestos) - (a[1].trajo + a[1].pospuestos))
     .map(([s, v]) => {
       const _evaluados = v.trajo - v.congelados;
       const pct = _evaluados ? Math.round((v.paso / _evaluados) * 100) : 0;
-      const señal = !_evaluados ? "🧊" : pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
-      return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)${v.congelados ? ` · ${v.congelados} congelados` : ""}`;
+      const señal = !_evaluados ? (v.congelados ? "🧊" : "↻") : pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
+      return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)${v.congelados ? ` · ${v.congelados} congelados` : ""}${v.pospuestos ? ` · ${v.pospuestos} pospuestos (siguen en la cola)` : ""}`;
     });
 
   // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -9702,19 +9710,16 @@ async function parteDelDia(token, opts = {}) {
     // `details.failed_email`, así que se puede atribuir el rebote a la vía que la encontró.
     // Es la única forma de saber si una vía nueva (el patrón, el PDF, Instagram) trae
     // direcciones que existen o sólo direcciones.
-    const _viaDe = new Map();   // email → vía que lo encontró
-    const _via = {};
-    for (const a of _altasMes) {
-      if (String(a.email_found_at || a.created_at || "") < _ultimos7) continue;
-      for (const [em, src] of Object.entries(a.email_sources || {})) {
-        // `email_sources` guarda un string ("scrape") O un objeto ({source, url}) según quién
-        // lo escribió. El parte del 10/09 mostró "[object object]" con 3.352 emails: la vía
-        // más grande del pool, ilegible. `_normSrc` entiende las dos formas.
-        const v = String(_normSrc(src) || "?").toLowerCase();
-        _viaDe.set(String(em).toLowerCase(), v);
-        (_via[v] = _via[v] || { n: 0, rebotes: 0 }).n++;
-      }
-    }
+    // `email_sources` guarda un string ("scrape") O un objeto ({source, url}) según quién lo
+    // escribió. El parte del 10/09 mostró "[object object]" con 3.352 emails: la vía más grande
+    // del pool, ilegible. `_normSrc` entiende las dos formas.
+    // ⚠️ CONTABA CLAVES, NO EMAILS (2026-09-13, segunda revisión). Formularios de contacto,
+    // direcciones que ya salieron de `emails` y todas las claves viejas de un lead rescatado ayer
+    // sumaban como "email(s)"; y un rescate sobre un lead de más de 30 días no se veía. La regla
+    // está en _viasDeEmailInforme. Los rescates se leen aparte, sin el filtro de 30 días de altas.
+    const _rescates7 = (await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${_ultimos7}&select=domain,emails,email_sources,email_found_at,created_at&order=id`,
+      auth, { max: 30000 })) || [];
     // ⚠️ "REBOTARON" MIRABA POCO Y DIVIDÍA POR DE MÁS (2026-09-13). Tres fallas:
     //   · Los "no" de MillionVerifier nunca llegaban: rol_mx mostraba "14 rebotes de 1387" el mismo
     //     día que MV dio 69 inválidos de 161. Una vía que adivina se ve limpia justo porque MV la frena.
@@ -9738,38 +9743,14 @@ async function parteDelDia(token, opts = {}) {
     const _verificados7 = (await _traerTodo(
       `${SUPABASE_URL}/rest/v1/toolbar_mv_results?created_at=gte.${_ultimos7}&select=email&order=id`,
       auth, { max: 5000 })) || [];
-    for (const d of Object.values(_via)) { d.env = 0; d.ver = 0; d.mvNo = 0; }
-    const _viaEnvio = new Map();   // email enviado en 7 días → vía con la que se mandó
-    for (const s of _enviados7) {
-      const em = String(s.email_to || "").toLowerCase();
-      if (!em) continue;
-      const v = String(_normSrc(s.details?.source) || _viaDe.get(em) || "").toLowerCase();
-      if (!v) continue;
-      _viaEnvio.set(em, v);
-      (_via[v] = _via[v] || { n: 0, rebotes: 0, env: 0, ver: 0, mvNo: 0 }).env++;
-    }
-    const _verSet = new Set(_verificados7.map(m => String(m.email || "").toLowerCase()).filter(Boolean));
-    for (const em of _verSet) { const v = _viaDe.get(em); if (v) _via[v].ver++; }
-    let _rebotesSinVia = 0;
-    const _malosVistos = new Set();
-    for (const f of _malos) {
-      const em = String(f.email || "").toLowerCase();
-      if (!em || _malosVistos.has(`${f.evidencia}|${em}`)) continue;
-      _malosVistos.add(`${f.evidencia}|${em}`);
-      if (f.evidencia === "rebote_smtp") {
-        const v = _viaEnvio.get(em);
-        if (v) _via[v].rebotes++; else _rebotesSinVia++;
-      } else if (f.evidencia === "verificador") {
-        const v = _viaDe.get(em);
-        if (v && _verSet.has(em)) _via[v].mvNo++;
-      }
-    }
-    for (const [v, d] of Object.entries(_via).sort((a, b) => (b[1].n + b[1].env) - (a[1].n + a[1].env)).slice(0, 12)) {
-      const pct = d.env ? Math.round(100 * d.rebotes / d.env) : 0;
-      const señal = d.rebotes === 0 ? "✅" : pct <= 5 ? "⚠️" : "🔴";
-      lineasVia.push(`   ${señal} ${v.padEnd(18)} ${String(d.n).padStart(4)} email(s) · rebotaron ${String(d.rebotes).padStart(3)} (${pct}%) de ${d.env} enviados · MV descartó ${d.mvNo} de ${d.ver} verificados`);
-    }
-    if (_rebotesSinVia) lineasVia.push(`   · ${_rebotesSinVia} rebote(s) de envíos anteriores a estos 7 días o que no hizo el agente`);
+    const _vias = _viasDeEmailInforme({
+      cohorte: [..._altasMes.filter(a => String(a.created_at || "") >= _ultimos7), ..._rescates7],
+      respaldo: _altasMes,
+      enviados: _enviados7, malos: _malos, verificados: _verificados7,
+    });
+    lineasVia.push(..._vias.lineas);
+    if (_vias.rebotesSinVia) lineasVia.push(`   · ${_vias.rebotesSinVia} rebote(s) de envíos anteriores a estos 7 días o que no hizo el agente`);
+    if (_vias.formularios) lineasVia.push(`   · ${_vias.formularios} formulario(s) de contacto: no son emails y no cuentan en ninguna vía`);
 
     // ── POR QUÉ SE RECHAZA LO QUE SE RECHAZA ─────────────────────────────────────────────
     // Agrupado por motivo. Sirve para dos cosas: ver si un veto está matando de más (fue el
@@ -9778,25 +9759,17 @@ async function parteDelDia(token, opts = {}) {
     const _rech = (await _traerTodo(
       `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${_ultimos7}&status=in.(skipped,next_day)&select=status,error_message&order=id`,
       auth, { max: 20000 })) || [];
-    const _porMotivo = {};
-    let _reintentables = 0, _yaEstaban = 0;
-    for (const r of _rech) {
-      const m = String(r.error_message || "?");
-      if (r.status === "next_day") { if (/reintentar|no_verificable|sin_cuota/i.test(m)) _reintentables++; continue; }
-      // "Ya estaba en Prospects" no es un rechazo: es el mismo dominio llegando por dos fuentes.
-      // Contarlo entre los motivos (el 10/09 era el más grande) tapaba los rechazos reales.
-      if (/^ya_estaba_en_prospects/.test(m)) { _yaEstaban++; continue; }
-      // El motivo viene como "not_publisher: haiku_corp" o "not_publisher: sin_ads_txt".
-      // 48 caracteres: con 34 se cortaba "tipo_no_prospectable:e-commerce" a la mitad.
-      const k = (m.split(":").slice(0, 2).join(":") || "?").replace(/^not_publisher:\s*/, "").slice(0, 48);
-      _porMotivo[k] = (_porMotivo[k] || 0) + 1;
+    // "Ya estaba en Prospects" no es un rechazo: es el mismo dominio llegando por dos fuentes.
+    // Contarlo entre los motivos (el 10/09 era el más grande) tapaba los rechazos reales.
+    // La agrupación es la MISMA que usa el resumen de salud (_agruparRechazosCola, 2026-09-13): antes
+    // se cortaba el texto crudo y "pageviews 212345 (…) below min 350000" salía como un motivo
+    // distinto por dominio, así que el descarte más grande quedaba fuera del top.
+    const _rc = _agruparRechazosCola(_rech);
+    for (const [k, g] of _rc.top.slice(0, 8)) {
+      lineasRechazo.push(`   ${k.padEnd(48)} ${String(g.n).padStart(5)}${_rc.totalDescartes ? ` (${Math.round(100 * g.n / _rc.totalDescartes)}%)` : ""}`);
     }
-    const _totalRech = Object.values(_porMotivo).reduce((a, b) => a + b, 0);
-    for (const [k, v] of Object.entries(_porMotivo).sort((a, b) => b[1] - a[1]).slice(0, 8)) {
-      lineasRechazo.push(`   ${k.padEnd(48)} ${String(v).padStart(5)}${_totalRech ? ` (${Math.round(100 * v / _totalRech)}%)` : ""}`);
-    }
-    if (_reintentables) lineasRechazo.push(`   ↻ ${_reintentables} NO se descartaron: vuelven mañana (ads.txt ilegible o sin cuota de API)`);
-    if (_yaEstaban) lineasRechazo.push(`   · ${_yaEstaban} ya estaban en Prospects: no es rechazo, es el mismo dominio llegando por dos fuentes`);
+    if (_rc.reintentables) lineasRechazo.push(`   ↻ ${_rc.reintentables} NO se descartaron: vuelven mañana (ads.txt ilegible, sin cuota de API o cupo del día por GEO)`);
+    if (_rc.yaEstaban) lineasRechazo.push(`   · ${_rc.yaEstaban} ya estaban en Prospects: no es rechazo, es el mismo dominio llegando por dos fuentes`);
 
     // ── LO QUE YA NO SE VUELVE A PAGAR ───────────────────────────────────────────────────
     // Cada fila `noData` es un dominio del que SimilarWeb no sabe nada y que antes se
@@ -9880,10 +9853,14 @@ async function parteDelDia(token, opts = {}) {
     // También los cortes de TURNO (`cycle_*`), no sólo los descartes por lead: un turno que
     // encontró la casilla llena o el pool vacío no descarta a nadie y antes quedaba invisible.
     const motivos = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(skipped,cycle_no_candidates,cycle_gates,cycle_cupo_casilla)&created_at=gte.${desdeHoy}&select=action,reason`,
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=in.(skipped,cycle_no_candidates,cycle_gates,cycle_cupo_casilla)&created_at=gte.${desdeHoy}&select=action,reason,domain`,
       { headers: auth }
     ).then(r => r.ok ? r.json() : []).catch(() => []);
     const top = {};
+    // Dominios distintos por motivo (2026-09-13): "mv_dudoso (195)" no dice si son 195 leads o el mismo
+    // puñado salteado en cada turno y por los dos buzones. Sólo para `skipped`: los cortes de turno no
+    // son por lead.
+    const _domsTop = {};
     let _cortesCasilla = 0, _motivoCasilla = "";
     for (const m of (Array.isArray(motivos) ? motivos : [])) {
       if (m.action === "cycle_cupo_casilla") {
@@ -9896,12 +9873,13 @@ async function parteDelDia(token, opts = {}) {
       }
       const k = m.action === "skipped" ? String(m.reason || "?").split(":")[0] : m.action;
       top[k] = (top[k] || 0) + 1;
+      if (m.action === "skipped" && m.domain) (_domsTop[k] = _domsTop[k] || new Set()).add(String(m.domain).trim().toLowerCase());
     }
     const orden = Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 3);
     // El corte por casilla llena se dice con todas las letras: es el otro sistema (la cadencia
     // del CRM) ocupando el cupo compartido del buzón, y no se arregla mirando al agente.
     if (_cortesCasilla) problemas.push(`El agente cortó ${_cortesCasilla} turno(s) porque la casilla ya tenía el tope de mails de la última hora (${_motivoCasilla || "cupo compartido con la cadencia del CRM"}). Faltaron ${objetivoTotal - totalEnviado} envíos por el cupo del buzón.`);
-    else if (orden.length) problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos. Los descartes de hoy: ${orden.map(([k, v]) => `${k} (${v})`).join(", ")}.`);
+    else if (orden.length) problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos. Los descartes de hoy: ${orden.map(([k, v]) => `${k} (${v}${_domsTop[k] && _domsTop[k].size !== v ? `, ${_nDominios(_domsTop[k].size)}` : ""})`).join(", ")}.`);
     else problemas.push(`Faltaron ${objetivoTotal - totalEnviado} envíos y NO hay descartes ni cortes registrados — el agente no llegó a intentarlo. Revisar si el worker corrió.`);
   }
   if (altasHoy === 0) problemas.push("No entró ni una URL nueva a Prospects. El descubrimiento está parado.");
@@ -26593,6 +26571,347 @@ async function chequearAutenticacionPropia(token) {
 // lo que no salió como primera parada del día, así que nada se pierde.
 const RESUMEN_SALUD_CADA_HORAS = 24;
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// REGLAS PURAS DEL INFORME (2026-09-13, segunda revisión de los mails del 12/09)
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// El parte y el resumen de salud contaban las mismas cosas con reglas escritas adentro de cada
+// bucle: "de qué fuente es esta fila", "qué es un descarte", "quién encontró este email". Cada
+// copia tenía su versión, así que un renglón se arreglaba y el del otro mail seguía diciendo lo
+// contrario. Acá quedan como funciones sin red, exportables, con tests
+// (tests/informe-13-09b.test.js). Ninguna cambia qué entra al pool ni qué se manda: sólo leen.
+
+// El filtro "pendiente sin email" de los CONTEOS del informe, uno solo. `and=(or(...))` y no un
+// `or=` suelto: dos `or=` en la misma URL se pisan en silencio en PostgREST. Es el mismo criterio
+// que ya usa toolbar_metricas_diarias (null o []), así que la serie histórica y el mail cuentan igual.
+const FILTRO_SIN_EMAIL_INFORME = "and=(or(emails.is.null,emails.eq.%5B%5D))";
+
+// ── EL ESTADO DE UNA FILA DE LA COLA, PARA CONTAR ──────────────────────────────────────────
+// markCsvItem estampa processed_at en TODO cambio de estado, también cuando el ítem vuelve a
+// pending (tráfico transitorio, intento 1/3) o a next_day (sin cuota, cupo anglo). El 12/09 "La
+// cola procesó 1227" y "Drenó 1227" incluían filas que seguían en la cola. Procesada = salió
+// (done, skipped, error); congelada va aparte, como en el parte; el resto se pospuso.
+function _estadoColaInforme(status) {
+  const s = String(status || "");
+  if (s === "done" || s === "skipped" || s === "error") return "procesada";
+  if (s === "frozen") return "congelada";
+  return "pospuesta";
+}
+
+// ── DE QUIÉN ES UNA FILA DE LA COLA ────────────────────────────────────────────────────────
+// La cola mezcla dos vocabularios. El feeder encola con la etiqueta de su carril
+// (auto_feeder_sellers, autogoogle). El congelado, el re-chequeo de ads.txt y el revivir de
+// Prospects vuelven a encolar con la etiqueta de PROSPECTS (sellers_json, majestic) firmada por el
+// worker. El MB importa con esa misma etiqueta, firmada con su email. El agente re-encola con
+// agent / bounce_retry. El 12/09 el resumen decía "sellers 3→0 · sellers_json 105→0 · majestic
+// 53→0 · autopilot 29→0" y parecía que esas fuentes traían basura: una parte era re-trabajo
+// (congelados que vuelven) sumado al rendimiento del feeder. `retry:` queda previsto por si el
+// re-encolado empieza a marcarse explícito.
+const _GRUPOS_COLA_ENVIO = new Set(["agent", "agent_reengagement", "bounce_retry"]);
+const _ETIQUETA_GRUPO_COLA = { feeder: "", import_mb: " (MB)", retrabajo: " (re-trabajo)", envio: " (envío)" };
+function _claveFuenteCola(fila) {
+  const crudo = String(fila?.source || "").trim();
+  const uploader = String(fila?.uploaded_by || "").trim();
+  if (/^retry:/i.test(crudo)) return { grupo: "retrabajo", fuente: _nombreFuenteInforme(crudo.slice(6)) };
+  if (/^auto_feeder_/.test(crudo) || crudo === "autogoogle") return { grupo: "feeder", fuente: _nombreFuenteInforme(crudo) };
+  if (_GRUPOS_COLA_ENVIO.has(crudo)) return { grupo: "envio", fuente: crudo };
+  const esMb = !!uploader && !/autofeeder/i.test(uploader);   // la misma regla que isManualImport
+  return { grupo: esMb ? "import_mb" : "retrabajo", fuente: _nombreFuenteInforme(crudo) };
+}
+
+// ── EL EMBUDO DE LA COLA, CON LAS DOS MITADES CONTADAS IGUAL ───────────────────────────────
+// `cola`: filas de toolbar_csv_queue de la ventana ({domain, source, status, uploaded_by}).
+// `altas`: filas de Prospects creadas en la ventana ({domain, source}).
+// `prospects`: las filas de Prospects de los "done" que NO son altas (reactivadas), para saber con
+// qué etiqueta quedaron. Un done sobre un dominio que ya existía hace upsert y conserva su fecha
+// de alta; y cualquier ítem con ficha en el CRM se guarda como monday_refresh (crm_reciclado).
+function _embudoColaInforme(cola, { altas = [], prospects = [] } = {}) {
+  const lower = (x) => String(x || "").trim().toLowerCase();
+  const nuevos = new Map((Array.isArray(altas) ? altas : []).map(a => [lower(a.domain), a]));
+  const enPros = new Map((Array.isArray(prospects) ? prospects : []).map(p => [lower(p.domain), p]));
+  const out = { procesadas: 0, congeladas: 0, pospuestas: 0, llegaron: 0, nuevas: 0, reactivadas: 0,
+                grupos: {}, otraEtiqueta: {}, altasSinCola: 0 };
+  const doneDom = new Set();
+  for (const f of (Array.isArray(cola) ? cola : [])) {
+    const { grupo, fuente } = _claveFuenteCola(f);
+    const g = (out.grupos[grupo] = out.grupos[grupo] || {});
+    const e = (g[fuente] = g[fuente] || { procesadas: 0, llegaron: 0, nuevas: 0, reactivadas: 0, congeladas: 0, pospuestas: 0 });
+    const est = _estadoColaInforme(f.status);
+    if (est === "congelada") { e.congeladas++; out.congeladas++; continue; }
+    if (est === "pospuesta") { e.pospuestas++; out.pospuestas++; continue; }
+    e.procesadas++; out.procesadas++;
+    if (f.status !== "done") continue;
+    e.llegaron++; out.llegaron++;
+    const d = lower(f.domain);
+    if (d) doneDom.add(d);
+    const fila = nuevos.get(d) || enPros.get(d);
+    if (nuevos.has(d)) { e.nuevas++; out.nuevas++; } else { e.reactivadas++; out.reactivadas++; }
+    if (fila && grupo !== "envio") {
+      const etiqueta = _nombreFuenteInforme(fila.source);
+      if (etiqueta !== fuente) out.otraEtiqueta[`${fuente}→${etiqueta}`] = (out.otraEtiqueta[`${fuente}→${etiqueta}`] || 0) + 1;
+    }
+  }
+  for (const d of nuevos.keys()) if (d && !doneDom.has(d)) out.altasSinCola++;
+  return out;
+}
+
+function _lineasEmbudoCola(emb) {
+  const TITULO = { feeder: "feeders", import_mb: "imports de MBs", retrabajo: "re-trabajo (congelados que vuelven, ads.txt re-chequeado, revividos de Prospects)", envio: "del agente (re-encolados para envío o rebote)" };
+  const lineas = [`La cola procesó ${emb.procesadas} (sin contar ${emb.pospuestas} pospuestas, que vuelven a la cola, ni ${emb.congeladas} congeladas) · llegaron a Prospects ${emb.llegaron} (${emb.nuevas} nuevas, ${emb.reactivadas} ya estaban y se reactivaron):`];
+  for (const grupo of ["feeder", "import_mb", "retrabajo", "envio"]) {
+    const g = emb.grupos[grupo];
+    if (!g) continue;
+    const partes = Object.entries(g).sort((a, b) => (b[1].procesadas + b[1].pospuestas + b[1].congeladas) - (a[1].procesadas + a[1].pospuestas + a[1].congeladas))
+      .map(([f, v]) => {
+        const extra = [
+          v.llegaron && v.nuevas !== v.llegaron ? `${v.nuevas} nuevas` : "",
+          v.pospuestas ? `${v.pospuestas} pospuestas` : "",
+          v.congeladas ? `${v.congeladas} congeladas` : "",
+        ].filter(Boolean).join("; ");
+        return `${f} ${v.procesadas}→${v.llegaron}${extra ? ` (${extra})` : ""}`;
+      });
+    lineas.push(`  ${TITULO[grupo]}: ${partes.join(" · ")}`);
+  }
+  const otras = Object.entries(emb.otraEtiqueta).sort((a, b) => b[1] - a[1]);
+  if (otras.length) {
+    lineas.push(`  En Prospects figuran con otra fuente: ${otras.map(([k, n]) => `${k} ${n}`).join(" · ")}${otras.some(([k]) => k.endsWith("→crm_reciclado")) ? " (con ficha en el CRM se guardan como crm_reciclado)" : ""}.`);
+  }
+  if (emb.altasSinCola) lineas.push(`  Altas de la ventana que no salieron de la cola en la ventana: ${emb.altasSinCola} (residuo de la conciliación, no es alarma).`);
+  return lineas;
+}
+
+// ── QUIÉN ENCONTRÓ EL EMAIL DE UN LEAD RESCATADO ───────────────────────────────────────────
+// Se tomaba "el último valor de email_sources" como la vía del rescate. email_sources es jsonb, y
+// Postgres guarda las claves ordenadas por largo y después por bytes, no por orden de escritura:
+// el último valor es el de la dirección más larga. reabrirLeadsRebotados deja las claves viejas, así
+// que un lead con {"info@diario.com.ar": generic} rescatado con ads@diario.com.ar por rol_mx salía
+// "generic". El 12/09: "generic 25", una vía que ningún rescate escribe. El rescate pone su email
+// PRIMERO en `emails`: se recorre esa lista, nunca el orden de las claves.
+function _viaDelRescate(lead) {
+  const ems = (Array.isArray(lead?.emails) ? lead.emails : []).map(e => String(e || "").trim().toLowerCase()).filter(Boolean);
+  const src = {};
+  for (const [k, v] of Object.entries(lead?.email_sources || {})) src[String(k).trim().toLowerCase()] = v;
+  for (const e of ems) {
+    const v = _normSrc(src[e]).toLowerCase();
+    if (v) return v;
+  }
+  return ems.length ? "sin_fuente" : "sin_email_vigente";
+}
+
+// "Emails nuevos por vía" era una lista fija sin pattern, informer ni social: el 12/09 sumaba 128
+// contra 159 rescatados. Las vías del plan se muestran siempre (sus ceros son la noticia) y después
+// cualquier otra que haya aparecido, así el renglón suma lo mismo que "N encontrados".
+const _VIAS_DEL_PLAN = ["apollo", "serper_persona", "rol_mx", "pattern", "google_contact", "scrape", "informer", "social"];
+function _lineaEmailsPorVia(porFuente) {
+  const p = porFuente || {};
+  const extra = Object.keys(p).filter(k => !_VIAS_DEL_PLAN.includes(k)).sort((a, b) => p[b] - p[a]);
+  return [..._VIAS_DEL_PLAN, ...extra].map(f => `${f} ${p[f] || 0}`).join(" · ");
+}
+
+// ── EL MOTIVO DE UN DESCARTE DE LA COLA, COMO CLAVE ESTABLE ────────────────────────────────
+// Los error_message traen números y nombres variables ("pageviews 212345 (visits×2.31) below min
+// 350000", "en descanso: faltan 45 días"). Agrupados por el texto crudo, el descarte más grande se
+// partía en cientos de "1" y quedaba fuera del top: invisible, que era justo lo que había que ver.
+// Orden importa: la primera regla que matchea gana. Lo que no conoce: prefijo, dígitos → N.
+const _MOTIVOS_COLA = [
+  [/^ya_estaba_en_prospects/, () => "ya_estaba_en_prospects"],
+  [/^pageviews \d+ .*below min/, () => "trafico_bajo_piso"],
+  [/^pageviews \d+ above max/, () => "gigante_sobre_techo"],
+  [/^deprio-geo:\s*([^(]+?)\s*\(/, (m) => `deprio-geo:${m[1]}`],
+  [/^worker_geo_excluded:\s*(.+)$/, (m) => `geo_excluida:${m[1].trim()}`],
+  [/^en descanso/, () => "crm_en_descanso"],
+  [/^crm_activo/, () => "crm_activo"],
+  [/^no_prospectable_tipo:.* es ([\w-]+)/, (m) => `tipo_no_prospectable:${m[1]}`],
+  [/^category-blocked:.*matchea "([^"]+)"/, (m) => `categoria_bloqueada:${m[1]}`],
+  [/^duplicate_subdomain_of:/, () => "subdominio_duplicado"],
+  [/^traffic_api_transient/, () => "trafico_api_reintentos_agotados"],
+  [/^sin_cuota_de_api/, () => "sin_cuota_de_api"],
+  [/^freeze_failed/, () => "freeze_failed"],
+  [/^worker_cat_not_priority/, () => "categoria_no_prioritaria_worker"],
+  [/^review_queue_insert_fail:\s*([a-z_]+)/i, (m) => `insert_fail:${m[1].replace(/_+$/, "")}`],
+  [/^blocked:\s*([a-z-]+)/i, (m) => `blocklist:${m[1]}`],
+  [/^(?:not_publisher|reintentar):\s*(bajo_trafico|gigante)/, (m) => m[1]],
+  [/^(?:not_publisher|reintentar):\s*([a-z_]+)/i, (m) => m[1].replace(/_+$/, "")],
+  [/^dead_domain_dns_fail/, () => "dead_domain_dns_fail"],
+  [/^geo_saturated_in_pool/, () => "geo_saturado_en_pool"],
+  [/^anglo_daily_quota/, () => "cupo_anglo_del_dia"],
+  [/^no_traffic_data/, () => "sin_datos_de_trafico"],
+];
+function _motivoCanonicoCola(msg) {
+  const s = String(msg || "").trim();
+  if (!s) return "(sin motivo)";
+  for (const [re, clave] of _MOTIVOS_COLA) {
+    const m = s.match(re);
+    if (m) return clave(m);
+  }
+  return (s.split(/[:\s]/)[0] || "?").replace(/\d+/g, "N").slice(0, 48);
+}
+
+// ── POR QUÉ NO PASÓ LO QUE NO PASÓ ─────────────────────────────────────────────────────────
+// "DESCARTES DEL DESCUBRIMIENTO" leía toolbar_diag_descartes, que sólo escriben tres motivos
+// (sin_ads_txt, tipo_no_prospectable, geo_excluida): el 12/09 explicaba 74 de ~950. Tráfico bajo,
+// deprio-geo, CRM activo, not_publisher y subdominio duplicado no aparecían. La verdad está en
+// csv_queue.error_message, y el parte ya la leía con otra agrupación. Una sola para los dos.
+// Todo lo que no es "done" cae en exactamente un balde:
+//   descartes + yaEstaban + errores + reintentables + reencolados + congelados === totalNoPasados
+function _agruparRechazosCola(rows) {
+  const out = { descartes: {}, top: [], totalDescartes: 0, yaEstaban: 0, errores: 0, reintentables: 0, reencolados: 0, congelados: 0, totalNoPasados: 0 };
+  for (const r of (Array.isArray(rows) ? rows : [])) {
+    const st = String(r?.status || "");
+    if (st === "done") continue;
+    out.totalNoPasados++;
+    if (st === "next_day") { out.reintentables++; continue; }
+    if (st === "frozen") { out.congelados++; continue; }
+    if (st === "error") { out.errores++; continue; }
+    if (st !== "skipped") { out.reencolados++; continue; }
+    const k = _motivoCanonicoCola(r.error_message);
+    if (k === "ya_estaba_en_prospects") { out.yaEstaban++; continue; }
+    const g = (out.descartes[k] = out.descartes[k] || { n: 0, ej: [], porFuente: {} });
+    g.n++;
+    out.totalDescartes++;
+    const d = String(r.domain || "").trim().toLowerCase();
+    if (d && g.ej.length < 2 && !g.ej.includes(d)) g.ej.push(d);
+    if (r.source !== undefined) {
+      const c = _claveFuenteCola(r);
+      const nombre = c.fuente + (_ETIQUETA_GRUPO_COLA[c.grupo] || "");
+      g.porFuente[nombre] = (g.porFuente[nombre] || 0) + 1;
+    }
+  }
+  out.top = Object.entries(out.descartes).sort((a, b) => b[1].n - a[1].n);
+  return out;
+}
+
+// Un comentario largo cortado a 220 caracteres terminaba en "Regla del user (27/08): aunque ".
+// Se corta en el último punto antes del tope; si no hay uno razonable, en la última palabra con "…".
+function _cortarComentario(txt, max = 400) {
+  const s = String(txt || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  const corte = s.slice(0, max);
+  const punto = corte.lastIndexOf(". ");
+  if (punto >= max * 0.4) return corte.slice(0, punto + 1);
+  return corte.replace(/\s+\S*$/, "") + "…";
+}
+
+// ── EL STOCK SIN EMAIL, TODO Y POR MOTIVO ──────────────────────────────────────────────────
+// El top 5 de motivos sumaba 314 de 327 y los leads sin motivo no tenían renglón: si la auditoría
+// vacía de más, o un reciclado pierde la marca, no se veía. Todo lead cae en un grupo y lo que no
+// entra en el top va a "otros": la suma de los renglones es siempre el encabezado.
+function _agruparStockSinEmail(filas, top = 5) {
+  const lista = Array.isArray(filas) ? filas : [];
+  const por = {};
+  let conMotivo = 0;
+  for (const l of lista) {
+    const m = String(l?.email_ultimo_motivo || "").trim();
+    if (m) conMotivo++;
+    const k = m
+      ? (m.split(":")[0] || "?")
+      : (Number(l?.email_intentos || 0) > 0 ? "sin_motivo_marca_borrada" : "sin_motivo_todavia_no_buscado");
+    const g = (por[k] = por[k] || { n: 0, ej: [] });
+    g.n++;
+    if (l?.domain && g.ej.length < 2 && !g.ej.includes(l.domain)) g.ej.push(l.domain);
+  }
+  const grupos = Object.entries(por).sort((a, b) => b[1].n - a[1].n).slice(0, top);
+  const enTop = grupos.reduce((s, [, g]) => s + g.n, 0);
+  return { total: lista.length, conMotivo, grupos, otros: lista.length - enTop };
+}
+
+// ── ENVÍOS SALTEADOS: EVENTOS Y DOMINIOS ───────────────────────────────────────────────────
+// "mv_dudoso → 195" con 40 envíos no dice si son 195 leads o 30 repetidos en varios turnos y dos
+// buzones. Los dominios distintos por motivo son lo que muestra si el filtro de 7 días funciona:
+// si anda, los dos números se acercan.
+const _nDominios = (n) => `${n} dominio${n === 1 ? "" : "s"}`;
+function _agruparSalteados(filas, { tope = 5, largoMotivo = 2 } = {}) {
+  const lista = Array.isArray(filas) ? filas : [];
+  const por = {};
+  const todos = new Set();
+  for (const a of lista) {
+    const k = String(a?.reason || "(sin motivo)").split(":").slice(0, largoMotivo).join(":");
+    const d = String(a?.domain || "").trim().toLowerCase();
+    const g = (por[k] = por[k] || { n: 0, dominios: new Set(), ej: [] });
+    g.n++;
+    if (d) {
+      todos.add(d);
+      if (!g.dominios.has(d) && g.ej.length < 2) g.ej.push(d);
+      g.dominios.add(d);
+    }
+  }
+  return {
+    total: lista.length,
+    dominios: todos.size,
+    top: Object.entries(por).sort((a, b) => b[1].n - a[1].n).slice(0, tope)
+      .map(([motivo, g]) => ({ motivo, n: g.n, dominios: g.dominios.size, ej: g.ej })),
+  };
+}
+
+// ── DE DÓNDE SALEN LOS EMAILS, CONTANDO EMAILS ─────────────────────────────────────────────
+// "N email(s)" contaba CLAVES de email_sources, no emails: los formularios de contacto
+// (__contact_form_1__), las direcciones que la auditoría o el rebote ya sacaron de `emails`, y todas
+// las claves viejas de un lead al que ayer se le rescató una dirección. Y un rescate sobre un lead
+// de más de 30 días no se veía. Ahora:
+//   · `cohorte` = altas de 7 días + rescates de 7 días (sin límite de antigüedad), una vez por dominio;
+//     cuenta sólo lo que sigue en `emails`, y los formularios no son emails.
+//   · El mapa email→vía de RESPALDO usa todas las claves (menos formularios) de los leads leídos: sólo
+//     atribuye, nunca cuenta. Así un rebote cuya dirección ya salió de `emails` sigue teniendo vía.
+//   · Los % se quedan como los dejó la revisión del 13/09: rebotes sobre enviados con la vía del
+//     envío, descartes de MV sobre verificados. Una vía sin envíos no lleva ✅: no se midió.
+function _viasDeEmailInforme({ cohorte = [], respaldo = [], enviados = [], malos = [], verificados = [] } = {}) {
+  const lower = (x) => String(x || "").trim().toLowerCase();
+  const fuentesDe = (a) => {
+    const m = new Map();
+    for (const [k, v] of Object.entries(a?.email_sources || {})) {
+      const em = lower(k);
+      const s = lower(_normSrc(v));
+      if (em && !em.startsWith("__") && s) m.set(em, s);
+    }
+    return m;
+  };
+  const viaDe = new Map();
+  for (const a of [...(respaldo || []), ...(cohorte || [])]) for (const [em, s] of fuentesDe(a)) viaDe.set(em, s);
+  const via = {};
+  const fila = (v) => (via[v] = via[v] || { n: 0, rebotes: 0, env: 0, ver: 0, mvNo: 0 });
+  let formularios = 0;
+  const vistos = new Set();
+  for (const a of (cohorte || [])) {
+    const dom = lower(a?.domain);
+    if (dom) { if (vistos.has(dom)) continue; vistos.add(dom); }
+    const propias = fuentesDe(a);
+    formularios += Object.keys(a?.email_sources || {}).filter(k => String(k).startsWith("__")).length;
+    const ems = new Set((Array.isArray(a?.emails) ? a.emails : []).map(lower).filter(e => e && !e.startsWith("__")));
+    for (const em of ems) fila(propias.get(em) || viaDe.get(em) || "?").n++;
+  }
+  const viaEnvio = new Map();   // email enviado en la ventana → vía con la que se mandó
+  for (const s of (enviados || [])) {
+    const em = lower(s?.email_to);
+    if (!em) continue;
+    const v = lower(_normSrc(s?.details?.source)) || viaDe.get(em) || "";
+    if (!v) continue;
+    viaEnvio.set(em, v);
+    fila(v).env++;
+  }
+  const verSet = new Set((verificados || []).map(m => lower(m?.email)).filter(Boolean));
+  for (const em of verSet) { const v = viaDe.get(em); if (v) fila(v).ver++; }
+  let rebotesSinVia = 0;
+  const malosVistos = new Set();
+  for (const f of (malos || [])) {
+    const em = lower(f?.email);
+    if (!em || malosVistos.has(`${f.evidencia}|${em}`)) continue;
+    malosVistos.add(`${f.evidencia}|${em}`);
+    if (f.evidencia === "rebote_smtp") {
+      const v = viaEnvio.get(em);
+      if (v) via[v].rebotes++; else rebotesSinVia++;
+    } else if (f.evidencia === "verificador") {
+      const v = viaDe.get(em);
+      if (v && verSet.has(em)) via[v].mvNo++;
+    }
+  }
+  const lineas = [];
+  for (const [v, d] of Object.entries(via).sort((a, b) => (b[1].n + b[1].env) - (a[1].n + a[1].env)).slice(0, 12)) {
+    const pct = d.env ? Math.round(100 * d.rebotes / d.env) : 0;
+    const señal = !d.env ? "·" : d.rebotes === 0 ? "✅" : pct <= 5 ? "⚠️" : "🔴";
+    lineas.push(`   ${señal} ${v.padEnd(18)} ${String(d.n).padStart(4)} email(s) · rebotaron ${String(d.rebotes).padStart(3)} (${pct}%) de ${d.env} enviados · MV descartó ${d.mvNo} de ${d.ver} verificados`);
+  }
+  return { lineas, via, rebotesSinVia, formularios };
+}
+
 // Acumula un hallazgo en el resumen pendiente. Deduplica por clave: si el mismo
 // problema aparece 40 veces en 3 días, en el mail va UNA línea con el conteo.
 async function _acumularEnResumen(token, item) {
@@ -26646,8 +26965,10 @@ async function _acumularCuracion(token, texto) {
 // el envío contra su cupo, el feeder contra sus carriles, el pulido contra su cola.
 // Va dentro del resumen diario que ya existe — la regla del user sigue siendo un mail de
 // resumen y uno de alertas por día, no tres.
-async function _boletinPorSeccion(token) {
-  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+// `compartido`: el resumen de salud recibe acá las filas de la cola que leyó el boletín, para que
+// DESCARTES DE LA COLA cuente exactamente la misma población que "La cola procesó" (2026-09-13).
+async function _boletinPorSeccion(token, { compartido = null } = {}) {
+  const auth ={ "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   // ── LA MISMA VENTANA QUE EL CUPO (Maxi 2026-08-31) ──────────────────────────────────
   // El bloque de ENVÍO usaba 24h CORRIDAS mientras la alerta de "no llegó a su cupo" usa el
   // día calendario. Resultado: el MISMO mail decía "72 de 60, 24 cada uno" arriba y "16 de
@@ -26729,45 +27050,51 @@ async function _boletinPorSeccion(token) {
     // su fecha de alta vieja. Por eso "agent 26→20" salía con 0 altas "agent" y "similar 525→181" con
     // 141 altas. Se separan cruzando por DOMINIO (el CRM reetiqueta la fuente a monday_refresh), con
     // los mismos nombres de fuente que el parte. `order=id`: sin orden la paginación puede repetir filas.
-    const _proc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=source,status,domain&order=id`, auth)) || [];
+    // ⚠️ Y "PROCESÓ" NO ES "SALIÓ", NI UNA ETIQUETA ES UNA FUENTE (2026-09-13, segunda revisión).
+    // Las filas que vuelven a pending/next_day también estampan processed_at: "La cola procesó 1227"
+    // y "Drenó 1227" contaban ítems que seguían en la cola. Y el feeder, el import del MB y el
+    // re-trabajo (congelados y re-chequeos que vuelven con la etiqueta de Prospects) sumaban en la
+    // misma fuente: "sellers_json 105→0" parecía una fuente muerta y era re-trabajo. El embudo lo
+    // arma _embudoColaInforme; las reactivadas se buscan en Prospects para decir con qué etiqueta
+    // quedaron. Estas MISMAS filas van al resumen para DESCARTES DE LA COLA: los números cuadran.
+    const _proc = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde24}&select=domain,source,status,uploaded_by,error_message&order=id`, auth);
+    if (compartido) compartido.cola = _proc;
+    const _procFilas = Array.isArray(_proc) ? _proc : [];
     const _altasFilas = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&select=source,domain&order=id`, auth)) || [];
-    const _nuevosDom = new Set(_altasFilas.map(a => String(a.domain || "").toLowerCase()));
-    const _porSrc = {};
-    let _reactivadas = 0;
-    for (const f of _proc) {
-      const k = _nombreFuenteInforme(f.source);
-      const e = (_porSrc[k] = _porSrc[k] || { n: 0, ok: 0, nuevas: 0 });
-      e.n++;
-      if (f.status === "done") {
-        e.ok++;
-        if (_nuevosDom.has(String(f.domain || "").toLowerCase())) e.nuevas++; else _reactivadas++;
-      }
+    const _nuevosDom = new Set(_altasFilas.map(a => String(a.domain || "").trim().toLowerCase()));
+    const _reactivDom = [...new Set(_procFilas.filter(f => f.status === "done")
+      .map(f => String(f.domain || "").trim().toLowerCase()).filter(d => d && !_nuevosDom.has(d)))];
+    const _prosReact = [];
+    for (let i = 0; i < _reactivDom.length; i += 80) {
+      const _lote = _reactivDom.slice(i, i + 80).map(d => encodeURIComponent(d)).join(",");
+      const _r = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=in.(${_lote})&select=domain,source&order=id`, auth);
+      if (Array.isArray(_r)) _prosReact.push(..._r);
     }
+    const _emb = _embudoColaInforme(_procFilas, { altas: _altasFilas, prospects: _prosReact });
     const _altas = _altasFilas.length;
     const _altasPor = {};
     for (const a of _altasFilas) { const k = _nombreFuenteInforme(a.source); _altasPor[k] = (_altasPor[k] || 0) + 1; }
-    const _fuentes = Object.entries(_porSrc).sort((a, b) => b[1].n - a[1].n);
-    const _llegaron = _fuentes.reduce((s, [, v]) => s + v.ok, 0);
     _nota("DESCUBRIMIENTO (24h)", _altas >= 15 ? "✅" : _altas >= 5 ? "🟡" : "🔴", [
       `${_altas} alta(s) en Prospects: ${Object.entries(_altasPor).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(" · ") || "ninguna"}`,
-      `La cola procesó ${_proc.length} · llegaron a Prospects ${_llegaron} (${_llegaron - _reactivadas} nuevas, ${_reactivadas} ya estaban y se reactivaron): ${_fuentes.map(([k, v]) => `${k} ${v.n}→${v.ok}${v.ok && v.nuevas !== v.ok ? ` (${v.nuevas} nuevas)` : ""}`).join(" · ") || "nada procesado"}`,
-      ...(_reactivadas ? ["Las altas cuentan sólo filas nuevas: una reactivada ya estaba en la base (congelada, rechazada o reciclada del CRM) y conserva su fecha de alta."] : []),
-      ...(_altas < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en DESCARTES DEL DESCUBRIMIENTO, abajo."] : []),
+      ...(_proc == null ? ["No se pudo leer la cola: el embudo de abajo no es un cero."] : []),
+      ..._lineasEmbudoCola(_emb),
+      ...(_emb.reactivadas ? ["Las altas cuentan sólo filas nuevas: una reactivada ya estaba en la base (congelada, rechazada o reciclada del CRM), vuelve al pool y conserva su fecha de alta."] : []),
+      ...(_altas < 15 ? ["Qué mirar: si una fuente procesa mucho y pasa poco, sus descartes están en DESCARTES DE LA COLA, abajo."] : []),
     ]);
 
     // ── BÚSQUEDA DE EMAILS ────────────────────────────────────────────────
-    const _mudos = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=id`);
+    const _mudos = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&${FILTRO_SIN_EMAIL_INFORME}&select=id`);
     const _rescatados = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desde24}&select=id`);
     const _diag24 = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_diag_sin_email?created_at=gte.${desde24}&select=motivo`, auth)) || [];
     const _porMot = {};
     for (const d of _diag24) _porMot[d.motivo] = (_porMot[d.motivo] || 0) + 1;
     // Por FUENTE: es lo que dice si las vías nuevas (Google fuera del sitio, rol con MX, Apollo
-    // quemando el ciclo) traen algo o no. Sale de email_sources de los rescatados en 24h.
-    const _resc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desde24}&select=email_sources`, auth)) || [];
+    // quemando el ciclo) traen algo o no. La vía es la del PRIMER email vigente (el que puso el
+    // rescate), nunca el orden de las claves de email_sources, que es jsonb (_viaDelRescate, 13/09).
+    const _resc = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?email_found_at=gte.${desde24}&select=emails,email_sources&order=id`, auth)) || [];
     const _porFuenteResc = {};
     for (const r of _resc) {
-      const vals = Object.values(r.email_sources || {}).map(v => _normSrc(v).toLowerCase()).filter(Boolean);
-      const f = vals[vals.length - 1] || "?";     // la última fuente escrita es la del rescate
+      const f = _viaDelRescate(r);
       _porFuenteResc[f] = (_porFuenteResc[f] || 0) + 1;
     }
     // Un conteo que no se pudo leer nunca da ✅ (2026-09-13): `_mudos ?? 1` convertía un timeout en
@@ -26788,11 +27115,16 @@ async function _boletinPorSeccion(token) {
       if (n == null) _porSt[st] = "?";        // una lectura fallida no es "vacía" (2026-09-13)
       else if (n) _porSt[st] = n;
     }
-    const _drenado = _proc.length;
-    _nota("COLA", _drenado >= 100 ? "✅" : _drenado >= 30 ? "🟡" : "🔴", [
-      `Drenó ${_drenado} en 24h. Ahora: ${Object.entries(_porSt).map(([k, v]) => `${k} ${v}`).join(" · ") || "vacía"}.`,
+    // Drenar es SALIR de la cola (procesadas + congeladas). Lo pospuesto se muestra aparte: una cola
+    // que corre pero pospone (sin cuota, tráfico transitorio) no es un ciclo parado (2026-09-13).
+    const _drenado = _emb.procesadas + _emb.congeladas;
+    _nota("COLA", _proc == null ? "🟡" : _drenado >= 100 ? "✅" : _drenado >= 30 ? "🟡" : "🔴", [
+      `Drenó ${_proc == null ? "?" : _drenado} en 24h${_emb.pospuestas ? ` (y pospuso ${_emb.pospuestas}: vuelven a la cola, no salieron)` : ""}. Ahora: ${Object.entries(_porSt).map(([k, v]) => `${k} ${v}`).join(" · ") || "vacía"}.`,
       ...((_porSt.error || 0) > 20 ? [`⚠️ ${_porSt.error} en error — el detalle está en ERRORES CONCRETOS.`] : []),
-      ...(_drenado < 30 ? ["Qué mirar: si pending>0 y drena 0, el ciclo de la cola no está corriendo — pedir los logs de Railway."] : []),
+      ...(_proc == null ? ["No se pudo leer la cola: el \"?\" no es un cero."]
+        : _drenado < 30 ? [_emb.pospuestas > 0
+          ? "Qué mirar: la cola corre pero pospone — ver el error_message de pending/next_day (cuota de API o tráfico transitorio)."
+          : "Qué mirar: si pending>0 y drena 0, el ciclo de la cola no está corriendo — pedir los logs de Railway."] : []),
     ]);
 
     // ── MONDAY (reciclado hacia cero) ─────────────────────────────────────
@@ -26943,7 +27275,7 @@ async function _boletinPorSeccion(token) {
       const _za = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?created_at=gte.${desde24}&domain=like.*.za&select=id`);
       const _barridoMarcas = await _cnt(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?suspect_reason=like.barrido:*&suspect_checked_at=gte.${desde24}&select=id`);
       _lp.push(`· Entraron sin ads.txt por AdSense activo: ${_adsense ?? "?"} · sitios .za nuevos: ${_za ?? "?"} · marcados ⚠️ por el barrido: ${_barridoMarcas ?? "?"} (24h)`);
-      _lp.push(`· Emails nuevos por vía (24h): ${["apollo", "serper_persona", "rol_mx", "google_contact", "scrape"].map(f => `${f} ${_porFuenteResc[f] || 0}`).join(" · ")}`);
+      _lp.push(`· Emails nuevos por vía (24h): ${_lineaEmailsPorVia(_porFuenteResc)}`);
       if (_porJob.fetch_page_content && _porJob.fetch_page_content.last_status === "fail") _lp.unshift(`🔴 fetchPageContent con error interno: ${String(_porJob.fetch_page_content.last_detail || "").slice(0, 140)}`);
       const _algunFail = _jobsPlan.some(j => _porJob[j] && _porJob[j].last_status === "fail");
       _nota("EL PLAN DEL 04/09, DÍA A DÍA", _algunFail ? "🔴" : "ℹ️", _lp);
@@ -27016,6 +27348,7 @@ async function enviarResumenSalud(token) {
 
     let pend = [], curado = [];
     let _rojasBoletin = [], _amarBoletin = [], _lineaEnvio = "";
+    const _compartido = {};   // las filas de la cola que leyó el boletín (DESCARTES DE LA COLA las reusa)
     try { pend   = JSON.parse(cfg.salud_resumen_pendiente || "[]"); } catch {}
     try { curado = JSON.parse(cfg.salud_resumen_curado || "[]"); } catch {}
     // Nada que contar → no se molesta a nadie, pero se corre la ventana igual para
@@ -27033,7 +27366,7 @@ async function enviarResumenSalud(token) {
     // El boletín por sección va PRIMERO: es la foto general. Las alertas y errores de abajo
     // son el detalle de lo que acá salga en amarillo o rojo.
     try {
-      const _boletin = await _boletinPorSeccion(token);
+      const _boletin = await _boletinPorSeccion(token, { compartido: _compartido });
       if (_boletin.length) {
         partes.push("📋 CÓMO RINDIÓ CADA SECCIÓN (24h):", ..._boletin, "");
         _rojasBoletin  = _boletin.filter(l => l.startsWith("🔴")).map(l => l.slice(2).trim());
@@ -27160,22 +27493,21 @@ async function enviarResumenSalud(token) {
       // ⚠️ "EL STOCK DE N" ERA UN PEDAZO (2026-09-13). Filtraba `email_ultimo_motivo=not.is.null` y
       // salía en el mismo mail que "quedan N sin email" con otro número (331/292, 477/297, 438/327).
       // Ahora es la misma población, y se dice cuántos todavía no tienen motivo del barrido.
-      const _pendSinMail = (await _traerTodo(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=eq.%5B%5D&select=domain,email_ultimo_motivo`,
-        _auth)) || [];
-      const _sinMail = Array.isArray(_pendSinMail) ? _pendSinMail.filter(l => l.email_ultimo_motivo) : [];
-      const _sinPasar = (Array.isArray(_pendSinMail) ? _pendSinMail.length : 0) - _sinMail.length;
-      if (Array.isArray(_pendSinMail) && _pendSinMail.length) {
-        const _porMotivo = {};
-        for (const l of _sinMail) {
-          // Los motivos con detalle traen el ejemplo pegado; se agrupa por el prefijo.
-          const _k = String(l.email_ultimo_motivo || "").split(":")[0];
-          (_porMotivo[_k] = _porMotivo[_k] || { n: 0, ej: new Set() }).n++;
-          if (_porMotivo[_k].ej.size < 2) _porMotivo[_k].ej.add(l.domain);
-        }
-        const _top = Object.entries(_porMotivo).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
-        _errs.push(`SIN EMAIL — hay ${_pendSinMail.length} pendientes sin email (lo acumulado, no es de hoy): ${_sinMail.length} ya tienen motivo del barrido de emails y ${_sinPasar} todavía no.${_sinMail.length ? " Los que tienen motivo, agrupados:" : ""}`);
-        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}. Ej: ${[...v.ej].join(", ")}`);
+      // ⚠️ Y LOS SIN MOTIVO NO TENÍAN RENGLÓN (2026-09-13, segunda revisión). El top 5 sumaba 314 de 327
+      // y los 111 sin motivo sólo aparecían como resta. Ahora todo lead cae en un grupo
+      // (_agruparStockSinEmail): los sin motivo se parten en "todavía no buscado" y "marca borrada"
+      // (ya se buscó y alguien le limpió el motivo), y lo que no entra al top va a "otros".
+      const _pendSinMailLeido = await _traerTodo(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&${FILTRO_SIN_EMAIL_INFORME}&select=domain,email_ultimo_motivo,email_intentos&order=id`,
+        _auth);
+      const _pendSinMail = Array.isArray(_pendSinMailLeido) ? _pendSinMailLeido : [];
+      if (_pendSinMailLeido == null) {
+        _errs.push("SIN EMAIL — no se pudo leer el stock de pendientes sin email (no es un cero).");
+      } else if (_pendSinMail.length) {
+        const _st = _agruparStockSinEmail(_pendSinMail, 5);
+        _errs.push(`SIN EMAIL — hay ${_pendSinMail.length} pendientes sin email (lo acumulado, no es de hoy): ${_st.conMotivo} ya tienen motivo del barrido de emails y ${_pendSinMail.length - _st.conMotivo} todavía no. Todos, por su último motivo:`);
+        for (const [k, v] of _st.grupos) _errs.push(`   · ${k} → ${v.n}${v.ej.length ? `. Ej: ${v.ej.join(", ")}` : ""}`);
+        if (_st.otros > 0) _errs.push(`   · otros motivos → ${_st.otros}`);
       }
 
       // 1b) El comentario REAL de un caso concreto, para poder verificarlo a mano.
@@ -27194,22 +27526,43 @@ async function enviarResumenSalud(token) {
         }
       }
 
-      // 1c) Descartes del descubrimiento, con el motivo explicado.
-      const _diagDesc = (await _traerTodo(
-        `${SUPABASE_URL}/rest/v1/toolbar_diag_descartes?created_at=gte.${_desdeResumenISO}&select=domain,etapa,motivo,comentario&order=created_at.desc`,
-        _auth)) || [];
-      if (Array.isArray(_diagDesc) && _diagDesc.length) {
-        // Por MOTIVO y no por etapa: "geo_bloqueada 54" mezclaba Estados Unidos, Reino Unido y
-        // Rusia, y "tipo_de_negocio 18" mezclaba streaming con e-commerce. El motivo trae el
-        // detalle después de los dos puntos, y es lo que se necesita para decidir algo.
-        const _porMotivo = {};
-        for (const d of _diagDesc) (_porMotivo[d.motivo || d.etapa] = _porMotivo[d.motivo || d.etapa] || []).push(d);
-        _errs.push("", `DESCARTES DEL DESCUBRIMIENTO (${_diagDesc.length} en 24h) — por qué:`);
-        for (const [mot, arr] of Object.entries(_porMotivo).sort((a, b) => b[1].length - a[1].length).slice(0, 6)) {
-          _errs.push(`   · ${mot} → ${arr.length}. Ej: ${[...new Set(arr.map(x => x.domain))].slice(0, 2).join(", ")}`);
+      // 1c) DESCARTES DE LA COLA, con el motivo explicado.
+      // ⚠️ ERAN 3 MOTIVOS DE ~20 (2026-09-13, segunda revisión). Este bloque leía toolbar_diag_descartes,
+      // que sólo escriben sin_ads_txt, tipo_no_prospectable y geo_excluida: el 12/09 decía "74 en 24h"
+      // con ~950 procesados que no pasaron. Tráfico bajo, deprio-geo, CRM activo, not_publisher y
+      // subdominio duplicado —lo que más saca de la cola— no aparecían. Ahora sale de las MISMAS filas
+      // de csv_queue que "La cola procesó" del boletín, agrupadas por _agruparRechazosCola (la misma
+      // del parte), así que cuadra: procesados = llegaron + descartes + ya estaban + errores.
+      // toolbar_diag_descartes queda para el comentario largo de un caso, buscado por dominio (la cola
+      // dice worker_geo_excluded y el diagnóstico geo_excluida: por nombre no se encuentra).
+      const _cola24 = Array.isArray(_compartido.cola) ? _compartido.cola
+        : await _traerTodo(
+          `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${new Date(Date.now() - 24 * 3600_000).toISOString()}&select=domain,source,status,uploaded_by,error_message&order=id`,
+          _auth);
+      if (_cola24 == null) {
+        _errs.push("", "DESCARTES DE LA COLA — no se pudo leer la cola (no es un cero).");
+      } else {
+        const _rc = _agruparRechazosCola(_cola24);
+        const _procesadas = _cola24.filter(f => _estadoColaInforme(f.status) === "procesada").length;
+        const _llegaronCola = _cola24.filter(f => f.status === "done").length;
+        if (_rc.totalNoPasados) {
+          _errs.push("", `DESCARTES DE LA COLA (24h) — de ${_procesadas} procesados, ${_llegaronCola} llegaron a Prospects, ${_rc.totalDescartes} se descartaron, ${_rc.yaEstaban} ya estaban y ${_rc.errores} dieron error. Por qué se descartan:`);
+          for (const [mot, g] of _rc.top.slice(0, 8)) {
+            const _pf = Object.entries(g.porFuente).sort((a, b) => b[1] - a[1]);
+            _errs.push(`   · ${mot} → ${g.n}${_pf.length > 1 ? ` (${_pf.slice(0, 4).map(([f, n]) => `${f} ${n}`).join(", ")})` : ""}${g.ej.length ? `. Ej: ${g.ej.join(", ")}` : ""}`);
+          }
+          if (_rc.top.length > 8) _errs.push(`   · otros motivos → ${_rc.top.slice(8).reduce((s, [, g]) => s + g.n, 0)}`);
+          if (_rc.reintentables || _rc.reencolados || _rc.congelados) {
+            _errs.push(`   No son descartes ni cuentan como procesados: ${_rc.reintentables} vuelven mañana · ${_rc.reencolados} vuelven a la cola · ${_rc.congelados} congelados.`);
+          }
+          const _diagDesc = (await _traerTodo(
+            `${SUPABASE_URL}/rest/v1/toolbar_diag_descartes?created_at=gte.${_desdeResumenISO}&select=domain,motivo,comentario&order=created_at.desc`,
+            _auth)) || [];
+          const _ejDom = new Set(_rc.top.slice(0, 8).flatMap(([, g]) => g.ej));
+          const _ej = _diagDesc.find(x => x.comentario && _ejDom.has(String(x.domain || "").trim().toLowerCase()))
+            || _diagDesc.find(x => x.comentario);
+          if (_ej) _errs.push(`     (por ejemplo, ${_ej.domain}${_ej.motivo ? ` [${_ej.motivo}]` : ""}: ${_cortarComentario(_ej.comentario, 400)})`);
         }
-        const _ej = _diagDesc.find(x => x.comentario);
-        if (_ej) _errs.push(`     (por ejemplo, ${_ej.domain}: ${String(_ej.comentario).slice(0, 220)})`);
       }
 
       // 2) Por qué el agente saltea envíos.
@@ -27217,15 +27570,13 @@ async function enviarResumenSalud(token) {
         `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.skipped&created_at=gte.${_desdeResumenISO}&select=reason,domain`,
         _auth)) || [];
       if (Array.isArray(_skips) && _skips.length) {
-        const _porRazon = {};
-        for (const a of _skips) {
-          const _k = String(a.reason || "(sin motivo)").split(":").slice(0, 2).join(":");
-          (_porRazon[_k] = _porRazon[_k] || { n: 0, ej: new Set() }).n++;
-          if (_porRazon[_k].ej.size < 2 && a.domain) _porRazon[_k].ej.add(a.domain);
+        // Eventos Y dominios distintos (2026-09-13): el mismo lead salteado en varios turnos o por los
+        // dos buzones inflaba el freno. El número entre paréntesis aparece sólo cuando hay repetidos.
+        const _g = _agruparSalteados(_skips);
+        _errs.push("", `ENVÍOS SALTEADOS (${_g.total} en 24h, ${_nDominios(_g.dominios)}) — por qué:`);
+        for (const r of _g.top) {
+          _errs.push(`   · ${r.motivo} → ${r.n}${r.dominios && r.dominios !== r.n ? ` (${_nDominios(r.dominios)})` : ""}${r.ej.length ? `. Ej: ${r.ej.join(", ")}` : ""}`);
         }
-        const _top = Object.entries(_porRazon).sort((a, b) => b[1].n - a[1].n).slice(0, 5);
-        _errs.push("", `ENVÍOS SALTEADOS (${_skips.length} en 24h) — por qué:`);
-        for (const [k, v] of _top) _errs.push(`   · ${k} → ${v.n}${v.ej.size ? `. Ej: ${[...v.ej].join(", ")}` : ""}`);
       }
 
       // 3) Lo que la cola no pudo procesar, con el error textual.
