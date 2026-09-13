@@ -1098,7 +1098,15 @@ const _ETIQUETAS_DE_REINTENTO = new Set(["agent", "frozen_retry", "prospects_off
 // rechazó una persona y la marca se queda. Todo lo demás también se queda, porque no se puede
 // distinguir de un rechazo a mano: "mb: …", y el ❌ SIN motivo, que deja suspect_reject=true con la
 // razón vacía (rejectReviewItem). Esas vuelven a Alert para que el MB decida con ✓ o ❌.
-const _MARCA_AUTOMATICA_RE = /^(purge|urlpurge|envio|descongelado):/i;
+// (2026-09-13) Faltaban dos prefijos que nacieron el mismo día que esta lista, en otras ramas:
+//   · `cleanup:` — _cleanupPool dejó de borrar y rechaza por tráfico (trafico_bajo / sin_trafico). Un
+//     lead que vuelve ya pasó el piso de 350K de saveToReviewQueue: el motivo viejo no aplica. Sin él
+//     volvía pending con suspect_reject=true y el agente, el pulido y el barrido no lo tomaban nunca.
+//   · `cola:` — "Quitar" de la cola 'Por enviar' rechaza lo que se guardó sin pasar el filtro de entrada
+//     (modules/colaEstado.js). No es un juicio del MB sobre el sitio: si después pasa el filtro, vuelve.
+// No se arma con CLEANUP_PREFIJO: esa constante se declara más abajo y leerla acá, al cargar el
+// módulo, tira ReferenceError y el worker no arranca. Un test ata las dos puntas.
+const _MARCA_AUTOMATICA_RE = /^(purge|urlpurge|envio|descongelado|cleanup|cola):/i;
 
 /**
  * Qué hacer con la fila que ya existe para el dominio. Pura.
@@ -4325,6 +4333,9 @@ async function _dominiosActivosEnCola(token, candidatos) {
 // barrido diario y el feeder por slot— desde el 13/09: el barrido cruzaba contra Prospects desde el
 // 25/08 y el feeder no, así que un reciclable pending volvía a la cola y le borraban la espera de
 // búsqueda de email. `null` = algún lote no se pudo leer; nunca significa "ninguno está".
+// (2026-09-13) Cuenta también `por_enviar`: el lead sigue en Prospects, sólo que un MB lo pasó a su
+// tanda de envío. Sin eso el reciclado lo re-encolaba, la cola pagaba la cadena entera y terminaba en
+// 'en_cola_de_envio'. El modo 'reciclable' de findKnownDomains (extensión) usa el mismo filtro.
 async function _dominiosPendientesEnProspects(token, candidatos) {
   const out = new Set();
   if (!Array.isArray(candidatos) || !candidatos.length) return out;
@@ -4333,7 +4344,7 @@ async function _dominiosPendientesEnProspects(token, candidatos) {
     const inList = candidatos.slice(i, i + BATCH).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
     try {
       const r = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=in.(${encodeURIComponent(inList)})&select=domain`,
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=in.(pending,por_enviar)&domain=in.(${encodeURIComponent(inList)})&select=domain`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(10000) });
       if (!r.ok) return null;
       const rows = await r.json();
@@ -15037,7 +15048,10 @@ function _vaABlocklistInoperativo({ prevFreeze = 0, deCache = false, source = ""
 // Qué hacer con la fila de la cola según lo que devolvió saveToReviewQueue. Todo lo que no era "ok"
 // quedaba 'skipped' con review_queue_insert_fail, un estado final: un 503 de la base al guardar
 // tiraba un lead que ya había pagado tráfico, scrape y quizá un crédito de Apollo.
-//   · dup / floor / contactado_hace_poco → son veredictos: 'skipped', como siempre.
+//   · dup / floor / contactado_hace_poco / en_cola_de_envio → son veredictos: 'skipped', como siempre.
+//     (2026-09-13) en_cola_de_envio (la fila está en la tanda 'Por enviar' de un MB) caía en "base
+//     rota": la fila iba a 'error', que no cuenta como cola activa y se volvía a encolar y pagar, y
+//     salía la alerta roja "revisar columnas o permisos" por un lead que sólo estaba esperando al MB.
 //   · 5xx, 408, 429 o corte de red (http_net) → falla pasajera: vuelve mañana, hasta 3 veces, con
 //     un contador propio `ins_N` (el `retry_N` es del tráfico y no se pueden pisar). Después, error.
 //   · 4xx, http_max_retries (columnas que la base no tiene) o cualquier otra cosa → la base está
@@ -15048,7 +15062,7 @@ function _vaABlocklistInoperativo({ prevFreeze = 0, deCache = false, source = ""
 function _estadoTrasGuardar(saved, mensajePrevio = "") {
   const s = String(saved ?? "");
   if (s === "ok") return { status: "done", error_message: null, alerta: false };
-  if (s === "dup" || s === "floor" || s === "contactado_hace_poco") {
+  if (s === "dup" || s === "floor" || s === "contactado_hace_poco" || s === "en_cola_de_envio") {
     return { status: "skipped", error_message: `review_queue_insert_fail:${s}`, alerta: false };
   }
   const codigo = s.match(/^http_[a-z0-9]+/i)?.[0] || "";
@@ -15140,10 +15154,13 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   // pueden pasar días, y en el medio otra vía —similar-expansion, ads.txt-graph, un import
   // del MB— lo puede haber metido en Prospects. La cola no se entera.
   // Una consulta al principio cuesta nada y ahorra la cadena entera.
+  // (2026-09-13) `por_enviar` también: es un lead de Prospects que un MB pasó a su tanda de envío.
+  // Con sólo `pending` se pagaba tráfico, Haiku y quizá Apollo para que al final saveToReviewQueue
+  // dijera "en_cola_de_envio". Misma regla que _dominiosPendientesEnProspects.
   if (!isManualImport) {
     try {
       const yaEsta = await fetch(
-        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=eq.pending&select=id&limit=1`,
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&status=in.(pending,por_enviar)&select=id&limit=1`,
         { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
       ).then(r => r.ok ? r.json() : null).catch(() => null);
       if (Array.isArray(yaEsta) && yaEsta.length) {
@@ -25005,6 +25022,36 @@ async function runAgentCycle(token, allFlags) {
           }
           continue; // próximo lead
         }
+        // ── ¿LA FILA SIGUE EN PROSPECTS? SE RELEE JUSTO ANTES DE MANDAR (2026-09-13) ──────────────
+        // El pool se carga una vez por buzón y cada lead pasa minutos por enriquecimiento, CRM, MV, pitch
+        // y reserva sin volver a mirar su estado. Si en ese rato un MB lo guardó en su cola 'Por enviar'
+        // (o el lote ya lo cargó al CRM, que manda su propio inicial), el agente mandaba igual y el paso 7
+        // lo pasaba a validated: la fila desaparecía de la cola del MB sin aviso y el sitio podía recibir
+        // dos contactos. Falla CERRADO, como el guard de sendtrack: si no se puede leer, no se manda; la
+        // fila sigue pending y se reintenta el turno siguiente. Cuesta un GET por mail que sale.
+        let _estadoFila = null;
+        try {
+          const _rs = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}&select=status`, {
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+            signal: AbortSignal.timeout(10000),
+          });
+          const _filasEstado = _rs.ok ? await _rs.json() : null;
+          if (Array.isArray(_filasEstado)) _estadoFila = String(_filasEstado[0]?.status || "borrada");
+        } catch {}
+        if (_estadoFila !== "pending") {
+          const _motivoFila = _estadoFila === null ? "review_queue_no_verificable" : `review_queue_status:${_estadoFila}`;
+          log(`  ⏸️ ${domain}: ${_estadoFila === null ? "no pude releer su fila de Prospects" : `su fila ya no está pending (${_estadoFila})`} — NO se manda`);
+          const _rpFila = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?id=eq.${reservedId}`, {
+            method: "PATCH",
+            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+            body: JSON.stringify({ action: "skipped", reason: _motivoFila }),
+            signal: AbortSignal.timeout(10000),
+          }).catch(() => null);
+          if (!_rpFila?.ok) {
+            await logAgentAction(token, userEmail, { domain, action: "skipped", reason: _motivoFila, details: { email, reserva_no_actualizada: true } }).catch(() => {});
+          }
+          continue; // próximo lead
+        }
         // Maxi 2026-08-18: TECHO DE TIEMPO al envío completo. La lección del apagón del 12 al 18
         // de agosto: un solo fetch sin timeout adentro de sendGmailServer congeló el agente seis
         // días sin dejar UN error. Lo peligroso no fue el fetch, fue que un cuelgue no se
@@ -25233,11 +25280,19 @@ async function runAgentCycle(token, allFlags) {
         });
 
         // 7. Marcar el review_queue item como validated_by agent
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
+        // (2026-09-13) Sólo si sigue pending: si un MB la pasó a 'Por enviar' entre la relectura y acá, no
+        // se le pisa la cola. El envío ya quedó en sendtrack (paso 6), así que el lote o "Quitar" la
+        // cierran como contactada. Con reloj y sin tirar: una excepción acá caía en el catch de abajo,
+        // que marca 'failed' y libera el cupo de un mail que SÍ salió.
+        const _val = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}&status=eq.pending&select=id`, {
           method: "PATCH",
-          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json" },
+          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=representation" },
           body: JSON.stringify({ status: "validated", validated_by: `agent:${userEmail}`, validated_at: new Date().toISOString() }),
-        });
+          signal: AbortSignal.timeout(10000),
+        }).catch(() => null);
+        const _valFilas = _val?.ok ? await _val.json().catch(() => null) : null;
+        if (Array.isArray(_valFilas) && _valFilas.length === 0) log(`  ⚠️ ${domain}: enviado, pero su fila ya no estaba pending — no se pisa`);
+        else if (!_val?.ok) log(`  ⚠️ ${domain}: enviado, pero no pude marcar su fila validated (${_val ? `HTTP ${_val.status}` : "sin respuesta"}) — el guard de sendtrack evita el segundo envío`);
 
         // 8. Log del resultado de Monday (NO duplica action='sent', solo confirma qué pasó)
         //

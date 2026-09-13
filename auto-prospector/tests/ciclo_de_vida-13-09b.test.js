@@ -247,14 +247,16 @@ test("C43: el modo 'reciclable' de la extensión cruza lo mismo que el reciclado
     ok(pedidos.some(p => p.u.includes("toolbar_url_blocklist")));
     // Los filtros tienen que ser los del worker, textuales.
     const filtroColaWorker = cuerpoDe(worker, "_dominiosActivosEnCola").match(/status=in\.\([^)]+\)/)[0];
-    const filtroProspectsWorker = cuerpoDe(worker, "_dominiosPendientesEnProspects").match(/status=eq\.pending/)[0];
+    // (2026-09-13) Prospects es pending + por_enviar (la tanda de envío de un MB): el filtro se lee del
+    // worker, sea `eq.pending` o `in.(…)`, y la extensión tiene que traer el mismo texto.
+    const filtroProspectsWorker = cuerpoDe(worker, "_dominiosPendientesEnProspects").match(/status=(?:eq\.pending|in\.\([^)]*\))/)[0];
     ok(cola.includes(filtroColaWorker), `cola: ${cola} no trae ${filtroColaWorker}`);
     ok(rq.includes(filtroProspectsWorker), `Prospects: ${rq} no trae ${filtroProspectsWorker}`);
     ok(pedidos.every(p => p.signal), "todo fetch con reloj");
     // El alias viejo no puede caer en el modo "all" (que bloquea cualquier fila histórica).
     pedidos.length = 0;
     await findKnownDomains("https://x.supabase.co", "anon", "tok", ["libre.com"], { mode: "monday_refresh" });
-    ok(pedidos.find(p => p.u.includes("toolbar_review_queue")).u.includes("status=eq.pending"));
+    ok(pedidos.find(p => p.u.includes("toolbar_review_queue")).u.includes(filtroProspectsWorker));
   } finally {
     globalThis.fetch = fetchViejo;
   }

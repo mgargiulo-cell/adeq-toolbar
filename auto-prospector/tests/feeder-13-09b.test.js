@@ -156,7 +156,8 @@ test("los reciclables pasan por UNA regla: contactados, cola, Prospects y sin ad
   globalThis.__fetchFalso = enrutar(pedidos, [
     [(u) => u.includes("toolbar_sendtrack?"), () => (sendtrackOk ? resp([{ domain: "contactado.com" }]) : resp({ message: "boom" }, { status: 500 }))],
     [(u) => u.includes("toolbar_csv_queue?domain=in."), () => resp([{ domain: "encola.com" }])],
-    [(u) => u.includes("toolbar_review_queue?status=eq.pending"), () => resp([{ domain: "Pendiente.com" }])],
+    // (2026-09-13) El cruce contra Prospects pide pending + por_enviar (la tanda de envÃ­o de un MB).
+    [(u) => u.includes("toolbar_review_queue?status=in.(pending,por_enviar)"), () => resp([{ domain: "Pendiente.com" }])],
     [(u) => u.includes("toolbar_adstxt_audit?verdict=eq.no&last_checked_at=gte."), () => resp([{ domain: "sinads.com" }])],
   ]);
   const lista = ["libre2.com", "contactado.com", "encola.com", "pendiente.com", "sinads.com", "libre1.com"];
@@ -173,7 +174,7 @@ test("el feeder por slot no re-baja lo descartado sin ads.txt, borra la marca sÃ
   const pedidos = [];
   globalThis.__fetchFalso = enrutar(pedidos, [
     [(u) => u.includes("/reciclables"), () => resp({ domains: ["pendiente.com", "sinads.com", "nuevo1.com", "nuevo2.com"] })],
-    [(u) => u.includes("toolbar_review_queue?status=eq.pending"), () => resp([{ domain: "pendiente.com" }])],
+    [(u) => u.includes("toolbar_review_queue?status=in.(pending,por_enviar)"), () => resp([{ domain: "pendiente.com" }])],
     [(u) => u.includes("toolbar_adstxt_audit?verdict=eq.no&last_checked_at=gte."), () => resp([{ domain: "sinads.com" }])],
     [(u) => u.includes("toolbar_csv_queue?status=in.(pending,processing,waiting_pool)"), () => resp([], { total: 0 })],
     [(u) => /^https?:\/\/[a-z0-9.-]+\/(app-)?ads\.txt$/.test(u), () => resp("", { status: 404 })],

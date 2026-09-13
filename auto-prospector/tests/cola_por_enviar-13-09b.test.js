@@ -179,7 +179,10 @@ test("C45: estadoAlSacarDeCola devuelve cada fila a su estado anterior", () => {
   }
   const sinFiltro = estadoAlSacarDeCola({ source: "manual_cola" });
   strictEqual(sinFiltro.suspect_reject, true);
-  ok(/^mb: /.test(sinFiltro.suspect_reason), "el motivo lleva el prefijo mb: como los demás rechazos de un MB");
+  // (2026-09-13) Era `mb: `. Ese prefijo es el de un rechazo a mano y el worker lo conserva al reactivar:
+  // si un feeder traía el sitio y pasaba el filtro, volvía con suspect_reject=true y el agente no lo
+  // tomaba. `cola:` es una marca automática (tests/estados_cola-13-09c.test.js ata las dos puntas).
+  strictEqual(sinFiltro.suspect_reason, "cola: sacada_sin_filtro", "no es un juicio del MB: si después pasa el filtro, vuelve limpio");
   strictEqual(estadoAlSacarDeCola({ status_previo: "rejected" }).suspect_reject, undefined, "restaurar un descartado no toca su motivo original");
   strictEqual(estadoAlSacarDeCola({ status_previo: "validated", mail_enviado: true }).sello, false, "un validated viejo conserva quién y cuándo");
   strictEqual(estadoAlSacarDeCola({ status_previo: "pending", mail_enviado: true }).sello, true);
@@ -221,17 +224,22 @@ test("C45 y C52: 'Quitar' arma un PATCH por destino y el cartel dice la verdad a
   ];
   const plan = planSacarDeCola(filas, { contactados: new Set(["b.com"]), minTraffic: MIN, loginEmail: "mb@x.com", ahoraIso: "2026-09-13T10:00:00Z" });
   const porIds = Object.fromEntries(plan.lotes.map(l => [l.ids.join(","), l.body]));
-  deepStrictEqual(porIds["1,5"], { status: "pending" }, "lo de menos de 350K también va a pending: la regla del piso la aplica cleanup_pool");
+  deepStrictEqual(porIds["1"], { status: "pending" });
+  // (2026-09-13) Iba a pending "porque cleanup_pool la borraba". La limpieza ya no borra: rechaza con
+  // rejected_at, y el parte la contaba como purga del pool. Ahora se descarta en el mismo PATCH, con el
+  // motivo de la limpieza y sin rejected_at.
+  deepStrictEqual(porIds["5"], { status: "rejected", suspect_reject: true, suspect_reason: "cleanup: trafico_bajo" }, "menos de 350K: descartada en el mismo PATCH");
   deepStrictEqual(porIds["2"], { status: "validated", validated_by: "mb@x.com", validated_at: "2026-09-13T10:00:00Z" });
   deepStrictEqual(porIds["3"], { status: "rejected" });
-  deepStrictEqual(porIds["4"], { status: "rejected", suspect_reject: true, suspect_reason: "mb: sacada_de_cola_sin_filtro" });
+  deepStrictEqual(porIds["4"], { status: "rejected", suspect_reject: true, suspect_reason: "cola: sacada_sin_filtro" });
   deepStrictEqual(porIds["6"], { status: "validated" });
   for (const l of plan.lotes) ok(!("rejected_at" in l.body), "rejected_at haría que el parte cuente como purga lo que sacó un MB de su cola");
   deepStrictEqual(contarGrupos(["1", "2", "3", "4", "5", "6"], plan.grupoPorId),
     { prospects: 1, bajo_piso: 1, contactado: 2, descartado: 1, sin_filtro: 1, restaurado: 0 });
   const conf = textoConfirmarSacar(plan, { minTraffic: MIN });
   ok(!/no se borran/i.test(conf), conf);
-  ok(/1 vuelven a Prospects/.test(conf) && /2 ya estaban contactados/.test(conf) && /menos de 350K y se eliminan/.test(conf), conf);
+  ok(/1 vuelven a Prospects/.test(conf) && /2 ya estaban contactados/.test(conf) && /menos de 350K y se descartan/.test(conf), conf);
+  ok(!/se eliminan|se borran/i.test(conf), `nada se borra: quedan descartados y se pueden revertir. ${conf}`);
   const fin = textoResultadoSacar(["1", "3"], 6, plan.grupoPorId, { minTraffic: MIN, fallas: ["4 no se pudieron sacar (HTTP 401)"] });
   ok(/Se sacaron 2 de 6/.test(fin) && /HTTP 401/.test(fin), fin);
 });
@@ -453,5 +461,6 @@ test("C52: 'Guardar' no pisa el tráfico de un lead que ya estaba en Prospects",
   strictEqual(filaColaDesdeFormulario(v, { prev: { id: 1, status: "pending", traffic: null } }).traffic, 300000);
   strictEqual(filaColaDesdeFormulario(v, {}).traffic, 300000);
   strictEqual(estadoAlSacarDeCola({ status_previo: "pending", traffic: 300000, minTraffic: MIN }).grupo, "bajo_piso");
-  strictEqual(estadoAlSacarDeCola({ status_previo: "pending", traffic: 0, minTraffic: MIN }).grupo, "prospects", "cleanup_pool sólo borra tráfico mayor que 0");
+  strictEqual(estadoAlSacarDeCola({ status_previo: "pending", traffic: 300000, minTraffic: MIN }).status, "rejected", "se descarta en el mismo PATCH (2026-09-13)");
+  strictEqual(estadoAlSacarDeCola({ status_previo: "pending", traffic: 0, minTraffic: MIN }).grupo, "prospects", "la regla trafico_bajo de cleanup_pool sólo mira tráfico mayor que 0");
 });

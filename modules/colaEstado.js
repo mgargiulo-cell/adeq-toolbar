@@ -116,7 +116,7 @@ export function avisoAlGuardarEnCola(prev, { loginEmail = "", ahoraMs = Date.now
 // pool — idioma ISO, país en inglés o ISO y `geos_all` — nunca la etiqueta del formulario.
 // Fila EXISTENTE: el pool conserva lo que midió. No se tocan idioma, país ni geos_all; el
 // tráfico sólo si no tenía (el que ya pasó el piso de 350K no se reescribe: si el MB lo tipeaba
-// más bajo y después sacaba la fila de la cola, cleanup_pool la borraba en 15 minutos); los
+// más bajo y después sacaba la fila de la cola, quedaba debajo del piso y salía de Prospects); los
 // emails se fusionan; el pitch sólo si el MB escribió uno.
 // Lo que el formulario eligió viaja entero en `monday_payload`, que es lo que lee el lote.
 export function filaColaDesdeFormulario(v, {
@@ -175,10 +175,19 @@ export function filaColaDesdeFormulario(v, {
 //      en suspect_reason: "Guardar" nunca lo borró).
 //   4. Sin estado anterior y creada por la cola (`manual_cola`): nunca pasó el filtro de entrada
 //      (ads.txt, tipo de negocio, GEO). Soltarla en pending la ponía en Prospects y en manos del
-//      agente sin filtro. Queda rejected con motivo `mb:`.
+//      agente sin filtro. Queda rejected con motivo `cola: sacada_sin_filtro`.
+//      (2026-09-13) Era `mb: …`, el prefijo de un rechazo a mano: el worker lo conserva al reactivar,
+//      así que si un feeder la traía y pasaba el filtro, volvía a Prospects con suspect_reject=true y
+//      el agente no la tomaba nunca. No es un juicio del MB sobre el sitio: `cola:` es una marca
+//      automática (_MARCA_AUTOMATICA_RE del worker) y la regla de dedup dice que vuelve si pasa el filtro.
 //   5. Otro estado conocido → se restaura tal cual.
 //   6. Pending (o una fila de antes del arreglo) → pending; si su tráfico está por debajo del
-//      piso, cleanup_pool la va a borrar, y el MB lo tiene que saber ANTES de confirmar.
+//      piso, se descarta en el mismo PATCH con el motivo de cleanup_pool (`cleanup: trafico_bajo`),
+//      y el MB lo sabe ANTES de confirmar.
+//      (2026-09-13) Antes volvía a pending "porque cleanup_pool la iba a borrar". La limpieza ya no
+//      borra: rechaza con rejected_at, así que a los 15 minutos el parte la contaba como purga del
+//      pool, y en ese rato quedaba en Prospects al alcance del pulido (Apollo) y del barrido (Haiku).
+//      Sin rejected_at, como el resto de "Quitar"; `cleanup:` la limpia sola si vuelve con tráfico.
 // `contactado_sendtrack: null` = no se pudo saber (sendtrack no contestó o su respuesta no es
 // creíble, ver lecturaDeEnvios). Lo que no depende de eso (1-4) sale igual; lo que volvería al
 // pool (5-6) se queda en la cola, con status null y grupo "sin_confirmar" (2026-09-13).
@@ -191,21 +200,24 @@ export function estadoAlSacarDeCola({ status_previo = null, source = "", mail_en
   if (previo === "validated") return { status: "validated", grupo: "contactado", sello: false };
   if (previo === "rejected") return { status: "rejected", grupo: "descartado" };
   if (!previo && source === "manual_cola") {
-    return { status: "rejected", grupo: "sin_filtro", suspect_reject: true, suspect_reason: "mb: sacada_de_cola_sin_filtro" };
+    return { status: "rejected", grupo: "sin_filtro", suspect_reject: true, suspect_reason: "cola: sacada_sin_filtro" };
   }
   // Devolverla al pool sin saber si ya se le escribió es justo lo que "Quitar" hacía mal: un
   // contactado de otro MB volvía a Prospects como nuevo. "No sé" no se trata como "no".
   if (contactado_sendtrack === null) return { status: null, grupo: "sin_confirmar" };
   if (previo && previo !== "pending") return { status: previo, grupo: "restaurado" };
   const t = Number(traffic);
-  if (t > 0 && t < minTraffic) return { status: "pending", grupo: "bajo_piso" };
+  // Mismo texto que arma _motivoCleanup en el worker (`${CLEANUP_PREFIJO} trafico_bajo`); un test los ata.
+  if (t > 0 && t < minTraffic) return { status: "rejected", grupo: "bajo_piso", suspect_reject: true, suspect_reason: "cleanup: trafico_bajo" };
   return { status: "pending", grupo: "prospects" };
 }
 
 // Agrupa las filas marcadas en un PATCH por cuerpo distinto (como mucho cinco).
 // ⚠️ `rejected_at` NO se escribe: el parte cuenta como "purgadas hoy" toda fila con
 // rejected_at de hoy (index.js, sección 4 de parteDelDia), y una fila que el MB saca de su cola
-// no es una purga del pool. `status_previo` tampoco se limpia: en cuanto la fila sale de
+// no es una purga del pool. Tampoco en las de menos de 350K (grupo bajo_piso), que se descartan acá
+// mismo con `cleanup: trafico_bajo`: nunca vuelven a Prospects, así que no hay nada que purgar.
+// `status_previo` tampoco se limpia: en cuanto la fila sale de
 // `por_enviar`, statusPrevioAlGuardar lo ignora, y limpiarlo obligaría a un PATCH por fila.
 // `contactados: null` = sendtrack no se pudo leer (o no es creíble): las filas que volverían al
 // pool quedan en `sinConfirmar` y no entran a ningún PATCH.
@@ -245,7 +257,8 @@ const _partes = (c, minTraffic) => [
   c.descartado && `${c.descartado} vuelven a descartados`,
   c.sin_filtro && `${c.sin_filtro} se descartan (se guardaron sin pasar el filtro de entrada)`,
   c.restaurado && `${c.restaurado} vuelven a su estado anterior`,
-  c.bajo_piso && `${c.bajo_piso} tienen menos de ${Math.round(minTraffic / 1000)}K y se eliminan (Prospects no admite menos de ${Math.round(minTraffic / 1000)}K)`,
+  // (2026-09-13) Decía "se eliminan": nada se borra, quedan descartados con motivo y se pueden revertir.
+  c.bajo_piso && `${c.bajo_piso} tienen menos de ${Math.round(minTraffic / 1000)}K y se descartan (Prospects no admite menos de ${Math.round(minTraffic / 1000)}K)`,
 ].filter(Boolean);
 
 // El confirm decía "Quedan en Prospects como pendientes, no se borran", y no era verdad ni

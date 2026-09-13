@@ -5585,7 +5585,7 @@ async function bindButtons() {
   // Antes: PATCH `status: "pending"` a todas, con el cartel "Quedan en Prospects como
   // pendientes, no se borran". Un contactado volvía al pool como nuevo, un descartado volvía a
   // verse, un sitio guardado sin pasar el filtro quedaba en manos del agente, y uno de menos de
-  // 350K se borraba a los 15 minutos contra lo que decía el cartel. La regla está en
+  // 350K volvía a Prospects hasta que la limpieza lo sacaba, contra lo que decía el cartel. La regla está en
   // planSacarDeCola (modules/colaEstado.js) y el cartel dice a dónde va cada uno ANTES de confirmar.
   document.getElementById("btn-cola-borrar")?.addEventListener("click", async () => {
     const ids = _colaMarcados();

@@ -317,9 +317,11 @@ export async function findKnownDomains(supabaseUrl, anonKey, accessToken, candid
     // _dominiosActivosEnCola + _dominiosPendientesEnProspects del worker: cola activa + Prospects
     // pending. Un rechazado o un validado viejo NO bloquea: el worker tampoco lo hace.
     // "monday_refresh" queda como alias para no caer en "all" por un nombre viejo.
+    // (2026-09-13) Prospects incluye `por_enviar`: el lead sigue ahí, en la tanda de envío de un MB.
+    // Con sólo pending la cola lo volvía a pagar entero para terminar en 'en_cola_de_envio'.
     tables = [
       { table: "toolbar_csv_queue",     col: "domain", filter: "&status=in.(pending,processing,waiting_pool,next_day)" },
-      { table: "toolbar_review_queue",  col: "domain", filter: "&status=eq.pending" },
+      { table: "toolbar_review_queue",  col: "domain", filter: "&status=in.(pending,por_enviar)" },
       // Blocklist sí — no re-procesar dominios bloqueados aunque vengan del CRM
       { table: "toolbar_url_blocklist", col: "domain", filter: "" },
     ];
