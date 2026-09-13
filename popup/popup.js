@@ -641,7 +641,6 @@ function initAdminPanel() {
     if (typeof showToast === "function") showToast("▶ Agent resumed", "ok", 3000);
     await loadAdminAgent();
   });
-  document.getElementById("agent-refresh-toggle")?.addEventListener("click", toggleRefreshEmptyLeads);
   document.getElementById("agent-feed-export-csv")?.addEventListener("click", _exportAgentFeedCsv);
   document.getElementById("agent-focus-save")?.addEventListener("click", saveAgentFocus);
 
@@ -1562,27 +1561,9 @@ async function saveAgentFocus() {
   await loadAdminAgent();
 }
 
-async function toggleRefreshEmptyLeads() {
-  // Lee estado actual + lo invierte
-  const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
-  try {
-    const res = await fetch(
-      `${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.agent_refresh_empty_leads&select=value`,
-      { headers }
-    );
-    const rows = await res.json();
-    const current = rows?.[0]?.value === "true";
-    const newVal = !current;
-    await _writeAgentConfig({ agent_refresh_empty_leads: String(newVal) });
-    showToast(newVal ? "🔄 Refresh enabled — worker processes 1 lead/cycle" : "⏸ Refresh disabled", "info");
-    const statusEl = document.getElementById("agent-refresh-status");
-    if (statusEl) statusEl.textContent = `Refresh leads sin traffic: ${newVal ? "🟢 ON" : "⚪ OFF"}`;
-    const btnEl = document.getElementById("agent-refresh-toggle");
-    if (btnEl) btnEl.textContent = newVal ? "⏸ Pause refresh" : "🔄 Activate refresh";
-  } catch (e) {
-    showToast("❌ Error: " + e.message, "error");
-  }
-}
+// 2026-09-13: se sacó el botón "Activar refresh" y su función. Prometía "worker processes 1
+// lead/cycle", pero el worker no hacía nada con esa llave, y hacerlo sería re-comprar el tráfico
+// de leads que ya están en Prospects (regla del 18/08: nunca). El worker retiró el job también.
 
 async function pauseAgent1h() {
   if (!confirm("Pause agent for 1 hour?")) return;

@@ -322,13 +322,9 @@
         <button id="agent-pause-1h" class="btn btn-sm" style="background:#dc2626;color:#fff;font-size:11px;padding:6px 12px" title="Pause agent for 1 hour (manual kill switch)">⏸ Pausar 1h</button>
         <button id="agent-unpause" class="btn btn-sm" style="background:#16a34a;color:#fff;font-size:11px;padding:6px 12px" title="Clear any pause">▶ Reanudar</button>
       </div>
-
-      <div style="margin-top:10px;padding-top:8px;border-top:1px solid #334155">
-        <div style="display:flex;gap:6px;align-items:center;justify-content:space-between;font-size:11px">
-          <span style="color:#cbd5e1" id="agent-refresh-status">Refresh leads sin traffic: ⚪ OFF</span>
-          <button id="agent-refresh-toggle" class="btn btn-sm" style="background:#0ea5e9;color:#fff;font-size:11px;padding:4px 10px" title="Re-fetches traffic+geo. Cache 90d.">🔄 Activar refresh</button>
-        </div>
-      </div>
+      <!-- 2026-09-13: se sacó el botón "Activar refresh". Prometía que el worker re-leía el tráfico de
+           los leads sin tráfico, pero el worker no lo hacía, y hacerlo es re-comprar a SimilarWeb el
+           tráfico de un lead que ya está en Prospects (regla del 18/08: nunca). -->
     </div>
 
     <!-- DIAGNÓSTICO — plegado: solo se mira cuando algo no anda. -->

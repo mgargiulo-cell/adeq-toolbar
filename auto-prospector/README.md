@@ -50,8 +50,6 @@ Editables vía SQL en `toolbar_config`:
 | `agent_active_hours_end` | 20 | Hora END España |
 | `agent_paused_until` | "" | ISO timestamp; si futuro pausa el agente |
 | `agent_claude_email_pick` | false | Opt-in 2do pass Claude para emails ambiguos |
-| `agent_refresh_empty_leads` | false | Toggle backfill traffic |
-| `agent_backfill_missing` | false | Toggle backfill missing fields (lang, contact, score, etc.) |
 | `csv_queue_enabled` | false | Toggle CSV worker |
 | `auto_prospecting_enabled` | false | Toggle autopilot worker |
 | `csv_queue_daily_cap` | 1000 | Safety net global CSV/día |

@@ -1288,106 +1288,17 @@ async function saveToReviewQueue(token, { domain, traffic, geo, geosAll, languag
   return "http_max_retries";
 }
 
-// ── Bulk refresh de leads sin traffic ───────────────────────
-// Job: cada loop iteration, si toolbar_config.agent_refresh_empty_leads=true,
-// pickea hasta REFRESH_BATCH leads con traffic=0/null y los re-fetchea en
-// paralelo. Cache 90d ayuda a no quemar RapidAPI. Cuando ya no quedan,
-// auto-apaga el flag.
-const REFRESH_EMPTY_BATCH = 3;
-async function refreshOneEmptyLead(token, cfg) {
-  // ⛔ REGLA DEL USER (2026-08-18), textual: "No hay que volver a consultar el tráfico si ya
-  // entró a Prospects porque pasó el filtro. Nunca."
-  // Este job hacía exactamente eso: agarraba leads YA en Prospects con traffic 0/null y les
-  // volvía a comprar el dato a SimilarWeb. Cada uno cuesta un hit del plan de 40.000/mes.
-  // Queda bloqueado en firme, no alcanzaba con el flag: estaba apagado de hecho pero cualquiera
-  // podía prenderlo sin saber lo que costaba.
-  // Si algún día hace falta revivirlo, hablarlo primero — la alternativa correcta para un lead
-  // con traffic 0 NO es volver a pagarlo, es que el agente de revisión lo saque de Prospects:
-  // si nunca tuvo una lectura válida de tráfico, en realidad nunca pasó el filtro.
-  if (String(cfg.permitir_recompra_de_trafico || "") !== "true") return;
-  const flag = cfg.agent_refresh_empty_leads === "true";
-  if (!flag) return;
-  const rapidapi_key = cfg.rapidapi_key;
-  if (!rapidapi_key) return;
-
-  // Maxi 2026-07-03 costo: este job corre CADA iteración del main loop y gasta
-  // RapidAPI (getTrafficData → hit facturado si no está cacheado) por lead. Antes
-  // NO chequeaba el cap mensual/diario — solo confiaba en _rapidCapReached, que se
-  // resetea a false al arrancar cada sesión de csv/autopilot. Con la cola parada
-  // (csv/autopilot OFF) el flag quedaba en false → este loop podía gastar RapidAPI
-  // pasado el cap MENSUAL sin ningún freno = runaway de costo. Ahora gate duro:
-  // si el cap mensual o diario ya está alcanzado, no gasta ni un hit.
-  try {
-    const [rapidMonth, rapidDay] = await Promise.all([
-      getRapidApiUsageThisMonth(token),
-      getRapidApiUsageToday(token),
-    ]);
-    if (rapidMonth.usedThisMonth >= rapidMonth.limit) {
-      log(`⛔ refreshEmpty: cap MENSUAL RapidAPI alcanzado (${rapidMonth.usedThisMonth}/${rapidMonth.limit}) — no gasto hits hasta próximo mes.`);
-      return;
-    }
-    if (rapidDay.usedToday >= rapidDay.limit) {
-      log(`⛔ refreshEmpty: cap DIARIO RapidAPI alcanzado (${rapidDay.usedToday}/${rapidDay.limit}) — no gasto hits hasta mañana.`);
-      return;
-    }
-  } catch { /* si el chequeo falla, el fusible por-minuto de rapidFetchWithRetry sigue protegiendo */ }
-
-  try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(traffic.eq.0,traffic.is.null)&select=id,domain&order=created_at.asc&limit=${REFRESH_EMPTY_BATCH}`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    // PostgREST devuelve un OBJETO de error, no un array. Antes eso apagaba el flag.
-    if (!res.ok) { await saludPing(token, "refresh_empty_leads", { status: "fail", detalle: `HTTP ${res.status}` }); return; }
-    const rows = await res.json();
-    if (!Array.isArray(rows)) { await saludPing(token, "refresh_empty_leads", { status: "fail", detalle: "respuesta inesperada" }); return; }
-    if (rows.length === 0) {
-      log("✅ Refresh empty leads: completado, no quedan leads sin traffic. Apagando flag.");
-      await setConfigValue(token, "agent_refresh_empty_leads", "false");
-      await saludPing(token, "refresh_empty_leads", { status: "ok", detalle: "sin leads pendientes de tráfico" });
-      return;
-    }
-    log(`🔄 Refresh empty batch: ${rows.length} leads`);
-    await Promise.all(rows.map(async (lead) => {
-      try {
-        const data = await getTrafficData(lead.domain, rapidapi_key);
-        const newVisits = data?.visits || 0;
-        const newGeo = data?.topCountry || "";
-        // Solo consideramos resuelto si hay tráfico real (>0). Sin tráfico el WHERE
-        // del job lo vuelve a pickear y entra en loop. Geo solo no alcanza.
-        if (newVisits > 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ traffic: newVisits, geo: newGeo || undefined }),
-          });
-          log(`  ✅ ${lead.domain} → traffic=${newVisits}, geo=${newGeo || "?"}`);
-        } else if (data?.error && /429|rate/i.test(data.error)) {
-          // 429: NO marcar -1, dejar en 0 para reintentar cuando se libere rate-limit
-          log(`  ⏳ ${lead.domain} → 429, dejando para retry`);
-        } else {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ traffic: -1 }),
-          });
-          log(`  ⚠️ ${lead.domain} → sin traffic real (marcado -1)`);
-        }
-      } catch (e) {
-        log(`  ⚠️ ${lead.domain} refresh err: ${e.message}`);
-      }
-    }));
-  } catch (e) {
-    log(`⚠️ refreshEmptyBatch error: ${e.message}`);
-  }
-}
-
-// ── Backfill missing fields ────────────────────────────────────
-// Job: si toolbar_config.agent_backfill_missing=true, busca leads pending con
-// language/contact_name/category/title/ad_networks/score vacíos y los completa
-// usando fetchPageContent + Apollo + detectLanguageRobust + scoreWebsite.
-// Cache 90d traffic + 7d Apollo → mayoría son hits gratis.
-const BACKFILL_BATCH = 5;
+// ── Retirados el 2026-09-13: el refresh de tráfico de Prospects y el backfill de campos ────
+// · El refresh re-compraba a SimilarWeb el dato de leads que YA estaban en Prospects, lo que la
+//   regla del 18/08 prohíbe ("el tráfico de un lead en Prospects no se vuelve a consultar.
+//   Nunca"). Estaba bloqueado detrás de una segunda llave que cualquiera podía abrir, y el botón
+//   del popup prometía un trabajo que el worker no hacía. Un lead sin lectura de tráfico nunca
+//   pasó el filtro: lo saca la limpieza del pool (_cleanupPool), no se re-paga.
+// · El backfill no terminaba nunca (contact_name, score o title pueden quedar vacíos para siempre
+//   y la consulta no tenía cursor) y RECHAZABA leads por el score de scoreWebsite, que baja de 0
+//   por penalizaciones informativas (Seedtag, saturado, idioma): un segundo filtro después de la
+//   entrada, contra la regla v638 de que el filtro corre una sola vez, al entrar. Idioma,
+//   categoría, título, redes y score los completa la entrada (processCsvItem, runSession).
 // ════════════════════════════════════════════════════════════════
 // AUTO-FEEDER v2 (2026-05-18) — Schedule fijo + 3 fuentes + RapidAPI gate
 // ────────────────────────────────────────────────────────────────
@@ -5397,172 +5308,15 @@ async function _checkAutoPauseAgent(token) {
   return;
 }
 
-// ════════════════════════════════════════════════════════════════
-// RE-ENRICH bad leads del review_queue — corre cuando flag activo
-// ────────────────────────────────────────────────────────────────
-// Política user 2026-05-13: hay ~240 leads en review_queue desde antes
-// de los fixes (source-strict, Apollo TLD, etc.). Para que el agent
-// los use bien, re-enriquecemos los que tienen 0 emails O solo generics.
-// Apollo cuesta — controlamos cap diario (150) y monthly (2400).
-// Procesa 5 leads/run, 1 run cada 60 iters (~5h).
-// ════════════════════════════════════════════════════════════════
-let _lastReenrichRunAt = 0;
-const REENRICH_COOLDOWN_MS = 60 * 1000;      // Maxi 2026-07-14: 60s (re-análisis rápido on-demand de los sin-email)
-const REENRICH_BATCH = 40;                    // Maxi 2026-07-14: 40/run
-const REENRICH_CONC = 5;                      // Maxi 2026-07-14: 5 en paralelo (antes secuencial) → ~5x más rápido
-
-async function runReenrichBadLeads(token) {
-  try {
-    const cfg = await getConfig(token);
-    if (String(cfg.agent_reenrich_bad_leads || "").toLowerCase() !== "true") return;
-    if (Date.now() - _lastReenrichRunAt < REENRICH_COOLDOWN_MS) return;
-    _lastReenrichRunAt = Date.now();
-
-    // Maxi 2026-06-30: el SCRAPE es gratis y no depende de Apollo. Antes, si no había
-    // Apollo o el cap estaba lleno, se cortaba TODO el re-enrich → nunca se re-leían las
-    // webs con el scraper mejorado. Ahora: el scrape siempre corre; Apollo es opcional
-    // (solo como fallback cuando hay cupo).
-    const apollo_api_key = cfg.apollo_api_key;
-    let apolloAvailable = !!apollo_api_key;
-    if (apolloAvailable) {
-      const usage = await getApolloUsageToday(token);
-      if (usage.usedToday >= usage.limit || (usage.usedThisMonth ?? 0) >= APOLLO_MONTHLY_HARD_CAP) {
-        log("⚠️ reenrich: Apollo cap alcanzado → solo scrape (gratis)");
-        apolloAvailable = false;
-      }
-    } else {
-      log("ℹ️ reenrich: sin APOLLO_API_KEY → solo scrape (gratis)");
-    }
-
-    // Leads que necesitan re-enrich: 0 emails, o solo generic (info@/contact@) sin apollo/informer.
-    // Maxi 2026-07-14: BARRIDO COMPLETO por cursor (antes miraba SIEMPRE los 50 más viejos con
-    // order=created_at.asc&limit=50 sin cursor → se apagaba antes de recorrer todo el pool y dejaba
-    // cientos sin re-analizar). Ahora avanza por reenrich_cursor_ts hasta agotar el pool. +traffic al
-    // select (faltaba → Apollo recibía traffic=0).
-    const cursor = cfg.reenrich_cursor_ts || "";
-    const cursorClause = cursor ? `&created_at=gt.${encodeURIComponent(cursor)}` : "";
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending${cursorClause}&select=id,domain,emails,email_sources,contact_name,category,traffic,created_at&order=created_at.asc&limit=${REENRICH_BATCH}`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!res.ok) return;
-    const leads = await res.json();
-    if (!Array.isArray(leads) || leads.length === 0) {
-      log("✅ reenrich: pool COMPLETO re-analizado → flag OFF");
-      await setConfigValue(token, "agent_reenrich_bad_leads", "false").catch(() => {});
-      await setConfigValue(token, "reenrich_cursor_ts", "").catch(() => {});
-      return;
-    }
-    // Avanzar cursor al último de la ventana (procesemos o no cada uno → sweep monotónico)
-    const _reenrichLastTs = leads[leads.length - 1].created_at;
-    const candidates = leads.filter(l => {
-      const emails = Array.isArray(l.emails) ? l.emails : [];
-      if (emails.length === 0) return true;  // sin email → re-leer
-      const sources = l.email_sources || {};
-      const hasGood = emails.some(e => {
-        const src = (sources[e.toLowerCase()] || "").toLowerCase();
-        if (src === "apollo" || src === "informer") return true;
-        return !_isGenericLocalPart(e);
-      });
-      return !hasGood;
-    });
-    await setConfigValue(token, "reenrich_cursor_ts", _reenrichLastTs).catch(() => {});
-    if (candidates.length === 0) { log(`🔄 reenrich: ventana ${leads.length} sin candidatos (cursor→${_reenrichLastTs})`); return; }
-
-    log(`🔄 reenrich: procesando ${candidates.length} leads (conc ${REENRICH_CONC})`);
-    for (let _ri = 0; _ri < candidates.length; _ri += REENRICH_CONC) {
-     await Promise.all(candidates.slice(_ri, _ri + REENRICH_CONC).map(async (lead) => {
-      try {
-        // 1) Scrape PRIMERO (gratis) — con CF decoder + JSON-LD nuevos
-        let foundEmail = null;
-        let foundSource = null;
-        let foundContactName = "";
-        try {
-          const scraped = await scrapeEmailsForDomain(lead.domain);
-          if (Array.isArray(scraped) && scraped.length > 0) {
-            // Pickear el mejor por rank
-            const ranked = scraped
-              .map(e => ({ email: e, score: rankEmail(e, lead.domain) }))
-              .filter(r => r.score > 0)
-              .sort((a, b) => b.score - a.score);
-            if (ranked.length > 0) {
-              foundEmail = ranked[0].email;
-              foundSource = "scrape";
-            }
-          }
-        } catch (e) { log(`  ⚠️ scrape ${lead.domain}: ${e.message}`); }
-
-        // ── APOLLO TAMBIÉN CUANDO EL SCRAPE SOLO TRAJO UN BUZÓN GENÉRICO (Maxi 2026-08-27)
-        // Antes se llamaba SOLO si el scrape volvía vacío. Pero los números del propio pool
-        // dicen otra cosa: los emails de Apollo responden al 9,1% y los scrapeados del sitio
-        // al 0% (0 de 106). La diferencia es que Apollo devuelve una PERSONA con nombre y
-        // cargo, y el scrape suele devolver info@ o contacto@, que es una bandeja compartida
-        // que nadie mira.
-        // Encontrar un `info@` no es haber resuelto el lead: es haber encontrado lo peor que
-        // se podía encontrar. Si hay cupo, vale el crédito.
-        // El user lo pidió textual: "forzar gastar los créditos mensuales sí o sí y darle
-        // prioridad si se descubre un email con Apollo".
-        const _soloGenerico = foundEmail && _isGenericLocalPart(foundEmail);
-        if ((!foundEmail || _soloGenerico) && apolloAvailable) {
-          try {
-            const apolloRes = await findBestApolloEmail(lead.domain, apollo_api_key, token, {
-              traffic: lead.traffic || 0, allowUnlock: true, forceUnlock: true,
-            });
-            if (apolloRes?.email) {
-              // Apollo PISA al genérico: una persona con nombre vale más que una bandeja
-              // compartida. El genérico no se pierde — queda como respaldo en la lista.
-              if (_soloGenerico) log(`  🎯 ${lead.domain}: Apollo ${apolloRes.email} reemplaza al genérico ${foundEmail}`);
-              foundEmail = apolloRes.email;
-              foundSource = "apollo";
-              foundContactName = apolloRes.contact_name || "";
-            }
-          } catch (e) { log(`  ⚠️ apollo ${lead.domain}: ${e.message}`); }
-        }
-
-        // 3) Maxi 2026-07-24: FALLBACK Serper/Google contact — la MEJOR fuente (google_contact
-        // 32.6%) faltaba en el re-barrido, por eso los ~375 sin email nunca la probaron. Ahora,
-        // si scrape+Apollo no encontraron nada, se reintenta con Serper (mismo cap 250/día y dedup
-        // compartido con qualify/envío/rescate). Esto es lo que "sofistica la identificación": las
-        // 4 vías que buscan email ya usan las mismas 3 fuentes.
-        if (!foundEmail) {
-          const _mDay = _madridNowParts().dateISO;
-          if (_serperContactoPermitido(cfg, token, lead.domain)) {
-            const g = await _serperContactSearch(lead.domain).catch(() => null);
-            if (g?.emails?.length) {
-              const gr = g.emails.map(e => ({ email: e, score: rankEmail(e, lead.domain, lead.category) })).filter(r => r.score > 0).sort((a, b) => b.score - a.score);
-              if (gr.length) { foundEmail = gr[0].email; foundSource = "google_contact"; }
-            }
-          }
-        }
-
-        if (foundEmail) {
-          const existing = Array.isArray(lead.emails) ? lead.emails : [];
-          const merged = [foundEmail, ...existing.filter(e => e.toLowerCase() !== foundEmail.toLowerCase())];
-          const validated = await validateEmailsBatch(merged);
-          const newSources = { ...(lead.email_sources || {}) };
-          newSources[foundEmail.toLowerCase()] = foundSource;
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({
-              emails: validated,
-              email_sources: newSources,
-              contact_name: foundContactName || lead.contact_name || "",
-            }),
-          });
-          log(`  ✅ ${lead.domain}: +${foundSource} ${foundEmail}`);
-        } else {
-          log(`  ⏭️ ${lead.domain}: scrape+Apollo sin resultados`);
-        }
-      } catch (e) {
-        log(`  ⚠️ reenrich ${lead.domain}: ${e.message}`);
-      }
-     }));
-    }
-  } catch (e) {
-    log(`⚠️ runReenrichBadLeads error: ${e.message}`);
-  }
-}
+// ── Retirado el 2026-09-13: el re-análisis de emails del pool (flag agent_reenrich_bad_leads) ──
+// Nació roto: leía email_sources sin _normSrc, y desde el 17/06 la fuente se guarda como objeto
+// ({source, url}), así que el filtro tiraba TypeError ANTES de avanzar el cursor. Cada 25 min
+// releía los mismos 40 leads y no escribía nada, sin latido. Arreglarlo revivía una segunda vía de
+// emails con reglas más flojas (sin blocklist, sin marca, Apollo con forceUnlock sin presupuesto,
+// Serper aunque el lead ya tuviera email). Lo cubren polishPool (polish_only_missing: scrape →
+// Apollo → Serper sólo sin email, con blocklist, ads.txt y marca), auditarEmailsDelPool (limpieza)
+// y apolloQuemarCiclo (ciclo de Apollo con pacing). Los flags agent_reenrich_bad_leads y
+// reenrich_cursor_ts quedan sin efecto.
 
 // ── Frozen Weekly Report ────────────────────────────────────────
 // Cada domingo 20-21hs Madrid, manda email a mgargiulo@adeqmedia.com con CSV
@@ -5682,117 +5436,6 @@ async function runFrozenWeeklyReport(token) {
     log(`📧 Frozen weekly report enviado: ${rows.length} dominios → ${userEmail}`);
   } catch (e) {
     log(`⚠️ frozen weekly: ${e.message}`);
-  }
-}
-
-async function backfillMissingFields(token, cfg) {
-  const flag = cfg.agent_backfill_missing === "true";
-  if (!flag) return;
-  const apollo_api_key = cfg.apollo_api_key;
-
-  try {
-    // Buscar leads pending con AL MENOS 1 campo crítico vacío
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&or=(language.is.null,language.eq.,contact_name.is.null,contact_name.eq.,category.is.null,category.eq.,page_title.is.null,page_title.eq.,score.eq.0,score.is.null)&select=id,domain,traffic,geo,language,category,page_title,ad_networks,emails,contact_name,score,status&order=created_at.asc&limit=${BACKFILL_BATCH}`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    // PostgREST devuelve un OBJETO de error, no un array. Antes eso apagaba el flag.
-    if (!res.ok) { await saludPing(token, "backfill_missing", { status: "fail", detalle: `HTTP ${res.status}` }); return; }
-    const rows = await res.json();
-    if (!Array.isArray(rows)) { await saludPing(token, "backfill_missing", { status: "fail", detalle: "respuesta inesperada" }); return; }
-    if (rows.length === 0) {
-      log("✅ Backfill missing: completado, no quedan leads incompletos. Apagando flag.");
-      await setConfigValue(token, "agent_backfill_missing", "false");
-      await saludPing(token, "backfill_missing", { status: "ok", detalle: "sin leads incompletos" });
-      return;
-    }
-    log(`🔧 Backfill missing batch: ${rows.length} leads`);
-
-    await Promise.all(rows.map(async (lead) => {
-      try {
-        const patch = {};
-        // 1) Page content (title, ad_networks, category, htmlLang, ogLocale, textSample)
-        const needsPage = !lead.category || !lead.page_title || !lead.ad_networks || (Array.isArray(lead.ad_networks) && lead.ad_networks.length === 0);
-        let pageContent = null;
-        if (needsPage) {
-          pageContent = await fetchPageContent(lead.domain).catch(() => null);
-          if (pageContent) {
-            if (!lead.page_title && pageContent.title) { patch.page_title = pageContent.title; lead.page_title = pageContent.title; }
-            if (!lead.category && pageContent.category) { patch.category = pageContent.category; lead.category = pageContent.category; }
-            if ((!lead.ad_networks || lead.ad_networks.length === 0) && pageContent.adNetworks?.length) {
-              patch.ad_networks = pageContent.adNetworks;
-              lead.ad_networks = pageContent.adNetworks;
-            }
-          }
-        }
-        // 2) Language (usar pageContent si lo trajimos, sino fallback geo/tld)
-        if (!lead.language || lead.language === "") {
-          const det = await detectLanguageRobust({
-            htmlLang:   pageContent?.htmlLang,
-            ogLocale:   pageContent?.ogLocale,
-            hreflang:   pageContent?.hreflang,
-            jsonLdLang: pageContent?.jsonLdLang,
-            pathLang:   pageContent?.pathLang,
-            textSample: pageContent?.textSample,
-            geo:        lead.geo,
-            domain:     lead.domain,
-          }, { token });
-          patch.language = det.lang;
-          lead.language = det.lang;
-        }
-        // 3) Contact name (Apollo cache 7d → gratis si ya existió)
-        if ((!lead.contact_name || lead.contact_name === "") && apollo_api_key) {
-          try {
-            const apolloEmails = await findAllEmails(lead.domain, apollo_api_key, token);
-            const name = apolloEmails && apolloEmails.contact_name;
-            if (name) { patch.contact_name = name; lead.contact_name = name; }
-            // Si trajo emails nuevos que no estaban, sumarlos (validados)
-            if (Array.isArray(apolloEmails) && apolloEmails.length > 0) {
-              const existing = new Set((lead.emails || []).filter(Boolean));
-              const newEmails = apolloEmails.filter(e => !existing.has(e));
-              if (newEmails.length) {
-                const merged = [...new Set([...apolloEmails, ...(lead.emails || [])])];
-                const validated = await validateEmailsBatch(merged);
-                // Compara contenido (set), no length — length puede coincidir si
-                // validateEmailsBatch quita N basura y agrega N nuevos.
-                const oldSet = new Set((lead.emails || []).filter(Boolean));
-                const newSet = new Set(validated);
-                const sameContent = oldSet.size === newSet.size && [...oldSet].every(e => newSet.has(e));
-                if (!sameContent) {
-                  patch.emails = validated;
-                  lead.emails = validated;
-                }
-              }
-            }
-          } catch {}
-        }
-        // 4) Score (sync, sin API)
-        if (!lead.score || lead.score === 0) {
-          const sw = scoreWebsite(lead);
-          if (sw.score < 0) {
-            // gate hit (geo/cat blocked) — marcar como rejected
-            patch.status = "rejected";
-            patch.validated_by = "agent:backfill";
-            patch.validated_at = new Date().toISOString();
-            log(`  ❌ ${lead.domain}: rejected (${sw.reasons.join(",")})`);
-          } else {
-            patch.score = sw.score;
-            log(`  ⭐ ${lead.domain}: ${sw.stars}★ score=${sw.score} lang=${lead.language}`);
-          }
-        }
-        if (Object.keys(patch).length > 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "PATCH",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify(patch),
-          });
-        }
-      } catch (e) {
-        log(`  ⚠️ ${lead.domain} backfill err: ${e.message}`);
-      }
-    }));
-  } catch (e) {
-    log(`⚠️ backfillMissingFields error: ${e.message}`);
   }
 }
 
@@ -6363,8 +6006,12 @@ async function saveApolloUsage(token, callsThisSession, today) {
 
 async function getRejectionPatterns(token) {
   try {
+    // Sin los rechazos de la limpieza del pool (2026-09-13). _cleanupPool saca con status rejected
+    // lo que no tiene tráfico o está debajo de 350K; eso no dice nada del RUBRO ni del país, y el
+    // autopilot castiga categorías con esta cuenta. Sin el filtro, el descubrimiento cambiaba
+    // solo por rechazos de tráfico. (Antes esas filas se borraban y no llegaban acá.)
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=category,geo&status=eq.rejected&order=created_at.desc&limit=150`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?select=category,geo&status=eq.rejected&or=(suspect_reason.is.null,suspect_reason.not.like.%22${CLEANUP_PREFIJO}*%22)&order=created_at.desc&limit=150`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rows = await res.json();
@@ -11644,13 +11291,57 @@ async function _loadProspectTrashContext(token) {
 // aprendizaje de rechazos (por CONTENIDO/TIPO, ignora geo). Marca suspect_reject=true en
 // las que Haiku considera del mismo tipo que las rechazadas → la toolbar enciende una ⚠️
 // al lado de la X para que el MB revise si conviene descartarlas. Bounded: 200/run.
+// ── NO PUDE MIRAR ≠ CORRIDA LIMPIA (2026-09-13) ──────────────────────────────────────────────
+// Antes se sellaba `last_suspect_analysis_date` aunque la IA no hubiera contestado NADA (techo
+// diario de Claude, 5xx o timeout en los 10 lotes): el log decía "0/200 marcadas" como si todo
+// hubiera salido limpio, no había latido y no se reintentaba hasta la corrida siguiente. Mientras
+// tanto el agente les escribía a sitios que no son medios (saltea los suspect_reject).
+// Ahora: una sonda de 20 antes de pagar el resto, el día se sella sólo si hubo veredictos (o al
+// tercer intento), el freno de reintentos vive en la config porque el worker reinicia cada ~7 min,
+// y el job late sin cadencia (corre L/X/V y tiene salidas mudas: una cadencia daría "atrasado").
+const SUSPECT_MAX_INTENTOS = 3;
+const SUSPECT_ESPERA_REINTENTO_MIN = 120;
+const SUSPECT_SONDA = 20;
+
+/**
+ * Qué deja una corrida de la revisión de sospechosos. Pura.
+ * @param consultables filas con título: las únicas que se le preguntan a la IA (sin título sale null sin llamar)
+ * @param veredictos   cuántas volvieron con un tipo
+ */
+function _resultadoCorridaSuspect({ consultables = 0, veredictos = 0, flagged = 0, intentoN = 1, maxIntentos = SUSPECT_MAX_INTENTOS } = {}) {
+  if (!consultables) return { cerrarDia: true, status: "ok", real: null, esperado: null, detalle: "ninguna fila con título para clasificar" };
+  if (!veredictos) {
+    if (intentoN < maxIntentos) return { cerrarDia: false, status: "warn", real: null, esperado: null, detalle: `IA sin respuesta — reintento ${intentoN}/${maxIntentos}` };
+    return { cerrarDia: true, status: "warn", real: null, esperado: null, detalle: `IA sin respuesta tras ${intentoN} intentos — sigue la próxima corrida L/X/V` };
+  }
+  // esperado = las que se le preguntaron, nunca todas las filas: las sin título no pueden dictaminarse.
+  return { cerrarDia: true, status: "ok", real: veredictos, esperado: consultables, detalle: `${flagged} marcadas de ${veredictos} dictaminadas` };
+}
+
+/** Lee la marca "YYYY-MM-DD|n|ISO" de `suspect_analysis_intento` y decide si toca intentar. Pura. */
+function _intentoSuspect(valor, { dateISO, ahora = Date.now(), maxIntentos = SUSPECT_MAX_INTENTOS, esperaMin = SUSPECT_ESPERA_REINTENTO_MIN } = {}) {
+  const [dia, n, iso] = String(valor || "").split("|");
+  if (dia !== dateISO) return { puede: true, intentoN: 1 };
+  const previos = parseInt(n, 10) || 0;
+  if (previos >= maxIntentos) return { puede: false, intentoN: previos, motivo: "tope de intentos del día" };
+  const ultimo = Date.parse(iso || "");
+  if (Number.isFinite(ultimo) && ahora - ultimo < esperaMin * 60_000) return { puede: false, intentoN: previos, motivo: "espera entre reintentos" };
+  return { puede: true, intentoN: previos + 1 };
+}
+
 let _lastSuspectAnalysisDate = "";
-async function runSuspectRejectAnalysis(token) {
-  const { weekday, dateISO, hour } = _madridNowParts();
+async function runSuspectRejectAnalysis(token, { partes = _madridNowParts(), ahora = Date.now() } = {}) {
+  const { weekday, dateISO, hour } = partes;
   if (!["Mon", "Wed", "Fri"].includes(weekday)) return;  // 3×/semana
   if (hour < 10) return;                                   // desde las 10 Madrid
   if (_lastSuspectAnalysisDate === dateISO) return;
-  try { const cfg = await getConfig(token); if (cfg.last_suspect_analysis_date === dateISO) { _lastSuspectAnalysisDate = dateISO; return; } } catch {}
+  let intento;
+  try {
+    const cfg = await getConfig(token);
+    if (cfg.last_suspect_analysis_date === dateISO) { _lastSuspectAnalysisDate = dateISO; return; }
+    intento = _intentoSuspect(cfg.suspect_analysis_intento, { dateISO, ahora });
+  } catch { return; }   // sin la config no se sabe si ya se intentó hoy: no se paga a ciegas
+  if (!intento.puede) return;
   _lastSuspectAnalysisDate = dateISO;
   const trash = await _loadProspectTrashContext(token);
   // Maxi 2026-07-01: el aprendizaje de rechazos es por CONTENIDO/TIPO del sitio (reglas destiladas
@@ -11659,21 +11350,35 @@ async function runSuspectRejectAnalysis(token) {
   if (!trash.rules) { log("🔎 suspect-analysis: sin reglas de rechazo por contenido aún — skip"); return; }
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   let rows = [];
+  let leyo = false;
   try {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&suspect_checked_at=is.null&select=id,domain,page_title,category&order=created_at.desc&limit=200`, { headers: auth });
-    if (r.ok) rows = await r.json();
+    if (r.ok) { rows = await r.json(); leyo = Array.isArray(rows); }
   } catch {}
-  if (!Array.isArray(rows) || rows.length === 0) return;
-  log(`🔎 suspect-analysis (${dateISO}): analizando ${rows.length} prospects contra reglas de rechazo`);
+  if (!leyo) {
+    await saludPing(token, "suspect_analysis", { status: "warn", detalle: "no pude leer los pendientes — sigue en la próxima vuelta" }).catch(() => {});
+    return;
+  }
+  if (rows.length === 0) return;
+  const consultables = rows.filter(r => String(r.page_title || "").trim());
+  log(`🔎 suspect-analysis (${dateISO}): analizando ${rows.length} prospects (${consultables.length} con título) contra reglas de rechazo — intento ${intento.intentoN}/${SUSPECT_MAX_INTENTOS}`);
   let flagged = 0;
 
   // Se pregunta de a 20 en una sola llamada. Antes era una llamada por sitio: 200 por corrida,
   // re-mandando los ~700 tokens del criterio cada vez para recibir 3 de vuelta.
-  const veredictos = await _haikuPublisherClassLote(
-    token,
-    rows.map(r => ({ domain: r.domain, title: r.page_title || "", description: "", category: r.category || "" })),
-    trash.rules || "",
-  );
+  // Primero una SONDA con los primeros 20: si no vuelve ningún veredicto, la IA no está contestando
+  // y no se pagan los otros lotes. La marca del intento se escribe ANTES de llamar.
+  const aFila = (r) => ({ domain: r.domain, title: r.page_title || "", description: "", category: r.category || "" });
+  const _conVeredicto = (m) => [...m.values()].filter(v => v != null).length;
+  let veredictos = new Map();
+  if (consultables.length) {
+    await setConfigValue(token, "suspect_analysis_intento", `${dateISO}|${intento.intentoN}|${new Date(ahora).toISOString()}`).catch(() => {});
+    veredictos = await _haikuPublisherClassLote(token, consultables.slice(0, SUSPECT_SONDA).map(aFila), trash.rules || "");
+    if (_conVeredicto(veredictos) > 0 && consultables.length > SUSPECT_SONDA) {
+      const resto = await _haikuPublisherClassLote(token, consultables.slice(SUSPECT_SONDA).map(aFila), trash.rules || "");
+      for (const [d, v] of resto) veredictos.set(d, v);
+    }
+  }
 
   const CONC = 8;   // ya no hay llamada a la IA acá adentro: esto sólo escribe en la base
   for (let i = 0; i < rows.length; i += CONC) {
@@ -11711,8 +11416,12 @@ async function runSuspectRejectAnalysis(token) {
       } catch {}
     }));
   }
-  await setConfigValue(token, "last_suspect_analysis_date", dateISO).catch(() => {});
-  log(`🔎 suspect-analysis: ${flagged}/${rows.length} marcadas como sospechosas (⚠️)`);
+  const res = _resultadoCorridaSuspect({ consultables: consultables.length, veredictos: _conVeredicto(veredictos), flagged, intentoN: intento.intentoN });
+  // Las filas sin veredicto no recibieron PATCH: siguen con suspect_checked_at null y vuelven solas.
+  if (res.cerrarDia) await setConfigValue(token, "last_suspect_analysis_date", dateISO).catch(() => {});
+  else _lastSuspectAnalysisDate = "";   // que la próxima vuelta pueda reintentar (la marca frena la espera)
+  await saludPing(token, "suspect_analysis", { status: res.status, detalle: res.detalle, real: res.real, esperado: res.esperado }).catch(() => {});
+  log(`🔎 suspect-analysis: ${res.detalle}${res.cerrarDia ? "" : " — el día no se da por hecho"}`);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -25086,6 +24795,105 @@ async function _tocaCorrer(token, clave, minutos) {
   return true;
 }
 
+// ── LIMPIEZA DEL POOL: RECHAZA CON MOTIVO, NUNCA BORRA (2026-09-13) ─────────────────────────
+// Corre cada 15 min desde el loop principal y saca de Prospects dos cosas que nunca pasaron el filtro:
+//   · trafico_bajo: tráfico conocido debajo de 350K. Piso duro del 01/07, para TODA fuente.
+//   · sin_trafico: tráfico 0, null o -1 con más de 48 h, salvo monday_refresh. El refresh de tráfico
+//     está retirado a propósito (regla del 18/08: el tráfico de Prospects no se re-compra), así que
+//     las 48 h son sólo margen: nadie lo va a enriquecer. El -1 entra directo; antes se reseteaba a 0
+//     para un refresh que ya no existe.
+// Antes hacía DELETE: la fila desaparecía con emails, pitch y monday_payload, sin motivo, sin latido
+// y fuera del renglón "SACADAS DE PROSPECTS" del parte (que cuenta rejected_at). Si el DELETE fallaba,
+// el log igual decía "eliminados". Ahora es el patrón de urlpurge/purge: status rejected +
+// rejected_at + suspect_reason. Se ve en el parte, el dedup de los feeders la sigue viendo (no se
+// vuelve a descubrir ni a pagar), y si hace falta se revierte.
+// Auditar y revertir: suspect_reason LIKE 'cleanup:%'.
+// La regla es _motivoCleanup: la consulta sólo trae candidatos y cada fila se decide con ella.
+const CLEANUP_PREFIJO = "cleanup:";
+const CLEANUP_LOTE = 200;
+const CLEANUP_ESPERA_SIN_TRAFICO_MS = 48 * 60 * 60 * 1000;
+
+/** Motivo por el que la limpieza saca una fila de Prospects, o null si se queda. Pura. */
+function _motivoCleanup(fila, ahora = Date.now()) {
+  if (!fila || fila.status !== "pending") return null;
+  const t = fila.traffic == null || fila.traffic === "" ? NaN : Number(fila.traffic);
+  if (Number.isFinite(t) && t > 0) return t < REVIEW_QUEUE_MIN_TRAFFIC ? `${CLEANUP_PREFIJO} trafico_bajo` : null;
+  // 0, null o -1: nunca tuvo una lectura válida de tráfico.
+  if (fila.source === "monday_refresh") return null;
+  const creada = Date.parse(fila.created_at || "");
+  if (!Number.isFinite(creada) || ahora - creada <= CLEANUP_ESPERA_SIN_TRAFICO_MS) return null;
+  return `${CLEANUP_PREFIJO} sin_trafico`;
+}
+
+/**
+ * ¿La limpieza quiere sacar demasiado de una vez? Relativo al tamaño del pool, sin umbral fijo:
+ * más de 50 o más del 10% de lo pendiente. Si pasa, algo escribió tráfico bajo o vacío en masa
+ * (un import, una columna renombrada): se sigue con un lote de 200 como siempre, pero el latido
+ * sale en fail para que el vigilante lo muestre. Es la "caída silenciosa" del 18/08 con alarma. Pura.
+ */
+function _cleanupDeGolpe(quiereSacar, pendientesEnPool) {
+  const pool = Number(pendientesEnPool);
+  return (Number(quiereSacar) || 0) > Math.max(50, Math.ceil((Number.isFinite(pool) ? pool : 0) * 0.10));
+}
+
+async function _cleanupPool(token, ahora = Date.now()) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const _total = (r) => parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "", 10);
+  const corte = encodeURIComponent(new Date(ahora - CLEANUP_ESPERA_SIN_TRAFICO_MS).toISOString());
+  const reglas = [
+    { clave: "trafico_bajo", filtro: `traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}` },
+    // `source.is.null` explícito: en SQL `source <> 'monday_refresh'` deja afuera las filas sin fuente,
+    // y la única excepción de la regla es monday_refresh.
+    { clave: "sin_trafico", filtro: `and=(or(traffic.eq.0,traffic.is.null,traffic.lt.0),or(source.is.null,source.neq.monday_refresh))&created_at=lt.${corte}` },
+  ];
+  const sacadas = { trafico_bajo: 0, sin_trafico: 0 };
+  const problemas = [];
+  try {
+    let pool = NaN;
+    try {
+      const rp = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&select=id`, { headers: { ...auth, "Prefer": "count=exact", "Range": "0-0" } });
+      if (rp.ok) pool = _total(rp);
+    } catch {}
+
+    for (const { clave, filtro } of reglas) {
+      const motivo = `${CLEANUP_PREFIJO} ${clave}`;
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&${filtro}&select=id,status,traffic,source,created_at&order=created_at.asc&limit=${CLEANUP_LOTE}`,
+        { headers: { ...auth, "Prefer": "count=exact" } },
+      );
+      // No pude leer ≠ no había nada.
+      if (!r.ok) { problemas.push(`${clave}: no pude leer (HTTP ${r.status})`); continue; }
+      const filas = await r.json();
+      if (!Array.isArray(filas)) { problemas.push(`${clave}: respuesta inesperada`); continue; }
+      const quiere = Number.isFinite(_total(r)) ? _total(r) : filas.length;
+      if (_cleanupDeGolpe(quiere, pool)) {
+        problemas.push(`${clave}: quiere sacar ${quiere} de golpe (pool ${Number.isFinite(pool) ? pool : "?"}) — revisar si se vació o renombró la columna traffic`);
+      }
+      const ids = filas.filter(f => _motivoCleanup(f, ahora) === motivo).map(f => f.id);
+      if (!ids.length) continue;
+      // `status=eq.pending` otra vez en el PATCH: si un MB la movió a la cola mientras tanto, no se toca.
+      const p = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${ids.join(",")})&status=eq.pending&select=id`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=representation" },
+        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: motivo, rejected_at: new Date(ahora).toISOString() }),
+      });
+      if (!p.ok) { problemas.push(`${clave}: el rechazo falló (HTTP ${p.status})`); continue; }
+      const hechas = await p.json().catch(() => null);
+      sacadas[clave] = Array.isArray(hechas) ? hechas.length : ids.length;
+    }
+  } catch (e) {
+    problemas.push(e.message);
+  }
+
+  const real = sacadas.trafico_bajo + sacadas.sin_trafico;
+  const detalle = `trafico_bajo ${sacadas.trafico_bajo} · sin_trafico ${sacadas.sin_trafico}${problemas.length ? ` — ${problemas.join("; ")}` : ""}`;
+  if (real > 0) log(`🧹 Cleanup: ${real} sacadas de Prospects (${detalle.split(" — ")[0]}) — rechazadas con motivo '${CLEANUP_PREFIJO}', se pueden revertir`);
+  if (problemas.length) log(`⚠️ cleanup: ${problemas.join("; ")}`);
+  // Sin `esperado`: no hay un número "deseado" de filas para sacar, y con uno saldría "rinde poco".
+  await saludPing(token, "cleanup_pool", { status: problemas.length ? "fail" : "ok", cadenciaMin: 15, real, detalle }).catch(() => {});
+  return { real, sacadas, problemas };
+}
+
 // Throttle en memoria: evita escribir el latido en cada vuelta del loop (30s).
 // Se pierde en cada restart y no importa — el peor caso es una escritura de más.
 const _SALUD_ULTIMO_PING = new Map();   // job -> { ts, status }
@@ -27791,9 +27599,6 @@ async function main() {
       runReengagementCycle(token).catch(e => log(`⚠️ reengagement: ${e.message}`));
       // (La cola manual de adicionales se movió arriba del portón horario: ver el comentario
       //  en el bloque de `processManualReengagementQueue`, cerca del parte diario.)
-      // Re-enrich de leads malos del review_queue (flag agent_reenrich_bad_leads).
-      // Sin esto, los 240 leads viejos sin Apollo nunca se actualizan.
-      runReenrichBadLeads(token).catch(e => log(`⚠️ reenrich: ${e.message}`));
       // Reconciliación one-time de Monday para los 161 falsos-fallos del bug .ok
       // (flag agent_reconcile_monday_bounces; se auto-apaga al terminar).
       reconcileMondayBounces(token).catch(e => log(`⚠️ reconcile monday: ${e.message}`));
@@ -27884,51 +27689,12 @@ async function main() {
       }
     }
 
-    // ── Cleanup periódico cada 30 iters ──
-    // Maxi 2026-06-18: ampliado para incluir leads con traffic=0 / NULL después
-    // de 48hs (les damos chance de que el refresh los enriquezca). Excluye
-    // monday_refresh (re-prospect explícito del MB, se procesan igual).
+    // ── Limpieza del pool cada 15 min de RELOJ ──
+    // Saca de Prospects lo que tiene tráfico conocido debajo de 350K, y lo que lleva más de 48 h sin
+    // ninguna lectura de tráfico (salvo monday_refresh). Desde el 2026-09-13 RECHAZA con motivo en
+    // vez de borrar, y late: ver _cleanupPool.
     if (await _tocaCorrer(token, "cleanup_pool", 15)) {
-      try {
-        // Reset -1 → 0 (re-eligible for refresh)
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=eq.-1`, {
-          method: "PATCH",
-          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-          body: JSON.stringify({ traffic: 0 }),
-        }).catch(() => {});
-
-        // 1. DELETE leads con traffic > 0 AND < MIN (basura conocida — el agente nunca los pickearía)
-        // Maxi 2026-07-01: se SACÓ la excepción `source=neq.monday_refresh`. El floor de 350K es
-        // duro para TODO (incluido monday_refresh) → los sub-350K de cualquier fuente que ya
-        // quedaron en la cola (los 2K/12K/67K reportados) se limpian también.
-        const subRes = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}&select=id`, {
-          headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" },
-        });
-        const subCount = parseInt((subRes.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
-        if (subCount > 0) {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&traffic=gt.0&traffic=lt.${REVIEW_QUEUE_MIN_TRAFFIC}`, {
-            method: "DELETE",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "return=minimal" },
-          }).catch(() => {});
-          log(`🗑 Cleanup: ${subCount} leads pending con traffic < ${REVIEW_QUEUE_MIN_TRAFFIC} eliminados`);
-        }
-
-        // 2. DELETE leads con traffic=0 OR NULL después de 48hs (sin tráfico tras
-        //    refresh + re-process — son "fantasma" que ocupan espacio).
-        const cutoff48h = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-        const noTrafficRes = await fetch(
-          `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&or=(traffic.eq.0,traffic.is.null)&created_at=lt.${encodeURIComponent(cutoff48h)}&select=id`,
-          { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
-        );
-        const noTrafficCount = parseInt((noTrafficRes.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "0", 10);
-        if (noTrafficCount > 0) {
-          await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&source=neq.monday_refresh&or=(traffic.eq.0,traffic.is.null)&created_at=lt.${encodeURIComponent(cutoff48h)}`,
-            { method: "DELETE", headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "return=minimal" } }
-          ).catch(() => {});
-          log(`🗑 Cleanup: ${noTrafficCount} leads pending SIN tráfico (> 48hs) eliminados`);
-        }
-      } catch (e) { log(`⚠️ cleanup: ${e.message}`); }
+      await _cleanupPool(token).catch(e => log(`⚠️ cleanup: ${e.message}`));
     }
 
     // Maxi 2026-07-15 (Cost#1): flush RapidAPI ELIMINADO. La persistencia la hace SOLO el RPC atómico
@@ -28111,16 +27877,6 @@ async function main() {
       // Cada loop iteration lo intenta — items "preparados" por MBs entran
       // automáticamente cuando se libera lugar.
       try { await promoteWaitlist(token); } catch (e) { log(`⚠️ promoteWaitlist: ${e.message}`); }
-
-      // Refresh job: si admin activó agent_refresh_empty_leads, procesar 1
-      // lead vacío por ciclo (cache 90d ahorra hits si ya analizado).
-      try {
-        const cfgRefresh = await getConfig(token);
-        await refreshOneEmptyLead(token, cfgRefresh);
-        // Backfill missing fields (language/contact_name/category/score) — corre
-        // en paralelo lógico con refresh de tráfico. Ambos terminan rápido (paralelo).
-        await backfillMissingFields(token, cfgRefresh);
-      } catch (e) { log(`⚠️ refresh+backfill: ${e.message}`); }
 
       // ── AUTO-FEEDER v2: schedule fijo 9/12/15/18/20 Madrid L-V ───
       // Reemplaza el band-maintainer 120-300. Ahora target diario fijo
