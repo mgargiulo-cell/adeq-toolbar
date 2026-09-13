@@ -23,6 +23,24 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY, BACKEND_BEARER } from "./config.js";
 // quema el dominio para siempre.
 export const SUPPORTED_AGENT_LANGS = new Set(["es", "en", "it", "pt", "ar"]);
 
+// ── EL IDIOMA GUARDADO COMO ÍNDICE DEL FORMULARIO DE MONDAY (2026-09-13) ──────────────────────
+// El <select id="form-idioma"> de la cola "Por enviar" guarda el ÍNDICE de la columna de Monday
+// ("0".."6") y hasta hoy el "Guardar" de la cola lo escribía tal cual en toolbar_review_queue.language.
+// Quedaron filas con '0','1','2','3','6'. El agente leía "1" como un idioma que no conoce: ignoraba
+// la elección del MB, bajaba la home a re-detectar y, si la home no respondía, adivinaba por GEO/TLD.
+// Es el mismo mapa que modules/colaEstado.js (IDIOMA_DE_INDICE_MONDAY, el inverso de LANG_TO_IDX del
+// popup); tests/agente_sueltos-13-09d.test.js exige que no se desincronicen.
+// "5" es "Language?" (el MB no sabe): no es un idioma, vuelve vacío y el agente lo detecta.
+export const IDIOMA_DE_INDICE_MONDAY = { "0": "en", "1": "es", "2": "it", "3": "pt", "6": "ar" };
+
+/** Idioma de una fila de Prospects en ISO de 2 letras en minúscula ("es-AR" → "es", "1" → "es",
+ *  "5" → ""). Lo que no es un dígito sigue como siempre: minúsculas y sin la región. Pura. */
+export function idiomaIsoDelLead(valor) {
+  const s = String(valor ?? "").trim().toLowerCase();
+  if (/^\d+$/.test(s)) return IDIOMA_DE_INDICE_MONDAY[s] || "";
+  return s.split("-")[0];
+}
+
 export const TLD_TO_LANG_AGENT = {
   ar:"es", mx:"es", co:"es", cl:"es", pe:"es", uy:"es", py:"es", bo:"es",
   ec:"es", ve:"es", do:"es", cr:"es", pa:"es", gt:"es", hn:"es", sv:"es",

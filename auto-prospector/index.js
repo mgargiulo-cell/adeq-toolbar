@@ -57,6 +57,7 @@ import {
   _domainLangCache,
   _scriptNoLatino,
   detectLanguageRobust,
+  idiomaIsoDelLead,
   puertaClaude,
 } from "./lib/idioma.js";
 import {
@@ -13605,6 +13606,34 @@ function _apruebaPorAdsTxtYTrafico(adsTxt, traffic) {
   return adsTxt?.state === "yes" && pv >= REVIEW_QUEUE_MIN_TRAFFIC;
 }
 
+// ── LA PUERTA GRANDE TAMBIÉN AL ENVIAR (2026-09-13) ──────────────────────────────────────────
+// El agente vuelve a mirar la URL antes de mandar (classifyByUrlOnly, gratis) y rechazaba con
+// 'envio:' todo lo que la URL marcara, sin la puerta grande que la entrada SÍ aplica en el pre-filtro
+// por URL de processCsvItem. Un sitio que entró con ads.txt y tráfico de sobra pero cuyo nombre
+// sugiere un rubro (tienda, apuestas, comparador) salía de Prospects en su primer envío, y como
+// 'envio:' es una marca automática, si volvía por un import se le repagaba el enriquecimiento.
+// Misma regla que la entrada: la puerta grande perdona el RUBRO por URL (`url_<tipo>` que no es
+// estructural). No perdona los vetos estructurales, ni el techo o el piso de tráfico, ni un dominio
+// vacío: no son rubro (en la entrada el techo lo frena el chequeo que va justo después).
+/** ¿Este motivo de classifyByUrlOnly es un rubro que la puerta grande puede perdonar? Pura. */
+function _urlRubroPerdonable(motivo) {
+  const m = String(motivo || "");
+  return m.startsWith("url_") && !_VETO_ESTRUCTURAL.test(m);
+}
+/**
+ * Qué hace el agente con la URL de un lead de Prospects antes de mandarle. Pura.
+ *   "enviar"     la URL pasa, o es un rubro y hay ads.txt confirmado + tráfico ≥ piso (puerta grande)
+ *   "rechazar"   veto estructural, techo/piso, o un rubro con ads.txt que dijo "no" (lo de siempre)
+ *   "reintentar" un rubro con el ads.txt ilegible (403, WAF, timeout): ilegible no es "no tiene", así
+ *                que hoy no sale, pero tampoco sale de Prospects (como la ficha del CRM que no contesta)
+ */
+function _veredictoUrlAlEnviar(urlVerdict, adsTxt, traffic) {
+  if (!urlVerdict || urlVerdict.ok) return "enviar";
+  if (!_urlRubroPerdonable(urlVerdict.reason)) return "rechazar";
+  if (_apruebaPorAdsTxtYTrafico(adsTxt, traffic)) return "enviar";
+  return adsTxt?.state === "unknown" ? "reintentar" : "rechazar";
+}
+
 function scoreProspectable({ domain, urlVerdict, adsTxt, pageContent, swCategory, haikuType, traffic = 0 }) {
   const señales = [];
   let score = 0;
@@ -23525,16 +23554,18 @@ async function runAgentCycle(token, allFlags) {
       // exige evidencia estadística (Wilson) en vez de comparar un cociente crudo.
       const _pctMax = parseInt(cfg.rebote_max_pct_dia || "8", 10) || 8;
       const _desde7 = new Date(Date.now() - 7 * 86400000).toISOString();
-      const _cuenta = async (accion) => {
+      // `filtroAccion` es el valor PostgREST entero (2026-09-13): numerador y denominador salen del
+      // mismo ACCION_ENVIO_PARA_REBOTE, que suma el 2º email (secondary_sent) a los `sent`.
+      const _cuenta = async (filtroAccion) => {
         try {
           const r = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.${accion}&created_at=gte.${_desde7}&select=id`,
+            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=${filtroAccion}&created_at=gte.${_desde7}&select=id`,
             { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" }, signal: AbortSignal.timeout(5000) });
           if (!r.ok) return null;
           return parseInt((r.headers.get("content-range") || "0-0/0").split("/")[1] || "0", 10);
         } catch { return null; }
       };
-      const _enviados = await _cuenta("sent");
+      const _enviados = await _cuenta(ACCION_ENVIO_PARA_REBOTE);
       // Muestra mínima real: con 10 envíos, un rebote ya da 10% y frena el buzón sin
       // que eso signifique nada.
       if (_enviados != null && _enviados >= 60) {
@@ -23549,7 +23580,7 @@ async function runAgentCycle(token, allFlags) {
         let _rebotes = 0;
         try {
           const _rs = await fetch(
-            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=eq.sent&created_at=gte.${_desde7}&select=email_to&limit=3000`,
+            `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?user_email=eq.${encodeURIComponent(userEmail)}&action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${_desde7}&select=email_to&limit=3000`,
             { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` }, signal: AbortSignal.timeout(8000) });
           const _rb = await fetch(
             `${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?select=email&${EVIDENCIA_BLOQUEA}&limit=5000`,
@@ -23985,7 +24016,9 @@ async function runAgentCycle(token, allFlags) {
       let emails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
       let leadTraffic = lead.traffic || 0;
       let leadGeo = lead.geo || "";
-      let leadLanguage = (lead.language || "").toLowerCase().split("-")[0];
+      // idiomaIsoDelLead (2026-09-13): hay filas con el índice del formulario de Monday ('1' = es)
+      // en vez del ISO. Leído crudo, "1" no era un idioma soportado y se perdía la elección del MB.
+      let leadLanguage = idiomaIsoDelLead(lead.language);
       let reservedId = null;
 
       try {
@@ -24195,6 +24228,13 @@ async function runAgentCycle(token, allFlags) {
                 for (const e of serperEmails) if (!_es[e.toLowerCase()]) _es[e.toLowerCase()] = "google_contact";
                 patch.email_sources = _es;
               }
+              // ── EL RESCATE DEL AGENTE CUENTA IGUAL QUE EL DEL PULIDO (2026-09-13) ─────────────
+              // El pool del agente también trae leads sin ningún email (van al final del orden). Si
+              // este enriquecimiento le encontraba el PRIMERO, se guardaba la lista sin email_found_at:
+              // el parte ("emails encontrados a leads que no tenían") y el boletín no lo contaban, y el
+              // mismo hallazgo en el pulido o en Apollo sí. Una sola regla, con los emails de la fila
+              // tal como estaban (no los filtrados de arriba): sólo marca si no tenía ninguno.
+              _marcarRescate(patch, lead.emails);
               await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
                 method: "PATCH",
                 headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
@@ -24389,19 +24429,21 @@ async function runAgentCycle(token, allFlags) {
         }
 
         // Floor 350K: si después del enrichment descubrimos que el lead tiene
-        // traffic CONOCIDO menor a 350K → no vale la pena procesarlo, lo BORRAMOS
-        // del review_queue para que no acumule basura. Solo aplica a leads con
-        // traffic > 0 (los que tienen 0/null seguirán esperando enrichment).
+        // traffic CONOCIDO menor a 350K → no vale la pena procesarlo y sale de Prospects.
+        // Solo aplica a leads con traffic > 0 (los que tienen 0/null los mira la limpieza).
+        // ── SALE RECHAZADO, NO BORRADO (2026-09-13) ─────────────────────────────────────────
+        // Acá había un DELETE: la fila desaparecía con emails, pitch y monday_payload, sin motivo,
+        // fuera del renglón "SACADAS DE PROSPECTS" del parte (que cuenta rejected_at), el dedup de
+        // los feeders dejaba de verla (se podía volver a descubrir y a pagar) y el log decía DELETE
+        // aunque fallara. Es la misma regla que cleanup_pool (piso duro de 350K), así que sale con su
+        // mismo rechazo: 'cleanup: trafico_bajo', que el autopilot no usa para aprender rubros.
         if (leadTraffic > 0 && leadTraffic < REVIEW_QUEUE_MIN_TRAFFIC) {
-          await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
-            method: "DELETE",
-            headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
-          }).catch(() => {});
+          const _sacado = await _rechazarPorTraficoBajo(_authRq, lead.id).catch(() => false);
           await logAgentAction(token, userEmail, {
-            domain, action: "skipped", reason: "below_min_traffic_deleted",
-            details: { traffic: leadTraffic, min: REVIEW_QUEUE_MIN_TRAFFIC },
+            domain, action: "skipped", reason: "below_min_traffic_rejected",
+            details: { traffic: leadTraffic, min: REVIEW_QUEUE_MIN_TRAFFIC, rechazado: _sacado },
           });
-          log(`  🗑 ${domain}: traffic ${leadTraffic} < ${REVIEW_QUEUE_MIN_TRAFFIC} → DELETE`);
+          log(`  🧹 ${domain}: traffic ${leadTraffic} < ${REVIEW_QUEUE_MIN_TRAFFIC} → ${_sacado ? `rechazado con '${CLEANUP_PREFIJO} trafico_bajo'` : "no pude rechazarlo (lo toma cleanup_pool)"}`);
           continue;
         }
 
@@ -24453,7 +24495,24 @@ async function runAgentCycle(token, allFlags) {
         // dominio, sin red, sin API, sin IA. Caza bancos, gobiernos, universidades y acortadores
         // por el patrón de la URL. No reemplaza al filtro de entrada: es el último cinturón.
         const _urlChk = classifyByUrlOnly(domain, lead.category || "", lead.traffic || 0);
-        if (!_urlChk.ok) {
+        // ── CON LA PUERTA GRANDE DE LA ENTRADA (2026-09-13) ──────────────────────────────────────
+        // Un rubro por URL ya no alcanza para sacar al lead: si tiene ads.txt y tráfico ≥ piso, pasó
+        // por la puerta grande al entrar y la pasa acá también (_veredictoUrlAlEnviar). El ads.txt se
+        // lee sólo en ese caso (un fetch al sitio, gratis y con caché); los vetos estructurales, el
+        // techo y el piso rechazan como siempre sin leer nada.
+        const _adsUrl = !_urlChk.ok && _urlRubroPerdonable(_urlChk.reason)
+          ? await checkAdsTxt(domain).catch(() => ({ state: "unknown", lines: 0 }))
+          : null;
+        const _urlDecision = _veredictoUrlAlEnviar(_urlChk, _adsUrl, lead.traffic || 0);
+        if (!_urlChk.ok && _urlDecision === "enviar") {
+          log(`  🚪 ${domain}: la URL sugiere "${_urlChk.reason}" PERO tiene ads.txt y ${lead.traffic} de tráfico → pasa por la puerta grande, como al entrar`);
+        }
+        if (_urlDecision === "reintentar") {
+          log(`  ⏭️ ${domain}: la URL sugiere "${_urlChk.reason}" y el ads.txt no se pudo leer (${_adsUrl?.why || "unknown"}) — no sale hoy y sigue en Prospects`);
+          await logAgentAction(token, userEmail, { domain, action: "skipped", reason: `url_ads_txt_ilegible:${_urlChk.reason}` }).catch(() => {});
+          continue;
+        }
+        if (_urlDecision === "rechazar") {
           log(`  🛑 ${domain}: NO se envía — la URL no debería estar en Prospects (${_urlChk.reason})`);
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
@@ -25892,6 +25951,21 @@ function _cleanupDeGolpe(quiereSacar, pendientesEnPool) {
   return (Number(quiereSacar) || 0) > Math.max(50, Math.ceil((Number.isFinite(pool) ? pool : 0) * 0.10));
 }
 
+/**
+ * El piso de 350K que el agente encuentra al enviar, con el mismo rechazo que la limpieza (2026-09-13).
+ * runAgentCycle BORRABA el lead; ahora queda rejected + rejected_at + 'cleanup: trafico_bajo', igual que
+ * cleanup_pool. `status=eq.pending` en el PATCH: si un MB lo movió a su cola mientras tanto, no se toca.
+ * Devuelve true si la base aceptó el cambio. tests/agente_sueltos-13-09d.test.js
+ */
+async function _rechazarPorTraficoBajo(auth, id, ahoraISO = new Date().toISOString()) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${id}&status=eq.pending`, {
+    method: "PATCH",
+    headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
+    body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: `${CLEANUP_PREFIJO} trafico_bajo`, rejected_at: ahoraISO }),
+  });
+  return r.ok;
+}
+
 async function _cleanupPool(token, ahora = Date.now()) {
   const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   const _total = (r) => parseInt((r.headers.get("content-range") || "").match(/\/(\d+)$/)?.[1] || "", 10);
@@ -26298,6 +26372,14 @@ async function autoAjustarSegunMetricas(token) {
 const REBOTE_TECHO_BUZON  = 0.02;   // 2% en 7 días → alerta sobre ese buzón
 const REBOTE_TECHO_DOMINIO = 0.03;  // 3% sumando los tres → freno
 
+// ── EL 2º EMAIL TAMBIÉN SALE, TAMBIÉN REBOTA (2026-09-13) ──────────────────────────────────────
+// Los tres lectores del % de rebote (vigilarReputacion, el aviso por buzón del agente y el bloque
+// REBOTES del boletín) contaban sólo action=sent. El 2º email del agente se anota como
+// `secondary_sent` (con email_to desde el 04/08): salía del mismo buzón y del mismo dominio, pero
+// no estaba en el denominador, y si rebotaba tampoco en el numerador, porque el cruce con
+// toolbar_bounced_emails es por email_to de las filas leídas. Un solo filtro para los tres.
+const ACCION_ENVIO_PARA_REBOTE = "in.(sent,secondary_sent)";
+
 // ⚠️ MUESTRA MÍNIMA (Maxi 2026-08-24) ────────────────────────────────────────
 // Este freno lo escribí el 12/08 comparando la tasa cruda contra el techo, con una
 // muestra mínima de 30. El 21/08 pausó el envío con 3 rebotes sobre 80 = 3,75%, y
@@ -26337,7 +26419,8 @@ async function vigilarReputacion(token) {
 
     let envios = [];
     try {
-      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&created_at=gte.${desde}&select=user_email,email_to&limit=3000`, { headers: auth });
+      // ACCION_ENVIO_PARA_REBOTE (2026-09-13): el 2º email también salió de este dominio.
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&created_at=gte.${desde}&select=user_email,email_to&limit=3000`, { headers: auth });
       if (!r.ok) return;                                   // no pude medir ≠ todo bien
       envios = await r.json();
     } catch { return; }
@@ -27529,7 +27612,8 @@ async function _boletinPorSeccion(token, { compartido = null } = {}) {
     // Va POR BUZÓN a propósito: el promedio de los tres escondía justamente ese caso.
     try {
       // Sólo envíos del AGENTE (regla del user: estas métricas son del agente); sin tope de filas.
-      const _envs = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=eq.sent&details->>ui_origin=is.null&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to`, auth)) || [];
+      // Con su 2º email (ACCION_ENVIO_PARA_REBOTE, 2026-09-13): sale del mismo buzón y rebota igual.
+      const _envs = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_agent_actions?action=${ACCION_ENVIO_PARA_REBOTE}&details->>ui_origin=is.null&created_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=user_email,email_to`, auth)) || [];
       const _reb  = (await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_bounced_emails?bounced_at=gte.${new Date(Date.now() - 7 * 86_400_000).toISOString()}&select=email`, auth)) || [];
       const _setReb = new Set((_reb || []).map(x => String(x.email || "").toLowerCase()));
       const _porMb = {};
