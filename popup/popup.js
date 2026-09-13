@@ -27,7 +27,7 @@ const ESTILO_PITCH = Object.freeze({ tone: "informal", length: "short", focus: "
 // `prensa@` valía 115 en el worker y era genérico acá; `dpo@`/`privacy@` eran "persona" acá y
 // basura allá; y los nueve cambios de la Fase 1 no llegaban al media buyer. Desde ahora el
 // popup importa el MISMO archivo que el worker. El zip lo incluye (scripts/empaquetar.sh).
-import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esRegistranteWebmail, motivoRebote, cargarRebotados, claseDeEmail } from "../auto-prospector/lib/email.js";
+import { rankEmail, _isGenericLocalPart, AD_SALES_LOCAL, _cleanScrapedEmails, vetoDuroEmail, esRegistranteWebmail, motivoRebote, cargarRebotados, claseDeEmail, tierDeEmail, compararCandidatosEmail, ordenDeTiersValido, esDecisor } from "../auto-prospector/lib/email.js";
 // La lista de dominios bloqueados existía en modules/blocklist.js y la usaba traffic.js para
 // no gastar API… pero NINGÚN botón del popup la consultaba (verificado el 08/09: cero llamadas
 // a checkDomainBlocked en este archivo). Un MB parado en mail.google.com cargó `mail.google.com`
@@ -58,7 +58,7 @@ import { voyageEmbed, buildPitchContext }                                       
 import { sendEmail, getGmailProfile, getGmailSignature, getGmailToken, clearAllCachedTokens, appendClosingIfMissing } from "../modules/gmail.js";
 import { markReviewQueueAsContacted, queueReengagement, createManualSendTracking, markManualSendFailed, isEmailBounced, dominiosConEnvioReciente } from "../modules/supabase.js";
 // Las reglas de la cola "Por enviar" y de los adicionales de la tarjeta, sin DOM y con tests (2026-09-13).
-import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, planSacarDeCola, textoConfirmarSacar,
+import { filaColaDesdeFormulario, avisoAlGuardarEnCola, emailDeCola, avisoDeCola, planSacarDeCola, textoConfirmarSacar,
          textoResultadoSacar, adicionalesDeLaTarjeta, contactosDeAdicionales,
          fotoCrmAlGuardar, decidirLoteCrm, lecturaDeEnvios, contactadoDeCola,
          anotarEnvioDeSesion, envioDeSesion, crmBloqueaCarga, veredictoConEnvioPropio, envioPropioGuardado,
@@ -3966,12 +3966,14 @@ const _AD_SALES_LOCAL_RE = AD_SALES_LOCAL;
 // publicidad@/ventas@/comercial@) y con las fuentes de OTRO dominio, así que elegía un email distinto
 // del que muestra Análisis y del que usa el agente (rol comercial > persona > genérico). Ahora las dos
 // pantallas ordenan con estas funciones y cada una pasa su contexto: dominio, categoría y fuentes.
+// `ordenTiers`: el orden de tipos que dejó el reajuste semanal del agente (ver _ordenTiersExtension); null =
+// el de por defecto, igual que el worker cuando nunca se midió.
 function _ctxEmailsAnalisis() {
-  return { domain: state.domain || "", category: state.category || "", fuente: (e) => state.emailSources.get(e) };
+  return { domain: state.domain || "", category: state.category || "", fuente: (e) => state.emailSources.get(e), ordenTiers: _ordenTiersExtension.orden };
 }
 function _ctxEmailsProspecto(r) {
   const fuentes = (r && r.email_sources) || {};
-  return { domain: (r && r.domain) || "", category: (r && r.category) || "", fuente: (e) => fuentes[String(e || "").toLowerCase()] };
+  return { domain: (r && r.domain) || "", category: (r && r.category) || "", fuente: (e) => fuentes[String(e || "").toLowerCase()], ordenTiers: _ordenTiersExtension.orden };
 }
 // email_sources guarda "scrape" o {source, url}; state.emailSources guarda "Page", "Informer"…
 function _fuenteTextoClient(v) {
@@ -4028,6 +4030,42 @@ function _reordenarAnalisisTrasRebotes() {
   const listEl = document.getElementById("email-list");
   if (!listEl || listEl.style.display === "none") return;
   if (!(state.emails || []).some(e => _motivoReboteClient(e))) return;
+  _redibujarAnalisisConservandoEleccion();
+}
+
+// ── EL ORDEN DE TIPOS DEL AGENTE, TAMBIÉN EN LA EXTENSIÓN (2026-09-13, cierre) ─────────────────────
+// Una vez por semana el agente reordena los tipos (apollo / rol / persona / genérico) según quién contesta
+// y lo guarda en toolbar_config.email_tier_ranking. La extensión nunca lo leía: si el reajuste cambiaba el
+// orden, la tarjeta y Análisis seguían con el de por defecto y preseleccionaban otra dirección que la que
+// manda el agente. Se lee una vez por hora, con reloj; si no contesta, queda el de por defecto (lo mismo
+// que hace el worker cuando nunca se midió) y se reintenta a los 5 minutos.
+const _ordenTiersExtension = { orden: null, ts: 0, enCurso: null, fallo: 0 };
+function _asegurarOrdenTiersExtension(alCambiar) {
+  if (Date.now() - _ordenTiersExtension.ts < 60 * 60 * 1000) return;
+  if (!state.accessToken || _ordenTiersExtension.enCurso || Date.now() - _ordenTiersExtension.fallo < 5 * 60 * 1000) return;
+  _ordenTiersExtension.enCurso = (async () => {
+    const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=eq.email_tier_ranking&select=value`,
+      { headers: { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` }, signal: AbortSignal.timeout(6000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const filas = await r.json();
+    let orden = null;
+    try { orden = ordenDeTiersValido(JSON.parse(filas?.[0]?.value || "null")?.orden); } catch {}
+    const cambio = JSON.stringify(orden) !== JSON.stringify(_ordenTiersExtension.orden);
+    _ordenTiersExtension.orden = orden;
+    _ordenTiersExtension.ts = Date.now();
+    if (cambio && typeof alCambiar === "function") alCambiar();
+  })().catch(() => { _ordenTiersExtension.fallo = Date.now(); }).finally(() => { _ordenTiersExtension.enCurso = null; });
+}
+function _reordenarAnalisisTrasOrden() {
+  const listEl = document.getElementById("email-list");
+  if (!listEl || listEl.style.display === "none") return;
+  _redibujarAnalisisConservandoEleccion();
+}
+
+// Redibuja Análisis y conserva la dirección elegida mientras se pueda elegir.
+function _redibujarAnalisisConservandoEleccion() {
+  const listEl = document.getElementById("email-list");
+  if (!listEl) return;
   const formEl = document.getElementById("form-email");
   const antes = formEl ? formEl.value : "";
   renderEmailList(state.emails);
@@ -4041,7 +4079,6 @@ function _reordenarAnalisisTrasRebotes() {
 
 function _emailPickTierClient(email, ctx = _ctxEmailsAnalisis()) {
   const src = _fuenteTextoClient(ctx.fuente(email));
-  const local = String(email || "").toLowerCase().split("@")[0];
   // Basura según los vetos compartidos con el worker (dpo@, privacy@, dmarc@, copyright@, owner@…):
   // último de todo. Veto y NO `rankEmail < 0` (2026-09-13): un buzón del grupo editor sin la casa
   // editora cargada vale -35 y es legítimo; con el puntaje se hundía debajo de los genéricos.
@@ -4051,22 +4088,23 @@ function _emailPickTierClient(email, ctx = _ctxEmailsAnalisis()) {
   if (_motivoReboteClient(email)) return -1;
   // El gmail del registrante que devuelve website.informer: el agente nunca le escribe (2026-09-13).
   if (esRegistranteWebmail(email, src)) return -1;
-  // Maxi 2026-07-15 (D1 sync worker _pickTier): informer (WHOIS/registrar) NO es top-tier — baja a 1
-  // (o 3 si el local es rol comercial). Antes estaba en 4 junto a apollo → el popup mostraba como
-  // "mejor contacto" un domainmanagement@ que el worker rankea ÚLTIMO. Ahora coincide con el envío real.
-  if (src === "informer") return _AD_SALES_LOCAL_RE.test(local) ? 3 : 1;
-  if (src === "manual") return 4;                            // lo eligió el MB a mano
-  // Apollo compite por resultado (decisión del user, 04/09; paridad con _tipoDeEmailParaRanking
-  // del worker): su email vale lo que es — rol comercial, persona o genérico — no por venir de Apollo.
-  // La clase sale de claseDeEmail (lib/email.js), la MISMA función que usa el agente (2026-09-13).
-  // Antes estaba copiada acá con las listas de genéricos y buzones funcionales, y rrhh@, empleos@ o
-  // informatique@ quedaban como "persona", arriba de info@ y preseleccionados aunque puntuaran menos.
-  // Un buzón funcional (download@, advent@) sigue con los genéricos: claseDeEmail lo incluye.
-  return ({ rol: 3, persona: 2, generico: 0 })[claseDeEmail(email)] ?? 0;
+  // ── EL TIPO SALE DE LA MISMA FUNCIÓN QUE USA EL AGENTE (2026-09-13, cierre) ───────────────────────
+  // tierDeEmail (lib/email.js) es el _pickTier del worker: manual 4, rol comercial 3, persona 2,
+  // genérico 1, e informer 3 (rol comercial) o 1 (el nivel del genérico). La clase la sigue decidiendo
+  // claseDeEmail adentro. Antes esta tabla estaba copiada acá con genérico 0 e informer 1 por ENCIMA
+  // del genérico, y sin el orden del reajuste semanal: para el mismo lead el agente podía elegir otra.
+  // Apollo compite por resultado (decisión del user, 04/09): su email vale lo que es.
+  return tierDeEmail(email, src, ctx.ordenTiers);
 }
-// Orden: tier de fuente primero, y dentro del tier el puntaje del ranking compartido.
+// Orden: el comparador del agente (compararCandidatosEmail): tipo, fuente con el ranking por defecto y
+// puntaje de rankEmail. La extensión no conoce el ranking de fuentes que el agente aprende por MB: dos
+// direcciones del MISMO tipo pueden desempatar distinto (ver lib/email.js). El tipo -1 (vetada,
+// rebotada, registrante) va precalculado y queda al final.
 function _ordenarEmailsClient(list, ctx = _ctxEmailsAnalisis()) {
-  return [...list].sort((a, b) => (_emailPickTierClient(b, ctx) - _emailPickTierClient(a, ctx)) || (_rankClient(b, ctx) - _rankClient(a, ctx)));
+  return [...list]
+    .map(e => ({ email: e, source: ctx.fuente(e), score: _rankClient(e, ctx), tier: _emailPickTierClient(e, ctx) }))
+    .sort((a, b) => compararCandidatosEmail(a, b))
+    .map(x => x.email);
 }
 // La dirección que queda puesta sola (2026-09-13): la primera del orden que se puede elegir. Nunca una
 // de tier -1 (vetada, rebotada, dominio quemado, registrante): se ve y se puede elegir a mano, pero no
@@ -4087,7 +4125,10 @@ async function _apolloAutoPaceReveal(apolloResult, domainGuard) {
     const locked = apolloResult.people.find(p => !p.unlocked && p.id);
     if (!locked) return;
     // ¿Ya tenemos un decision-maker NO genérico por fuentes gratis?
-    const haveDM = (state.emails || []).some(e => !_isGenericEmailLocal(e));
+    // (2026-09-13) Con la clase con la que se elige a quién escribir (esDecisor → claseDeEmail), no con
+    // la lista de genéricos: rrhh@, soporte.web@ o redaccion@ contaban como decisor y el reveal quedaba
+    // a merced del pacing en vez de salir. El tope mensual y el pacing no cambian.
+    const haveDM = (state.emails || []).some(e => esDecisor(e));
     // Cupo mensual Apollo (mismo origen que el footer)
     const headers = { "apikey": CONFIG.SUPABASE_ANON_KEY, "Authorization": `Bearer ${state.accessToken}` };
     const r = await fetch(`${CONFIG.SUPABASE_URL}/rest/v1/toolbar_config?key=in.(apollo_calls_month,apollo_monthly_limit)&select=key,value`, { headers, signal: AbortSignal.timeout(6000) });
@@ -4546,6 +4587,8 @@ function renderEmailList(emails) {
 
   // La lista de rebotados de la extensión (sólo ordena): si no está, se pide y al llegar se reordena.
   _asegurarRebotesExtension(_reordenarAnalisisTrasRebotes);
+  // El orden de tipos del reajuste semanal del agente: si cambia al llegar, se reordena (2026-09-13).
+  _asegurarOrdenTiersExtension(_reordenarAnalisisTrasOrden);
 
   // 1. Dedupe + excluir el email de Monday + DESCARTAR garbage (whois/proxy/abuse).
   //    Estos emails nunca deberían aparecer en la UI — son inservibles.
@@ -5378,11 +5421,16 @@ async function bindButtons() {
       // pero tiene que verse: si no, entra al CRM como contactado y nunca lo fue.
       const sinMail = mp.mail_enviado === false
         ? ' <span title="Todavía no se le mandó el mail" style="color:#fbbf24">✉︎?</span>' : "";
-      // La auditoría de emails del worker también recorre la cola y saca direcciones (basura,
-      // rebotada, otra marca). El lote manda igual la que eligió el MB: tiene que verse antes.
+      // (2026-09-13) La auditoría de emails del worker ya no saca direcciones de la cola: escribe
+      // monday_payload.aviso_email sobre la dirección que se va a mandar (rebotó, otra marca, basura).
+      // Nadie lo mostraba. Se ve acá si el aviso es sobre lo que manda el lote (avisoDeCola).
+      // `sacada` queda para las filas de antes, a las que la auditoría vieja sí les sacaba la dirección.
+      const _av = avisoDeCola(f);
       const elegida = String(mp.email || "");
-      const sacada = elegida.includes("@") && Array.isArray(f.emails) && !f.emails.some(e => String(e).toLowerCase() === elegida.toLowerCase())
-        ? ' <span title="El sistema sacó esta dirección de la lista del sitio (basura, rebote u otra marca): revisala antes de mandar" style="color:#fbbf24">⚠️</span>' : "";
+      const sacada = _av
+        ? ` <span title="${esc(`El sistema revisó ${_av.email}: ${_av.texto}. Revisala antes de mandar`)}" style="color:#fbbf24">⚠️</span>`
+        : elegida.includes("@") && Array.isArray(f.emails) && !f.emails.some(e => String(e).toLowerCase() === elegida.toLowerCase())
+        ? ' <span title="Esta dirección ya no está en la lista del sitio (una revisión vieja la sacó por basura, rebote u otra marca): revisala antes de mandar" style="color:#fbbf24">⚠️</span>' : "";
       // El país como lo eligió el MB en el formulario, que es lo que recibe el CRM.
       const geo = mp.geo_form || f.geo || "—";
       return `<label style="display:flex;align-items:center;gap:6px;padding:4px 2px;border-bottom:1px solid var(--border);cursor:pointer">
@@ -5470,7 +5518,18 @@ async function bindButtons() {
     const ids = _colaMarcados();
     const out = document.getElementById("cola-result");
     if (!ids.length) { out.textContent = "Marcá al menos uno."; out.style.color = "var(--muted)"; return; }
-    if (!confirm(`Se van a crear ${ids.length} ficha(s) en ADEQ. ¿Confirmás?`)) return;
+    // (2026-09-13) Lo que la auditoría del worker avisó sobre la dirección que se va a mandar tiene que
+    // verse ANTES de cargar la ficha: con mail_ya_enviado, el CRM le manda los follow-ups a esa casilla.
+    // Si otra marca o basura tiene que frenar el lote lo decide el dueño; hoy se muestra y el MB decide.
+    // La que rebotó se sigue salteando más abajo (isEmailBounced).
+    const _avisosLote = ids.map(id => _colaFilas.find(x => String(x.id) === String(id))).filter(Boolean)
+      .map(f => ({ f, av: avisoDeCola(f) })).filter(x => x.av);
+    const _txtAvisos = _avisosLote.length
+      ? `\n\n⚠️ ${_avisosLote.length} con aviso del sistema (se cargan igual si confirmás):\n`
+        + _avisosLote.slice(0, 8).map(x => `· ${x.f.domain}: ${x.av.email} ${x.av.texto}`).join("\n")
+        + (_avisosLote.length > 8 ? `\n· y ${_avisosLote.length - 8} más` : "")
+      : "";
+    if (!confirm(`Se van a crear ${ids.length} ficha(s) en ADEQ. ¿Confirmás?${_txtAvisos}`)) return;
     const btn = document.getElementById("btn-cola-enviar");
     btn.disabled = true;
     const filas = ids.map(id => _colaFilas.find(x => String(x.id) === String(id))).filter(Boolean);
@@ -11639,6 +11698,8 @@ function initProspectCard(card, data) {
     // La lista de rebotados de la extensión: si no está, se pide; cuando llega, esta tarjeta se
     // redibuja sólo si alguna de sus direcciones cambió de lugar.
     _asegurarRebotesExtension(() => { if (card.isConnected && emails.some(e => _motivoReboteClient(e))) renderProspectEmailList(); });
+    // Y el orden de tipos del reajuste semanal del agente (2026-09-13): si cambia, se redibuja.
+    _asegurarOrdenTiersExtension(() => { if (card.isConnected) renderProspectEmailList(); });
 
     // ── EL ORDEN ES EL DE ANÁLISIS (2026-09-13) ─────────────────────────────────────────────
     // Antes ordenaba por la nota A-E, que le resta 25 a publicidad@/ventas@/comercial@, y con las
@@ -12514,7 +12575,15 @@ async function validateProspect(card, data, doSendEmail) {
   // Maxi 2026-07-01: aviso en inglés — el email lo busca el worker automáticamente;
   // si todavía no está, el MB debe esperar (o tipear uno manual).
   if (!email) {
-    setResult("⏳ No email yet — the system is still searching for it. Please wait a moment, or type one manually below.", false);
+    // ── HAY DIRECCIONES, PERO NINGUNA QUEDÓ ELEGIDA (2026-09-13) ─────────────────────────────────
+    // La tarjeta no preselecciona una dirección rebotada, de un dominio quemado, vetada o del gmail
+    // del registrante, y tampoco la que el MB asignó como adicional. Con eso el campo queda vacío y el
+    // aviso decía "el sistema todavía la está buscando": el MB esperaba algo que no iba a llegar. Se
+    // cuentan los chips de la tarjeta (también los escondidos detrás de "show N more").
+    const _hayDirecciones = card.querySelectorAll(".pcard-email-list .email-chip[data-email]").length > 0;
+    setResult(_hayDirecciones
+      ? "⚠️ No address selected — the ones found for this lead bounced, are blocked, belong to the domain registrant or are set as additional contacts. Pick one above or type another below."
+      : "⏳ No email yet — the system is still searching for it. Please wait a moment, or type one manually below.", false);
     card.querySelector(".pcard-email-monday")?.focus();
     return;
   }

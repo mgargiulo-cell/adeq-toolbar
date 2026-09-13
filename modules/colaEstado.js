@@ -72,16 +72,38 @@ export function fusionarEmailsCola(prev, emailForm, { loginEmail = "", esFormula
   return { cambia, emails, email_sources, payloadEmail: e, contactoFormulario: "" };
 }
 
-// A quién le escribe el CRM cuando se manda el lote. La auditoría de emails del worker también
-// recorre las filas `por_enviar` y reordena la lista por puntaje: mandar `emails[0]` podía
-// terminar en una casilla distinta de la que eligió el MB (y a la que quizás ya le escribió).
-// Manda lo que el MB eligió al guardar; las filas de antes del arreglo no tienen esa clave y
-// siguen usando la primera de la lista, como hasta hoy.
+// A quién le escribe el CRM cuando se manda el lote. Manda lo que el MB eligió al guardar; las filas
+// de antes del arreglo no tienen esa clave y siguen usando la primera de la lista, como hasta hoy.
+// (2026-09-13) La auditoría de emails del worker ya no reordena ni saca direcciones de las filas
+// `por_enviar`: sólo escribe monday_payload.aviso_email sobre ESTA dirección (ver avisoDeCola).
+// El worker tiene una copia (_emailQueMandaLaCola en index.js: el worker no carga modules/) y un test
+// exige que digan lo mismo.
 export function emailDeCola(f) {
   const mp = (f && f.monday_payload) || {};
   if (mp.contacto_formulario) return String(mp.contacto_formulario);
   if (Object.prototype.hasOwnProperty.call(mp, "email")) return String(mp.email || "");
   return (Array.isArray(f?.emails) && f.emails[0]) || "";
+}
+
+// ── EL AVISO DE LA AUDITORÍA, A LA VISTA (2026-09-13) ─────────────────────────────────────────
+// El worker escribe monday_payload.aviso_email cuando la dirección que va a mandar el lote rebotó, es
+// de otra marca o es un buzón basura/de departamento, y nadie lo leía: la ficha entraba al CRM con esa
+// dirección como contactada y los follow-ups salían a otro buzón. Vale sólo si el aviso es sobre la
+// dirección que se va a mandar HOY: si el MB volvió a guardar con otra, el aviso viejo no aplica.
+// null = nada que avisar. Si otra marca o basura tiene que FRENAR el lote lo decide el dueño: hoy se
+// muestra en la lista y en la confirmación.
+const _TEXTO_AVISO_COLA = {
+  ya_reboto: "ya rebotó",
+  otra_marca: "es de otra marca que el sitio",
+  basura_o_departamento: "es un buzón basura o de un departamento que no compra pauta",
+};
+export function avisoDeCola(f) {
+  const av = f?.monday_payload?.aviso_email;
+  const dir = String(av?.email || "").trim().toLowerCase();
+  if (!dir.includes("@")) return null;
+  if (dir !== String(emailDeCola(f) || "").trim().toLowerCase()) return null;
+  const motivo = String(av.motivo || "");
+  return { email: dir, motivo, texto: _TEXTO_AVISO_COLA[motivo] || "tiene un aviso del sistema" };
 }
 
 // ── Estado anterior ─────────────────────────────────────────────────────────────────────

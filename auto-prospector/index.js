@@ -110,6 +110,13 @@ import {
   recontarRebotesPorDominio,
   cuentaParaElDominio,
   motivoNoEscribirDominio,
+  // Elección de dirección compartida con la extensión (2026-09-13, cierre de eleccion_paridad).
+  esRegistranteWebmail,
+  esDecisor,
+  tierDeEmail,
+  compararCandidatosEmail,
+  ordenDeTiersValido,
+  SOURCE_RANK_DEFAULT,
 } from "./lib/email.js";
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -8047,12 +8054,15 @@ async function scrapeInformerOnly(domain) {
 // llegaba a mobilepub@comercio.com.pe, que es el buzón de pauta de verdad.
 // Un webmail personal puede terminar siendo el contacto (el user lo pidió explícitamente), pero
 // NO es motivo para dejar de buscar el buzón corporativo. Se conserva y se sigue.
+// (2026-09-13) "Genérico" es la clase con la que se elige a quién escribir (esDecisor → claseDeEmail), no
+// la lista de genéricos: rrhh@, soporte.web@, informatique@ o redaccion@ cortaban el rastreo como si ya
+// hubiera contacto, y el sitio no se seguía mirando.
 function _tenemosContactoBueno(emails, dominioLead) {
   const core = String(dominioLead || "").replace(/^www\./, "").toLowerCase();
   for (const e of emails) {
     const local = e.split("@")[0] || "";
     const dom   = (e.split("@")[1] || "").toLowerCase();
-    if (_isGenericLocalPart(e)) continue;
+    if (!esDecisor(e)) continue;
     if (WEBMAIL_RE.test(dom)) continue;                       // gmail/hotmail suelto: no corta
     if (core && dom !== core && !dom.endsWith("." + core) && !core.endsWith("." + dom)
         && !AD_SALES_LOCAL.test(local) && !AD_SALES_CONTIENE.test(local)) continue;  // cross-domain sin rol comercial
@@ -12789,7 +12799,7 @@ function _ordenarPorPuntaje(emails, dominio, categoria = "") {
 // contactable y la auditoría no lo sacaba nunca. La regla es esRegistranteWebmail de lib/email.js, la
 // misma de la extensión, leída con la fuente que se guarda. Un gmail publicado en el sitio (scrape,
 // redes) queda: esto sólo mira informer.
-import { esRegistranteWebmail } from "./lib/email.js";
+// esRegistranteWebmail llega por el import de arriba: un segundo import del mismo nombre no deja arrancar el worker.
 function _quitarRegistranteWebmail(emails, fuentes) {
   const src = fuentes || {};
   const quedan = [], fuera = [];
@@ -12799,22 +12809,30 @@ function _quitarRegistranteWebmail(emails, fuentes) {
   return { quedan, fuera };
 }
 
+// La dirección que va a mandar el lote de "Por enviar": copia de emailDeCola (modules/colaEstado.js),
+// porque el worker no carga modules/. Un test exige que las dos digan lo mismo. (2026-09-13)
+function _emailQueMandaLaCola(lead) {
+  const mp = (lead && lead.monday_payload) || {};
+  if (mp.contacto_formulario) return String(mp.contacto_formulario);
+  if (Object.prototype.hasOwnProperty.call(mp, "email")) return String(mp.email || "");
+  return (Array.isArray(lead?.emails) && lead.emails[0]) || "";
+}
+
 // ── PRIMERA PASADA DE LA AUDITORÍA, POR LEAD (2026-09-13) ───────────────────────────────────
 // Qué emails quedan, cuáles salen y por qué. Pura: se prueba sin base.
 // Una fila `por_enviar` es un prospecto que un media buyer YA trabajó: le escribió a esa dirección
 // y la guardó para mandarla al CRM. La auditoría le agregaba o le sacaba direcciones, y "Enviar"
-// carga al CRM emails[0] con mail_ya_enviado=true: la ficha podía quedar con un contacto al que
-// nadie le escribió (los follow-ups salen a otro buzón) o con el email vacío. En esas filas no se
-// toca la lista: si la dirección que se va a mandar está muerta, se AVISA (el rebote se informa,
-// no se decide por el MB).
+// carga al CRM la dirección de la cola (emailDeCola) con mail_ya_enviado=true: la ficha podía quedar
+// con un contacto al que nadie le escribió (los follow-ups salen a otro buzón) o con el email vacío.
+// En esas filas no se toca la lista: si la dirección que se va a mandar está muerta, se AVISA (el
+// rebote se informa, no se decide por el MB) y la extensión lo muestra (avisoDeCola).
 function _planAuditoriaLead(lead) {
   const originales = (Array.isArray(lead?.emails) ? lead.emails : []).filter(e => typeof e === "string" && e);
   const vacio = { plan: null, malos: [], cambioOrden: false, aviso: null };
-  if (!originales.length) return vacio;
-  const fuentes = lead.email_sources || {};
-  const evaluados = originales.map(e => {
+  const fuentes = lead?.email_sources || {};
+  const evaluar = (e) => {
     const score  = rankEmail(e, lead.domain, lead.category || "");
-    const marca  = _brandMatches(e, lead.domain, _normSrc(fuentes[e.toLowerCase()]));
+    const marca  = _brandMatches(e, lead.domain, _normSrc(fuentes[String(e).toLowerCase()]));
     let motivo = "";
     if (isBouncedSync(e))      motivo = "ya_reboto";
     // El gmail del WHOIS no es contacto (regla del 14/07): sale con motivo propio (2026-09-13).
@@ -12822,13 +12840,22 @@ function _planAuditoriaLead(lead) {
     else if (score < 0)        motivo = "basura_o_departamento";
     else if (!marca)           motivo = "otra_marca";
     return { email: e, score, ok: !motivo, motivo };
-  });
+  };
+  // ── EL AVISO ES SOBRE LO QUE MANDA EL LOTE, NO SOBRE emails[0] (2026-09-13) ─────────────────────
+  // Se juzgaba emails[0], pero el lote manda emailDeCola: lo que el MB eligió al guardar
+  // (monday_payload.email) o la URL del formulario. Una dirección de otra marca tipeada por el MB no se
+  // avisaba si no era la primera, y a una fila de formulario se le avisaba por contacto@, que no se manda.
+  if (lead?.status === "por_enviar") {
+    const mp = lead.monday_payload || {};
+    const dir = String(_emailQueMandaLaCola(lead) || "").trim();
+    if (mp.contacto_formulario || !dir.includes("@")) return vacio;
+    const ev = evaluar(dir);
+    return { ...vacio, aviso: ev.ok ? null : { email: ev.email, motivo: ev.motivo } };
+  }
+  if (!originales.length) return vacio;
+  const evaluados = originales.map(evaluar);
   const buenos = evaluados.filter(x => x.ok).sort((a, b) => b.score - a.score).map(x => x.email);
   const malos  = evaluados.filter(x => !x.ok);
-  if (lead.status === "por_enviar") {
-    const muerto = malos.find(m => m.email === originales[0]);
-    return { ...vacio, aviso: muerto ? { email: muerto.email, motivo: muerto.motivo } : null };
-  }
   const cambioContenido = buenos.length !== originales.length;
   const cambioOrden = !cambioContenido && buenos.some((e, i) => e !== originales[i]);
   const plan = (cambioContenido || cambioOrden)
@@ -12960,8 +12987,9 @@ async function auditarEmailsDelPool(token) {
           const rf = await fetch(`${_urlFila}&select=emails,monday_payload`, { headers: auth, signal: AbortSignal.timeout(10000) });
           if (!rf.ok) continue;
           const fila = (await rf.json().catch(() => []))?.[0];
-          const primero = Array.isArray(fila?.emails) ? String(fila.emails[0] || "") : "";
-          if (!fila || primero.toLowerCase() !== av.email.toLowerCase()) continue;
+          // La misma dirección que juzgó la primera pasada: la que manda el lote (2026-09-13), no emails[0].
+          const manda = fila ? String(_emailQueMandaLaCola(fila) || "") : "";
+          if (!fila || manda.trim().toLowerCase() !== av.email.trim().toLowerCase()) continue;
           const rw = await fetch(_urlFila, {
             method: "PATCH",
             headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=minimal" },
@@ -13405,11 +13433,14 @@ async function polishPool(token) {
           }
           return null;
         };
+        // "Ya tiene contacto" = un rol comercial o una persona, con la clase con la que el agente elige
+        // (esDecisor → claseDeEmail), no con la lista de genéricos (2026-09-13): un lead con sólo rrhh@,
+        // informatique@ o redaccion@ quedaba como "con contacto" y el pulido no le buscaba a nadie.
         const hasGood = !_marcado && curEmails.some(e => {
           const raw = srcMap[e.toLowerCase()];
           const src = (typeof raw === "string" ? raw : (raw?.source || "")).toLowerCase();
           if (src === "apollo" || src === "informer") return true;
-          return !_isGenericLocalPart(e);
+          return esDecisor(e);
         });
         // OJO CON EL ATAJO (Maxi 2026-08-07): acá había un `if (soloSinEmail && hasGood) return;`
         // para ahorrar el fetch en los leads que ya tenían email. Estaba mal: se salteaba también
@@ -13536,9 +13567,11 @@ async function polishPool(token) {
         // pendientes tienen SOLO direcciones genéricas. Apollo es la única vía que
         // devuelve una persona con nombre y cargo, que es justamente lo que hace que un
         // mail se conteste. Ahí es donde el crédito rinde.
+        // "Sólo genéricos" con la misma clase del agente (esDecisor, 2026-09-13): rrhh@, soporte.web@ o
+        // redaccion@ no son a quien venderle pauta, igual que info@. El tope de Apollo y su pacing no cambian.
         const _soloGenericos = curUtiles.length > 0
-          && curUtiles.every(e => _isGenericLocalPart(e))
-          && (!foundEmail || _isGenericLocalPart(foundEmail));
+          && curUtiles.every(e => !esDecisor(e))
+          && (!foundEmail || !esDecisor(foundEmail));
         if ((!foundEmail || _soloGenericos) && apolloAvailable) {
           // No se paga donde Apollo ya contestó sin email en 45 días, ni en un lead con la marca vieja
           // `apollo_sin_contacto` (la misma exclusión que la quema del ciclo): ahí sólo la búsqueda gratis.
@@ -13584,7 +13617,8 @@ async function polishPool(token) {
         // 5b) LA PERSONA POR FUERA DEL SITIO (decisión 3 del user, 04/09): Google con "@dominio".
         //     Sólo cuando no hay nada o sólo hay genéricos (el hueco real). 60 consultas por día,
         //     contador y dominios ya buscados persistidos en config (el worker reinicia seguido).
-        if (!foundEmail && (curUtiles.length === 0 || curUtiles.every(e => _isGenericLocalPart(e))) && String(cfg.polish_serper_personas ?? "true") !== "false") {
+        //     "Sólo genéricos" con la clase del agente (esDecisor, 2026-09-13); el tope de 60 por día no cambia.
+        if (!foundEmail && (curUtiles.length === 0 || curUtiles.every(e => !esDecisor(e))) && String(cfg.polish_serper_personas ?? "true") !== "false") {
           const _mDay = _madridNowParts().dateISO;
           const [_pd, _pn] = String(cfg.serper_personas_hoy || "").split(":");
           let _usadasHoy = _pd === _mDay ? (parseInt(_pn, 10) || 0) : 0;
@@ -17577,7 +17611,9 @@ async function runSession(token, cfg, sessionStart) {
     const contactFormsAuto = new Set();
     const googleSetAuto    = new Set();   // lo que trajo Google dentro del scrape → google_contact (2026-09-13)
     const infResAuto = await scrapeInformerOnly(domain).catch(() => ({ emails: [], urlByEmail: new Map() }));
-    const infAutoNonGeneric = infResAuto.emails.find(e => !_isGenericLocalPart(e));
+    // "No genérico" con la clase del agente (esDecisor, 2026-09-13): un rrhh@ o un soporte.web@ del
+    // Informer ya no saltea Apollo y el raspado como si fuera el contacto.
+    const infAutoNonGeneric = infResAuto.emails.find(e => esDecisor(e));
     if (infAutoNonGeneric) {
       scraperEmails = infResAuto.emails;
       infResAuto.emails.forEach(e => { informerSetAuto.add(e.toLowerCase()); });
@@ -18181,7 +18217,7 @@ async function pickNextEmailCandidate(token, domain, excludeEmails = []) {
   try {
     // 3.a Lee review_queue para ese dominio
     const rqRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,emails,language,category,contact_name,contact_phone,monday_item_id&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,emails,email_sources,language,category,contact_name,contact_phone,monday_item_id&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rq = await rqRes.json();
@@ -18216,12 +18252,15 @@ async function pickNextEmailCandidate(token, domain, excludeEmails = []) {
         if (_utiles.length) {
           log(`  🔍 ${domain}: no había alternativo guardado, pero el scrape encontró ${_utiles.length} → sigo`);
           const _todos = [...new Set([...emails, ..._utiles])];
+          // Con la fuente de lo raspado (2026-09-13): sin ella el ranking lo leía como genérico y la
+          // tarjeta y el agente ordenaban distinto. Se leen las fuentes que ya había para no pisarlas.
+          const _fuentes = _fuentesDelEnriquecimiento(lead.email_sources, { scrape: _utiles });
           await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=eq.${lead.id}`, {
             method: "PATCH",
             headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
-            body: JSON.stringify({ emails: _todos }),
+            body: JSON.stringify({ emails: _todos, email_sources: _fuentes }),
           }).catch(() => {});
-          return { email: _utiles[0], lead: { ...lead, emails: _todos } };
+          return { email: _utiles[0], lead: { ...lead, emails: _todos, email_sources: _fuentes } };
         }
       } catch (e) { log(`  ⚠️ ${domain}: no pude buscar un email alternativo (${e.message}) — no lo doy por agotado`); return null; }
       return null;
@@ -18441,7 +18480,8 @@ async function runReengagementCycle(token) {
         // cada intento dejaba una fila colgada que después el cleanup barría como fallo, y
         // esas reservas ocupaban el cupo de PRIMER contacto del buzón. Es la explicación de
         // por qué sales@ y dhorovitz@ se clavaban en 6-8 envíos mientras mgargiulo@ llegaba a 20.
-        const _vr = await _verifyEmailMV(token, cfg, newEmail).catch(() => "riesgo");
+        // Una excepción tampoco es un catch-all (2026-09-13): "sin_verificar", que acá igual no sale.
+        const _vr = await _verifyEmailMV(token, cfg, newEmail).catch(() => "sin_verificar");
         if (_vr !== "ok") {
           log(`  ⛔ re-engagement ${newEmail}: verificación dio "${_vr}" y el dominio ya rebotó — no se manda`);
           if (reservedId) {
@@ -19796,81 +19836,86 @@ async function scanRealResponsesForUser(token, userEmail) {
 // ════════════════════════════════════════════════════════════════
 
 // Informer (WHOIS) + freemail = el email del REGISTRANTE del dominio, no el contacto comercial
-// (regla del agente del 14/07: nunca sirve y suele rebotar). Es la misma expresión del filtro de
-// runAgentCycle; el test compara las dos para que no se desalineen.
-const _WEBMAIL_DE_REGISTRANTE = /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\.|@mail\.ru\b/i;
+// (regla del agente del 14/07: nunca sirve y suele rebotar). Desde el 13/09 es esRegistranteWebmail de
+// lib/email.js, la misma función del filtro de runAgentCycle y de la extensión: hasta ahí eran tres copias
+// de la regex, sostenidas por dos tests de dos grupos distintos.
 
 /**
- * Qué hacer con UN candidato, con los hechos ya averiguados. Pura.
+ * Qué hacer con UN candidato, con los hechos ya averiguados. Pura. La usan el agente y el reintento
+ * (a través de _elegirDireccion): es LA regla de a quién se le escribe.
  * @param hechos.rebotado    isBouncedSync de la dirección
  * @param hechos.noEscribir  _porQueNoEscribirA (el dominio del correo ya rechazó direcciones)
  * @param hechos.marcaOk     _brandMatches
  * @param hechos.ruta        decidirVerificacionMV (null = todavía no se preguntó)
  * @param hechos.mv          _verifyEmailMV (undefined = no se verificó)
+ * @param politica.manualManda  la dirección que el MB cargó a mano (future_email) sólo la frena un "no"
+ *                              (reintento: sí; agente: no, ahí "manual" no es una elección para este envío)
+ * @param politica.sinVerificar qué hacer con "sin_verificar" (tope diario, error o timeout de MV):
+ *                              "reserva" (agente, primer contacto) o "saltear" (reintento)
  * @returns "elegir" | "reserva" | "saltear:<motivo>"
  *
- * Es la regla del agente (el loop de "salto instantáneo" más su última puerta de MV) con UNA
- * diferencia pedida por la regla del dueño "dudoso nunca como primer contacto": un `dudoso` no se
- * elige y se prueba la siguiente dirección, en vez de perder el turno del lead. Un `dudoso` no se
- * quema; sólo un "no" de MV.
+ * Un `dudoso` no se elige y se prueba la siguiente dirección (regla del dueño "dudoso nunca como primer
+ * contacto"); no se quema: sólo un "no" de MV. Los veredictos salen de _accionPorVeredictoMV, la tabla única.
  */
-function _decidirCandidato(cand, { rebotado = false, noEscribir = "", marcaOk = true, ruta = null, mv } = {}) {
+function _decidirCandidato(cand, { rebotado = false, noEscribir = "", marcaOk = true, ruta = null, mv } = {}, { manualManda = true, sinVerificar = "saltear" } = {}) {
   const email = String(cand?.email || "");
   const fuente = _normSrc(cand?.source);
   if (rebotado) return "saltear:ya_reboto";
   // La dirección que el MB cargó a mano (future_email) es SU elección: la única que la frena es
   // un "no existe" de MillionVerifier.
-  if (fuente === "manual") return mv === "no" ? "saltear:mv_no" : "elegir";
-  if (fuente === "informer" && _WEBMAIL_DE_REGISTRANTE.test(email)) return "saltear:informer_webmail";
+  if (manualManda && fuente === "manual") return mv === "no" ? "saltear:mv_no" : "elegir";
+  if (esRegistranteWebmail(email, fuente)) return "saltear:informer_webmail";
   if (noEscribir) return "saltear:dominio_ya_rechazo";
   if (!marcaOk) return "saltear:otra_marca";
   if (ruta && ruta.enviar === false) return "saltear:catch_all_y_patron";
-  if (mv === "no") return "saltear:mv_no";
-  if (mv === "dudoso") return "saltear:mv_dudoso";
-  // `riesgo` (catch-all, o MV sin cupo): si la ruta ya decía que MV no puede saber nada (Microsoft
-  // 365, gateways, rol publicado en proveedor confiable), el agente lo manda igual; si la consulta
-  // debía decidir, queda de reserva y se busca uno limpio.
-  if (mv === "riesgo") return ruta && ruta.verificar === false ? "elegir" : "reserva";
+  // ── "NO PUDE VERIFICAR" NO ES UN CATCH-ALL (2026-09-13, cierre) ─────────────────────────────────
+  // El tope diario, un error o un timeout de MillionVerifier devolvían "riesgo", la misma palabra que un
+  // catch_all real. En el reintento eso era "reserva" y salía, SIN verificar, justo al dominio que acaba
+  // de rebotar (el re-engagement, que también le escribe a un dominio rebotado, exige "ok"). Con la ruta
+  // ciega (M365, gateways: verificar:false) la consulta no aportaba nada y el resultado es el de siempre.
+  if (mv === "sin_verificar" && sinVerificar === "saltear") return ruta && ruta.verificar === false ? "elegir" : "saltear:mv_sin_verificar";
+  const accion = _accionPorVeredictoMV(mv);
+  if (accion === "quemar") return "saltear:mv_no";
+  if (accion === "saltar") return "saltear:mv_dudoso";
+  // `riesgo` (catch-all) o `sin_verificar` en el agente: si la ruta ya decía que MV no puede saber nada
+  // (Microsoft 365, gateways, rol publicado en proveedor confiable) se manda igual; si la consulta debía
+  // decidir, queda de reserva y se busca uno limpio.
+  if (accion === "reserva") return ruta && ruta.verificar === false ? "elegir" : "reserva";
   return "elegir";
 }
 
 /**
- * Recorre los candidatos YA ORDENADOS y devuelve el primero que se puede mandar.
- * Hasta `maxMv` consultas a MillionVerifier por reintento (cada una lee toolbar_mv_results antes
- * de pagar). Un candidato que necesitaría otra consulta con el cupo gastado se saltea: sin
- * verificar no sale, justo en el dominio que acaba de rebotar.
+ * El reintento por rebote: recorre los candidatos YA ORDENADOS y devuelve el primero que se puede mandar.
+ * Es la elección del agente (_elegirDireccion) con la política del reintento, no una copia del bucle
+ * (2026-09-13: las dos copias ya elegían distinto al gastar las 3 consultas):
+ *   · lo que necesitaría otra consulta con el cupo del reintento gastado se saltea ("tope_mv");
+ *   · lo que MillionVerifier no pudo verificar (tope diario, error, timeout) se saltea: sin verificar no
+ *     sale, justo en el dominio que acaba de rebotar;
+ *   · la dirección que el MB cargó a mano sólo la frena un "no".
  * `rutaMV` / `verificarMV` / `quemar` existen para los tests (sin DNS ni red); en producción son
- * decidirVerificacionMV, _verifyEmailMV y markEmailBounced.
+ * decidirVerificacionMV, _verifyEmailMV y markEmailBounced. `alAgotarMv` queda como opción para el día
+ * que el dueño decida otra cosa (hoy "saltear").
  * @returns {{ chosen: object|null, motivos: string[], mvUsados: number, deReserva: boolean }}
  */
 async function _elegirEnviable(token, cfg, domain, ranked, opts = {}) {
-  const { maxMv = 3, rutaMV = decidirVerificacionMV, verificarMV = _verifyEmailMV, quemar = markEmailBounced } = opts;
-  let mvUsados = 0, reserva = null;
-  const motivos = [];
-  for (const cand of (ranked || [])) {
-    const email = String(cand?.email || "").trim().toLowerCase();
-    if (!email.includes("@")) continue;
-    const fuente = _normSrc(cand.source);
-    const hechos = { rebotado: isBouncedSync(email), noEscribir: _porQueNoEscribirA(email), marcaOk: _brandMatches(email, domain, fuente) };
-    let dec = _decidirCandidato(cand, hechos);
-    if (dec.startsWith("saltear:")) { motivos.push(dec.slice(8)); continue; }
-    const ruta = fuente === "manual" ? null
-      : await Promise.resolve(rutaMV(email, fuente)).catch(() => ({ verificar: true, enviar: true }));
-    dec = _decidirCandidato(cand, { ...hechos, ruta });
-    if (dec.startsWith("saltear:")) { motivos.push(dec.slice(8)); continue; }
-    if (mvUsados >= maxMv) { motivos.push("tope_mv"); continue; }
-    mvUsados++;
-    const mv = await Promise.resolve(verificarMV(token, cfg, email)).catch(() => "riesgo");
-    dec = _decidirCandidato(cand, { ...hechos, ruta, mv });
-    if (mv === "no") {
-      // Igual que el agente: la dirección no existe → se quema para que nadie la vuelva a elegir.
-      Promise.resolve(quemar(token, { email, reason: "mv_undeliverable", evidencia: "verificador", fuente: fuente || null, originalDomain: domain })).catch(() => {});
-    }
-    if (dec === "elegir") return { chosen: cand, motivos, mvUsados, deReserva: false };
-    if (dec === "reserva") { if (!reserva) reserva = cand; continue; }
-    motivos.push(dec.slice(8));
-  }
-  return { chosen: reserva, motivos, mvUsados, deReserva: !!reserva };
+  const { maxMv = 3, rutaMV = decidirVerificacionMV, verificarMV = _verifyEmailMV, quemar = markEmailBounced, alAgotarMv = "saltear" } = opts;
+  const norm = (e) => String(e || "").trim().toLowerCase();
+  const lista = (Array.isArray(ranked) ? ranked : []).filter(c => norm(c?.email).includes("@"));
+  const r = await _elegirDireccion(lista, {
+    rebotado: (e) => isBouncedSync(norm(e)),
+    noEscribir: (e) => _porQueNoEscribirA(norm(e)),
+    marcaOk: (c) => _brandMatches(norm(c.email), domain, _normSrc(c.source)),
+    ruta: (c) => rutaMV(norm(c.email), _normSrc(c.source)),
+    verificar: (e) => verificarMV(token, cfg, norm(e)),
+    // Igual que el agente: la dirección no existe → se quema para que nadie la vuelva a elegir.
+    quemar: (c) => {
+      try {
+        Promise.resolve(quemar(token, { email: norm(c.email), reason: "mv_undeliverable", evidencia: "verificador", fuente: _normSrc(c.source) || null, originalDomain: domain })).catch(() => {});
+      } catch {}
+    },
+    maxMv, alAgotarMv, sinVerificar: "saltear", manualManda: true,
+  });
+  return { chosen: r.chosen, motivos: r.motivos, mvUsados: r.mvUsed, deReserva: r.deReserva };
 }
 
 // La misma puerta que el agente consulta justo antes de mandar. Pura: `ficha` es lo que devuelve
@@ -19900,6 +19945,27 @@ function _fusionarRescate({ emails = [], sources = {}, vias = new Map() } = {}) 
     if (l && !fuentes[l]) fuentes[l] = via;
   }
   return { emails: lista, email_sources: fuentes };
+}
+
+// ── LA FUENTE DE LO QUE TRAE EL ENRIQUECIMIENTO DEL AGENTE (2026-09-13, cierre) ─────────────────────
+// runAgentCycle sumaba a la ficha lo que encontraban Apollo, el raspado y Serper, pero sólo anotaba la
+// fuente de Serper: una persona de Apollo quedaba sin fuente, el ranking la trataba como genérica y el
+// agente le escribía a info@ mientras la tarjeta preseleccionaba a la persona. Misma etiqueta que el alta
+// (qualify): "apollo", "generic" si el local es genérico y "scrape" si no, "google_contact" para Serper.
+// El orden de las vías decide quién gana si la misma dirección vino de dos lados; nunca se pisa una fuente
+// que ya estaba. Pura.
+function _fuentesDelEnriquecimiento(previas, { apollo = [], scrape = [], google_contact = [] } = {}) {
+  const fuentes = (previas && typeof previas === "object" && !Array.isArray(previas)) ? { ...previas } : {};
+  const anotar = (lista, via) => {
+    for (const e of (Array.isArray(lista) ? lista : [])) {
+      const k = String(e || "").trim().toLowerCase();
+      if (k.includes("@") && !fuentes[k]) fuentes[k] = via(k);
+    }
+  };
+  anotar(apollo, () => "apollo");
+  anotar(scrape, (k) => GENERIC_LOCAL_RE.test(k.split("@")[0]) ? "generic" : "scrape");
+  anotar(google_contact, () => "google_contact");
+  return fuentes;
 }
 
 /**
@@ -20408,18 +20474,10 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
       // dejamos pasar igual con score forzado a 0 para que entre al sort.
       .map(x => (x.source === "manual" && x.score < 0) ? { ...x, score: 0 } : x)
       .filter(x => x.score >= 0)
-      .sort((a, b) => {
-        // Maxi 2026-07-09: tier DURO primero (_pickTier): apollo/informer nominal > rol
-        // comercial/publicidad scrapeado > persona scrapeada > genérico. Honra la regla del
-        // dueño (decision-maker verificado manda) Y la elección del user (Q4: rol comercial).
-        const ta = _pickTier(a.email, a.source);
-        const tb = _pickTier(b.email, b.source);
-        if (ta !== tb) return tb - ta;
-        const sa = SOURCE_RANK[a.source] || 0;
-        const sb = SOURCE_RANK[b.source] || 0;
-        if (sa !== sb) return sb - sa;
-        return b.score - a.score;
-      });
+      // Maxi 2026-07-09: tier DURO primero: apollo/manual > rol comercial > persona > genérico, después
+      // el ranking dinámico de fuentes y al final rankEmail. El mismo comparador que el agente y la
+      // extensión (lib/email.js, 2026-09-13): antes era una copia que ya no leía el orden semanal.
+      .sort((a, b) => compararCandidatosEmail(a, b, { sourceRank: SOURCE_RANK, orden: _tierOrdenCache.orden }));
     if (ranked.length === 0) {
       log(`  ⏭️ ${domain}: candidatos existen pero todos con score negativo — skip`);
       _registrarSalto("candidatos_score_negativo");
@@ -20457,7 +20515,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     const retryEmail  = _eleccion.chosen.email;
     const retrySource = _eleccion.chosen.source || "scrape";
     const _elegido = ranked.find(x => x.email === retryEmail) || _eleccion.chosen;
-    log(`  🎯 ${domain}: retry → ${retryEmail} (source=${retrySource}, score=${_elegido.score}${_eleccion.deReserva ? ", reserva: catch-all o sin verificar" : ""}${_eleccion.motivos.length ? `, salteados: ${_eleccion.motivos.join(",")}` : ""})`);
+    log(`  🎯 ${domain}: retry → ${retryEmail} (source=${retrySource}, score=${_elegido.score}${_eleccion.deReserva ? ", reserva: catch-all" : ""}${_eleccion.motivos.length ? `, salteados: ${_eleccion.motivos.join(",")}` : ""})`);
 
     // 5. Config ya cargada arriba + send
     const mondayApiKey = (cfg[`monday_api_key_${mbEmail.toLowerCase()}`] || cfg.monday_api_key || "").trim();
@@ -21770,14 +21828,16 @@ async function _verifyEmailMV(token, cfg, email) {
     // pasaba en silencio y los rebotes aparecían después sin explicación.
     if (_mvCount === cap) log(`⚠️ MillionVerifier: llegué al tope de ${cap}/día — de acá en más los emails van SIN verificar (esperar rebotes)`);
     _mvCount++;
-    return "riesgo";   // sin verificar no es "limpio": que compita como reserva, no como bueno
+    // Sin verificar no es "limpio" ni es un catch-all (2026-09-13): estado propio. El agente lo trata
+    // como reserva (igual que hasta hoy); el reintento por rebote no lo manda al dominio que rebotó.
+    return "sin_verificar";
   }
   _mvCount++;
   // Persistir SIEMPRE (no cada 20) → un restart no pierde la cuenta del día. ~60 writes/día = nada.
   setConfigValue(token, "millionverifier_used", `${day}:${_mvCount}`).catch(() => {});
   try {
     const r = await fetch(`https://api.millionverifier.com/api/v3/?api=${encodeURIComponent(key)}&email=${encodeURIComponent(lower)}&timeout=10`, { signal: AbortSignal.timeout(12000) });
-    if (!r.ok) return "riesgo";                            // error API → fail-open, pero como reserva
+    if (!r.ok) return "sin_verificar";                     // error API → no es un veredicto (2026-09-13)
     const j = await r.json().catch(() => null);
     const res = String(j?.result || "").toLowerCase();
     // ── TRES ESTADOS, NO DOS (Maxi 2026-08-10) ──────────────────────────────────────────
@@ -21802,9 +21862,10 @@ async function _verifyEmailMV(token, cfg, email) {
     // Se separan para poder tratarlos distinto: el catch-all sigue siendo enviable como último
     // recurso, el dudoso no.
     // ⚠️ Ojo con NO meter acá los fallos NUESTROS (tope diario, error de red, timeout): esos
-    // devuelven "riesgo" más arriba y siguen siendo enviables, porque son ausencia de
+    // devuelven "sin_verificar" más arriba (hasta el 13/09 era "riesgo", la misma palabra que un
+    // catch-all) y en el primer contacto siguen siendo enviables de reserva, porque son ausencia de
     // información y no un veredicto. Tratar "no sé" como "no" es el error que ya pagamos ocho
-    // veces en este proyecto.
+    // veces en este proyecto. El reintento por rebote no los manda: ver _decidirCandidato.
     const estado = _mvEstadoDe(res) || "ok";
     const deliverable = estado !== "no";
     if (_mvCache.size >= MV_CACHE_MAX) _mvCache.delete(_mvCache.keys().next().value);
@@ -21820,7 +21881,7 @@ async function _verifyEmailMV(token, cfg, email) {
     if (estado === "riesgo")  log(`  ⚠️ MV: ${lower} = ${res} (dominio catch-all: acepta todo, puede rebotar) → queda de reserva`);
     if (estado === "dudoso")  log(`  ⚠️ MV: ${lower} = ${res} (no pudo confirmar la casilla; este grupo rebota 1 de cada 10) → no va como primer contacto`);
     return estado;
-  } catch { return "riesgo"; }                             // timeout/red → fail-open, pero como reserva
+  } catch { return "sin_verificar"; }                      // timeout/red → no es un veredicto (2026-09-13)
 }
 
 // ── QUÉ SE HACE CON CADA VEREDICTO, EN UNA SOLA TABLA (2026-09-13) ──────────────────────────
@@ -21830,13 +21891,15 @@ async function _verifyEmailMV(token, cfg, email) {
 // siguiente. Así [contacto@ dudoso, redaccion@ ok] no salía nunca (195 `mv_dudoso` el 12/09).
 // Las reglas del dueño ya estaban escritas; faltaba que el código las tuviera en un solo lugar:
 //   ok (o `true`, MV dormido sin clave) → se elige
-//   riesgo (catch-all, o NUESTRO tope/error) → de reserva, sale sólo si no hay uno limpio
+//   riesgo (catch-all real) → de reserva, sale sólo si no hay uno limpio
+//   sin_verificar (NUESTRO tope diario, error o timeout, 2026-09-13) → de reserva en el primer contacto,
+//                 igual que hasta hoy; el reintento lo saltea (ver _decidirCandidato)
 //   dudoso → se salta la dirección SIN quemarla: no va como primer contacto
 //   no → se quema y se salta
 function _accionPorVeredictoMV(estado) {
   if (estado === "no") return "quemar";
   if (estado === "dudoso") return "saltar";
-  if (estado === "riesgo") return "reserva";
+  if (estado === "riesgo" || estado === "sin_verificar") return "reserva";
   return "elegir";
 }
 
@@ -21851,32 +21914,57 @@ function _accionPorVeredictoMV(estado) {
 // dudoso salta a la dirección siguiente. En esos proveedores un catch-all es lo esperable y hoy
 // sale igual, así que `riesgo` se elige como antes en vez de ir a reserva: la política de qué se
 // manda no cambia y no se gasta una consulta de más buscando un "ok" que ahí no significa nada.
-async function _elegirDireccion(orden, { rebotado, noEscribir, marcaOk, ruta, verificar, quemar = () => {}, avisar = () => {}, maxMv = 3 }) {
+// ── UNA SOLA ELECCIÓN PARA EL AGENTE Y EL REINTENTO (2026-09-13, cierre) ─────────────────────────────
+// El reintento por rebote (_elegirEnviable) tenía su propia copia de este bucle y ya elegía distinto:
+// con [riesgo, dudoso, dudoso, ok] el agente mandaba a la 4ª y el reintento a la reserva catch-all, y con
+// [no, no, no, ok] el reintento no mandaba nada. Ahora el reintento llama a esta función y cada candidato
+// se decide con _decidirCandidato. Lo que distingue a los dos es POLÍTICA, explícita en tres parámetros:
+//   alAgotarMv   "elegir_sin_verificar" (agente: la red final le paga la consulta) | "saltear" (reintento)
+//   sinVerificar "reserva" (agente) | "saltear" (reintento): MV no contestó (tope diario, error, timeout)
+//   manualManda  false (agente) | true (reintento: la dirección que el MB cargó a mano sólo la frena un "no")
+// Qué hacer al gastar las consultas lo decide el dueño: hoy cada uno sigue como estaba.
+async function _elegirDireccion(orden, { rebotado, noEscribir, marcaOk, ruta, verificar, quemar = () => {}, avisar = () => {}, maxMv = 3,
+                                         alAgotarMv = "elegir_sin_verificar", sinVerificar = "reserva", manualManda = false }) {
   let mvUsed = 0, chosen = null, reserva = null, descartados = 0;
   const motivos = [];                 // POR QUÉ se cayó cada candidato, no sólo cuántos
   const noEnviables = new Set();      // lo que ya se probó que no sale: el 2º email no puede reusarlo
   const veredictos = new Map();
+  const politica = { manualManda, sinVerificar };
   for (const cand of (Array.isArray(orden) ? orden : [])) {
     const em = String(cand?.email || "").toLowerCase();
     if (!em) continue;
     const fuera = (motivo) => { descartados++; motivos.push(motivo); noEnviables.add(em); };
-    if (rebotado(cand.email)) { fuera("ya_reboto"); continue; }
-    const _no = noEscribir(cand.email);
-    if (_no) { avisar(`🧠 no escribo a ${cand.email} — ${_no}`); fuera("dominio_ya_rechazo"); continue; }
-    if (!marcaOk(cand)) { avisar(`🚫 ${cand.email} es de otra marca — se descarta el email, NO el lead`); fuera("otra_marca"); continue; }
-    const _ruta = (await ruta(cand)) || { verificar: true, enviar: true };
-    if (!_ruta.enviar) { avisar(`⏭️ ${cand.email} descartado — ${_ruta.motivo || "hipótesis en un proveedor que acepta todo"}`); fuera("catch_all_y_patron"); continue; }
-    if (mvUsed < maxMv) {
-      mvUsed++;
-      const v = await verificar(cand.email);
-      veredictos.set(em, v);
-      const accion = _accionPorVeredictoMV(v);
-      if (accion === "quemar") { quemar(cand); fuera("mv_no"); continue; }
-      if (accion === "saltar") { fuera("mv_dudoso"); continue; }
-      if (accion === "reserva" && _ruta.verificar !== false) { if (!reserva) reserva = cand; continue; }
+    // 1. Lo gratis: rebote, dirección del MB, registrante, dominio que rechaza, marca.
+    const hechos = { rebotado: !!rebotado(cand.email) };
+    if (!hechos.rebotado) { hechos.noEscribir = noEscribir(cand.email) || ""; hechos.marcaOk = !!marcaOk(cand); }
+    let dec = _decidirCandidato(cand, hechos, politica);
+    if (dec.startsWith("saltear:")) {
+      const motivo = dec.slice(8);
+      if (motivo === "dominio_ya_rechazo") avisar(`🧠 no escribo a ${cand.email} — ${hechos.noEscribir}`);
+      if (motivo === "otra_marca") avisar(`🚫 ${cand.email} es de otra marca — se descarta el email, NO el lead`);
+      fuera(motivo); continue;
     }
-    chosen = cand;
-    break;
+    // 2. La ruta del gasto (la dirección del MB no la necesita: sólo la frena un "no").
+    const esDelMb = manualManda && _normSrc(cand.source) === "manual";
+    const _ruta = esDelMb ? null : ((await Promise.resolve().then(() => ruta(cand)).catch(() => null)) || { verificar: true, enviar: true });
+    if (_ruta) {
+      dec = _decidirCandidato(cand, { ...hechos, ruta: _ruta }, politica);
+      if (dec.startsWith("saltear:")) { avisar(`⏭️ ${cand.email} descartado — ${_ruta.motivo || "hipótesis en un proveedor que acepta todo"}`); fuera(dec.slice(8)); continue; }
+    }
+    // 3. MillionVerifier, de a uno y hasta `maxMv` consultas.
+    if (mvUsed >= maxMv) {
+      if (alAgotarMv === "saltear") { descartados++; motivos.push("tope_mv"); continue; }
+      chosen = cand;
+      break;
+    }
+    mvUsed++;
+    const v = await Promise.resolve().then(() => verificar(cand.email)).catch(() => "sin_verificar");
+    veredictos.set(em, v);
+    if (v === "no") quemar(cand);
+    dec = _decidirCandidato(cand, { ...hechos, ruta: _ruta, mv: v }, politica);
+    if (dec === "elegir") { chosen = cand; break; }
+    if (dec === "reserva") { if (!reserva) reserva = cand; continue; }
+    fuera(dec.slice(8));
   }
   const deReserva = !chosen && !!reserva;
   if (deReserva) chosen = reserva;
@@ -24784,16 +24872,22 @@ async function runAgentCycle(token, allFlags) {
               const patch = { emails: validated };
               if (apolloRes?.contact_name && !lead.contact_name) patch.contact_name = apolloRes.contact_name;
               if (serperPhone && !lead.contact_phone) patch.contact_phone = serperPhone;
-              // Registrar la fuente de los emails de Serper para el ranking/atribución.
-              // También lo que encontró la búsqueda en Google DENTRO del scrape (2026-09-13). De ahí sólo los
-              // no genéricos: esos antes quedaban sin fuente, y un genérico sin fuente es el que hace que
-              // el agente busque uno mejor (allGeneric). Esa decisión no cambia.
-              const _deGoogle = [...serperEmails, ...scraped.filter(e => _googleScrape.has(String(e).toLowerCase()) && !_isGenericLocalPart(e))];
-              if (_deGoogle.length) {
-                const _es = { ...(lead.email_sources || {}) };
-                for (const e of _deGoogle) if (!_es[e.toLowerCase()]) _es[e.toLowerCase()] = "google_contact";
-                patch.email_sources = _es;
-              }
+              // ── LA FUENTE DE TODO LO NUEVO, NO SÓLO DE SERPER (2026-09-13, cierre) ───────────────
+              // Sólo se anotaban los de Serper: una persona de Apollo o del raspado quedaba sin fuente, el
+              // ranking la leía como genérica (tier) y sin puntos de fuente, y el agente le escribía a info@
+              // mientras la tarjeta de Prospects preseleccionaba a la persona. Misma etiqueta que el alta
+              // (qualify): apollo, generic si el local es genérico, scrape si no. Nunca se pisa una fuente
+              // que ya estaba, y el lead en memoria se actualiza para que ESTE ciclo ordene con ella.
+              // También lo que encontró la búsqueda en Google DENTRO del scrape (2026-09-13): los no genéricos van
+              // como google_contact; los genéricos siguen como "generic", porque un genérico es el que hace que el
+              // agente busque uno mejor (allGeneric) y esa decisión no cambia.
+              const _deGoogleScrape = new Set(scraped.filter(e => _googleScrape.has(String(e).toLowerCase()) && !_isGenericLocalPart(e)).map(e => String(e).toLowerCase()));
+              patch.email_sources = _fuentesDelEnriquecimiento(lead.email_sources, {
+                apollo: apolloEmail,
+                scrape: scraped.filter(e => !_deGoogleScrape.has(String(e).toLowerCase())),
+                google_contact: [...serperEmails, ...scraped.filter(e => _deGoogleScrape.has(String(e).toLowerCase()))],
+              });
+              lead.email_sources = patch.email_sources;
               // ── EL RESCATE DEL AGENTE CUENTA IGUAL QUE EL DEL PULIDO (2026-09-13) ─────────────
               // El pool del agente también trae leads sin ningún email (van al final del orden). Si
               // este enriquecimiento le encontraba el PRIMERO, se guardaba la lista sin email_found_at:
@@ -24839,19 +24933,14 @@ async function runAgentCycle(token, allFlags) {
           // Maxi 2026-07-14 (auditoría rebotes): informer (WHOIS) + freemail = email del REGISTRANTE
           // del dominio, NO el contacto comercial → nunca sirve y suele rebotar (caso rudnypc@gmail de
           // baladag4.com.br). Un gmail SCRAPEADO del sitio sí puede ser real → esto solo aplica a informer.
-          .filter(x => !(x.source === "informer" && /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|aol|icloud|protonmail|gmx|yandex)\.|@mail\.ru\b/i.test(x.email)))
-          .sort((a, b) => {
-            // Maxi 2026-07-09: tier DURO primero (_pickTier): apollo/informer nominal > rol
-            // comercial/publicidad scrapeado > persona scrapeada > genérico. Honra la regla del
-            // dueño (decision-maker verificado manda) Y la elección del user (Q4: rol comercial).
-            const ta = _pickTier(a.email, a.source);
-            const tb = _pickTier(b.email, b.source);
-            if (ta !== tb) return tb - ta;     // apollo/informer > publicidad@ > persona > genérico
-            const sa = SOURCE_RANK[a.source] || 0;
-            const sb = SOURCE_RANK[b.source] || 0;
-            if (sa !== sb) return sb - sa;     // dentro del tier: ranking dinámico
-            return b.score - a.score;          // desempate final: rankEmail
-          });
+          // La regla es la de lib/email.js (esRegistranteWebmail), la misma del reintento y la extensión:
+          // hasta el 13/09 era una copia literal de la regex en cada lado.
+          .filter(x => !esRegistranteWebmail(x.email, x.source))
+          // Maxi 2026-07-09: tier DURO primero: apollo/manual > rol comercial > persona > genérico
+          // (informer baja, ver tierDeEmail), después el ranking dinámico de fuentes y al final rankEmail.
+          // El comparador es el de lib/email.js: el mismo del reintento y de la tarjeta de Prospects
+          // (2026-09-13); la extensión le pasa el ranking de fuentes por defecto.
+          .sort((a, b) => compararCandidatosEmail(a, b, { sourceRank: SOURCE_RANK, orden: _tierOrdenCache.orden }));
         // ── EN UN RE-CONTACTO, PROBAR OTRA DIRECCIÓN (Maxi 2026-08-27, pedido del user) ────
         // "Que todas las webs en ciclo finalizado vuelvan a Prospects con un mail distinto al
         //  que está en Monday, idealmente."
@@ -25614,7 +25703,7 @@ async function runAgentCycle(token, allFlags) {
           const _ruta2 = secondCandidate
             ? await decidirVerificacionMV(secondCandidate.email, secondCandidate.source).catch(() => ({ verificar: true, enviar: true }))
             : null;
-          const _v2 = _ruta2?.enviar ? await _verifyEmailMV(token, cfg, secondCandidate.email).catch(() => "riesgo") : null;
+          const _v2 = _ruta2?.enviar ? await _verifyEmailMV(token, cfg, secondCandidate.email).catch(() => "sin_verificar") : null;
           const _dec2 = secondCandidate
             ? _segundoEmailEnviable({ ..._datos2(secondCandidate), ruta: _ruta2, veredictoMV: _v2 })
             : { ok: false, motivo: "sin_candidato" };
@@ -25891,7 +25980,7 @@ process.on("SIGINT", () => {
 // con cache 1h en memoria, fallback a default si sample chico, y ε-greedy 10%.
 // ════════════════════════════════════════════════════════════════
 
-const SOURCE_RANK_DEFAULT = { manual: 5, apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+// SOURCE_RANK_DEFAULT vive en lib/email.js desde el 13/09: la extensión ordena con la misma tabla.
 
 
 let _tierOrdenCache = { orden: null, ts: 0 };
@@ -25953,32 +26042,25 @@ async function reajustarPrioridadTiposEmail(token) {
   } catch (e) { log(`⚠️ reajustarPrioridadTiposEmail: ${e.message}`); }
 }
 
-// El orden vigente, con caché de 1h. Si nunca se midió, el default.
-function _tierPrioridad(tipo) {
-  const orden = _tierOrdenCache.orden || _TIER_ORDEN_DEFAULT;
-  const idx = orden.indexOf(tipo);
-  // Prioridad más alta = número más alto (misma semántica que _pickTier de siempre).
-  return idx === -1 ? 0 : (orden.length - idx);
-}
+// El orden vigente, con caché de 1h. Si nunca se midió, el default. La prioridad por tipo la calcula
+// tierDeEmail (lib/email.js) con este orden: la extensión usa la misma función (2026-09-13).
 async function _cargarTierOrden(cfg) {
   if (_tierOrdenCache.orden && Date.now() - _tierOrdenCache.ts < 3600_000) return;
   try {
     const g = JSON.parse(cfg.email_tier_ranking || "null");
-    if (g && Array.isArray(g.orden) && g.orden.length === 4) _tierOrdenCache = { orden: g.orden, ts: Date.now() };
+    // La misma validación que la extensión (ordenDeTiersValido): cuatro tipos conocidos, sin repetir.
+    const orden = ordenDeTiersValido(g?.orden);
+    if (orden) _tierOrdenCache = { orden, ts: Date.now() };
   } catch {}
 }
 
+// El tier con que el agente y el reintento eligen dirección. La regla vive en lib/email.js
+// (tierDeEmail) y la usa también la extensión (2026-09-13): informer 3 si es rol comercial y 1 si no;
+// el orden entre los cuatro tipos sale del reajuste semanal por respuestas medidas
+// (`reajustarPrioridadTiposEmail`); si nunca se midió, `_TIER_ORDEN_DEFAULT` reproduce el orden fijo
+// de siempre: apollo > rol > persona > genérico.
 function _pickTier(email, source) {
-  const src = String(source || "").toLowerCase();
-  const local = String(email || "").toLowerCase().split("@")[0];
-  // Maxi 2026-07-13 (auditoría 48h): informer (website.informer/WHOIS) NO es top-tier — da contactos
-  // técnicos/registrar (domainmanagement@, net-manage@…) de baja calidad. Se baja al nivel más bajo
-  // salvo que el local sea un rol comercial explícito. apollo/manual siguen tier 4.
-  if (src === "informer") return AD_SALES_LOCAL.test(local) ? 3 : 1;
-  // El orden entre los cuatro tipos sale del reajuste semanal por respuestas medidas
-  // (`reajustarPrioridadTiposEmail`). Si nunca se midió, `_TIER_ORDEN_DEFAULT` reproduce
-  // exactamente el orden fijo de siempre: apollo > rol > persona > genérico.
-  return _tierPrioridad(_tipoDeEmailParaRanking(email, source));
+  return tierDeEmail(email, source, _tierOrdenCache.orden);
 }
 const SOURCE_PERF_WINDOW_DAYS = 30;
 const SOURCE_PERF_MIN_SENT = 50;       // sample mínimo por (mb, source) para usar dinámico

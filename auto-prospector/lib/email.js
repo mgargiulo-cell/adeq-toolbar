@@ -589,7 +589,10 @@ export function _isGenericLocalPart(email) {
 // Maxi 2026-07-13 (auditoría): +cobertura del pool europeo — régie(FR), Vermarktung/Anzeigen/Verkauf(DE),
 // verkoop/adverteren(NL), vente(FR), raccolta pubblicitaria(IT), auglýsingar(IS), annons(SE). Todos = venta
 // de pauta/inventario. 'regie\b'/'regiepub' evita matchear 'regierung'(gobierno DE).
-export const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|vertrieb|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor|inzerc|inzer[aá]t|hirdet|diafimisi|diafhmish|adverten|adverteren|advertentie|oglas|marknad|myynti)/i;
+// `reklam(?!ac|ati)` (2026-09-13): reklama/reklamy son publicidad, pero reklamacje (pl), reklamace (cz),
+// reklamácie (sk) y Reklamation (de) son RECLAMOS. Con el prefijo solo, reklamacje@ valía 135 como
+// buzón de venta de pauta y era lo primero que elegían el agente y la extensión: es la mesa de reclamos.
+export const AD_SALES_LOCAL = /^(?:publicidad|publicidade|publicit[ea]|pubblicit|werbung|vermarkt|vertrieb|advertis|advert\b|\badv\b|ads\b|ad[-_.]?sales|adverten|anunci|anzeigen|reklam(?!ac|ati)|iklan|regiepub|regie\b|comercial|commercial|ventas|vendas|vente|verkauf|verkoop|sales\b|salesteam|marketing|mktg?\b|monetiz|media[-_.]?sales|raccolta|auglys|annons|inventory|programmatic|patrocin|sponsor|inzerc|inzer[aá]t|hirdet|diafimisi|diafhmish|adverten|adverteren|advertentie|oglas|marknad|myynti)/i;
 
 // Igual que AD_SALES_LOCAL pero SIN anclar al principio: el token comercial puede estar en el
 // medio o al final del buzón. Medido: mobilepub@comercio.com.pe es el único contacto alcanzable
@@ -1034,7 +1037,7 @@ function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) 
   // "comerciales" o "noticiascomerciales" no.
   const _SEG_COMERCIAL = /^(?:comercial|commercial|publicidad|publicidade|pubblicita|publicite|ventas|vendas|sales|adsales|marketing|advertising|anuncios|anunciantes|reklama|werbung|pauta)$/i;
   const AD_SALES_DEPTO = {
-    test: (l) => /^(?:departamento|depto|dpto|dept|area|setor|sector|equipo|equipe|team|servicio|service|oficina|gerencia|direccion|diretoria)[._-]?(?:comercial|commercial|publicidad|publicidade|publicit|pubblicit|ventas|vendas|sales|marketing|advertis|anunci|reklam|werbung)/i.test(l)
+    test: (l) => /^(?:departamento|depto|dpto|dept|area|setor|sector|equipo|equipe|team|servicio|service|oficina|gerencia|direccion|diretoria)[._-]?(?:comercial|commercial|publicidad|publicidade|publicit|pubblicit|ventas|vendas|sales|marketing|advertis|anunci|reklam(?!ac|ati)|werbung)/i.test(l)
              || (l.includes(".") || l.includes("_") || l.includes("-")) && l.split(/[._-]+/).some(seg => _SEG_COMERCIAL.test(seg)),
   };
   const COMMERCIAL = /^(?:(?:business|partnership|partner|propaganda|director|gerente|manager|jefe|brand|media)|(?:bd|head)\b)/i;
@@ -1048,7 +1051,10 @@ function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) 
   // que `press@` valía 115 y `presse@` 55 — la misma palabra, dos puntajes, según el idioma.
   // Es el mismo error que se arregló con `redazione` el 31/08. (Maxi 2026-09-04)
   const EDITORIAL  = /^(editor|editorial|editor-in-chief|chief-editor|redacao|redaccion|redazione|redaktion|redaction|redactie|redakcja|redakce|redaktsiya|szerkesztoseg|syntaxi|toimitus|newsroom|writer|periodista|journalist|prensa|press|presse|imprensa|stampa|basin|sajto|tisk|reporter|news-?desk)\b/;
-  const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president)\b/;
+  // `geschaeftsfuehrer` (el gerente general en Alemania, 2026-09-13): con 17 letras no entraba en
+  // PERSON_LIKELY y quedaba sin rol, en 40 — debajo de info@ (55) pero "persona" en el tier, o sea
+  // arriba de info@ al elegir. Es el mismo rol que ceo@: se le da el puntaje de EXEC y la clase no cambia.
+  const EXEC       = /^(ceo|cmo|cto|coo|founder|co-?founder|owner|publisher|presidente|president|gesch(?:ae|a)ftsf(?:ue|u)hrer)\b/;
 
   // ORDEN: chequear generics PRIMERO (antes que "single name"), sino palabras
   // tipo "contato" se cuelan como single-name con score alto en lugar de role.
@@ -1094,7 +1100,9 @@ function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) 
   // Score NEGATIVO = rankEmail lo descarta. Preferimos no mandar antes que mandar acá.
   // `ouvidoria` (la defensoría del lector en Brasil), `ombudsman` y `complaints` son la mesa de
   // reclamos con otro nombre (Maxi 2026-09-04): `ouvidoria@` puntuaba 95 por parecer un nombre.
-  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|ajuda|apoyo|denuncias?|reclamos?|reclama[cç][õo]es|ouvidoria|ombudsman|complaints?|abonnements?|suscripciones|assinaturas|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|helpdesk|help|servicios?|servico|service|tickets?|customer[a-z]*|cliente[a-z]*|servicedesk)([._-]|$)/i.test(local)) { score -= 20; matchedRole = "MESA_DE_AYUDA"; }
+  // `reklamacje` (pl), `reklamace` (cz), `reklamácie` (sk), `Reklamation` (de): el mismo buzón de
+  // reclamos (2026-09-13). Salían de AD_SALES por el prefijo `reklam`; acá valen lo que ouvidoria@.
+  else if (/^(soporte|suporte|support|suport|atencion|atenci[oó]n|atendimento|ajuda|apoyo|denuncias?|reclamos?|reclama[cç][õo]es|reklamac[a-z]*|reklamation(?:en)?|ouvidoria|ombudsman|complaints?|abonnements?|suscripciones|assinaturas|cobran[zc]as|cobran[çc]a|facturaci[oó]n|faturamento|billing|pedidos|env[ií]os|devoluciones|postvent[ao]|posvent[ao]|\bsac\b|\bbok\b|cskh|helpdesk|help|servicios?|servico|service|tickets?|customer[a-z]*|cliente[a-z]*|servicedesk)([._-]|$)/i.test(local)) { score -= 20; matchedRole = "MESA_DE_AYUDA"; }
   // Otros departamentos que no son mesa de ayuda: no venden pauta, pero tampoco
   // ensucian una cola de soporte. Siguen sendables como último recurso (North Star: ≥1 email).
   // ── ÁREAS QUE LOS MB DESCARTAN SIEMPRE (Maxi 2026-08-25) ────────────────────────────
@@ -1108,7 +1116,11 @@ function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) 
   // `redaccion` NO está acá: la agarra antes EDITORIAL (+75), que es lo que Agus quiere.
   else if (/^(noticias?|news|newsletter)([._-]|$)/i.test(local)) { score -= 10; matchedRole = "AREA_EQUIVOCADA"; }
   else if (/^(finan|contab|administracion|administrativo|tesoreria|pagos?)/i.test(local)) { score -= 10; matchedRole = "AREA_EQUIVOCADA"; }
-  else if (/^(rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|legal|privacy|privacidad|privacidade|\bdpo\b|abuse)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
+  // El buzón de RRHH / empleo en los otros idiomas del pool (2026-09-13): recrutement@ y emploi@ (fr),
+  // kadry@ y praca@ (pl), recrutamento@ y emprego@ (pt), reclutamiento@ (es), karriere@ (de), lavoro@
+  // (it) valían 95 como "nombre de persona" y le ganaban a info@ (55). Es el mismo departamento que
+  // rrhh@/empleos@, igual que se hizo con presse/stampa: la palabra en otro idioma, el mismo puntaje.
+  else if (/^(rrhh|recursoshumanos|empleos?|jobs|careers|trabaj[ao]|recrutement|recrutamento|reclutamiento|rekrutacja|emplois?|empregos?|kadry|praca|karriere|lavoro|legal|privacy|privacidad|privacidade|\bdpo\b|abuse)([._-]|$)/i.test(local)) { score += 8; matchedRole = "DEPARTMENT"; }
   // Maxi 2026-07-27 (auditoría respuestas 23-27): buzones de IT / infraestructura / dominios /
   // registrar. NO son contacto de venta de pauta y jamás responden un pitch de inventario; peor,
   // varios son direcciones técnicas donde el mail se archiva o abre un ticket. Casos reales de
@@ -1232,7 +1244,7 @@ function _puntuarEmail(email, siteDomain, leadCategory, casasEditoras, conVeto) 
   if (/^(datenschutz|legal|privacy|privacidad|gdpr|dpo|dsb|dmca|copyright|compliance|abuse|recht)/.test(local)) score -= 30;
   // Maxi 2026-07-13 (auditoría): departamentos que NO compran pauta (seguridad/casting/quejas/
   // reclamos/RRHH/soporte). No se descartan del todo (por si es el único contacto), pero van bien abajo.
-  if (/^(seguridad|seguranca|security|sicherheit|casting|complaints?|ouvidoria|ombudsman|reclam|quejas|reclamacoes|helpdesk|helpline|support.?tech|soporte.?tecnico|suporte.?tecnico)/.test(local)) score -= 45;
+  if (/^(seguridad|seguranca|security|sicherheit|casting|complaints?|ouvidoria|ombudsman|reclam|reklamac|reklamation|quejas|reclamacoes|helpdesk|helpline|support.?tech|soporte.?tecnico|suporte.?tecnico)/.test(local)) score -= 45;
   // Roles TÉCNICOS/IT/operaciones/red — rara vez compran pauta, pero en un medio chico pueden ser el
   // ÚNICO contacto (feedback user 2026-07-13: "sistemas.diariodovale@ no lo veo mal") → penalty fuerte,
   // NO hard-reject: pierden contra cualquier otro candidato pero sobreviven como último recurso.
@@ -1573,6 +1585,13 @@ export const BUZON_FUNCIONAL_SEGMENT = new Set([
   "moderators", "moderator", "mods", "moderacion", "volunteer", "volunteers", "voluntarios", "volontari",
   "translate", "translations", "report", "reports", "accessibility", "ethics", "standards", "letters",
   "subscribe", "subscriptions", "techsupport", "websupport",
+  // Compras, proveedores y cartas de lectores (2026-09-13): compras@, proveedores@, lectores@ y cartas@
+  // valían 95 como "persona" y contaban como mejora frente a info@ (55). Son el buzón de un área que no
+  // compra pauta, igual que tienda@ o eventos@. Las mismas palabras en los idiomas del pool. Quedan afuera
+  // a propósito `leser` (de) y `courrier` (fr): son también un apellido y el nombre de un diario.
+  "compras", "proveedores", "lectores", "cartas", "fornecedores", "leitores", "acquisti", "fornitori", "lettori",
+  "achats", "fournisseurs", "lecteurs", "einkauf", "lieferanten", "leserbriefe", "zakupy", "dostawcy", "czytelnicy",
+  "purchasing", "procurement", "suppliers",
 ]);
 // Un trozo comercial o de decisor le gana al funcional (revisión del 13/09): eventos.comercial@,
 // events.marketing@, eventos.patrocinio@ y events.partner@ son el área que vende o arma acuerdos
@@ -1600,9 +1619,18 @@ export function esBuzonFuncional(emailOLocal) {
 //   AREA_EQUIVOCADA       noticias@, finanzas@, contabilidad@, administracion@, pagos@
 //   INICIALES_SOSPECHOSAS tld@, gp@: rankEmail les resta 40 por el 19% de rebote ("último recurso");
 //                         como "persona" eran lo primero y la extensión los dejaba puestos.
-// No cambia la clase de los demás: EXEC, COMMERCIAL, EDITORIAL, PERSON, PERSON_LIKELY, SINGLE_NAME y
-// los locales sin rol (pr@, geschaeftsfuehrer@) siguen "persona"; press@ y webmaster@ ya eran genéricos.
-export const ROLES_DE_BUZON = new Set(["DEPARTMENT", "IT_INFRA", "MESA_DE_AYUDA", "AREA_EQUIVOCADA", "INICIALES_SOSPECHOSAS"]);
+// No cambia la clase de los demás: EXEC, COMMERCIAL, PERSON, PERSON_LIKELY y SINGLE_NAME siguen "persona";
+// press@ y webmaster@ ya eran genéricos.
+// ── EL MISMO ROL, UNA SOLA CLASE (2026-09-13, cierre) ──────────────────────────────────────────────
+// prensa@, presse@, stampa@ e imprensa@ (EDITORIAL, 115) eran "generico" porque están en la lista de
+// genéricos, y redaccion@, redazione@ o newsroom@ (EDITORIAL, 115) eran "persona": el mismo rol en dos
+// tiers según la palabra, y el agente ponía redaccion@ arriba de un nombre y prensa@ debajo. Manda la
+// clase que ya dicta la lista de genéricos: EDITORIAL es un buzón. El puntaje no cambia, así que entre
+// los genéricos redaccion@ (115) sigue ganándole a info@ (55); lo que cambia es que una persona con
+// nombre le gana a los dos. pr@ y rp@ (prensa / relaciones públicas, 10) son la sigla del mismo buzón:
+// eran "persona" sin rol y quedaban arriba de info@ por tier. geschaeftsfuehrer@ es EXEC (ver rankEmail).
+export const ROLES_DE_BUZON = new Set(["DEPARTMENT", "IT_INFRA", "MESA_DE_AYUDA", "AREA_EQUIVOCADA", "INICIALES_SOSPECHOSAS", "EDITORIAL"]);
+const _SIGLA_DE_PRENSA = /^(?:pr|rp)$/;
 export function claseDeEmail(email) {
   const e = String(email || "");
   const local = e.toLowerCase().split("@")[0];
@@ -1610,12 +1638,22 @@ export function claseDeEmail(email) {
   // Un genérico (info@, press@) o un buzón funcional (download@, store@) es "generico" venga de donde
   // venga (2026-09-13). esBuzonFuncional se mira aparte porque rankEmail no lo marca en un webmail.
   if (_isGenericLocalPart(e) || esBuzonFuncional(e)) return "generico";
+  if (_SIGLA_DE_PRENSA.test(local.replace(/[._-]/g, ""))) return "generico";
   if (ROLES_DE_BUZON.has(rolDeEmail(e))) return "generico";
   return "persona";
 }
 
+// ¿Esta dirección ya es alguien con quien hablar (un rol comercial o una persona)? (2026-09-13, cierre)
+// polishPool, la búsqueda de personas en Google, el unlock de Apollo, el Informer del autopilot, el
+// rastreo del sitio y el reveal automático de Análisis decidían "ya hay decisor" con la lista de
+// genéricos: rrhh@, soporte.web@, informatique@ o redaccion@ contaban como contacto real y el lead no
+// salía a buscar a nadie. Es la misma clase con la que se elige a quién escribir.
+export function esDecisor(email) {
+  return claseDeEmail(email) !== "generico";
+}
+
 export function _tipoDeEmailParaRanking(email, source) {
-  const src = String(source || "").toLowerCase();
+  const src = fuenteDeRanking(source);
   // El que eligió una persona a mano sigue arriba de todo.
   if (src === "manual") return "apollo";
   const clase = claseDeEmail(email);
@@ -1624,10 +1662,70 @@ export function _tipoDeEmailParaRanking(email, source) {
   // 6,6% de los que el MB agregó a mano y 3,1% del scrape. Ser de Apollo ya no vale por sí
   // solo: una persona de Apollo es una persona, un rol comercial es un rol, y un info@ que
   // Apollo devolvió es un genérico — y se ordena con los de su clase.
-  if (src === "apollo") return clase;
   // Un rol o un genérico lo son venga de donde vengan. Antes decidía la fuente: un info@ de redes,
   // de caché o sin fuente caía en "persona", y el agente lo ordenaba distinto que la extensión.
-  if (clase !== "persona") return clase;
-  if (_sourceHardTier(source) === 1) return "persona";
-  return "generico";
+  // ── UNA PERSONA ES PERSONA AUNQUE NO SEPAMOS DE DÓNDE SALIÓ (2026-09-13, cierre) ─────────────────
+  // Con fuente vacía o "generic" una persona bajaba a "generico": juan.perez@ que el agente sumó con
+  // Apollo sin anotar la fuente competía con info@, y el agente le escribía a info@ mientras la tarjeta
+  // de Prospects preseleccionaba a juan.perez@. La excepción es informer (el WHOIS): una "persona" de ahí
+  // es un contacto técnico o del registrante, y sigue con los genéricos, como siempre.
+  if (clase === "persona" && src === "informer") return "generico";
+  return clase;
+}
+
+// ── EL ORDEN DE LOS CANDIDATOS: UNA SOLA REGLA PARA EL AGENTE, EL REINTENTO Y LA EXTENSIÓN (2026-09-13) ──
+// El agente (runAgentCycle) y el reintento (queueBounceRetry) ordenaban tipo → fuente → puntaje con un
+// comparador escrito dos veces, y la tarjeta y Análisis ordenaban tipo → puntaje con su propia tabla de
+// tipos (informer 1, genérico 0). Para el mismo lead el primero podía ser otro. Ahora los tres usan esto:
+//   1. el tipo (tierDeEmail): apollo/manual > rol comercial > persona > genérico, en el orden que dejó el
+//      reajuste semanal por respuestas; informer 3 si es rol comercial y 1 si no (el nivel del genérico);
+//   2. la fuente (SOURCE_RANK): el agente pasa el ranking aprendido por MB, la extensión el de por defecto;
+//   3. el puntaje de rankEmail.
+// ⚠️ Lo que puede seguir distinto, a propósito: el ranking aprendido por MB (con 10% de exploración al
+// azar) desempata dos direcciones del MISMO tipo según qué fuente contestó más a ese MB, y la extensión
+// no lo conoce. Es la política del 19/05, no un error.
+export const SOURCE_RANK_DEFAULT = { manual: 5, apollo: 4, informer: 3, scrape: 2, generic: 1, "": 0 };
+
+// La fuente como la leen el ranking y el tipo: email_sources guarda "scrape" o {source, url}; Análisis
+// guarda "Page", "Scrape", "Informer", "Apollo". "Page" es el raspado del propio sitio, o sea "scrape".
+export function fuenteDeRanking(v) {
+  const s = String((typeof v === "string" ? v : (v && v.source)) || "").trim().toLowerCase();
+  return s === "page" ? "scrape" : s;
+}
+
+// El orden de tipos que guarda el reajuste semanal (toolbar_config.email_tier_ranking), o null si no sirve.
+export function ordenDeTiersValido(orden) {
+  if (!Array.isArray(orden) || orden.length !== _TIER_ORDEN_DEFAULT.length) return null;
+  const vistos = new Set(orden);
+  return vistos.size === orden.length && _TIER_ORDEN_DEFAULT.every(t => vistos.has(t)) ? [...orden] : null;
+}
+
+// Número más alto = se elige antes. Mismo resultado que el _pickTier del worker de siempre.
+export function tierDeEmail(email, source, orden = null) {
+  const src = fuenteDeRanking(source);
+  const local = String(email || "").toLowerCase().split("@")[0];
+  // Maxi 2026-07-13 (auditoría 48h): informer (WHOIS) no es top-tier: da contactos técnicos o del
+  // registrar. Nivel más bajo, salvo que el local sea un rol comercial explícito.
+  if (src === "informer") return AD_SALES_LOCAL.test(local) ? 3 : 1;
+  const o = ordenDeTiersValido(orden) || _TIER_ORDEN_DEFAULT;
+  const idx = o.indexOf(_tipoDeEmailParaRanking(email, src));
+  return idx === -1 ? 0 : o.length - idx;
+}
+
+// Comparador para .sort(): candidatos { email, source, score, tier? }. `tier` precalculado manda (la
+// extensión pone -1 a lo vetado o rebotado); si no viene, se calcula con `orden`.
+export function compararCandidatosEmail(a, b, { sourceRank = SOURCE_RANK_DEFAULT, orden = null } = {}) {
+  const ta = typeof a?.tier === "number" ? a.tier : tierDeEmail(a?.email, a?.source, orden);
+  const tb = typeof b?.tier === "number" ? b.tier : tierDeEmail(b?.email, b?.source, orden);
+  if (ta !== tb) return tb - ta;
+  const rank = sourceRank || SOURCE_RANK_DEFAULT;
+  // Primero la fuente tal cual (el ranking aprendido guarda las claves como las anotó el agente) y si no
+  // está, normalizada.
+  const rangoDe = (x) => {
+    const crudo = typeof x?.source === "string" ? x.source : "";
+    return rank[crudo] ?? rank[fuenteDeRanking(x?.source)] ?? 0;
+  };
+  const sa = rangoDe(a), sb = rangoDe(b);
+  if (sa !== sb) return sb - sa;
+  return (Number(b?.score) || 0) - (Number(a?.score) || 0);
 }

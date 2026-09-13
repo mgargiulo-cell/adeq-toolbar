@@ -150,14 +150,16 @@ test("C36: un 'no' se quema y se prueba la siguiente; el tope de MV corta; la re
 });
 
 test("C36: el veto de informer+webmail es la misma expresión en el reintento y en el agente", async () => {
-  const { _WEBMAIL_DE_REGISTRANTE } = await cargarWorker(["_WEBMAIL_DE_REGISTRANTE"]);
-  const agente = cuerpoDe("runAgentCycle");
-  const m = agente.match(/x\.source === "informer" && \/(.+?)\/i\.test\(x\.email\)/);
-  if (!m) {
-    ok(/_elegirEnviable\(|_WEBMAIL_DE_REGISTRANTE/.test(agente), "el agente perdió el filtro y tampoco usa la regla compartida");
-    return;
-  }
-  strictEqual(m[1], _WEBMAIL_DE_REGISTRANTE.source, "dos copias de la misma regla que ya no dicen lo mismo");
+  // (2026-09-13, cierre de eleccion_paridad) Este test comparaba dos copias de la regex (la del reintento,
+  // _WEBMAIL_DE_REGISTRANTE, y el literal del agente). Ya no hay copias: los dos llaman a
+  // esRegistranteWebmail de lib/email.js, la misma de la extensión. Se exige eso y que no vuelvan.
+  ok(!/const _WEBMAIL_DE_REGISTRANTE\s*=/.test(worker), "volvió la copia local de la regex del registrante");
+  ok(!/x\.source === "informer" && \/@\(gmail/.test(worker), "volvió el literal del registrante en el agente");
+  ok(/esRegistranteWebmail\(email, fuente\)/.test(cuerpoDe("_decidirCandidato")), "el reintento no usa la regla compartida");
+  ok(/\.filter\(x => !esRegistranteWebmail\(x\.email, x\.source\)\)/.test(cuerpoDe("runAgentCycle")), "el agente perdió el filtro o no usa la regla compartida");
+  const { _decidirCandidato } = await cargarWorker(["_decidirCandidato"]);
+  strictEqual(_decidirCandidato({ email: "mario.rossi@gmail.com", source: "informer" }, {}), "saltear:informer_webmail");
+  strictEqual(_decidirCandidato({ email: "ivan@mail.ru", source: { source: "informer" } }, {}), "saltear:informer_webmail", "la fuente guardada como objeto también");
 });
 
 test("C36: el reintento elige con _elegirEnviable y, sin candidato, no congela ni avisa 'contacto agotado'", () => {

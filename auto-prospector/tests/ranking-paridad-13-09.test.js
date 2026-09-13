@@ -81,7 +81,9 @@ test("la extensión usa los vetos y el criterio de buzón funcional del módulo 
   ok(!/_rankClient\(email\) < 0/.test(tier), "un puntaje negativo hundía a los buzones del grupo editor");
   // Un buzón funcional va con los genéricos: lo decide claseDeEmail (que incluye esBuzonFuncional), la
   // misma función del agente; la paridad de comportamiento la fija el test T1 de ranking_extension-13-09b.
-  ok(/\[claseDeEmail\(email\)\]/.test(tier) && !/esBuzonFuncional\(|_isGenericEmailLocal\(/.test(tier), "un buzón funcional va con los genéricos");
+  // (2026-09-13, cierre de eleccion_paridad) El tipo sale de tierDeEmail, que clasifica con claseDeEmail: la
+  // misma función del _pickTier del agente. Lo que se protege es lo mismo: ninguna lista propia en el popup.
+  ok(/tierDeEmail\(email, src, ctx\.ordenTiers\)/.test(tier) && !/esBuzonFuncional\(|_isGenericEmailLocal\(/.test(tier), "un buzón funcional va con los genéricos");
   const llamadas = popup.match(/isGarbageEmail\([^)]*\)/g) || [];
   ok(llamadas.length >= 5, `esperaba al menos 5 llamadas, hay ${llamadas.length}`);
   for (const c of llamadas) ok(c.includes(","), `${c} tiene que pasar el dominio del sitio`);
