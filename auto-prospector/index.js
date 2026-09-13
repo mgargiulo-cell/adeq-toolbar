@@ -7467,15 +7467,35 @@ function _deobfuscateEmails(text) {
 // Ahora: la clase se compara como token ENTERO, se excluye la clase que se prende por breakpoint,
 // `hidden` sólo cuenta como ATRIBUTO y aria-hidden sale del veto (la trampa de Mailchimp igual cae
 // por su style position:absolute;left:-5000px). La otra defensa, detectarTrampaEmail, no cambia.
+// ── PERO NO TODAS LAS CLASES SON IGUALES (2026-09-13, revisión) ───────────────────────────────
+// Pasar TODAS las clases a token exacto dejó de borrar trampas sin ninguna duda: form-honeypot,
+// honeypot-field, hp-field-wrap, screen-reader-only, el .hide de Bootstrap 3 y Foundation
+// (display:none), "honeypot lg:block" (la exclusión por breakpoint miraba la clase entera) y
+// `<div hidden inert>`. Detrás sólo queda detectarTrampaEmail, que mira la parte local: un cebo con
+// cara normal (ventas@) entraba y el agente lo mandaba desde el Gmail del MB. Por eso tres reglas:
+//   _CLASE_TRAMPA  palabras que sólo existen en trampas: TEXTO SUELTO dentro del valor y sin
+//                  exclusión por breakpoint. Ninguna clase visible contiene "honeypot".
+//   _CLASE_DISPLAY hidden/hide: token EXACTO, salvo que un breakpoint lo prenda (md:block).
+//   _CLASE_LECTOR  sólo para lectores de pantalla: token EXACTO, salvo md:not-sr-only (Tailwind).
+const _CLASE_TRAMPA  = "honey-?pot|hp[-_]field|nospam|antispam|spam-?trap";
+const _CLASE_DISPLAY = "(?:is-|u-|element-)?hidden|hide";
+const _CLASE_LECTOR  = "sr-only|screen-reader-(?:text|only)|(?:is-|u-)?visually-?hidden";
+// Clase con token EXACTO (bordes: principio del valor o espacio, y espacio o comilla), salvo que
+// OTRA clase del mismo valor lo prenda en un breakpoint.
+const _claseConToken = (tokens, prende) =>
+  "class\\s*=\\s*[\"'](?![^\"']*(?:sm|md|lg|xl|2xl):(?:" + prende + "))(?:[^\"']*\\s)?(?:" + tokens + ")(?=[\\s\"'])[^\"']*[\"']";
 const _BLOQUE_OCULTO_RE = new RegExp(
   "<([a-z]+)\\b[^>]*(?:" +
     "style\\s*=\\s*[\"'][^\"']*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden|opacity\\s*:\\s*0|" +
       "font-size\\s*:\\s*0|text-indent\\s*:\\s*-\\d{3,}|position\\s*:\\s*absolute\\s*;?\\s*left\\s*:\\s*-\\d{3,})[^\"']*[\"']" +
-    // Atributo HTML `hidden` de verdad: detrás viene >, =, u otro atributo. La palabra dentro de un valor no cuenta.
-    "|\\shidden(?=\\s*(?:/?>|=|[a-z][\\w:-]*\\s*=))" +
-    // Clase con token EXACTO (bordes: principio del valor o espacio, y espacio o comilla). No valen
-    // overflow-hidden, hidden-xs, elementor-hidden-mobile ni md:hidden. Tampoco "hidden md:block".
-    "|class\\s*=\\s*[\"'](?![^\"']*(?:sm|md|lg|xl|2xl):(?:block|flex|grid|inline|table|contents))(?:[^\"']*\\s)?(?:hidden|sr-only|screen-reader-text|visually-hidden|honeypot|hp-field|nospam|antispam)(?=[\\s\"'])[^\"']*[\"']" +
+    // Atributo HTML `hidden` de verdad: detrás viene >, =, otro atributo con valor, o un atributo
+    // booleano conocido (inert, itemscope, data-*, aria-*). La palabra dentro de un valor no cuenta.
+    "|\\shidden(?=\\s*(?:/?>|=|[a-z][\\w:-]*\\s*=|(?:inert|itemscope|data-[\\w-]+|aria-[\\w-]+)(?=[\\s/>])))" +
+    // Trampa: como texto suelto y sin mirar breakpoints.
+    "|class\\s*=\\s*[\"'][^\"']*(?:" + _CLASE_TRAMPA + ")[^\"']*[\"']" +
+    // No valen overflow-hidden, hidden-xs, elementor-hidden-mobile, hide-on-scroll ni md:hidden.
+    "|" + _claseConToken(_CLASE_DISPLAY, "block|flex|grid|inline|table|contents") +
+    "|" + _claseConToken(_CLASE_LECTOR, "not-sr-only") +
   ")[^>]*>[\\s\\S]{0,4000}?</\\1>", "gi");
 
 function _quitarBloquesOcultos(html) {
@@ -14304,30 +14324,49 @@ async function registrarDiagDescarte(token, d) {
 }
 
 // Traduce el diagnóstico técnico a una frase que explique qué pasó y qué se podría probar.
-function _comentarioSinEmail(d) {
-  if (d.ok === 0 && d.fail > 0) return `No se pudo abrir NINGUNA de las ${d.fail} página(s) que se intentaron${d.timeouts ? ` (${d.timeouts} por timeout)` : ""}. El sitio puede estar caído, lento o con problemas de DNS/TLS. Vale reintentar más adelante antes de darlo por perdido.`;
-  if (d.waf) return "El sitio está detrás de un WAF (Cloudflare) que bloquea el crawler antes de servir el HTML. No es que no tenga email: no lo pudimos leer. Vale probar por MX/DMARC, Certificate Transparency o buscando el dominio en Google.";
-  // ⚠️ Este renglón AFIRMABA "se leyeron varias páginas" siempre, porque nadie pasaba
-  // `d.paginas` y el `?? "varias"` tapaba el hueco. Salía igual cuando el sitio no se había
-  // podido abrir. Así fue como lafranceagricole.fr quedó explicado como ilegible mientras el
-  // crawler le bajaba 71 KB de su página de publicidad, y me mandó a buscar donde no era.
-  // Ahora, si no sabemos cuántas páginas se leyeron, se dice que no se sabe.
-  if (!d.ok && d.ok !== 0 && !d.paginas) {
-    return "No quedó registro de cuántas páginas se leyeron, así que no se puede afirmar por qué falta el email. Si se repite en este dominio, mirarlo a mano.";
+// ── EL COMENTARIO EXPLICA EL MOTIVO, NO TIENE UN ORDEN PROPIO (2026-09-13, revisión) ──────────
+// Eran dos cascadas copiadas. El 13/09 _motivoSinEmail pasó a poner primero lo encontrado
+// (rechazados_por_ranking → email_en_imagen → waf) y ésta siguió con el orden viejo (sitio ilegible
+// → waf → imagen → ranking). La misma fila de toolbar_diag_sin_email decía
+// "rechazados_por_ranking:tvcherpak@gmail.com" y el parte imprimía abajo "el sitio está detrás de un
+// WAF": un tipo con la explicación de otro, justo en el renglón que avisa de un filtro demasiado
+// estricto. Ahora no hay segunda cascada: se le pregunta el motivo a _motivoSinEmail y se explica
+// ESE motivo. `d` trae juntos el diagnóstico (crudos, rechazados) y las estadísticas del crawl (ok,
+// fail, waf, emailEnImagen) — sus claves no se pisan —, por eso va en los dos argumentos.
+// Un motivo nuevo sin su `case` cae en el default, que lo dice en vez de inventar una explicación.
+function _comentarioSinEmail(d = {}) {
+  const motivo = _motivoSinEmail(d, d).split(":")[0];
+  switch (motivo) {
+    case "rechazados_por_ranking":
+      if (d.rechazados?.length) return `La web SÍ publica ${d.crudos} dirección(es), pero el ranking las rechazó a todas: ${d.rechazados.slice(0, 3).join(", ")}. Si alguna parece legítima, el filtro está siendo demasiado estricto y hay que revisarlo.`;
+      return `La web SÍ publica ${d.crudos} dirección(es), pero el ranking las rechazó a todas y no quedó registro de cuáles. Mirarlo a mano: si alguna parece legítima, el filtro está siendo demasiado estricto.`;
+    // `email_en_imagen` salía con el comentario genérico de "ninguna página publica un correo,
+    // suele ser un sitio que sólo tiene formulario" (gastrolabweb.com, 12/09). Es otra cosa y se
+    // resuelve distinto: el email existe, está dibujado.
+    case "email_en_imagen": {
+      const _leidas = d.paginas ?? d.ok;
+      return `La página de contacto muestra el email como IMAGEN, no como texto: el crawl no lo puede leer${_leidas != null ? ` (${_leidas} página(s) leídas)` : ""}. El email existe; hay que copiarlo a mano desde la web. Insistir con el crawl no lo va a cambiar.`;
+    }
+    case "waf_nos_bloqueo":
+      return "El sitio está detrás de un WAF (Cloudflare) que bloquea el crawler antes de servir el HTML. No es que no tenga email: no lo pudimos leer. Vale probar por MX/DMARC, Certificate Transparency o buscando el dominio en Google.";
+    case "no_se_pudo_leer_el_sitio":
+      return `No se pudo abrir NINGUNA de las ${d.fail} página(s) que se intentaron${d.timeouts ? ` (${d.timeouts} por timeout)` : ""}. El sitio puede estar caído, lento o con problemas de DNS/TLS. Vale reintentar más adelante antes de darlo por perdido.`;
+    case "la_web_no_publica_ningun_email": {
+      // ⚠️ Este renglón AFIRMABA "se leyeron varias páginas" siempre, porque nadie pasaba
+      // `d.paginas` y el `?? "varias"` tapaba el hueco. Salía igual cuando el sitio no se había
+      // podido abrir. Así fue como lafranceagricole.fr quedó explicado como ilegible mientras el
+      // crawler le bajaba 71 KB de su página de publicidad, y me mandó a buscar donde no era.
+      // Ahora, si no sabemos cuántas páginas se leyeron, se dice que no se sabe.
+      if (!d.ok && d.ok !== 0 && !d.paginas) {
+        return "No quedó registro de cuántas páginas se leyeron, así que no se puede afirmar por qué falta el email. Si se repite en este dominio, mirarlo a mano.";
+      }
+      const _leidas = d.paginas ?? d.ok ?? 0;
+      const _fallidas = d.fail ? ` (${d.fail} no respondieron)` : "";
+      return `Se leyeron ${_leidas} página(s)${_fallidas} —home, contacto, publicidad, legales— y ninguna publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo; insistir con el crawl no va a cambiar nada.`;
+    }
+    default:
+      return `Motivo "${motivo}" sin explicación escrita en _comentarioSinEmail. Mirarlo a mano.`;
   }
-  // `email_en_imagen` salía con el comentario genérico de "ninguna página publica un correo,
-  // suele ser un sitio que sólo tiene formulario" (gastrolabweb.com, 12/09). Es otra cosa y se
-  // resuelve distinto: el email existe, está dibujado.
-  if (d.emailEnImagen && !d.crudos) {
-    return `La página de contacto muestra el email como IMAGEN, no como texto: el crawl no lo puede leer (${d.paginas ?? d.ok ?? 0} página(s) leídas). El email existe; hay que copiarlo a mano desde la web. Insistir con el crawl no lo va a cambiar.`;
-  }
-  if (!d.crudos) {
-    const _leidas = d.paginas ?? d.ok ?? 0;
-    const _fallidas = d.fail ? ` (${d.fail} no respondieron)` : "";
-    return `Se leyeron ${_leidas} página(s)${_fallidas} —home, contacto, publicidad, legales— y ninguna publica una dirección de correo. Suele ser un sitio que solo tiene formulario. Queda la vía de redes sociales o Apollo; insistir con el crawl no va a cambiar nada.`;
-  }
-  if (d.rechazados?.length) return `La web SÍ publica ${d.crudos} dirección(es), pero el ranking las rechazó a todas: ${d.rechazados.slice(0, 3).join(", ")}. Si alguna parece legítima, el filtro está siendo demasiado estricto y hay que revisarlo.`;
-  return "No se encontró contacto y no quedó registro de candidatos. Revisar si el crawl llegó a correr.";
 }
 
 async function reabrirLeadsRebotados(token) {

@@ -23,7 +23,7 @@ import { cargarWorker } from "./_worker-exportado.mjs";
 const RAIZ = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const worker = fs.readFileSync(path.join(RAIZ, "index.js"), "utf8");
 
-const W = await cargarWorker(["extractEmailsFromHtml", "_motivoSinEmail", "_esBloqueoWaf"]);
+const W = await cargarWorker(["extractEmailsFromHtml", "_motivoSinEmail", "_comentarioSinEmail", "_esBloqueoWaf"]);
 
 // Dirección NEUTRA a propósito: con bait@ o trap@ detectarTrampaEmail la tira igual y el test
 // daría verde aunque el filtro de bloques ocultos estuviera roto.
@@ -42,6 +42,9 @@ test("C9: los bloques visibles con 'hidden' dentro de otra clase conservan el em
     `<header class="navbar hide-on-scroll"><p>${E}</p></header>`,
     `<p title="a hidden gem">${E}</p>`,
     `<div class="md:hidden"><p>${E}</p></div>`,
+    // Tailwind: sólo para lectores en el celular, visible desde md.
+    `<div class="sr-only md:not-sr-only"><p>${E}</p></div>`,
+    `<p class="show-hide-toggle">${E}</p>`,
   ];
   const perdidos = visibles.filter(h => !W.extractEmailsFromHtml(h).includes(E));
   deepStrictEqual(perdidos, [], "estos bloques se ven en el navegador: la extensión muestra el email y el worker lo perdía");
@@ -62,9 +65,81 @@ test("C9: lo que de verdad está oculto se sigue borrando", () => {
     `<span class='visually-hidden'>${E}</span>`,
     // La trampa de Mailchimp: sale por el style, no por el aria-hidden.
     `<div style="position: absolute; left: -5000px;" aria-hidden="true"><p>${E}</p></div>`,
+    // Revisión del 13/09: pasar TODO a token exacto dejó entrar estos. Palabras que sólo existen
+    // en trampas se buscan como texto suelto y sin mirar breakpoints.
+    `<div class="form-honeypot"><p>${E}</p></div>`,
+    `<div class="honeypot-field"><p>${E}</p></div>`,
+    `<div class="hp-field-wrap"><p>${E}</p></div>`,
+    `<div class="wpcf7-hp_field"><p>${E}</p></div>`,
+    `<div class="honeypot lg:block"><p>${E}</p></div>`,
+    `<div class="spam-trap"><p>${E}</p></div>`,
+    `<div class="contact-nospam-box"><p>${E}</p></div>`,
+    // Clases genéricas que de verdad ocultan (token exacto).
+    `<div class="hide"><p>${E}</p></div>`,
+    `<div class="box is-hidden"><p>${E}</p></div>`,
+    `<span class="screen-reader-only">${E}</span>`,
+    `<span class="visuallyhidden">${E}</span>`,
+    // Atributo `hidden` seguido de otro atributo booleano.
+    `<div hidden inert><p>${E}</p></div>`,
+    `<div hidden data-x><p>${E}</p></div>`,
   ];
   const filtrados = ocultos.filter(h => W.extractEmailsFromHtml(h).includes(E));
   deepStrictEqual(filtrados, [], "un bloque invisible para el visitante es el escondite clásico de un email cebo");
+});
+
+// ── C10: el comentario explica el MISMO motivo que se guardó en la fila ─────────────────────
+// polishPool guarda motivo y comentario en la misma fila de toolbar_diag_sin_email y el parte
+// imprime uno debajo del otro. Con dos cascadas copiadas, el 13/09 salió
+// "rechazados_por_ranking:tvcherpak@gmail.com" explicado como "el sitio está detrás de un WAF".
+const FIRMA_DEL_MOTIVO = {
+  rechazados_por_ranking:         /ranking las rechazó/,
+  email_en_imagen:                /IMAGEN/,
+  waf_nos_bloqueo:                /WAF/,
+  no_se_pudo_leer_el_sitio:       /NINGUNA/,
+  la_web_no_publica_ningun_email: /solo tiene formulario|No quedó registro/,
+};
+function comentarioDeOtroMotivo(motivo, comentario) {
+  if (/sin explicación escrita/.test(comentario)) return `el motivo ${motivo} no tiene su case`;
+  if (!FIRMA_DEL_MOTIVO[motivo].test(comentario)) return `${motivo} sin su explicación: ${comentario}`;
+  const ajeno = Object.entries(FIRMA_DEL_MOTIVO).find(([m, re]) => m !== motivo && re.test(comentario));
+  return ajeno ? `${motivo} explicado como ${ajeno[0]}: ${comentario}` : "";
+}
+
+test("C10: el comentario sin email corresponde al motivo, en los casos del parte", () => {
+  const casos = [
+    [{ crudos: 3, rechazados: ["tvcherpak@gmail.com"] }, { ok: 12, fail: 1, waf: true }, "rechazados_por_ranking"],
+    [{ crudos: 0, rechazados: [] }, { ok: 4, fail: 0, waf: true, emailEnImagen: true }, "email_en_imagen"],
+    [{ crudos: 2, rechazados: ["a@b.com"] }, { ok: 0, fail: 5 }, "rechazados_por_ranking"],
+  ];
+  for (const [diag, stats, esperado] of casos) {
+    const motivo = W._motivoSinEmail(diag, stats).split(":")[0];
+    strictEqual(motivo, esperado);
+    // Igual que la llamada de polishPool.
+    const comentario = W._comentarioSinEmail({ ...diag, ...stats, paginas: stats.ok });
+    strictEqual(comentarioDeOtroMotivo(motivo, comentario), "");
+  }
+});
+
+test("C10: motivo y comentario no pueden divergir en ninguna combinación", () => {
+  const mal = [], vistos = new Set();
+  for (const crudos of [0, 2]) for (const rechazados of [[], ["a@b.com"]])
+  for (const ok of [undefined, 0, 5]) for (const fail of [0, 4])
+  for (const waf of [false, true]) for (const emailEnImagen of [false, true])
+  for (const conPaginas of [false, true]) {
+    const diag = { crudos, rechazados }, stats = { ok, fail, waf, emailEnImagen };
+    const motivo = W._motivoSinEmail(diag, stats).split(":")[0];
+    vistos.add(motivo);
+    const comentario = W._comentarioSinEmail({ ...diag, ...stats, ...(conPaginas ? { paginas: ok } : {}) });
+    const error = comentarioDeOtroMotivo(motivo, comentario);
+    if (error) mal.push(`${JSON.stringify({ ...diag, ...stats })} → ${error}`);
+  }
+  deepStrictEqual(mal, []);
+  deepStrictEqual([...vistos].sort(), Object.keys(FIRMA_DEL_MOTIVO).sort(), "la matriz recorre los cinco motivos");
+  // Sin segunda cascada: el comentario le pregunta el motivo a _motivoSinEmail.
+  const i = worker.indexOf("function _comentarioSinEmail(");
+  const cuerpo = worker.slice(i, worker.indexOf("\n}\n", i));
+  ok(/_motivoSinEmail\(d, d\)/.test(cuerpo), "el comentario sale del motivo");
+  ok(!/if \(d\.waf\)|d\.ok === 0 && d\.fail > 0/.test(cuerpo), "no vuelve a decidir el tipo por su cuenta");
 });
 
 // ── C12: mailto con la arroba codificada ────────────────────────────────────────────────────
