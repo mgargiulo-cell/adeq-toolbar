@@ -345,7 +345,9 @@ test("C40: el rescate suma cada dirección con su vía y la ficha final conserva
     "la vía real, nunca 'rescue', y sin pisar la que ya estaba");
   const f = _fichaTrasReintento({ emails: fusion.emails, sources: fusion.email_sources, bouncedEmail: "ventas@sitio.com.br", retryEmail: "joao.silva@sitio.com.br", retrySource: "apollo" });
   deepStrictEqual(f.emails, ["joao.silva@sitio.com.br", "contato@sitio.com.br"], "contato@ desaparecía de Prospects");
-  deepStrictEqual(f.email_sources, { "contato@sitio.com.br": "scrape", "joao.silva@sitio.com.br": "apollo" }, "el pago a Apollo figuraba como scrape");
+  // La rebotada (ventas@) conserva su vía como registro desde el 13/09 (reintento_crm-13-09d, R2): sale de
+  // `emails`, no de `email_sources`.
+  deepStrictEqual(f.email_sources, { "ventas@sitio.com.br": "scrape", "contato@sitio.com.br": "scrape", "joao.silva@sitio.com.br": "apollo" }, "el pago a Apollo figuraba como scrape");
   strictEqual(_fichaTrasReintento({ emails: ["a@x.com"], sources: {}, bouncedEmail: "a@x.com", retryEmail: "b@x.com", retrySource: "google_contact" }).email_sources["b@x.com"], "google_contact");
   deepStrictEqual(_fichaTrasReintento({ emails: ["B@x.com", "c@x.com", "A@X.com"], sources: {}, bouncedEmail: "a@x.com", retryEmail: "b@x.com", retrySource: "scrape" }).emails,
     ["b@x.com", "c@x.com"], "ni duplica la nueva ni deja la rebotada por diferencia de mayúsculas");

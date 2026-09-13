@@ -4125,6 +4125,60 @@ const MONDAY_FINALIZADO_STAGE = 5;          // deal_stage index del board 142026
 const MONDAY_SYNC_MAX_POR_DIA = 400;        // default; lo pisa `monday_sync_techo_dia`
 const MONDAY_SYNC_POOL_MAX    = 10000;      // cuántos reciclables se le piden al CRM en el barrido diario (hoy devuelve ~5.000)
 
+// ── LOS BLOQUEADOS QUE ESPERAN EN PROSPECTS SALEN DEL POOL (2026-09-13) ──────────────────────
+// La lista del CRM (clientes que facturan, negociaciones, descansos, bloqueados a mano) se guarda una
+// vez por día, pero sólo se miraba al MANDAR: el agente salteaba el lead todos los días (desde hoy lo
+// rechaza cuando lo toma), el pulido sólo mira leads sin email y el barrido de bloqueados se rearma
+// cada 10 días. Un lead que pasó a la lista después de entrar a Prospects y que el agente no llegaba a
+// tomar seguía a la vista del MB. Es la regla que ya aplica el agente —bloqueado = rechazo suave, lo
+// encuentre quien lo encuentre—, corrida al guardar la lista:
+//   · SÓLO con la lectura sana del CRM (el piso de 100 dominios de guardarBloqueadosDeMonday). Si el
+//     CRM falla o viene corto no se llama: no se toca nada.
+//   · De a 200 dominios por consulta (nunca más de 1.000 filas), con reloj, y con TOPE por corrida: si
+//     el CRM devolviera de golpe dominios que no le corresponden, el daño queda acotado y se revierte.
+//   · `status=eq.pending` también en el PATCH: lo que un MB pasó a su cola mientras tanto no se toca.
+//   · Prefijo `purge:` a propósito: es una marca automática (`_MARCA_AUTOMATICA_RE`), así que si el
+//     CRM lo recicla más adelante vuelve a Prospects limpio. Auditar y revertir:
+//     suspect_reason = 'purge: crm_no_recontactar_diario'.
+const CRM_BLOQUEADOS_MOTIVO = "purge: crm_no_recontactar_diario";
+const CRM_BLOQUEADOS_TOPE_POR_CORRIDA = 500;
+async function _sacarBloqueadosDeProspects(token, dominios, { tope = CRM_BLOQUEADOS_TOPE_POR_CORRIDA, lote = 200 } = {}) {
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+  const lista = [...new Set((Array.isArray(dominios) ? dominios : [])
+    .map(d => String(d || "").trim().toLowerCase().replace(/^www\./, ""))
+    .filter(d => d.includes(".")))];
+  const out = { sacados: 0, problemas: [], topeAlcanzado: false };
+  for (let i = 0; i < lista.length && out.sacados < tope; i += lote) {
+    const n = Math.floor(i / lote) + 1;
+    const inList = lista.slice(i, i + lote).map(d => `"${d.replace(/"/g, '\\"')}"`).join(",");
+    let ids = [];
+    try {
+      const r = await fetch(
+        `${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&domain=in.(${encodeURIComponent(inList)})&select=id&limit=${lote}`,
+        { headers: auth, signal: AbortSignal.timeout(10000) });
+      // No pude leer ≠ no hay ninguno: ese lote se saltea sin tocarlo y queda dicho.
+      if (!r.ok) { out.problemas.push(`lote ${n}: no pude leer (HTTP ${r.status})`); continue; }
+      const filas = await r.json();
+      if (!Array.isArray(filas)) { out.problemas.push(`lote ${n}: respuesta inesperada`); continue; }
+      ids = filas.map(f => f?.id).filter(id => id != null).slice(0, tope - out.sacados);
+    } catch (e) { out.problemas.push(`lote ${n}: ${e.message}`); continue; }
+    if (!ids.length) continue;
+    try {
+      const p = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?id=in.(${ids.join(",")})&status=eq.pending&select=id`, {
+        method: "PATCH",
+        headers: { ...auth, "Content-Type": "application/json", "Prefer": "return=representation" },
+        body: JSON.stringify({ status: "rejected", suspect_reject: true, suspect_reason: CRM_BLOQUEADOS_MOTIVO, rejected_at: new Date().toISOString() }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!p.ok) { out.problemas.push(`lote ${n}: el rechazo falló (HTTP ${p.status})`); continue; }
+      const hechas = await p.json().catch(() => null);
+      out.sacados += Array.isArray(hechas) ? hechas.length : ids.length;
+    } catch (e) { out.problemas.push(`lote ${n}: ${e.message}`); }
+  }
+  out.topeAlcanzado = out.sacados >= tope;
+  return out;
+}
+
 // ── EL ESTADO DE MONDAY, GUARDADO PARA PODER CONSULTARLO (Maxi 2026-08-25) ──────────
 // Regla del user, verificada contra las 11 etiquetas del board: solo se re-contacta si el
 // dominio NO está en Monday, o si está en "Ciclo Finalizado", "Mail No Enviado" o
@@ -4164,9 +4218,18 @@ async function guardarBloqueadosDeMonday(token) {
         if (_doms.length >= 100) {
           await setConfigValue(token, "monday_bloqueados", JSON.stringify(_doms)).catch(() => {});
           await setConfigValue(token, "monday_bloqueados_at", new Date().toISOString()).catch(() => {});
+          // Y los que esperan en Prospects salen del pool, sólo con esta lectura sana (2026-09-13, ver
+          // `_sacarBloqueadosDeProspects`). Un problema del cruce no invalida la lista: queda en el latido.
+          const _cruce = await _sacarBloqueadosDeProspects(token, _doms)
+            .catch(e => ({ sacados: 0, problemas: [e.message], topeAlcanzado: false }));
+          if (_cruce.sacados) log(`  🚫 ${_cruce.sacados} lead(s) de Prospects están en la lista del CRM → rechazados con motivo '${CRM_BLOQUEADOS_MOTIVO}'`);
+          if (_cruce.problemas.length) log(`  ⚠️ cruce de la lista del CRM con Prospects: ${_cruce.problemas.join("; ")}`);
+          const _txtCruce = ` · ${_cruce.sacados} sacado(s) de Prospects`
+            + (_cruce.topeAlcanzado ? " (tope de la corrida: el resto sale mañana)" : "")
+            + (_cruce.problemas.length ? ` — ${_cruce.problemas.slice(0, 3).join("; ")}` : "");
           await saludPing(token, "monday_bloqueados", {
             status: "ok", cadenciaMin: 1440,
-            detalle: `${_doms.length} dominios activos (del CRM Board, incluye ${_j?.clientesActivos ?? "?"} clientes)`,
+            detalle: `${_doms.length} dominios activos (del CRM Board, incluye ${_j?.clientesActivos ?? "?"} clientes)${_txtCruce}`,
             real: _doms.length, esperado: 1000,
           }).catch(() => {});
           log(`  🚫 no-recontactar: ${_doms.length} dominios desde el CRM Board (Monday ya no hace falta acá)`);
@@ -18216,8 +18279,9 @@ async function countAttemptsForDomain(token, domain) {
 async function pickNextEmailCandidate(token, domain, excludeEmails = []) {
   try {
     // 3.a Lee review_queue para ese dominio
+    // `geo` (2026-09-13): el re-engagement elige el idioma con `_idiomaParaEnvio`, que lo usa.
     const rqRes = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,emails,email_sources,language,category,contact_name,contact_phone,monday_item_id&limit=1`,
+      `${SUPABASE_URL}/rest/v1/toolbar_review_queue?domain=eq.${encodeURIComponent(domain)}&select=id,emails,email_sources,language,geo,category,contact_name,contact_phone,monday_item_id&limit=1`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     const rq = await rqRes.json();
@@ -18411,15 +18475,21 @@ async function runReengagementCycle(token) {
 
       // Pickear template del pool combinado (baked + DB drafts), ponderado
       // por open rate. Misma lógica que el envío normal del Agent.
+      // ⚠️ EL IDIOMA, CON LA REGLA DEL AGENTE (2026-09-13). Era `lead.language || "en"`: un sitio
+      // hispano con el idioma vacío —lo común en un lead viejo o importado— recibía el pitch en
+      // inglés. `_idiomaParaEnvio` es la misma regla que usan el agente y el reintento por rebote: el
+      // idioma guardado si el TLD/GEO lo respalda, si no el que dice la página, y fuera de los 5 con
+      // plantilla, inglés.
       let pitch = null;
       try {
         const senderName = getSenderName(userEmail);
-        const picked = await pickAnyTemplate(token, userEmail, lead.language || "en");
+        const _idioma = await _idiomaParaEnvio({ lead, domain, token });
+        const picked = await pickAnyTemplate(token, userEmail, _idioma);
         if (picked.template) {
           pitch = fillTemplate(picked.template, { domain, geo: "", traffic: 0, senderName });
           pitch._templateId = picked.templateId;
         } else {
-          const tpl = pickRandomTemplate(lead.language || "en");
+          const tpl = pickRandomTemplate(_idioma);
           pitch = fillTemplate(tpl, { domain, geo: "", traffic: 0, senderName });
         }
       } catch (e) {
@@ -19258,14 +19328,24 @@ const REBOTE_BUZON_LLENO = new RegExp([
  * Se resuelve por `toolbar_sendtrack`, que es el registro de A QUIÉN le mandamos qué.
  * Si no se encuentra, devuelve "" y el rebote NO se reporta: mandar el dominio equivocado es
  * peor que no avisar, porque crea un prospecto falso que después alguien va a trabajar.
+ *
+ * ── LOS ADICIONALES NO ESTÁN EN SENDTRACK (2026-09-13) ──────────────────────────────────────
+ * Los emails adicionales (los que el MB suma en Análisis o en la tarjeta) los manda
+ * processManualReengagementQueue y quedan SÓLO en `toolbar_agent_actions` como `future_sent`, con
+ * `email_to` y el `domain` del sitio: ese camino nunca escribió sendtrack. El scan de rebotes sí los
+ * cuenta como destinatarios reales, así que un adicional que rebotaba se quemaba bien pero el aviso
+ * al CRM decía "no sé a qué sitio" y no salía, y el reintento apuntaba al dominio del correo. Si
+ * sendtrack no lo tiene (o no se pudo leer), se busca el último envío a esa dirección en
+ * agent_actions: 90 días, una fila, con reloj. Mismas acciones que `_leEscribimosA`.
  */
 async function _sitioDeLaDireccion(token, email) {
   const e = String(email || "").trim().toLowerCase();
   if (!e) return "";
+  const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
   try {
     const r = await fetch(
       `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?email=eq.${encodeURIComponent(e)}&select=domain&order=send_date.desc&limit=1`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } },
+      { headers: auth, signal: AbortSignal.timeout(10000) },
     );
     if (!r.ok) {
       // ⚠️ Devolver "" acá hacía que el llamador dijera "no encuentro a qué sitio se lo
@@ -19273,11 +19353,26 @@ async function _sitioDeLaDireccion(token, email) {
       // la columna se llama `send_date`, no `sent_at`, y la query fallaba SIEMPRE. El puente
       // de rebotes al CRM estuvo apagado el 100% del tiempo y el log decía otra cosa.
       // Un fallo de consulta y una falta de datos NO se pueden ver iguales desde afuera.
-      log(`  ⚠️ _sitioDeLaDireccion(${e}): HTTP ${r.status} — no es que falten datos, la consulta falló`);
+      log(`  ⚠️ _sitioDeLaDireccion(${e}): sendtrack HTTP ${r.status} — no es que falten datos, la consulta falló`);
+    } else {
+      const filas = await r.json();
+      if (Array.isArray(filas) && filas[0]?.domain) return String(filas[0].domain).toLowerCase();
+    }
+  } catch { /* se prueba el respaldo */ }
+  try {
+    const desde = new Date(Date.now() - 90 * 86_400_000).toISOString();
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_agent_actions?email_to=eq.${encodeURIComponent(e)}&action=in.(sent,secondary_sent,re_sent,bounce_retry_sent,future_sent)&created_at=gte.${desde}&select=domain&order=created_at.desc&limit=1`,
+      { headers: auth, signal: AbortSignal.timeout(10000) },
+    );
+    if (!r.ok) {
+      log(`  ⚠️ _sitioDeLaDireccion(${e}): agent_actions HTTP ${r.status} — no es que falten datos, la consulta falló`);
       return "";
     }
     const filas = await r.json();
-    return (Array.isArray(filas) && filas[0]?.domain) ? String(filas[0].domain).toLowerCase() : "";
+    const d = (Array.isArray(filas) && filas[0]?.domain) ? String(filas[0].domain).trim().toLowerCase() : "";
+    // Sólo un dominio de verdad: nunca un marcador como "_bounce_".
+    return d.includes(".") && !d.startsWith("_") ? d : "";
   } catch { return ""; }
 }
 
@@ -19539,13 +19634,15 @@ async function scanBouncesForUser(token, userEmail) {
             // semana que viene entra. Todo lo demás es permanente y se quema.
             const _esRebote = _tipoRebote !== "buzon_lleno" && _tipoRebote !== "temporal";
             if (_esRebote) {
-              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: (await _sitioDeLaDireccion(token, failed)) || failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
+              // El dominio del SITIO, no el del correo. Ver `_sitioDeLaDireccion`. Se resuelve UNA vez
+              // (2026-09-13): con el respaldo por agent_actions son hasta dos consultas, y se pedía dos
+              // veces seguidas para la misma dirección.
+              const _sitio = await _sitioDeLaDireccion(token, failed);
+              await markEmailBounced(token, { email: failed, reason: `smtp_bounce_${bounceType}`, originalDomain: _sitio || failed.split("@")[1], tipo: _tipoRebote, detalle: _detalleRebote });
               // Y al board propio, que vacía la columna Email para frenar la cadencia sola.
               // Se manda SIEMPRE, sin chequear si ese dominio ya había rebotado antes: filtrar
               // por "todavía no rebotó nunca" es justo el bug que nos avisaron del otro lado —
               // un segundo rebote sobre una dirección de reemplazo no se detectaría jamás.
-              // El dominio del SITIO, no el del correo. Ver `_sitioDeLaDireccion`.
-              const _sitio = await _sitioDeLaDireccion(token, failed);
               if (_sitio) {
                 await reportarReboteAlCrm(token, { email: failed, originalDomain: _sitio, tipo: _tipoRebote, detalle: _detalleRebote });
               } else {
@@ -19971,8 +20068,16 @@ function _fuentesDelEnriquecimiento(previas, { apollo = [], scrape = [], google_
 /**
  * Cómo queda la ficha de Prospects después de un reintento que salió. Pura.
  * La dirección nueva va primera y el resto se CONSERVA (incluidos los rescatados que no se
- * usaron). La que rebotó se saca, salvo que haya sido una ausencia: un fuera de oficina prueba que
- * la casilla existe (regla del 29/05, "el original queda usable").
+ * usaron). La que rebotó sale de `emails`, salvo que haya sido una ausencia: un fuera de oficina
+ * prueba que la casilla existe (regla del 29/05, "el original queda usable").
+ *
+ * ⚠️ LA QUE REBOTÓ SALE DE `emails`, NO DE `email_sources` (2026-09-13). Se borraba también la
+ * clave, y con ella quién la había encontrado. Es el mismo registro que `reabrirLeadsRebotados`
+ * promete conservar ("email_sources queda intacto"), y el que usa el renglón de vías del parte
+ * como respaldo para atribuir un rebote cuya dirección ya no está en `emails`
+ * (`_viasDeEmailInforme`: las claves sólo atribuyen, nunca cuentan). Que no se reuse lo garantizan
+ * la lista de rebotados (`isBouncedSync`) y que no esté en `emails`: nada arma `emails` desde las
+ * claves de `email_sources`.
  */
 function _fichaTrasReintento({ emails = [], sources = {}, bouncedEmail = "", retryEmail = "", retrySource = "", conservarRebotado = false } = {}) {
   const low = (s) => String(s || "").trim().toLowerCase();
@@ -19986,7 +20091,6 @@ function _fichaTrasReintento({ emails = [], sources = {}, bouncedEmail = "", ret
     resto.push(String(e).trim());
   }
   const email_sources = { ...(sources || {}) };
-  if (!conservarRebotado && rebotado) delete email_sources[rebotado];
   if (nuevo && !email_sources[nuevo]) email_sources[nuevo] = retrySource || "rescue";
   return { emails: nuevo ? [String(retryEmail).trim(), ...resto] : resto, email_sources };
 }
@@ -26220,11 +26324,15 @@ async function aggregateSourcePerformance(token) {
     }
 
     // 3. Bulk pull de bounces — match por email_to (los rebotados son target del send).
+    // ⚠️ Sin los fuera de oficina (2026-09-13): queueBounceRetry también se dispara con
+    // bounce_type='auto_reply', y esa casilla EXISTE. Contarla bajaba el score de la fuente que
+    // encontró a una persona real que estaba de vacaciones. Mismo filtro que el tope de intentos del
+    // reintento; `bounce_type.is.null` explícito porque en SQL `neq` deja afuera las filas sin tipo.
     const bouncedEmails = new Set();
     // Sin `limit=` también corta en 1.000 (2026-09-13): de a páginas, y sin la lista entera no se
     // escribe una tasa de rebote en cero.
     const brows = await _traerTodo(
-      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${since}&select=original_email&order=id`,
+      `${SUPABASE_URL}/rest/v1/toolbar_bounce_retries?created_at=gte.${since}&or=(bounce_type.is.null,bounce_type.neq.auto_reply)&select=original_email&order=id`,
       { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
       { max: 100000, entero: true });
     if (!brows) { log(`  ⚠️ bounce_retries: no pude leer la ventana entera`); return; }
