@@ -10,6 +10,12 @@
 //      re-bajaba lo descartado sin ads.txt y borraba la marca de email en dominios que no entraban.
 //   3. El reparto del feeder "por rendimiento" dividía filas distintas arriba y abajo y quedaba
 //      clavado en 70/15/15 sin importar lo que rindiera cada fuente.
+//   4. Tres lecturas del feeder pedían 14 o 90 días en un solo pedido con `limit=20000` y PostgREST
+//      corta en 1.000: el reparto y los carriles se medían con un pedazo sin orden de la ventana, y
+//      los contactados que caían fuera de esas 1.000 se re-prospectaban.
+//   5. Monday por slot usaba el techo DIARIO como tope de cada slot y contaba su carril fallando abierto;
+//      la fila del slot se escribía al final (un reinicio a mitad lo re-disparaba); y sus 0-400 filas
+//      entraban en la conversión que decide cuánto traen sellers y majestic.
 //
 // Run: npm test
 import { test } from "node:test";
@@ -242,7 +248,10 @@ test("el reparto por rendimiento cuenta filas de la misma tabla, deja afuera a m
 test("el slot le da a monday lo que falta de su carril, a sellers+majestic la misma parte de antes, y el reparto no lee brutos de otra tabla", () => {
   const slot = worker.slice(worker.indexOf("async function _runFeederSlot("), worker.indexOf("async function _measureFeederRuns("));
   ok(!/w\.monday/.test(slot), "monday ya no sale de un peso por rendimiento");
-  ok(/const allocMonday\s+= Math\.min\(_libreMonday, _techoMonday\)/.test(slot) && /_capDeFuente\("auto_feeder_monday"\)/.test(slot),
+  // Desde la corrección del 13/09 el lugar se cuenta con _lugarEnCarril (el mismo _capDeFuente que usa la
+  // inyección, fallando cerrado) y el techo es lo que QUEDA del día (ver la sección 5).
+  ok(/const allocMonday\s+= _asigMonday\.alloc/.test(slot) && /_lugarEnCarril\(token, "auto_feeder_monday"\)/.test(slot)
+    && /_contarEncoladosHoy\(token, "auto_feeder_monday"\)/.test(slot) && /return _capDeFuente|const cap = _capDeFuente\(sourceTag\)/.test(cuerpoDe("_lugarEnCarril")),
     "monday: el lugar libre de su carril (el mismo cap que usa la inyección), con el techo diario del barrido");
   ok(/_parteSM\s+= Math\.round\(targetGross \* FEEDER_PARTE_SELLERS_MAJESTIC\)/.test(slot));
   strictEqual(worker.match(/const FEEDER_PARTE_SELLERS_MAJESTIC = ([\d.]+);/)?.[1], "0.30", "la parte conjunta de sellers + majestic es la que tenían (15 + 15): subirla es decisión del dueño");
@@ -252,4 +261,211 @@ test("el slot le da a monday lo que falta de su carril, a sellers+majestic la mi
   const pesos = cuerpoDe("_getFeederSourceWeights");
   ok(!/toolbar_feeder_runs/.test(pesos), "los brutos del slot contra las done de toda la base eran poblaciones distintas");
   ok(/_pesosFeeder\(filas, FEEDER_EXPLORE_FLOOR\)/.test(pesos));
+});
+
+// ── 4. Lo que mide o filtra una ventana la lee ENTERA ───────────────────────────────────
+// PostgREST devuelve 1.000 filas como máximo por pedido, pida lo que pida el `limit=`. Este
+// enrutador contesta como la base: sin Range, las primeras 1.000; con Range, esa página. Con
+// `romperDesde`, las páginas desde esa fila contestan 503.
+const paginado = (pedidos, tablas, { romperDesde = null } = {}) => async (url, opts = {}) => {
+  const u = String(url), m = (opts.method || "GET").toUpperCase();
+  const rango = String(opts.headers?.Range || "");
+  pedidos.push({ u, m, rango, b: String(opts.body || "") });
+  for (const [marca, filas] of tablas) {
+    if (m !== "GET" || !u.includes(marca)) continue;
+    const desde = parseInt(rango.split("-")[0], 10) || 0;
+    if (romperDesde != null && desde >= romperDesde) return resp({ message: "caído" }, { status: 503 });
+    const hasta = rango ? parseInt(rango.split("-")[1], 10) : desde + 999;
+    return resp(filas.slice(desde, Math.min(hasta + 1, desde + 1000)), { status: rango ? 206 : 200 });
+  }
+  return resp([]);
+};
+const filasDe = (tag, llegaron, n) => Array.from({ length: n }, (_, i) => ({
+  source: tag, status: i < llegaron ? "done" : "skipped", error_message: i < llegaron ? null : "not_publisher: sin_ads_txt",
+}));
+
+test("el reparto sellers/majestic lee los 14 días de a páginas: la fuente que cae en la segunda página cuenta", async () => {
+  const { _getFeederSourceWeights } = await cargarWorker(["_getFeederSourceWeights"], { fetchFalso: true });
+  const filas = [...filasDe("auto_feeder_sellers", 100, 1000), ...filasDe("auto_feeder_majestic", 60, 300)];
+  const pedidos = [];
+  globalThis.__fetchFalso = paginado(pedidos, [["toolbar_csv_queue?processed_at=gte.", filas]]);
+  const w = await _getFeederSourceWeights("t");
+  const lecturas = pedidos.filter(p => p.u.includes("toolbar_csv_queue?processed_at=gte."));
+  deepStrictEqual(lecturas.map(p => p.rango), ["0-999", "1000-1999"], "pide la segunda página, y con 300 filas no pide una tercera");
+  ok(lecturas.every(p => /&order=id/.test(p.u) && !/limit=/.test(p.u)), `paginar sin orden repite y saltea filas: ${lecturas[0]?.u}`);
+  ok(/sellers 100\/1000 · majestic 60\/300 \(14d\)/.test(w.debug), `con un solo pedido daba majestic 0/0 y 'muestra chica: mitad y mitad': ${w.debug}`);
+  ok(w.majestic > w.sellers, `majestic rinde 20% y sellers 10%: ${JSON.stringify(w)}`);
+  globalThis.__fetchFalso = paginado([], [["toolbar_csv_queue?processed_at=gte.", filas]], { romperDesde: 1000 });
+  const roto = await _getFeederSourceWeights("t");
+  deepStrictEqual([roto.sellers, roto.majestic], [0.5, 0.5]);
+  ok(/lectura incompleta/.test(roto.debug), `una página caída no es la muestra entera: ${roto.debug}`);
+});
+
+test("el recálculo de carriles lee los 14 días de a páginas, y con una página caída deja el reparto que había", async () => {
+  // sellers llena la primera página; similar y adstxt están en la segunda. Con un solo pedido había
+  // una fuente sola, "sin con qué comparar", y los carriles no se recalculaban nunca.
+  const filas = [...filasDe("auto_feeder_sellers", 80, 1000), ...filasDe("auto_feeder_similar", 150, 200), ...filasDe("auto_feeder_adstxt", 20, 200)];
+  const cambioElReparto = (pedidos) => pedidos.some(p => p.m !== "GET" && `${p.u} ${p.b}`.includes("carriles_dinamicos"));
+  {
+    const w = await cargarWorker(["recalcularCarrilesPorRendimiento", "_capDeFuente"], { fetchFalso: true });
+    const pedidos = [];
+    globalThis.__fetchFalso = paginado(pedidos, [["toolbar_csv_queue?processed_at=gte.", filas]]);
+    await w.recalcularCarrilesPorRendimiento("t");
+    const lecturas = pedidos.filter(p => p.u.includes("toolbar_csv_queue?processed_at=gte."));
+    deepStrictEqual(lecturas.map(p => p.rango), ["0-999", "1000-1999"]);
+    ok(lecturas.every(p => /&order=id/.test(p.u) && !/limit=/.test(p.u)), lecturas[0]?.u);
+    // similar 151/210, adstxt 21/210, sellers 81/1010 sobre 520 de carril total (250 + 120 + 150).
+    strictEqual(w._capDeFuente("auto_feeder_similar"), 416);
+    strictEqual(w._capDeFuente("auto_feeder_adstxt"), 58);
+    strictEqual(w._capDeFuente("auto_feeder_sellers"), 60, "sellers al 8% queda en el piso del 40% de su carril");
+    ok(cambioElReparto(pedidos), "el reparto nuevo se guarda y late");
+  }
+  {
+    const w = await cargarWorker(["recalcularCarrilesPorRendimiento", "_capDeFuente"], { fetchFalso: true });
+    const pedidos = [];
+    globalThis.__fetchFalso = paginado(pedidos, [["toolbar_csv_queue?processed_at=gte.", filas]], { romperDesde: 1000 });
+    await w.recalcularCarrilesPorRendimiento("t");
+    strictEqual(w._capDeFuente("auto_feeder_similar"), 250, "sin la ventana entera queda el carril que había");
+    ok(!cambioElReparto(pedidos), "no se guarda un reparto medido con media ventana");
+  }
+});
+
+test("los contactados de 90 días se leen de a páginas: el que cae después del envío 1.000 no se re-prospecta", async () => {
+  const { _filtrarReciclables } = await cargarWorker(["_filtrarReciclables"], { fetchFalso: true });
+  const envios = [...Array.from({ length: 1000 }, (_, i) => ({ domain: `enviado${i}.com` })), { domain: "contactado-tarde.com" }];
+  const pedidos = [];
+  globalThis.__fetchFalso = paginado(pedidos, [["toolbar_sendtrack?", envios]]);
+  const f = await _filtrarReciclables("t", ["contactado-tarde.com", "libre.com"], 90);
+  deepStrictEqual(f.elegibles, ["libre.com"], "con un solo pedido la base cortaba en 1.000 y contactado-tarde.com volvía a la cola");
+  const lecturas = pedidos.filter(p => p.u.includes("toolbar_sendtrack?"));
+  deepStrictEqual(lecturas.map(p => p.rango), ["0-999", "1000-1999"]);
+  ok(lecturas.every(p => /&order=domain/.test(p.u) && !/limit=/.test(p.u)), lecturas[0]?.u);
+  globalThis.__fetchFalso = paginado([], [["toolbar_sendtrack?", envios]], { romperDesde: 1000 });
+  strictEqual(await _filtrarReciclables("t", ["contactado-tarde.com", "libre.com"], 90), null,
+    "media lista de contactados no es la lista: no se re-prospecta a ciegas");
+});
+
+test("ninguna lectura del feeder que mide o filtra una ventana pide más de 1.000 filas en un solo pedido", () => {
+  // `_reconcileAutogoogleAttribution` queda afuera a propósito: es un drenaje ordenado de las más
+  // viejas que borra lo que procesa, así que 1.000 por vuelta avanza igual.
+  const zona = ["recalcularCarrilesPorRendimiento", "_getFeederSourceWeights", "_dominiosContactadosDesde", "_filtrarReciclables",
+    "_runAutoGoogleSlot", "runProspectSimilarExpansion", "_feederPullMonday", "sincronizarFinalizadosDeMonday",
+    "_injectIntoCsvQueue", "_lugarEnCarril", "_dominiosActivosEnCola", "_runFeederSlot"];
+  for (const n of zona) ok(worker.includes(`function ${n}(`), `no encontré ${n}: si cambió de nombre, actualizar la lista`);
+  const ast = acorn.parse(worker, { ecmaVersion: "latest", sourceType: "module" });
+  const fuera = [];
+  walk.fullAncestor(ast, (node, _s, anc) => {
+    if (node.type !== "TemplateLiteral") return;
+    const m = /[?&]limit=(\d+)/.exec(worker.slice(node.start, node.end));
+    if (!m || Number(m[1]) <= 1000) return;
+    const fn = [...anc].reverse().find(a => a.type === "FunctionDeclaration")?.id?.name;
+    if (zona.includes(fn)) fuera.push(`${fn}: limit=${m[1]}`);
+  });
+  deepStrictEqual(fuera, [], "PostgREST corta en 1.000: el pedido cree que leyó todo y leyó un pedazo. Usar _traerTodo con orden");
+});
+
+// ── 5. Monday por slot: techo del DÍA, cuentas que fallan cerrado, slot anotado al empezar ──────────
+test("monday recicla en un slot lo que QUEDA del techo del día, nunca más que su carril, y sin poder contar no recicla", async () => {
+  const { _asignacionMondaySlot: a } = await cargarWorker(["_asignacionMondaySlot"]);
+  strictEqual(a({ lugar: 700, techo: 400, encoladosHoy: 0 }).alloc, 400);
+  strictEqual(a({ lugar: 700, techo: 400, encoladosHoy: 360 }).alloc, 40, "el techo es del día: con 360 ya encolados quedan 40, no otros 400");
+  strictEqual(a({ lugar: 30, techo: 400, encoladosHoy: 0 }).alloc, 30, "y nunca más que el lugar del carril");
+  strictEqual(a({ lugar: 700, techo: 400, encoladosHoy: 520 }).alloc, 0);
+  for (const roto of [{ lugar: null, techo: 400, encoladosHoy: 0 }, { lugar: 700, techo: 400, encoladosHoy: null }]) {
+    const r = a(roto);
+    ok(r.error && r.alloc === 0, `una cuenta ilegible es 'no reciclo', no 'carril vacío': ${JSON.stringify(roto)} → ${JSON.stringify(r)}`);
+  }
+});
+
+// El slot entero, con la base, el CRM y los ads.txt falsos. `crm` decide qué contesta /reciclables.
+const correrSlot = async ({ crm, carril = () => resp([], { total: 100 }), hoy = () => resp([], { total: 360 }), cerrar = () => resp(null, { status: 204 }), anotar = () => resp([{ id: 77 }], { status: 201 }) }) => {
+  const { _runFeederSlot } = await cargarWorker(["_runFeederSlot"], { fetchFalso: true });
+  const pedidos = [];
+  globalThis.__fetchFalso = enrutar(pedidos, [
+    [(u, m) => m === "POST" && /\/rest\/v1\/toolbar_feeder_runs$/.test(u), () => anotar()],
+    [(u, m) => m === "PATCH" && u.includes("/rest/v1/toolbar_feeder_runs?id=eq."), () => cerrar()],
+    [(u) => u.includes("toolbar_csv_queue?status=in.(pending,processing,waiting_pool)&source=eq.auto_feeder_monday"), () => carril()],
+    [(u) => u.includes("toolbar_csv_queue?source=eq.auto_feeder_monday&uploaded_at=gte."), () => hoy()],
+    [(u) => u.includes("/reciclables"), () => crm()],
+    [(u) => /^https?:\/\/[a-z0-9.-]+\/(app-)?ads\.txt$/.test(u), () => resp("", { status: 404 })],
+  ]);
+  return { corrida: _runFeederSlot("t", "2026-09-14-09:00"), pedidos };
+};
+const reciclablesDelCrm = () => resp({ domains: Array.from({ length: 100 }, (_, i) => `reciclado${i}.com`) });
+
+test("el slot le da a monday lo que queda del techo de hoy (40 de 400 con 360 encolados), no el techo entero", async () => {
+  const { corrida, pedidos } = await correrSlot({ crm: reciclablesDelCrm });
+  await corrida;
+  const latido = latidoDe(pedidos, "feeder_monday");
+  ok(latido, "tiene que latir");
+  strictEqual(latido.esperado_ultimo, 40, `con el techo diario como tope por slot pedía 100 de 100 (5 slots × 400 por día): ${JSON.stringify(latido)}`);
+  const chequeados = new Set(pedidos.filter(p => /\/(app-)?ads\.txt$/.test(p.u) && /reciclado\d+\.com/.test(p.u)).map(p => p.u.match(/reciclado\d+\.com/)[0]));
+  ok(chequeados.size <= 40, `chequeó el ads.txt de ${chequeados.size} reciclados`);
+});
+
+test("sin poder contar el carril de monday o lo encolado hoy, el slot no le pide la lista al CRM y late 'fail'", async () => {
+  for (const caso of [{ carril: () => resp({ message: "caído" }, { status: 503 }) }, { hoy: () => resp({ message: "caído" }, { status: 503 }) }]) {
+    const { corrida, pedidos } = await correrSlot({ crm: reciclablesDelCrm, ...caso });
+    await corrida;
+    ok(!pedidos.some(p => p.u.includes("/reciclables")), `un 503 contaba como carril vacío → 400 reciclados al CRM: ${Object.keys(caso)[0]}`);
+    const latido = latidoDe(pedidos, "feeder_monday");
+    ok(latido && latido.last_status === "fail" && /no pude contar/.test(latido.last_detail), JSON.stringify(latido));
+    ok(pedidos.some(p => p.m === "PATCH" && p.u.includes("toolbar_feeder_runs?id=eq.77")), "el resto del slot sigue y la fila se cierra");
+  }
+});
+
+test("el slot se anota ANTES del trabajo largo: un reinicio a mitad no lo vuelve a disparar, y al terminar se cierra esa misma fila", async () => {
+  // El CRM no contesta nunca: es el reinicio de Railway cayendo en el medio del slot.
+  {
+    const { pedidos } = await correrSlot({ crm: () => new Promise(() => {}) });
+    for (let i = 0; i < 200 && !pedidos.some(p => p.u.includes("/reciclables")); i++) await new Promise(r => setTimeout(r, 25));
+    const iCrm = pedidos.findIndex(p => p.u.includes("/reciclables"));
+    ok(iCrm >= 0, "el slot tiene que llegar a pedir los reciclables");
+    const anotado = pedidos.findIndex(p => p.m === "POST" && /\/rest\/v1\/toolbar_feeder_runs$/.test(p.u) && JSON.parse(p.b).status === "en_curso");
+    ok(anotado >= 0 && anotado < iCrm,
+      "la fila se escribía al final: con el worker muerto a mitad, maybeRunFeederSlot no la encontraba y rehacía el slot en la vuelta siguiente");
+    strictEqual(JSON.parse(pedidos[anotado].b).slot_label, "2026-09-14-09:00", "maybeRunFeederSlot reconoce el slot por slot_label");
+  }
+  {
+    const { corrida, pedidos } = await correrSlot({ crm: reciclablesDelCrm });
+    await corrida;
+    const escrituras = pedidos.filter(p => p.u.includes("/rest/v1/toolbar_feeder_runs") && p.m !== "GET");
+    deepStrictEqual(escrituras.map(p => p.m), ["POST", "PATCH"], "una sola fila por slot: se anota y se cierra");
+    const cierre = JSON.parse(escrituras[1].b);
+    ok(/id=eq\.77/.test(escrituras[1].u) && ["ok", "incomplete"].includes(cierre.status) && "gross_monday" in cierre && cierre.cron_at,
+      `el cierre lleva los números y re-escribe cron_at (la medición mide desde ahí, como antes): ${escrituras[1].b}`);
+  }
+  {
+    // Si no se pudo anotar, o no se puede cerrar, la fila se escribe al final como antes: nunca se pierde.
+    const sinAnotar = await correrSlot({ crm: reciclablesDelCrm, anotar: () => resp({ message: "no" }, { status: 400 }) });
+    await sinAnotar.corrida;
+    const e1 = sinAnotar.pedidos.filter(p => p.u.includes("/rest/v1/toolbar_feeder_runs") && p.m !== "GET");
+    deepStrictEqual(e1.map(p => [p.m, JSON.parse(p.b).status === "en_curso"]), [["POST", true], ["POST", false]]);
+    const sinCerrar = await correrSlot({ crm: reciclablesDelCrm, cerrar: () => resp({ message: "no" }, { status: 500 }) });
+    await sinCerrar.corrida;
+    const e2 = sinCerrar.pedidos.filter(p => p.u.includes("/rest/v1/toolbar_feeder_runs") && p.m !== "GET");
+    deepStrictEqual(e2.map(p => p.m), ["POST", "PATCH", "POST"]);
+  }
+});
+
+test("la conversión del slot no la mueve el volumen de monday, y con la mezcla de antes da lo mismo que antes", async () => {
+  const { _measureFeederRuns } = await cargarWorker(["_measureFeederRuns"], { fetchFalso: true });
+  const hace1h = new Date(Date.now() - 60 * 60_000).toISOString();
+  const runs = [
+    { id: 1, cron_at: hace1h, gross_sellers: 20, gross_majestic: 10, gross_total: 430 },   // monday recicló 400
+    { id: 2, cron_at: hace1h, gross_sellers: 20, gross_majestic: 10, gross_total: 30 },    // monday con el carril lleno
+    { id: 3, cron_at: hace1h, gross_sellers: 30, gross_majestic: 30, gross_total: 200 },   // la mezcla de antes: monday 70%
+  ];
+  const pedidos = [];
+  globalThis.__fetchFalso = enrutar(pedidos, [
+    [(u, m) => m === "GET" && u.includes("toolbar_feeder_runs?status=eq.ok&conversion_pct=is.null"), () => resp(runs)],
+    [(u) => u.includes("toolbar_csv_queue?status=eq.done"), () => resp([], { total: 6 })],
+  ]);
+  await _measureFeederRuns("t");
+  const conv = Object.fromEntries(pedidos.filter(p => p.m === "PATCH" && p.u.includes("toolbar_feeder_runs?id=eq."))
+    .map(p => [p.u.match(/id=eq\.(\d+)/)[1], JSON.parse(p.b)]));
+  deepStrictEqual([conv[1]?.conversion_pct, conv[2]?.conversion_pct], ["6.00", "6.00"],
+    `con gross_total abajo, 400 reciclados de monday la bajaban de 20% a 1,4% y el objetivo del slot subía hacia 800: ${JSON.stringify(conv)}`);
+  strictEqual(conv[3]?.conversion_pct, "3.00", "con monday en el 70% da efectivos / gross_total, lo mismo que se medía");
+  ok(Object.values(conv).every(c => c.effective_added === 6), "los efectivos no cambian");
 });

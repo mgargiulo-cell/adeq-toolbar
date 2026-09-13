@@ -1854,17 +1854,53 @@ async function _getRecentConversionRate(token) {
   }
 }
 
-async function _insertFeederRun(token, slotLabel, data) {
+// `runId` (2026-09-13): si el slot ya se anotó al empezar (`_anotarFeederRunEnCurso`), se CIERRA esa
+// fila en vez de escribir otra. `cron_at` se reescribe al cerrar, como cuando la fila nacía recién al
+// final: `_measureFeederRuns` mide desde `cron_at`, y mover ese punto cambia la conversión medida y con
+// ella cuánto traen sellers y majestic. Si la fila no se puede cerrar, se escribe nueva como antes.
+async function _insertFeederRun(token, slotLabel, data, runId = null) {
+  const headers = {
+    "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+    "Content-Type": "application/json", "Prefer": "return=minimal",
+  };
   try {
+    if (runId != null) {
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?id=eq.${encodeURIComponent(runId)}`, {
+        method: "PATCH", headers, body: JSON.stringify({ ...data, cron_at: new Date().toISOString() }),
+      });
+      if (r.ok) return;
+      log(`⚠️ feeder run: no pude cerrar la fila ${runId} (HTTP ${r.status}) — la escribo nueva`);
+    }
     await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs`, {
-      method: "POST",
-      headers: {
-        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
-        "Content-Type": "application/json", "Prefer": "return=minimal",
-      },
+      method: "POST", headers,
       body: JSON.stringify({ slot_label: slotLabel, ...data }),
     });
   } catch (e) { log(`⚠️ feeder run log failed: ${e.message}`); }
+}
+
+// ── EL SLOT QUEDA ANOTADO ANTES DEL TRABAJO LARGO (2026-09-13) ─────────────────────────────────
+// La fila de `toolbar_feeder_runs` se escribía recién al FINAL del slot, y es lo único que mira
+// `maybeRunFeederSlot` para saber si ese slot ya corrió. Railway reinicia el worker cada ~7 min y un
+// slot baja listas de sellers.json, chequea el ads.txt de cada reciclado (concurrencia 8, hasta 12 s
+// por pedido) y consulta las fuentes GEO: si el reinicio caía en el medio no quedaba fila, el slot
+// volvía a dispararse en la vuelta siguiente y rehacía todo, y si volvía a cortarse, otra vez. Ahora
+// se anota `en_curso` antes de empezar y se cierra al terminar. Un slot cortado queda `en_curso` (así
+// se ve en el panel) y no se repite: el siguiente slot sigue con lo que falte.
+// Si la anotación falla, devuelve null y el cierre escribe la fila al final, como antes.
+async function _anotarFeederRunEnCurso(token, slotLabel) {
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs`, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
+        "Content-Type": "application/json", "Prefer": "return=representation",
+      },
+      body: JSON.stringify({ slot_label: slotLabel, status: "en_curso", notes: `en curso desde ${new Date().toISOString()}: si queda así, el worker se reinició a mitad del slot` }),
+    });
+    if (!r.ok) { log(`⚠️ feeder run: no pude anotar el slot ${slotLabel} al empezar (HTTP ${r.status})`); return null; }
+    const filas = await r.json().catch(() => null);
+    return Array.isArray(filas) && filas[0]?.id != null ? filas[0].id : null;
+  } catch (e) { log(`⚠️ feeder run: no pude anotar el slot ${slotLabel} al empezar (${e.message})`); return null; }
 }
 
 // Maxi 2026-07-01: CARRIL POR FUENTE + tope global del waiting_pool.
@@ -1914,6 +1950,9 @@ const DEFAULT_SOURCE_CAP = 150;
 //  · techo del 200%, para que un pico no vacíe a las demás;
 //  · sin datos suficientes (menos de 50 procesados) NO se toca: no se decide con ruido.
 const _CAP_PISO = 0.4, _CAP_TECHO = 2.0, _CAP_MIN_MUESTRA = 50;
+// Tope de filas que lee el recálculo (14 días de TODA la cola, ~26.000 medidas). Llegar al tope es
+// "ventana cortada", no muestra: no se recalcula.
+const CARRILES_MAX_FILAS = 100_000;
 // `auto_feeder_monday` queda FUERA del reparto por rendimiento. Su carril de 400 no salió de
 // competir contra las otras fuentes: es el tamaño que necesita el barrido diario del board
 // completo (`sincronizarFinalizadosDeMonday`). Meterlo en la comparación lo bajaba a 289 y
@@ -1936,10 +1975,17 @@ async function recalcularCarrilesPorRendimiento(token) {
     if (!(await _tocaCorrer(token, "recalcular_carriles", 12 * 60))) return;
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const desde = new Date(Date.now() - 14 * 86400_000).toISOString();
-    const filas = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde}&select=source,status&limit=20000`,
-      { headers: auth }).then(r => r.ok ? r.json() : []).catch(() => []);
-    if (!Array.isArray(filas) || filas.length < 200) return;   // muestra chica: no se toca nada
+    // ⚠️ DE A PÁGINAS Y CON ORDEN (2026-09-13). Era un solo pedido con `limit=20000`: PostgREST
+    // devuelve 1.000 filas como máximo, sin orden, y 14 días de cola son ~26.000. El reparto se
+    // decidía con un pedazo cualquiera de la ventana (la misma clase de bug que cerró _traerTodo
+    // el 04/09). Una página caída o una ventana más grande que el tope NO es una muestra: no se
+    // toca nada y queda el reparto que había.
+    const filas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde}&select=source,status&order=id`,
+      auth, { max: CARRILES_MAX_FILAS });
+    if (!Array.isArray(filas)) { log(`  ⚠️ carriles: no pude leer la cola completa de 14 días — queda el reparto que había`); return; }
+    if (filas.length >= CARRILES_MAX_FILAS) { log(`  ⚠️ carriles: más de ${CARRILES_MAX_FILAS} filas en 14 días — no mido con una ventana cortada`); return; }
+    if (filas.length < 200) return;   // muestra chica: no se toca nada
 
     const stats = {};
     for (const f of filas) {
@@ -2025,6 +2071,22 @@ async function _lugarEnCarril(token, sourceTag) {
   return usados == null
     ? { cap, usados: null, lugar: 0, error: true }
     : { cap, usados, lugar: Math.max(0, cap - usados), error: false };
+}
+
+// Cuántas filas de la fuente se encolaron HOY (medianoche de Madrid), por cualquier camino y en
+// cualquier estado: `uploaded_at` lo pone `_injectIntoCsvQueue` al insertar y al reactivar. Cuenta
+// también las que cayeron en `next_day`, que no ocupan carril. Falla CERRADO como
+// `_contarActivosCarril`: null = no pude contar, nunca "cero" (2026-09-13).
+async function _contarEncoladosHoy(token, sourceTag) {
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?source=eq.${encodeURIComponent(sourceTag)}&uploaded_at=gte.${encodeURIComponent(_madridMidnightUtcISO())}&select=id`,
+      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Prefer": "count=exact", "Range": "0-0" } }
+    );
+    if (!res.ok && res.status !== 416) return null;
+    const m = (res.headers.get("content-range") || "").match(/\/(\d+)$/);
+    return m ? parseInt(m[1], 10) : null;
+  } catch { return null; }
 }
 
 // ── PRE-LISTADO DE DESCUBRIMIENTO (Maxi 2026-07-17, pedido del user) ─────────────────
@@ -3436,16 +3498,18 @@ async function _runAutoGoogleSlot(token, slotLabel) {
   const _muertas = new Set();
   try {
     const _hdr = { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } };
-    const [_yr, _mr] = await Promise.all([
+    // Las muertas se leen DE A PÁGINAS (2026-09-13): con `limit=2000` en un solo pedido PostgREST
+    // corta en 1.000, y la frase muerta 1.001 volvía a gastar Serper. El top sí es un corte (600).
+    const [_yr, _mfilas] = await Promise.all([
       fetch(`${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.2&qualified=gt.0&order=qualified.desc,fresh.desc&select=phrase,searches&limit=600`, _hdr),
-      fetch(`${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.10&or=(qualified.is.null,qualified.eq.0)&select=phrase&limit=2000`, _hdr),
+      _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_keyword_yield?searches=gte.10&or=(qualified.is.null,qualified.eq.0)&select=phrase&order=phrase`, _hdr.headers),
     ]);
     if (_yr.ok) {
       const _filas = await _yr.json();
       _topPhrases = _filas.map(r => r.phrase).filter(p => typeof p === "string");
       _filas.forEach(r => { if (r.phrase) _yieldPorFrase.set(r.phrase, r.searches || 0); });
     }
-    if (_mr.ok) for (const r of await _mr.json()) if (r?.phrase) _muertas.add(r.phrase);
+    if (Array.isArray(_mfilas)) for (const r of _mfilas) if (r?.phrase) _muertas.add(r.phrase);
   } catch {}
   if (_muertas.size) log(`  🪦 AutoGoogle: ${_muertas.size} frase(s) retiradas por no calificar nunca en ≥10 búsquedas`);
   const _poolSet = new Set(pool);
@@ -4210,17 +4274,21 @@ async function sincronizarFinalizadosDeMonday(token) {
 // ── Dominios a los que YA les escribimos en los últimos N días ───────────────
 // Devuelve null si no se pudo leer: re-prospectar a ciegas podría mandarle un mail
 // a alguien que lo recibió ayer.
+const CONTACTADOS_MAX_FILAS = 60_000;
 async function _dominiosContactadosDesde(token, dias) {
   const desde = new Date(Date.now() - dias * 86400000).toISOString();
   const out = new Set();
   try {
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${desde.slice(0, 10)}&select=domain&limit=20000`,
-      { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
-    );
-    if (!r.ok) return null;
-    const rows = await r.json();
-    if (!Array.isArray(rows)) return null;
+    // ⚠️ DE A PÁGINAS (2026-09-13). Era un solo pedido con `limit=20000` y PostgREST corta en 1.000:
+    // 90 días de envíos son varios miles, así que los contactados que caían fuera de esas 1.000
+    // pasaban el filtro y se re-prospectaban. Orden por dominio: dos filas empatadas son el mismo
+    // dominio, así que el conjunto sale entero aunque el empate cambie de página. Una página caída
+    // o una ventana más grande que el tope = no pude leer (null), nunca "no hay contactados".
+    const rows = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_sendtrack?send_date=gte.${desde.slice(0, 10)}&select=domain&order=domain`,
+      { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` },
+      { max: CONTACTADOS_MAX_FILAS });
+    if (!Array.isArray(rows) || rows.length >= CONTACTADOS_MAX_FILAS) return null;
     rows.forEach(x => { const d = _normalizeFeederDomain(x.domain || ""); if (d) out.add(d); });
     return out;
   } catch { return null; }
@@ -4345,8 +4413,8 @@ async function _feederPullMonday(token, targetCount, sessionKnown) {
     // que falta para llenar su carril (ver _runFeederSlot), "lleno" es un caso normal: se late igual,
     // para que no hacer falta no se lea como estar caído.
     if (!(targetCount > 0)) {
-      log(`  🌱 reciclables: carril auto_feeder_monday lleno — no hace falta pedirle la lista al CRM este slot`);
-      await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: "carril lleno: no hacía falta reciclar este slot" }).catch(() => {});
+      log(`  🌱 reciclables: carril auto_feeder_monday lleno o techo del día cumplido — no hace falta pedirle la lista al CRM este slot`);
+      await saludPing(token, "feeder_monday", { status: "ok", cadenciaMin: 24 * 60, detalle: "carril lleno o techo del día cumplido: no hacía falta reciclar este slot" }).catch(() => {});
       return 0;
     }
     if (!CRM_SYNC_URL || !CRM_SYNC_SECRET) { log(`  ⚠️ feeder reciclables: falta CRM_SYNC_SECRET`); return 0; }
@@ -4932,10 +5000,27 @@ const FEEDER_SOURCE_KEYS = [
 ];
 const FEEDER_EXPLORE_FLOOR     = 0.15; // cada fuente del reparto recibe ≥15% (exploración)
 const FEEDER_PESOS_MIN_MUESTRA = 50;   // procesadas por fuente en 14 días; con menos, mitad y mitad
+const FEEDER_PESOS_MAX_FILAS = 20_000; // sellers + majestic en 14 días (~2.200 medidas); llegar al tope = ventana cortada
 // La parte del bruto del slot que va a sellers + majestic. Es la que tenían: con monday clavado en
 // el techo del reparto (70%), a las dos juntas les quedaba 15 + 15. Darles más volumen es otra
 // decisión; acá sólo cambia cómo se reparte esa parte entre ellas.
 const FEEDER_PARTE_SELLERS_MAJESTIC = 0.30;
+
+// ── CUÁNTO RECICLA MONDAY EN UN SLOT (2026-09-13) ──────────────────────────────────────────────
+// Desde que monday salió del reparto, el slot le daba `min(lugar libre, techo)`. Pero el techo es
+// DIARIO (`monday_sync_techo_dia`, 400 por default) y hay 5 slots: cada uno podía encolar el techo
+// entero, y lo que no entraba en pending ni en waiting_pool caía en `next_day`, que no ocupa carril, así
+// que el lugar libre no bajaba. Y el lugar salía de `_countActiveCsvBySource`, que ante un error de la
+// base da 0 → carril vacío → asignación de 400 y 400 chequeos de ads.txt.
+// Regla: lo que queda del techo de HOY —contando lo que ya encolaron el slot y el barrido— y nunca más
+// que el lugar del carril. Sin poder contar cualquiera de las dos cosas, 0: no se recicla a ciegas.
+function _asignacionMondaySlot({ lugar, techo, encoladosHoy }) {
+  if (lugar == null || encoladosHoy == null || !Number.isFinite(lugar) || !Number.isFinite(encoladosHoy)) {
+    return { alloc: 0, restante: null, error: true };
+  }
+  const restante = Math.max(0, (Number(techo) || 0) - encoladosHoy);
+  return { alloc: Math.max(0, Math.min(lugar, restante)), restante, error: false };
+}
 
 // Sube las fuentes por debajo del piso y baja proporcionalmente las de arriba.
 // `keys` (2026-09-13): el reparto por rendimiento ahora es de dos fuentes, no de tres.
@@ -4992,12 +5077,16 @@ async function _getFeederSourceWeights(token) {
   try {
     const desde = new Date(Date.now() - 14 * 86400_000).toISOString();
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
-    const r = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde}&source=in.(auto_feeder_sellers,auto_feeder_majestic)&select=source,status,error_message&limit=20000`,
-      { headers: auth });
-    if (!r.ok) return parejo(`HTTP ${r.status}`);
-    const filas = await r.json();
-    if (!Array.isArray(filas)) return parejo("respuesta inesperada");
+    // ⚠️ DE A PÁGINAS Y CON ORDEN (2026-09-13). Un solo pedido con `limit=20000` traía como mucho
+    // 1.000 filas sin orden (tope de PostgREST) de las ~2.200 de 14 días: el "n < 50 → mitad y
+    // mitad" y el ok/n de cada fuente salían de las filas que la base devolviera primero, y el
+    // debug decía "(14d)". Una página caída o una ventana más grande que el tope no se leen como
+    // muestra entera: mitad y mitad.
+    const filas = await _traerTodo(
+      `${SUPABASE_URL}/rest/v1/toolbar_csv_queue?processed_at=gte.${desde}&source=in.(auto_feeder_sellers,auto_feeder_majestic)&select=source,status,error_message&order=id`,
+      auth, { max: FEEDER_PESOS_MAX_FILAS });
+    if (!Array.isArray(filas)) return parejo("lectura incompleta");
+    if (filas.length >= FEEDER_PESOS_MAX_FILAS) return parejo(`más de ${FEEDER_PESOS_MAX_FILAS} filas: ventana cortada`);
     return _pesosFeeder(filas, FEEDER_EXPLORE_FLOOR);
   } catch (e) { return parejo(e.message); }
 }
@@ -5106,6 +5195,9 @@ async function _runFeederSlot(token, slotLabel) {
     });
     return;
   }
+  // Pasados los frenos, el slot se anota ANTES del trabajo largo: un reinicio a mitad ya no lo
+  // vuelve a disparar (ver _anotarFeederRunEnCurso). Las salidas de arriba escriben su fila al toque.
+  const _runId = await _anotarFeederRunEnCurso(token, slotLabel);
 
   // 4. Calcular target conversion-aware
   const remaining = FEEDER_DAILY_TARGET - dailyEffective;
@@ -5131,16 +5223,25 @@ async function _runFeederSlot(token, slotLabel) {
   const w = await _getFeederSourceWeights(token);
   const _cfgSlot = await getConfig(token).catch(() => ({}));
   const _techoMonday = parseInt(_cfgSlot?.monday_sync_techo_dia || "", 10) || MONDAY_SYNC_MAX_POR_DIA;
-  const _libreMonday = Math.max(0, _capDeFuente("auto_feeder_monday") - await _countActiveCsvBySource(token, "auto_feeder_monday"));
-  const allocMonday   = Math.min(_libreMonday, _techoMonday);
+  // Lugar del carril y lo encolado hoy, las dos cuentas fallando CERRADO (ver _asignacionMondaySlot).
+  const _carrilMonday = await _lugarEnCarril(token, "auto_feeder_monday");
+  const _mondayHoy    = await _contarEncoladosHoy(token, "auto_feeder_monday");
+  const _asigMonday   = _asignacionMondaySlot({ lugar: _carrilMonday.error ? null : _carrilMonday.lugar, techo: _techoMonday, encoladosHoy: _mondayHoy });
+  const allocMonday   = _asigMonday.alloc;
   const _parteSM      = Math.round(targetGross * FEEDER_PARTE_SELLERS_MAJESTIC);
   const allocSellers  = Math.max(1, Math.round(_parteSM * w.sellers));
   const allocMajestic = Math.max(1, Math.round(_parteSM * w.majestic));
   const _cupoEncima   = Math.min(40, Math.max(15, Math.round(targetGross * FEEDER_EXPLORE_FLOOR)));
-  log(`  ⚖️ feeder: sellers=${(w.sellers * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% de ${_parteSM} (por rendimiento) · monday fijo ${allocMonday} (carril libre ${_libreMonday}, techo ${_techoMonday}) — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
+  log(`  ⚖️ feeder: sellers=${(w.sellers * 100).toFixed(0)}% majestic=${(w.majestic * 100).toFixed(0)}% de ${_parteSM} (por rendimiento) · monday fijo ${allocMonday} (${_asigMonday.error ? "no pude contar carril u hoy" : `carril libre ${_carrilMonday.lugar}, techo ${_techoMonday}/día con ${_mondayHoy} ya encolados hoy`}) — alloc ${allocSellers}/${allocMonday}/${allocMajestic} [${w.debug}]`);
   const sessionKnown = new Set();
   const fromSellers  = await _feederPullSellers(token, allocSellers, sessionKnown);
-  const fromMonday   = await _feederPullMonday(token, allocMonday, sessionKnown);
+  let fromMonday = 0;
+  if (_asigMonday.error) {
+    log(`  ⚠️ reciclables: no pude contar el carril de auto_feeder_monday o lo encolado hoy — no reciclo este slot`);
+    await saludPing(token, "feeder_monday", { status: "fail", cadenciaMin: 24 * 60, detalle: "no pude contar el carril o lo encolado hoy: no reciclo este slot" }).catch(() => {});
+  } else {
+    fromMonday = await _feederPullMonday(token, allocMonday, sessionKnown);
+  }
   const fromMajestic = await _feederPullMajestic(token, allocMajestic, sessionKnown, _slotHispanic);
   // BONUS renovable: ads.txt → sellers.json (descubre redes/publishers nuevos, $0).
   // Va ENCIMA del split de las 3 (no compite por el yield) — supply extra que
@@ -5162,7 +5263,22 @@ async function _runFeederSlot(token, slotLabel) {
     rapidapi_used: usedThisMonth, rapidapi_limit: rapidLimit,
     rq_valid_before: rqValid,
     notes: `w s/m/j=${(w.sellers * 100).toFixed(0)}/fijo${allocMonday}/${(w.majestic * 100).toFixed(0)} adstxt=${fromAdsTxt} geo=${fromGeo.pais}:crux${fromGeo.crux}/wd${fromGeo.wikidata}/dir${fromGeo.directorio || 0}`,
-  });
+  }, _runId);
+}
+
+// ── LA CONVERSIÓN DEL SLOT SE MIDE SOBRE LO QUE EL OBJETIVO DECIDE (2026-09-13) ─────────────────
+// `conversion_pct` alimenta `_getRecentConversionRate` → `targetGross`. Se dividía por `gross_total`
+// (sellers + monday + majestic, columna generada). Mientras monday era el 70% de `targetGross`, la mezcla
+// era fija y el número se movía con lo que rendían las fuentes. Desde que monday recicla lo que falta de
+// su carril y de su techo diario (0 a 400 filas, sin relación con `targetGross`), esas filas movían la
+// conversión y con ella cuánto traen sellers y majestic: 400 de monday bajaban la medida y el objetivo
+// subía hacia 800. Ahora se divide por lo que `targetGross` sí decide, sellers + majestic, llevado a la
+// misma escala de antes (÷ su parte del 30%): con la mezcla vieja da exactamente `gross_total`, y el
+// volumen de monday no la mueve. El numerador no cambia.
+function _conversionFeederRun(efectivos, run) {
+  const sm = (parseInt(run?.gross_sellers, 10) || 0) + (parseInt(run?.gross_majestic, 10) || 0);
+  const base = sm / FEEDER_PARTE_SELLERS_MAJESTIC;
+  return base > 0 ? ((Number(efectivos) || 0) / base) * 100 : 0;
 }
 
 // MEASUREMENT: post-mortem para calcular effective_added después de 30 min.
@@ -5173,7 +5289,7 @@ async function _measureFeederRuns(token) {
     const today = _madridNowParts().dateISO;
     const cutoffAgo = new Date(Date.now() - FEEDER_MEASURE_DELAY_MIN * 60_000).toISOString();
     const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&conversion_pct=is.null&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,rq_valid_before&limit=5`,
+      `${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?status=eq.ok&conversion_pct=is.null&cron_at=lt.${cutoffAgo}&cron_at=gte.${today}T00:00:00&select=id,cron_at,gross_total,gross_sellers,gross_majestic,rq_valid_before&limit=5`,
       { headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` } }
     );
     if (!res.ok) return;
@@ -5193,7 +5309,7 @@ async function _measureFeederRuns(token) {
       );
       const rangeHdr = doneRes.headers.get("content-range") || "";
       const eff = parseInt(rangeHdr.match(/\/(\d+)$/)?.[1] || "0", 10);
-      const conv = run.gross_total > 0 ? (eff / run.gross_total) * 100 : 0;
+      const conv = _conversionFeederRun(eff, run);   // sin monday arriba ni abajo del objetivo (2026-09-13)
       const rqValidNow = await _getReviewQueueValidCount(token);
       await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?id=eq.${run.id}`, {
         method: "PATCH",
