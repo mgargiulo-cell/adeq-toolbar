@@ -15,6 +15,9 @@
 //       sola regla para la heurística de entrada y para las filas viejas; la piratería con marcado, también.
 //   S5. El barrido y el chequeo al enviar no sacan a un medio de streaming que entró.
 //   S6. La extensión no lo marca "no prospectable" por tipo.
+//   S7. Revisión de la misma noche: la regla pirata corre en la PUERTA (antes de Haiku, de Apollo y de
+//       ocupar una fila de Prospects) y sobre cualquier categoría guardada, no sólo sobre la etiqueta
+//       "streaming"; y "streaming" es la etiqueta del MEDIO, no de quien vende el servicio.
 //
 // Run: npm test
 /* eslint-disable no-new-func */
@@ -45,8 +48,8 @@ globalThis.__fetchFalso = async () => resp([]);
 
 const W = await cargarWorker([
   "processCsvItem", "_categoriaNuncaProspectable", "CATEGORIAS_NUNCA", "BLOCKED_CATEGORIES", "scoreWebsite",
-  "_esStreamingPirata", "classifyByUrlOnly", "_veredictoUrlAlEnviar", "_veredictoPorSimilarWeb",
-  "fetchPageContent", "barridoNoPublisher", "_motivoCanonicoCola",
+  "_esStreamingPirata", "_esMedioDeStreaming", "classifyByUrlOnly", "_veredictoUrlAlEnviar", "_veredictoPorSimilarWeb",
+  "fetchPageContent", "barridoNoPublisher", "_motivoCanonicoCola", "PUBLISHER_CATEGORIES",
 ], { fetchFalso: true });
 
 const ADS_TXT = Array.from({ length: 25 }, (_, i) => `google.com, pub-${3000 + i}, DIRECT, f08c47fec0942fa0`).join("\n");
@@ -264,4 +267,128 @@ test("S6 extensión: la categoría de streaming no está bloqueada y el panel ya
   deepStrictEqual(isCategoryBlocked("Music & Audio > Music Streaming"), { blocked: false });
   strictEqual(isCategoryBlocked("Banking, Credit, and Lending").blocked, true, "la banca sigue bloqueada");
   match(popupHtml, /Hard gates<\/strong>: Adult \/ Streaming pirata \/ Gambling/);
+});
+
+// ═══ S7 — REVISIÓN: la regla pirata corre en la PUERTA, y "streaming" es el medio ════════════════
+// Los tres agujeros que dejó abrir el streaming, cada uno con el código real:
+//   · el freno nuevo para lo pirata vivía sólo al ENVIAR y sólo si la categoría guardada era
+//     "streaming" a secas. Con la home tapada por un WAF —que es como contestan cuevana y
+//     compañía— lo que se guarda es la categoría de SimilarWeb, así que no corría NADA y el
+//     agente le mandaba el mail;
+//   · el pirata que SÍ podíamos leer entraba igual: pagaba Haiku, ocupaba una fila de Prospects
+//     que el barrido no sacaba y el pulido le volvía a buscar contacto en cada vuelta;
+//   · y la palabra "streaming" suelta ascendía a "categoría de medios" a cualquiera que la
+//     nombrara (hosting de streaming, reventa de IPTV, VPN que promete desbloquearlo).
+
+// La home tapada por Cloudflare: 403 y ni un título que juzgar. Es el caso que hoy pasaba entero.
+const homeTapada = [[(u) => /^https?:\/\/(?:www\.)?cuevana3deprueba\.io\/?$/.test(u),
+  () => resp("<html><body>Just a moment... Cloudflare</body></html>", { status: 403 })]];
+
+test("S7 processCsvItem de verdad: el pirata detrás de un WAF se frena en la puerta, sin gastar Claude ni llegar a Prospects", async () => {
+  const reg = red({ category: "arts_and_entertainment/tv_movies_and_streaming", pais: "AR", visits: 1_500_000, extra: homeTapada });
+  await W.processCsvItem("t", itemDe(731, "cuevana3deprueba.io"), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
+  const p = patchesDeCola(reg, 731);
+  strictEqual(p.length, 1, JSON.stringify(p));
+  strictEqual(p[0].status, "skipped");
+  match(p[0].error_message, /^no_prospectable_tipo: ".*" es streaming_pirata \(ni con ads\.txt ni con tráfico\)$/);
+  strictEqual(W._motivoCanonicoCola(p[0].error_message), "tipo_no_prospectable:streaming_pirata", "el parte lo agrupa como los demás tipos");
+  strictEqual(altasEnProspects(reg).length, 0, "antes entraba a Prospects con la categoría de SimilarWeb y el agente le mandaba el mail");
+  ok(!reg.some(r => /toolbar_claude_gasto|anthropic|\/api\/claude/i.test(r.u)), "el veto es gratis: ni una llamada a Claude");
+});
+
+test("S7 processCsvItem de verdad: el pirata que sí podemos leer tampoco entra, y no paga Haiku ni ocupa el pool", async () => {
+  const reg = red({ category: "arts_and_entertainment/tv_movies_and_streaming", pais: "AR", html: home("Cuevana 3 - Ver peliculas online gratis HD") });
+  await W.processCsvItem("t", itemDe(732, "cuevana3legibledeprueba.io"), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
+  const p = patchesDeCola(reg, 732);
+  strictEqual(p.length, 1, JSON.stringify(p));
+  match(p[0].error_message, /es streaming_pirata/);
+  strictEqual(altasEnProspects(reg).length, 0);
+  ok(!reg.some(r => /toolbar_claude_gasto|anthropic|\/api\/claude/i.test(r.u)), "antes se llamaba y se contabilizaba Haiku en classifyPublisher");
+  ok(reg.some(r => r.m === "POST" && r.u.includes("toolbar_diag_descartes") && /streaming_pirata/.test(r.b)), "queda anotado en el diagnóstico de descartes");
+});
+
+test("S7 scoreWebsite: la regla pirata corre sea cual sea la categoría guardada, no sólo sobre 'streaming'", () => {
+  const swCat = "arts_and_entertainment/tv_movies_and_streaming";
+  // El caso exacto que pasaba: categoría de SimilarWeb y el título vacío porque el WAF tapó la home.
+  deepStrictEqual(W.scoreWebsite({ domain: "cuevana3.io", category: swCat, traffic: 1_500_000, geo: "Argentina", page_title: "" }).reasons,
+    ["cat_blocked:streaming_pirata"], "antes daba 85, cinco estrellas y verde");
+  deepStrictEqual(W.scoreWebsite({ domain: "verhddeprueba.net", category: swCat, traffic: 1_500_000, page_title: "Ver peliculas online gratis" }).reasons,
+    ["cat_blocked:streaming_pirata"], "con categoría de SimilarWeb, el título lo delata igual");
+  deepStrictEqual(W.scoreWebsite({ domain: "listasiptvdeprueba.net", category: "", traffic: 1_500_000, page_title: "" }).reasons,
+    ["cat_blocked:streaming_pirata"], "sin categoría ninguna, el dominio alcanza");
+  // Y el medio de streaming sigue pasando, con la categoría de SimilarWeb o con la de la heurística.
+  for (const c of [swCat, "streaming"]) {
+    ok(W.scoreWebsite({ domain: "tv-programme.com", category: c, traffic: 2_000_000, geo: "France", page_title: "Programme TV ce soir : films, series et streaming" }).score >= 0, c);
+  }
+});
+
+test("S7 _veredictoPorSimilarWeb: el streaming pirata no es publisher (la regex de medios matcheaba 'streaming' adentro)", () => {
+  strictEqual(W._veredictoPorSimilarWeb({ category: "streaming_pirata", traffic: 1_000_000 }), "no", "antes decía 'publisher' y el barrido dejaba la fila muerta en Prospects");
+  strictEqual(W._veredictoPorSimilarWeb({ category: "streaming", traffic: 1_000_000 }), "publisher", "el medio de streaming no cambia");
+});
+
+// ── Los tres que la palabra suelta ascendía a medio ───────────────────────────────────────────
+const VENDEN_STREAMING = [
+  { id: 741, domain: "serverstreamdeprueba.com", sw: "computers_electronics_and_technology/programming_and_developer_software",
+    title: "Servidores de streaming y hosting de radio online", que: "hosting de streaming" },
+  { id: 742, domain: "iptvpremiumdeprueba.com", sw: "arts_and_entertainment/tv_movies_and_streaming",
+    title: "IPTV Premium: 12000 canales en streaming, suscripcion mensual", que: "reventa de IPTV", pirata: true },
+  { id: 743, domain: "vpnrapidadeprueba.com", sw: "computers_electronics_and_technology/programming_and_developer_software",
+    title: "VPN rapida: desbloquea el streaming de cualquier pais", que: "VPN" },
+];
+
+test("S7 fetchPageContent de verdad: 'streaming' es la etiqueta del MEDIO, no de quien vende el servicio", async () => {
+  red({ homes: Object.fromEntries(VENDEN_STREAMING.map(s => [s.domain, home(s.title)])) });
+  for (const s of VENDEN_STREAMING) {
+    const c = (await W.fetchPageContent(s.domain))?.category;
+    ok(c !== "streaming", `${s.que}: la heurística le ponía "streaming" y eso hoy vale +25 "categoría de medios" (dio "${c}")`);
+  }
+  // La misma regla que usa la heurística es la que hace válida la etiqueta de PUBLISHER_CATEGORIES.
+  ok(W.PUBLISHER_CATEGORIES.has("streaming"), "el medio de streaming sigue contando como categoría de medios");
+  for (const t of ["Servidores de streaming y hosting de radio online", "VPN rapida: desbloquea el streaming de cualquier pais",
+    "Streaming de datos en tiempo real para tu app", "streaming"]) strictEqual(W._esMedioDeStreaming(t), false, t);
+  for (const t of ["Guia de series y peliculas en streaming", "Programme TV ce soir : films, series et streaming",
+    "Guia de musica en streaming: radios, playlists y estrenos", "Filmelier: onde assistir filmes e series no streaming"]) strictEqual(W._esMedioDeStreaming(t), true, t);
+});
+
+for (const s of VENDEN_STREAMING) {
+  test(`S7 processCsvItem de verdad: ${s.que} no entra a Prospects como medio de streaming`, async () => {
+    const reg = red({ category: s.sw, pais: "AR", html: home(s.title) });
+    await W.processCsvItem("t", itemDe(s.id, s.domain), { rapidapi_key: "" }, USO_APOLLO, { count: 0 });
+    const altas = altasEnProspects(reg);
+    if (s.pirata) {
+      // La reventa de listas de 12.000 canales por suscripción es la piratería que el dueño NO abrió.
+      match(patchesDeCola(reg, s.id)[0].error_message, /es streaming_pirata/);
+      strictEqual(altas.length, 0);
+      strictEqual(W.scoreWebsite({ domain: s.domain, category: "", traffic: 1_000_000, page_title: s.title }).score, -1);
+    } else {
+      // No se veta por tipo (no es lo que el dueño decidió), pero deja de disfrazarse de medio:
+      // sin la etiqueta "streaming" no hay +25 ni `evidenciaDeMedio`, así que sin ads.txt no pasa.
+      ok(altas.length === 0 || altas[0].category !== "streaming", `entró como "${altas[0]?.category}"`);
+    }
+  });
+}
+
+test("S7 polishPool de verdad: un lead que el gate duro rechaza no se lleva más presupuesto de contacto", async () => {
+  const P = await cargarWorker(["polishPool"], { fetchFalso: true });
+  const leads = [
+    { id: 851, domain: "cuevanaviejadeprueba.io", status: "pending", category: "streaming_pirata", traffic: 1_000_000,
+      emails: [], email_sources: {}, contact_name: "", contact_phone: "", created_at: "2026-09-13T20:00:00Z", language: "es", email_intentos: 0, email_ultimo_motivo: null },
+  ];
+  const pedidos = [];
+  globalThis.__fetchFalso = async (url, opts = {}) => {
+    const u = String(url), m = String(opts.method || "GET").toUpperCase();
+    pedidos.push({ u, m, b: String(opts.body || "") });
+    if (u.includes("/rest/v1/toolbar_config?select=key,value")) return resp([{ key: "polish_pool", value: "true" }]);
+    if (u.includes("/rest/v1/toolbar_bounced_emails")) return resp([]);
+    if (u.includes("/rest/v1/toolbar_review_queue?status=eq.pending") && m === "GET") return resp(leads.map(l => ({ ...l })));
+    if (u.includes("/rest/v1/")) return resp([]);
+    return resp("");
+  };
+  await P.polishPool("t");
+  const marcas = pedidos.filter(r => r.m === "PATCH" && r.u.includes("toolbar_review_queue?id=eq.851")).map(r => JSON.parse(r.b));
+  ok(marcas.some(b => b.status === "rejected" && /cat_blocked:streaming_pirata/.test(b.suspect_reason || "")),
+    `el pulido tiene que sacarlo del pool, no volver a buscarle contacto: ${JSON.stringify(marcas)}`);
+  ok(!pedidos.some(r => /cuevanaviejadeprueba\.io/.test(r.u) && !r.u.includes("supabase")), "no sale a la web a buscarle un email");
+  ok(!pedidos.some(r => /apollo\.io|serper|millionverifier/i.test(r.u)), "ni a Apollo, ni a Google, ni al verificador");
 });

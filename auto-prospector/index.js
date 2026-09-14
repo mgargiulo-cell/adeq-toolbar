@@ -9079,7 +9079,10 @@ async function fetchPageContent(domain, _yaReintentado = false, _reintentoDns = 
     let category = "other";
     if      (/\b(porn|xxx|sex|adult|escort|fetish|hentai|onlyfans|pornhub|xvideos|xnxx|redtube|cam[\s-]?girl|webcam|nude|nudes|brazzer)\b|videos?xxx|sexo[\s-]?gratis|chicas[\s-]?desnudas/i.test(textForCategory)) category = "adult";
     else if (_esStreamingPirata(textForCategory)) category = "streaming_pirata";
-    else if (/\bstreaming\b/i.test(textForCategory)) category = "streaming";
+    // Sólo el MEDIO de streaming (música, cine, series, TV) se llama "streaming": la palabra suelta
+    // se la ponía también al hosting de streaming, al vendedor de IPTV y a la VPN, y esa etiqueta hoy
+    // suma "categoría de medios". Lo que no es medio sigue de largo y cae donde le corresponde.
+    else if (_esMedioDeStreaming(textForCategory)) category = "streaming";
     else if (/sport|futbol|futebol|soccer|football|nba|basket|tennis|béisbol|beisbol|liga|mlb|f1|motor|boxeo|boxing/.test(textForCategory)) category = "sports";
     else if (/noticia|news|diario|periódico|periodico|press|journalism|último|ultimo momento|actualidad/.test(textForCategory))            category = "news";
     else if (/finanz|banco|econom|invest|crypto|bolsa|stock|finance|mercad/.test(textForCategory))                                          category = "finance";
@@ -13589,6 +13592,13 @@ async function polishPool(token) {
         // 1) blocklist (sin red)
         const bl = await isDomainBlockedFull(domain, token);
         if (bl) { await _softRejectLead(auth, lead.id, `blocklist:${bl}`); blocked++; return; }
+        // Un lead que el gate duro del agente rechaza (adulto, apuestas, streaming pirata) queda
+        // pending y sin email para siempre — que es exactamente el perfil que esta consulta levanta.
+        // Sin esto el pulido le pagaba búsqueda de contacto en cada vuelta de la espera por alguien a
+        // quien nunca se le va a escribir. Mismo BLOCKED_CATEGORIES que scoreWebsite. (13/09, revisión.)
+        if (BLOCKED_CATEGORIES.has(String(lead.category || "").toLowerCase())) {
+          await _softRejectLead(auth, lead.id, `cat_blocked:${lead.category}`); blocked++; return;
+        }
         // ¿Este lead ya está resuelto? Se calcula ANTES de salir a la red, porque en modo
         // "solo los que no tienen email" saltearlo acá ahorra el fetch entero.
         const curEmails = Array.isArray(lead.emails) ? lead.emails.filter(Boolean) : [];
@@ -14462,6 +14472,10 @@ function _veredictoPorSimilarWeb({ category = "", traffic = 0, geo = "" } = {}) 
   // compartida con el veto duro de scoreProspectable (antes estaban duplicadas y se iban a
   // desincronizar en cuanto tocáramos una).
   if (_categoriaNoPublisher(cat)) return "no";
+  // Lo pirata, ANTES de la regex de medios: ella matchea "streaming" adentro de "streaming_pirata" y
+  // devolvía "publisher", así que el barrido dejaba tranquila a una fila que el agente nunca va a
+  // usar. Misma regla compartida de siempre. (Revisión del 13/09.)
+  if (cat === "streaming_pirata" || _esStreamingPirata(cat)) return "no";
 
   // Categorías que SÍ son medios monetizables con display.
   if (/news|media|magazine|newspaper|journal|sport|entertain|gossip|celebrit|lifestyle|music|film|movie|\btv\b|streaming|gaming|games|blog|recipe|food|arts_and_entertainment|motorsports|automotive/.test(cat)) {
@@ -16333,6 +16347,27 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
   const _adsFrase = _ads?.state === "yes" ? `Tiene ads.txt (${_ads.lines || 0} sellers) y ${_pvTxt} pageviews`
     : _ads?.state === "adsense" ? `No tiene ads.txt (entró por la excepción de AdSense activo) y tiene ${_pvTxt} pageviews`
     : `Su ads.txt no se pudo leer (bloqueado o timeout) y tiene ${_pvTxt} pageviews`;
+  // ── LO PIRATA SE FRENA EN LA PUERTA, NO AL ENVIAR (revisión del 13/09) ───────────────────────
+  // Al abrir el streaming, el único freno nuevo para lo pirata quedó en scoreWebsite, o sea al
+  // ENVIAR: para entonces ya se pagó Haiku y Apollo, el lead ocupa una fila de Prospects que el MB
+  // ve como prospectable, el barrido no lo saca y el pulido le vuelve a buscar contacto en cada
+  // vuelta. Y si la home nos la tapa un WAF —que es justo como contestan cuevana y compañía— no hay
+  // título que juzgar y lo que se guarda es la categoría de SimilarWeb
+  // ("arts_and_entertainment/tv_movies_and_streaming"), así que ese freno ni siquiera corría.
+  // Es la MISMA regla, aplicada donde todavía no se gastó un centavo, sobre todo lo que sabemos:
+  // el título de la home, el dominio y la categoría de SimilarWeb.
+  if (category === "streaming_pirata" || _esStreamingPirata(`${pageTitle} ${domain} ${swCategory}`)) {
+    await markCsvItem(token, item.id, "skipped", {
+      error_message: `no_prospectable_tipo: "${swCategory || category}" es streaming_pirata (ni con ads.txt ni con tráfico)`,
+    });
+    registrarDiagDescarte(token, {
+      domain, etapa: "tipo_de_negocio", motivo: "tipo_no_prospectable:streaming_pirata",
+      categoria: swCategory, geo: topCountry || "", traffic: effectivePageViews, adsTxt: _adsTxtDiag,
+      comentario: `${_adsFrase}, pero es streaming pirata o retransmisión sin derechos. El dueño abrió el streaming de música, películas, series y TV (13/09), no la piratería: no entra ni con ads.txt ni con tráfico.`,
+    }).catch(() => {});
+    log(`  ⛔ ${domain} — streaming pirata o retransmisión sin derechos: no entra`);
+    return;
+  }
   const _nunca = _categoriaNuncaProspectable(swCategory);
   if (_nunca) {
     await markCsvItem(token, item.id, "skipped", {
@@ -21975,10 +22010,32 @@ function scoreGeo(geo) {
 // Los nombres de los sitios piratas van SIN borde de palabra al final a propósito: casi todos llevan un
 // número pegado (cuevana3.io, repelis24, pelis24), y con `\b` la regex vieja no los veía cuando lo único
 // que había para mirar era el dominio. Son marcas inequívocas; el resto sigue pidiendo palabra entera.
-const _STREAMING_PIRATA_RE = /(cuevana|repelis|pelis24|pelisplus|gnula|123movies|fmovies|putlocker|soap2day)|\b(stream[\s-]?online|magis[\s-]?tv|futbol[\s-]?en[\s-]?vivo|live[\s-]?stream|free[\s-]?movies|watch[\s-]?free|netflix[\s-]?free|disney[\s-]?free|hbo[\s-]?free)\b|ver[\s-]?(peliculas|series|partidos|futbol)[\s-]?(online|gratis|en[\s-]?vivo)/i;
+// "iptv" va también sin borde de palabra: en el pool aparece pegado al dominio (iptvpremium.com,
+// smartiptv.net) y un revendedor de listas de 12.000 canales por suscripción es exactamente la
+// piratería que el dueño NO abrió. Los canales legales de una telco no se anuncian así.
+const _STREAMING_PIRATA_RE = /(cuevana|repelis|pelis24|pelisplus|gnula|123movies|fmovies|putlocker|soap2day|iptv)|\b(stream[\s-]?online|magis[\s-]?tv|futbol[\s-]?en[\s-]?vivo|live[\s-]?stream|free[\s-]?movies|watch[\s-]?free|netflix[\s-]?free|disney[\s-]?free|hbo[\s-]?free)\b|ver[\s-]?(peliculas|series|partidos|futbol)[\s-]?(online|gratis|en[\s-]?vivo)/i;
 /** ¿Este texto (título, descripción, dominio) es de streaming pirata o de retransmisión en vivo? Pura. */
 function _esStreamingPirata(texto) {
   return _STREAMING_PIRATA_RE.test(String(texto || ""));
+}
+
+// ── QUÉ ES UN MEDIO DE STREAMING Y QUÉ ES VENDER EL SERVICIO (revisión del 13/09) ───────────────
+// La heurística guardaba "streaming" con sólo ver la palabra suelta. Mientras "streaming" estaba en
+// BLOCKED_CATEGORIES eso no se notaba: la etiqueta equivocada terminaba igual en un veto y sus falsos
+// positivos quedaban tapados. Al abrirla, esa misma etiqueta pasó a valer +25 "categoría de medios"
+// en classifyPublisher y a contar como `evidenciaDeMedio` (o sea: entrar sin ads.txt confirmado), así
+// que un hosting de streaming, un revendedor de IPTV o una VPN que promete "desbloquear el streaming"
+// se volvieron medios de golpe. El dueño abrió música, películas, series y TV — no a todo el que
+// escriba la palabra; el hosting es de los tipos que explícitamente NO cambiaban.
+// Regla única, la misma que usan la heurística de fetchPageContent y, por lo tanto, la etiqueta
+// "streaming" de PUBLISHER_CATEGORIES (que es su único productor): palabra entera "streaming" MÁS una
+// señal editorial de música/cine/series/TV, y ninguna marca de que lo que se vende es el servicio.
+const _SENAL_MEDIO_STREAMING_RE = /pel[íi]cula|filme|\bfilms?\b|\bmovies?\b|serie|\bm[úu]sica\b|\bmusic\b|[áa]lbum|estreno|cartelera|d[óo]nde ver|donde ver|onde assistir|where to watch|playlist|temporada|cap[íi]tulo|episodi|\bcine\b|documental|anime|programme tv|programaci[óo]n (de )?tv|gu[íi]a de tv|guia de tv/i;
+const _VENDE_STREAMING_RE = /\b(hosting|host|servidor|servidores|server|servers|vps|cdn|iptv|vpn|proxy|reseller|revendedor|reventa|ancho de banda|bandwidth|desbloquea|desbloquear|unblock)\b/i;
+/** ¿Este texto es de un MEDIO de streaming (música, cine, series, TV), y no de quien vende el servicio? Pura. */
+function _esMedioDeStreaming(texto) {
+  const t = String(texto || "");
+  return /\bstreaming\b/i.test(t) && _SENAL_MEDIO_STREAMING_RE.test(t) && !_VENDE_STREAMING_RE.test(t);
 }
 
 // Categorías que descartan el lead al enviar (gate duro de scoreWebsite). "streaming" a secas ya no
@@ -22064,10 +22121,12 @@ function scoreWebsite(lead) {
   if (BLOCKED_CATEGORIES.has(cat)) {
     return { score: -1, color: "red", reasons: [`cat_blocked:${cat}`] };
   }
-  // Filas guardadas antes del 13/09: la heurística ponía "streaming" también a los piratas y a las
-  // retransmisiones en vivo. Con el título guardado y el dominio se aplica la misma regla que hoy los
-  // separa al entrar; el streaming de música, películas, series y TV sigue de largo.
-  if (cat === "streaming" && _esStreamingPirata(`${lead.page_title || ""} ${domain}`)) {
+  // La regla pirata es UNA y corre sea cual sea la categoría guardada (revisión del 13/09). Atarla a
+  // `cat === "streaming"` la dejaba muerta justo en el caso que importa: cuando el WAF nos tapa la home
+  // no hay heurística que corra y lo que queda guardado es la categoría de SimilarWeb
+  // ("arts_and_entertainment/tv_movies_and_streaming"), que no es "streaming" a secas. También cubre
+  // las filas viejas guardadas como "streaming", que es de donde salió esta regla.
+  if (_esStreamingPirata(`${lead.page_title || ""} ${domain} ${cat}`)) {
     return { score: -1, color: "red", reasons: ["cat_blocked:streaming_pirata"] };
   }
   // Mega-corps — usa el mismo set de EXCLUDE_DOMAINS que el autopilot
