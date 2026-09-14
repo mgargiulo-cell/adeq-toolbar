@@ -322,6 +322,19 @@ test("S7 scoreWebsite: la regla pirata corre sea cual sea la categoría guardada
   }
 });
 
+// Verificación de la misma noche: el productor de la etiqueta se angostó, pero las filas guardadas ANTES
+// con "streaming" (la heurística vieja etiquetaba a cualquiera que nombrara la palabra) las lee el agente
+// tal cual. Con "streaming" en BLOCKED_CATEGORIES nadie les escribía; sin él, daban 85 y "enviar".
+test("S7 scoreWebsite: una fila vieja guardada como 'streaming' que vende el servicio (hosting, VPN) sigue vetada", () => {
+  for (const [domain, title] of [["serverstreamdeprueba.com", "Servidores de streaming y hosting de radio online"], ["vpnrapidadeprueba.com", "VPN rapida: desbloquea el streaming de cualquier pais"]]) {
+    deepStrictEqual(W.scoreWebsite({ domain, category: "streaming", traffic: 1_500_000, geo: "Argentina", page_title: title }).reasons,
+      ["cat_blocked:vende_streaming"], `${domain} daba 85 verde y 'enviar'`);
+  }
+  // El medio guardado con la misma etiqueta no se toca, y sin título el dominio solo decide si lo delata.
+  ok(W.scoreWebsite({ domain: "filmelier.com", category: "streaming", traffic: 1_500_000, geo: "Brasil", page_title: "Filmelier: onde assistir filmes e series em streaming" }).score >= 0);
+  ok(W.scoreWebsite({ domain: "guiadeseries.com", category: "streaming", traffic: 1_500_000, geo: "Argentina", page_title: "" }).score >= 0, "sin título no se inventa un veto");
+});
+
 test("S7 _veredictoPorSimilarWeb: el streaming pirata no es publisher (la regex de medios matcheaba 'streaming' adentro)", () => {
   strictEqual(W._veredictoPorSimilarWeb({ category: "streaming_pirata", traffic: 1_000_000 }), "no", "antes decía 'publisher' y el barrido dejaba la fila muerta en Prospects");
   strictEqual(W._veredictoPorSimilarWeb({ category: "streaming", traffic: 1_000_000 }), "publisher", "el medio de streaming no cambia");

@@ -22129,6 +22129,14 @@ function scoreWebsite(lead) {
   if (_esStreamingPirata(`${lead.page_title || ""} ${domain} ${cat}`)) {
     return { score: -1, color: "red", reasons: ["cat_blocked:streaming_pirata"] };
   }
+  // La otra mitad de la misma clase (verificación del 13/09): las filas guardadas ANTES de hoy con
+  // "streaming" salieron de la heurística vieja, que etiquetaba a cualquiera que nombrara la palabra.
+  // Mientras "streaming" estaba en BLOCKED_CATEGORIES nadie les escribía; al abrirla, un hosting de
+  // streaming o una VPN guardados así pasaban a 85 y "enviar". La categoría guardada no se recalcula,
+  // así que el lector aplica la misma regla que el productor: quien vende el servicio no es medio.
+  if (cat === "streaming" && _VENDE_STREAMING_RE.test(`${lead.page_title || ""} ${domain}`)) {
+    return { score: -1, color: "red", reasons: ["cat_blocked:vende_streaming"] };
+  }
   // Mega-corps — usa el mismo set de EXCLUDE_DOMAINS que el autopilot
   if (EXCLUDE_DOMAINS.has(domain) || EXCLUDE_DOMAINS.has(domain.replace(/^www\./, ""))) {
     return { score: -1, color: "red", reasons: [`mega_corp:${domain}`] };
