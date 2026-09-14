@@ -46,18 +46,18 @@ const FLUSH_EVERY_MS  = 30_000; // persiste como mucho cada 30s
 const FLUSH_EVERY_HITS = 10;    // o cada 10 hits, lo que ocurra antes
 let _hitsSinceFlush = 0;
 
-// Período de facturación: ciclo del 6 al 6 (Maxi 2026-06-17). RapidAPI cobra
-// del día 7 al día 7 del mes siguiente. Si hoy >= día 7 → período empieza este
-// mes-07. Si hoy < día 7 → empezó el mes pasado-07. Formato "YYYY-MM-07" para
-// que matchee con el worker (también compat con slice(0,7) legacy).
-// Maxi 2026-07-17: era el día 6. El user confirmó que SimilarWeb repone la cuota el 7.
-// Debe seguir igual que _billingCyclePeriod() del worker (auto-prospector/index.js).
+// Período de facturación de RapidAPI: el plan `custom-40k-hard` arrancó el 18 de agosto de 2026 y
+// renueva cada mes el 18 (Maxi 2026-08-24). El worker ya usaba el 18 (RAPIDAPI_CYCLE_ANCHOR_DAY) y
+// la extensión seguía en el 7 (el ancla vieja del 17/07): entre el 7 y el 17 de cada mes las dos
+// contaban ciclos distintos. Confirmado por Maxi el 13/09: es el 18, y hay un test que exige que
+// los dos lados tengan el mismo número. Formato "YYYY-MM-18" (compat con slice(0,7) legacy).
+const RAPIDAPI_CYCLE_ANCHOR_DAY = 18;
 function currentPeriod() {
   const d = new Date();
-  const isBeforeDay7 = d.getUTCDate() < 7;
-  const month = isBeforeDay7 ? d.getUTCMonth() - 1 : d.getUTCMonth();
-  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, 7));
-  return anchor.toISOString().slice(0, 10); // "2026-06-07"
+  const beforeAnchor = d.getUTCDate() < RAPIDAPI_CYCLE_ANCHOR_DAY;
+  const month = beforeAnchor ? d.getUTCMonth() - 1 : d.getUTCMonth();
+  const anchor = new Date(Date.UTC(d.getUTCFullYear(), month, RAPIDAPI_CYCLE_ANCHOR_DAY));
+  return anchor.toISOString().slice(0, 10); // "2026-08-18"
 }
 
 async function _readConfigKeys(keys) {
