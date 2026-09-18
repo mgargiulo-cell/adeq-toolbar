@@ -25,8 +25,8 @@ Tres piezas, un solo repo:
 
 ## 2. Qué podés y qué no podés hacer
 
-Tenés una copia del repo. **No tenés** la base (salvo la foto de la sección 3), ni Railway, ni la
-credencial del Chrome Web Store. Por lo tanto:
+Tenés una copia del repo. **No tenés** la base (salvo la foto de la sección 3, que te llega por GitHub), ni
+Railway, ni la credencial del Chrome Web Store. Por lo tanto:
 
 | Podés | No podés (dejalo anotado en el pedido de cambio) |
 |---|---|
@@ -41,16 +41,18 @@ del `manifest.json`.
 
 ## 3. La foto de salud
 
+Tu entorno NO llega a la base (el proxy de salida rechaza `supabase.co`; GitHub sí anda). Por eso la foto
+te espera en GitHub: `.github/workflows/foto-salud.yml` la baja martes y viernes a las 10:30 UTC —media
+hora antes que vos— y la deja en la rama `salud` del mismo repo.
+
 ```bash
-URL=$(grep -o 'SUPABASE_URL: *"[^"]*"' config.js | cut -d'"' -f2)
-ANON=$(grep -o 'SUPABASE_ANON_KEY: *"[^"]*"' config.js | cut -d'"' -f2)
-curl -s -X POST "$URL/rest/v1/rpc/salud_snapshot" -H "apikey: $ANON" -H "Authorization: Bearer $ANON" \
-  -H "Content-Type: application/json" -d "{\"k\":\"$SALUD_KEY\"}" -o /tmp/snap.json
+git fetch -q origin salud && git show origin/salud:foto-salud.json > /tmp/snap.json
+python3 -c "import json; print(json.load(open('/tmp/snap.json'))['generado_at'])"
 ```
 
-`SALUD_KEY` viene en el mensaje que te disparó. Es de sólo lectura. **No la escribas en ningún archivo
-del repo ni en el PR.** Si la respuesta es `{"error":"no autorizado"}` o no hay red, no adivines:
-terminá diciendo exactamente eso.
+**Mirá `generado_at` antes que nada.** Si la foto tiene más de 24 horas, el paso de GitHub no corrió: no
+revises con datos viejos. Terminá diciendo exactamente eso ("la foto es del …, el workflow foto-salud no
+corrió") y nada más. Lo mismo si la rama no existe o no podés traerla: no adivines.
 
 Qué trae (`sql/2026-09-18_salud_snapshot.sql` es la definición): `health` (un renglón por job, con
 cuándo corrió, su detalle y real/esperado), `feeder_runs`, la cola por estado con sus motivos de 24 h y
