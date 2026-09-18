@@ -1,0 +1,47 @@
+# La foto de salud, dejada donde la revisión automática SÍ puede leerla. (2026-09-18)
+#
+# La rutina de martes y viernes corre en un entorno de la nube que sólo sale a una lista corta de
+# sitios: GitHub sí, la base (supabase.co) no. Probado el 18/09: "connect_rejected (organization
+# policy)". Abrirle la red es un ajuste manual en la cuenta del dueño, y él pidió que funcione sin
+# tener que tocar nada. Así que la foto viaja por GitHub: esto la baja (de sólo lectura, agregados,
+# sin API keys ni emails de leads — ver sql/2026-09-18_salud_snapshot.sql) y la deja en la rama
+# `salud`, en UN solo commit que se pisa cada vez. Railway no despliega esa rama.
+#
+# La clave va acá adentro a propósito: el repo es privado, ya guarda la anon key y el secreto del CRM
+# en config.js, y ésta es de sólo lectura y se revoca cambiando UN valor en la base
+# (toolbar_config.salud_snapshot_sha256). ⚠️ Si algún día se le da acceso al repo a otra persona,
+# rotarla ese mismo día.
+name: Foto de salud
+on:
+  schedule:
+    - cron: "30 10 * * 2,5"      # martes y viernes 10:30 UTC, media hora antes de la revisión
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths: [".github/workflows/foto-salud.yml"]
+permissions:
+  contents: write
+jobs:
+  foto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bajar la foto
+        run: |
+          URL=$(grep -o 'SUPABASE_URL: *"[^"]*"' config.js | cut -d'"' -f2)
+          ANON=$(grep -o 'SUPABASE_ANON_KEY: *"[^"]*"' config.js | cut -d'"' -f2)
+          curl -sS --fail --max-time 60 -X POST "$URL/rest/v1/rpc/salud_snapshot" \
+            -H "apikey: $ANON" -H "Authorization: Bearer $ANON" -H "Content-Type: application/json" \
+            -d '{"k":"0b290893c3991d1382988f77ad0013a8da43806c8aeb8d9c00cf899b131aa089"}' -o /tmp/foto-salud.json
+          # "No pude" no es "está todo bien": si no es la foto, se corta acá y la rama queda como estaba.
+          python3 -c "import json,sys; d=json.load(open('/tmp/foto-salud.json')); sys.exit(0 if 'health' in d and 'generado_at' in d else 1)"
+          echo "foto de $(python3 -c "import json; print(json.load(open('/tmp/foto-salud.json'))['generado_at'])")"
+      - name: Dejarla en la rama salud (un solo commit, se pisa)
+        run: |
+          mkdir /tmp/rama && cd /tmp/rama && git init -q -b salud
+          cp /tmp/foto-salud.json foto-salud.json
+          printf 'Foto de salud de la ADEQ Toolbar. La escribe .github/workflows/foto-salud.yml; la lee la revision automatica.\nNo es codigo y no se mergea.\n' > LEEME.md
+          git config user.name "foto-salud" && git config user.email "foto-salud@users.noreply.github.com"
+          git add -A && git commit -q -m "Foto de salud $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q --force "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" salud
