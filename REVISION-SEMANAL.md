@@ -98,6 +98,10 @@ Cosas que **parecen** fallas y no lo son (no las "arregles"):
 7. **Nada se entrega sin su detector.** Cada arreglo lleva un test que falla sin él. Si lo que arreglaste
    era silencioso, además tiene que quedar registrado o alarmar la próxima vez.
 8. Los mails que escribe el dueño (plantillas, borradores) no se reescriben.
+9. **Decisiones ya tomadas — no las vuelvas a proponer** (18/09/2026, textual: *"No freno ningún pool, que
+   sume miles. No subo techo de Claude, no quiero gastar de más."*): el pool de Prospects crece sin tope
+   aunque haya meses de stock (similar, AutoGoogle y el reciclado del CRM siguen inyectando con el feeder
+   saturado: es lo que quiere), y el techo diario de Claude queda en 700 aunque se alcance a la tarde.
 
 ## 6. Cómo se entrega
 
