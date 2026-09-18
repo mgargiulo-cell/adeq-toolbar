@@ -19,14 +19,20 @@ Toolbar (mar y vie)" — cron `0 11 * * 2,5` UTC (= 08:00 Argentina), modelo `cl
 Se maneja con la tool `RemoteTrigger` (`list_runs` + `get_run_log` para depurar). No se pueden
 borrar por API: sólo desde el panel. Para pausarla: `update` con `enabled:false`.
 
-## ⚠️ BLOQUEADA HASTA QUE EL USER ABRA LA RED (probado el 18/09, corrida cse_01Mi8N7Cfsq2Bw2k5kC1UGF2)
-La corrida de prueba clonó el repo, leyó el manual y arrancó bien, pero el proxy de salida del
-entorno **rechazó** `ticjpwimhtfkbccchfyp.supabase.co:443` (`connect_rejected — organization
-policy`). El entorno "Default" sólo deja salir a una lista (github, npm, pypi, anthropic…). Eso no
-se cambia por API: lo tiene que hacer el user en claude.ai/code → Entornos → acceso de red →
-agregar ese dominio (o acceso completo). Hasta entonces la rutina termina diciendo "no hay red",
-que es lo que el manual le ordena. **Después de que lo abra: `RemoteTrigger run` y mirar con
-`get_run_log` que baje la foto y que pueda empujar la rama y abrir el PR (eso NO se llegó a probar).**
+## La foto viaja por GitHub (resuelto el 18/09 a la tarde, sin que el user toque nada)
+La primera corrida de prueba falló: el proxy de salida del entorno rechaza `supabase.co`
+(`connect_rejected — organization policy`); GitHub sí anda. Abrir la red es un ajuste manual en
+claude.ai que el user no quiso hacer (*"¿por qué no dejás todo listo para que funcione?"*). El otro
+entorno de su cuenta (`env_01QFAG…`) ya no existe. Solución: **`.github/workflows/foto-salud.yml`**
+(martes y viernes 10:30 UTC + a mano + al tocar ese archivo) llama a `salud_snapshot` y deja
+`foto-salud.json` en la **rama `salud`**, en un solo commit que se pisa (force-push). La rutina la lee
+con `git fetch origin salud && git show origin/salud:foto-salud.json` y, si `generado_at` tiene más
+de 24 h, frena diciendo que el workflow no corrió. Railway no despliega esa rama (tampoco `memoria`).
+**La clave ahora vive DENTRO del workflow** (repo privado, que ya guarda la anon key y el secreto del
+CRM en config.js) y ya NO está en el prompt de la rutina. ⚠️ Si alguna vez se le da acceso al repo a
+otra persona: rotarla ese día (nuevo valor en el workflow + nuevo hash en
+`toolbar_config.salud_snapshot_sha256`). Un workflow programado se apaga solo tras 60 días sin
+actividad en el repo: si la foto envejece, mirar eso primero.
 
 ## Qué ve y qué no
 Tiene **una copia del repo y nada más**: ni la base (el CLI de Supabase linkeado es de esta Mac), ni
