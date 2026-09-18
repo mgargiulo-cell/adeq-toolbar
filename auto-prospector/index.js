@@ -4529,8 +4529,29 @@ async function _filtrarReciclables(token, dominios, dias) {
       if (Array.isArray(f)) f.forEach(x => x.domain && _sinAdsReciente.add(String(x.domain).toLowerCase()));
     }
   } catch (e) { log(`  ⚠️ reciclables: no pude leer la auditoría de ads.txt (${e.message}) — sigo sin ese filtro`); }
-  const elegibles = lista.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d) && !_sinAdsReciente.has(d));
-  return { elegibles, recientes, enCola, yaEnProspects: _yaEnProspects, sinAds30d: _sinAdsReciente };
+  // · LO QUE ESTÁ CONGELADO AHORA NO SE VUELVE A ENCOLAR (2026-09-18). Medido ese día: 42 de los 680
+  //   encolados tenían un congelado VIGENTE (`frozen_until` en el futuro, "sin datos de SimilarWeb").
+  //   `enCola` no los ve porque su fila quedó en estado `frozen`, así que el CRM los devolvía cada
+  //   pasada, ocupaban un lugar del carril, caían otra vez en "sin datos" y se intentaba congelarlos
+  //   de nuevo — hasta ese día con un 409 que los mandaba a `error` (~30 por día), y desde el arreglo
+  //   del 409 escalando 15→30→60 días por cada vuelta en vez de por cada descongelado, que es lo que
+  //   mide el castigo progresivo. El descongelador los devuelve solo cuando les toca. Falla ABIERTO
+  //   como los otros: sin poder leer, se sigue sin este filtro (reprocesarlos no gasta APIs).
+  const _congelados = new Set();
+  try {
+    const _h = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
+    const _ahora = encodeURIComponent(new Date().toISOString());
+    for (let i = 0; i < lista.length; i += 150) {
+      const lote = lista.slice(i, i + 150).map(d => `"${String(d).replace(/"/g, '\\"')}"`).join(",");
+      const r = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?frozen_until=gt.${_ahora}&domain=in.(${encodeURIComponent(lote)})&select=domain`,
+        { headers: _h, signal: AbortSignal.timeout(10000) });
+      if (!r.ok) continue;
+      const f = await r.json();
+      if (Array.isArray(f)) f.forEach(x => x.domain && _congelados.add(String(x.domain).toLowerCase()));
+    }
+  } catch (e) { log(`  ⚠️ reciclables: no pude leer los congelados vigentes (${e.message}) — sigo sin ese filtro`); }
+  const elegibles = lista.filter(d => !recientes.has(d) && !enCola.has(d) && !_yaEnProspects.has(d) && !_sinAdsReciente.has(d) && !_congelados.has(d));
+  return { elegibles, recientes, enCola, yaEnProspects: _yaEnProspects, sinAds30d: _sinAdsReciente, congelados: _congelados };
 }
 
 // Borra la marca de "ya le busqué email y no encontré" para que la caza vuelva sobre
@@ -10062,6 +10083,16 @@ async function parteDelDia(token, opts = {}) {
 
   // 2. Prospects: lo que importa no es el total, es cuántos se pueden contactar.
   const conEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=id`);
+  // ── CUÁNTOS "CONTACTABLES" SÓLO TIENEN UNA DIRECCIÓN ADIVINADA (2026-09-18) ────────────────────
+  // Desde ese día una dirección que nadie publicó (rol_mx, patrón) sólo sale si MillionVerifier la
+  // confirma. Medido al cambiar la regla: 462 de 4.490 "contactables" (10%) no tenían NINGUNA otra
+  // dirección. Siguen contando en el stock —algunas se confirman—, pero el parte tiene que decir
+  // cuántas son, o los "días de envíos" prometen un 10% que quizá no sale. `null` = no se pudo medir.
+  let soloAdivinadas = null;
+  try {
+    const _fa = await _traerTodo(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&emails=neq.%5B%5D&select=emails,email_sources&order=id`, auth, { max: 30000 });
+    if (Array.isArray(_fa)) soloAdivinadas = _fa.filter(_soloDireccionesAdivinadas).length;
+  } catch {}
   const sinEmail = await _contar(`${SUPABASE_URL}/rest/v1/toolbar_review_queue?status=eq.pending&${FILTRO_SIN_EMAIL_INFORME}&select=id`);
   const diasDeStock = (totalEnviado > 0 && conEmail != null) ? (conEmail / Math.max(1, objetivoTotal)).toFixed(1) : "?";
 
@@ -10160,7 +10191,12 @@ async function parteDelDia(token, opts = {}) {
     .map(([s, v]) => {
       const _evaluados = v.trajo - v.congelados;
       const pct = _evaluados ? Math.round((v.paso / _evaluados) * 100) : 0;
-      const señal = !_evaluados ? (v.congelados ? "🧊" : "↻") : pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
+      // El semáforo juzga FUENTES. Los renglones "(re-trabajo)" y "(envío)" son filas que vuelven a pasar
+      // (congelados que se liberan, ads.txt re-chequeado, re-encolados del agente): casi todas se vuelven a
+      // congelar, y con la caché negativa no pagan tráfico. Pintarlas 🔴 con "gasta créditos para nada" al
+      // pie era acusar a un proceso que no gasta (parte del 17/09: cinco renglones rojos de re-trabajo).
+      const _esFuente = !/\((re-trabajo|envío)\)/.test(s);
+      const señal = !_esFuente ? (!_evaluados && v.congelados ? "🧊" : "↻") : !_evaluados ? (v.congelados ? "🧊" : "↻") : pct >= 25 ? "✅" : pct >= 10 ? "⚠️" : "🔴";
       return `   ${señal} ${s.padEnd(18)} trajo ${String(v.trajo).padStart(5)} · pasaron ${String(v.paso).padStart(4)} (${pct}%)${v.congelados ? ` · ${v.congelados} congelados` : ""}${v.pospuestos ? ` · ${v.pospuestos} pospuestos (siguen en la cola)` : ""}`;
     });
 
@@ -11047,6 +11083,7 @@ async function parteDelDia(token, opts = {}) {
     ["Contactables (con email)", `${_num(conEmail)}  ·  ~${diasDeStock} días de envíos`, (conEmail != null && conEmail < objetivoTotal * 10) ? _ROJO : _VERDE],
     ...(conEmail != null && objetivoTotal > 0 && (conEmail / objetivoTotal) < 10
       ? [["Ritmo de envío", "BAJADO por stock — vuelve solo al recuperarse", _ROJO]] : []),
+    ...(soloAdivinadas ? [["De ellos, sólo con dirección adivinada", `${soloAdivinadas} — salen sólo si MillionVerifier la confirma`, _GRIS]] : []),
     ["Sin email todavía", _num(sinEmail)],
     ["En cola esperando", _num(backlog)],
     ["Sacadas de Prospects por no cumplir", _num(purgadas)],
@@ -11055,7 +11092,7 @@ async function parteDelDia(token, opts = {}) {
 
   ${lineasFuente.length ? _card("Rendimiento por fuente (7 días)",
     `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasFuente.join("\n"))}</pre>
-     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Menos de 10% que pasan = esa fuente gasta créditos para nada.</div>`) : ""}
+     <div style="font:12px -apple-system,Segoe UI,Roboto,Arial,sans-serif;color:${_GRIS};padding-top:8px">Menos de 10% que pasan = esa fuente gasta créditos para nada. Los renglones ↻ (re-trabajo y envío) no son fuentes: son filas que vuelven a pasar y no pagan tráfico.</div>`) : ""}
 
   ${lineasEmbudo.length ? _card("¿La fuente trae buenas webs? El embudo a 30 días",
     `<pre style="margin:0;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#202124;white-space:pre-wrap">${_e(lineasEmbudo.join("\n"))}</pre>
@@ -20271,6 +20308,16 @@ function _decidirCandidato(cand, { rebotado = false, noEscribir = "", marcaOk = 
 function _esHipotesisDeDireccion(fuente) {
   const f = String(fuente || "").toLowerCase();
   return f === "pattern" || f === "guess" || f === "apollo_pattern" || f === "rol_mx";
+}
+
+// ¿TODAS las direcciones de la ficha son adivinadas? Pura. Una dirección sin fuente anotada no se da por
+// adivinada ("no sé" no es "sí"): con una sola publicada, o de origen desconocido, el lead no entra acá.
+function _soloDireccionesAdivinadas(fila) {
+  const emails = Array.isArray(fila?.emails) ? fila.emails.filter(Boolean) : [];
+  if (!emails.length) return false;
+  const src = (fila?.email_sources && typeof fila.email_sources === "object") ? fila.email_sources : {};
+  const porEmail = new Map(Object.entries(src).map(([e, v]) => [String(e).toLowerCase(), _normSrc(v)]));
+  return emails.every(e => _esHipotesisDeDireccion(porEmail.get(String(e).toLowerCase())));
 }
 
 /**

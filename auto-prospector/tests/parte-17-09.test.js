@@ -151,3 +151,46 @@ test("qué cuenta como adivinada", () => {
   for (const f of ["rol_mx", "pattern", "guess", "apollo_pattern", "ROL_MX"]) ok(W._esHipotesisDeDireccion(f), f);
   for (const f of ["scrape", "apollo", "informer", "manual", "google_contact", "", null]) ok(!W._esHipotesisDeDireccion(f), String(f));
 });
+
+// ── 6. El reciclador del CRM no vuelve a encolar lo que está congelado ───────────────────
+const { _filtrarReciclables } = await cargarWorker(["_filtrarReciclables"], { fetchFalso: true });
+const respF = (body, status = 200) => ({ ok: status >= 200 && status < 300, status,
+  headers: { get: (k) => (k.toLowerCase() === "content-range" ? `0-0/${Array.isArray(body) ? body.length : 0}` : null) },
+  json: async () => body, text: async () => JSON.stringify(body) });
+test("un dominio con congelado vigente no es elegible para reciclar", async () => {
+  const pedidos = [];
+  globalThis.__fetchFalso = async (url) => {
+    const u = String(url); pedidos.push(u);
+    if (u.includes("toolbar_frozen_leads")) return respF([{ domain: "congelado.com" }]);
+    return respF([]);
+  };
+  const r = await _filtrarReciclables("t", ["congelado.com", "libre.com"], 60);
+  ok(r, "sin contactados legibles devuelve null; acá se leyeron");
+  ok(!r.elegibles.includes("congelado.com"), "42 de 680 por día ocupaban el carril para volver a congelarse");
+  ok(r.elegibles.includes("libre.com"));
+  ok(r.congelados.has("congelado.com"));
+  const q = pedidos.find(u => u.includes("toolbar_frozen_leads"));
+  ok(/frozen_until=gt\./.test(q), "sólo los congelados VIGENTES: uno ya vencido lo libera el descongelador y sí se puede reciclar");
+});
+test("si no se pueden leer los congelados, se sigue sin ese filtro (falla abierto, como los otros)", async () => {
+  globalThis.__fetchFalso = async (url) => String(url).includes("toolbar_frozen_leads") ? respF([], 500) : respF([]);
+  const r = await _filtrarReciclables("t", ["congelado.com", "libre.com"], 60);
+  ok(r && r.elegibles.length === 2, "reprocesarlos no gasta APIs: no vale frenar el reciclado por esto");
+});
+
+// ── 7. El parte dice cuántos "contactables" sólo tienen una dirección adivinada ──────────
+const { _soloDireccionesAdivinadas } = await cargarWorker(["_soloDireccionesAdivinadas"]);
+test("sólo cuenta la ficha donde TODAS las direcciones son adivinadas", () => {
+  const f = _soloDireccionesAdivinadas;
+  strictEqual(f({ emails: ["info@a.it", "redazione@a.it"], email_sources: { "info@a.it": "rol_mx", "redazione@a.it": "rol_mx" } }), true);
+  strictEqual(f({ emails: ["m.rossi@a.it"], email_sources: { "m.rossi@a.it": { source: "pattern", url: "x" } } }), true, "la fuente también llega como objeto");
+  strictEqual(f({ emails: ["info@a.it", "ads@a.it"], email_sources: { "info@a.it": "rol_mx", "ads@a.it": "scrape" } }), false, "con una publicada ya es contactable de verdad");
+  strictEqual(f({ emails: ["info@a.it"], email_sources: {} }), false, "sin fuente anotada no se da por adivinada: no sé no es sí");
+  strictEqual(f({ emails: ["INFO@a.it"], email_sources: { "info@a.it": "rol_mx" } }), true, "sin distinguir mayúsculas");
+  strictEqual(f({ emails: [], email_sources: {} }), false);
+  strictEqual(f(null), false);
+});
+test("el parte lo muestra en la tarjeta del stock, y el semáforo de 7 días no juzga el re-trabajo", () => {
+  ok(/"De ellos, sólo con dirección adivinada"/.test(indexJs));
+  ok(/const _esFuente = !\/\\\(\(re-trabajo\|envío\)\\\)\/\.test\(s\);/.test(indexJs), "los renglones (re-trabajo) y (envío) no son fuentes");
+});
