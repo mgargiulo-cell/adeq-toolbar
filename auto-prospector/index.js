@@ -6105,8 +6105,12 @@ async function getRapidApiUsageThisMonth(token) {
     const storedPer   = map.rapidapi_calls_month_period || "";
     const storedCount = parseInt(map.rapidapi_calls_month || "0", 10);
     const limit       = parseInt(map.rapidapi_monthly_limit || "40000", 10);
-    // Compat con formato viejo (YYYY-MM-06): comparar por YYYY-MM.
-    const sameMonth   = storedPer.slice(0, 7) === period.slice(0, 7);
+    // ⚠️ SE COMPARA EL PERÍODO ENTERO, NO EL YYYY-MM (2026-09-18). El ciclo va del 18 al 18 y el RPC
+    // guardaba mes calendario: comparando por YYYY-MM, del 1 al 17 esto leía 0 usados (sin tope ni
+    // freno de ritmo) y del 18 en adelante leía como gasto del ciclo nuevo lo acumulado del 1 al 17.
+    // El 18/09 el feeder anotó "pacing — used 40% vs cycle 1%" con 15.914 llamadas del ciclo viejo.
+    // Ahora el RPC escribe el inicio del ciclo (sql/2026-09-18_…) y acá se exige que coincida.
+    const sameMonth   = _mismoCicloRapidApi(storedPer, period);
     const usedThisMonth = sameMonth ? storedCount : 0;
     return { usedThisMonth, limit, period };
   } catch { return { usedThisMonth: 0, limit: 40000, period: _billingCyclePeriod() }; }
@@ -6302,6 +6306,13 @@ const RAPIDAPI_CYCLE_ANCHOR_DAY = 18;
 function _billingCyclePeriod() {
   return _cycleStartForAnchor(RAPIDAPI_CYCLE_ANCHOR_DAY).toISOString().slice(0, 10);
 }
+// ¿El contador guardado es de ESTE ciclo? Pura. El período guardado es el inicio del ciclo
+// ("2026-09-18"); un valor viejo de mes calendario ("2026-09") nunca coincide y se lee como 0,
+// que es lo correcto: no se sabe a qué ciclo pertenece.
+function _mismoCicloRapidApi(guardado, periodo) {
+  const g = String(guardado || ""), p = String(periodo || "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(g) && g === p;
+}
 
 // Apollo: ciclo 12→12 (verificado en el panel — renew Aug 12, 2026). Maxi 2026-07-17.
 // Antes compartía el ancla 6 de RapidAPI → el contador mensual se reseteaba 6 días
@@ -6354,8 +6365,8 @@ async function saveRapidApiMonthlyUsage(token, callsThisSession, period) {
     if (Array.isArray(rows)) rows.forEach(r => { map[r.key] = r.value; });
 
     const storedPer   = map.rapidapi_calls_month_period || "";
-    // Compat YYYY-MM-06 vs YYYY-MM
-    const sameMonth   = storedPer.slice(0, 7) === period.slice(0, 7);
+    // Período entero, no YYYY-MM: ver getRapidApiUsageThisMonth (2026-09-18).
+    const sameMonth   = _mismoCicloRapidApi(storedPer, period);
     const storedCount = sameMonth ? parseInt(map.rapidapi_calls_month || "0", 10) : 0;
     const newCount    = storedCount + callsThisSession;
 
@@ -16172,7 +16183,7 @@ async function processCsvItem(token, item, cfg, apolloUsage, apolloCallsThisSess
           log(`  🧊 ${domain} — tercer congelado, pero viene del CRM: 60 días sin blocklist permanente`);
         }
         const frozenUntil = new Date(Date.now() + days * 86400_000).toISOString();
-        const _resFreeze = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+        const _resFreeze = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?on_conflict=domain`, {
           method: "POST",
           headers: {
             "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
@@ -18602,7 +18613,7 @@ async function runReengagementCycle(token) {
       const attempts = await countAttemptsForDomain(token, domain);
       if (attempts >= maxAttempts) {
         log(`  🧊 ${domain}: ${attempts} attempts sin opens — freeze 60d`);
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?on_conflict=domain`, {
           method: "POST",
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
           body: JSON.stringify({
@@ -20625,7 +20636,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
     }
     if (totalAttempts >= 2) {
       log(`  🧊 ${domain}: ya ${totalAttempts} bounce retries — FREEZE 60d`);
-      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+      await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?on_conflict=domain`, {
         method: "POST",
         headers: {
           "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
@@ -20856,7 +20867,7 @@ async function queueBounceRetry(token, mbEmail, bouncedEmail, bounceType) {
         log(`  ↪️ ${domain}: ${bouncedEmail} no era la principal — no se avisa "contacto agotado" al CRM`);
       }
         // Freeze 30d (no 60d) para darle chance que el sitio actualice contactos
-        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+        await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?on_conflict=domain`, {
           method: "POST",
           headers: { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=minimal" },
           body: JSON.stringify({
@@ -22291,7 +22302,7 @@ async function decidirVerificacionMV(email, fuente) {
   const local = String(email || "").split("@")[0] || "";
   const perfil = await perfilCorreoDelDominio(dom).catch(() => ({ verificable: "medio", proveedor: "?" }));
   const generadoPorPatron = fuente === "pattern" || fuente === "guess" || fuente === "apollo_pattern";
-  const rolComun = /^(info|contacto|contact|contato|redaccion|redazione|redacao|publicidad|publicidade|comercial|ventas|marketing|prensa)$/i.test(local);
+  const rolComun =/^(info|contacto|contact|contato|redaccion|redazione|redacao|publicidad|publicidade|comercial|ventas|marketing|prensa)$/i.test(local);
 
   if (perfil.verificable === "acepta_todo" && generadoPorPatron)
     return { verificar: false, enviar: false, motivo: `${perfil.proveedor} acepta cualquier destinatario y el email es una hipótesis de patrón — MV no puede resolverlo` };
@@ -25577,7 +25588,7 @@ async function runAgentCycle(token, allFlags) {
               const _origen = _origenParaCongelar(_filaOrigen);
               // Primero se anota el congelado y DESPUÉS cambia el estado: una fila 'frozen' sin pareja en
               // toolbar_frozen_leads es lo que el reconciliador de huérfanos devuelve a Prospects.
-              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads`, {
+              await fetch(`${SUPABASE_URL}/rest/v1/toolbar_frozen_leads?on_conflict=domain`, {
                 method: "POST",
                 headers: {
                   "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}`,
@@ -27785,11 +27796,50 @@ const _FUENTES_VIGILADAS = {
   monday_refresh: 3,
 };
 
+// Las que sólo inyecta _runFeederSlot (similar, autogoogle y monday_refresh tienen su propio job).
+const _FUENTES_DEL_FEEDER = new Set(["adstxt", "sellers_json", "majestic"]);
+// ¿Los últimos turnos del feeder se saltearon A PROPÓSITO? Pura, para poder probarla.
+//   pausa: texto del freno por diseño (pool lleno / meta del día) o null
+//   raro:  si se saltean todos por OTRO motivo, cuál (ritmo de RapidAPI, cuota…): eso sí alarma
+function _frenoDelFeeder(runs) {
+  const lista = Array.isArray(runs) ? runs.filter(r => r && r.status) : [];
+  if (lista.length < 3) return { pausa: null, raro: "" };
+  const todos = (re) => lista.every(r => re.test(String(r.status)));
+  if (todos(/^skipped_(saturated|daily_target)$/)) {
+    const u = lista[0];
+    return {
+      pausa: u.status === "skipped_saturated"
+        ? `Prospects está lleno (${u.rq_valid_before ?? "?"} válidos, el feeder frena en ${FEEDER_RQ_SATURATION})`
+        : "la meta diaria del feeder ya se cumplió",
+      raro: "",
+    };
+  }
+  if (todos(/^skipped_/)) return { pausa: null, raro: `${lista[0].status}${lista[0].notes ? ` (${String(lista[0].notes).slice(0, 80)})` : ""}` };
+  return { pausa: null, raro: "" };
+}
+
 async function vigilarFuentesDeDescubrimiento(token) {
   try {
     if (!(await _tocaCorrer(token, "vigilar_fuentes", 12 * 60))) return;
     const auth = { "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${BACKEND_BEARER || token}` };
     const mudas = [];
+    // ── UNA FUENTE FRENADA A PROPÓSITO NO ESTÁ MUDA (2026-09-18) ─────────────────────────────
+    // adstxt, sellers_json y majestic sólo las inyecta _runFeederSlot, y ese turno se saltea entero
+    // cuando Prospects pasa de FEEDER_RQ_SATURATION. Desde el 09/09 el pool está por encima (4.314
+    // contra 3.000: 108 días de envíos) y los cinco turnos diarios anotan `skipped_saturated`. El
+    // vigilante avisaba igual "🛑 2 fuentes sin producir" todos los días: el sistema acusándose de
+    // su propio freno (mismo patrón que las tres alertas falsas del 26/08). Si los últimos turnos
+    // del feeder se saltearon por pool lleno o por meta diaria cumplida, esas fuentes van como
+    // "en pausa" y no alarman. Cualquier OTRO motivo de salteo (ritmo de RapidAPI, cuota) sí
+    // alarma, y el aviso dice cuál es: el 18/09 era un contador de ciclo mal leído.
+    const enPausa = [];
+    let _frenoFeeder = null, _salteoRaro = "";
+    try {
+      const rr = await fetch(`${SUPABASE_URL}/rest/v1/toolbar_feeder_runs?select=slot_label,status,notes,rq_valid_before&order=slot_label.desc&limit=5`, { headers: auth });
+      const runs = rr.ok ? await rr.json() : null;
+      const v = _frenoDelFeeder(runs);
+      _frenoFeeder = v.pausa; _salteoRaro = v.raro;
+    } catch {}
     for (const [fuente, diasMax] of Object.entries(_FUENTES_VIGILADAS)) {
       let ultimo = null;
       try {
@@ -27804,20 +27854,24 @@ async function vigilarFuentesDeDescubrimiento(token) {
       } catch { continue; }
       if (!ultimo) continue;
       const dias = Math.floor((Date.now() - ultimo) / 86400000);
-      if (dias >= diasMax) mudas.push(`${fuente}: ${dias} días sin producir (esperado cada ${diasMax})`);
+      if (dias < diasMax) continue;
+      if (_frenoFeeder && _FUENTES_DEL_FEEDER.has(fuente)) { enPausa.push(`${fuente} (${dias} d)`); continue; }
+      mudas.push(`${fuente}: ${dias} días sin producir (esperado cada ${diasMax})`);
     }
+    const _txtPausa = enPausa.length ? `${enPausa.length} en pausa porque ${_frenoFeeder}: ${enPausa.join(", ")}` : "";
     await saludPing(token, "fuentes_descubrimiento", {
       status: "ok", cadenciaMin: 12 * 60,
-      detalle: mudas.length ? `${mudas.length} fuente(s) muda(s)` : `las ${Object.keys(_FUENTES_VIGILADAS).length} producen`,
+      detalle: [mudas.length ? `${mudas.length} fuente(s) muda(s)` : `${Object.keys(_FUENTES_VIGILADAS).length - enPausa.length} producen`, _txtPausa].filter(Boolean).join(" · "),
       real: Object.keys(_FUENTES_VIGILADAS).length - mudas.length,
       esperado: Object.keys(_FUENTES_VIGILADAS).length,
     });
     if (mudas.length) {
+      const _delFeeder = mudas.some(m => _FUENTES_DEL_FEEDER.has(m.split(":")[0]));
       await saludAlerta(token, {
         clave: "fuentes-mudas", severidad: "error",
         titulo: `🔌 ${mudas.length} fuente(s) de descubrimiento sin producir`,
-        cuerpo: `${mudas.map(m => "· " + m).join("\n")}\n\nMientras las otras alimenten, esto no se nota en el total.\n  SELECT source, count(*), max(created_at)::date FROM toolbar_review_queue GROUP BY 1 ORDER BY 2 DESC;`,
-        metadata: { mudas },
+        cuerpo: `${mudas.map(m => "· " + m).join("\n")}${_delFeeder && _salteoRaro ? `\n\nEl feeder viene salteando sus turnos por: ${_salteoRaro}. Eso NO es el freno por pool lleno: mirá ese motivo primero.` : ""}\n\nMientras las otras alimenten, esto no se nota en el total.\n  SELECT source, count(*), max(created_at)::date FROM toolbar_review_queue GROUP BY 1 ORDER BY 2 DESC;\n  SELECT slot_label, status, notes FROM toolbar_feeder_runs ORDER BY slot_label DESC LIMIT 10;`,
+        metadata: { mudas, enPausa, salteo: _salteoRaro },
       });
     }
   } catch (e) { log(`⚠️ vigilarFuentesDeDescubrimiento: ${e.message}`); }

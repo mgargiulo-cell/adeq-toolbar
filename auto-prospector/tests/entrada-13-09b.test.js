@@ -165,7 +165,9 @@ test("un ex cliente del CRM sin datos de SimilarWeb no termina en la blocklist p
   match(cuerpo, /case "auto_feeder_monday":\s+source = "monday_refresh";/, "el reciclado del CRM llega como monday_refresh");
   match(cuerpo, /source = "monday_refresh";\s+mondayItemId = null;/, "y todo lo que tiene ficha en el CRM también");
   match(cuerpo, /if \(_vaABlocklistInoperativo\(\{ prevFreeze, deCache: !!trafficData\.fromCache, source \}\)\) \{/);
-  ok(cuerpo.indexOf("_vaABlocklistInoperativo(") < cuerpo.indexOf("rest/v1/toolbar_frozen_leads`, {"), "el congelado se escribe después y fuera de esa condición");
+  // La URL del congelado lleva `?on_conflict=domain` desde el 18/09 (sin él, re-congelar daba 409).
+  const _iCongelado = cuerpo.indexOf("rest/v1/toolbar_frozen_leads?on_conflict=domain`, {");
+  ok(_iCongelado > 0 && cuerpo.indexOf("_vaABlocklistInoperativo(") < _iCongelado, "el congelado se escribe después y fuera de esa condición");
 });
 
 // ── 3. Guardar en Prospects ─────────────────────────────────────────────────────────────

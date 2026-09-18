@@ -1519,7 +1519,13 @@ export function revisarEntregabilidad({ to, subject, body, cuerpo, html, mime, e
   // Caracteres que marcan spam o sirven para suplantar
   if (/[​-‍﻿]/.test(s + b)) bloqueantes.push("caracteres_invisibles");
   if (/[‪-‮⁦-⁩]/.test(s + b)) bloqueantes.push("override_bidireccional");
-  if (/[a-zA-Z]/.test(b) && /[Ѐ-ӿͰ-Ͽ]/.test(b)) bloqueantes.push("homoglifos_mezclados");
+  // ── HOMÓGLIFOS = DOS ALFABETOS DENTRO DE LA MISMA PALABRA (2026-09-18) ──────────────────────────
+  // La regla miraba el mail ENTERO: una letra latina en cualquier lado + una cirílica o griega en
+  // cualquier otro ya bloqueaba. Eso no es un homóglifo, es cualquier pitch en ucraniano, griego o
+  // búlgaro que nombre a "ADEQ Media" o al dominio del sitio: xsport.ua quedó frenado dos veces, y el
+  // 16/09 frenó TRES veces el resumen de salud del dueño porque citaba un sitio griego. El ataque
+  // que esto ataja es otro: "pаypal" con la «а» cirílica, o sea alfabetos mezclados en UN token.
+  if (/[a-zA-Z]\p{L}*[Ѐ-ӿͰ-Ͽ]|[Ѐ-ӿͰ-Ͽ]\p{L}*[a-zA-Z]/u.test(b)) bloqueantes.push("homoglifos_mezclados");
   // Entidades numéricas: atrapa si alguien reintroduce el anti-linkify de los puntos.
   if (/&#\d+;/.test(b) || /&#\d+;/.test(String(html || ""))) bloqueantes.push("entidades_html_ofuscadas");
 

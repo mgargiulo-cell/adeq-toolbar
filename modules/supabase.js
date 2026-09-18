@@ -1721,7 +1721,12 @@ export async function uploadCsvDomains(domains, userEmail, accessToken, source =
       // Ahora "merge-duplicates": re-activa la fila existente al nuevo status (pending/
       // waiting) → el dominio se re-encola y el worker lo re-procesa (chequea Monday +
       // tráfico igual, no re-spamea). Sincroniza el insert con el dedup canónico.
-      const res = await fetch(`${url}/rest/v1/toolbar_csv_queue`, {
+      // ⚠️ `on_conflict=domain` (2026-09-18): sin él, "merge-duplicates" resuelve contra la CLAVE
+      // PRIMARIA, que acá es `id`, no `domain`. Con un solo dominio repetido en la tanda, PostgREST
+      // contestaba 409 y se caía el lote ENTERO (hasta 500), y como abajo sólo se cuenta si `res.ok`,
+      // el MB veía "0 nuevos" sin error. Es la misma trampa que dejaba ~30 filas por día en
+      // `freeze_failed … HTTP 409` en el worker (toolbar_frozen_leads: PK id, UNIQUE domain).
+      const res = await fetch(`${url}/rest/v1/toolbar_csv_queue?on_conflict=domain`, {
         method: "POST",
         headers: {
           "apikey": key, "Authorization": `Bearer ${accessToken}`,
@@ -1815,7 +1820,9 @@ export async function savePitchDraft(accessToken, { id, user_email, name, langua
       const data = await res.json().catch(() => []);
       return { ok: res.ok, data: data?.[0] || null };
     }
-    const res = await fetch(`${url}/rest/v1/toolbar_pitch_drafts`, {
+    // `on_conflict` con las tres columnas del UNIQUE (la PK es `id`): sin él, guardar un borrador con
+    // un nombre que ya existe en ese idioma daba 409 en vez de actualizarlo (2026-09-18).
+    const res = await fetch(`${url}/rest/v1/toolbar_pitch_drafts?on_conflict=user_email,name,language`, {
       method: "POST",
       headers: { "apikey": key, "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates,return=representation" },
       body: JSON.stringify([payload]),

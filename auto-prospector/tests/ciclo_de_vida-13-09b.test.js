@@ -165,7 +165,8 @@ test("C42: el bloque de congelado usa esa regla y anota el congelado ANTES de ca
   ok(!/uploaded_by:\s*userEmail/.test(bloque), "volvió uploaded_by: userEmail");
   ok(/_origenParaCongelar\(/.test(bloque), "tiene que usar _origenParaCongelar");
   ok(/last_error: "no_email_3_attempts"/.test(bloque));
-  const post = bloque.indexOf("toolbar_frozen_leads`"), patch = bloque.indexOf('status: "frozen"');
+  // Desde el 18/09 la URL lleva `?on_conflict=domain` (sin él el re-congelado daba 409): se busca el nombre de la tabla.
+  const post = bloque.indexOf("rest/v1/toolbar_frozen_leads"), patch = bloque.indexOf('status: "frozen"');
   ok(post > 0 && patch > 0 && post < patch, "si el estado cambia primero, el reconciliador puede verla huérfana en el medio");
 });
 
