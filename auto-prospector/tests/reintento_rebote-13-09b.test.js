@@ -90,7 +90,12 @@ test("C36: la decisión por candidato es la del agente, y un dudoso se saltea si
   strictEqual(d("juan@sitio.it", "scrape", { noEscribir: "ya rechazó 2 direcciones" }), "saltear:dominio_ya_rechazo");
   strictEqual(d("info@otra.com", "scrape", { marcaOk: false }), "saltear:otra_marca");
   strictEqual(d("m.rossi@sitio.it", "pattern", { ruta: { verificar: false, enviar: false } }), "saltear:catch_all_y_patron", "patrón en M365: MV no puede resolverlo");
-  strictEqual(d("contacto@sitio.it", "rol_mx", { ruta: { verificar: false, enviar: true }, mv: "riesgo" }), "elegir", "rol_mx en M365: hoy el agente lo manda (cambiarlo es decisión del dueño)");
+  // El dueño decidió el 18/09 ("soluciona todos los problemas", con rol_mx rebotando 23 de 46): una dirección
+  // adivinada sólo sale con un "ok" de MillionVerifier. Hasta ese día acá se esperaba "elegir".
+  strictEqual(d("contacto@sitio.it", "rol_mx", { ruta: { verificar: false, enviar: true }, mv: "riesgo" }), "saltear:hipotesis_sin_ok", "rol_mx sin un ok no sale (decisión del dueño, 18/09)");
+  strictEqual(d("contacto@sitio.it", "rol_mx", { ruta: { verificar: true, enviar: true }, mv: "ok" }), "elegir", "rol_mx con ok sale");
+  strictEqual(_decidirCandidato({ email: "contacto@sitio.it", source: "rol_mx" }, { ruta: { verificar: true, enviar: true }, mv: "sin_verificar" }, { manualManda: false, sinVerificar: "reserva" }), "saltear:hipotesis_sin_ok", "con la política del agente (sin_verificar = reserva) tampoco: un no-sé no alcanza para una adivinanza");
+  strictEqual(d("contacto@sitio.it", "rol_mx"), "elegir", "sin veredicto todavía sigue de largo: la verifica _elegirDireccion");
   strictEqual(d("publicidad@sitio.it", "rol_mx", { ruta: { verificar: true, enviar: true }, mv: "dudoso" }), "saltear:mv_dudoso");
   strictEqual(d("publicidad@sitio.it", "scrape", { ruta: { verificar: true, enviar: true }, mv: "no" }), "saltear:mv_no");
   strictEqual(d("publicidad@sitio.it", "scrape", { ruta: { verificar: true, enviar: true }, mv: "riesgo" }), "reserva");

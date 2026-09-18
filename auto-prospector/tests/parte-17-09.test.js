@@ -13,8 +13,8 @@
 //  4. El linter frenó tres veces el resumen de salud del dueño y dos veces un pitch a xsport.ua por
 //     "homóglifos": miraba el mail entero, no la palabra.
 //
-// NO se tocó: `rol_mx` rebotó 23 de 46 (50%), pero el test C36 de reintento_rebote-13-09b dice que
-// cambiar cómo sale es decisión del dueño. Quedó planteado, no hecho.
+//  5. `rol_mx` rebotó 23 de 46 (50%). Era decisión del dueño (test C36 de reintento_rebote-13-09b) y la tomó
+//     el 18/09: una dirección adivinada sólo sale con un "ok" de MillionVerifier.
 // Run: npm test
 import { test } from "node:test";
 import { ok, strictEqual } from "node:assert";
@@ -28,7 +28,7 @@ const aqui    = path.dirname(fileURLToPath(import.meta.url));
 const raiz    = path.join(aqui, "..", "..");
 const indexJs = fs.readFileSync(path.join(aqui, "..", "index.js"), "utf8");
 
-const W = await cargarWorker(["_mismoCicloRapidApi", "_frenoDelFeeder", "_billingCyclePeriod"]);
+const W = await cargarWorker(["_mismoCicloRapidApi", "_frenoDelFeeder", "_billingCyclePeriod", "_elegirDireccion", "_esHipotesisDeDireccion"]);
 
 // ── 1. El ciclo de RapidAPI ───────────────────────────────────────────────────────────────
 test("el contador de RapidAPI sólo vale si es de ESTE ciclo, comparando el período entero", () => {
@@ -122,4 +122,32 @@ test("dos alfabetos dentro de UNA palabra sí se frena", () => {
   ok(lint("Entrá a tu cuenta de pаypal ahora").includes("homoglifos_mezclados"), "la «а» de pаypal es cirílica");
   ok(lint("Visitá gοogle.com").includes("homoglifos_mezclados"), "la «ο» de gοogle es griega");
   ok(lint("Оffer para vos").includes("homoglifos_mezclados"), "la «О» inicial es cirílica");
+});
+
+// ── 5. Una dirección adivinada sólo sale con un "ok" ──────────────────────────────────────
+const elegir = (orden, veredictos) => W._elegirDireccion(orden, {
+  rebotado: () => false, noEscribir: () => "", marcaOk: () => true,
+  ruta: async () => ({ verificar: true, enviar: true }),
+  verificar: async (e) => veredictos[e],
+  alAgotarMv: "elegir_sin_verificar", sinVerificar: "reserva", manualManda: false,   // la política del agente
+});
+test("rol_mx en un catch-all ya no sale de reserva: el lead queda sin dirección enviable", async () => {
+  const r = await elegir([{ email: "info@sitio.it", source: "rol_mx" }, { email: "redazione@sitio.it", source: "rol_mx" }],
+                         { "info@sitio.it": "riesgo", "redazione@sitio.it": "sin_verificar" });
+  strictEqual(r.chosen, null, "antes salía info@ de reserva: así rebotó 23 de 46");
+  ok(r.motivos.every(m => m === "hipotesis_sin_ok"), `motivos: ${r.motivos}`);
+});
+test("si MillionVerifier confirma una de las adivinadas, ésa sale", async () => {
+  const r = await elegir([{ email: "info@sitio.it", source: "rol_mx" }, { email: "redazione@sitio.it", source: "rol_mx" }],
+                         { "info@sitio.it": "riesgo", "redazione@sitio.it": "ok" });
+  strictEqual(r.chosen?.email, "redazione@sitio.it");
+});
+test("una dirección PUBLICADA en un catch-all sigue saliendo de reserva, como siempre", async () => {
+  const r = await elegir([{ email: "publicidad@sitio.it", source: "scrape" }], { "publicidad@sitio.it": "riesgo" });
+  strictEqual(r.chosen?.email, "publicidad@sitio.it", "la regla nueva es sólo para lo que nadie publicó");
+  strictEqual(r.deReserva, true);
+});
+test("qué cuenta como adivinada", () => {
+  for (const f of ["rol_mx", "pattern", "guess", "apollo_pattern", "ROL_MX"]) ok(W._esHipotesisDeDireccion(f), f);
+  for (const f of ["scrape", "apollo", "informer", "manual", "google_contact", "", null]) ok(!W._esHipotesisDeDireccion(f), String(f));
 });

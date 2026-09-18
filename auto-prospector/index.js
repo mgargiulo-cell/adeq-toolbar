@@ -20248,11 +20248,29 @@ function _decidirCandidato(cand, { rebotado = false, noEscribir = "", marcaOk = 
   const accion = _accionPorVeredictoMV(mv);
   if (accion === "quemar") return "saltear:mv_no";
   if (accion === "saltar") return "saltear:mv_dudoso";
+  // ── UNA DIRECCIÓN ADIVINADA SÓLO SALE CON UN "OK" (decisión del dueño, 2026-09-18, medido) ─────────
+  // El parte del 17/09: **rol_mx rebotó 23 de 46 enviados (50%)**, contra 1% del scrape y 7% de Apollo, y
+  // era la vía que más empujaba el 9,9% de rebote a 7 días. rol_mx no encuentra nada: arma info@/redaccion@
+  // porque el dominio tiene MX, y se guarda SIN verificar. Al enviar, un catch-all o un "no pude verificar"
+  // iban a `reserva` — y como un lead de rol_mx por definición no tiene otra dirección, la reserva salía
+  // siempre. La hipótesis de patrón ya exigía "ok" al crearse (polishPool); ésta no. Misma regla para toda
+  // dirección que nadie publicó: sin "ok", no sale. No es una pausa de envío (regla del 02/09 intacta): el
+  // cupo del día se llena igual con las direcciones reales del pool.
+  // `mv === undefined` es "todavía no se consultó" (la función se llama por etapas): sigue de largo para que
+  // _elegirDireccion la verifique. `true` es MillionVerifier dormido, sin clave: no hay con qué decidir.
+  if (mv !== undefined && _esHipotesisDeDireccion(fuente) && mv !== "ok" && mv !== true) return "saltear:hipotesis_sin_ok";
   // `riesgo` (catch-all) o `sin_verificar` en el agente: si la ruta ya decía que MV no puede saber nada
   // (Microsoft 365, gateways, rol publicado en proveedor confiable) se manda igual; si la consulta debía
   // decidir, queda de reserva y se busca uno limpio.
   if (accion === "reserva") return ruta && ruta.verificar === false ? "elegir" : "reserva";
   return "elegir";
+}
+
+// Direcciones que NADIE publicó: las armó el sistema (patrón nombre.apellido@, o el rol estándar del idioma
+// porque el dominio tiene MX). Pura. Se tratan igual en la ruta de MV y en la elección.
+function _esHipotesisDeDireccion(fuente) {
+  const f = String(fuente || "").toLowerCase();
+  return f === "pattern" || f === "guess" || f === "apollo_pattern" || f === "rol_mx";
 }
 
 /**
@@ -22301,7 +22319,8 @@ async function decidirVerificacionMV(email, fuente) {
   const dom = String(email || "").split("@")[1] || "";
   const local = String(email || "").split("@")[0] || "";
   const perfil = await perfilCorreoDelDominio(dom).catch(() => ({ verificable: "medio", proveedor: "?" }));
-  const generadoPorPatron = fuente === "pattern" || fuente === "guess" || fuente === "apollo_pattern";
+  // `rol_mx` también es una hipótesis (decisión del dueño, 2026-09-18): ver _esHipotesisDeDireccion.
+  const generadoPorPatron = _esHipotesisDeDireccion(fuente);
   const rolComun =/^(info|contacto|contact|contato|redaccion|redazione|redacao|publicidad|publicidade|comercial|ventas|marketing|prensa)$/i.test(local);
 
   if (perfil.verificable === "acepta_todo" && generadoPorPatron)
@@ -22484,6 +22503,8 @@ async function _elegirDireccion(orden, { rebotado, noEscribir, marcaOk, ruta, ve
     // 3. MillionVerifier, de a uno y hasta `maxMv` consultas.
     if (mvUsed >= maxMv) {
       if (alAgotarMv === "saltear") { descartados++; motivos.push("tope_mv"); continue; }
+      // Una dirección adivinada no se elige "sin verificar" por haber gastado las consultas (2026-09-18).
+      if (_esHipotesisDeDireccion(_normSrc(cand.source))) { fuera("hipotesis_sin_ok"); continue; }
       chosen = cand;
       break;
     }
